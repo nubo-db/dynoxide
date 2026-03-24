@@ -1,10 +1,10 @@
 # Dynoxide DynamoDB Compatibility
 
-Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. It is designed for local development, testing, and CI pipelines — not as a production DynamoDB replacement.
+Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for local development, testing, and CI pipelines - not as a production DynamoDB replacement.
 
 **What "not applicable" means:** Dynoxide does not emulate capacity management, throttling, global replication, backup infrastructure, or Kinesis integration. These features are meaningless for a local emulator and are marked as "not applicable" rather than "not implemented."
 
-**Consistency model:** SQLite provides strong consistency. `ConsistentRead` is accepted but has no effect — all reads are strongly consistent.
+**Consistency model:** SQLite provides strong consistency. `ConsistentRead` is accepted but has no effect - all reads are strongly consistent.
 
 > **Updated:** 2026-03-24 · Reflects all fixes from compatibility phases 1–5, correctness audit, and conformance suite results.
 
@@ -14,7 +14,7 @@ Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. It is 
 
 Dynoxide's DynamoDB compatibility is independently verified by the
 [dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) test
-suite — 526 tests across 3 tiers, validated against real DynamoDB ground truth.
+suite - 526 tests across 3 tiers, validated against real DynamoDB ground truth.
 
 | Target | Tier 1 (Core) | Tier 2 (Complete) | Tier 3 (Strict) | Total |
 |---|---|---|---|---|
@@ -27,11 +27,11 @@ adds transactions, PartiQL, streams, TTL, tags, and UpdateTable. Tier 3 covers
 validation ordering, error message fidelity, reserved words, and edge cases.
 
 "100% conformance on 526 tests" means Dynoxide matches real DynamoDB behaviour
-for every test in the suite. It does not mean "100% DynamoDB compatible" — there
+for every test in the suite. It does not mean "100% DynamoDB compatible" - there
 are aspects of DynamoDB the suite does not yet cover.
 
 **How Dynoxide compares to DynamoDB Local:** DynamoDB Local is itself a subset of
-the full DynamoDB API — it fails 42 of the 526 conformance tests that real
+the full DynamoDB API - it fails 42 of the 526 conformance tests that real
 DynamoDB passes. Where a feature is unsupported in both, it is marked as such.
 Where Dynoxide supports something DynamoDB Local does not, this is noted
 explicitly.
@@ -40,19 +40,19 @@ explicitly.
 
 ## Operation Coverage
 
-### Core Operations — Fully Supported
+### Core Operations - Fully Supported
 
 | Category | Operations | Dynoxide | DDB Local |
 |----------|-----------|----------|-----------|
-| **Item CRUD** | PutItem, GetItem, UpdateItem, DeleteItem | Full | Partial — ItemCollectionMetrics returns null |
+| **Item CRUD** | PutItem, GetItem, UpdateItem, DeleteItem | Full | Partial - ItemCollectionMetrics returns null |
 | **Query & Scan** | Query, Scan | Full | Full |
-| **Batch** | BatchGetItem, BatchWriteItem | Full | Partial — ItemCollectionMetrics returns null |
+| **Batch** | BatchGetItem, BatchWriteItem | Full | Partial - ItemCollectionMetrics returns null |
 | **Transactions** | TransactWriteItems, TransactGetItems | Full | Full |
 | **Table Management** | CreateTable, DeleteTable, DescribeTable, UpdateTable, ListTables | Full | Full |
 | **TTL** | UpdateTimeToLive, DescribeTimeToLive | Full | Full |
 | **Tags** | TagResource, UntagResource, ListTagsOfResource | Full | Not supported |
 | **Streams** | ListStreams, DescribeStream, GetShardIterator, GetRecords | Full | Full (single-shard) |
-| **PartiQL** | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Full | Partial — wrong error code for duplicate INSERT |
+| **PartiQL** | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Full | Partial - wrong error code for duplicate INSERT |
 
 ### Not Implemented
 
@@ -83,7 +83,7 @@ explicitly.
 
 ### Condition/Filter Functions
 
-`attribute_exists` · `attribute_not_exists` · `attribute_type` · `begins_with` · `contains` · `size` — all supported.
+`attribute_exists` · `attribute_not_exists` · `attribute_type` · `begins_with` · `contains` · `size` - all supported.
 
 ---
 
@@ -150,7 +150,7 @@ DynamoDB Local fails 42 of 526 conformance tests. Grouped by category:
 |---|---|---|
 | Table name validation messages | 15 | DDB Local returns generic "Invalid table/index name" instead of specific AWS constraint messages |
 | Tags (TagResource, UntagResource, ListTagsOfResource) | 8 | DDB Local returns `UnknownOperationException: Tagging is not currently supported` |
-| Validation ordering — wrong exception type | 4 | DDB Local returns `ResourceNotFoundException` or `InternalFailure` instead of `ValidationException` |
+| Validation ordering - wrong exception type | 4 | DDB Local returns `ResourceNotFoundException` or `InternalFailure` instead of `ValidationException` |
 | CreateTable error message fidelity | 4 | DDB Local uses its own wording for KeySchema and index validation errors |
 | ItemCollectionMetrics | 3 | DDB Local returns `undefined` for `ReturnItemCollectionMetrics: SIZE` |
 | Scan parallel validation messages | 3 | DDB Local uses different wording for Segment/TotalSegments validation |
@@ -163,21 +163,21 @@ DynamoDB Local fails 42 of 526 conformance tests. Grouped by category:
 | Capability | Notes |
 |---|---|
 | MCP server (33 tools, stdio + HTTP) | Exposes all DynamoDB operations as tools for coding agents |
-| Embedded mode (direct Rust API) | `Database::memory()` — no HTTP, no serialisation overhead |
+| Embedded mode (direct Rust API) | `Database::memory()` - no HTTP, no serialisation overhead |
 | Snapshots + auto-snapshot before destructive ops | Point-in-time save/restore for safe experimentation |
 | OneTable data model integration | `--data-model` loads entity schemas for agent context |
 | Anonymised import with rule-based anonymisation | Import DynamoDB exports with fake/mask/hash/redact rules |
 | SQLCipher encryption at rest | `encryption` feature flag for encrypted databases |
-| iOS/native embedding | No runtime dependencies — runs on platforms where Docker can't |
+| iOS/native embedding | No runtime dependencies - runs on platforms where Docker can't |
 | Sub-millisecond startup, ~5 MB binary | vs ~2.5s and ~225 MB for DynamoDB Local |
 
 ---
 
 ## Known Remaining Limitations
 
-- **Single-shard stream model** — DescribeStream returns a single shard; `ExclusiveStartShardId` and `Limit` accepted but ignored
-- **Number arithmetic precision** — uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
-- **Transaction contention errors** — `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
+- **Single-shard stream model** - DescribeStream returns a single shard; `ExclusiveStartShardId` and `Limit` accepted but ignored
+- **Number arithmetic precision** - uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
+- **Transaction contention errors** - `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
 
 ### Legacy Pre-2015 API Parameters
 

@@ -1,0 +1,56 @@
+{
+    "version": "0.1.0",
+    "format": "onetable:1.1.0",
+    "description": "Test schema for MCP data model context",
+    "indexes": {
+        "primary": { "hash": "pk", "sort": "sk" },
+        "gs1": { "hash": "gs1pk", "sort": "gs1sk", "project": "all", "name": "GSI1" },
+        "gs2": { "hash": "gs2pk", "sort": "gs2sk", "project": "keys", "name": "GSI2" }
+    },
+    "params": {
+        "typeField": "_type",
+        "isoDates": true
+    },
+    "models": {
+        "Account": {
+            "pk":    { "type": "string", "value": "account#${id}" },
+            "sk":    { "type": "string", "value": "account#" },
+            "id":    { "type": "string", "uuid": "ulid" },
+            "name":  { "type": "string", "required": true },
+            "plan":  { "type": "string", "default": "free" }
+        },
+        "User": {
+            "pk":    { "type": "string", "value": "account#${accountId}" },
+            "sk":    { "type": "string", "value": "user#${email}" },
+            "gs1pk": { "type": "string", "value": "user#${email}" },
+            "gs1sk": { "type": "string", "value": "user#" },
+            "id":    { "type": "string", "uuid": "ulid" },
+            "accountId": { "type": "string", "required": true },
+            "email": { "type": "string", "required": true },
+            "role":  { "type": "string", "enum": ["viewer", "editor", "admin"] }
+        },
+        "Project": {
+            "pk":    { "type": "string", "value": "account#${accountId}" },
+            "sk":    { "type": "string", "value": "project#${id}" },
+            "gs1pk": { "type": "string", "value": "project#${id}" },
+            "gs1sk": { "type": "string", "value": "project#" },
+            "gs2pk": { "type": "string", "value": "account#${accountId}" },
+            "gs2sk": { "type": "string", "value": "project#${status}#${name}" },
+            "id":    { "type": "string", "uuid": "ulid" },
+            "accountId": { "type": "string", "required": true },
+            "name":  { "type": "string", "required": true },
+            "status": { "type": "string", "default": "active" }
+        },
+        "Task": {
+            "pk":    { "type": "string", "value": "project#${projectId}" },
+            "sk":    { "type": "string", "value": "task#${id}" },
+            "gs1pk": { "type": "string", "value": "user#${assigneeEmail}" },
+            "gs1sk": { "type": "string", "value": "task#${dueDate}" },
+            "id":    { "type": "string", "uuid": "ulid" },
+            "projectId": { "type": "string", "required": true },
+            "title": { "type": "string", "required": true },
+            "assigneeEmail": { "type": "string" },
+            "dueDate": { "type": "string" }
+        }
+    }
+}

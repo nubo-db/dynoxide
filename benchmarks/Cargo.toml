@@ -1,0 +1,74 @@
+[package]
+name = "dynoxide-benchmarks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+dynoxide = { package = "dynoxide-rs", path = "..", features = ["http-server"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+aws-sdk-dynamodb = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+libc = "0.2"
+tempfile = "3"
+rand = "0.8"
+
+# iai-callgrind for instruction-count regression detection (Linux/CI only)
+# Requires: cargo install iai-callgrind-runner --version 0.14.2
+#           apt-get install valgrind
+iai-callgrind = { version = "0.14", optional = true }
+
+[features]
+iai-callgrind = ["dep:iai-callgrind"]
+
+[[bench]]
+name = "embedded_micro"
+harness = false
+
+[[bench]]
+name = "embedded_macro"
+harness = false
+
+[[bench]]
+name = "embedded_file_backed"
+harness = false
+
+[[bench]]
+name = "http_macro"
+harness = false
+
+[[bench]]
+name = "iai_core"
+harness = false
+
+[[bin]]
+name = "size_comparison"
+path = "bin/size_comparison.rs"
+
+[[bin]]
+name = "startup_bench"
+path = "bin/startup_bench.rs"
+
+[[bin]]
+name = "ci_pipeline_bench"
+path = "bin/ci_pipeline_bench.rs"
+
+[[bin]]
+name = "workload_driver"
+path = "bin/workload_driver.rs"
+
+[[bin]]
+name = "memory_profiler"
+path = "bin/memory_profiler.rs"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

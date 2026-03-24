@@ -1,0 +1,174 @@
+name: "Dynoxide"
+description: "Start a Dynoxide DynamoDB emulator in CI with optional snapshot loading"
+branding:
+  icon: database
+  color: orange
+
+inputs:
+  snapshot-url:
+    description: "HTTPS URL to download a database snapshot (.db or .db.zst)"
+    required: false
+  port:
+    description: "Port to listen on"
+    required: false
+    default: "8000"
+  version:
+    description: "Dynoxide version to install (e.g., v0.9.1). Defaults to latest."
+    required: false
+    default: "latest"
+  mode:
+    description: "Run mode: serve (HTTP server) or mcp (MCP server)"
+    required: false
+    default: "serve"
+  db-path:
+    description: "Path to the database file. Defaults to in-memory."
+    required: false
+
+outputs:
+  endpoint:
+    description: "The HTTP endpoint URL (serve mode only)"
+    value: ${{ steps.start.outputs.endpoint }}
+  pid:
+    description: "The process ID of the running Dynoxide instance"
+    value: ${{ steps.start.outputs.pid }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)  target="x86_64-unknown-linux-gnu" ;;
+          Linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
+          Darwin-x86_64) target="x86_64-apple-darwin" ;;
+          Darwin-arm64)  target="aarch64-apple-darwin" ;;
+          *)             echo "Unsupported platform: $(uname -s)-$(uname -m)"; exit 1 ;;
+        esac
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+
+    - name: Validate inputs
+      shell: bash
+      run: |
+        PORT="${{ inputs.port }}"
+        VERSION="${{ inputs.version }}"
+        SNAPSHOT_URL="${{ inputs.snapshot-url }}"
+        MODE="${{ inputs.mode }}"
+        DB_PATH="${{ inputs.db-path }}"
+
+        # Validate port is a number in valid range
+        if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+          echo "::error::Invalid port: '$PORT'. Must be a number between 1 and 65535."
+          exit 1
+        fi
+
+        # Validate version format (vX.Y.Z or "latest")
+        if [ "$VERSION" != "latest" ] && ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::Invalid version: '$VERSION'. Must be 'latest' or vX.Y.Z (e.g., v0.9.1)."
+          exit 1
+        fi
+
+        # Validate snapshot URL is HTTPS (if provided)
+        if [ -n "$SNAPSHOT_URL" ] && ! [[ "$SNAPSHOT_URL" =~ ^https:// ]]; then
+          echo "::error::Invalid snapshot-url: must start with https://"
+          exit 1
+        fi
+
+        # Validate mode
+        if [ "$MODE" != "serve" ] && [ "$MODE" != "mcp" ]; then
+          echo "::error::Invalid mode: '$MODE'. Must be 'serve' or 'mcp'."
+          exit 1
+        fi
+
+        # Validate db-path contains only safe characters
+        if [ -n "$DB_PATH" ] && ! [[ "$DB_PATH" =~ ^[a-zA-Z0-9._/=-]+$ ]]; then
+          echo "::error::Invalid db-path: '$DB_PATH'. Must contain only alphanumeric characters, dots, underscores, hyphens, equals, and slashes."
+          exit 1
+        fi
+
+    - name: Download Dynoxide
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        TARGET="${{ steps.platform.outputs.target }}"
+        REPO="nubo-db/dynoxide"
+
+        if [ "$VERSION" = "latest" ]; then
+          URL="https://github.com/$REPO/releases/latest/download/dynoxide-$TARGET.tar.gz"
+        else
+          URL="https://github.com/$REPO/releases/download/$VERSION/dynoxide-$TARGET.tar.gz"
+        fi
+
+        echo "Downloading $URL"
+        curl -fsSL "$URL" | tar xz -C /usr/local/bin/
+        chmod +x /usr/local/bin/dynoxide
+        dynoxide --version
+
+    - name: Download snapshot
+      if: inputs.snapshot-url != ''
+      shell: bash
+      run: |
+        URL="${{ inputs.snapshot-url }}"
+        FILENAME=$(basename "$URL")
+        echo "Downloading snapshot from $URL"
+        curl -fsSL -o "$FILENAME" "$URL"
+
+        # Decompress if zstd-compressed
+        if [[ "$FILENAME" == *.zst ]]; then
+          echo "Decompressing $FILENAME"
+          zstd -d "$FILENAME" -o "${FILENAME%.zst}"
+          FILENAME="${FILENAME%.zst}"
+        fi
+
+        echo "DB_FILE=$FILENAME" >> "$GITHUB_ENV"
+
+    - name: Start Dynoxide
+      id: start
+      shell: bash
+      run: |
+        MODE="${{ inputs.mode }}"
+        PORT="${{ inputs.port }}"
+        DB_PATH="${{ inputs.db-path }}"
+
+        # Use snapshot if downloaded
+        if [ -n "$DB_FILE" ]; then
+          DB_PATH="$DB_FILE"
+        fi
+
+        if [ "$MODE" = "mcp" ]; then
+          echo "Starting Dynoxide MCP server..."
+          if [ -n "$DB_PATH" ]; then
+            dynoxide mcp --db-path "$DB_PATH" &
+          else
+            dynoxide mcp &
+          fi
+          PID=$!
+          echo "pid=$PID" >> "$GITHUB_OUTPUT"
+
+          # Output MCP config snippet
+          echo "::notice::Dynoxide MCP server started (PID $PID). Use stdio transport."
+        else
+          echo "Starting Dynoxide HTTP server on port $PORT..."
+          if [ -n "$DB_PATH" ]; then
+            dynoxide serve --port "$PORT" --db-path "$DB_PATH" &
+          else
+            dynoxide serve --port "$PORT" &
+          fi
+          PID=$!
+          echo "pid=$PID" >> "$GITHUB_OUTPUT"
+          echo "endpoint=http://127.0.0.1:$PORT" >> "$GITHUB_OUTPUT"
+
+          # Wait for health check
+          for i in $(seq 1 30); do
+            if curl -sf "http://127.0.0.1:$PORT" > /dev/null 2>&1; then
+              echo "Dynoxide is ready on http://127.0.0.1:$PORT"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Timed out waiting for Dynoxide to start"
+              exit 1
+            fi
+            sleep 1
+          done
+        fi

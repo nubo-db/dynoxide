@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: minimal-library
+            flags: "--no-default-features --features native-sqlite --lib"
+          - name: encryption-only
+            flags: "--no-default-features --features encryption --lib"
+          - name: encryption+http-server
+            flags: "--no-default-features --features encryption,http-server"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build ${{ matrix.flags }}
+
+      - name: Test
+        run: cargo test ${{ matrix.flags }}
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (default)
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (encryption)
+        run: cargo clippy --no-default-features --features encryption --lib -- -D warnings
+
+      - name: Format
+        run: cargo fmt --check
+
+  feature-guards:
+    name: Feature guard checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Both features must fail
+        run: |
+          if cargo check --features "native-sqlite,encryption" 2>&1; then
+            echo "ERROR: both features should cause compile_error!"
+            exit 1
+          fi
+
+      - name: Neither feature must fail
+        run: |
+          if cargo check --no-default-features --features http-server 2>&1; then
+            echo "ERROR: no SQLite backend should cause compile_error!"
+            exit 1
+          fi

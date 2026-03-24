@@ -1,0 +1,256 @@
+name: Comparative Benchmark
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Prevent concurrent benchmark runs from corrupting the benchmark-data branch
+concurrency:
+  group: benchmark-comparative
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dynoxide-vs-dynamodb-local:
+    runs-on: ubuntu-latest
+
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+        options: >-
+          --health-cmd "(echo > /dev/tcp/localhost/8000) 2>/dev/null || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            benchmarks
+
+      - name: Create results directory
+        run: mkdir -p benchmarks/results
+
+      - name: Pull LocalStack image
+        run: docker pull localstack/localstack:latest
+
+      - name: Build Dynoxide server and benchmarks
+        run: |
+          cargo build --release --bin dynoxide
+          cd benchmarks
+          cargo build --release --bin workload_driver --bin ci_pipeline_bench --bin startup_bench --bin memory_profiler
+
+      - name: Collect system info
+        run: bash benchmarks/scripts/collect_system_info.sh > benchmarks/results/system_info.json
+
+      - name: Wait for DynamoDB Local
+        run: |
+          # DynamoDB Local requires credentials (even dummy ones) and returns
+          # MissingAuthenticationToken for unsigned requests. Accept any non-5xx
+          # response as proof the JVM is up.
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST http://localhost:8000 \
+              -H 'Content-Type: application/x-amz-json-1.0' \
+              -H 'X-Amz-Target: DynamoDB_20120810.ListTables' \
+              -d '{}' 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" -gt 0 ] 2>/dev/null && [ "$HTTP_CODE" -lt 500 ] 2>/dev/null; then
+              echo "DynamoDB Local is ready (HTTP $HTTP_CODE)"
+              break
+            fi
+            echo "Waiting for DynamoDB Local... ($i)"
+            sleep 1
+          done
+
+      - name: Start Dynoxide HTTP server
+        run: |
+          ./target/release/dynoxide --port 8123 &
+          DYNOXIDE_PID=$!
+          echo "DYNOXIDE_PID=$DYNOXIDE_PID" >> $GITHUB_ENV
+          # Wait for Dynoxide to start
+          for i in $(seq 1 10); do
+            if curl -sf -X POST http://localhost:8123 \
+              -H 'X-Amz-Target: DynamoDB_20120810.ListTables' \
+              -H 'Content-Type: application/x-amz-json-1.0' \
+              -d '{}' > /dev/null 2>&1; then
+              echo "Dynoxide HTTP is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run workload -- Dynoxide HTTP
+        run: |
+          cd benchmarks
+          cargo run --release --bin workload_driver -- \
+            --endpoint-url http://localhost:8123 \
+            --output results/dynoxide_http.json
+
+      - name: Run workload -- DynamoDB Local
+        run: |
+          cd benchmarks
+          cargo run --release --bin workload_driver -- \
+            --endpoint-url http://localhost:8000 \
+            --output results/dynamodb_local.json
+
+      - name: Run CI pipeline benchmark
+        run: |
+          cd benchmarks
+          cargo run --release --bin ci_pipeline_bench -- \
+            --ddb-endpoint http://localhost:8000 \
+            --output results/ci_pipeline.json
+
+      - name: Run startup benchmark
+        run: |
+          cd benchmarks
+          cargo run --release --bin startup_bench -- \
+            --reps 5 \
+            --output results/startup.json
+
+      - name: Run memory profiler
+        run: |
+          cd benchmarks
+          cargo run --release --bin memory_profiler > results/memory_profile.csv
+
+      - name: Extract CI ratios from pipeline results
+        run: |
+          cd benchmarks
+          python3 -c "
+          import json
+          with open('results/ci_pipeline.json') as f:
+              data = json.load(f)
+          ratios = {}
+          for row in data.get('summary', []):
+              speedup = row.get('speedup_vs_ddb_local')
+              if speedup is not None:
+                  key = row['mode'] + '_' + row['execution']
+                  ratios[key] = round(speedup, 1)
+          with open('results/ci_ratios.json', 'w') as f:
+              json.dump(ratios, f, indent=2)
+          "
+
+      - name: Run criterion baseline (for PR regression checks)
+        run: |
+          cd benchmarks
+          cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
+          python3 -c "
+          import json, sys, re
+          results = {}
+          for line in open('criterion_output.txt'):
+              m = re.match(r'^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter', line)
+              if m:
+                  results[m.group(1)] = int(m.group(2).replace(',', ''))
+          with open('results/criterion_baseline.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          "
+
+      - name: Consolidate results
+        run: python3 benchmarks/scripts/append_history.py --results-dir benchmarks/results --output benchmarks/results/run_summary.json
+
+      - name: Store results in benchmark-data branch
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%d)
+          RUN_DIR="runs/${DATE}-${SHA}"
+
+          # Configure git for the push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch benchmark-data branch if it exists, otherwise create orphan
+          git fetch origin benchmark-data:benchmark-data 2>/dev/null || true
+          if git rev-parse --verify benchmark-data >/dev/null 2>&1; then
+            git worktree add /tmp/bench-data benchmark-data
+          else
+            git worktree add --detach /tmp/bench-data
+            cd /tmp/bench-data
+            git checkout --orphan benchmark-data
+            git rm -rf . 2>/dev/null || true
+            echo "# Benchmark History" > README.md
+            echo "" >> README.md
+            echo "This branch stores historical benchmark results." >> README.md
+            echo "Each run is stored in \`runs/YYYY-MM-DD-<commit_sha>/\`." >> README.md
+            git add README.md
+            git commit -m "Initialize benchmark-data branch"
+            cd -
+          fi
+
+          # Copy results into the run directory
+          mkdir -p "/tmp/bench-data/${RUN_DIR}"
+          cp benchmarks/results/*.json benchmarks/results/*.csv "/tmp/bench-data/${RUN_DIR}/" 2>/dev/null || true
+
+          # Commit and push
+          cd /tmp/bench-data
+          git add .
+          git commit -m "Benchmark results for ${SHA} (${DATE})" || echo "No changes to commit"
+          git push origin benchmark-data
+          cd -
+
+          # Cleanup worktree
+          git worktree remove /tmp/bench-data --force 2>/dev/null || true
+
+      - name: Update README benchmarks
+        run: |
+          python3 benchmarks/scripts/update_readme_benchmarks.py \
+            --data-dir benchmarks/results/ \
+            --readme README.md \
+            --benchmarks-readme benchmarks/README.md
+        continue-on-error: true
+        id: update_readmes
+
+      - name: Create or update benchmark PR
+        if: steps.update_readmes.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet README.md benchmarks/README.md; then
+            echo "No benchmark changes"
+            exit 0
+          fi
+
+          BRANCH="auto/benchmark-update"
+          git checkout -B "$BRANCH"
+          git add README.md benchmarks/README.md
+          COMMIT_SHA="${{ github.sha }}"
+          git commit -m "docs: update benchmark numbers from ${COMMIT_SHA::7}"
+
+          git push -f origin "$BRANCH"
+
+          # Update existing PR or create new one
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Updated existing PR #$EXISTING_PR"
+          else
+            gh pr create \
+              --title "docs: update benchmark numbers" \
+              --body "Automated update from benchmark-comparative workflow run for $(git rev-parse --short HEAD)." \
+              --base main \
+              --head "$BRANCH"
+          fi
+
+      # TODO: Upload to S3 when public site is ready
+      # - name: Upload to S3
+      #   run: aws s3 sync /tmp/bench-data/runs/ s3://dynoxide-benchmarks/runs/
+
+      - name: Upload results artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmarks/results/
+            benchmarks/target/criterion/
+          retention-days: 90
+
+      - name: Cleanup
+        if: always()
+        run: kill $DYNOXIDE_PID 2>/dev/null || true

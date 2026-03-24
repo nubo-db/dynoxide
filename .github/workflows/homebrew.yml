@@ -1,0 +1,20 @@
+name: Update Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-formula:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update formula
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap: nubo-db/homebrew-tap
+          formula: dynoxide
+          tag: ${{ github.event.release.tag_name }}
+          revision: ${{ github.event.release.target_commitish }}

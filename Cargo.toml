@@ -1,0 +1,88 @@
+[package]
+name = "dynoxide-rs"
+version = "0.9.5"
+edition = "2024"
+description = "A lightweight, embeddable DynamoDB emulator backed by SQLite"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nubo-db/dynoxide"
+homepage = "https://github.com/nubo-db/dynoxide"
+keywords = ["dynamodb", "sqlite", "emulator", "aws", "database"]
+categories = ["database", "emulators"]
+rust-version = "1.85"
+
+[lib]
+name = "dynoxide"
+
+[features]
+default = ["native-sqlite", "http-server", "mcp-server", "import"]
+http-server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast"]
+native-sqlite = ["rusqlite/bundled"]
+_has-encryption = ["dep:zeroize"]
+encryption = ["_has-encryption", "rusqlite/bundled-sqlcipher-vendored-openssl"]
+encryption-cc = ["_has-encryption", "rusqlite/bundled-sqlcipher"]
+encrypted-server = ["encryption", "http-server"]
+encrypted-server-cc = ["encryption-cc", "http-server"]
+encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
+mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc"]
+import = ["dep:clap", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
+
+# Backward-compatible alias — identical to default features
+full = ["native-sqlite", "http-server", "mcp-server", "import"]
+
+[dependencies]
+rusqlite = { version = "0.36", features = ["backup", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+bigdecimal = "0.4"
+uuid = { version = "1", features = ["v4", "v7"] }
+md5 = "0.7"
+
+# Optional encryption dependency
+zeroize = { version = "1", optional = true }
+
+# Optional HTTP server dependencies
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "set-header", "trace"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+socket2 = { version = "0.6", optional = true }
+crc32fast = { version = "1", optional = true }
+
+# Optional MCP server dependencies
+rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
+schemars = { version = "1", optional = true }
+tokio-util = { version = "0.7", optional = true }
+libc = { version = "0.2", optional = true }
+
+# Optional import dependencies
+toml = { version = "0.8", optional = true }
+fake = { version = "3", features = ["derive"], optional = true }
+sha2 = { version = "0.10", optional = true }
+flate2 = { version = "1", optional = true }
+indicatif = { version = "0.17", optional = true }
+zstd = { version = "0.13", optional = true }
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+proptest = "1"
+aws-sdk-dynamodb = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+tempfile = "3.25.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "dynoxide"
+path = "src/main.rs"

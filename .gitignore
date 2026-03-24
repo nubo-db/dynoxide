@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+*~
+.DS_Store
+tests/external/dynalite/
+tests/external/results/
+.claude/worktrees/

@@ -1,0 +1,177 @@
+name: Benchmark Regression Check
+
+on: [pull_request]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  criterion-benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            benchmarks
+
+      - name: Run criterion micro-benchmarks
+        run: cd benchmarks && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
+
+      - name: Compare results and post summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+
+            // Parse current criterion output (bencher format: "test name ... bench: NNN ns/iter (+/- NNN)")
+            const currentOutput = fs.readFileSync('benchmarks/criterion_output.txt', 'utf8');
+            const currentResults = {};
+            for (const line of currentOutput.split('\n')) {
+              const match = line.match(/^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns\/iter/);
+              if (match) {
+                currentResults[match[1]] = parseInt(match[2].replace(/,/g, ''));
+              }
+            }
+
+            if (Object.keys(currentResults).length === 0) {
+              console.log('No criterion results parsed -- skipping regression check');
+              return;
+            }
+
+            // Try to fetch baseline from benchmark-data branch
+            let baselineResults = {};
+            let hasBaseline = false;
+            try {
+              execSync('git fetch origin benchmark-data:benchmark-data 2>/dev/null', { stdio: 'pipe' });
+              const latestDir = execSync(
+                'git ls-tree --name-only benchmark-data runs/ | sort -r | head -1',
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+              ).trim();
+
+              if (latestDir) {
+                const baselineFile = execSync(
+                  `git show benchmark-data:${latestDir}/criterion_baseline.json 2>/dev/null || echo "{}"`,
+                  { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+                ).trim();
+                baselineResults = JSON.parse(baselineFile);
+                hasBaseline = Object.keys(baselineResults).length > 0;
+              }
+            } catch (e) {
+              console.log('No benchmark-data branch found -- will post results without comparison');
+            }
+
+            const sanitize = (s) => s.replace(/[|`\[\]<>]/g, '\\$&');
+
+            // Build comparison for all benchmarks
+            const allNames = [...new Set([...Object.keys(currentResults), ...Object.keys(baselineResults)])].sort();
+            const rows = [];
+            const regressions = [];
+            const threshold = 1.50; // 50% -- wall-clock on shared runners is noisy
+
+            for (const name of allNames) {
+              const current = currentResults[name];
+              const baseline = baselineResults[name];
+              let changeStr = '';
+
+              if (current && baseline) {
+                const ratio = current / baseline;
+                const pct = ((ratio - 1) * 100).toFixed(1);
+                changeStr = ratio >= 1 ? `+${pct}%` : `${pct}%`;
+                if (ratio > threshold) {
+                  regressions.push({ name, baseline, current, change: `+${pct}%` });
+                }
+              } else if (current && !baseline) {
+                changeStr = 'new';
+              } else if (!current && baseline) {
+                changeStr = 'removed';
+              }
+
+              rows.push({
+                name,
+                baseline: baseline ? baseline.toLocaleString() : '—',
+                current: current ? current.toLocaleString() : '—',
+                change: changeStr
+              });
+            }
+
+            // Build markdown body
+            let body = '## Criterion Benchmark Results\n\n';
+            body += '| Benchmark | Baseline (ns/iter) | Current (ns/iter) | Change |\n';
+            body += '|-----------|-------------------|-------------------|--------|\n';
+            for (const r of rows) {
+              const flag = regressions.some(reg => reg.name === r.name) ? ' :warning:' : '';
+              body += `| ${sanitize(r.name)} | ${r.baseline} | ${r.current} | ${sanitize(r.change)}${flag} |\n`;
+            }
+
+            if (regressions.length > 0) {
+              body += `\n> :warning: ${regressions.length} benchmark(s) regressed >50%. Wall-clock benchmarks on shared CI runners can vary up to 3x between runs due to noisy neighbours. iai-callgrind provides deterministic regression detection.\n`;
+            } else if (hasBaseline) {
+              body += '\n> All benchmarks within 50% of baseline.\n';
+            } else {
+              body += '\n> No baseline available for comparison. Baseline is recorded on push to `main`.\n';
+            }
+
+            // Post to GITHUB_STEP_SUMMARY (always visible in Actions tab)
+            await core.summary.addRaw(body).write();
+
+            // Post as PR comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            // Wall-clock regressions are advisory only -- don't block merge
+            if (regressions.length > 0) {
+              core.warning(`Wall-clock regression detected in ${regressions.length} benchmark(s) -- see PR comment for details`);
+            }
+
+  iai-benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            benchmarks
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Install iai-callgrind-runner
+        run: |
+          IAI_VERSION=$(cd benchmarks && cargo metadata --format-version=1 --no-deps | python3 -c "
+          import json, sys
+          meta = json.load(sys.stdin)
+          for pkg in meta['packages']:
+              for dep in pkg.get('dependencies', []):
+                  if dep['name'] == 'iai-callgrind':
+                      req = dep['req']
+                      if not req.startswith(('^', '~', '=')):
+                          req = '^' + req
+                      print(req)
+                      sys.exit(0)
+          print('^0.14')
+          ")
+          cargo install iai-callgrind-runner --version "${IAI_VERSION}"
+
+      - name: Run iai-callgrind benchmarks
+        run: cd benchmarks && cargo bench --bench iai_core --features iai-callgrind 2>&1 | tee iai_output.txt
+
+      - name: Check for instruction-count regressions
+        run: |
+          if grep -q "Performance has regressed" benchmarks/iai_output.txt; then
+            echo "::error::Instruction-count regression detected in iai-callgrind benchmarks"
+            grep "Performance has regressed" benchmarks/iai_output.txt
+            exit 1
+          else
+            echo "No iai-callgrind regressions detected"
+          fi

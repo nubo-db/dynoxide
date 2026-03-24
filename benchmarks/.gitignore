@@ -1,0 +1,6 @@
+target/
+results/*.json
+results/*.csv
+results/*.png
+results/*.svg
+local-results/

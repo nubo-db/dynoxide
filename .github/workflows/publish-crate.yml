@@ -11,6 +11,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.repository == 'nubo-db/dynoxide'
     name: Publish to crates.io
     runs-on: ubuntu-latest
 

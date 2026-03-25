@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    if: github.repository == 'nubo-db/dynoxide-development'
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
 
@@ -35,6 +36,7 @@ jobs:
         run: cargo test ${{ matrix.flags }}
 
   lint:
+    if: github.repository == 'nubo-db/dynoxide-development'
     name: Lint
     runs-on: ubuntu-latest
 
@@ -55,6 +57,7 @@ jobs:
         run: cargo fmt --check
 
   feature-guards:
+    if: github.repository == 'nubo-db/dynoxide-development'
     name: Feature guard checks
     runs-on: ubuntu-latest
 

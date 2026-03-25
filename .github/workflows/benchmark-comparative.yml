@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   dynoxide-vs-dynamodb-local:
+    if: github.repository == 'nubo-db/dynoxide-development'
     runs-on: ubuntu-latest
 
     services:

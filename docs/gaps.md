@@ -3,7 +3,7 @@
 Prioritised list of gaps between Dynoxide and the DynamoDB API surface.
 
 > **Original audit date:** 2026-03-14 · **Commit:** `45bd46c`
-> **Updated:** 2026-03-24 · All 12 original gaps resolved. Conformance suite (526 tests, 100%) validates all fixes. See also [correctness-audit.md](correctness-audit.md) for additional fixes beyond the original gap analysis.
+> **Updated:** 2026-03-24 · All 12 original gaps resolved. Conformance suite (526 tests, 100%) validates all fixes. See also [correctness-audit.md](internal/correctness-audit.md) for additional fixes beyond the original gap analysis.
 
 ---
 
@@ -187,7 +187,7 @@ DynamoDB validates parameters in a specific order. Dynoxide may return a differe
 | **P2** | 7 | Open | All resolved | 9 failures (tags, PartiQL error code) |
 | **P3** | 9 | Intentionally out of scope | Unchanged | ~7 also not supported |
 
-All 12 actionable gaps (P1 + P2) identified in the original audit have been resolved across five implementation phases. In addition, the [correctness audit](correctness-audit.md) identified and resolved 31 further issues (10 critical, 10 important core, 11 important PartiQL) plus 10 minor issues, bringing overall DynamoDB compatibility to a significantly higher level.
+All 12 actionable gaps (P1 + P2) identified in the original audit have been resolved across five implementation phases. In addition, the [correctness audit](internal/correctness-audit.md) identified and resolved 31 further issues (10 critical, 10 important core, 11 important PartiQL) plus 10 minor issues, bringing overall DynamoDB compatibility to a significantly higher level.
 
 ### Known Remaining Limitations
 

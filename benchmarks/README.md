@@ -280,7 +280,7 @@ We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers
 ### What Dynoxide Does Better
 - **Startup time**: No JVM, no Docker — microsecond-level embedded initialisation
 - **CI pipeline speed**: Zero-cost per-test isolation in embedded mode
-- **Resource usage**: 5MB binary vs 225MB Docker image; 5MB idle RSS vs 152MB
+- **Resource usage**: < 3MB binary vs 225MB Docker image; 5MB idle RSS vs 152MB
 - **Embedded mode**: Eliminates HTTP overhead entirely for Rust and iOS consumers
 - **Predictable latency**: No JVM GC pauses, no JIT warmup effects
 

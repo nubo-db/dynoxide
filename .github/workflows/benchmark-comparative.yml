@@ -1,8 +1,9 @@
 name: Comparative Benchmark
 
 on:
-  push:
-    branches: [main]
+  # Uncomment to run on every push to main:
+  # push:
+  #   branches: [main]
   workflow_dispatch:
 
 # Prevent concurrent benchmark runs from corrupting the benchmark-data branch

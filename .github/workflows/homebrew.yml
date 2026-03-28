@@ -1,20 +1,28 @@
 name: Update Homebrew Formula
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 jobs:
   update-formula:
     name: Update Homebrew tap
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
 
     steps:
+      - name: Get release tag
+        id: tag
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          echo "tag=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
       - name: Update formula
         uses: dawidd6/action-homebrew-bump-formula@v4
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           tap: nubo-db/homebrew-tap
           formula: dynoxide
-          tag: ${{ github.event.release.tag_name }}
-          revision: ${{ github.event.release.target_commitish }}
+          tag: ${{ steps.tag.outputs.tag }}

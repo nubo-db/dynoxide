@@ -1,9 +1,7 @@
 name: Update Homebrew Formula
+# Fallback workflow. Primary release path is release-pipeline.yml.
 
 on:
-  workflow_run:
-    workflows: ["Release"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -14,28 +12,78 @@ on:
 jobs:
   update-formula:
     name: Update Homebrew tap
-    if: >-
-      (github.event_name == 'workflow_dispatch') ||
-      (github.event.workflow_run.conclusion == 'success')
+    if: github.repository == 'nubo-db/dynoxide'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get release tag
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
         id: tag
         env:
           INPUT_TAG: ${{ inputs.tag }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
-          fi
+          TAG="$INPUT_TAG"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Update formula
-        uses: dawidd6/action-homebrew-bump-formula@v4
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          tap: nubo-db/homebrew-tap
-          formula: dynoxide
-          tag: ${{ steps.tag.outputs.tag }}
+      - name: Download checksums
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release download "$TAG" \
+            --repo nubo-db/dynoxide \
+            --pattern 'sha256sums.txt' \
+            --output sha256sums.txt
+
+      - name: Build formula from template
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          # Extract checksums for each target
+          SHA_DARWIN_ARM64=$(grep 'aarch64-apple-darwin' sha256sums.txt | awk '{print $1}')
+          SHA_DARWIN_X64=$(grep 'x86_64-apple-darwin' sha256sums.txt | awk '{print $1}')
+          SHA_LINUX_ARM64=$(grep 'aarch64-unknown-linux-musl' sha256sums.txt | awk '{print $1}')
+          SHA_LINUX_X64=$(grep 'x86_64-unknown-linux-musl' sha256sums.txt | awk '{print $1}')
+
+          # Verify all checksums were found
+          for var in SHA_DARWIN_ARM64 SHA_DARWIN_X64 SHA_LINUX_ARM64 SHA_LINUX_X64; do
+            if [[ -z "${!var}" ]]; then
+              echo "::error::Missing checksum for $var"
+              exit 1
+            fi
+          done
+
+          # Read template, stamp version and checksums
+          sed -e "s/version \".*\"/version \"$VERSION\"/" \
+              dist/dynoxide.rb \
+            | awk -v da="$SHA_DARWIN_ARM64" \
+                  -v dx="$SHA_DARWIN_X64" \
+                  -v la="$SHA_LINUX_ARM64" \
+                  -v lx="$SHA_LINUX_X64" '
+            /aarch64-apple-darwin/ { getline; sub(/"PLACEHOLDER"/, "\"" da "\"") }
+            /x86_64-apple-darwin/  { getline; sub(/"PLACEHOLDER"/, "\"" dx "\"") }
+            /aarch64-unknown-linux-musl/ { getline; sub(/"PLACEHOLDER"/, "\"" la "\"") }
+            /x86_64-unknown-linux-musl/  { getline; sub(/"PLACEHOLDER"/, "\"" lx "\"") }
+            { print }
+          ' > formula.rb
+
+          echo "Generated formula:"
+          cat formula.rb
+
+      - name: Push formula to tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          # Get current file SHA for the update
+          CURRENT_SHA=$(gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb --jq '.sha')
+
+          gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb \
+            -X PUT \
+            --field message="dynoxide $VERSION" \
+            --field content="$(base64 -w0 formula.rb)" \
+            --field sha="$CURRENT_SHA" \
+            --jq '.commit.html_url'

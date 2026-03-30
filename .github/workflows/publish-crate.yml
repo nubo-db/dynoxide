@@ -1,9 +1,13 @@
 name: Publish to crates.io
+# Fallback workflow. Primary release path is release-pipeline.yml.
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.9.6)"
+        required: true
+        type: string
 
 concurrency:
   group: publish-crate
@@ -17,6 +21,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 

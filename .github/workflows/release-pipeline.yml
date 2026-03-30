@@ -1,0 +1,770 @@
+name: Release Pipeline
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Version tag (e.g. v0.9.6)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate the version tag and dispatch payload
+  # ---------------------------------------------------------------------------
+  validate:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Validate inputs
+    runs-on: ubuntu-latest
+
+    outputs:
+      version_tag: ${{ steps.resolve.outputs.version_tag }}
+
+    steps:
+      - name: Resolve version tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            TAG="${{ github.event.client_payload.version_tag }}"
+          else
+            TAG="${{ inputs.version_tag }}"
+          fi
+          echo "version_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate dispatch payload version
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          SCHEMA_VERSION="${{ github.event.client_payload.version }}"
+          if [ "$SCHEMA_VERSION" != "1" ]; then
+            echo "::error::Dispatch payload schema version mismatch: expected 1, got $SCHEMA_VERSION"
+            exit 1
+          fi
+
+      - name: Validate version tag format
+        env:
+          TAG: ${{ steps.resolve.outputs.version_tag }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::version_tag is required but was empty"
+            exit 1
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
+            exit 1
+          fi
+          echo "Version tag validated: $TAG"
+
+      - name: Check release branch exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.version_tag }}
+        run: |
+          BRANCH="release/${TAG}"
+          if ! gh api "repos/${{ github.repository }}/branches/${BRANCH}" --silent 2>/dev/null; then
+            echo "::error::Release branch ${BRANCH} does not exist"
+            exit 1
+          fi
+          echo "Release branch ${BRANCH} exists"
+
+  # ---------------------------------------------------------------------------
+  # Run comparative benchmarks and commit README updates to the release branch
+  # ---------------------------------------------------------------------------
+  benchmark:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Benchmark
+    needs: validate
+    runs-on: ubuntu-latest
+    continue-on-error: false
+
+    outputs:
+      release_sha: ${{ steps.final-sha.outputs.sha }}
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+        options: >-
+          --health-cmd "(echo > /dev/tcp/localhost/8000) 2>/dev/null || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - name: Mint App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: release/${{ env.VERSION_TAG }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            benchmarks
+
+      - name: Create results directory
+        run: mkdir -p benchmarks/results
+
+      - name: Pull LocalStack image
+        run: docker pull localstack/localstack:latest
+
+      - name: Build Dynoxide server and benchmarks
+        run: |
+          cargo build --release --bin dynoxide
+          cd benchmarks
+          cargo build --release --bin workload_driver --bin ci_pipeline_bench --bin startup_bench --bin memory_profiler
+
+      - name: Collect system info
+        run: bash benchmarks/scripts/collect_system_info.sh > benchmarks/results/system_info.json
+
+      - name: Wait for DynamoDB Local
+        run: |
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST http://localhost:8000 \
+              -H 'Content-Type: application/x-amz-json-1.0' \
+              -H 'X-Amz-Target: DynamoDB_20120810.ListTables' \
+              -d '{}' 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" -gt 0 ] 2>/dev/null && [ "$HTTP_CODE" -lt 500 ] 2>/dev/null; then
+              echo "DynamoDB Local is ready (HTTP $HTTP_CODE)"
+              break
+            fi
+            echo "Waiting for DynamoDB Local... ($i)"
+            sleep 1
+          done
+
+      - name: Start Dynoxide HTTP server
+        run: |
+          ./target/release/dynoxide --port 8123 &
+          DYNOXIDE_PID=$!
+          echo "DYNOXIDE_PID=$DYNOXIDE_PID" >> $GITHUB_ENV
+          for i in $(seq 1 10); do
+            if curl -sf -X POST http://localhost:8123 \
+              -H 'X-Amz-Target: DynamoDB_20120810.ListTables' \
+              -H 'Content-Type: application/x-amz-json-1.0' \
+              -d '{}' > /dev/null 2>&1; then
+              echo "Dynoxide HTTP is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run workload -- Dynoxide HTTP
+        run: |
+          cd benchmarks
+          cargo run --release --bin workload_driver -- \
+            --endpoint-url http://localhost:8123 \
+            --output results/dynoxide_http.json
+
+      - name: Run workload -- DynamoDB Local
+        run: |
+          cd benchmarks
+          cargo run --release --bin workload_driver -- \
+            --endpoint-url http://localhost:8000 \
+            --output results/dynamodb_local.json
+
+      - name: Run CI pipeline benchmark
+        run: |
+          cd benchmarks
+          cargo run --release --bin ci_pipeline_bench -- \
+            --ddb-endpoint http://localhost:8000 \
+            --output results/ci_pipeline.json
+
+      - name: Run startup benchmark
+        run: |
+          cd benchmarks
+          cargo run --release --bin startup_bench -- \
+            --reps 5 \
+            --output results/startup.json
+
+      - name: Run memory profiler
+        run: |
+          cd benchmarks
+          cargo run --release --bin memory_profiler > results/memory_profile.csv
+
+      - name: Extract CI ratios from pipeline results
+        run: |
+          cd benchmarks
+          python3 -c "
+          import json
+          with open('results/ci_pipeline.json') as f:
+              data = json.load(f)
+          ratios = {}
+          for row in data.get('summary', []):
+              speedup = row.get('speedup_vs_ddb_local')
+              if speedup is not None:
+                  key = row['mode'] + '_' + row['execution']
+                  ratios[key] = round(speedup, 1)
+          with open('results/ci_ratios.json', 'w') as f:
+              json.dump(ratios, f, indent=2)
+          "
+
+      - name: Run criterion baseline
+        run: |
+          cd benchmarks
+          cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
+          python3 -c "
+          import json, sys, re
+          results = {}
+          for line in open('criterion_output.txt'):
+              m = re.match(r'^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter', line)
+              if m:
+                  results[m.group(1)] = int(m.group(2).replace(',', ''))
+          with open('results/criterion_baseline.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          "
+
+      - name: Consolidate results
+        run: python3 benchmarks/scripts/append_history.py --results-dir benchmarks/results --output benchmarks/results/run_summary.json
+
+      - name: Store results in benchmark-data branch
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%d)
+          RUN_DIR="runs/${DATE}-${SHA}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch benchmark-data branch if it exists, otherwise create orphan
+          git fetch origin benchmark-data:benchmark-data 2>/dev/null || true
+          if git rev-parse --verify benchmark-data >/dev/null 2>&1; then
+            git worktree add /tmp/bench-data benchmark-data
+          else
+            git worktree add --detach /tmp/bench-data
+            cd /tmp/bench-data
+            git checkout --orphan benchmark-data
+            git rm -rf . 2>/dev/null || true
+            echo "# Benchmark History" > README.md
+            echo "" >> README.md
+            echo "This branch stores historical benchmark results." >> README.md
+            echo "Each run is stored in \`runs/YYYY-MM-DD-<commit_sha>/\`." >> README.md
+            git add README.md
+            git commit -m "Initialise benchmark-data branch"
+            cd -
+          fi
+
+          mkdir -p "/tmp/bench-data/${RUN_DIR}"
+          cp benchmarks/results/*.json benchmarks/results/*.csv "/tmp/bench-data/${RUN_DIR}/" 2>/dev/null || true
+
+          cd /tmp/bench-data
+          git add .
+          git commit -m "Benchmark results for ${SHA} (${DATE})" || echo "No changes to commit"
+          git push origin benchmark-data
+          cd -
+
+          git worktree remove /tmp/bench-data --force 2>/dev/null || true
+
+      - name: Update README benchmarks
+        id: update-readmes
+        run: |
+          python3 benchmarks/scripts/update_readme_benchmarks.py \
+            --data-dir benchmarks/results/ \
+            --readme README.md \
+            --benchmarks-readme benchmarks/README.md
+
+      - name: Commit README updates to release branch
+        if: steps.update-readmes.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Check if README files actually changed
+          if git diff --quiet README.md benchmarks/README.md; then
+            echo "No benchmark changes to commit"
+            exit 0
+          fi
+
+          BRANCH="release/${VERSION_TAG}"
+          BRANCH_SHA=$(gh api "repos/${{ github.repository }}/git/refs/heads/${BRANCH}" --jq '.object.sha')
+
+          # Get the current tree for the branch HEAD
+          BASE_TREE=$(gh api "repos/${{ github.repository }}/git/commits/${BRANCH_SHA}" --jq '.tree.sha')
+
+          # Create blobs for the updated files
+          README_BLOB=$(gh api "repos/${{ github.repository }}/git/blobs" \
+            -f content="$(base64 -w0 README.md)" \
+            -f encoding=base64 \
+            --jq '.sha')
+
+          BENCH_README_BLOB=$(gh api "repos/${{ github.repository }}/git/blobs" \
+            -f content="$(base64 -w0 benchmarks/README.md)" \
+            -f encoding=base64 \
+            --jq '.sha')
+
+          # Create a new tree with the updated files
+          NEW_TREE=$(gh api "repos/${{ github.repository }}/git/trees" \
+            --input - <<TREEOF | jq -r '.sha'
+          {
+            "base_tree": "${BASE_TREE}",
+            "tree": [
+              {
+                "path": "README.md",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "${README_BLOB}"
+              },
+              {
+                "path": "benchmarks/README.md",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "${BENCH_README_BLOB}"
+              }
+            ]
+          }
+          TREEOF
+          )
+
+          # Create the commit
+          NEW_SHA=$(gh api "repos/${{ github.repository }}/git/commits" \
+            --input - <<COMMITOF | jq -r '.sha'
+          {
+            "message": "docs: update benchmark numbers",
+            "tree": "${NEW_TREE}",
+            "parents": ["${BRANCH_SHA}"]
+          }
+          COMMITOF
+          )
+
+          # Update the branch ref to point to the new commit
+          gh api "repos/${{ github.repository }}/git/refs/heads/${BRANCH}" \
+            -X PATCH \
+            -f sha="${NEW_SHA}" \
+            -f force=false
+
+          echo "Committed README update: ${NEW_SHA}"
+
+      - name: Determine final release branch SHA
+        id: final-sha
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BRANCH="release/${VERSION_TAG}"
+          SHA=$(gh api "repos/${{ github.repository }}/git/refs/heads/${BRANCH}" --jq '.object.sha')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Final release branch SHA: $SHA"
+
+      - name: Upload results artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmarks/results/
+            benchmarks/target/criterion/
+          retention-days: 90
+
+      - name: Cleanup
+        if: always()
+        run: kill $DYNOXIDE_PID 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Build release binaries for all targets
+  # ---------------------------------------------------------------------------
+  build:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Build (${{ matrix.target }})
+    needs: [validate, benchmark]
+    runs-on: ${{ matrix.os }}
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - name: Checkout release branch at benchmark SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.benchmark.outputs.release_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install zig (aarch64-musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild (aarch64-musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }} --features full
+
+      - name: Build (zigbuild)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --release --target ${{ matrix.target }} --features full
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../dynoxide-${{ matrix.target }}.tar.gz dynoxide
+          cd ../../..
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/dynoxide.exe" -DestinationPath "dynoxide-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynoxide-${{ matrix.target }}
+          path: dynoxide-${{ matrix.target }}.${{ matrix.archive }}
+
+  # ---------------------------------------------------------------------------
+  # Create Git tag and GitHub Release with all artefacts
+  # ---------------------------------------------------------------------------
+  tag-and-release:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Tag and Release
+    needs: [validate, benchmark, build]
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+      RELEASE_SHA: ${{ needs.benchmark.outputs.release_sha }}
+
+    steps:
+      - name: Mint App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
+          sha256sum *.tar.gz *.zip > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${VERSION_TAG#v}"
+          BODY=$(scripts/extract-changelog.sh "$VERSION" CHANGELOG.md)
+          # Write to a file for use in release creation
+          printf '%s\n' "$BODY" > /tmp/release_body.md
+
+      - name: Strip attribution from changelog
+        run: scripts/strip-attribution.sh /tmp/release_body.md
+
+      - name: Check if tag already exists
+        id: check-tag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/git/refs/tags/${VERSION_TAG}" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${VERSION_TAG} already exists -- skipping creation"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag via GitHub API
+        if: steps.check-tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/tags/${VERSION_TAG}" \
+            -f sha="${RELEASE_SHA}"
+          echo "Created tag ${VERSION_TAG} at ${RELEASE_SHA}"
+
+      - name: Check if release already exists
+        id: check-release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if gh release view "$VERSION_TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION_TAG} already exists -- will update"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.check-release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh release create "$VERSION_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$VERSION_TAG" \
+            --notes-file /tmp/release_body.md \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/sha256sums.txt
+
+      - name: Update existing GitHub Release
+        if: steps.check-release.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh release edit "$VERSION_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$VERSION_TAG" \
+            --notes-file /tmp/release_body.md
+
+          # Upload/overwrite artefacts
+          gh release upload "$VERSION_TAG" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/sha256sums.txt
+
+  # ---------------------------------------------------------------------------
+  # Merge release branch to main and clean up
+  # ---------------------------------------------------------------------------
+  merge-to-main:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Merge to main
+    needs: [validate, tag-and-release]
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+
+    steps:
+      - name: Mint App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Check if release branch still exists
+        id: check-branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BRANCH="release/${VERSION_TAG}"
+          if gh api "repos/${{ github.repository }}/branches/${BRANCH}" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release branch ${BRANCH} no longer exists -- skipping merge and cleanup"
+          fi
+
+      - name: Merge release branch to main
+        if: steps.check-branch.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BRANCH="release/${VERSION_TAG}"
+          gh api "repos/${{ github.repository }}/merges" \
+            -f base=main \
+            -f head="${BRANCH}" \
+            -f commit_message="merge: release ${VERSION_TAG}"
+
+      - name: Delete release branch
+        if: steps.check-branch.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BRANCH="release/${VERSION_TAG}"
+          gh api "repos/${{ github.repository }}/git/refs/heads/${BRANCH}" -X DELETE
+          echo "Deleted branch ${BRANCH}"
+
+  # ---------------------------------------------------------------------------
+  # Publish crate to crates.io
+  # ---------------------------------------------------------------------------
+  publish-crate:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Publish to crates.io
+    needs: [validate, tag-and-release]
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION_TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dry run
+        run: cargo publish --dry-run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Update Homebrew formula in the tap repository
+  # ---------------------------------------------------------------------------
+  publish-homebrew:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Update Homebrew tap
+    needs: [validate, tag-and-release]
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION_TAG }}
+
+      - name: Download checksums from release
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          gh release download "$VERSION_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'sha256sums.txt' \
+            --output sha256sums.txt
+
+      - name: Build formula from template
+        run: |
+          VERSION="${VERSION_TAG#v}"
+
+          SHA_DARWIN_ARM64=$(grep 'aarch64-apple-darwin' sha256sums.txt | awk '{print $1}')
+          SHA_DARWIN_X64=$(grep 'x86_64-apple-darwin' sha256sums.txt | awk '{print $1}')
+          SHA_LINUX_ARM64=$(grep 'aarch64-unknown-linux-musl' sha256sums.txt | awk '{print $1}')
+          SHA_LINUX_X64=$(grep 'x86_64-unknown-linux-musl' sha256sums.txt | awk '{print $1}')
+
+          for var in SHA_DARWIN_ARM64 SHA_DARWIN_X64 SHA_LINUX_ARM64 SHA_LINUX_X64; do
+            if [[ -z "${!var}" ]]; then
+              echo "::error::Missing checksum for $var"
+              exit 1
+            fi
+          done
+
+          sed -e "s/version \".*\"/version \"$VERSION\"/" \
+              dist/dynoxide.rb \
+            | awk -v da="$SHA_DARWIN_ARM64" \
+                  -v dx="$SHA_DARWIN_X64" \
+                  -v la="$SHA_LINUX_ARM64" \
+                  -v lx="$SHA_LINUX_X64" '
+            /aarch64-apple-darwin/ { getline; sub(/"PLACEHOLDER"/, "\"" da "\"") }
+            /x86_64-apple-darwin/  { getline; sub(/"PLACEHOLDER"/, "\"" dx "\"") }
+            /aarch64-unknown-linux-musl/ { getline; sub(/"PLACEHOLDER"/, "\"" la "\"") }
+            /x86_64-unknown-linux-musl/  { getline; sub(/"PLACEHOLDER"/, "\"" lx "\"") }
+            { print }
+          ' > formula.rb
+
+          echo "Generated formula:"
+          cat formula.rb
+
+      - name: Push formula to tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${VERSION_TAG#v}"
+
+          CURRENT_SHA=$(gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb --jq '.sha')
+
+          gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb \
+            -X PUT \
+            --field message="dynoxide $VERSION" \
+            --field content="$(base64 -w0 formula.rb)" \
+            --field sha="$CURRENT_SHA" \
+            --jq '.commit.html_url'
+
+  # ---------------------------------------------------------------------------
+  # Publish npm packages
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    if: github.repository == 'nubo-db/dynoxide'
+    name: Publish to npm
+    needs: [validate, tag-and-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VERSION_TAG }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="${VERSION_TAG#v}"
+          npm/scripts/publish.sh \
+            --version "$VERSION" \
+            --release-url "https://github.com/nubo-db/dynoxide/releases/download/${VERSION_TAG}"

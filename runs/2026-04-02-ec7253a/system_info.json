@@ -1,0 +1,16 @@
+{
+  "os": "Linux",
+  "kernel": "6.17.0-1008-azure",
+  "arch": "x86_64",
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
+  "cpu_cores": "4",
+  "total_ram_gb": "15.6",
+  "rust_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "dynoxide_version": "0.9.6",
+  "dynoxide_commit": "ec7253a",
+  "dynamodb_local_image_id": "sha256:16ad5",
+  "dynoxide_binary_bytes": 6567384,
+  "dynamodb_local_image_bytes": 493511688,
+  "localstack_image_bytes": 1263951535,
+  "timestamp": "2026-04-02T13:12:04.419719+00:00"
+}

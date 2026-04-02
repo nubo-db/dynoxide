@@ -28,7 +28,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+
+      - name: Configure npm auth
+        run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
 
       - name: Install jq
         run: sudo apt-get install -y jq
@@ -60,7 +62,6 @@ jobs:
         env:
           PUBLISH_VERSION: ${{ steps.version.outputs.version }}
           PUBLISH_TAG: ${{ steps.version.outputs.tag }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm/scripts/publish.sh \
             --version "$PUBLISH_VERSION" \

@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "dynoxide-rs"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "axum",
  "base64",

@@ -4,9 +4,9 @@ A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for 
 
 ## Why Dynoxide?
 
-I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs Docker and a JVM. That's <!-- prose:ddb_local_cold_start -->~3 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~185 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
+I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs Docker and a JVM. That's <!-- prose:ddb_local_cold_start -->3-4 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~163 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
 
-Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~4.8 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~6.3 MB<!-- /bench --> download. Point any DynamoDB SDK at it and your tests just work.
+Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~4.9 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~5MB<!-- /bench --> download. Point any DynamoDB SDK at it and your tests just work.
 
 For Rust projects, there's also an **embedded mode** - direct API calls via `Database::memory()` with no HTTP layer at all. Each test gets an isolated in-memory database with zero startup cost. And because it compiles to a native library with no runtime dependencies, it runs on platforms where DynamoDB Local can't, including iOS.
 
@@ -24,16 +24,16 @@ For Rust projects, there's also an **embedded mode** - direct API calls via `Dat
 
 #### CI (GitHub Actions)
 
-Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:ci_commit_link_root -->[`ec7253a`](../../commit/ec7253ad1cd86ebfff4bdc7a1a353ae947a597ee)<!-- /bench -->.
+Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:ci_commit_link_root -->[`006fa80`](../../commit/006fa8060c37561d79f8d455e8a752a93188ac9a)<!-- /bench -->.
 
 | Metric | Dynoxide (embedded) | Dynoxide (HTTP) | DynamoDB Local | LocalStack (all services) |
 |---|---|---|---|---|
-| Cold startup | <!-- bench:ci_startup_embedded -->**<1ms**<!-- /bench --> | <!-- bench:ci_startup_http -->**~3ms**<!-- /bench --> | <!-- bench:ci_startup_ddb_local -->~2,757ms<!-- /bench --> | <!-- bench:ci_startup_localstack -->~8,635ms<!-- /bench --> |
-| GetItem (p50) | <!-- bench:ci_getitem_embedded -->15µs<!-- /bench --> | <!-- bench:ci_getitem_http -->0.3ms<!-- /bench --> | <!-- bench:ci_getitem_ddb_local -->0.9ms<!-- /bench --> | — |
-| 50-test CI suite | <!-- bench:ci_suite_embedded_seq -->791ms<!-- /bench --> | <!-- bench:ci_suite_http_seq -->769ms<!-- /bench --> | <!-- bench:ci_suite_ddb_local_seq -->2,652ms<!-- /bench --> | — |
-| Full workload (10K items) | — | <!-- bench:ci_workload_http -->**3.0s**<!-- /bench --> | <!-- bench:ci_workload_ddb_local -->11.7s<!-- /bench --> | — |
-| Binary / Docker image | <!-- bench:ci_binary_size -->6 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->6 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->225 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->1.2 GB<!-- /bench --> |
-| Idle memory (RSS) | <!-- bench:ci_memory_embedded_idle -->~4.8 MB<!-- /bench --> | <!-- bench:ci_memory_http_idle -->~8 MB<!-- /bench --> | <!-- bench:ci_memory_ddb_local_idle -->~185 MB<!-- /bench --> | <!-- bench:ci_memory_localstack_idle -->~366 MB<!-- /bench --> |
+| Cold startup | <!-- bench:ci_startup_embedded -->**<1ms**<!-- /bench --> | <!-- bench:ci_startup_http -->**~3ms**<!-- /bench --> | <!-- bench:ci_startup_ddb_local -->~3,715ms<!-- /bench --> | <!-- bench:ci_startup_localstack -->~5,243ms<!-- /bench --> |
+| GetItem (p50) | <!-- bench:ci_getitem_embedded -->16µs<!-- /bench --> | <!-- bench:ci_getitem_http -->0.4ms<!-- /bench --> | <!-- bench:ci_getitem_ddb_local -->0.9ms<!-- /bench --> | — |
+| 50-test CI suite | <!-- bench:ci_suite_embedded_seq -->775ms<!-- /bench --> | <!-- bench:ci_suite_http_seq -->784ms<!-- /bench --> | <!-- bench:ci_suite_ddb_local_seq -->3,156ms<!-- /bench --> | — |
+| Full workload (10K items) | — | <!-- bench:ci_workload_http -->**3.2s**<!-- /bench --> | <!-- bench:ci_workload_ddb_local -->15.4s<!-- /bench --> | — |
+| Binary / Docker image | <!-- bench:ci_binary_size -->~5 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->~5 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->225 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->1.1 GB<!-- /bench --> |
+| Idle memory (RSS) | <!-- bench:ci_memory_embedded_idle -->~4.9 MB<!-- /bench --> | <!-- bench:ci_memory_http_idle -->~8 MB<!-- /bench --> | <!-- bench:ci_memory_ddb_local_idle -->~163 MB<!-- /bench --> | <!-- bench:ci_memory_localstack_idle -->~259 MB<!-- /bench --> |
 
 > The gap is wider on Apple Silicon because the faster CPU amplifies the difference between native code and JVM overhead. Both are real measurements of the same benchmark suite. [Full methodology and per-operation breakdowns →](benchmarks/README.md)
 

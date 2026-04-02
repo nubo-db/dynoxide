@@ -782,8 +782,6 @@ jobs:
         run: sudo apt-get install -y jq
 
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION="${VERSION_TAG#v}"
           npm/scripts/publish.sh \

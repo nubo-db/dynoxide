@@ -144,7 +144,7 @@ for i in $(seq 0 $((PLATFORM_COUNT - 1))); do
 
   # Publish (only 409/EPUBLISHCONFLICT is safe to skip)
   echo "  Publishing $NPM_PKG@$VERSION..."
-  PUBLISH_OUTPUT=$(cd "$PKG_DIR" && npm publish --access public $DRY_RUN 2>&1) || {
+  PUBLISH_OUTPUT=$(cd "$PKG_DIR" && npm publish --access public --provenance $DRY_RUN 2>&1) || {
     if echo "$PUBLISH_OUTPUT" | grep -q 'EPUBLISHCONFLICT\|previously published\|cannot publish over'; then
       echo "  Already published, skipping."
     else
@@ -171,7 +171,7 @@ jq --arg v "$VERSION" '
 mv "$WRAPPER_DIR/package.json.tmp" "$WRAPPER_DIR/package.json"
 
 echo "  Publishing dynoxide@$VERSION..."
-PUBLISH_OUTPUT=$(cd "$WRAPPER_DIR" && npm publish --access public $DRY_RUN 2>&1) || {
+PUBLISH_OUTPUT=$(cd "$WRAPPER_DIR" && npm publish --access public --provenance $DRY_RUN 2>&1) || {
   if echo "$PUBLISH_OUTPUT" | grep -q 'EPUBLISHCONFLICT\|previously published\|cannot publish over'; then
     echo "  Already published, skipping."
   else

@@ -1,14 +1,14 @@
 {
-  "put_item/put_item/small": 22197,
-  "put_item/put_item/medium": 40290,
-  "put_item/put_item/large": 291249,
-  "get_item": 15019,
-  "query_base_table": 1102922,
-  "query_gsi": 25777,
-  "scan_with_filter": 8574444,
-  "update_item": 175772,
-  "delete_item": 48112,
-  "batch_write_item_25": 1028423,
-  "batch_get_item_100": 1446022,
-  "transact_write_items_4": 240751
+  "put_item/put_item/small": 22151,
+  "put_item/put_item/medium": 40740,
+  "put_item/put_item/large": 306484,
+  "get_item": 15025,
+  "query_base_table": 1144629,
+  "query_gsi": 26531,
+  "scan_with_filter": 8922440,
+  "update_item": 201632,
+  "delete_item": 54714,
+  "batch_write_item_25": 1038885,
+  "batch_get_item_100": 1475023,
+  "transact_write_items_4": 249414
 }

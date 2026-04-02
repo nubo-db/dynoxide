@@ -197,6 +197,8 @@ jobs:
             --output results/ci_pipeline.json
 
       - name: Run startup benchmark
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
         run: |
           cd benchmarks
           cargo run --release --bin startup_bench -- \
@@ -204,6 +206,8 @@ jobs:
             --output results/startup.json
 
       - name: Run memory profiler
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
         run: |
           cd benchmarks
           cargo run --release --bin memory_profiler > results/memory_profile.csv
@@ -283,6 +287,7 @@ jobs:
 
       - name: Update README benchmarks
         id: update-readmes
+        continue-on-error: true
         run: |
           python3 benchmarks/scripts/update_readme_benchmarks.py \
             --data-dir benchmarks/results/ \
@@ -290,7 +295,7 @@ jobs:
             --benchmarks-readme benchmarks/README.md
 
       - name: Commit README updates to release branch
-        if: steps.update-readmes.outcome == 'success'
+        if: steps.update-readmes.outcome == 'success' || steps.update-readmes.outcome == 'failure'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |

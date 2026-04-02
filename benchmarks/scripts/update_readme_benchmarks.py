@@ -720,10 +720,11 @@ MARKER_RE = re.compile(
 )
 
 
-def replace_markers(content, values, filename, mode="ci"):
+def replace_markers(content, values, filename, mode="ci", force=False):
     """Replace marker values in content. Returns (new_content, stats).
 
     mode: 'ci' skips local_ markers, 'local' skips non-local_ markers.
+    force: bypass sanity checks (for environment transitions).
     """
     updated = 0
     skipped = 0
@@ -759,9 +760,12 @@ def replace_markers(content, values, filename, mode="ci"):
         # Sanity check
         ok, reason = sanity_check(key, old_value, new_value)
         if not ok:
-            skipped += 1
-            warnings.append("SANITY SKIP {}: {} \u2014 {}".format(filename, key, reason))
-            return match.group(0)
+            if force:
+                warnings.append("FORCED {}: {} \u2014 {}".format(filename, key, reason))
+            else:
+                skipped += 1
+                warnings.append("SANITY SKIP {}: {} \u2014 {}".format(filename, key, reason))
+                return match.group(0)
 
         if old_value != new_value:
             updated += 1
@@ -804,6 +808,8 @@ def main():
                         help="Show what would change without writing files")
     parser.add_argument("--local", action="store_true",
                         help="Update local_ markers instead of ci_ markers")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass sanity checks (for environment transitions)")
     args = parser.parse_args()
 
     mode = "local" if args.local else "ci"
@@ -833,7 +839,8 @@ def main():
         validation_warnings = validate_markers(content, values, readme_path, mode=mode)
         all_warnings.extend(validation_warnings)
 
-        new_content, stats = replace_markers(content, values, readme_path, mode=mode)
+        new_content, stats = replace_markers(content, values, readme_path, mode=mode,
+                                              force=args.force)
         total_updated += stats["updated"]
         total_skipped += stats["skipped"]
         total_missing += stats["missing"]

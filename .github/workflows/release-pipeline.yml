@@ -780,11 +780,5 @@ jobs:
         run: |
           gh api "repos/${{ github.repository }}/actions/workflows/npm.yml/dispatches" \
             -f ref=main \
-            --input - <<PAYLOAD
-          {
-            "inputs": {
-              "tag": "${VERSION_TAG}"
-            }
-          }
-          PAYLOAD
+            -f "inputs[tag]=${VERSION_TAG}"
           echo "Triggered npm.yml with tag ${VERSION_TAG}"

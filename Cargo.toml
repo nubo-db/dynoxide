@@ -1,6 +1,6 @@
 [package]
 name = "dynoxide-rs"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2024"
 description = "A lightweight, embeddable DynamoDB emulator backed by SQLite"
 license = "MIT OR Apache-2.0"

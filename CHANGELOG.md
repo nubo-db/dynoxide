@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-04-02
+
+### Fixed
+
+- Benchmark sanity checks were blocking README updates during release - 10 stale values from the v0.9.6 pipeline now corrected
+- Binary download size in README was wrong (~5 MB, actually ~3 MB compressed / ~6 MB on disk)
+- Docker image sizes now show both download and on-disk measurements - the old "225 MB" was the compressed download, the actual on-disk size is 471 MB
+- MCP tool count in README was 33, should be 34 - `execute_transaction_partiql` was missing from the list
+- npm README had incorrect `--input` and `--db-path` flags for the import command (should be `--source`, `--schema`, `--output`)
+- Dropped the `serve` subcommand from npm examples (bare `dynoxide --port 8000` is the preferred form)
+
+### Changed
+
+- Restructured release pipeline for token efficiency and reliability - dispatch verification, idempotent crate/npm publishing, template-based Homebrew formula updates
+- npm publishing uses OIDC provenance via a dedicated `npm.yml` workflow
+- Cross-compilation switched to cargo-zigbuild for aarch64-musl targets
+- Commit Cargo.lock for reproducible CI builds (was previously gitignored)
+- Updated npm package README to reflect current CLI usage and features
+
+### Security
+
+- Updated `aws-lc-sys` 0.37.1 to 0.39.1 (10 high-severity advisories - PKCS7 verification bypass, timing side-channel in AES-CCM, CRL/name constraint issues)
+- Updated `rustls-webpki` 0.103.9 to 0.103.10 (2 medium-severity CRL Distribution Point matching issues)
+
 ## [0.9.6] - 2026-03-27
 
 ### Fixed

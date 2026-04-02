@@ -448,11 +448,11 @@ def build_value_mapping(run_summary, memory_rows):
     if ddb_idle:
         values["ddb_local_idle_memory"] = fmt_memory_mb(int(ddb_idle["rss_bytes"]))
     if ddb_image_bytes:
-        values["ddb_local_image_size"] = fmt_memory_mb(ddb_image_bytes)
+        values["ddb_local_image_size_disk"] = fmt_memory_mb(ddb_image_bytes)
     if mem_idle:
         values["dynoxide_idle_memory"] = fmt_memory_mb(int(mem_idle["rss_bytes"]))
-    if binary_bytes:
-        values["dynoxide_binary_size"] = fmt_memory_mb(binary_bytes)
+    # dynoxide_binary_size is manually maintained (download/compressed size)
+    # ci_binary_size handles the on-disk measurement in the CI table
 
     return values
 

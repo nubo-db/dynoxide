@@ -56,11 +56,15 @@ pub async fn serve_http_with_shutdown(
     let ct = shutdown.unwrap_or_default();
     let db = Arc::new(db);
 
-    let mut http_config = StreamableHttpServerConfig::default();
-    http_config.stateful_mode = false;
-    http_config.json_response = true;
-    http_config.sse_keep_alive = None;
-    http_config.cancellation_token = ct.clone();
+    #[allow(clippy::field_reassign_with_default)]
+    let http_config = {
+        let mut c = StreamableHttpServerConfig::default();
+        c.stateful_mode = false;
+        c.json_response = true;
+        c.sse_keep_alive = None;
+        c.cancellation_token = ct.clone();
+        c
+    };
 
     let service: StreamableHttpService<McpServer, LocalSessionManager> = StreamableHttpService::new(
         {

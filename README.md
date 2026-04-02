@@ -4,9 +4,9 @@ A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for 
 
 ## Why Dynoxide?
 
-I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs Docker and a JVM. That's <!-- prose:ddb_local_cold_start -->3-4 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~163 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
+I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs Docker and a JVM. That's <!-- prose:ddb_local_cold_start -->3-4 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~163 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~471 MB<!-- /bench --> on disk) before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
 
-Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~4.9 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~5MB<!-- /bench --> download. Point any DynamoDB SDK at it and your tests just work.
+Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~4.9 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~3 MB<!-- /bench --> download. Point any DynamoDB SDK at it and your tests just work.
 
 For Rust projects, there's also an **embedded mode** - direct API calls via `Database::memory()` with no HTTP layer at all. Each test gets an isolated in-memory database with zero startup cost. And because it compiles to a native library with no runtime dependencies, it runs on platforms where DynamoDB Local can't, including iOS.
 
@@ -32,7 +32,8 @@ Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:
 | GetItem (p50) | <!-- bench:ci_getitem_embedded -->16µs<!-- /bench --> | <!-- bench:ci_getitem_http -->0.4ms<!-- /bench --> | <!-- bench:ci_getitem_ddb_local -->0.9ms<!-- /bench --> | — |
 | 50-test CI suite | <!-- bench:ci_suite_embedded_seq -->775ms<!-- /bench --> | <!-- bench:ci_suite_http_seq -->784ms<!-- /bench --> | <!-- bench:ci_suite_ddb_local_seq -->3,156ms<!-- /bench --> | — |
 | Full workload (10K items) | — | <!-- bench:ci_workload_http -->**3.2s**<!-- /bench --> | <!-- bench:ci_workload_ddb_local -->15.4s<!-- /bench --> | — |
-| Binary / Docker image | <!-- bench:ci_binary_size -->~5 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->~5 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->225 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->1.1 GB<!-- /bench --> |
+| Binary / image (download) | <!-- prose:ci_binary_download -->~3 MB<!-- /bench --> | <!-- prose:ci_binary_download_http -->~3 MB<!-- /bench --> | <!-- prose:ci_image_ddb_local_download -->225 MB<!-- /bench --> | <!-- prose:ci_image_localstack_download -->1.1 GB<!-- /bench --> |
+| Binary / image (on disk) | <!-- bench:ci_binary_size -->6 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->6 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->471 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->1.2 GB<!-- /bench --> |
 | Idle memory (RSS) | <!-- bench:ci_memory_embedded_idle -->~4.9 MB<!-- /bench --> | <!-- bench:ci_memory_http_idle -->~8 MB<!-- /bench --> | <!-- bench:ci_memory_ddb_local_idle -->~163 MB<!-- /bench --> | <!-- bench:ci_memory_localstack_idle -->~259 MB<!-- /bench --> |
 
 > The gap is wider on Apple Silicon because the faster CPU amplifies the difference between native code and JVM overhead. Both are real measurements of the same benchmark suite. [Full methodology and per-operation breakdowns →](benchmarks/README.md)
@@ -74,7 +75,7 @@ npm install --save-dev dynoxide
 Or run directly without installing:
 
 ```sh
-npx dynoxide serve --port 8000
+npx dynoxide --port 8000
 ```
 
 ### Homebrew (macOS)
@@ -228,7 +229,7 @@ With a OneTable data model for single-table designs:
 }
 ```
 
-### Available tools (33)
+### Available tools (34)
 
 | Category | Tools |
 |----------|-------|
@@ -237,7 +238,7 @@ With a OneTable data model for single-table designs:
 | Batch | `batch_get_item`, `batch_write_item`, `bulk_put_items` |
 | Query | `query`, `scan` |
 | Transactions | `transact_get_items`, `transact_write_items` |
-| PartiQL | `execute_partiql`, `batch_execute_partiql` |
+| PartiQL | `execute_partiql`, `batch_execute_partiql`, `execute_transaction_partiql` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, `sweep_ttl` |
 | Tags | `tag_resource`, `untag_resource`, `list_tags_of_resource` |
 | Streams | `list_streams`, `describe_stream`, `get_shard_iterator`, `get_records` |
@@ -539,7 +540,7 @@ dynoxide-rs = { version = "0.9", default-features = false, features = ["encrypti
 | Query & Scan | Query, Scan |
 | Batch | BatchGetItem, BatchWriteItem |
 | Transactions | TransactWriteItems, TransactGetItems |
-| PartiQL | ExecuteStatement, BatchExecuteStatement |
+| PartiQL | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction |
 | Streams | DescribeStream, GetShardIterator, GetRecords, ListStreams |
 | TTL | UpdateTimeToLive, DescribeTimeToLive |
 | Tags | TagResource, UntagResource, ListTagsOfResource |

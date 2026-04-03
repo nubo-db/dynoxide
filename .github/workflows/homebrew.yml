@@ -38,17 +38,15 @@ jobs:
             --pattern 'sha256sums.txt' \
             --output sha256sums.txt
 
-      - name: Build formula from template
+      - name: Build formula
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          # Extract checksums for each target
           SHA_DARWIN_ARM64=$(grep 'aarch64-apple-darwin' sha256sums.txt | awk '{print $1}')
           SHA_DARWIN_X64=$(grep 'x86_64-apple-darwin' sha256sums.txt | awk '{print $1}')
           SHA_LINUX_ARM64=$(grep 'aarch64-unknown-linux-musl' sha256sums.txt | awk '{print $1}')
           SHA_LINUX_X64=$(grep 'x86_64-unknown-linux-musl' sha256sums.txt | awk '{print $1}')
 
-          # Verify all checksums were found
           for var in SHA_DARWIN_ARM64 SHA_DARWIN_X64 SHA_LINUX_ARM64 SHA_LINUX_X64; do
             if [[ -z "${!var}" ]]; then
               echo "::error::Missing checksum for $var"
@@ -56,19 +54,42 @@ jobs:
             fi
           done
 
-          # Read template, stamp version and checksums
-          sed -e "s/version \".*\"/version \"$VERSION\"/" \
-              dist/dynoxide.rb \
-            | awk -v da="$SHA_DARWIN_ARM64" \
-                  -v dx="$SHA_DARWIN_X64" \
-                  -v la="$SHA_LINUX_ARM64" \
-                  -v lx="$SHA_LINUX_X64" '
-            /aarch64-apple-darwin/ { getline; sub(/"PLACEHOLDER"/, "\"" da "\"") }
-            /x86_64-apple-darwin/  { getline; sub(/"PLACEHOLDER"/, "\"" dx "\"") }
-            /aarch64-unknown-linux-musl/ { getline; sub(/"PLACEHOLDER"/, "\"" la "\"") }
-            /x86_64-unknown-linux-musl/  { getline; sub(/"PLACEHOLDER"/, "\"" lx "\"") }
-            { print }
-          ' > formula.rb
+          BASE="https://github.com/nubo-db/dynoxide/releases/download/v${VERSION}"
+
+          cat > formula.rb <<FORMULA
+class Dynoxide < Formula
+  desc "Fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite"
+  homepage "https://dynoxide.dev"
+  version "${VERSION}"
+  license any_of: ["MIT", "Apache-2.0"]
+  on_macos do
+    on_arm do
+      url "${BASE}/dynoxide-aarch64-apple-darwin.tar.gz"
+      sha256 "${SHA_DARWIN_ARM64}"
+    end
+    on_intel do
+      url "${BASE}/dynoxide-x86_64-apple-darwin.tar.gz"
+      sha256 "${SHA_DARWIN_X64}"
+    end
+  end
+  on_linux do
+    on_arm do
+      url "${BASE}/dynoxide-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "${SHA_LINUX_ARM64}"
+    end
+    on_intel do
+      url "${BASE}/dynoxide-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "${SHA_LINUX_X64}"
+    end
+  end
+  def install
+    bin.install "dynoxide"
+  end
+  test do
+    assert_match version.to_s, shell_output("#{bin}/dynoxide --version")
+  end
+end
+FORMULA
 
           echo "Generated formula:"
           cat formula.rb
@@ -78,7 +99,6 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          # Get current file SHA for the update
           CURRENT_SHA=$(gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb --jq '.sha')
 
           gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb \

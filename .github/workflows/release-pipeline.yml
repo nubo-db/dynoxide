@@ -516,9 +516,6 @@ jobs:
           # Write to a file for use in release creation
           printf '%s\n' "$BODY" > /tmp/release_body.md
 
-      - name: Strip attribution from changelog
-        run: scripts/strip-attribution.sh /tmp/release_body.md
-
       - name: Check if tag already exists
         id: check-tag
         env:

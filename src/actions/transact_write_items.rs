@@ -364,17 +364,10 @@ fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
     let (pk, sk) = helpers::extract_key_strings(&update.key, &key_schema)?;
 
     let existing_json = storage.get_item(&update.table_name, &pk, &sk)?;
-    let mut item: Item = existing_json
+    let existing_item: Item = existing_json
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
-
-    // If new item (upsert), populate key attrs
-    if existing_json.is_none() {
-        for (k, v) in &update.key {
-            item.insert(k.clone(), v.clone());
-        }
-    }
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &update.expression_attribute_names,
@@ -391,17 +384,28 @@ fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
         tracker.track_update_expr(&parsed);
     }
 
-    // Evaluate condition if present
+    // Evaluate condition against the original existing item BEFORE populating
+    // key attributes for upsert. Otherwise attribute_exists(PK) would always
+    // pass because the key was pre-populated.
     if let Some(ref cond_expr) = update.condition_expression {
         let return_item = if update.return_values_on_condition_check_failure.as_deref()
             == Some("ALL_OLD")
             && existing_json.is_some()
         {
-            Some(item.clone())
+            Some(existing_item.clone())
         } else {
             None
         };
-        check_condition_tracked(cond_expr, &item, &tracker, return_item)?;
+        check_condition_tracked(cond_expr, &existing_item, &tracker, return_item)?;
+    }
+
+    // Build the mutable item for the update expression.
+    // If new item (upsert), populate key attrs.
+    let mut item = existing_item;
+    if existing_json.is_none() {
+        for (k, v) in &update.key {
+            item.insert(k.clone(), v.clone());
+        }
     }
 
     // Apply update expression

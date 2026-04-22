@@ -1002,14 +1002,35 @@ impl Storage {
         if let (Some(start_pk), Some(start_sk)) =
             (params.exclusive_start_pk, params.exclusive_start_sk)
         {
-            where_clauses.push(format!(
-                "(gsi_pk, gsi_sk) > (?{}, ?{})",
-                param_idx,
-                param_idx + 1
-            ));
-            params_vec.push(Box::new(start_pk.to_string()));
-            params_vec.push(Box::new(start_sk.to_string()));
-            param_idx += 2;
+            // The GSI table's primary key is (gsi_pk, gsi_sk, table_pk, table_sk).
+            // Using only (gsi_pk, gsi_sk) for the cursor skips rows that share the
+            // same GSI key but have different base table keys.
+            if let (Some(base_pk), Some(base_sk)) = (
+                params.exclusive_start_base_pk,
+                params.exclusive_start_base_sk,
+            ) {
+                where_clauses.push(format!(
+                    "(gsi_pk, gsi_sk, table_pk, table_sk) > (?{}, ?{}, ?{}, ?{})",
+                    param_idx,
+                    param_idx + 1,
+                    param_idx + 2,
+                    param_idx + 3
+                ));
+                params_vec.push(Box::new(start_pk.to_string()));
+                params_vec.push(Box::new(start_sk.to_string()));
+                params_vec.push(Box::new(base_pk.to_string()));
+                params_vec.push(Box::new(base_sk.to_string()));
+                param_idx += 4;
+            } else {
+                where_clauses.push(format!(
+                    "(gsi_pk, gsi_sk) > (?{}, ?{})",
+                    param_idx,
+                    param_idx + 1
+                ));
+                params_vec.push(Box::new(start_pk.to_string()));
+                params_vec.push(Box::new(start_sk.to_string()));
+                param_idx += 2;
+            }
         }
 
         // For GSI parallel scan, hash on the base table pk (table_pk column)
@@ -1028,7 +1049,7 @@ impl Storage {
             sql.push_str(&where_clauses.join(" AND "));
         }
 
-        sql.push_str(" ORDER BY gsi_pk ASC, gsi_sk ASC");
+        sql.push_str(" ORDER BY gsi_pk ASC, gsi_sk ASC, table_pk ASC, table_sk ASC");
 
         if let Some(lim) = params.limit {
             sql.push_str(&format!(" LIMIT {lim}"));

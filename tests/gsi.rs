@@ -667,3 +667,153 @@ fn test_gsi_sort_order() {
         .collect();
     assert_eq!(timestamps, vec!["2024-03-01", "2024-02-01", "2024-01-01"]);
 }
+
+// ---------------------------------------------------------------------------
+// Bug: GSI scan pagination breaks after the first page
+// ---------------------------------------------------------------------------
+
+/// Paginated scan on a GSI should return all items across multiple pages.
+///
+/// Root cause: `scan_gsi_items` used `(gsi_pk, gsi_sk) > (?, ?)` for the
+/// cursor, but the GSI table's primary key is `(gsi_pk, gsi_sk, table_pk,
+/// table_sk)`. When multiple items share the same GSI key, the 2-column
+/// cursor skips all remaining rows with that key on the second page.
+#[test]
+fn test_gsi_scan_pagination_returns_all_items() {
+    let db = Database::memory().unwrap();
+
+    // Table: pk=ID(S), GSI1: pk=Type(S) sk=ID(S), projection=ALL
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "Items",
+        "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "ID", "AttributeType": "S"},
+            {"AttributeName": "Type", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "TypeIndex",
+            "KeySchema": [
+                {"AttributeName": "Type", "KeyType": "HASH"},
+                {"AttributeName": "ID", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    });
+    db.create_table(serde_json::from_value(req).unwrap()).unwrap();
+
+    // Insert 50 items all with the same GSI PK ("widget")
+    for i in 0..50 {
+        let req: serde_json::Value = serde_json::json!({
+            "TableName": "Items",
+            "Item": {
+                "ID": {"S": format!("item-{:03}", i)},
+                "Type": {"S": "widget"},
+                "Data": {"S": format!("payload-{}", i)}
+            }
+        });
+        db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+    }
+
+    // Paginated scan on GSI with limit=10, should get all 50 items across 5 pages
+    let mut all_items = Vec::new();
+    let mut exclusive_start_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+    let mut pages = 0;
+
+    loop {
+        let mut req: serde_json::Value = serde_json::json!({
+            "TableName": "Items",
+            "IndexName": "TypeIndex",
+            "Limit": 10
+        });
+        if let Some(ref esk) = exclusive_start_key {
+            req["ExclusiveStartKey"] = serde_json::to_value(esk).unwrap();
+        }
+
+        let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+        pages += 1;
+
+        if let Some(items) = &resp.items {
+            all_items.extend(items.clone());
+        }
+
+        match resp.last_evaluated_key {
+            Some(lek) => exclusive_start_key = Some(lek),
+            None => break,
+        }
+
+        assert!(pages <= 10, "too many pages — pagination may be looping");
+    }
+
+    assert_eq!(all_items.len(), 50, "expected all 50 items across paginated GSI scan, got {}", all_items.len());
+}
+
+/// Paginated scan on a GSI with a filter expression should still paginate correctly.
+#[test]
+fn test_gsi_scan_pagination_with_filter() {
+    let db = Database::memory().unwrap();
+
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "Filtered",
+        "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "ID", "AttributeType": "S"},
+            {"AttributeName": "Type", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "TypeIndex",
+            "KeySchema": [
+                {"AttributeName": "Type", "KeyType": "HASH"},
+                {"AttributeName": "ID", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    });
+    db.create_table(serde_json::from_value(req).unwrap()).unwrap();
+
+    // Insert 100 items, every 5th one is "special"
+    for i in 0..100 {
+        let req: serde_json::Value = serde_json::json!({
+            "TableName": "Filtered",
+            "Item": {
+                "ID": {"S": format!("item-{:03}", i)},
+                "Type": {"S": "widget"},
+                "Special": {"BOOL": i % 5 == 0}
+            }
+        });
+        db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+    }
+
+    // Paginated scan on GSI with filter, limit=10 per page
+    let mut all_items = Vec::new();
+    let mut exclusive_start_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+    let mut pages = 0;
+
+    loop {
+        let mut req: serde_json::Value = serde_json::json!({
+            "TableName": "Filtered",
+            "IndexName": "TypeIndex",
+            "Limit": 10,
+            "FilterExpression": "Special = :t",
+            "ExpressionAttributeValues": {":t": {"BOOL": true}}
+        });
+        if let Some(ref esk) = exclusive_start_key {
+            req["ExclusiveStartKey"] = serde_json::to_value(esk).unwrap();
+        }
+
+        let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+        pages += 1;
+
+        if let Some(items) = &resp.items {
+            all_items.extend(items.clone());
+        }
+
+        match resp.last_evaluated_key {
+            Some(lek) => exclusive_start_key = Some(lek),
+            None => break,
+        }
+
+        assert!(pages <= 20, "too many pages — pagination may be looping");
+    }
+
+    assert_eq!(all_items.len(), 20, "expected 20 special items out of 100, got {}", all_items.len());
+}

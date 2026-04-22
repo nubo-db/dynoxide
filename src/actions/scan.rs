@@ -414,9 +414,12 @@ pub fn execute(storage: &Storage, mut request: ScanRequest) -> Result<ScanRespon
         (None, None)
     };
 
-    // For LSI scans, extract the base table key from ExclusiveStartKey
-    // for composite cursor pagination.
-    let (start_base_pk, start_base_sk) = if is_lsi {
+    // For index scans (LSI and GSI), extract the base table key from
+    // ExclusiveStartKey for composite cursor pagination. The GSI/LSI
+    // tables have a composite primary key that includes the base table
+    // keys, so the cursor must include them to avoid skipping rows that
+    // share the same index key.
+    let (start_base_pk, start_base_sk) = if is_lsi || request.index_name.is_some() {
         if let Some(ref esk) = exclusive_start_key {
             let base_pk = esk
                 .get(&table_key_schema.partition_key)

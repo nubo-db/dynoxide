@@ -699,7 +699,8 @@ fn test_gsi_scan_pagination_returns_all_items() {
             "Projection": {"ProjectionType": "ALL"}
         }]
     });
-    db.create_table(serde_json::from_value(req).unwrap()).unwrap();
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
 
     // Insert 50 items all with the same GSI PK ("widget")
     for i in 0..50 {
@@ -744,7 +745,12 @@ fn test_gsi_scan_pagination_returns_all_items() {
         assert!(pages <= 10, "too many pages — pagination may be looping");
     }
 
-    assert_eq!(all_items.len(), 50, "expected all 50 items across paginated GSI scan, got {}", all_items.len());
+    assert_eq!(
+        all_items.len(),
+        50,
+        "expected all 50 items across paginated GSI scan, got {}",
+        all_items.len()
+    );
 }
 
 /// Paginated scan on a GSI with a filter expression should still paginate correctly.
@@ -768,7 +774,8 @@ fn test_gsi_scan_pagination_with_filter() {
             "Projection": {"ProjectionType": "ALL"}
         }]
     });
-    db.create_table(serde_json::from_value(req).unwrap()).unwrap();
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
 
     // Insert 100 items, every 5th one is "special"
     for i in 0..100 {
@@ -815,5 +822,10 @@ fn test_gsi_scan_pagination_with_filter() {
         assert!(pages <= 20, "too many pages — pagination may be looping");
     }
 
-    assert_eq!(all_items.len(), 20, "expected 20 special items out of 100, got {}", all_items.len());
+    assert_eq!(
+        all_items.len(),
+        20,
+        "expected 20 special items out of 100, got {}",
+        all_items.len()
+    );
 }

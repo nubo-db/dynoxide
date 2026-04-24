@@ -43,23 +43,35 @@ jobs:
         id: npm-check
         continue-on-error: true
         working-directory: npm/dynoxide
-        run: npm publish --dry-run --provenance
+        # The package.json carries a placeholder prerelease version
+        # (0.0.0-development) that publish.sh rewrites at real publish time.
+        # npm requires --tag for prerelease dry-runs; the value is inert since
+        # nothing is published.
+        run: npm publish --dry-run --provenance --tag preflight
 
       # --- Homebrew tap --------------------------------------------------
-      - name: Probe Homebrew tap write access
+      - name: Probe Homebrew tap access
         id: homebrew-check
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        # Probe the exact endpoint the formula push uses so a fine-grained PAT
+        # scoped to the Formula path still passes this check. A bare
+        # "gh api repos/..." call rejects fine-grained tokens that have file-
+        # scoped access without metadata read.
         run: |
           set -euo pipefail
-          PUSH=$(gh api repos/nubo-db/homebrew-tap --jq '.permissions.push // false')
-          echo "push_permission=$PUSH"
-          if [ "$PUSH" != "true" ]; then
-            echo "::error::HOMEBREW_TAP_TOKEN lacks push permission on nubo-db/homebrew-tap"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set on this repo"
             exit 1
           fi
-          echo "Homebrew tap write access confirmed"
+          HTTP_STATUS=$(gh api -i repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb 2>&1 | head -1 || true)
+          echo "response: $HTTP_STATUS"
+          if ! gh api repos/nubo-db/homebrew-tap/contents/Formula/dynoxide.rb --jq '.sha' >/dev/null 2>&1; then
+            echo "::error::HOMEBREW_TAP_TOKEN cannot access Formula/dynoxide.rb in nubo-db/homebrew-tap (auth rejected, expired, or not set)"
+            exit 1
+          fi
+          echo "Homebrew tap access confirmed"
 
       # --- Summary and final gate ---------------------------------------
       - name: Preflight summary

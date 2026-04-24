@@ -1322,7 +1322,14 @@ mod tests {
     fn test_missing_attribute_comparisons() {
         let item: HashMap<String, AttributeValue> = HashMap::new();
         let av = vals(&[(":val", AttributeValue::S("x".into()))]);
-        for (op, expected) in [("=", false), ("<>", true), ("<", false), ("<=", false), (">", false), (">=", false)] {
+        for (op, expected) in [
+            ("=", false),
+            ("<>", true),
+            ("<", false),
+            ("<=", false),
+            (">", false),
+            (">=", false),
+        ] {
             let expr = parse(&format!("nonexistent {} :val", op)).unwrap();
             assert_eq!(
                 evaluate_without_tracking(&expr, &item, &None, &av).unwrap(),

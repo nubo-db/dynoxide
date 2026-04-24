@@ -742,7 +742,8 @@ fn test_ne_on_missing_attribute_returns_true() {
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
         "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
     });
-    db.create_table(serde_json::from_value(req).unwrap()).unwrap();
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
 
     // PutItem with condition: status <> "working" on a non-existent item.
     let req: serde_json::Value = serde_json::json!({
@@ -779,5 +780,8 @@ fn test_ne_on_missing_attribute_returns_true() {
         "Key": {"pk": {"S": "item2"}}
     });
     let resp = db.get_item(serde_json::from_value(req).unwrap()).unwrap();
-    assert!(resp.item.is_some(), "item2 should have been created via OR short-circuit");
+    assert!(
+        resp.item.is_some(),
+        "item2 should have been created via OR short-circuit"
+    );
 }

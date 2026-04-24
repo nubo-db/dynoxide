@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] - 2026-04-24
+
+### Fixed
+
+- `KeyConditionExpression` now accepts parenthesised sub-expressions, matching DynamoDB. Forms like `(#pk = :pk) AND (#sk = :sk)` previously returned `ValidationException: Expected attribute name, got (`. Both outer-wrap and per-condition parens are now handled ([#4](https://github.com/nubo-db/dynoxide/issues/4), [#7](https://github.com/nubo-db/dynoxide/pull/7))
+- `UpdateItem` and `TransactWriteItems.Update` now evaluate `ConditionExpression` against the existing item before populating key attributes for upsert. Previously `attribute_exists(pk)` on a non-existent key succeeded and created a ghost item ([#5](https://github.com/nubo-db/dynoxide/pull/5))
+- Paginated `Scan` on a GSI now returns all items when multiple items share the same GSI partition key. Previously the second page returned 0 items because the pagination cursor used only `(gsi_pk, gsi_sk)` instead of the full 4-tuple primary key ([#6](https://github.com/nubo-db/dynoxide/pull/6))
+- `<>` on missing attributes now returns true, matching DynamoDB. All other comparison operators continue to return false on missing operands. Previously `<>` also returned false, breaking `PutItem` conditional idioms like `status <> "working"` against fresh keys ([#8](https://github.com/nubo-db/dynoxide/pull/8))
+
 ## [0.9.8] - 2026-04-06
 
 ### Fixed

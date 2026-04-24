@@ -928,7 +928,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynoxide-rs"
-version = "0.9.8"
+version = "0.9.9"
 dependencies = [
  "aws-config",
  "aws-credential-types",

@@ -9,6 +9,9 @@ permissions:
 jobs:
   criterion-benchmarks:
     runs-on: ubuntu-latest
+    # Skip for PRs from forks so external contributors can't auto-trigger
+    # benchmarks. First-party branches only.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -134,6 +137,9 @@ jobs:
 
   iai-benchmarks:
     runs-on: ubuntu-latest
+    # Skip for PRs from forks so external contributors can't auto-trigger
+    # benchmarks. First-party branches only.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

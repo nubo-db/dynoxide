@@ -400,30 +400,25 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
     let transactional_work = || -> Result<UpdateWorkResult> {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk)?;
-        let mut item: HashMap<String, AttributeValue> = existing_json
+        let existing_item: HashMap<String, AttributeValue> = existing_json
             .as_ref()
             .and_then(|j| serde_json::from_str(j).ok())
             .unwrap_or_default();
 
-        // If item doesn't exist, populate key attributes for upsert
-        if existing_json.is_none() {
-            for (k, v) in &request.key {
-                item.insert(k.clone(), v.clone());
-            }
-        }
-
-        // Evaluate ConditionExpression against the existing item
+        // Evaluate ConditionExpression against the original existing item BEFORE
+        // populating key attributes for upsert. Otherwise attribute_exists(PK)
+        // would always pass because the key was pre-populated.
         if let Some(ref cond_expr) = request.condition_expression {
             let parsed = crate::expressions::condition::parse(cond_expr)
                 .map_err(DynoxideError::ValidationException)?;
-            let result = crate::expressions::condition::evaluate(&parsed, &item, &tracker)
+            let result = crate::expressions::condition::evaluate(&parsed, &existing_item, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
             if !result {
                 let return_item = if request.return_values_on_condition_check_failure.as_deref()
                     == Some("ALL_OLD")
                     && existing_json.is_some()
                 {
-                    Some(item.clone())
+                    Some(existing_item.clone())
                 } else {
                     None
                 };
@@ -431,6 +426,15 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
                     "The conditional request failed".to_string(),
                     return_item,
                 ));
+            }
+        }
+
+        // Build mutable item for the update expression.
+        // If item doesn't exist, populate key attributes for upsert.
+        let mut item = existing_item;
+        if existing_json.is_none() {
+            for (k, v) in &request.key {
+                item.insert(k.clone(), v.clone());
             }
         }
 

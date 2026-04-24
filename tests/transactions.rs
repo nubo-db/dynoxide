@@ -684,3 +684,101 @@ fn test_transact_get_empty_items_rejected() {
         "Expected empty array error, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bug: TransactWriteItems Update ignores ConditionExpression on non-existent items
+// ---------------------------------------------------------------------------
+
+fn create_pk_sk_table(db: &Database, name: &str) {
+    let req: serde_json::Value = json!({
+        "TableName": name,
+        "KeySchema": [
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"}
+        ]
+    });
+    let create_req = serde_json::from_value(req).unwrap();
+    db.create_table(create_req).unwrap();
+}
+
+/// TransactWriteItems Update with `attribute_exists(PK)` should fail when the
+/// item does not exist.
+///
+/// Root cause: `execute_update` populated key attributes on the item BEFORE
+/// evaluating the condition expression, so `attribute_exists(PK)` always
+/// returned true.
+#[test]
+fn test_transact_update_condition_rejects_nonexistent_item() {
+    let db = Database::memory().unwrap();
+    create_pk_sk_table(&db, "cond-test");
+
+    let req: serde_json::Value = json!({
+        "TransactItems": [{
+            "Update": {
+                "TableName": "cond-test",
+                "Key": {"PK": {"S": "does-not-exist"}, "SK": {"S": "nope"}},
+                "UpdateExpression": "ADD TagCount :inc",
+                "ExpressionAttributeValues": {":inc": {"N": "1"}},
+                "ConditionExpression": "attribute_exists(PK)"
+            }
+        }]
+    });
+    let transact_req = serde_json::from_value(req).unwrap();
+    let err = db.transact_write_items(transact_req).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ConditionalCheckFailed"),
+        "Expected ConditionalCheckFailed for non-existent item, got: {msg}"
+    );
+
+    // Verify no ghost item was created.
+    let get_req: serde_json::Value = json!({
+        "TableName": "cond-test",
+        "Key": {"PK": {"S": "does-not-exist"}, "SK": {"S": "nope"}}
+    });
+    let get_req = serde_json::from_value(get_req).unwrap();
+    let resp = db.get_item(get_req).unwrap();
+    assert!(
+        resp.item.is_none(),
+        "item should not exist after failed condition"
+    );
+}
+
+/// Standalone UpdateItem with `attribute_exists(PK)` should also fail when
+/// the item does not exist (same bug, different code path).
+#[test]
+fn test_update_item_condition_rejects_nonexistent_item() {
+    let db = Database::memory().unwrap();
+    create_pk_sk_table(&db, "cond-test-single");
+
+    let req: serde_json::Value = json!({
+        "TableName": "cond-test-single",
+        "Key": {"PK": {"S": "ghost"}, "SK": {"S": "nope"}},
+        "UpdateExpression": "ADD TagCount :inc",
+        "ExpressionAttributeValues": {":inc": {"N": "1"}},
+        "ConditionExpression": "attribute_exists(PK)"
+    });
+    let update_req = serde_json::from_value(req).unwrap();
+    let err = db.update_item(update_req).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("conditional request failed"),
+        "Expected conditional check failure for non-existent item, got: {msg}"
+    );
+
+    // Verify no ghost item was created.
+    let get_req: serde_json::Value = json!({
+        "TableName": "cond-test-single",
+        "Key": {"PK": {"S": "ghost"}, "SK": {"S": "nope"}}
+    });
+    let get_req = serde_json::from_value(get_req).unwrap();
+    let resp = db.get_item(get_req).unwrap();
+    assert!(
+        resp.item.is_none(),
+        "item should not exist after failed condition"
+    );
+}

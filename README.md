@@ -44,9 +44,11 @@ Verified against real DynamoDB by the [dynamodb-conformance](https://github.com/
 
 | Target | Tests | Pass Rate |
 |---|---|---|
-| DynamoDB | 526 | 100% |
-| **Dynoxide** | **526** | **100%** |
-| DynamoDB Local | 526 | 92.0% |
+| DynamoDB | 572 | 100% |
+| **Dynoxide** | **572** | **100%** |
+| LocalStack | 572 | 93.5% |
+| DynamoDB Local | 572 | 92.7% |
+| dynalite | 572 | 80.8% |
 
 See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#results).
 
@@ -54,7 +56,7 @@ See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#resul
 
 | | Dynoxide | DynamoDB Local | LocalStack (all services) | dynalite |
 |---|---|---|---|---|
-| Conformance (526 tests) | **100%** | 92% | 93% | 81% |
+| Conformance (572 tests) | **100%** | 92.7% | 93.5% | 80.8% |
 | Language | Rust | Java | Python + Java | Node.js |
 | Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
 | Docker required | — | ✓ | ✓ | — |
@@ -519,7 +521,9 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 | `mcp-server` | Yes | Adds MCP server for coding agents (stdio and Streamable HTTP transports). |
 | `import` | Yes | Adds `dynoxide import` CLI for importing DynamoDB Export data with anonymisation. |
 | `encryption` | No | Bundles SQLCipher + vendored OpenSSL. Adds `Database::new_encrypted()` for encryption at rest. |
+| `encryption-cc` | No | Like `encryption` but uses Apple CommonCrypto instead of bundled OpenSSL. For macOS and iOS builds. |
 | `encrypted-server` | No | Convenience: enables `encryption` + `http-server`. |
+| `encrypted-server-cc` | No | Convenience: enables `encryption-cc` + `http-server`. |
 | `encrypted-full` | No | Convenience: enables `encryption` + `http-server` + `mcp-server` + `import`. |
 | `full` | — | Alias for default features (backward compatibility). |
 

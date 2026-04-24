@@ -1,0 +1,314 @@
+name: Benchmark Refresh
+
+# Runs the full comparative benchmark suite and opens a PR that updates
+# README.md and benchmarks/README.md with fresh numbers. Historical runs are
+# appended to the benchmark-data branch. Release numbers come from this
+# workflow, not from the release pipeline -- run this, merge the PR, then tag.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-refresh
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  refresh:
+    name: Refresh README benchmark numbers
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      dynamodb-local:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+        options: >-
+          --health-cmd "(echo > /dev/tcp/localhost/8000) 2>/dev/null || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            benchmarks
+
+      - name: Create results directory
+        run: mkdir -p benchmarks/results
+
+      - name: Pull LocalStack image
+        run: docker pull localstack/localstack:latest
+
+      - name: Build Dynoxide server and benchmarks
+        run: |
+          cargo build --release --bin dynoxide
+          cd benchmarks
+          cargo build --release --bin workload_driver --bin ci_pipeline_bench --bin startup_bench --bin memory_profiler
+
+      - name: Collect system info
+        run: bash benchmarks/scripts/collect_system_info.sh > benchmarks/results/system_info.json
+
+      - name: Wait for DynamoDB Local
+        run: |
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST http://localhost:8000 \
+              -H 'Content-Type: application/x-amz-json-1.0' \
+              -H 'X-Amz-Target: DynamoDB_20120810.ListTables' \
+              -d '{}' 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" -gt 0 ] 2>/dev/null && [ "$HTTP_CODE" -lt 500 ] 2>/dev/null; then
+              echo "DynamoDB Local is ready (HTTP $HTTP_CODE)"
+              break
+            fi
+            echo "Waiting for DynamoDB Local... ($i)"
+            sleep 1
+          done
+
+      - name: Start Dynoxide HTTP server
+        run: |
+          ./target/release/dynoxide --port 8123 &
+          DYNOXIDE_PID=$!
+          echo "DYNOXIDE_PID=$DYNOXIDE_PID" >> "$GITHUB_ENV"
+          for i in $(seq 1 10); do
+            if curl -sf -X POST http://localhost:8123 \
+              -H 'X-Amz-Target: DynamoDB_20120810.ListTables' \
+              -H 'Content-Type: application/x-amz-json-1.0' \
+              -d '{}' > /dev/null 2>&1; then
+              echo "Dynoxide HTTP is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run workload -- Dynoxide HTTP
+        run: |
+          cd benchmarks
+          cargo run --release --bin workload_driver -- \
+            --endpoint-url http://localhost:8123 \
+            --output results/dynoxide_http.json
+
+      - name: Run workload -- DynamoDB Local
+        run: |
+          cd benchmarks
+          cargo run --release --bin workload_driver -- \
+            --endpoint-url http://localhost:8000 \
+            --output results/dynamodb_local.json
+
+      - name: Run CI pipeline benchmark
+        run: |
+          cd benchmarks
+          cargo run --release --bin ci_pipeline_bench -- \
+            --ddb-endpoint http://localhost:8000 \
+            --output results/ci_pipeline.json
+
+      - name: Run startup benchmark
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          cd benchmarks
+          cargo run --release --bin startup_bench -- \
+            --reps 5 \
+            --output results/startup.json
+
+      - name: Run memory profiler
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          cd benchmarks
+          cargo run --release --bin memory_profiler > results/memory_profile.csv
+
+      - name: Extract CI ratios from pipeline results
+        run: |
+          cd benchmarks
+          python3 -c "
+          import json
+          with open('results/ci_pipeline.json') as f:
+              data = json.load(f)
+          ratios = {}
+          for row in data.get('summary', []):
+              speedup = row.get('speedup_vs_ddb_local')
+              if speedup is not None:
+                  key = row['mode'] + '_' + row['execution']
+                  ratios[key] = round(speedup, 1)
+          with open('results/ci_ratios.json', 'w') as f:
+              json.dump(ratios, f, indent=2)
+          "
+
+      - name: Run criterion baseline
+        run: |
+          cd benchmarks
+          cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
+          python3 -c "
+          import json, re
+          results = {}
+          for line in open('criterion_output.txt'):
+              m = re.match(r'^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter', line)
+              if m:
+                  results[m.group(1)] = int(m.group(2).replace(',', ''))
+          with open('results/criterion_baseline.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          "
+
+      - name: Consolidate results
+        run: python3 benchmarks/scripts/append_history.py --results-dir benchmarks/results --output benchmarks/results/run_summary.json
+
+      - name: Build PR body from comparison
+        run: |
+          python3 <<'PY' > /tmp/pr_body.md
+          import json, os, subprocess, sys
+
+          with open('benchmarks/results/criterion_baseline.json') as f:
+              current = json.load(f)
+
+          baseline = {}
+          try:
+              subprocess.run(
+                  ['git', 'fetch', 'origin', 'benchmark-data:benchmark-data'],
+                  check=True, stderr=subprocess.DEVNULL,
+              )
+              ls = subprocess.run(
+                  ['git', 'ls-tree', '--name-only', 'benchmark-data', 'runs/'],
+                  capture_output=True, text=True, check=True,
+              )
+              dirs = sorted([d for d in ls.stdout.strip().split('\n') if d], reverse=True)
+              if dirs:
+                  show = subprocess.run(
+                      ['git', 'show', f'benchmark-data:{dirs[0]}/criterion_baseline.json'],
+                      capture_output=True, text=True,
+                  )
+                  if show.returncode == 0:
+                      baseline = json.loads(show.stdout)
+          except Exception as e:
+              print(f"baseline fetch failed: {e}", file=sys.stderr)
+
+          names = sorted(set(current) | set(baseline))
+          rows = []
+          regressions = []
+          threshold = 1.50  # matches benchmark-regression.yml
+          for name in names:
+              c = current.get(name)
+              b = baseline.get(name)
+              if c is not None and b is not None and b != 0:
+                  ratio = c / b
+                  pct = (ratio - 1) * 100
+                  change = f"{'+' if pct >= 0 else ''}{pct:.1f}%"
+                  if ratio > threshold:
+                      regressions.append(name)
+                      change += " :warning:"
+              elif c is not None:
+                  change = "new"
+              else:
+                  change = "removed"
+              rows.append((name, b, c, change))
+
+          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          repo = os.environ.get('GITHUB_REPOSITORY', 'nubo-db/dynoxide')
+          run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
+
+          print("## Benchmark refresh")
+          print()
+          print(f"Run: [{run_id}]({run_url})")
+          print()
+          print("### Criterion comparison vs previous run")
+          print()
+          print("| Benchmark | Baseline (ns/iter) | Current (ns/iter) | Change |")
+          print("|-----------|-------------------:|------------------:|--------|")
+          for name, b, c, change in rows:
+              bs = f"{b:,}" if b else "—"
+              cs = f"{c:,}" if c else "—"
+              print(f"| {name} | {bs} | {cs} | {change} |")
+          print()
+          if regressions:
+              print(f"> :warning: {len(regressions)} benchmark(s) exceeded the 50% threshold. Wall-clock runners are noisy; variance up to 3x between runs on shared hardware is common. iai-callgrind provides deterministic regression detection in PR checks.")
+          elif baseline:
+              print("> All benchmarks within 50% of prior baseline.")
+          else:
+              print("> No prior baseline; this run establishes one.")
+          print()
+          print("Before merging, eyeball the numbers and re-run this workflow if any look like noise rather than real change.")
+          PY
+
+      - name: Store results in benchmark-data branch
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%d)
+          RUN_DIR="runs/${DATE}-${SHA}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin benchmark-data:benchmark-data 2>/dev/null || true
+          if git rev-parse --verify benchmark-data >/dev/null 2>&1; then
+            git worktree add /tmp/bench-data benchmark-data
+          else
+            git worktree add --detach /tmp/bench-data
+            cd /tmp/bench-data
+            git checkout --orphan benchmark-data
+            git rm -rf . 2>/dev/null || true
+            echo "# Benchmark History" > README.md
+            echo "" >> README.md
+            echo "This branch stores historical benchmark results." >> README.md
+            echo "Each run is stored in \`runs/YYYY-MM-DD-<commit_sha>/\`." >> README.md
+            git add README.md
+            git commit -m "Initialise benchmark-data branch"
+            cd -
+          fi
+
+          mkdir -p "/tmp/bench-data/${RUN_DIR}"
+          cp benchmarks/results/*.json benchmarks/results/*.csv "/tmp/bench-data/${RUN_DIR}/" 2>/dev/null || true
+
+          cd /tmp/bench-data
+          git add .
+          git commit -m "Benchmark results for ${SHA} (${DATE})" || echo "No changes to commit"
+          git push origin benchmark-data
+          cd -
+
+          git worktree remove /tmp/bench-data --force 2>/dev/null || true
+
+      - name: Update README benchmarks
+        id: update-readmes
+        continue-on-error: true
+        run: |
+          python3 benchmarks/scripts/update_readme_benchmarks.py \
+            --data-dir benchmarks/results/ \
+            --readme README.md \
+            --benchmarks-readme benchmarks/README.md
+
+      - name: Open or update benchmark PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: auto/benchmark-refresh
+          delete-branch: false
+          commit-message: "docs: update benchmark numbers"
+          title: "docs: update benchmark numbers"
+          body-path: /tmp/pr_body.md
+          add-paths: |
+            README.md
+            benchmarks/README.md
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmarks/results/
+            benchmarks/target/criterion/
+          retention-days: 90
+
+      - name: Stop Dynoxide server
+        if: always()
+        run: kill "$DYNOXIDE_PID" 2>/dev/null || true

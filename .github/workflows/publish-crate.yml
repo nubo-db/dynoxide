@@ -1,5 +1,7 @@
 name: Publish to crates.io
-# Fallback workflow. Primary release path is release-pipeline.yml.
+# Manual recovery workflow. The primary release path is release.yml
+# (triggered by a v* tag push). Use this only to re-run a crate publish
+# in isolation when the main pipeline has partially failed.
 
 on:
   workflow_dispatch:
@@ -15,7 +17,6 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'nubo-db/dynoxide'
     name: Publish to crates.io
     runs-on: ubuntu-latest
 

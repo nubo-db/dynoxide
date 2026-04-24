@@ -1,9 +1,9 @@
 name: Publish to npm
+# Manual recovery workflow. The primary release path is release.yml
+# (triggered by a v* tag push). Use this only to re-run the npm publish
+# in isolation when the main pipeline has partially failed.
 
 on:
-  # Uncomment to auto-publish on release:
-  # release:
-  #   types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -18,7 +18,6 @@ permissions:
 jobs:
   publish:
     name: Publish npm packages
-    if: github.repository == 'nubo-db/dynoxide'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

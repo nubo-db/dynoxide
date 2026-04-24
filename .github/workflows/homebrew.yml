@@ -1,5 +1,7 @@
 name: Update Homebrew Formula
-# Fallback workflow. Primary release path is release-pipeline.yml.
+# Manual recovery workflow. The primary release path is release.yml
+# (triggered by a v* tag push). Use this only to re-run the Homebrew tap
+# update in isolation when the main pipeline has partially failed.
 
 on:
   workflow_dispatch:
@@ -12,7 +14,6 @@ on:
 jobs:
   update-formula:
     name: Update Homebrew tap
-    if: github.repository == 'nubo-db/dynoxide'
     runs-on: ubuntu-latest
 
     steps:

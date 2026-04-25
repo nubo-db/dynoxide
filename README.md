@@ -50,6 +50,8 @@ Verified against real DynamoDB by the [dynamodb-conformance](https://github.com/
 | DynamoDB Local | 572 | 92.7% |
 | dynalite | 572 | 80.8% |
 
+> Numbers reflect the conformance suite as of the v0.9.9 release. The suite has since tightened tier-3 error-message assertions; v0.9.9 currently scores 566/572 against latest main, tracked in [#11](https://github.com/nubo-db/dynoxide/issues/11), [#12](https://github.com/nubo-db/dynoxide/issues/12), [#13](https://github.com/nubo-db/dynoxide/issues/13). The table refreshes at the next release.
+
 See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#results).
 
 ### How It Compares

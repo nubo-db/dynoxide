@@ -155,8 +155,8 @@ fn query_rejects_invalid_select_value() {
         "Expected select enum validation error, got: {err}"
     );
     assert!(
-        err.contains("ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, COUNT, SPECIFIC_ATTRIBUTES"),
-        "Expected enum set in error, got: {err}"
+        err.contains("SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES"),
+        "Expected enum set in AWS API-model order, got: {err}"
     );
 }
 

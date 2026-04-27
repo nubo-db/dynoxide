@@ -117,7 +117,7 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             {
                 errors.push(format!(
                     "Value '{}' at 'select' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, COUNT, SPECIFIC_ATTRIBUTES]",
+                     Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
                     sel
                 ));
             }

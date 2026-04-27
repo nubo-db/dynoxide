@@ -44,13 +44,15 @@ Verified against real DynamoDB by the [dynamodb-conformance](https://github.com/
 
 | Target | Tests | Pass Rate |
 |---|---|---|
-| DynamoDB | 572 | 100% |
-| **Dynoxide** | **572** | **100%** |
-| LocalStack | 572 | 93.5% |
-| DynamoDB Local | 572 | 92.7% |
-| dynalite | 572 | 80.8% |
+| DynamoDB | 601 | 100% |
+| **Dynoxide** | **601** | **100%** |
+| LocalStack | 601 | 89.0% |
+| DynamoDB Local | 601 | 88.2% |
+| dynalite | 601 | 78.0% |
+| ministack | 601 | 60.6% |
+| floci | 601 | 58.7% |
 
-> Numbers reflect the conformance suite as of the v0.9.9 release. The suite has since tightened tier-3 error-message assertions; v0.9.9 currently scores 566/572 against latest main, tracked in [#11](https://github.com/nubo-db/dynoxide/issues/11), [#12](https://github.com/nubo-db/dynoxide/issues/12), [#13](https://github.com/nubo-db/dynoxide/issues/13). The table refreshes at the next release.
+> Numbers reflect the conformance suite as of the v0.9.10 release.
 
 See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#results).
 
@@ -58,7 +60,7 @@ See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#resul
 
 | | Dynoxide | DynamoDB Local | LocalStack (all services) | dynalite |
 |---|---|---|---|---|
-| Conformance (572 tests) | **100%** | 92.7% | 93.5% | 80.8% |
+| Conformance (601 tests) | **100%** | 88.2% | 89.0% | 78.0% |
 | Language | Rust | Java | Python + Java | Node.js |
 | Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
 | Docker required | — | ✓ | ✓ | — |

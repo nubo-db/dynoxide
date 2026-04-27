@@ -3,7 +3,9 @@
 //! Parses comma-separated attribute paths, supports dot notation and bracket indexing.
 //! Always includes key attributes in the result.
 
-use crate::expressions::tokenizer::{Token, TokenStream, tokenize};
+use crate::expressions::tokenizer::{
+    Token, TokenStream, near_window_parser, near_window_tokenizer, tokenize,
+};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, resolve_path, resolve_path_elements,
 };
@@ -18,7 +20,18 @@ pub struct ProjectionExpr {
 
 /// Parse a ProjectionExpression string.
 pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
-    let tokens = tokenize(expr).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
+    let tokens = match tokenize(expr) {
+        Ok(t) => t,
+        Err(err) => {
+            // Tokenizer-level syntax error (e.g. stray `!`): build the
+            // AWS-style `near: "..."` window from the offending byte position.
+            let bad = &expr[err.position..err.position + err.bad_len];
+            let near = near_window_tokenizer(expr, err.position);
+            return Err(format!(
+                r#"Invalid ProjectionExpression: Syntax error; token: "{bad}", near: "{near}""#
+            ));
+        }
+    };
     let mut stream = TokenStream::new(tokens);
 
     let mut paths = Vec::new();
@@ -27,12 +40,14 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
         return Ok(ProjectionExpr { paths });
     }
 
-    paths.push(parse_path(&mut stream).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?);
+    paths.push(
+        parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?,
+    );
 
     while matches!(stream.peek(), Some(Token::Comma)) {
         stream.next();
         paths.push(
-            parse_path(&mut stream).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?,
+            parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?,
         );
     }
 
@@ -44,6 +59,15 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
     }
 
     Ok(ProjectionExpr { paths })
+}
+
+/// Wrap a parser-level ProjectionExpression error in the standard envelope.
+/// For now this is a passthrough through the existing message shape; if the
+/// conformance suite later pins a `near:` window for parser-level projection
+/// errors, the offending span is available via `stream.current_span()` and
+/// the next span via `stream.peek_span()`.
+fn projection_parser_error(_expr: &str, _stream: &mut TokenStream, msg: String) -> String {
+    format!("Invalid ProjectionExpression: {msg}")
 }
 
 /// Apply a projection to an item, returning only the specified attributes.

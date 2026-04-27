@@ -597,7 +597,8 @@ fn collect_ks_errors(ks_val: &Option<serde_json::Value>, errors: &mut Vec<String
                 if arr.is_empty() {
                     errors.push("Value '[]' at 'keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string());
                 } else if arr.len() > 2 {
-                    errors.push(format!("Value '{}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 2", v));
+                    let dump = render_key_schema_java_toString(arr);
+                    errors.push(format!("Value '{}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 2", dump));
                 }
                 for (i, elem) in arr.iter().enumerate().take(10) {
                     collect_ks_elem_errors(elem, i + 1, errors);
@@ -623,6 +624,27 @@ fn collect_ks_elem_errors(elem: &serde_json::Value, idx: usize, errors: &mut Vec
             }
         }
     }
+}
+
+/// Render a KeySchema array the way AWS does in validation messages: Java's
+/// default toString() shape over the SDK's KeySchemaElement model, e.g.
+/// `[KeySchemaElement(attributeName=pk, keyType=HASH), KeySchemaElement(attributeName=sk, keyType=RANGE)]`.
+/// Missing attribute fields render as the empty string, matching what AWS
+/// emits when the upstream object hasn't been populated.
+#[allow(non_snake_case)]
+fn render_key_schema_java_toString(arr: &[serde_json::Value]) -> String {
+    let parts: Vec<String> = arr
+        .iter()
+        .map(|elem| {
+            let an = elem
+                .get("AttributeName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let kt = elem.get("KeyType").and_then(|v| v.as_str()).unwrap_or("");
+            format!("KeySchemaElement(attributeName={an}, keyType={kt})")
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 fn collect_ad_errors(ad_val: &Option<serde_json::Value>, errors: &mut Vec<String>) {

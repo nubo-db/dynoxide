@@ -57,11 +57,16 @@ pub fn execute(
         ));
     }
 
-    // Validate: up to 100 actions
+    // Validate: up to 100 actions.
+    // AWS surfaces this as the standard "1 validation error detected" envelope
+    // around `Value '[<dump>]' at 'transactItems'`. The conformance suite
+    // anchors a regex on the envelope and constraint phrase but leaves the
+    // dump body unconstrained.
     if request.transact_items.len() > 100 {
-        return Err(DynoxideError::ValidationException(
-            "Member must have length less than or equal to 100".to_string(),
-        ));
+        let dump = format!("{:?}", request.transact_items);
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+        )));
     }
 
     // Validate: no duplicate item targets

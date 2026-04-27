@@ -114,11 +114,14 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             }
         }
 
-        // Limit must be >= 1
+        // Limit must be >= 1.
+        // AWS DynamoDB's Scan message diverges from Query: Scan keeps the rejected
+        // value and lowercases 'limit', whereas Query omits the value and uses
+        // capital 'Limit'. Do not collapse these into a shared helper.
         if let Some(limit) = raw.limit {
             if limit == 0 {
                 errors.push(
-                    "Value '0' at 'Limit' failed to satisfy constraint: \
+                    "Value '0' at 'limit' failed to satisfy constraint: \
                      Member must have value greater than or equal to 1"
                         .to_string(),
                 );

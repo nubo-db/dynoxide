@@ -106,16 +106,16 @@ Results from a Mac Studio (M-series). These reflect the experience of a develope
 
 ## Results: CI (GitHub Actions)
 
-Results from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:ci_commit_link_benchmarks -->[`aefc68a`](../../../commit/aefc68a2b5efeb6ead6c1e3c0550f9c0fcfd9a76)<!-- /bench -->. Absolute wall-clock numbers vary between runners; ratios are stable across runs.
+Results from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:ci_commit_link_benchmarks -->[`f5052db`](../../../commit/f5052db2ac87597e5a1993037f89df9740e4cd74)<!-- /bench -->. Absolute wall-clock numbers vary between runners; ratios are stable across runs.
 
 ### Cold Startup
 
 | Target | Mean | Stddev | vs DynamoDB Local |
 |--------|------|--------|-------------------|
-| Dynoxide Embedded | <!-- bench:ci_startup_embedded_mean -->0.3ms<!-- /bench --> | <!-- bench:ci_startup_embedded_stddev -->±0.2ms<!-- /bench --> | <!-- bench:ci_startup_embedded_ratio -->**~14,448x faster**<!-- /bench --> |
-| Dynoxide HTTP | <!-- bench:ci_startup_http_mean -->2.4ms<!-- /bench --> | <!-- bench:ci_startup_http_stddev -->±3.0ms<!-- /bench --> | <!-- bench:ci_startup_http_ratio -->**~1,545x faster**<!-- /bench --> |
-| DynamoDB Local | <!-- bench:ci_startup_ddb_local_mean -->3,718ms<!-- /bench --> | <!-- bench:ci_startup_ddb_local_stddev -->±731ms<!-- /bench --> | — |
-| LocalStack | <!-- bench:ci_startup_localstack_mean -->8,624ms<!-- /bench --> | <!-- bench:ci_startup_localstack_stddev -->±334ms<!-- /bench --> | <!-- bench:ci_startup_localstack_ratio -->2.3x slower<!-- /bench --> |
+| Dynoxide Embedded | <!-- bench:ci_startup_embedded_mean -->0.3ms<!-- /bench --> | <!-- bench:ci_startup_embedded_stddev -->±0.2ms<!-- /bench --> | <!-- bench:ci_startup_embedded_ratio -->**~10,812x faster**<!-- /bench --> |
+| Dynoxide HTTP | <!-- bench:ci_startup_http_mean -->2.4ms<!-- /bench --> | <!-- bench:ci_startup_http_stddev -->±3.0ms<!-- /bench --> | <!-- bench:ci_startup_http_ratio -->**~1,147x faster**<!-- /bench --> |
+| DynamoDB Local | <!-- bench:ci_startup_ddb_local_mean -->2,769ms<!-- /bench --> | <!-- bench:ci_startup_ddb_local_stddev -->±335ms<!-- /bench --> | — |
+| LocalStack | <!-- bench:ci_startup_localstack_mean -->8,627ms<!-- /bench --> | <!-- bench:ci_startup_localstack_stddev -->±857ms<!-- /bench --> | <!-- bench:ci_startup_localstack_ratio -->3.1x slower<!-- /bench --> |
 
 DynamoDB Local warm start (after JVM JIT): ~2ms. The cold start cost is what CI pipelines actually pay.
 
@@ -123,18 +123,18 @@ DynamoDB Local warm start (after JVM JIT): ~2ms. The cold start cost is what CI 
 
 | Operation | Dynoxide HTTP (p50) | DynamoDB Local (p50) | Speedup |
 |-----------|-------------------|---------------------|---------|
-| CreateTable | <!-- bench:ci_op_CreateTable_http -->0.78ms<!-- /bench --> | <!-- bench:ci_op_CreateTable_ddb -->26.6ms<!-- /bench --> | <!-- bench:ci_op_CreateTable_ratio -->**34x**<!-- /bench --> |
-| GetItem | <!-- bench:ci_op_GetItem_http -->0.34ms<!-- /bench --> | <!-- bench:ci_op_GetItem_ddb -->0.76ms<!-- /bench --> | <!-- bench:ci_op_GetItem_ratio -->**2.2x**<!-- /bench --> |
-| PutItem | <!-- bench:ci_op_PutItem_http -->0.39ms<!-- /bench --> | <!-- bench:ci_op_PutItem_ddb -->0.92ms<!-- /bench --> | <!-- bench:ci_op_PutItem_ratio -->**2.4x**<!-- /bench --> |
-| Query (base) | <!-- bench:ci_op_Query_http -->0.35ms<!-- /bench --> | <!-- bench:ci_op_Query_ddb -->1.5ms<!-- /bench --> | <!-- bench:ci_op_Query_ratio -->**4.3x**<!-- /bench --> |
-| Query (GSI) | <!-- bench:ci_op_QueryGSI_http -->0.38ms<!-- /bench --> | <!-- bench:ci_op_QueryGSI_ddb -->1.2ms<!-- /bench --> | <!-- bench:ci_op_QueryGSI_ratio -->**3.1x**<!-- /bench --> |
+| CreateTable | <!-- bench:ci_op_CreateTable_http -->0.73ms<!-- /bench --> | <!-- bench:ci_op_CreateTable_ddb -->21.7ms<!-- /bench --> | <!-- bench:ci_op_CreateTable_ratio -->**30x**<!-- /bench --> |
+| GetItem | <!-- bench:ci_op_GetItem_http -->0.34ms<!-- /bench --> | <!-- bench:ci_op_GetItem_ddb -->0.77ms<!-- /bench --> | <!-- bench:ci_op_GetItem_ratio -->**2.2x**<!-- /bench --> |
+| PutItem | <!-- bench:ci_op_PutItem_http -->0.39ms<!-- /bench --> | <!-- bench:ci_op_PutItem_ddb -->0.90ms<!-- /bench --> | <!-- bench:ci_op_PutItem_ratio -->**2.3x**<!-- /bench --> |
+| Query (base) | <!-- bench:ci_op_Query_http -->0.35ms<!-- /bench --> | <!-- bench:ci_op_Query_ddb -->1.4ms<!-- /bench --> | <!-- bench:ci_op_Query_ratio -->**4.1x**<!-- /bench --> |
+| Query (GSI) | <!-- bench:ci_op_QueryGSI_http -->0.35ms<!-- /bench --> | <!-- bench:ci_op_QueryGSI_ddb -->1.2ms<!-- /bench --> | <!-- bench:ci_op_QueryGSI_ratio -->**3.4x**<!-- /bench --> |
 | Query (paginated) | <!-- bench:ci_op_QueryPaginated_http -->2.8ms<!-- /bench --> | <!-- bench:ci_op_QueryPaginated_ddb -->6.9ms<!-- /bench --> | <!-- bench:ci_op_QueryPaginated_ratio -->**2.5x**<!-- /bench --> |
-| Scan (full table) | <!-- bench:ci_op_Scan_http -->77.7ms<!-- /bench --> | <!-- bench:ci_op_Scan_ddb -->190.7ms<!-- /bench --> | <!-- bench:ci_op_Scan_ratio -->**2.5x**<!-- /bench --> |
-| UpdateItem | <!-- bench:ci_op_UpdateItem_http -->0.43ms<!-- /bench --> | <!-- bench:ci_op_UpdateItem_ddb -->1.4ms<!-- /bench --> | <!-- bench:ci_op_UpdateItem_ratio -->**3.4x**<!-- /bench --> |
-| TransactWriteItems | <!-- bench:ci_op_TransactWriteItems_http -->0.64ms<!-- /bench --> | <!-- bench:ci_op_TransactWriteItems_ddb -->6.0ms<!-- /bench --> | <!-- bench:ci_op_TransactWriteItems_ratio -->**9.3x**<!-- /bench --> |
-| BatchGetItem (100 keys) | <!-- bench:ci_op_BatchGetItem_http -->3.1ms<!-- /bench --> | <!-- bench:ci_op_BatchGetItem_ddb -->10.2ms<!-- /bench --> | <!-- bench:ci_op_BatchGetItem_ratio -->**3.3x**<!-- /bench --> |
-| BatchWriteItem (25 items) | <!-- bench:ci_op_BatchWriteItem_http -->2.1ms<!-- /bench --> | <!-- bench:ci_op_BatchWriteItem_ddb -->8.2ms<!-- /bench --> | <!-- bench:ci_op_BatchWriteItem_ratio -->**3.9x**<!-- /bench --> |
-| DeleteItem | <!-- bench:ci_op_DeleteItem_http -->0.35ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ddb -->0.89ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ratio -->**2.6x**<!-- /bench --> |
+| Scan (full table) | <!-- bench:ci_op_Scan_http -->76.3ms<!-- /bench --> | <!-- bench:ci_op_Scan_ddb -->259.0ms<!-- /bench --> | <!-- bench:ci_op_Scan_ratio -->**3.4x**<!-- /bench --> |
+| UpdateItem | <!-- bench:ci_op_UpdateItem_http -->0.42ms<!-- /bench --> | <!-- bench:ci_op_UpdateItem_ddb -->1.4ms<!-- /bench --> | <!-- bench:ci_op_UpdateItem_ratio -->**3.4x**<!-- /bench --> |
+| TransactWriteItems | <!-- bench:ci_op_TransactWriteItems_http -->0.64ms<!-- /bench --> | <!-- bench:ci_op_TransactWriteItems_ddb -->5.0ms<!-- /bench --> | <!-- bench:ci_op_TransactWriteItems_ratio -->**7.9x**<!-- /bench --> |
+| BatchGetItem (100 keys) | <!-- bench:ci_op_BatchGetItem_http -->3.1ms<!-- /bench --> | <!-- bench:ci_op_BatchGetItem_ddb -->9.9ms<!-- /bench --> | <!-- bench:ci_op_BatchGetItem_ratio -->**3.2x**<!-- /bench --> |
+| BatchWriteItem (25 items) | <!-- bench:ci_op_BatchWriteItem_http -->2.1ms<!-- /bench --> | <!-- bench:ci_op_BatchWriteItem_ddb -->8.1ms<!-- /bench --> | <!-- bench:ci_op_BatchWriteItem_ratio -->**3.8x**<!-- /bench --> |
+| DeleteItem | <!-- bench:ci_op_DeleteItem_http -->0.35ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ddb -->0.86ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ratio -->**2.5x**<!-- /bench --> |
 | **Total workload** | <!-- bench:ci_workload_http -->**2.9s**<!-- /bench --> | <!-- bench:ci_workload_ddb -->**10.8s**<!-- /bench --> | <!-- bench:ci_workload_ratio -->**3.8x**<!-- /bench --> |
 
 The largest speedups are on read-heavy operations (GetItem, Query, Scan, BatchGetItem) and multi-item writes (BatchWriteItem, TransactWriteItems) where Dynoxide avoids JVM dispatch overhead and lock contention. Single-row writes (PutItem, DeleteItem) still show a clear win at 2-3x.
@@ -143,14 +143,14 @@ The largest speedups are on read-heavy operations (GetItem, Query, Scan, BatchGe
 
 | Mode | Wall Clock | Speedup vs DDB Local |
 |------|-----------|---------------------|
-| Dynoxide Embedded (sequential) | <!-- bench:ci_suite_embedded_seq -->755ms<!-- /bench --> | <!-- bench:ci_suite_embedded_seq_ratio -->**3.3x**<!-- /bench --> |
-| Dynoxide Embedded (4x parallel) | <!-- bench:ci_suite_embedded_par -->355ms<!-- /bench --> | <!-- bench:ci_suite_embedded_par_ratio -->**5.1x**<!-- /bench --> |
-| Dynoxide HTTP (sequential) | <!-- bench:ci_suite_http_seq -->738ms<!-- /bench --> | <!-- bench:ci_suite_http_seq_ratio -->**3.4x**<!-- /bench --> |
-| Dynoxide HTTP (4x parallel) | <!-- bench:ci_suite_http_par -->410ms<!-- /bench --> | <!-- bench:ci_suite_http_par_ratio -->**4.4x**<!-- /bench --> |
-| DynamoDB Local (sequential) | <!-- bench:ci_suite_ddb_seq -->2,483ms<!-- /bench --> | — |
-| DynamoDB Local (4x parallel) | <!-- bench:ci_suite_ddb_par -->1,792ms<!-- /bench --> | — |
+| Dynoxide Embedded (sequential) | <!-- bench:ci_suite_embedded_seq -->722ms<!-- /bench --> | <!-- bench:ci_suite_embedded_seq_ratio -->**3.1x**<!-- /bench --> |
+| Dynoxide Embedded (4x parallel) | <!-- bench:ci_suite_embedded_par -->333ms<!-- /bench --> | <!-- bench:ci_suite_embedded_par_ratio -->**4.6x**<!-- /bench --> |
+| Dynoxide HTTP (sequential) | <!-- bench:ci_suite_http_seq -->731ms<!-- /bench --> | <!-- bench:ci_suite_http_seq_ratio -->**3.1x**<!-- /bench --> |
+| Dynoxide HTTP (4x parallel) | <!-- bench:ci_suite_http_par -->398ms<!-- /bench --> | <!-- bench:ci_suite_http_par_ratio -->**3.9x**<!-- /bench --> |
+| DynamoDB Local (sequential) | <!-- bench:ci_suite_ddb_seq -->2,265ms<!-- /bench --> | — |
+| DynamoDB Local (4x parallel) | <!-- bench:ci_suite_ddb_par -->1,543ms<!-- /bench --> | — |
 
-DynamoDB Local barely benefits from parallelism (<!-- bench:ci_suite_ddb_seq_prose -->2,483ms<!-- /bench --> → <!-- bench:ci_suite_ddb_par_prose -->1,792ms<!-- /bench -->). Under concurrent load, individual tests take 3-4x longer due to JVM contention — setup times spike to 200-1,000ms on some tests as `CreateTable` calls queue behind the JVM's single-threaded SQLite access. Dynoxide embedded scales better because each test gets its own isolated `Database::memory()` with no shared state.
+DynamoDB Local barely benefits from parallelism (<!-- bench:ci_suite_ddb_seq_prose -->2,265ms<!-- /bench --> → <!-- bench:ci_suite_ddb_par_prose -->1,543ms<!-- /bench -->). Under concurrent load, individual tests take 3-4x longer due to JVM contention — setup times spike to 200-1,000ms on some tests as `CreateTable` calls queue behind the JVM's single-threaded SQLite access. Dynoxide embedded scales better because each test gets its own isolated `Database::memory()` with no shared state.
 
 ### Embedded Micro-benchmarks (criterion)
 
@@ -159,15 +159,15 @@ These measure Dynoxide's embedded API directly — no HTTP, no serialisation. Th
 | Operation | Latency |
 |-----------|---------|
 | GetItem | <!-- bench:ci_criterion_get_item -->14µs<!-- /bench --> |
-| PutItem (small / medium / large) | <!-- bench:ci_criterion_put_item_small -->17µs<!-- /bench --> / <!-- bench:ci_criterion_put_item_medium -->31µs<!-- /bench --> / <!-- bench:ci_criterion_put_item_large -->307µs<!-- /bench --> |
+| PutItem (small / medium / large) | <!-- bench:ci_criterion_put_item_small -->18µs<!-- /bench --> / <!-- bench:ci_criterion_put_item_medium -->32µs<!-- /bench --> / <!-- bench:ci_criterion_put_item_large -->299µs<!-- /bench --> |
 | Query (base, ~50 hits) | <!-- bench:ci_criterion_query_base -->1.1ms<!-- /bench --> |
 | Query (GSI) | <!-- bench:ci_criterion_query_gsi -->21µs<!-- /bench --> |
-| Scan (filter, 1K items) | <!-- bench:ci_criterion_scan -->8.7ms<!-- /bench --> |
-| UpdateItem | <!-- bench:ci_criterion_update_item -->174µs<!-- /bench --> |
-| DeleteItem | <!-- bench:ci_criterion_delete_item -->44µs<!-- /bench --> |
-| BatchWrite (25) | <!-- bench:ci_criterion_batch_write -->851µs<!-- /bench --> |
+| Scan (filter, 1K items) | <!-- bench:ci_criterion_scan -->8.4ms<!-- /bench --> |
+| UpdateItem | <!-- bench:ci_criterion_update_item -->153µs<!-- /bench --> |
+| DeleteItem | <!-- bench:ci_criterion_delete_item -->43µs<!-- /bench --> |
+| BatchWrite (25) | <!-- bench:ci_criterion_batch_write -->853µs<!-- /bench --> |
 | BatchGet (100) | <!-- bench:ci_criterion_batch_get -->1.4ms<!-- /bench --> |
-| TransactWrite (4) | <!-- bench:ci_criterion_transact_write -->198µs<!-- /bench --> |
+| TransactWrite (4) | <!-- bench:ci_criterion_transact_write -->196µs<!-- /bench --> |
 
 <!-- Criterion generates detailed charts for each benchmark (PDF distributions,
 regression plots, violin plots). These are available in the CI artifacts under
@@ -182,8 +182,8 @@ the GetItem PDF (shows the tight distribution). To include them:
 
 | Metric | In-Memory | File-Backed | DynamoDB Local (Docker) | LocalStack (Docker) |
 |--------|-----------|-------------|------------------------|---------------------|
-| Idle | <!-- bench:ci_mem_memory_idle -->4.9 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_idle -->42.3 MB<!-- /bench --> RSS | <!-- bench:ci_mem_ddb_local_idle -->189.7 MB<!-- /bench --> RSS | <!-- bench:ci_mem_localstack_idle -->356.5 MB<!-- /bench --> RSS |
-| After 10K items (~1KB each) | <!-- bench:ci_mem_memory_loaded -->45.6 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_loaded -->41.3 MB<!-- /bench --> RSS | — | — |
+| Idle | <!-- bench:ci_mem_memory_idle -->4.9 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_idle -->44.7 MB<!-- /bench --> RSS | <!-- bench:ci_mem_ddb_local_idle -->187.7 MB<!-- /bench --> RSS | <!-- bench:ci_mem_localstack_idle -->358.0 MB<!-- /bench --> RSS |
+| After 10K items (~1KB each) | <!-- bench:ci_mem_memory_loaded -->45.8 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_loaded -->44.7 MB<!-- /bench --> RSS | — | — |
 | Disk (10K items) | — | <!-- bench:ci_disk_file_loaded -->15.6 MB<!-- /bench --> | — | — |
 | Disk (empty table) | — | <!-- bench:ci_disk_file_empty -->121 KB<!-- /bench --> | — | — |
 

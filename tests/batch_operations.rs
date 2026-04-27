@@ -181,10 +181,7 @@ fn test_batch_get_exceeds_100_keys() {
         msg.contains("Member must have length less than or equal to 100"),
         "Got: {msg}"
     );
-    assert!(
-        msg.contains("RequestItems.Tbl.member.Keys"),
-        "Got: {msg}"
-    );
+    assert!(msg.contains("RequestItems.Tbl.member.Keys"), "Got: {msg}");
 }
 
 // =============================================================================

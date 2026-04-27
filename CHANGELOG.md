@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.10]
+
+### Fixed
+
+- 16 places where dynoxide's error strings drifted from real AWS DynamoDB. Mostly small things you only notice when you assert the message: `tableName` length validation is now per-operation (1 char on read/write, 3 stays on `CreateTable`), `Select` enum order matches AWS rather than alphabetical, `Query` vs `Scan` `Limit=0` messages are different on purpose now, batch/transact empty and oversize requests use the standard validation envelope, and `UpdateExpression`/`ProjectionExpression` syntax errors include the AWS `near: "..."` window ([#11](https://github.com/nubo-db/dynoxide/issues/11), [#12](https://github.com/nubo-db/dynoxide/issues/12), [#13](https://github.com/nubo-db/dynoxide/issues/13), [#15](https://github.com/nubo-db/dynoxide/issues/15), [#16](https://github.com/nubo-db/dynoxide/issues/16), [#17](https://github.com/nubo-db/dynoxide/issues/17), [#18](https://github.com/nubo-db/dynoxide/issues/18))
+- `TransactGetItems` with a bad action key now comes back as a `TransactionCanceledException` with `ValidationError` rather than HTTP 500. The 500 was a real leak: the dedup loop called the server-fault helper before key validation ([#19](https://github.com/nubo-db/dynoxide/issues/19))
+
 ## [0.9.9] - 2026-04-24
 
 ### Fixed

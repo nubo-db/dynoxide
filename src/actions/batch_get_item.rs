@@ -39,10 +39,12 @@ pub struct BatchGetItemResponse {
 }
 
 pub fn execute(storage: &Storage, request: BatchGetItemRequest) -> Result<BatchGetItemResponse> {
-    // Validate RequestItems is not empty
+    // Validate RequestItems is not empty.
+    // AWS routes the empty-map case through a separate parameter-required path
+    // rather than the standard "N validation errors detected" envelope.
     if request.request_items.is_empty() {
         return Err(DynoxideError::ValidationException(
-            "1 validation error detected: Value '{}' at 'requestItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),
+            "The requestItems parameter is required for BatchGetItem".to_string(),
         ));
     }
 

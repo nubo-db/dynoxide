@@ -176,9 +176,14 @@ fn test_batch_get_exceeds_100_keys() {
     .unwrap();
 
     let err = db.batch_get_item(req).unwrap_err();
+    let msg = format!("{err:?}");
     assert!(
-        format!("{err:?}").contains("Too many items"),
-        "Got: {err:?}"
+        msg.contains("Member must have length less than or equal to 100"),
+        "Got: {msg}"
+    );
+    assert!(
+        msg.contains("RequestItems.Tbl.member.Keys"),
+        "Got: {msg}"
     );
 }
 
@@ -268,10 +273,12 @@ fn test_batch_write_exceeds_25_items() {
     .unwrap();
 
     let err = db.batch_write_item(req).unwrap_err();
+    let msg = format!("{err:?}");
     assert!(
-        format!("{err:?}").contains("Too many items"),
-        "Got: {err:?}"
+        msg.contains("Member must have length less than or equal to 25"),
+        "Got: {msg}"
     );
+    assert!(msg.contains("at 'requestItems'"), "Got: {msg}");
 }
 
 #[test]

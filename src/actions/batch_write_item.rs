@@ -77,12 +77,29 @@ pub fn execute(
         crate::validation::validate_table_name(table_name)?;
     }
 
-    // Validate total request count
+    // Validate total request count.
+    // AWS surfaces this as the standard "1 validation error detected" envelope
+    // and echoes the WriteRequest list inside `Value '{<table>=[<dump>]}'`. The
+    // conformance suite anchors a regex around the envelope and the constraint
+    // phrase but leaves the dump body unconstrained (because the AWS SDK's
+    // Java-toString shape adds new AttributeValue fields over time). We emit
+    // the table name verbatim and a Rust Debug dump of the WriteRequests so
+    // the envelope matches without coupling to a specific SDK version. If a
+    // future suite tightens the regex to pin the dump exactly, this site
+    // will need a follow-up change.
     let total_requests: usize = request.request_items.values().map(|v| v.len()).sum();
     if total_requests > 25 {
-        return Err(DynoxideError::ValidationException(
-            "Too many items requested for the BatchWriteItem call".to_string(),
-        ));
+        let empty: Vec<WriteRequest> = Vec::new();
+        let (table_name, requests) = request
+            .request_items
+            .iter()
+            .max_by_key(|(_, v)| v.len())
+            .map(|(name, v)| (name.as_str(), v))
+            .unwrap_or(("", &empty));
+        let dump = format!("{requests:?}");
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{{{table_name}=[{dump}]}}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to 25, Member must have length greater than or equal to 1]"
+        )));
     }
 
     // --- Pre-table validations ---

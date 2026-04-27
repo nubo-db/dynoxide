@@ -62,12 +62,24 @@ pub fn execute(storage: &Storage, request: BatchGetItemRequest) -> Result<BatchG
         crate::validation::validate_table_name(table_name)?;
     }
 
-    // Validate total key count
+    // Validate total key count.
+    // AWS surfaces this as the standard "1 validation error detected" envelope
+    // with the field path pinned to one of the request's tables. The conformance
+    // suite exercises a single-table case; for multi-table requests we pick the
+    // table with the largest Keys array (and, on ties, fall through to whichever
+    // HashMap iteration yields first) so the field path lines up with the table
+    // that pushed the total over.
     let total_keys: usize = request.request_items.values().map(|ka| ka.keys.len()).sum();
     if total_keys > 100 {
-        return Err(DynoxideError::ValidationException(
-            "Too many items requested for the BatchGetItem call".to_string(),
-        ));
+        let table_name = request
+            .request_items
+            .iter()
+            .max_by_key(|(_, ka)| ka.keys.len())
+            .map(|(name, _)| name.as_str())
+            .unwrap_or("");
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to 100"
+        )));
     }
 
     // --- Pre-table validations ---

@@ -199,9 +199,14 @@ fn scan_rejects_limit_zero() {
         "Limit": 0
     }));
     let err = result.unwrap_err().to_string();
+    // AWS DynamoDB lowercases 'limit' for Scan (Query keeps capital 'Limit').
     assert!(
-        err.contains("at 'Limit' failed to satisfy constraint"),
-        "Expected limit validation error, got: {err}"
+        err.contains("at 'limit' failed to satisfy constraint"),
+        "Expected scan limit validation error with lowercase 'limit', got: {err}"
+    );
+    assert!(
+        err.contains("greater than or equal to 1"),
+        "Expected limit >= 1 message, got: {err}"
     );
 }
 

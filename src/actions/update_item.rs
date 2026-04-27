@@ -67,12 +67,17 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = UpdateItemRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{format_validation_errors, table_name_constraint_errors};
+        use crate::validation::{
+            format_validation_errors, table_name_constraint_errors, TableNameContext,
+        };
 
         let mut errors = Vec::new();
 
         // Table name constraints
-        errors.extend(table_name_constraint_errors(raw.table_name.as_deref()));
+        errors.extend(table_name_constraint_errors(
+            raw.table_name.as_deref(),
+            TableNameContext::ReadWrite,
+        ));
         let table_name = raw.table_name.unwrap_or_default();
 
         // Key constraint

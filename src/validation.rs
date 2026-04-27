@@ -4,12 +4,30 @@ use crate::types::{
     ScalarAttributeType,
 };
 
-/// Validate a DynamoDB table name.
+/// Per-operation context for table-name validation.
 ///
-/// Rules: 3-255 characters, only `[a-zA-Z0-9_.-]`.
-/// Reports all constraint violations at once (matching DynamoDB behaviour).
+/// AWS DynamoDB applies different constraints to `tableName` depending on the
+/// operation. CreateTable enforces a minimum of 3 characters and a regex
+/// pattern. Read/write operations (PutItem, GetItem, Query, Scan, UpdateItem,
+/// DeleteItem, BatchGet/Write, TransactGet/Write) only enforce a minimum of 1
+/// character; the regex pattern only fires on a non-empty invalid name.
+#[derive(Copy, Clone, Debug)]
+pub enum TableNameContext {
+    /// CreateTable: regex pattern + minimum length 3.
+    CreateTable,
+    /// PutItem and friends: minimum length 1, regex pattern only on non-empty input.
+    ReadWrite,
+}
+
+/// Validate a DynamoDB table name for a read/write operation.
+///
+/// Equivalent to `table_name_constraint_errors(Some(name), TableNameContext::ReadWrite)`
+/// followed by formatting into the multi-error envelope. CreateTable callers must use
+/// `table_name_constraint_errors` directly with `TableNameContext::CreateTable` because
+/// CreateTable's full validation produces additional errors that need to be folded into
+/// a single envelope.
 pub fn validate_table_name(name: &str) -> Result<()> {
-    let errors = table_name_constraint_errors(Some(name));
+    let errors = table_name_constraint_errors(Some(name), TableNameContext::ReadWrite);
     if errors.is_empty() {
         return Ok(());
     }
@@ -26,8 +44,11 @@ pub fn validate_table_name(name: &str) -> Result<()> {
 ///
 /// Returns a (possibly empty) list of error strings. If `table_name` is `None`,
 /// a "must not be null" error is emitted. If it is present but invalid, pattern
-/// and/or length errors are emitted.
-pub fn table_name_constraint_errors(table_name: Option<&str>) -> Vec<String> {
+/// and/or length errors are emitted, gated by `context`.
+pub fn table_name_constraint_errors(
+    table_name: Option<&str>,
+    context: TableNameContext,
+) -> Vec<String> {
     let mut errors = Vec::new();
     match table_name {
         None => {
@@ -37,33 +58,60 @@ pub fn table_name_constraint_errors(table_name: Option<&str>) -> Vec<String> {
                     .to_string(),
             );
         }
-        Some(name) => {
-            if name.is_empty()
-                || !name
+        Some(name) => match context {
+            TableNameContext::CreateTable => {
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                {
+                    errors.push(format!(
+                        "Value '{}' at 'tableName' failed to satisfy constraint: \
+                         Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+                        name
+                    ));
+                }
+                if name.len() < 3 {
+                    errors.push(format!(
+                        "Value '{}' at 'tableName' failed to satisfy constraint: \
+                         Member must have length greater than or equal to 3",
+                        name
+                    ));
+                }
+                if name.len() > 255 {
+                    errors.push(format!(
+                        "Value '{}' at 'tableName' failed to satisfy constraint: \
+                         Member must have length less than or equal to 255",
+                        name
+                    ));
+                }
+            }
+            TableNameContext::ReadWrite => {
+                if name.is_empty() {
+                    errors.push(
+                        "Value '' at 'tableName' failed to satisfy constraint: \
+                         Member must have length greater than or equal to 1"
+                            .to_string(),
+                    );
+                } else if !name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-            {
-                errors.push(format!(
-                    "Value '{}' at 'tableName' failed to satisfy constraint: \
-                     Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-                    name
-                ));
+                {
+                    errors.push(format!(
+                        "Value '{}' at 'tableName' failed to satisfy constraint: \
+                         Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+                        name
+                    ));
+                }
+                if name.len() > 255 {
+                    errors.push(format!(
+                        "Value '{}' at 'tableName' failed to satisfy constraint: \
+                         Member must have length less than or equal to 255",
+                        name
+                    ));
+                }
             }
-            if name.len() < 3 {
-                errors.push(format!(
-                    "Value '{}' at 'tableName' failed to satisfy constraint: \
-                     Member must have length greater than or equal to 3",
-                    name
-                ));
-            }
-            if name.len() > 255 {
-                errors.push(format!(
-                    "Value '{}' at 'tableName' failed to satisfy constraint: \
-                     Member must have length less than or equal to 255",
-                    name
-                ));
-            }
-        }
+        },
     }
     errors
 }
@@ -651,14 +699,34 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_table_name_too_short() {
-        assert!(validate_table_name("ab").is_err());
+    fn test_short_table_name_accepted_for_read_write() {
+        // ReadWrite context (the default for validate_table_name) only enforces min length 1,
+        // matching AWS's per-operation rules. CreateTable's min-length-3 lives behind
+        // table_name_constraint_errors with TableNameContext::CreateTable.
+        assert!(validate_table_name("ab").is_ok());
+        assert!(validate_table_name("a").is_ok());
+    }
+
+    #[test]
+    fn test_empty_table_name_rejected_for_read_write() {
+        let err = validate_table_name("").unwrap_err().to_string();
+        assert!(err.contains("Member must have length greater than or equal to 1"));
+        assert!(!err.contains("greater than or equal to 3"));
     }
 
     #[test]
     fn test_invalid_table_name_bad_chars() {
         assert!(validate_table_name("my table").is_err());
         assert!(validate_table_name("my@table").is_err());
+    }
+
+    #[test]
+    fn test_create_table_context_keeps_min_length_3() {
+        let errs = table_name_constraint_errors(Some("ab"), TableNameContext::CreateTable);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("Member must have length greater than or equal to 3"))
+        );
     }
 
     #[test]

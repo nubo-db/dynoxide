@@ -392,6 +392,7 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
     helpers::validate_key_only(&request.key, &key_schema)?;
 
     // Extract key values
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&request.key, &key_schema)?;
 
     // Collect the set of attribute names affected by the legacy AttributeUpdates

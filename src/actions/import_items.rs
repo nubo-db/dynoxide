@@ -98,6 +98,7 @@ fn execute_inner(
             // Deduplicate sets (in-place, no clone needed)
             crate::validation::normalize_item_sets(&mut item);
 
+            // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
             let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
 
             // 6. Serialize and calculate size

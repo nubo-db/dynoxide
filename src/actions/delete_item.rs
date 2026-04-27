@@ -55,7 +55,7 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = DeleteItemRequestRaw::deserialize(deserializer)?;
         use crate::validation::{
-            format_validation_errors, table_name_constraint_errors, TableNameContext,
+            TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
         let mut errors = Vec::new();

@@ -226,10 +226,7 @@ pub fn execute(
 /// TransactGet action: table-name shape, table existence, parsed key schema,
 /// and key shape against that schema. Returns the resolved KeySchema so the
 /// caller can avoid re-parsing it before extract_key_strings.
-fn validate_action(
-    storage: &Storage,
-    get: &TransactGet,
-) -> Result<helpers::KeySchema> {
+fn validate_action(storage: &Storage, get: &TransactGet) -> Result<helpers::KeySchema> {
     crate::validation::validate_table_name(&get.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &get.table_name)?;
     let key_schema = helpers::parse_key_schema(&meta)?;

@@ -376,10 +376,7 @@ pub fn near_window_parser(source: &str, offending: TokenSpan, next: Option<Token
 pub fn near_window_tokenizer(source: &str, position: usize) -> &str {
     let bytes = source.as_bytes();
     let mut end = position + 1;
-    if end <= bytes.len()
-        && end < bytes.len()
-        && !(bytes[end] as char).is_whitespace()
-    {
+    if end <= bytes.len() && end < bytes.len() && !(bytes[end] as char).is_whitespace() {
         end += 1;
     }
     let end = end.min(bytes.len());
@@ -515,7 +512,10 @@ mod tests {
         let source = "INVALID SYNTAX HERE";
         let offending = TokenSpan::new(0, 7);
         let next = Some(TokenSpan::new(8, 6));
-        assert_eq!(near_window_parser(source, offending, next), "INVALID SYNTAX");
+        assert_eq!(
+            near_window_parser(source, offending, next),
+            "INVALID SYNTAX"
+        );
     }
 
     #[test]

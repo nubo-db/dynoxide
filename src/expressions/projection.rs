@@ -3,9 +3,7 @@
 //! Parses comma-separated attribute paths, supports dot notation and bracket indexing.
 //! Always includes key attributes in the result.
 
-use crate::expressions::tokenizer::{
-    Token, TokenStream, near_window_parser, near_window_tokenizer, tokenize,
-};
+use crate::expressions::tokenizer::{Token, TokenStream, near_window_tokenizer, tokenize};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, resolve_path, resolve_path_elements,
 };
@@ -40,9 +38,7 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
         return Ok(ProjectionExpr { paths });
     }
 
-    paths.push(
-        parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?,
-    );
+    paths.push(parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?);
 
     while matches!(stream.peek(), Some(Token::Comma)) {
         stream.next();

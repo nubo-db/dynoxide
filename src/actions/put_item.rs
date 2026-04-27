@@ -54,7 +54,7 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
         let raw = PutItemRequestRaw::deserialize(deserializer)?;
 
         use crate::validation::{
-            format_validation_errors, table_name_constraint_errors, TableNameContext,
+            TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
         // Collect constraint validation errors (DynamoDB checks all at once)

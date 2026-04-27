@@ -235,6 +235,7 @@ fn execute_insert(
     // Deduplicate sets
     crate::validation::normalize_item_sets(&mut item);
 
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = crate::actions::helpers::extract_key_strings(&item, &key_schema)?;
 
     // PartiQL INSERT must reject duplicates (unlike PutItem which overwrites)

@@ -266,6 +266,7 @@ pub fn execute(storage: &Storage, mut request: PutItemRequest) -> Result<PutItem
     crate::validation::normalize_item_sets(&mut request.item);
 
     // Extract key values
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&request.item, &key_schema)?;
 
     // Check for unused expression attribute names/values

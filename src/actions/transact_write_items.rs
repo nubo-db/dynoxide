@@ -287,6 +287,7 @@ fn execute_put(storage: &Storage, put: &TransactPut) -> Result<()> {
         ));
     }
 
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
@@ -366,6 +367,7 @@ fn execute_update(storage: &Storage, update: &TransactUpdate) -> Result<()> {
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_key_only(&update.key, &key_schema)?;
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&update.key, &key_schema)?;
 
     let existing_json = storage.get_item(&update.table_name, &pk, &sk)?;
@@ -479,6 +481,7 @@ fn execute_delete(storage: &Storage, delete: &TransactDelete) -> Result<()> {
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_key_only(&delete.key, &key_schema)?;
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&delete.key, &key_schema)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
@@ -533,6 +536,7 @@ fn execute_condition_check(storage: &Storage, check: &TransactConditionCheck) ->
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     helpers::validate_key_only(&check.key, &key_schema)?;
+    // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&check.key, &key_schema)?;
 
     let existing_json = storage.get_item(&check.table_name, &pk, &sk)?;
@@ -620,24 +624,28 @@ fn get_item_target(storage: &Storage, item: &TransactWriteItem) -> Result<String
         crate::validation::validate_table_name(&put.table_name)?;
         let meta = helpers::require_table_for_item_op(storage, &put.table_name)?;
         let key_schema = helpers::parse_key_schema(&meta)?;
+        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&put.item, &key_schema)?;
         Ok(format!("{}#{}#{}", put.table_name, pk, sk))
     } else if let Some(ref update) = item.update {
         crate::validation::validate_table_name(&update.table_name)?;
         let meta = helpers::require_table_for_item_op(storage, &update.table_name)?;
         let key_schema = helpers::parse_key_schema(&meta)?;
+        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&update.key, &key_schema)?;
         Ok(format!("{}#{}#{}", update.table_name, pk, sk))
     } else if let Some(ref delete) = item.delete {
         crate::validation::validate_table_name(&delete.table_name)?;
         let meta = helpers::require_table_for_item_op(storage, &delete.table_name)?;
         let key_schema = helpers::parse_key_schema(&meta)?;
+        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&delete.key, &key_schema)?;
         Ok(format!("{}#{}#{}", delete.table_name, pk, sk))
     } else if let Some(ref check) = item.condition_check {
         crate::validation::validate_table_name(&check.table_name)?;
         let meta = helpers::require_table_for_item_op(storage, &check.table_name)?;
         let key_schema = helpers::parse_key_schema(&meta)?;
+        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
         let (pk, sk) = helpers::extract_key_strings(&check.key, &key_schema)?;
         Ok(format!("{}#{}#{}", check.table_name, pk, sk))
     } else {

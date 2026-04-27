@@ -166,6 +166,7 @@ pub fn execute(
                 } else {
                     continue;
                 };
+                // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(key_item, &key_schema)?;
                 let key = (table_name.clone(), pk, sk);
                 if !seen_keys.insert(key) {
@@ -213,6 +214,7 @@ pub fn execute(
                     ));
                 }
 
+                // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(&put_req.item, &key_schema)?;
                 let item_json = serde_json::to_string(&put_req.item)
                     .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
@@ -284,6 +286,7 @@ pub fn execute(
                 )?;
             } else if let Some(ref del_req) = wr.delete_request {
                 helpers::validate_key_only(&del_req.key, &key_schema)?;
+                // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(&del_req.key, &key_schema)?;
                 let old_json = storage.delete_item(table_name, &pk, &sk)?;
 

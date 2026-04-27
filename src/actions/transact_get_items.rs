@@ -1,5 +1,5 @@
 use crate::actions::helpers;
-use crate::errors::{DynoxideError, Result};
+use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::expressions;
 use crate::storage::Storage;
 use crate::types::{AttributeValue, Item};
@@ -69,14 +69,70 @@ pub fn execute(
         )));
     }
 
-    // Validate: no duplicate item targets
-    let mut seen_targets = HashSet::new();
+    // Per-action validation pass.
+    //
+    // AWS surfaces per-action validation failures (empty Key, schema mismatch,
+    // etc.) through the cancellation channel rather than as a request-level
+    // ValidationException, so we collect a CancellationReason for each action
+    // up-front. Validation here must run BEFORE any call to
+    // helpers::extract_key_strings: that helper returns InternalServerError
+    // for a missing partition or sort key, which would leak as HTTP 500
+    // instead of a per-action ValidationError. validate_key_only is the
+    // ValidationException-returning equivalent.
+    let mut reasons: Vec<CancellationReason> = Vec::with_capacity(request.transact_items.len());
+    let mut validated_schemas: Vec<Option<helpers::KeySchema>> =
+        Vec::with_capacity(request.transact_items.len());
+    let mut has_failure = false;
+
     for transact_item in &request.transact_items {
         let get = &transact_item.get;
-        crate::validation::validate_table_name(&get.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &get.table_name)?;
-        let key_schema = helpers::parse_key_schema(&meta)?;
-        let (pk, sk) = helpers::extract_key_strings(&get.key, &key_schema)?;
+        match validate_action(storage, get) {
+            Ok(schema) => {
+                reasons.push(CancellationReason {
+                    code: "None".to_string(),
+                    message: None,
+                    item: None,
+                });
+                validated_schemas.push(Some(schema));
+            }
+            Err(DynoxideError::ValidationException(msg)) => {
+                has_failure = true;
+                reasons.push(CancellationReason {
+                    code: "ValidationError".to_string(),
+                    message: Some(msg),
+                    item: None,
+                });
+                validated_schemas.push(None);
+            }
+            Err(DynoxideError::ResourceNotFoundException(msg)) => {
+                // Resource-not-found at the request level is the existing AWS
+                // behaviour (mirrors transact-get's pre-fix path); preserve it.
+                return Err(DynoxideError::ResourceNotFoundException(msg));
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    if has_failure {
+        let codes: Vec<&str> = reasons.iter().map(|r| r.code.as_str()).collect();
+        let message = format!(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+            codes.join(", ")
+        );
+        return Err(DynoxideError::TransactionCanceledException(
+            message, reasons,
+        ));
+    }
+
+    // Validate: no duplicate item targets.
+    // Safe to call extract_key_strings here because validate_key_only has
+    // already passed for every action.
+    let mut seen_targets = HashSet::new();
+    for (transact_item, schema) in request.transact_items.iter().zip(validated_schemas.iter()) {
+        let get = &transact_item.get;
+        let key_schema = schema.as_ref().expect("validated above");
+        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
+        let (pk, sk) = helpers::extract_key_strings(&get.key, key_schema)?;
         let target = format!("{}#{}#{}", get.table_name, pk, sk);
         if !seen_targets.insert(target) {
             return Err(DynoxideError::ValidationException(
@@ -87,14 +143,12 @@ pub fn execute(
 
     let mut responses = Vec::with_capacity(request.transact_items.len());
 
-    for transact_item in &request.transact_items {
+    for (transact_item, schema) in request.transact_items.iter().zip(validated_schemas.iter()) {
         let get = &transact_item.get;
-        crate::validation::validate_table_name(&get.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &get.table_name)?;
-        let key_schema = helpers::parse_key_schema(&meta)?;
+        let key_schema = schema.as_ref().expect("validated above");
 
-        helpers::validate_key_only(&get.key, &key_schema)?;
-        let (pk, sk) = helpers::extract_key_strings(&get.key, &key_schema)?;
+        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
+        let (pk, sk) = helpers::extract_key_strings(&get.key, key_schema)?;
 
         let item_json = storage.get_item(&get.table_name, &pk, &sk)?;
 
@@ -165,4 +219,20 @@ pub fn execute(
         responses,
         consumed_capacity,
     })
+}
+
+/// Run the validation that AWS treats as per-action (and therefore reportable
+/// through the cancellation channel as ValidationError) for a single
+/// TransactGet action: table-name shape, table existence, parsed key schema,
+/// and key shape against that schema. Returns the resolved KeySchema so the
+/// caller can avoid re-parsing it before extract_key_strings.
+fn validate_action(
+    storage: &Storage,
+    get: &TransactGet,
+) -> Result<helpers::KeySchema> {
+    crate::validation::validate_table_name(&get.table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, &get.table_name)?;
+    let key_schema = helpers::parse_key_schema(&meta)?;
+    helpers::validate_key_only(&get.key, &key_schema)?;
+    Ok(key_schema)
 }

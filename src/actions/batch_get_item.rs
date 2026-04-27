@@ -217,6 +217,7 @@ pub fn execute(storage: &Storage, request: BatchGetItemRequest) -> Result<BatchG
             }
 
             helpers::validate_key_only(key, &key_schema)?;
+            // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
             let (pk, sk) = helpers::extract_key_strings(key, &key_schema)?;
 
             if let Some(item_json) = storage.get_item(table_name, &pk, &sk)? {

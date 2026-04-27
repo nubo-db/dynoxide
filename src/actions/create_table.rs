@@ -418,7 +418,10 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
     // Use the shared constraint error collector for table name validation.
     // This produces the correct multi-field constraint format for empty,
     // too-short, too-long, or invalid-pattern table names.
-    let name_errors = crate::validation::table_name_constraint_errors(raw.table_name.as_deref());
+    let name_errors = crate::validation::table_name_constraint_errors(
+        raw.table_name.as_deref(),
+        crate::validation::TableNameContext::CreateTable,
+    );
     if !name_errors.is_empty() {
         let msg = format!(
             "{} validation error{} detected: {}",

@@ -74,10 +74,15 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{format_validation_errors, table_name_constraint_errors};
+        use crate::validation::{
+            format_validation_errors, table_name_constraint_errors, TableNameContext,
+        };
 
         let mut errors = Vec::new();
-        errors.extend(table_name_constraint_errors(raw.table_name.as_deref()));
+        errors.extend(table_name_constraint_errors(
+            raw.table_name.as_deref(),
+            TableNameContext::ReadWrite,
+        ));
         let table_name = raw.table_name.unwrap_or_default();
 
         // ReturnConsumedCapacity enum

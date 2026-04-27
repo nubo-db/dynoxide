@@ -53,13 +53,18 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = PutItemRequestRaw::deserialize(deserializer)?;
 
-        use crate::validation::{format_validation_errors, table_name_constraint_errors};
+        use crate::validation::{
+            format_validation_errors, table_name_constraint_errors, TableNameContext,
+        };
 
         // Collect constraint validation errors (DynamoDB checks all at once)
         let mut errors = Vec::new();
         let table_name_opt = raw.table_name.as_deref();
 
-        errors.extend(table_name_constraint_errors(table_name_opt));
+        errors.extend(table_name_constraint_errors(
+            table_name_opt,
+            TableNameContext::ReadWrite,
+        ));
         let table_name = raw.table_name.unwrap_or_default();
 
         // Item constraint validation

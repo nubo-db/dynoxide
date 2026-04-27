@@ -480,3 +480,58 @@ fn reserved_word_case_insensitive() {
         "Mixed-case reserved word should be rejected"
     );
 }
+
+// --------------------------------------------------------------------------
+// UpdateExpression / ProjectionExpression syntax error context
+// --------------------------------------------------------------------------
+
+#[test]
+fn update_expression_syntax_error_includes_quoted_token_and_near_window() {
+    // The conformance suite pins the AWS string for "INVALID SYNTAX HERE":
+    //   Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX"
+    let err = dynoxide::expressions::update::parse("INVALID SYNTAX HERE").unwrap_err();
+    assert_eq!(
+        err,
+        r#"Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX""#
+    );
+}
+
+#[test]
+fn projection_expression_tokenizer_error_includes_near_window() {
+    // The conformance suite pins the AWS string for "!!! INVALID !!!":
+    //   Invalid ProjectionExpression: Syntax error; token: "!", near: "!!"
+    let err = dynoxide::expressions::projection::parse("!!! INVALID !!!").unwrap_err();
+    assert_eq!(
+        err,
+        r#"Invalid ProjectionExpression: Syntax error; token: "!", near: "!!""#
+    );
+}
+
+#[test]
+fn update_expression_missing_eav_carries_invalid_update_expression_prefix() {
+    // R7: UpdateItem with `SET attr1 = :v` and no ExpressionAttributeValues should
+    // carry the `Invalid UpdateExpression:` prefix on the missing-EAV message.
+    use dynoxide::actions::create_table::CreateTableRequest;
+    use dynoxide::actions::update_item::UpdateItemRequest;
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "EavTbl",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+
+    let req: UpdateItemRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "EavTbl",
+        "Key": {"pk": {"S": "k1"}},
+        "UpdateExpression": "SET attr1 = :v"
+    }))
+    .unwrap();
+    let err = db.update_item(req).unwrap_err().to_string();
+    assert!(
+        err.starts_with("Invalid UpdateExpression: An expression attribute value used in expression is not defined"),
+        "Expected Invalid UpdateExpression: prefix on missing-EAV error, got: {err}"
+    );
+}

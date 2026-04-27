@@ -3,7 +3,9 @@
 //! Supports SET, REMOVE, ADD, DELETE clauses.
 
 use crate::expressions::condition::parse_raw_path;
-use crate::expressions::tokenizer::{Token, TokenStream, tokenize};
+use crate::expressions::tokenizer::{
+    Token, TokenStream, near_window_parser, near_window_tokenizer, tokenize,
+};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, remove_path, resolve_path, resolve_path_elements,
     set_path,
@@ -63,8 +65,19 @@ pub struct DeleteAction {
 
 /// Parse an UpdateExpression string.
 pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
-    let tokens =
-        tokenize(expr).map_err(|e| format!("Invalid UpdateExpression: Syntax error; {e}"))?;
+    let tokens = match tokenize(expr) {
+        Ok(t) => t,
+        Err(err) => {
+            // Tokenizer-level syntax error (e.g. stray `!` mid-expression):
+            // emit the same shape as parser-level errors, with a tokenizer-style
+            // near: window (offending byte plus at most one more non-whitespace byte).
+            let bad = &expr[err.position..err.position + err.bad_len];
+            let near = near_window_tokenizer(expr, err.position);
+            return Err(format!(
+                r#"Invalid UpdateExpression: Syntax error; token: "{bad}", near: "{near}""#
+            ));
+        }
+    };
     let mut stream = TokenStream::new(tokens);
 
     let mut set_actions = Vec::new();
@@ -111,9 +124,19 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 stream.next();
                 parse_delete_clause(&mut stream, &mut delete_actions).map_err(wrap_syntax_error)?;
             }
-            Some(t) => {
+            Some(_) => {
+                // Unexpected leading token where SET/REMOVE/ADD/DELETE was required.
+                // Build the AWS-style "token: \"X\", near: \"X Y\"" window from the
+                // offending token's span and the next token's span (if any).
+                let offending_span = stream
+                    .peek_span()
+                    .expect("peek_span must yield when peek did");
+                let bad = &expr[offending_span.start..offending_span.end()];
+                stream.next();
+                let next_span = stream.peek_span();
+                let near = near_window_parser(expr, offending_span, next_span);
                 return Err(format!(
-                    "Invalid UpdateExpression: Syntax error; token: {t}"
+                    r#"Invalid UpdateExpression: Syntax error; token: "{bad}", near: "{near}""#
                 ));
             }
             None => break,

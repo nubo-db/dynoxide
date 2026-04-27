@@ -172,6 +172,21 @@ pub struct UpdateItemResponse {
     pub item_collection_metrics: Option<crate::types::ItemCollectionMetrics>,
 }
 
+/// Apply the `Invalid UpdateExpression:` prefix to a sub-error message at the
+/// UpdateItem dispatch boundary. AWS DynamoDB tags the missing-EAV error
+/// (and similar UpdateExpression-scoped errors) with this prefix; the prefix
+/// must not leak into ConditionExpression contexts that share the same
+/// underlying validators in `crate::expressions::mod`. Idempotent so that
+/// errors which already carry the prefix (e.g. parser-level syntax errors)
+/// are not double-wrapped.
+fn wrap_invalid_update_expression(err: String) -> String {
+    if err.starts_with("Invalid UpdateExpression:") {
+        err
+    } else {
+        format!("Invalid UpdateExpression: {err}")
+    }
+}
+
 pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<UpdateItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
@@ -302,7 +317,7 @@ pub fn execute(storage: &Storage, mut request: UpdateItemRequest) -> Result<Upda
             &request.expression_attribute_values,
         );
         crate::expressions::update::track_references(&parsed, &tracker)
-            .map_err(DynoxideError::ValidationException)?;
+            .map_err(|e| DynoxideError::ValidationException(wrap_invalid_update_expression(e)))?;
 
         // Also walk the ConditionExpression to track its attribute usage
         if let Some(ref ce) = request.condition_expression {

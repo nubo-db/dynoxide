@@ -4,7 +4,7 @@
 //! Sort key conditions: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN ... AND ...`, `begins_with(sk, :prefix)`
 
 use crate::expressions::condition::parse_raw_path;
-use crate::expressions::tokenizer::{Token, TokenStream, tokenize};
+use crate::expressions::tokenizer::{Token, TokenSpan, TokenStream, tokenize};
 use crate::expressions::{PathElement, TrackedExpressionAttributes};
 use crate::types::AttributeValue;
 
@@ -255,19 +255,19 @@ impl ParsedCond {
 /// `(pk = :pk AND sk = :sk)` → `pk = :pk AND sk = :sk`
 /// `((pk = :pk))` → `pk = :pk` (applied repeatedly)
 /// `(pk = :pk) AND (sk = :sk)` → unchanged (closing paren is not at the end)
-fn strip_outer_parens(mut tokens: Vec<Token>) -> Vec<Token> {
+fn strip_outer_parens(mut tokens: Vec<(Token, TokenSpan)>) -> Vec<(Token, TokenSpan)> {
     loop {
         if tokens.len() < 2 {
             break;
         }
-        if !matches!(tokens.first(), Some(Token::LParen)) {
+        if !matches!(tokens.first().map(|(t, _)| t), Some(Token::LParen)) {
             break;
         }
         // Walk forward, tracking paren depth, to see if the opening paren's
         // match is the very last token.
         let mut depth = 0;
         let mut close_pos = None;
-        for (i, tok) in tokens.iter().enumerate() {
+        for (i, (tok, _)) in tokens.iter().enumerate() {
             match tok {
                 Token::LParen => depth += 1,
                 Token::RParen => {

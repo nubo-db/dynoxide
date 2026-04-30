@@ -26,6 +26,8 @@
 
 pub mod clock;
 pub mod error;
+#[cfg(feature = "native-sqlite")]
+pub mod rusqlite_impl;
 
 use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,

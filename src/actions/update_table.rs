@@ -444,7 +444,7 @@ pub fn execute(storage: &Storage, request: UpdateTableRequest) -> Result<UpdateT
                     .stream_view_type
                     .as_deref()
                     .unwrap_or("NEW_AND_OLD_IMAGES");
-                let label = streams::generate_stream_label();
+                let label = streams::generate_stream_label(storage.clock());
                 storage.enable_stream(&request.table_name, view_type, &label)?;
             } else {
                 storage.disable_stream(&request.table_name)?;

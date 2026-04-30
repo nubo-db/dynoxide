@@ -4,9 +4,9 @@
 
 use crate::errors::Result;
 use crate::storage::{Storage, TableMetadata};
+use crate::storage_backend::clock::Clock;
 use crate::types::{AttributeValue, Item};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Region used in ARNs for the local emulator.
 pub const LOCAL_REGION: &str = "dynoxide";
@@ -34,11 +34,15 @@ pub fn shard_id(table_name: &str) -> String {
 }
 
 /// Generate a stream label from the current timestamp.
-pub fn generate_stream_label() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}.{:09}", now.as_secs(), now.subsec_nanos())
+///
+/// The label format preserves the historical `<secs>.<nanos>` shape. The
+/// caller supplies the clock so production callers route through
+/// `Storage::clock()` while tests can pin time via `ManualClock`.
+pub fn generate_stream_label(clock: &dyn Clock) -> String {
+    let now_f64 = clock.now_unix_secs_f64();
+    let secs = now_f64.trunc() as u64;
+    let nanos = ((now_f64 - secs as f64) * 1_000_000_000.0) as u32;
+    format!("{secs}.{nanos:09}")
 }
 
 /// Extract only key attributes from an item given the key schema JSON.
@@ -104,10 +108,7 @@ pub fn record_stream_event(
 
     let seq_num = storage.next_stream_sequence_number(&meta.table_name)?;
     let sid = shard_id(&meta.table_name);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = storage.clock().now_unix_secs() as i64;
 
     storage.insert_stream_record(
         &meta.table_name,

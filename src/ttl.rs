@@ -7,7 +7,6 @@ use crate::errors::Result;
 use crate::storage::Storage;
 use crate::streams;
 use crate::types::{AttributeValue, Item};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// JSON representation of the TTL service identity for stream records.
 const TTL_USER_IDENTITY: &str = r#"{"type":"Service","principalId":"dynamodb.amazonaws.com"}"#;
@@ -16,10 +15,7 @@ const TTL_USER_IDENTITY: &str = r#"{"type":"Service","principalId":"dynamodb.ama
 ///
 /// Returns the total number of items deleted across all tables.
 pub fn sweep_expired_items(storage: &Storage) -> Result<usize> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = storage.clock().now_unix_secs();
 
     let tables = storage.list_ttl_enabled_tables()?;
     let mut total_deleted = 0;
@@ -129,10 +125,7 @@ fn record_ttl_stream_event(
 
     let seq_num = storage.next_stream_sequence_number(&meta.table_name)?;
     let sid = streams::shard_id(&meta.table_name);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = storage.clock().now_unix_secs() as i64;
 
     storage.insert_stream_record_with_identity(
         &meta.table_name,

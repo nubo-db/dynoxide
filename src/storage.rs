@@ -1,8 +1,10 @@
 use crate::errors::{DynoxideError, Result};
+use crate::storage_backend::clock::{Clock, SystemClock};
 use crate::types::AttributeValue;
 use rusqlite::{Connection, params};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Current schema version. Stored in the `_config` table for future migrations.
 const SCHEMA_VERSION: &str = "6";
@@ -237,6 +239,8 @@ pub struct Storage {
     /// In-memory cache of table metadata to avoid repeated SQLite reads.
     /// Safe to use `RefCell` because `Storage` is always behind `Arc<Mutex<>>`.
     metadata_cache: RefCell<HashMap<String, TableMetadata>>,
+    /// Wall-clock used by stream / TTL paths. Defaults to [`SystemClock`].
+    clock: Arc<dyn Clock>,
 }
 
 impl Storage {
@@ -246,9 +250,25 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            clock: Arc::new(SystemClock),
         };
         storage.initialize().map_err(Self::maybe_encrypted_error)?;
         Ok(storage)
+    }
+
+    /// Replace the [`Clock`] used by the stream and TTL paths. Returns `self`
+    /// so callers can chain construction (`Storage::memory()?.with_clock(c)`).
+    ///
+    /// Default for every constructor is [`SystemClock`]. Tests use this to
+    /// inject a `ManualClock`.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Borrow the active [`Clock`]. Used by stream and TTL paths.
+    pub(crate) fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
     }
 
     /// If a SQLite error is SQLITE_NOTADB, return a clearer error message
@@ -289,6 +309,7 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
         Ok(storage)
@@ -300,6 +321,7 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
         Ok(storage)

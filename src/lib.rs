@@ -52,6 +52,7 @@ pub mod server;
 #[cfg(feature = "mcp-server")]
 pub(crate) mod snapshots;
 pub mod storage;
+pub mod storage_backend;
 pub mod streams;
 pub mod ttl;
 pub mod types;
@@ -66,6 +67,7 @@ use std::time::Instant;
 
 pub use errors::{DynoxideError, Result};
 pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};
+pub use storage_backend::BackendError;
 pub use types::{AttributeValue, ConversionError, Item};
 
 /// Options for `Database::import_items()`.

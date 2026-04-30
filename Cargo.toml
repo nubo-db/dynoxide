@@ -26,6 +26,11 @@ encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
 mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc"]
 import = ["dep:clap", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
+# Compile-only wa-sqlite stub. Surfaces trait-shape drift at type-check
+# time so a real wa-sqlite backend does not absorb that drift later. Not
+# a working backend; bodies are unimplemented!().
+wasm-stub = []
+
 # Backward-compatible alias — identical to default features
 full = ["native-sqlite", "http-server", "mcp-server", "import"]
 

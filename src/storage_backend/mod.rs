@@ -3,9 +3,11 @@
 //! Defines the [`StorageBackend`] trait that decouples Dynoxide's data layer
 //! from a specific SQLite binding. The native [`rusqlite`]-backed
 //! [`Storage`](crate::storage::Storage) implements the trait. A compile-only
-//! wa-sqlite stub implements it on `wasm32-unknown-unknown` so trait-shape
-//! drift surfaces at type-check time rather than once a real wa-sqlite
-//! backend is wired up.
+//! wa-sqlite stub gated behind the `wasm-stub` feature also implements it,
+//! so trait-shape drift surfaces at type-check time rather than once a real
+//! wa-sqlite backend is wired up. Building dynoxide for a non-native target
+//! (e.g., `wasm32-unknown-unknown` itself) is not yet supported; the stub
+//! validates the trait surface, not the rest of the codebase.
 //!
 //! Today the trait is consumed monomorphically. Nothing constructs
 //! `dyn StorageBackend`, nothing awaits it at runtime in production code.
@@ -28,6 +30,8 @@ pub mod clock;
 pub mod error;
 #[cfg(feature = "native-sqlite")]
 pub mod rusqlite_impl;
+#[cfg(feature = "wasm-stub")]
+pub mod wasm_stub;
 
 use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,

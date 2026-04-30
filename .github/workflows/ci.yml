@@ -75,3 +75,15 @@ jobs:
             echo "ERROR: no SQLite backend should cause compile_error!"
             exit 1
           fi
+
+  wasm-stub-check:
+    name: wasm-stub trait-shape check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --features wasm-stub
+        run: cargo check --features wasm-stub --lib

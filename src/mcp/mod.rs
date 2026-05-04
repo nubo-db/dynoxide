@@ -83,9 +83,19 @@ pub async fn serve_http_with_shutdown(
 
     eprintln!("MCP HTTP server listening on http://{local_addr}/mcp");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { ct.cancelled_owned().await })
-        .await?;
+    // Don't use with_graceful_shutdown for the MCP transport: persistent
+    // Streamable-HTTP sessions held open by MCP clients (Claude Code, Cursor,
+    // etc.) don't close on their own, so the drain phase can hang
+    // indefinitely. Race the cancellation against the serve future and drop
+    // the serve future on cancel; the listener closes, this function returns,
+    // and the surrounding tokio::join! in main.rs proceeds so the process
+    // exits.
+    use std::future::IntoFuture;
+    let serve_fut = axum::serve(listener, router).into_future();
+    tokio::select! {
+        res = serve_fut => res?,
+        _ = ct.cancelled_owned() => {}
+    }
 
     Ok(())
 }

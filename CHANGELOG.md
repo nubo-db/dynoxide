@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.11] - 2026-05-04
+
+### Fixed
+
+- `dynoxide serve --mcp` now exits cleanly on Ctrl+C when an MCP client (Claude Code, Cursor) is holding a connection open. The MCP server's graceful-shutdown drain used to wait for those connections forever, hanging the process until something SIGKILLed it ([#22](https://github.com/nubo-db/dynoxide/issues/22))
+
+### Security
+
+- Refresh `Cargo.lock` for the dependabot patches reachable within MSRV: `aws-lc-sys` 0.37.1 to 0.40.0 (5 high-severity AWS-LC issues), `openssl` 0.10.75 to 0.10.79 (5 buffer-overflow advisories), `rand` 0.8.5 to 0.8.6. Remaining `rustls-webpki` / `time` / `aws-sdk-dynamodb` alerts are dev-dependency only (test-suite AWS SDK chain, not the production binary) and stay pinned by MSRV 1.85 until v0.10.0
+
 ## [0.9.10] - 2026-04-27
 
 ### Fixed

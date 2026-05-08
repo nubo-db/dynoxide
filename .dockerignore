@@ -1,0 +1,7 @@
+# The build context only needs the prebuilt binaries that the release
+# workflow stages under dist/. Everything else stays out so the context
+# uploaded to buildx is a few MB rather than the whole repo.
+
+*
+!dist/
+!dist/**

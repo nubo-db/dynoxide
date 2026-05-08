@@ -7,7 +7,7 @@ name: Release
 # then let this workflow do the rest.
 #
 # Flow: validate -> build (5 targets) -> github-release -> publish-crate
-# (review gate) -> publish-homebrew + publish-npm in parallel.
+# (review gate) -> publish-homebrew + publish-npm + publish-docker in parallel.
 
 on:
   push:
@@ -324,3 +324,185 @@ jobs:
             -f ref=main \
             -f "inputs[tag]=$TAG"
           echo "Dispatched npm.yml with tag $TAG"
+
+  # -------------------------------------------------------------------
+  # Build and push multi-arch Docker images. GHCR is canonical and
+  # gating; Docker Hub and ECR Public are best-effort mirrors.
+  # -------------------------------------------------------------------
+  publish-docker:
+    name: Publish Docker image
+    needs: [validate, publish-crate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage prebuilt linux-musl binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf dist staging
+          mkdir -p dist/amd64 dist/arm64 staging
+          gh release download "$TAG" \
+            --repo nubo-db/dynoxide \
+            --pattern '*linux-musl.tar.gz' \
+            --dir staging/
+          tar -xzf staging/dynoxide-x86_64-unknown-linux-musl.tar.gz -C dist/amd64/
+          tar -xzf staging/dynoxide-aarch64-unknown-linux-musl.tar.gz -C dist/arm64/
+          chmod +x dist/amd64/dynoxide dist/arm64/dynoxide
+          # Fail loud if either slot holds the wrong arch.
+          file dist/amd64/dynoxide
+          file dist/arm64/dynoxide
+          file dist/amd64/dynoxide | grep -q 'x86-64'
+          file dist/arm64/dynoxide | grep -q 'aarch64'
+
+      # QEMU is for the post-push verification step that runs the arm64
+      # image on the amd64 runner. The build itself is pure COPY.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        id: ghcr-login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        id: dockerhub-login
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configure AWS credentials for ECR Public
+        id: aws-creds
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_PUBLIC_PUBLISH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to ECR Public
+        id: ecr-public-login
+        continue-on-error: true
+        if: steps.aws-creds.outcome == 'success'
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+
+      - name: Build and push to GHCR
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Verify published image runs on both architectures
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ needs.validate.outputs.version }}
+          EXPECTED: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in linux/amd64 linux/arm64; do
+            echo "Probing $IMAGE on $arch"
+            actual=$(docker run --rm --pull=always --platform "$arch" "$IMAGE" --version | awk '{print $NF}')
+            echo "  reported: $actual"
+            if [ "$actual" != "$EXPECTED" ]; then
+              echo "::error::$arch reported version $actual, expected $EXPECTED"
+              exit 1
+            fi
+          done
+
+      - name: Attest build provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Mirror to Docker Hub
+        id: mirror-dockerhub
+        if: ${{ !cancelled() && steps.dockerhub-login.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          echo "$META_JSON" | jq -r '.tags[]' | while read -r src_tag; do
+            tag="${src_tag##*:}"
+            echo "Mirroring $src_tag -> docker.io/nubodb/dynoxide:${tag}"
+            docker buildx imagetools create \
+              -t "docker.io/nubodb/dynoxide:${tag}" \
+              "$src_tag"
+          done
+
+      - name: Mirror to ECR Public
+        id: mirror-ecr
+        if: ${{ !cancelled() && steps.ecr-public-login.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          echo "$META_JSON" | jq -r '.tags[]' | while read -r src_tag; do
+            tag="${src_tag##*:}"
+            echo "Mirroring $src_tag -> public.ecr.aws/nubodb/dynoxide:${tag}"
+            docker buildx imagetools create \
+              -t "public.ecr.aws/nubodb/dynoxide:${tag}" \
+              "$src_tag"
+          done
+
+      - name: Publish summary
+        if: ${{ !cancelled() }}
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+          GHCR_OUTCOME: ${{ steps.build.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          DOCKERHUB_OUTCOME: ${{ steps.mirror-dockerhub.outcome }}
+          ECR_OUTCOME: ${{ steps.mirror-ecr.outcome }}
+        run: |
+          {
+            echo "## Docker publish summary"
+            echo
+            echo "| Surface | Outcome |"
+            echo "| --- | --- |"
+            echo "| GHCR push | ${GHCR_OUTCOME} |"
+            echo "| Provenance attestation | ${ATTEST_OUTCOME} |"
+            echo "| Docker Hub mirror | ${DOCKERHUB_OUTCOME:-skipped} |"
+            echo "| ECR Public mirror | ${ECR_OUTCOME:-skipped} |"
+            echo
+            echo "### Pushed tags"
+            echo
+            echo "$META_JSON" | jq -r '.tags[] | "- `\(.)`"'
+          } >> "$GITHUB_STEP_SUMMARY"

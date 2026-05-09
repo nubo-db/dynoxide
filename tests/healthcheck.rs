@@ -46,13 +46,7 @@ fn fails_fast_on_unused_port() {
     };
     let started = Instant::now();
     let status = Command::new(dynoxide_bin())
-        .args([
-            "healthcheck",
-            "--port",
-            &port.to_string(),
-            "--timeout",
-            "2",
-        ])
+        .args(["healthcheck", "--port", &port.to_string(), "--timeout", "2"])
         .status()
         .expect("spawn dynoxide");
     let elapsed = started.elapsed();
@@ -87,22 +81,13 @@ fn times_out_on_listener_that_never_writes() {
     // on its read budget rather than hang forever.
     std::thread::spawn(move || {
         let mut held = Vec::new();
-        loop {
-            match listener.accept() {
-                Ok((s, _)) => held.push(s),
-                Err(_) => break,
-            }
+        while let Ok((s, _)) = listener.accept() {
+            held.push(s);
         }
     });
     let started = Instant::now();
     let status = Command::new(dynoxide_bin())
-        .args([
-            "healthcheck",
-            "--port",
-            &port.to_string(),
-            "--timeout",
-            "1",
-        ])
+        .args(["healthcheck", "--port", &port.to_string(), "--timeout", "1"])
         .status()
         .expect("spawn dynoxide");
     let elapsed = started.elapsed();
@@ -135,10 +120,7 @@ async fn rewrites_ipv4_wildcard_host() {
         .await
         .expect("spawn dynoxide");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "expected exit 0; stderr: {stderr}"
-    );
+    assert!(output.status.success(), "expected exit 0; stderr: {stderr}");
     assert!(
         stderr.contains("rewriting wildcard host 0.0.0.0"),
         "stderr did not mention wildcard rewrite: {stderr}"

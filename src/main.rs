@@ -603,7 +603,10 @@ fn do_healthcheck(args: HealthcheckArgs) -> Result<(), String> {
             "127.0.0.1".to_string()
         }
         "::" | "[::]" => {
-            eprintln!("healthcheck: rewriting wildcard host {} to ::1 for probe", args.host);
+            eprintln!(
+                "healthcheck: rewriting wildcard host {} to ::1 for probe",
+                args.host
+            );
             "::1".to_string()
         }
         h => h.to_string(),

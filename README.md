@@ -148,7 +148,7 @@ docker run --rm -p 8000:8000 \
   serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
 ```
 
-The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubodb/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
+The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
 
 If you override `CMD` to bind to a different port, set the healthcheck target with environment variables so the container's `HEALTHCHECK` follows:
 

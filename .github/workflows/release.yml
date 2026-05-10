@@ -477,9 +477,9 @@ jobs:
           set -euo pipefail
           echo "$META_JSON" | jq -r '.tags[]' | while read -r src_tag; do
             tag="${src_tag##*:}"
-            echo "Mirroring $src_tag -> public.ecr.aws/nubodb/dynoxide:${tag}"
+            echo "Mirroring $src_tag -> public.ecr.aws/nubo-db/dynoxide:${tag}"
             docker buildx imagetools create \
-              -t "public.ecr.aws/nubodb/dynoxide:${tag}" \
+              -t "public.ecr.aws/nubo-db/dynoxide:${tag}" \
               "$src_tag"
           done
 

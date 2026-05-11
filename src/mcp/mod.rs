@@ -56,6 +56,8 @@ pub async fn serve_http_with_shutdown(
     let ct = shutdown.unwrap_or_default();
     let db = Arc::new(db);
 
+    // load-bearing: rmcp's config struct is #[non_exhaustive], so struct-literal
+    // init does not compile. Keep the field-reassign block.
     #[allow(clippy::field_reassign_with_default)]
     let http_config = {
         let mut c = StreamableHttpServerConfig::default();
@@ -63,6 +65,13 @@ pub async fn serve_http_with_shutdown(
         c.json_response = true;
         c.sse_keep_alive = None;
         c.cancellation_token = ct.clone();
+        // Explicit DNS rebinding defences. Stating the lists protects against an
+        // rmcp default flip. Native clients pass because rmcp skips Origin
+        // validation when the header is absent (rmcp 1.6.0 tower.rs:385-387).
+        // allowed_origins is IPv4-loopback-only; add http://[::1] when dynoxide
+        // binds [::1] and https://* if TLS-on-loopback lands.
+        c.allowed_hosts = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+        c.allowed_origins = vec!["http://localhost".into(), "http://127.0.0.1".into()];
         c
     };
 

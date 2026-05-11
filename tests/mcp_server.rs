@@ -1197,6 +1197,97 @@ fn test_http_transport() {
     let _ = child.wait();
 }
 
+// Regression: rmcp 1.4+ ships a Host-header allowlist defaulting to
+// ["localhost", "127.0.0.1", "::1"] to defend the Streamable HTTP transport
+// against DNS rebinding (CVE-2026-42559 / GHSA-89vp-x53w-74fx). dynoxide binds
+// only to 127.0.0.1, so the default matches the bind surface and we rely on it
+// rather than calling with_allowed_hosts explicitly. This test locks the
+// behaviour in so a future config refactor or rmcp default flip cannot silently
+// regress the protection.
+#[test]
+fn test_http_transport_rejects_foreign_host() {
+    use std::io::Read;
+
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut child = Command::new(binary)
+        .args(["mcp", "--http", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp --http");
+
+    let mut ready = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "MCP HTTP server did not start within 5 seconds");
+
+    let init_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"}
+        }
+    });
+    let body = serde_json::to_string(&init_body).unwrap();
+
+    let send_with_host = |host: &str| -> String {
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let loopback_response = send_with_host(&format!("127.0.0.1:{port}"));
+    assert!(
+        loopback_response.starts_with("HTTP/1.1 2"),
+        "Loopback Host should be accepted with 2xx, got: {loopback_response}"
+    );
+    assert!(
+        loopback_response.contains("dynoxide"),
+        "Loopback response should contain server name, got: {loopback_response}"
+    );
+
+    // Body wording is rmcp-internal and may change across minor releases; assert
+    // only on the status line, which is the security-relevant contract.
+    let foreign_response = send_with_host("evil.example.com");
+    assert!(
+        foreign_response.starts_with("HTTP/1.1 403"),
+        "Foreign Host should be rejected with 403, got: {foreign_response}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 // ---------------------------------------------------------------------------
 // Data model (--data-model) tests
 // ---------------------------------------------------------------------------

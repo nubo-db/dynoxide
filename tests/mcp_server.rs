@@ -1197,16 +1197,26 @@ fn test_http_transport() {
     let _ = child.wait();
 }
 
-// Regression: rmcp 1.4+ ships a Host-header allowlist defaulting to
-// ["localhost", "127.0.0.1", "::1"] to defend the Streamable HTTP transport
-// against DNS rebinding (CVE-2026-42559 / GHSA-89vp-x53w-74fx). dynoxide binds
-// only to 127.0.0.1, so the default matches the bind surface and we rely on it
-// rather than calling with_allowed_hosts explicitly. This test locks the
-// behaviour in so a future config refactor or rmcp default flip cannot silently
-// regress the protection.
+// Regression for CVE-2026-42559 / GHSA-89vp-x53w-74fx (DNS rebinding against
+// rmcp's Streamable HTTP transport). src/mcp/mod.rs sets allowed_hosts and
+// allowed_origins explicitly; this test locks both in. Asserts on rmcp's
+// rejection-reason body so a future 403 emitted from elsewhere can't masquerade
+// as the Host or Origin check still working.
 #[test]
-fn test_http_transport_rejects_foreign_host() {
+fn test_http_transport_dns_rebinding_defences() {
     use std::io::Read;
+
+    // Kill the child on every exit path, including panic between spawn and the
+    // final assertion. std::process::Child does not kill on drop, so a panicked
+    // test would otherwise leak a dynoxide process holding the loopback port and
+    // flake subsequent runs.
+    struct ChildKiller(std::process::Child);
+    impl Drop for ChildKiller {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     let binary = env!("CARGO_BIN_EXE_dynoxide");
 
@@ -1214,13 +1224,14 @@ fn test_http_transport_rejects_foreign_host() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let mut child = Command::new(binary)
+    let child = Command::new(binary)
         .args(["mcp", "--http", "--port", &port.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn dynoxide mcp --http");
+    let _kill_on_drop = ChildKiller(child);
 
     let mut ready = false;
     for _ in 0..50 {
@@ -1244,14 +1255,19 @@ fn test_http_transport_rejects_foreign_host() {
     });
     let body = serde_json::to_string(&init_body).unwrap();
 
-    let send_with_host = |host: &str| -> String {
+    let send = |host: &str, origin: Option<&str>| -> String {
         let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
+        let origin_line = match origin {
+            Some(o) => format!("Origin: {o}\r\n"),
+            None => String::new(),
+        };
         let request = format!(
             "POST /mcp HTTP/1.1\r\n\
              Host: {host}\r\n\
+             {origin_line}\
              Content-Type: application/json\r\n\
              Accept: application/json, text/event-stream\r\n\
              Content-Length: {}\r\n\
@@ -1266,26 +1282,41 @@ fn test_http_transport_rejects_foreign_host() {
         String::from_utf8_lossy(&buf).into_owned()
     };
 
-    let loopback_response = send_with_host(&format!("127.0.0.1:{port}"));
+    // Ordering is load-bearing: with stateful_mode=false the Host and Origin
+    // checks run before session lookup, so per-request rejection cannot leak
+    // state. If stateful_mode ever flips, revisit this ordering.
+    let loopback = send(&format!("127.0.0.1:{port}"), None);
     assert!(
-        loopback_response.starts_with("HTTP/1.1 2"),
-        "Loopback Host should be accepted with 2xx, got: {loopback_response}"
+        loopback.starts_with("HTTP/1.1 2"),
+        "Loopback Host should be accepted with 2xx, got: {loopback}"
     );
     assert!(
-        loopback_response.contains("dynoxide"),
-        "Loopback response should contain server name, got: {loopback_response}"
-    );
-
-    // Body wording is rmcp-internal and may change across minor releases; assert
-    // only on the status line, which is the security-relevant contract.
-    let foreign_response = send_with_host("evil.example.com");
-    assert!(
-        foreign_response.starts_with("HTTP/1.1 403"),
-        "Foreign Host should be rejected with 403, got: {foreign_response}"
+        loopback.contains("dynoxide"),
+        "Loopback response should contain server name, got: {loopback}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    let foreign_host = send("evil.example.com", None);
+    assert!(
+        foreign_host.starts_with("HTTP/1.1 403"),
+        "Foreign Host should be rejected with 403, got: {foreign_host}"
+    );
+    assert!(
+        foreign_host.contains("Host header is not allowed"),
+        "Foreign Host rejection should name the Host check, got: {foreign_host}"
+    );
+
+    let foreign_origin = send(
+        &format!("127.0.0.1:{port}"),
+        Some("https://evil.example.com"),
+    );
+    assert!(
+        foreign_origin.starts_with("HTTP/1.1 403"),
+        "Foreign Origin should be rejected with 403, got: {foreign_origin}"
+    );
+    assert!(
+        foreign_origin.contains("Origin header is not allowed"),
+        "Foreign Origin rejection should name the Origin check, got: {foreign_origin}"
+    );
 }
 
 // ---------------------------------------------------------------------------

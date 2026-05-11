@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.13] - 2026-05-11
+
+### Security
+
+- Close a DNS rebinding vulnerability in the MCP HTTP transport
+  ([GHSA-89vp-x53w-74fx](https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-89vp-x53w-74fx) /
+  [CVE-2026-42559](https://www.cve.org/CVERecord?id=CVE-2026-42559)) by upgrading `rmcp`
+  from 1.1.1 to 1.6.0 in both lockfiles. A malicious page could make the
+  user's browser send requests to a loopback MCP server with a non-loopback
+  `Host` header, which the server would then process. Affects 0.9.3 to 0.9.12.
+  Users running `dynoxide mcp --http` or `dynoxide serve --mcp` should
+  upgrade; stdio transport is unaffected.
+
+- Close a related cross-origin CSRF gap: a page could `fetch` the loopback
+  endpoint with `mode: 'no-cors'`, and the Host check would pass while the
+  Origin header went unchecked. Affected write tools: `put_item`,
+  `update_item`, `delete_item`, `create_table`, and `batch_write_item`.
+  Fixed by setting an explicit Host and Origin allowlist on
+  `StreamableHttpServerConfig`. Native MCP clients (Claude Code, Cursor,
+  the dynoxide CLI) don't send an Origin header and are unaffected.
+
 ## [0.9.12] - 2026-05-04
 
 ### Fixed

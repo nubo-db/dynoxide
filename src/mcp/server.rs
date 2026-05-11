@@ -1,7 +1,7 @@
 //! MCP server implementation with tool definitions.
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::schemars;
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
@@ -53,7 +53,6 @@ impl Default for McpConfig {
 
 #[derive(Clone)]
 pub struct McpServer {
-    tool_router: ToolRouter<Self>,
     db: Arc<Database>,
     config: McpConfig,
 }
@@ -636,11 +635,7 @@ impl McpServer {
     }
 
     pub fn with_config(db: Arc<Database>, config: McpConfig) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            db,
-            config,
-        }
+        Self { db, config }
     }
 
     /// Reject the call if the server is in read-only mode.

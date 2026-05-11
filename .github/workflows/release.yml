@@ -324,3 +324,28 @@ jobs:
             -f ref=main \
             -f "inputs[tag]=$TAG"
           echo "Dispatched npm.yml with tag $TAG"
+
+  # -------------------------------------------------------------------
+  # Notify dynoxide.dev so the marketing site rebuilds and the banner /
+  # changelog pick up the new version. The site reads CHANGELOG.md from
+  # this repo at build time, so it only needs a kick.
+  # -------------------------------------------------------------------
+  notify-site:
+    name: Trigger dynoxide.dev rebuild
+    needs: [validate, publish-crate, publish-homebrew, publish-npm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Dispatch dynoxide.dev deploy
+        env:
+          GH_TOKEN: ${{ secrets.DYNOXIDE_SITE_DISPATCH_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh api repos/nubo-db/dynoxide.dev/dispatches \
+            -X POST \
+            -f event_type=dynoxide-release \
+            -f "client_payload[version]=$VERSION" \
+            -f "client_payload[tag]=$TAG"
+          echo "Dispatched dynoxide-release event for $TAG"

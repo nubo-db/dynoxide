@@ -86,6 +86,7 @@ pub async fn serve_http_with_shutdown(
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
+    // If you widen this bind, update c.allowed_origins above too (see comment near allowed_hosts).
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_addr = listener.local_addr()?;

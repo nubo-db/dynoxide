@@ -6,3 +6,4 @@
 tests/external/dynalite/
 tests/external/results/
 .claude/worktrees/
+.worktrees

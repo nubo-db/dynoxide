@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Official Docker image. `docker run -p 8000:8000 ghcr.io/nubo-db/dynoxide` is a ~5 MB drop-in for `amazon/dynamodb-local` in containerised test suites: multi-arch (`linux/amd64` and `linux/arm64`), `FROM scratch`, published to GHCR on each release with Docker Hub and ECR Public mirrors pushed best-effort. The image ships a `HEALTHCHECK` backed by a new `dynoxide healthcheck` subcommand, so `docker ps` and Compose health gates report status without extra tooling ([#3](https://github.com/nubo-db/dynoxide/issues/3)).
 - `SECURITY.md`, setting out the MCP HTTP transport's loopback-only threat model: what the Host and Origin allowlists cover, what they don't, and where it's safe to run until authentication ([#27](https://github.com/nubo-db/dynoxide/issues/27)) lands.
 
+### Fixed
+
+- Tighter expression and scan validation, to match what real DynamoDB rejects
+  (surfaced by the conformance suite). Dynoxide now turns away redundant
+  parentheses like `((a = :b))` in condition, filter, and key-condition
+  expressions; `contains(x, x)` with the same operand on both sides; and
+  `begins_with` handed a number instead of a string or binary. These are
+  rejected up front, before any items are scanned
+  ([#31](https://github.com/nubo-db/dynoxide/issues/31)).
+- `size()` now measures strings in UTF-16 code units rather than bytes, so
+  values with emoji or accented characters report the length DynamoDB returns.
+- A negative `Segment` on a parallel scan is now rejected rather than accepted.
+
 ## [0.9.13] - 2026-05-11
 
 ### Security

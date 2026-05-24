@@ -2,7 +2,7 @@
 //!
 //! Both use identical syntax: comparisons, functions, BETWEEN, IN, AND/OR/NOT.
 
-use crate::expressions::tokenizer::{Token, TokenStream, tokenize};
+use crate::expressions::tokenizer::{Token, TokenStream, check_redundant_parens, tokenize};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, resolve_path, resolve_path_elements,
 };
@@ -62,7 +62,7 @@ pub enum CompOp {
 }
 
 /// An operand in an expression.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     /// A document path (e.g., `attr`, `a.b[0].c`, `#name.sub`)
     Path(Vec<PathElement>),
@@ -78,6 +78,7 @@ pub enum Operand {
 /// prefix — callers must add the appropriate prefix for their expression type.
 pub fn parse(expr: &str) -> Result<ConditionExpr, String> {
     let tokens = tokenize(expr).map_err(|e| e.to_string())?;
+    check_redundant_parens(&tokens)?;
     let mut stream = TokenStream::new(tokens);
     let result = parse_or(&mut stream)?;
     if !stream.at_end() {
@@ -529,7 +530,9 @@ fn resolve_operand(
             match resolve_path(item, &resolved) {
                 Some(val) => {
                     let size = match &val {
-                        AttributeValue::S(s) => s.len(),
+                        // DynamoDB measures string size in UTF-16 code units,
+                        // not UTF-8 bytes (so a surrogate pair counts as 2).
+                        AttributeValue::S(s) => s.encode_utf16().count(),
                         AttributeValue::B(b) => b.len(),
                         AttributeValue::SS(set) => set.len(),
                         AttributeValue::NS(set) => set.len(),
@@ -735,6 +738,69 @@ fn track_cond_path_refs(
 /// - Correct ordering (lower bound must not be greater than upper bound)
 ///
 /// This validation happens before table lookup, matching DynamoDB behaviour.
+/// Semantic validation that needs resolved names and/or values: rejects
+/// `contains(x, x)` (operands must be distinct) and `begins_with(_, :v)` where
+/// the value operand is not a string or binary. Returns the raw reason; callers
+/// add the `Invalid <X>Expression:` prefix. Runs before execution, so it
+/// rejects on empty tables the way real DynamoDB does.
+pub fn validate_operand_semantics(
+    expr: &ConditionExpr,
+    names: &Option<HashMap<String, String>>,
+    values: &Option<HashMap<String, AttributeValue>>,
+) -> Result<(), String> {
+    match expr {
+        ConditionExpr::Contains(first, rest) => {
+            if first == rest {
+                return Err(format!(
+                    "The first operand must be distinct from the remaining operands for this operator or function; operator: contains, first operand: [{}]",
+                    render_operand_name(first, names)
+                ));
+            }
+            Ok(())
+        }
+        ConditionExpr::BeginsWith(_, prefix) => {
+            if let Operand::ValueRef(vname) = prefix {
+                if let Some(v) = values.as_ref().and_then(|m| m.get(vname.as_str())) {
+                    if !matches!(v, AttributeValue::S(_) | AttributeValue::B(_)) {
+                        return Err(format!(
+                            "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {}",
+                            v.type_name()
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        ConditionExpr::And(a, b) | ConditionExpr::Or(a, b) => {
+            validate_operand_semantics(a, names, values)?;
+            validate_operand_semantics(b, names, values)
+        }
+        ConditionExpr::Not(inner) => validate_operand_semantics(inner, names, values),
+        _ => Ok(()),
+    }
+}
+
+/// Render an operand's path for error messages, resolving `#name` aliases.
+fn render_operand_name(op: &Operand, names: &Option<HashMap<String, String>>) -> String {
+    let elems = match op {
+        Operand::Path(elems) | Operand::Size(elems) => elems,
+        Operand::ValueRef(name) => return name.clone(),
+    };
+    elems
+        .iter()
+        .map(|e| match e {
+            PathElement::Attribute(a) if a.starts_with('#') => names
+                .as_ref()
+                .and_then(|m| m.get(a))
+                .cloned()
+                .unwrap_or_else(|| a.clone()),
+            PathElement::Attribute(a) => a.clone(),
+            PathElement::Index(i) => format!("[{i}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 pub fn validate_static(
     expr: &ConditionExpr,
     values: &Option<HashMap<String, AttributeValue>>,

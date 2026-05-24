@@ -383,6 +383,51 @@ pub fn near_window_tokenizer(source: &str, position: usize) -> &str {
     &source[position..end]
 }
 
+/// Detect redundant parentheses, matching DynamoDB's rule: a parenthesised
+/// group whose entire content is itself a single parenthesised group, e.g.
+/// `((expr))` or `((a)) AND (b)`. A single wrap like `(expr)` is fine, and a
+/// wrap around a real combination like `((a) AND (b))` is fine. Shared by
+/// condition/filter and key-condition parsing. Returns the raw reason; callers
+/// add the `Invalid <X>Expression:` prefix.
+pub fn check_redundant_parens(tokens: &[(Token, TokenSpan)]) -> Result<(), String> {
+    let toks: Vec<&Token> = tokens.iter().map(|(t, _)| t).collect();
+    let match_close = |open: usize| -> Option<usize> {
+        let mut depth = 0;
+        for (j, tok) in toks.iter().enumerate().skip(open) {
+            match tok {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    for i in 0..toks.len() {
+        if !matches!(toks[i], Token::LParen) {
+            continue;
+        }
+        let Some(outer_close) = match_close(i) else {
+            continue;
+        };
+        // Redundant when the outer group's entire content is a single
+        // parenthesised group: the token after the outer `(` is itself `(`
+        // and its match sits immediately before the outer `)`.
+        if matches!(toks.get(i + 1), Some(Token::LParen)) {
+            if let Some(inner_close) = match_close(i + 1) {
+                if inner_close == outer_close - 1 {
+                    return Err("The expression has redundant parentheses;".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

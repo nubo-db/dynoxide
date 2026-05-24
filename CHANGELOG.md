@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Official Docker image. `docker run -p 8000:8000 ghcr.io/nubo-db/dynoxide` is a ~5 MB drop-in for `amazon/dynamodb-local` in containerised test suites: multi-arch (`linux/amd64` and `linux/arm64`), `FROM scratch`, published to GHCR on each release with Docker Hub and ECR Public mirrors pushed best-effort. The image ships a `HEALTHCHECK` backed by a new `dynoxide healthcheck` subcommand, so `docker ps` and Compose health gates report status without extra tooling ([#3](https://github.com/nubo-db/dynoxide/issues/3)).
+- `SECURITY.md`, setting out the MCP HTTP transport's loopback-only threat model: what the Host and Origin allowlists cover, what they don't, and where it's safe to run until authentication ([#27](https://github.com/nubo-db/dynoxide/issues/27)) lands.
+
 ## [0.9.13] - 2026-05-11
 
 ### Security

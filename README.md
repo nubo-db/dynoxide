@@ -130,6 +130,53 @@ dynoxide-rs = { version = "0.9", default-features = false, features = ["native-s
 
 See [action/action.yml](action/action.yml) for all inputs and outputs.
 
+### Docker
+
+A 5 MB drop-in for `amazon/dynamodb-local` in containerised test suites. Same DynamoDB-compatible API, faster startup, smaller image. Note that this is a packaging convenience for test fixtures, not a containerised database product; production-database-on-Kubernetes patterns are out of scope.
+
+```sh
+docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
+```
+
+With persistent storage:
+
+```sh
+docker run --rm -p 8000:8000 \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/nubo-db/dynoxide \
+  serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
+```
+
+The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
+
+If you override `CMD` to bind to a different port, set the healthcheck target with environment variables so the container's `HEALTHCHECK` follows:
+
+```sh
+docker run -e DYNOXIDE_HEALTHCHECK_PORT=9000 ghcr.io/nubo-db/dynoxide serve --port 9000
+```
+
+`DYNOXIDE_HEALTHCHECK_HOST` and `DYNOXIDE_HEALTHCHECK_PORT` are documented public surface and will not be renamed in a patch or minor release.
+
+#### Running as nonroot
+
+For security-conscious operators, opt into a nonroot uid:
+
+```sh
+docker run --rm -p 8000:8000 --user 65532:65532 ghcr.io/nubo-db/dynoxide
+```
+
+Persistent mode under nonroot needs a host-owned bind mount, since the in-image `/data` is owned by root:
+
+```sh
+docker run --rm -p 8000:8000 \
+  --user "$(id -u):$(id -g)" \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/nubo-db/dynoxide \
+  serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
+```
+
+The default in-memory mode needs no flags whether root or nonroot. The uid 65532 is the well-known nonroot uid used by Google's distroless images; pick any uid you prefer with `--user <uid>:<gid>`.
+
 ## HTTP Server
 
 Start the server:

@@ -9,7 +9,8 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # required for npm OIDC provenance dry-run
+  id-token: write  # required for npm OIDC provenance dry-run and ECR Public OIDC
+  packages: read   # required for GHCR auth probe
 
 jobs:
   preflight:
@@ -73,6 +74,42 @@ jobs:
           fi
           echo "Homebrew tap access confirmed"
 
+      # --- GHCR ---------------------------------------------------------
+      - name: GHCR auth probe
+        id: ghcr-check
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- Docker Hub ---------------------------------------------------
+      - name: Docker Hub auth probe
+        id: dockerhub-check
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --- ECR Public ---------------------------------------------------
+      - name: ECR Public AWS credentials probe
+        id: ecr-public-creds
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_PUBLIC_PUBLISH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: ECR Public auth token probe
+        id: ecr-public-check
+        if: steps.ecr-public-creds.outcome == 'success'
+        continue-on-error: true
+        # Discard the token output so GitHub's secret masking does not have to
+        # race the runner log buffer.
+        run: aws ecr-public get-authorization-token --region us-east-1 --query 'authorizationData.authorizationToken' --output text > /dev/null
+
       # --- Summary and final gate ---------------------------------------
       - name: Preflight summary
         if: always()
@@ -80,6 +117,9 @@ jobs:
           CARGO_OUTCOME: ${{ steps.cargo-check.outcome }}
           NPM_OUTCOME: ${{ steps.npm-check.outcome }}
           HOMEBREW_OUTCOME: ${{ steps.homebrew-check.outcome }}
+          GHCR_OUTCOME: ${{ steps.ghcr-check.outcome }}
+          DOCKERHUB_OUTCOME: ${{ steps.dockerhub-check.outcome }}
+          ECR_OUTCOME: ${{ steps.ecr-public-check.outcome }}
         run: |
           {
             echo "## Release Preflight"
@@ -89,6 +129,9 @@ jobs:
             echo "| cargo publish --dry-run | $CARGO_OUTCOME |"
             echo "| npm publish --dry-run --provenance (meta) | $NPM_OUTCOME |"
             echo "| Homebrew tap write-access probe | $HOMEBREW_OUTCOME |"
+            echo "| GHCR auth probe | $GHCR_OUTCOME |"
+            echo "| Docker Hub auth probe | $DOCKERHUB_OUTCOME |"
+            echo "| ECR Public auth probe | ${ECR_OUTCOME:-skipped} |"
             echo ""
             echo "Run: ${{ github.run_id }}"
             echo "Triggered by: ${{ github.actor }}"
@@ -96,7 +139,10 @@ jobs:
 
           if [ "$CARGO_OUTCOME" != "success" ] || \
              [ "$NPM_OUTCOME" != "success" ] || \
-             [ "$HOMEBREW_OUTCOME" != "success" ]; then
+             [ "$HOMEBREW_OUTCOME" != "success" ] || \
+             [ "$GHCR_OUTCOME" != "success" ] || \
+             [ "$DOCKERHUB_OUTCOME" != "success" ] || \
+             [ "$ECR_OUTCOME" != "success" ]; then
             echo "::error::One or more preflight checks failed. See summary for details."
             exit 1
           fi

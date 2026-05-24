@@ -4,7 +4,7 @@ A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for 
 
 ## Why Dynoxide?
 
-I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs Docker and a JVM. That's <!-- prose:ddb_local_cold_start -->2–3 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~188 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~471 MB<!-- /bench --> on disk) before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
+I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs a JVM, and the typical Docker-based setups adds <!-- prose:ddb_local_cold_start -->2–3 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~188 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~471 MB<!-- /bench --> on disk) before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
 
 Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~4.9 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~3 MB<!-- /bench --> download. Point any DynamoDB SDK at it and your tests just work.
 
@@ -63,8 +63,7 @@ See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#resul
 | Conformance (601 tests) | **100%** | 88.2% | 89.0% | 78.0% |
 | Language | Rust | Java | Python + Java | Node.js |
 | Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
-| Docker required | — | ✓ | ✓ | — |
-| JVM required | — | ✓ | ✓ | — |
+| Runtime dependency | — | JVM | Docker + LocalStack | Node.js |
 | Embeddable (Rust / iOS) | ✓ | — | — | — |
 | MCP server for agents | ✓ | — | — | — |
 

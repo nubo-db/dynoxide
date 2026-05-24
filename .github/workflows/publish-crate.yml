@@ -15,6 +15,9 @@ concurrency:
   group: publish-crate
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Publish to crates.io

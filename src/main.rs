@@ -109,6 +109,26 @@ struct ServeArgs {
     #[cfg(feature = "mcp-server")]
     #[arg(long, value_name = "PATH", requires = "mcp")]
     mcp_data_model: Option<PathBuf>,
+
+    /// Host for the MCP HTTP transport (default: 127.0.0.1)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, default_value = "127.0.0.1", requires = "mcp")]
+    mcp_host: String,
+
+    /// Bearer token for the MCP HTTP transport. Overrides the persisted token.
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    mcp_token: Option<String>,
+
+    /// Disable MCP HTTP authentication (loopback binds only)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, requires = "mcp")]
+    mcp_no_auth: bool,
+
+    /// Extra Host header value to accept on a non-loopback MCP bind (repeatable)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, value_name = "HOST", requires = "mcp")]
+    mcp_allowed_host: Vec<String>,
 }
 
 /// Arguments for the `healthcheck` subcommand.
@@ -149,9 +169,25 @@ struct McpArgs {
     #[arg(long)]
     http: bool,
 
+    /// Host to bind the HTTP transport to (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1", requires = "http")]
+    host: String,
+
     /// Port for the HTTP transport (default: 19280)
     #[arg(long, default_value_t = 19280)]
     port: u16,
+
+    /// Bearer token for the HTTP transport. Overrides the persisted token.
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    token: Option<String>,
+
+    /// Disable HTTP authentication (loopback binds only)
+    #[arg(long, requires = "http")]
+    no_auth: bool,
+
+    /// Extra Host header value to accept on a non-loopback bind (repeatable)
+    #[arg(long, value_name = "HOST", requires = "http")]
+    allowed_host: Vec<String>,
 
     /// Read-only mode: reject all write operations
     #[arg(long)]
@@ -252,6 +288,26 @@ struct ImportArgs {
     #[cfg(feature = "mcp-server")]
     #[arg(long, value_name = "PATH", requires = "mcp")]
     mcp_data_model: Option<PathBuf>,
+
+    /// Host for the MCP HTTP transport when using --serve --mcp (default: 127.0.0.1)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, default_value = "127.0.0.1", requires = "mcp")]
+    mcp_host: String,
+
+    /// Bearer token for the MCP HTTP transport. Overrides the persisted token.
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    mcp_token: Option<String>,
+
+    /// Disable MCP HTTP authentication (loopback binds only)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, requires = "mcp")]
+    mcp_no_auth: bool,
+
+    /// Extra Host header value to accept on a non-loopback MCP bind (repeatable)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, value_name = "HOST", requires = "mcp")]
+    mcp_allowed_host: Vec<String>,
 }
 
 /// Returns the after_help text. Encryption builds include key guidance.
@@ -336,6 +392,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 mcp_read_only: false,
                 #[cfg(feature = "mcp-server")]
                 mcp_data_model: None,
+                #[cfg(feature = "mcp-server")]
+                mcp_host: "127.0.0.1".to_string(),
+                #[cfg(feature = "mcp-server")]
+                mcp_token: None,
+                #[cfg(feature = "mcp-server")]
+                mcp_no_auth: false,
+                #[cfg(feature = "mcp-server")]
+                mcp_allowed_host: Vec::new(),
             };
             run_serve(args).await
         }
@@ -419,14 +483,20 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             data_model: mcp_data_model,
             ..Default::default()
         };
-        let mcp_port = args.mcp_port;
+        let opts = resolve_mcp_http_options(
+            &args.mcp_host,
+            args.mcp_port,
+            args.mcp_token.clone(),
+            args.mcp_no_auth,
+            args.mcp_allowed_host.clone(),
+        )?;
         let mcp_db = db.clone();
         let mcp_shutdown = CancellationToken::new();
         let mcp_shutdown_clone = mcp_shutdown.clone();
 
         eprintln!(
-            "Starting DynamoDB HTTP server on {}:{} + MCP server on 127.0.0.1:{}",
-            args.host, args.port, mcp_port
+            "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
+            args.host, args.port, args.mcp_host, args.mcp_port
         );
 
         let (http_result, mcp_result) = tokio::join!(
@@ -436,12 +506,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 mcp_shutdown_clone.cancel();
                 r
             },
-            dynoxide::mcp::serve_http_with_shutdown(
-                mcp_db,
-                mcp_port,
-                mcp_config,
-                Some(mcp_shutdown),
-            ),
+            dynoxide::mcp::serve_http_with_shutdown(mcp_db, opts, mcp_config, Some(mcp_shutdown),),
         );
         http_result?;
         mcp_result?;
@@ -697,6 +762,51 @@ fn do_healthcheck(args: HealthcheckArgs) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "mcp-server")]
+/// Resolve the auth mode and build HTTP transport options for an MCP HTTP
+/// server. Emits the one-time first-run token guidance or the auth-disabled
+/// warning to stderr. Startup guards (off-loopback requires a token, --no-auth
+/// is loopback-only) surface as errors from `resolve_auth`.
+#[cfg(feature = "mcp-server")]
+fn resolve_mcp_http_options(
+    host: &str,
+    port: u16,
+    cli_token: Option<String>,
+    no_auth: bool,
+    extra_allowed_hosts: Vec<String>,
+) -> Result<dynoxide::mcp::HttpOptions, Box<dyn std::error::Error>> {
+    use dynoxide::mcp::{self, AuthMode};
+
+    let resolved = mcp::resolve_auth(mcp::is_loopback_host(host), cli_token, no_auth, None)?;
+
+    match &resolved.mode {
+        AuthMode::Disabled => {
+            eprintln!(
+                "WARNING: MCP auth disabled (--no-auth, loopback only). \
+                 Any local process on this machine can call this server."
+            );
+        }
+        AuthMode::Enabled(token) if resolved.first_run => {
+            if let Some(path) = &resolved.token_path {
+                let authority = if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
+                let url = format!("http://{authority}/mcp");
+                eprintln!("{}", mcp::first_run_message(&url, token, path));
+            }
+        }
+        AuthMode::Enabled(_) => {}
+    }
+
+    Ok(mcp::HttpOptions {
+        host: host.to_string(),
+        port,
+        auth: resolved.mode,
+        extra_allowed_hosts,
+    })
+}
+
 async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
@@ -734,7 +844,14 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.http {
-        dynoxide::mcp::serve_http(db, args.port, mcp_config).await
+        let opts = resolve_mcp_http_options(
+            &args.host,
+            args.port,
+            args.token.clone(),
+            args.no_auth,
+            args.allowed_host.clone(),
+        )?;
+        dynoxide::mcp::serve_http(db, opts, mcp_config).await
     } else {
         dynoxide::mcp::serve_stdio(db, mcp_config).await
     }
@@ -817,14 +934,20 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 data_model: mcp_data_model,
                 ..Default::default()
             };
-            let mcp_port = args.mcp_port;
+            let opts = resolve_mcp_http_options(
+                &args.mcp_host,
+                args.mcp_port,
+                args.mcp_token.clone(),
+                args.mcp_no_auth,
+                args.mcp_allowed_host.clone(),
+            )?;
             let mcp_db = db.clone();
             let mcp_shutdown = CancellationToken::new();
             let mcp_shutdown_clone = mcp_shutdown.clone();
 
             eprintln!(
-                "Starting DynamoDB HTTP server on {}:{} + MCP server on 127.0.0.1:{}",
-                args.host, args.port, mcp_port
+                "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
+                args.host, args.port, args.mcp_host, args.mcp_port
             );
 
             let (http_result, mcp_result) = tokio::join!(
@@ -835,7 +958,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 },
                 dynoxide::mcp::serve_http_with_shutdown(
                     mcp_db,
-                    mcp_port,
+                    opts,
                     mcp_config,
                     Some(mcp_shutdown),
                 ),

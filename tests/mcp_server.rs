@@ -1129,9 +1129,11 @@ fn test_http_transport() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    // Start the MCP server in HTTP mode
+    // Start the MCP server in HTTP mode. A fixed token via env keeps the test
+    // deterministic and avoids writing to the real per-user config dir.
     let mut child = Command::new(binary)
         .args(["mcp", "--http", "--port", &port.to_string()])
+        .env("DYNOXIDE_MCP_AUTH_TOKEN", "test-transport-token")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1171,6 +1173,7 @@ fn test_http_transport() {
     let request = format!(
         "POST /mcp HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer test-transport-token\r\n\
          Content-Type: application/json\r\n\
          Accept: application/json, text/event-stream\r\n\
          Content-Length: {}\r\n\
@@ -1226,6 +1229,10 @@ fn test_http_transport_dns_rebinding_defences() {
 
     let child = Command::new(binary)
         .args(["mcp", "--http", "--port", &port.to_string()])
+        // Auth now wraps the transport. Use a fixed token and send it on every
+        // request so these assertions still exercise rmcp's Host/Origin checks
+        // (which sit behind auth) rather than the 401 from the auth layer.
+        .env("DYNOXIDE_MCP_AUTH_TOKEN", "dns-rebind-token")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1268,6 +1275,7 @@ fn test_http_transport_dns_rebinding_defences() {
             "POST /mcp HTTP/1.1\r\n\
              Host: {host}\r\n\
              {origin_line}\
+             Authorization: Bearer dns-rebind-token\r\n\
              Content-Type: application/json\r\n\
              Accept: application/json, text/event-stream\r\n\
              Content-Length: {}\r\n\
@@ -1591,4 +1599,410 @@ fn test_bulk_put_items_read_only_rejected() {
 
     drop(child.stdin.take());
     let _ = child.wait();
+}
+
+// ---------------------------------------------------------------------------
+// MCP HTTP bearer-token auth (#27) + configurable bind host (#24)
+// ---------------------------------------------------------------------------
+
+/// Kills the child on drop, including panic paths (std::process::Child does not
+/// kill on drop, so a panicked test would otherwise leak a process holding the
+/// loopback port and flake subsequent runs).
+struct AuthChild(std::process::Child);
+impl Drop for AuthChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+fn wait_ready(addr: &str) {
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+    }
+    panic!("MCP HTTP server at {addr} did not start within 5 seconds");
+}
+
+/// Spawn `dynoxide mcp --http` on 127.0.0.1 with a fixed token via env, waiting
+/// until it accepts connections. The explicit token means no token file is
+/// written, so tests never touch the real per-user config dir.
+fn spawn_authed_mcp(port: u16, token: &str) -> AuthChild {
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let child = Command::new(binary)
+        .args(["mcp", "--http", "--port", &port.to_string()])
+        .env("DYNOXIDE_MCP_AUTH_TOKEN", token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp --http");
+    wait_ready(&format!("127.0.0.1:{port}"));
+    AuthChild(child)
+}
+
+/// Send an `initialize` POST and return the raw HTTP response. `host` sets the
+/// Host header; `auth` adds an `Authorization: Bearer` header when present.
+fn mcp_request(connect_port: u16, host: &str, auth: Option<&str>) -> String {
+    use std::io::Read;
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"}
+        }
+    });
+    let body = serde_json::to_string(&init).unwrap();
+    let auth_line = match auth {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{connect_port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         {auth_line}\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Split a raw HTTP response into (head, body) at the blank line.
+fn response_body(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}
+
+/// Run the binary expecting it to exit non-zero before serving; returns
+/// (success, stderr). Safe against hangs because the startup guards error
+/// before any listener is bound.
+fn run_expect_startup_failure(args: &[&str]) -> (bool, String) {
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let out = Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn dynoxide");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn auth_missing_and_wrong_token_return_identical_401() {
+    let port = free_port();
+    let _srv = spawn_authed_mcp(port, "the-secret-token");
+
+    let no_token = mcp_request(port, &format!("127.0.0.1:{port}"), None);
+    let wrong = mcp_request(port, &format!("127.0.0.1:{port}"), Some("not-the-token"));
+
+    assert!(
+        no_token.starts_with("HTTP/1.1 401"),
+        "missing token should be 401, got: {no_token}"
+    );
+    assert!(
+        wrong.starts_with("HTTP/1.1 401"),
+        "wrong token should be 401, got: {wrong}"
+    );
+    let lower = no_token.to_lowercase();
+    assert!(
+        lower.contains("www-authenticate: bearer realm=\"dynoxide-mcp\""),
+        "401 should carry the Bearer challenge, got: {no_token}"
+    );
+    assert!(
+        !lower.contains("resource_metadata"),
+        "WWW-Authenticate must not include resource_metadata, got: {no_token}"
+    );
+    // No oracle: missing and wrong tokens yield byte-identical bodies.
+    assert_eq!(
+        response_body(&no_token),
+        response_body(&wrong),
+        "401 bodies for missing vs wrong token must be identical"
+    );
+}
+
+#[test]
+fn auth_correct_token_succeeds() {
+    let port = free_port();
+    let _srv = spawn_authed_mcp(port, "the-secret-token");
+    let resp = mcp_request(port, &format!("127.0.0.1:{port}"), Some("the-secret-token"));
+    assert!(
+        resp.starts_with("HTTP/1.1 2"),
+        "correct token should be 2xx, got: {resp}"
+    );
+    assert!(resp.contains("dynoxide"), "got: {resp}");
+}
+
+#[test]
+fn auth_non_bearer_header_is_401() {
+    use std::io::Read;
+    let port = free_port();
+    let _srv = spawn_authed_mcp(port, "the-secret-token");
+    let body = "{}";
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Authorization: Basic dXNlcjpwYXNz\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(
+        resp.starts_with("HTTP/1.1 401"),
+        "non-Bearer scheme should be 401, got: {resp}"
+    );
+}
+
+#[test]
+fn auth_does_not_mask_host_check() {
+    // A token holder spoofing Host still hits rmcp's 403 (defense-in-depth);
+    // an unauthenticated foreign-Host request is rejected by auth first (401).
+    let port = free_port();
+    let _srv = spawn_authed_mcp(port, "the-secret-token");
+
+    let with_token = mcp_request(port, "evil.example.com", Some("the-secret-token"));
+    assert!(
+        with_token.starts_with("HTTP/1.1 403"),
+        "foreign Host with valid token should be 403, got: {with_token}"
+    );
+
+    let no_token = mcp_request(port, "evil.example.com", None);
+    assert!(
+        no_token.starts_with("HTTP/1.1 401"),
+        "foreign Host with no token should be 401, got: {no_token}"
+    );
+}
+
+#[test]
+fn off_loopback_without_token_fails_to_start() {
+    let (ok, stderr) =
+        run_expect_startup_failure(&["mcp", "--http", "--host", "0.0.0.0", "--port", "0"]);
+    assert!(!ok, "off-loopback bind without a token must fail to start");
+    assert!(
+        stderr.contains("non-loopback"),
+        "error should mention the non-loopback bind, got: {stderr}"
+    );
+}
+
+#[test]
+fn off_loopback_no_auth_fails_to_start() {
+    let (ok, stderr) = run_expect_startup_failure(&[
+        "mcp",
+        "--http",
+        "--host",
+        "0.0.0.0",
+        "--no-auth",
+        "--port",
+        "0",
+    ]);
+    assert!(!ok, "--no-auth on a non-loopback bind must fail to start");
+    assert!(
+        stderr.contains("loopback"),
+        "error should explain --no-auth is loopback-only, got: {stderr}"
+    );
+}
+
+#[test]
+fn no_auth_loopback_starts_and_warns() {
+    use std::io::Read;
+    let port = free_port();
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let mut child = Command::new(binary)
+        .args(["mcp", "--http", "--no-auth", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp --http --no-auth");
+    wait_ready(&format!("127.0.0.1:{port}"));
+
+    // With auth disabled, an unauthenticated request succeeds.
+    let resp = mcp_request(port, &format!("127.0.0.1:{port}"), None);
+    assert!(
+        resp.starts_with("HTTP/1.1 2"),
+        "--no-auth should allow unauthenticated requests, got: {resp}"
+    );
+
+    let _ = child.kill();
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut stderr);
+    }
+    let _ = child.wait();
+    assert!(
+        stderr.contains("auth disabled"),
+        "starting with --no-auth must print a warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn token_flag_beats_env() {
+    let port = free_port();
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let child = Command::new(binary)
+        .args([
+            "mcp",
+            "--http",
+            "--port",
+            &port.to_string(),
+            "--token",
+            "flag-token",
+        ])
+        .env("DYNOXIDE_MCP_AUTH_TOKEN", "env-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp --http");
+    let _kill = AuthChild(child);
+    wait_ready(&format!("127.0.0.1:{port}"));
+
+    let with_flag = mcp_request(port, &format!("127.0.0.1:{port}"), Some("flag-token"));
+    let with_env = mcp_request(port, &format!("127.0.0.1:{port}"), Some("env-token"));
+    assert!(
+        with_flag.starts_with("HTTP/1.1 2"),
+        "flag token should win over env, got: {with_flag}"
+    );
+    assert!(
+        with_env.starts_with("HTTP/1.1 401"),
+        "env token should be rejected when flag is set, got: {with_env}"
+    );
+}
+
+#[test]
+fn ipv6_loopback_is_treated_as_loopback() {
+    // ::1 is loopback, so a token-less start would auto-generate; we pass a
+    // token to keep it deterministic and assert the IPv6 bind accepts.
+    let port = free_port();
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let child = Command::new(binary)
+        .args([
+            "mcp",
+            "--http",
+            "--host",
+            "::1",
+            "--port",
+            &port.to_string(),
+            "--token",
+            "tok",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp --http --host ::1");
+    let _kill = AuthChild(child);
+    wait_ready(&format!("[::1]:{port}"));
+}
+
+#[test]
+fn first_run_generates_token_then_reuses_silently() {
+    use std::io::Read;
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let home = tempfile::tempdir().unwrap();
+
+    let run_once = |port: u16| -> String {
+        let mut child = Command::new(binary)
+            .args(["mcp", "--http", "--port", &port.to_string()])
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("DYNOXIDE_MCP_AUTH_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn dynoxide mcp --http");
+        wait_ready(&format!("127.0.0.1:{port}"));
+        let _ = child.kill();
+        let mut stderr = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut stderr);
+        }
+        let _ = child.wait();
+        stderr
+    };
+
+    let first = run_once(free_port());
+    assert!(
+        first.contains("Generated an MCP auth token"),
+        "first run should print one-time guidance, got: {first}"
+    );
+    let second = run_once(free_port());
+    assert!(
+        !second.contains("Generated an MCP auth token"),
+        "second run should silently reuse the persisted token, got: {second}"
+    );
+}
+
+#[test]
+fn allowed_host_extends_acceptance() {
+    let port = free_port();
+    let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let child = Command::new(binary)
+        .args([
+            "mcp",
+            "--http",
+            "--port",
+            &port.to_string(),
+            "--token",
+            "tok",
+            "--allowed-host",
+            "myhost.lan",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp --http");
+    let _kill = AuthChild(child);
+    wait_ready(&format!("127.0.0.1:{port}"));
+
+    let allowed = mcp_request(port, "myhost.lan", Some("tok"));
+    assert!(
+        allowed.starts_with("HTTP/1.1 2"),
+        "allowlisted host should be accepted, got: {allowed}"
+    );
+    let foreign = mcp_request(port, "evil.example.com", Some("tok"));
+    assert!(
+        foreign.starts_with("HTTP/1.1 403"),
+        "non-allowlisted host should still be 403, got: {foreign}"
+    );
 }

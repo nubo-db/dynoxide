@@ -3,9 +3,13 @@
 //! Exposes DynamoDB operations as MCP tools, allowing coding agents to
 //! interact with the local DynamoDB emulator through structured tool calls.
 
+mod auth;
 mod errors;
 mod server;
 
+pub use auth::{
+    AuthError, AuthMode, ResolvedAuth, first_run_message, is_loopback_host, resolve_auth,
+};
 pub use server::{McpConfig, McpServer};
 
 use crate::Database;
@@ -30,22 +34,60 @@ pub async fn serve_stdio(
     Ok(())
 }
 
+/// Transport-level options for the MCP HTTP server.
+///
+/// Distinct from [`McpConfig`], which is per-session server behaviour cloned
+/// into every connection. These are resolved once at startup: where to bind,
+/// the bearer-token auth mode, and any operator-added `Host`/`Origin` allowlist
+/// entries beyond loopback.
+#[derive(Clone, Debug)]
+pub struct HttpOptions {
+    pub host: String,
+    pub port: u16,
+    pub auth: AuthMode,
+    /// Extra hosts to accept beyond the loopback default. Each entry also adds
+    /// a matching `http://<host>` origin. Empty preserves loopback-only.
+    pub extra_allowed_hosts: Vec<String>,
+}
+
+impl HttpOptions {
+    /// Loopback default with no extra allowed hosts — convenience for tests and
+    /// simple callers.
+    pub fn new(host: impl Into<String>, port: u16, auth: AuthMode) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            auth,
+            extra_allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+/// Format a `host:port` bind address, bracketing bare IPv6 literals.
+fn format_bind_addr(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Start the MCP server over Streamable HTTP transport.
 ///
-/// Binds to `127.0.0.1:{port}` and serves MCP at `/mcp`.
-/// If a `shutdown` token is provided, the server will stop when it is cancelled.
+/// Binds to `opts.host:opts.port` and serves MCP at `/mcp`, behind the
+/// bearer-token auth layer.
 pub async fn serve_http(
     db: Database,
-    port: u16,
+    opts: HttpOptions,
     config: McpConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    serve_http_with_shutdown(db, port, config, None).await
+    serve_http_with_shutdown(db, opts, config, None).await
 }
 
 /// Start the MCP server over Streamable HTTP with an external shutdown signal.
 pub async fn serve_http_with_shutdown(
     db: Database,
-    port: u16,
+    opts: HttpOptions,
     config: McpConfig,
     shutdown: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +97,16 @@ pub async fn serve_http_with_shutdown(
 
     let ct = shutdown.unwrap_or_default();
     let db = Arc::new(db);
+
+    // Loopback defaults, plus any operator-added hosts (for non-loopback binds
+    // reached by name). Each added host gets a matching http:// origin.
+    let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    let mut allowed_origins: Vec<String> =
+        vec!["http://localhost".into(), "http://127.0.0.1".into()];
+    for host in &opts.extra_allowed_hosts {
+        allowed_hosts.push(host.clone());
+        allowed_origins.push(format!("http://{host}"));
+    }
 
     // load-bearing: rmcp's config struct is #[non_exhaustive], so struct-literal
     // init does not compile. Keep the field-reassign block.
@@ -68,10 +120,10 @@ pub async fn serve_http_with_shutdown(
         // Explicit DNS rebinding defences. Stating the lists protects against an
         // rmcp default flip. Native clients pass because rmcp skips Origin
         // validation when the header is absent (rmcp 1.6.0 tower.rs:385-387).
-        // allowed_origins is IPv4-loopback-only; add http://[::1] when dynoxide
-        // binds [::1] and https://* if TLS-on-loopback lands.
-        c.allowed_hosts = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
-        c.allowed_origins = vec!["http://localhost".into(), "http://127.0.0.1".into()];
+        // Bearer-token auth (the .layer below) is the primary control once the
+        // bind widens; this allowlist is defense-in-depth for browser origins.
+        c.allowed_hosts = allowed_hosts;
+        c.allowed_origins = allowed_origins;
         c
     };
 
@@ -85,9 +137,12 @@ pub async fn serve_http_with_shutdown(
         http_config,
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
-    // If you widen this bind, update c.allowed_origins above too (see comment near allowed_hosts).
-    let addr = format!("127.0.0.1:{port}");
+    // Auth runs outside rmcp's Host/Origin checks: unauthenticated callers get
+    // 401 regardless of Host; a token holder spoofing Host still hits 403.
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(opts.auth.clone(), auth::enforce),
+    );
+    let addr = format_bind_addr(&opts.host, opts.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_addr = listener.local_addr()?;
 

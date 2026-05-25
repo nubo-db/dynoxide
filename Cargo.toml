@@ -23,7 +23,7 @@ encryption-cc = ["_has-encryption", "rusqlite/bundled-sqlcipher"]
 encrypted-server = ["encryption", "http-server"]
 encrypted-server-cc = ["encryption-cc", "http-server"]
 encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
-mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc"]
+mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
 import = ["dep:clap", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
 # Backward-compatible alias — identical to default features
@@ -57,6 +57,8 @@ rmcp = { version = "1", features = ["server", "transport-io", "transport-streama
 schemars = { version = "1", optional = true }
 tokio-util = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
+directories = { version = "6", optional = true }
+subtle = { version = "2", optional = true }
 
 # Optional import dependencies
 toml = { version = "0.8", optional = true }

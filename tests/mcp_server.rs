@@ -1637,9 +1637,26 @@ fn wait_ready(addr: &str) {
 /// until it accepts connections. The explicit token means no token file is
 /// written, so tests never touch the real per-user config dir.
 fn spawn_authed_mcp(port: u16, token: &str) -> AuthChild {
+    spawn_authed_mcp_host(port, token, "127.0.0.1", &[])
+}
+
+/// Like [`spawn_authed_mcp`] but binds an explicit `--host` (e.g. `0.0.0.0`)
+/// with optional extra args (e.g. `--allowed-host`). Connections are still made
+/// over loopback: a `0.0.0.0` bind includes `127.0.0.1`, so tests reach it the
+/// same way regardless of the bind host (the #24 reachability shape).
+fn spawn_authed_mcp_host(port: u16, token: &str, host: &str, extra_args: &[&str]) -> AuthChild {
     let binary = env!("CARGO_BIN_EXE_dynoxide");
+    let mut args: Vec<String> = vec![
+        "mcp".into(),
+        "--http".into(),
+        "--host".into(),
+        host.into(),
+        "--port".into(),
+        port.to_string(),
+    ];
+    args.extend(extra_args.iter().map(|s| s.to_string()));
     let child = Command::new(binary)
-        .args(["mcp", "--http", "--port", &port.to_string()])
+        .args(&args)
         .env("DYNOXIDE_MCP_AUTH_TOKEN", token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2042,5 +2059,44 @@ fn allowed_host_extends_acceptance() {
     assert!(
         foreign.starts_with("HTTP/1.1 403"),
         "non-allowlisted host should still be 403, got: {foreign}"
+    );
+}
+
+#[test]
+fn off_loopback_bind_is_reachable_with_token() {
+    // #24: a 0.0.0.0 bind with a token is reachable over loopback and
+    // authenticates — the core Docker reachability shape. Existing auth tests
+    // all bind the 127.0.0.1 default; this is the only widened-bind happy path.
+    let port = free_port();
+    let _srv = spawn_authed_mcp_host(port, "the-secret-token", "0.0.0.0", &[]);
+    let resp = mcp_request(port, &format!("127.0.0.1:{port}"), Some("the-secret-token"));
+    assert!(
+        resp.starts_with("HTTP/1.1 2"),
+        "0.0.0.0 bind with a token should accept a loopback-Host request, got: {resp}"
+    );
+    assert!(resp.contains("dynoxide"), "got: {resp}");
+}
+
+#[test]
+fn off_loopback_bind_accepts_allowlisted_name() {
+    // #24 container-to-container shape: a 0.0.0.0 bind reached by service name
+    // needs that name on the Host allowlist via --allowed-host. (Foreign-Host
+    // 403 and loopback acceptance are covered by auth_does_not_mask_host_check
+    // and allowed_host_extends_acceptance.)
+    let port = free_port();
+    let _srv = spawn_authed_mcp_host(
+        port,
+        "the-secret-token",
+        "0.0.0.0",
+        &["--allowed-host", "dynoxide.test"],
+    );
+    let resp = mcp_request(
+        port,
+        &format!("dynoxide.test:{port}"),
+        Some("the-secret-token"),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 2"),
+        "allowlisted by-name Host on a 0.0.0.0 bind should be accepted, got: {resp}"
     );
 }

@@ -28,7 +28,11 @@
 
 pub mod clock;
 pub mod error;
-#[cfg(feature = "native-sqlite")]
+// The native rusqlite-backed `Storage` exists whenever either SQLite backend
+// feature is on (the crate refuses to build with neither), and the handlers
+// now consume `StorageBackend` through it, so the impl must track the same
+// condition rather than `native-sqlite` alone.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub mod rusqlite_impl;
 #[cfg(feature = "wasm-stub")]
 pub mod wasm_stub;

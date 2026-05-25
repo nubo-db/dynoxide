@@ -12,8 +12,14 @@
 
 /// Backend-neutral error variants surfaced by the [`StorageBackend`] trait.
 ///
+/// Marked `#[non_exhaustive]`: a future backend may surface failure modes the
+/// native one cannot, so downstream code must not assume the variant set is
+/// closed. Added before the trait's first release so later additions stay
+/// non-breaking.
+///
 /// [`StorageBackend`]: super::StorageBackend
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BackendError {
     /// The opened file is not a valid SQLite database, or is encrypted with the
     /// wrong key.

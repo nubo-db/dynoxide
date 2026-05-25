@@ -20,7 +20,12 @@ pub struct CancellationReason {
 ///
 /// Each variant corresponds to a DynamoDB API error, carrying a human-readable
 /// message that matches DynamoDB's actual error messages.
+///
+/// Marked `#[non_exhaustive]` as of 0.10.0 (itself a breaking release), so
+/// later variant additions stay non-breaking. Downstream `match` arms over
+/// this enum must include a wildcard.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DynoxideError {
     /// Table or resource not found.
     #[error("{0}")]

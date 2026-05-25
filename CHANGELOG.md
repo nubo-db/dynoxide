@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2026-04-30
+## [Unreleased]
 
 ### Added
 
@@ -18,6 +18,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - This release is behaviour-preserving: existing public APIs (`Database`, `Storage`, action handlers, error types) are unchanged. Tests, conformance suites, and benchmarks continue to pass against the same surface as 0.9.10.
 - Building dynoxide for `wasm32-unknown-unknown` is not yet supported. The trait surface is in place; making the rest of the codebase target-agnostic is the next pass and lands when a working WASM backend does.
+
+## [0.9.13] - 2026-05-11
+
+### Security
+
+- Close a DNS rebinding vulnerability in the MCP HTTP transport
+  ([GHSA-89vp-x53w-74fx](https://github.com/modelcontextprotocol/rust-sdk/security/advisories/GHSA-89vp-x53w-74fx) /
+  [CVE-2026-42559](https://www.cve.org/CVERecord?id=CVE-2026-42559)) by upgrading `rmcp`
+  from 1.1.1 to 1.6.0 in both lockfiles. A malicious page could make the
+  user's browser send requests to a loopback MCP server with a non-loopback
+  `Host` header, which the server would then process. Affects 0.9.3 to 0.9.12.
+  Users running `dynoxide mcp --http` or `dynoxide serve --mcp` should
+  upgrade; stdio transport is unaffected.
+
+- Close a related cross-origin CSRF gap: a page could `fetch` the loopback
+  endpoint with `mode: 'no-cors'`, and the Host check would pass while the
+  Origin header went unchecked. Affected write tools: `put_item`,
+  `update_item`, `delete_item`, `create_table`, and `batch_write_item`.
+  Fixed by setting an explicit Host and Origin allowlist on
+  `StreamableHttpServerConfig`. Native MCP clients (Claude Code, Cursor,
+  the dynoxide CLI) don't send an Origin header and are unaffected.
+
+## [0.9.12] - 2026-05-04
+
+### Fixed
+
+- Unix: port releases immediately after `dynoxide serve` shuts down. The listener used to skip `SO_REUSEADDR`, leaving leftover `TIME_WAIT` sockets from connected clients to block restart for ~60s. Live-listener conflict detection is unaffected: `SO_REUSEADDR` only bypasses `TIME_WAIT`, not active sockets.
+
+  Windows: unchanged. `SO_REUSEADDR` lets another process hijack an active bind there, so we leave it off.
+
+## [0.9.11] - 2026-05-04
+
+### Fixed
+
+- `dynoxide serve --mcp` now exits cleanly on Ctrl+C when an MCP client (Claude Code, Cursor) is holding a connection open. The MCP server's graceful-shutdown drain used to wait for those connections forever, hanging the process until something SIGKILLed it ([#22](https://github.com/nubo-db/dynoxide/issues/22))
+
+### Security
+
+- Refresh `Cargo.lock` for the dependabot patches reachable within MSRV: `aws-lc-sys` 0.37.1 to 0.40.0 (5 high-severity AWS-LC issues), `openssl` 0.10.75 to 0.10.79 (5 buffer-overflow advisories), `rand` 0.8.5 to 0.8.6. Remaining `rustls-webpki` / `time` / `aws-sdk-dynamodb` alerts are dev-dependency only (test-suite AWS SDK chain, not the production binary) and stay pinned by MSRV 1.85 until v0.10.0
 
 ## [0.9.10] - 2026-04-27
 

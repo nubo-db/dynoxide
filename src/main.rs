@@ -761,7 +761,6 @@ fn do_healthcheck(args: HealthcheckArgs) -> Result<(), String> {
 // MCP subcommand (mcp-server feature)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "mcp-server")]
 /// Resolve the auth mode and build HTTP transport options for an MCP HTTP
 /// server. Emits the one-time first-run token guidance or the auth-disabled
 /// warning to stderr. Startup guards (off-loopback requires a token, --no-auth
@@ -807,6 +806,7 @@ fn resolve_mcp_http_options(
     })
 }
 
+#[cfg(feature = "mcp-server")]
 async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;

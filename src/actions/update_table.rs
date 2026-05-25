@@ -6,7 +6,6 @@ use crate::storage::Storage;
 use crate::streams;
 use crate::types::{AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, Projection};
 use crate::validation;
-use rusqlite;
 use serde::{Deserialize, Serialize};
 
 /// Internal raw deserialization struct.
@@ -738,17 +737,6 @@ fn backfill_gsi(
     let mut last_pk: Option<String> = None;
     let mut last_sk: Option<String> = None;
 
-    let gsi_table_name = format!("{}::gsi::{}", table_name, gsi_def.index_name);
-    let insert_sql = format!(
-        "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        crate::storage::escape_table_name(&gsi_table_name)
-    );
-    let mut stmt = storage
-        .conn()
-        .prepare_cached(&insert_sql)
-        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-
     loop {
         let items = storage.scan_items(
             table_name,
@@ -764,6 +752,7 @@ fn backfill_gsi(
             break;
         }
 
+        let mut rows: Vec<crate::storage_backend::GsiItemRow> = Vec::new();
         for (pk, sk, item_json) in &items {
             let item: crate::types::Item = serde_json::from_str(item_json)
                 .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
@@ -786,10 +775,17 @@ fn backfill_gsi(
                 let projected_json = serde_json::to_string(&projected)
                     .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-                stmt.execute(rusqlite::params![gsi_pk, gsi_sk, pk, sk, projected_json])
-                    .map_err(DynoxideError::from)?;
+                rows.push(crate::storage_backend::GsiItemRow {
+                    gsi_pk,
+                    gsi_sk,
+                    table_pk: pk.clone(),
+                    table_sk: sk.clone(),
+                    item_json: projected_json,
+                });
             }
         }
+
+        storage.insert_gsi_items(table_name, &gsi_def.index_name, &rows)?;
 
         let last = &items[items.len() - 1];
         last_pk = Some(last.0.clone());

@@ -42,6 +42,46 @@ use crate::types::Tag;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{BackendError, from_rusqlite};
 
+/// One base-table row for a bulk insert via [`StorageBackend::put_base_items`].
+///
+/// Unlike [`StorageBackend::put_item_with_hash`], which preserves any existing
+/// `cached_at` value, the bulk path writes `cached_at` verbatim: this mirrors
+/// the import flow, which sets the timestamp explicitly (or clears it) for
+/// every row it loads.
+#[derive(Debug, Clone)]
+pub struct BaseItemRow {
+    /// Partition key string.
+    pub pk: String,
+    /// Sort key string (empty for tables without a sort key).
+    pub sk: String,
+    /// Serialised item JSON.
+    pub item_json: String,
+    /// Item size in bytes.
+    pub item_size: usize,
+    /// Cache timestamp written verbatim; `None` clears the column.
+    pub cached_at: Option<f64>,
+    /// Hash prefix used for parallel-scan ordering.
+    pub hash_prefix: String,
+}
+
+/// One GSI-table row for a bulk insert via [`StorageBackend::insert_gsi_items`].
+///
+/// The fields mirror the argument order of the single-row
+/// [`StorageBackend::insert_gsi_item`].
+#[derive(Debug, Clone)]
+pub struct GsiItemRow {
+    /// GSI partition key string.
+    pub gsi_pk: String,
+    /// GSI sort key string (empty when the index has no sort key).
+    pub gsi_sk: String,
+    /// Base-table partition key string.
+    pub table_pk: String,
+    /// Base-table sort key string.
+    pub table_sk: String,
+    /// Projected item JSON.
+    pub item_json: String,
+}
+
 /// Backend-neutral storage interface.
 ///
 /// Method signatures mirror [`Storage`](crate::storage::Storage)'s public
@@ -62,6 +102,16 @@ pub use error::{BackendError, from_rusqlite};
 /// a real callsite.
 #[allow(async_fn_in_trait)]
 pub trait StorageBackend {
+    // -----------------------------------------------------------------------
+    // Capabilities
+    // -----------------------------------------------------------------------
+
+    /// Wall-clock access for the stream and TTL paths.
+    ///
+    /// Sync because reading the clock is not I/O. The native backend returns
+    /// its injected [`Clock`]; a real wa-sqlite backend supplies its own.
+    fn clock(&self) -> &dyn Clock;
+
     // -----------------------------------------------------------------------
     // Table metadata
     // -----------------------------------------------------------------------
@@ -150,6 +200,19 @@ pub trait StorageBackend {
         table_pk: &str,
         table_sk: &str,
         item_json: &str,
+    ) -> Result<(), BackendError>;
+
+    /// Bulk-insert many rows into one GSI table.
+    ///
+    /// Batch-shaped so a backend can amortise per-row round-trips (the native
+    /// backend reuses a single cached prepared statement). Used by the GSI
+    /// backfill path; the per-row [`insert_gsi_item`](Self::insert_gsi_item)
+    /// covers single writes during normal fan-out.
+    async fn insert_gsi_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[GsiItemRow],
     ) -> Result<(), BackendError>;
 
     async fn delete_gsi_item(
@@ -252,6 +315,19 @@ pub trait StorageBackend {
         item_size: usize,
         hash_prefix: &str,
     ) -> Result<Option<String>, BackendError>;
+
+    /// Bulk-insert many base-table rows in one call (`INSERT OR REPLACE`).
+    ///
+    /// Batch-shaped so a backend can amortise per-row round-trips (the native
+    /// backend reuses a single cached prepared statement). Used by the import
+    /// path. Writes `cached_at` verbatim from each [`BaseItemRow`]; see the
+    /// note there for how this differs from
+    /// [`put_item_with_hash`](Self::put_item_with_hash).
+    async fn put_base_items(
+        &self,
+        table_name: &str,
+        rows: &[BaseItemRow],
+    ) -> Result<(), BackendError>;
 
     async fn get_item(
         &self,

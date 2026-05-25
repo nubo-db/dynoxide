@@ -12,7 +12,7 @@ use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
     TableStats,
 };
-use crate::storage_backend::{BackendError, StorageBackend};
+use crate::storage_backend::{BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend};
 use crate::types::Tag;
 
 /// Placeholder backend. Constructible but not callable.
@@ -21,6 +21,27 @@ pub struct WaSqliteBackend;
 const STUB_NOT_IMPLEMENTED: &str = "wa-sqlite backend stub: no runtime support";
 
 impl StorageBackend for WaSqliteBackend {
+    fn clock(&self) -> &dyn Clock {
+        unimplemented!("{STUB_NOT_IMPLEMENTED}")
+    }
+
+    async fn insert_gsi_items(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _rows: &[GsiItemRow],
+    ) -> Result<(), BackendError> {
+        unimplemented!("{STUB_NOT_IMPLEMENTED}")
+    }
+
+    async fn put_base_items(
+        &self,
+        _table_name: &str,
+        _rows: &[BaseItemRow],
+    ) -> Result<(), BackendError> {
+        unimplemented!("{STUB_NOT_IMPLEMENTED}")
+    }
+
     async fn insert_table_metadata(
         &self,
         _m: &CreateTableMetadata<'_>,

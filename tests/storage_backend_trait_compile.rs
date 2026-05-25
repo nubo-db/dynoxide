@@ -11,7 +11,7 @@ use dynoxide::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
     TableStats,
 };
-use dynoxide::storage_backend::{BackendError, StorageBackend};
+use dynoxide::storage_backend::{BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend};
 use dynoxide::types::Tag;
 
 /// A type that satisfies [`StorageBackend`] with `unimplemented!()` bodies.
@@ -20,6 +20,27 @@ use dynoxide::types::Tag;
 pub struct TestBackend;
 
 impl StorageBackend for TestBackend {
+    fn clock(&self) -> &dyn Clock {
+        unimplemented!()
+    }
+
+    async fn insert_gsi_items(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _rows: &[GsiItemRow],
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn put_base_items(
+        &self,
+        _table_name: &str,
+        _rows: &[BaseItemRow],
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn insert_table_metadata(
         &self,
         _m: &CreateTableMetadata<'_>,

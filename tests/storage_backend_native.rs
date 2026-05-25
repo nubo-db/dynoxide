@@ -17,8 +17,8 @@
 //! [`StorageBackend`]: dynoxide::storage_backend::StorageBackend
 //! [`Storage`]: dynoxide::storage::Storage
 
-use dynoxide::storage::{CreateTableMetadata, Storage};
-use dynoxide::storage_backend::StorageBackend;
+use dynoxide::storage::{CreateTableMetadata, QueryParams, Storage};
+use dynoxide::storage_backend::{BaseItemRow, GsiItemRow, StorageBackend};
 
 fn make_metadata<'a>(table_name: &'a str, key_schema: &'a str) -> CreateTableMetadata<'a> {
     CreateTableMetadata {
@@ -179,4 +179,122 @@ async fn count_items_matches_inserted_count_via_trait() {
         .await
         .unwrap();
     assert_eq!(count, 5);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_base_items_bulk_insert_via_trait() {
+    let storage = Storage::memory().expect("Storage::memory");
+    seed_table(&storage, "bulk").await;
+
+    let rows: Vec<BaseItemRow> = (0..3)
+        .map(|i| {
+            let pk = format!("k{i}");
+            let item_json = format!(r#"{{"pk":{{"S":"{pk}"}}}}"#);
+            BaseItemRow {
+                pk,
+                sk: String::new(),
+                item_size: item_json.len(),
+                item_json,
+                // First row carries a cache timestamp; the rest leave it NULL.
+                cached_at: if i == 0 { Some(123.0) } else { None },
+                hash_prefix: String::new(),
+            }
+        })
+        .collect();
+
+    <Storage as StorageBackend>::put_base_items(&storage, "bulk", &rows)
+        .await
+        .expect("put_base_items via trait");
+
+    // Every row is retrievable.
+    for i in 0..3 {
+        let got = <Storage as StorageBackend>::get_item(&storage, "bulk", &format!("k{i}"), "")
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(format!(r#"{{"pk":{{"S":"k{i}"}}}}"#).as_str())
+        );
+    }
+
+    // cached_at is written verbatim: only the row that set it shows up in the
+    // LRU view (which excludes NULL cached_at).
+    let lru = <Storage as StorageBackend>::get_lru_items(&storage, "bulk", 10)
+        .await
+        .unwrap();
+    assert_eq!(lru.len(), 1, "only the row with a cached_at should appear");
+    assert_eq!(lru[0].0, "k0");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_gsi_items_bulk_insert_via_trait() {
+    let storage = Storage::memory().expect("Storage::memory");
+    seed_table(&storage, "orders").await;
+    <Storage as StorageBackend>::create_gsi_table(&storage, "orders", "by-status")
+        .await
+        .expect("create_gsi_table via trait");
+
+    let rows = vec![
+        GsiItemRow {
+            gsi_pk: "shipped".to_string(),
+            gsi_sk: "o1".to_string(),
+            table_pk: "o1".to_string(),
+            table_sk: String::new(),
+            item_json: r#"{"pk":{"S":"o1"},"status":{"S":"shipped"}}"#.to_string(),
+        },
+        GsiItemRow {
+            gsi_pk: "shipped".to_string(),
+            gsi_sk: "o2".to_string(),
+            table_pk: "o2".to_string(),
+            table_sk: String::new(),
+            item_json: r#"{"pk":{"S":"o2"},"status":{"S":"shipped"}}"#.to_string(),
+        },
+    ];
+
+    <Storage as StorageBackend>::insert_gsi_items(&storage, "orders", "by-status", &rows)
+        .await
+        .expect("insert_gsi_items via trait");
+
+    let found = <Storage as StorageBackend>::query_gsi_items(
+        &storage,
+        "orders",
+        "by-status",
+        "shipped",
+        &QueryParams::default(),
+    )
+    .await
+    .expect("query_gsi_items via trait");
+    assert_eq!(
+        found.len(),
+        2,
+        "both bulk-inserted GSI rows should be queryable"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_base_items_to_missing_table_is_backend_error() {
+    let storage = Storage::memory().expect("Storage::memory");
+    let rows = vec![BaseItemRow {
+        pk: "x".to_string(),
+        sk: String::new(),
+        item_json: r#"{"pk":{"S":"x"}}"#.to_string(),
+        item_size: 1,
+        cached_at: None,
+        hash_prefix: String::new(),
+    }];
+
+    let err = <Storage as StorageBackend>::put_base_items(&storage, "does-not-exist", &rows)
+        .await
+        .expect_err("bulk insert into a missing table must fail");
+
+    // From<BackendError> for DynoxideError keeps storage faults as 500s.
+    let dyno: dynoxide::DynoxideError = err.into();
+    assert_eq!(dyno.status_code(), 500);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn clock_via_trait_returns_wall_clock() {
+    let storage = Storage::memory().expect("Storage::memory");
+    let now = <Storage as StorageBackend>::clock(&storage).now_unix_secs();
+    assert!(now > 0, "system clock should report a positive epoch");
 }

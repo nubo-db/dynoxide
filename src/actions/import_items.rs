@@ -2,10 +2,10 @@ use crate::actions::gsi;
 use crate::actions::helpers;
 use crate::actions::lsi;
 use crate::errors::{DynoxideError, Result};
-use crate::storage::{Storage, escape_table_name};
+use crate::storage::Storage;
+use crate::storage_backend::BaseItemRow;
 use crate::types::item_size;
 use crate::{ImportOptions, ImportResult};
-use rusqlite::params;
 use std::time::SystemTime;
 
 /// Execute a bulk import of items into a table.
@@ -80,16 +80,9 @@ fn execute_inner(
     };
 
     let mut total_bytes: usize = 0;
+    let mut base_rows: Vec<BaseItemRow> = Vec::with_capacity(item_count);
 
     let result = (|| -> Result<()> {
-        // Prepare the INSERT statement once outside the loop
-        let escaped = escape_table_name(table_name);
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{escaped}\" (pk, sk, item_json, item_size, cached_at, hash_prefix) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-        );
-        let mut insert_stmt = storage.conn().prepare_cached(&sql)?;
-
         for mut item in items {
             // 5. Validate required keys and extract pk/sk
             helpers::validate_item_keys(&item, &key_schema, &meta)?;
@@ -113,16 +106,6 @@ fn execute_inner(
                 .get(&key_schema.partition_key)
                 .map(crate::storage::compute_hash_prefix)
                 .unwrap_or_default();
-
-            // 7. INSERT OR REPLACE into base table
-            insert_stmt.execute(params![
-                pk,
-                sk,
-                item_json,
-                size as i64,
-                cached_at_val,
-                hash_prefix
-            ])?;
 
             // 8. Maintain GSI tables (sparse: skip items missing GSI pk)
             for gsi_def in &gsi_defs {
@@ -249,7 +232,19 @@ fn execute_inner(
                     now_epoch,
                 )?;
             }
+
+            // Collect the base row; all base inserts run as one batch after
+            // the loop (same transaction, identical final state).
+            base_rows.push(BaseItemRow {
+                pk,
+                sk,
+                item_json,
+                item_size: size,
+                cached_at: cached_at_val,
+                hash_prefix,
+            });
         }
+        storage.put_base_items(table_name, &base_rows)?;
         Ok(())
     })();
 

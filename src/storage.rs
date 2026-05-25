@@ -903,6 +903,33 @@ impl Storage {
         Ok(())
     }
 
+    /// Bulk-insert many rows into one GSI table using a single cached
+    /// prepared statement. Equivalent to calling [`Self::insert_gsi_item`]
+    /// once per row, but reuses the statement across the batch.
+    pub fn insert_gsi_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[crate::storage_backend::GsiItemRow],
+    ) -> Result<()> {
+        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
+        let sql = format!(
+            "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            escape_table_name(&gsi_table_name)
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        for row in rows {
+            stmt.execute(params![
+                row.gsi_pk,
+                row.gsi_sk,
+                row.table_pk,
+                row.table_sk,
+                row.item_json
+            ])?;
+        }
+        Ok(())
+    }
+
     /// Delete an item from a GSI table by base table primary key.
     pub fn delete_gsi_item(
         &self,
@@ -1415,6 +1442,34 @@ impl Storage {
         )?;
 
         Ok(old_item)
+    }
+
+    /// Bulk-insert many base-table rows using a single cached prepared
+    /// statement (`INSERT OR REPLACE`). Unlike [`Self::put_item_with_hash`],
+    /// which preserves any existing `cached_at`, this writes `cached_at`
+    /// verbatim from each row, matching the import flow's semantics.
+    pub fn put_base_items(
+        &self,
+        table_name: &str,
+        rows: &[crate::storage_backend::BaseItemRow],
+    ) -> Result<()> {
+        let escaped = escape_table_name(table_name);
+        let sql = format!(
+            "INSERT OR REPLACE INTO \"{escaped}\" (pk, sk, item_json, item_size, cached_at, hash_prefix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        for row in rows {
+            stmt.execute(params![
+                row.pk,
+                row.sk,
+                row.item_json,
+                row.item_size as i64,
+                row.cached_at,
+                row.hash_prefix
+            ])?;
+        }
+        Ok(())
     }
 
     /// Get a single item by primary key.

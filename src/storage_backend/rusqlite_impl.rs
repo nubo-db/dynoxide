@@ -11,7 +11,7 @@ use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, Storage, StreamRecord,
     TableMetadata, TableStats,
 };
-use crate::storage_backend::{BackendError, StorageBackend, error};
+use crate::storage_backend::{BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, error};
 use crate::types::Tag;
 
 /// Convert a [`DynoxideError`] into a [`BackendError`].
@@ -29,6 +29,10 @@ fn dyno_to_backend(err: DynoxideError) -> BackendError {
 }
 
 impl StorageBackend for Storage {
+    fn clock(&self) -> &dyn Clock {
+        Storage::clock(self)
+    }
+
     async fn insert_table_metadata(&self, m: &CreateTableMetadata<'_>) -> Result<(), BackendError> {
         Storage::insert_table_metadata(self, m).map_err(dyno_to_backend)
     }
@@ -151,6 +155,15 @@ impl StorageBackend for Storage {
         .map_err(dyno_to_backend)
     }
 
+    async fn insert_gsi_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[GsiItemRow],
+    ) -> Result<(), BackendError> {
+        Storage::insert_gsi_items(self, table_name, index_name, rows).map_err(dyno_to_backend)
+    }
+
     async fn delete_gsi_item(
         &self,
         table_name: &str,
@@ -270,6 +283,14 @@ impl StorageBackend for Storage {
     ) -> Result<Option<String>, BackendError> {
         Storage::put_item_with_hash(self, table_name, pk, sk, item_json, item_size, hash_prefix)
             .map_err(dyno_to_backend)
+    }
+
+    async fn put_base_items(
+        &self,
+        table_name: &str,
+        rows: &[BaseItemRow],
+    ) -> Result<(), BackendError> {
+        Storage::put_base_items(self, table_name, rows).map_err(dyno_to_backend)
     }
 
     async fn get_item(

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** the MCP HTTP transport (`dynoxide mcp --http`, `dynoxide serve --mcp`) now requires bearer-token authentication on every request. On a loopback bind, dynoxide generates a token on first run, persists it to a per-user config file, and prints a client-config snippet; later runs reuse it silently. **Existing clients break until updated** — add `"headers": { "Authorization": "Bearer <token>" }` to your MCP client config. A non-loopback bind requires an explicit token via `--mcp-token`/`--token` or `DYNOXIDE_MCP_AUTH_TOKEN` and will not start without one. The stdio transport is unaffected ([#27](https://github.com/nubo-db/dynoxide/issues/27)).
+- **Breaking (library API):** `dynoxide::mcp::serve_http` and `serve_http_with_shutdown` now take an `HttpOptions` struct (bind host, `AuthMode`, extra allowed hosts) in place of a bare `port: u16`. Embedders constructing the MCP HTTP server must build `HttpOptions` and choose an `AuthMode`.
 
 ### Fixed
 

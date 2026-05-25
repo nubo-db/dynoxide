@@ -50,26 +50,19 @@ pub struct HttpOptions {
     pub extra_allowed_hosts: Vec<String>,
 }
 
-impl HttpOptions {
-    /// Loopback default with no extra allowed hosts — convenience for tests and
-    /// simple callers.
-    pub fn new(host: impl Into<String>, port: u16, auth: AuthMode) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            auth,
-            extra_allowed_hosts: Vec::new(),
-        }
+/// Wrap a bare IPv6 literal in brackets for a URL authority. Leaves IPv4,
+/// hostnames, and already-bracketed literals untouched.
+fn bracket_ipv6(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
 /// Format a `host:port` bind address, bracketing bare IPv6 literals.
 fn format_bind_addr(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
+    format!("{}:{}", bracket_ipv6(host), port)
 }
 
 /// Start the MCP server over Streamable HTTP transport.
@@ -105,7 +98,7 @@ pub async fn serve_http_with_shutdown(
         vec!["http://localhost".into(), "http://127.0.0.1".into()];
     for host in &opts.extra_allowed_hosts {
         allowed_hosts.push(host.clone());
-        allowed_origins.push(format!("http://{host}"));
+        allowed_origins.push(format!("http://{}", bracket_ipv6(host)));
     }
 
     // load-bearing: rmcp's config struct is #[non_exhaustive], so struct-literal

@@ -31,10 +31,10 @@ pub struct ResolvedAuth {
 pub enum AuthError {
     #[error("--no-auth is only allowed on a loopback bind")]
     NoAuthRequiresLoopback,
-    #[error("MCP auth token is empty (--mcp-token / DYNOXIDE_MCP_AUTH_TOKEN)")]
+    #[error("MCP auth token is empty (set --mcp-token/--token or DYNOXIDE_MCP_AUTH_TOKEN)")]
     EmptyToken,
     #[error(
-        "a non-loopback MCP bind requires an explicit token via --mcp-token or DYNOXIDE_MCP_AUTH_TOKEN"
+        "a non-loopback MCP bind requires an explicit token (set --mcp-token/--token or DYNOXIDE_MCP_AUTH_TOKEN)"
     )]
     NonLoopbackRequiresToken,
     #[error("could not determine a config directory for the MCP auth token")]
@@ -111,7 +111,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
-    let (scheme, token) = value.split_once(' ')?;
+    let (scheme, token) = value.split_once([' ', '\t'])?;
     if !scheme.eq_ignore_ascii_case("bearer") {
         return None;
     }
@@ -152,11 +152,15 @@ pub fn resolve_auth(
     }
 
     if let Some(token) = cli_token {
-        if token.trim().is_empty() {
+        // Trim to match the presented-token side (bearer_token trims) and the
+        // persisted-file path; otherwise a token supplied with stray whitespace
+        // would never match.
+        let token = token.trim();
+        if token.is_empty() {
             return Err(AuthError::EmptyToken);
         }
         return Ok(ResolvedAuth {
-            mode: AuthMode::Enabled(token),
+            mode: AuthMode::Enabled(token.to_string()),
             first_run: false,
             token_path: None,
         });
@@ -235,6 +239,9 @@ fn create_new_token_file(path: &Path) -> Result<String, CreateError> {
         Ok(mut file) => {
             let token = generate_token();
             file.write_all(token.as_bytes()).map_err(CreateError::Io)?;
+            // Durably flush before returning so a process that lost the create
+            // race reads a complete token rather than a partial/empty file.
+            file.sync_all().map_err(CreateError::Io)?;
             Ok(token)
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(CreateError::AlreadyExists),

@@ -1841,6 +1841,31 @@ fn off_loopback_no_auth_fails_to_start() {
 }
 
 #[test]
+fn off_loopback_no_auth_with_token_still_fails() {
+    // --no-auth is evaluated before the token, so the loopback-only guard wins
+    // even when an explicit token is also supplied.
+    let (ok, stderr) = run_expect_startup_failure(&[
+        "mcp",
+        "--http",
+        "--host",
+        "0.0.0.0",
+        "--no-auth",
+        "--token",
+        "tok",
+        "--port",
+        "0",
+    ]);
+    assert!(
+        !ok,
+        "--no-auth on a non-loopback bind must fail even when --token is given"
+    );
+    assert!(
+        stderr.contains("loopback"),
+        "error should explain --no-auth is loopback-only, got: {stderr}"
+    );
+}
+
+#[test]
 fn no_auth_loopback_starts_and_warns() {
     use std::io::Read;
     let port = free_port();
@@ -1897,6 +1922,7 @@ fn token_flag_beats_env() {
 
     let with_flag = mcp_request(port, &format!("127.0.0.1:{port}"), Some("flag-token"));
     let with_env = mcp_request(port, &format!("127.0.0.1:{port}"), Some("env-token"));
+    let no_token = mcp_request(port, &format!("127.0.0.1:{port}"), None);
     assert!(
         with_flag.starts_with("HTTP/1.1 2"),
         "flag token should win over env, got: {with_flag}"
@@ -1904,6 +1930,12 @@ fn token_flag_beats_env() {
     assert!(
         with_env.starts_with("HTTP/1.1 401"),
         "env token should be rejected when flag is set, got: {with_env}"
+    );
+    // The rejected env token must look identical to no token — no oracle.
+    assert_eq!(
+        response_body(&with_env),
+        response_body(&no_token),
+        "rejected-token body must match missing-token body"
     );
 }
 
@@ -1995,6 +2027,12 @@ fn allowed_host_extends_acceptance() {
     let _kill = AuthChild(child);
     wait_ready(&format!("127.0.0.1:{port}"));
 
+    // --allowed-host extends the loopback list, it does not replace it.
+    let loopback = mcp_request(port, &format!("127.0.0.1:{port}"), Some("tok"));
+    assert!(
+        loopback.starts_with("HTTP/1.1 2"),
+        "loopback Host must still be accepted when --allowed-host is set, got: {loopback}"
+    );
     let allowed = mcp_request(port, "myhost.lan", Some("tok"));
     assert!(
         allowed.starts_with("HTTP/1.1 2"),

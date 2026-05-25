@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A `StorageBackend` trait in the new `dynoxide::storage_backend` module, decoupling the data layer from a specific SQLite binding. The native rusqlite-backed `Storage` implements the trait. Today the trait is consumed monomorphically only -- `Database`, action handlers, and `DynoxideError` continue to operate against `Storage` directly.
+- A `StorageBackend` trait in the new `dynoxide::storage_backend` module, decoupling the data layer from a specific SQLite binding. The native rusqlite-backed `Storage` implements the trait, and the action handlers and `Database` now consume it (see Changed). The trait surface also carries a `clock()` accessor for the stream and TTL paths and batch-shaped `put_base_items` / `insert_gsi_items` methods that replaced the last two raw `Storage::conn()` escape hatches in the handlers.
 - A `BackendError` enum returned by the trait surface, with an explicit `rusqlite::Error -> BackendError` mapping for the common failure modes (`NotADatabase`, locked / busy, constraint violations, I/O failures).
 - A `Clock` capability on `Storage` so the trait surface does not assume `std::time`. Stream and TTL paths route their `created_at` and sweep timestamps through the clock; `SystemClock` is the default and `ManualClock` ships as a deterministic test helper. Other `std::time` call sites (idempotency cache, action-handler timestamps, snapshots) remain native-only and are unchanged.
 - A `wasm-stub` cargo feature that builds a placeholder `WaSqliteBackend` whose method bodies are `unimplemented!()`. The stub exists to catch trait-shape drift at type-check time before a real wa-sqlite backend has to absorb it. CI gains a `wasm-stub-check` job that runs `cargo check --features wasm-stub --lib` on every PR.
@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A single-item write (`PutItem`, `DeleteItem`, `UpdateItem`) and its GSI/LSI index fan-out now run in a single transaction. A failure partway through the fan-out rolls the whole write back rather than leaving a base row with a half-applied (torn) index. This matches DynamoDB, where a single-item write does not half-apply to its indexes.
+- A single-item write (`PutItem`, `DeleteItem`, `UpdateItem`) and its GSI/LSI index fan-out now run in a single transaction. A failure partway through the fan-out rolls the whole write back rather than leaving a base row with a half-applied (torn) index. The same per-item atomicity now also covers `BatchWriteItem` (each write request) and the TTL sweep (each expired-item delete). This matches DynamoDB, where a single-item write does not half-apply to its indexes.
+- Write paths now roll back on a failed `COMMIT` and surface a failed `ROLLBACK` rather than leaving the connection stuck mid-transaction, which would make the next write fail. Every write path shares one transaction helper for this.
+- A client-facing `ValidationException` raised inside a backend method (the 50-tag limit in `set_tags`) keeps its 400 status across the `StorageBackend` boundary instead of collapsing to a 500.
 
 ### Notes
 

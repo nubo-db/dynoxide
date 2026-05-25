@@ -100,17 +100,17 @@ helps a reviewer but are not required.
 
 ## Storage layer boundary
 
-The storage layer is mid-refactor. A `StorageBackend` trait now lives in
-`src/storage_backend/` and the native rusqlite-backed `Storage` implements
-it; nothing dynamic dispatches the trait yet, and `Database` plus the
-action handlers continue to operate against `Storage` directly. Folding
-the `Storage::conn()` and `Storage::conn_mut()` escape hatches into the
-trait (or migrating their callers off them) is the next move and is
-sequenced with the upcoming non-native (browser / WASM) backend. Please
-open an issue before submitting changes to `src/storage.rs`,
-`src/storage_backend/`, or call sites that use `conn()` directly; we can
-advise whether your change fits the current shape or is better held until
-the next pass.
+The data layer goes through the `StorageBackend` trait in
+`src/storage_backend/`; the native rusqlite-backed `Storage` implements it.
+The action handlers are async and generic over the trait
+(`execute<S: StorageBackend>`), and `Database` is `Database<S = RusqliteBackend>`
+with a `NativeDatabase` alias that preserves the historical synchronous public
+API through a `block_on` facade. The trait is consumed monomorphically (no
+`dyn`); a non-native (browser / WASM) backend is the next consumer. The raw
+`Storage::conn()` / `conn_mut()` escape hatches are no longer used by action
+handlers. Please open an issue before submitting changes to `src/storage.rs`
+or `src/storage_backend/`; we can advise whether your change fits the current
+shape or is better held until the next pass.
 
 ## Where to discuss
 

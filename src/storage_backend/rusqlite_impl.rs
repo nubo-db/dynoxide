@@ -3,8 +3,19 @@
 //!
 //! Each impl method is a thin async wrapper over the existing sync method on
 //! `Storage`: the body invokes the sync method synchronously and returns a
-//! ready future. No `spawn_blocking` is used — today's behaviour of running
+//! ready future. No `spawn_blocking` is used, so today's behaviour of running
 //! rusqlite calls on the active executor thread is preserved exactly.
+//!
+//! # Load-bearing invariant: native futures never suspend
+//!
+//! Every method here resolves on the first poll (it runs synchronous work and
+//! returns `Ready`). The synchronous `Database` facade depends on this: it
+//! drives these futures with `block_on`, which is only safe to call from inside
+//! the tokio-based HTTP and MCP servers because an always-ready future never
+//! parks the worker thread. Do not introduce a real `.await` on external async
+//! I/O (a socket, a timer, a task spawn, a channel) into any method here
+//! without first moving the facade off `block_on`; otherwise the server worker
+//! threads will stall.
 
 use crate::errors::DynoxideError;
 use crate::storage::{

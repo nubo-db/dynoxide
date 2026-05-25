@@ -143,7 +143,9 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/dynoxide dist/amd64/dynoxide
           chmod +x dist/amd64/dynoxide
           file dist/amd64/dynoxide
-          file dist/amd64/dynoxide | grep -q 'statically linked'
+          # musl builds report "static-pie linked"; zig cross-builds report
+          # "statically linked". Both are self-contained and run on FROM scratch.
+          file dist/amd64/dynoxide | grep -qE 'static-pie linked|statically linked'
 
       - uses: docker/setup-buildx-action@v3
 

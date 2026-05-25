@@ -10,7 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Official Docker image. `docker run -p 8000:8000 ghcr.io/nubo-db/dynoxide` is a ~5 MB drop-in for `amazon/dynamodb-local` in containerised test suites: multi-arch (`linux/amd64` and `linux/arm64`), `FROM scratch`, published to GHCR on each release with Docker Hub and ECR Public mirrors pushed best-effort. The image ships a `HEALTHCHECK` backed by a new `dynoxide healthcheck` subcommand, so `docker ps` and Compose health gates report status without extra tooling ([#3](https://github.com/nubo-db/dynoxide/issues/3)).
-- `SECURITY.md`, setting out the MCP HTTP transport's loopback-only threat model: what the Host and Origin allowlists cover, what they don't, and where it's safe to run until authentication ([#27](https://github.com/nubo-db/dynoxide/issues/27)) lands.
+- `SECURITY.md`, documenting the MCP HTTP transport's threat model — the bearer-token authentication it now requires, plus the Host and Origin allowlists that back it ([#27](https://github.com/nubo-db/dynoxide/issues/27)).
+- MCP HTTP transport options: `--mcp-host`/`--host` to bind beyond loopback, `--mcp-allowed-host`/`--allowed-host` to accept additional `Host` headers by name, and `--mcp-no-auth`/`--no-auth` to disable authentication on loopback binds only. With a token set, these make the transport reachable from outside a container, unblocking the Docker MCP path ([#24](https://github.com/nubo-db/dynoxide/issues/24)).
+
+### Changed
+
+- **Breaking:** the MCP HTTP transport (`dynoxide mcp --http`, `dynoxide serve --mcp`) now requires bearer-token authentication on every request. On a loopback bind, dynoxide generates a token on first run, persists it to a per-user config file, and prints a client-config snippet; later runs reuse it silently. **Existing clients break until updated** — add `"headers": { "Authorization": "Bearer <token>" }` to your MCP client config. A non-loopback bind requires an explicit token via `--mcp-token`/`--token` or `DYNOXIDE_MCP_AUTH_TOKEN` and will not start without one. The stdio transport is unaffected ([#27](https://github.com/nubo-db/dynoxide/issues/27)).
 
 ### Fixed
 

@@ -240,6 +240,48 @@ dynoxide mcp --db-path data.db
 dynoxide mcp --http --port 19280
 ```
 
+The HTTP transport requires a bearer token on every request. On a loopback
+bind with no token supplied, dynoxide generates one on first run, saves it to a
+per-user config file (`~/.config/dynoxide/mcp-token` on Linux,
+`~/Library/Application Support/dynoxide/mcp-token` on macOS), and prints a
+ready-to-paste client snippet; later runs reuse it silently. Supply your own
+with `--token` or the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (the flag
+wins if both are set).
+
+| Flag | Purpose |
+|------|---------|
+| `--host <HOST>` | Bind address (default `127.0.0.1`). Non-loopback binds require an explicit token. |
+| `--token <TOKEN>` / `DYNOXIDE_MCP_AUTH_TOKEN` | Use a fixed token instead of the persisted one. |
+| `--allowed-host <HOST>` | Accept an additional `Host` header by name (repeatable); needed for non-loopback access by hostname. |
+| `--no-auth` | Disable authentication. Loopback binds only; prints a warning. |
+
+Prefer the environment variable or the persisted file over `--token` for
+anything beyond one-shot debugging — flag values leak into shell history and
+`ps`. To rotate the token, delete the persisted file (or change
+`DYNOXIDE_MCP_AUTH_TOKEN`) and restart; there is no rotation mechanism by
+design.
+
+On the `serve` subcommand the equivalent flags are prefixed —
+`--mcp-host`, `--mcp-token`, `--mcp-no-auth`, `--mcp-allowed-host` — because
+`serve` already owns `--host`/`--port` for the DynamoDB server.
+
+#### HTTP client configuration
+
+Point an HTTP-transport MCP client at the endpoint and send the token in an
+`Authorization` header:
+
+```json
+{
+  "mcpServers": {
+    "dynoxide": {
+      "type": "http",
+      "url": "http://127.0.0.1:19280/mcp",
+      "headers": { "Authorization": "Bearer <TOKEN>" }
+    }
+  }
+}
+```
+
 ### Claude Code configuration
 
 Add to your `mcp.json`:

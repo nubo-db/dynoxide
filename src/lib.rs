@@ -98,17 +98,45 @@ type TokenCache = HashMap<
     ),
 >;
 
+/// The native storage backend: the rusqlite-backed [`storage::Storage`].
+///
+/// `Database`'s type parameter defaults to this, so existing native callers
+/// keep writing `Database` and get the synchronous rusqlite-backed engine.
+pub type RusqliteBackend = storage::Storage;
+
+/// The native, synchronous `Database`.
+///
+/// Alias for the default [`Database`] monomorphisation over
+/// [`RusqliteBackend`]. It exposes the historical synchronous public API
+/// unchanged: each method drives an async handler future to completion with
+/// `block_on`. Because the native backend's futures never suspend, that
+/// `block_on` never parks the thread.
+pub type NativeDatabase = Database<RusqliteBackend>;
+
 /// The main entry point for the DynamoDB emulator.
 ///
-/// Wraps a SQLite-backed storage layer and provides DynamoDB-compatible
-/// operations. Thread-safe via `Arc<Mutex<>>` — clone freely across threads.
-#[derive(Clone)]
-pub struct Database {
-    inner: Arc<Mutex<storage::Storage>>,
+/// Generic over the storage backend `S`, monomorphised (no `dyn`). The type
+/// parameter defaults to [`RusqliteBackend`], so `Database` means the native
+/// engine and the public synchronous API is preserved via [`NativeDatabase`].
+///
+/// Wraps a storage layer and provides DynamoDB-compatible operations.
+/// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+pub struct Database<S = RusqliteBackend> {
+    inner: Arc<Mutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
 }
 
-impl Database {
+// Hand-written so cloning never requires `S: Clone`; only the `Arc`s clone.
+impl<S> Clone for Database<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            idempotency_tokens: Arc::clone(&self.idempotency_tokens),
+        }
+    }
+}
+
+impl Database<RusqliteBackend> {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
         let storage = storage::Storage::new(path)?;
@@ -706,5 +734,50 @@ mod tests {
 
         let tables = handle.join().unwrap();
         assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn test_native_database_alias_round_trips() {
+        // The `NativeDatabase` alias is the default `Database<RusqliteBackend>`
+        // and must drive the async handlers through the synchronous facade
+        // transparently: a put/get round-trip behaves exactly as before.
+        let db: NativeDatabase = Database::memory().unwrap();
+
+        db.create_table(actions::create_table::CreateTableRequest {
+            table_name: "tbl".to_string(),
+            key_schema: vec![types::KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: types::KeyType::HASH,
+            }],
+            attribute_definitions: vec![types::AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: types::ScalarAttributeType::S,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("a".to_string()));
+        db.put_item(actions::put_item::PutItemRequest {
+            table_name: "tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut key = HashMap::new();
+        key.insert("pk".to_string(), AttributeValue::S("a".to_string()));
+        let got = db
+            .get_item(actions::get_item::GetItemRequest {
+                table_name: "tbl".to_string(),
+                key,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            got.item.unwrap().get("pk"),
+            Some(&AttributeValue::S("a".to_string()))
+        );
     }
 }

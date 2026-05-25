@@ -10,28 +10,26 @@ I aim to acknowledge reports within 5 business days. Fix timelines depend on sev
 
 ## Threat model
 
-dynoxide's MCP HTTP transport is intended for local single-user development. It is opt-in: the default `dynoxide mcp` uses stdio and has no network exposure. Only `dynoxide mcp --http` opens a localhost HTTP listener.
+dynoxide's MCP HTTP transport is intended for local single-user development, with an explicit opt-in for wider exposure. It is opt-in to begin with: the default `dynoxide mcp` uses stdio and has no network exposure. Only `dynoxide mcp --http` (or `dynoxide serve --mcp`) opens an HTTP listener.
 
-The threat model for the HTTP transport is browser-based cross-origin attacks (DNS rebinding, cross-origin CSRF), not multi-user systems or network-adjacent attackers.
+The HTTP transport defends against two threats: direct-from-tooling callers (anyone who can reach the port) and browser-based cross-origin attacks (DNS rebinding, cross-origin CSRF).
 
-In that scope, dynoxide:
+dynoxide:
 
-- Binds to `127.0.0.1` only. There is no flag to override this.
-- Validates the `Host` header against a loopback allowlist (`localhost`, `127.0.0.1`, `::1`). Anything else returns 403.
-- Validates the `Origin` header when present, against `http://localhost` and `http://127.0.0.1`. Anything else returns 403. Native MCP clients (Claude Code, Cursor, the dynoxide CLI) don't send an Origin header and pass through unaffected.
+- **Requires a bearer token on every request.** Each `/mcp` request must carry `Authorization: Bearer <token>`; a missing or wrong token returns an identical `401` (no oracle distinguishes the two). On a loopback bind with no token supplied, dynoxide generates one on first run, persists it to a per-user config file (mode `0600` on Unix; on Windows it lives under your per-user `%APPDATA%`, which other standard accounts cannot read), and prints client-config guidance. Supply your own with `--token` / `--mcp-token` or `DYNOXIDE_MCP_AUTH_TOKEN`. There is no rotation mechanism: to rotate, delete the persisted file (or change the env var) and restart.
+- **Defaults to a loopback bind.** `--host` / `--mcp-host` can widen it, but a non-loopback bind will not start without an explicit token — auto-generation is loopback-only.
+- **Validates the `Host` header** against a loopback allowlist (`localhost`, `127.0.0.1`, `::1`); anything else returns `403`. `--allowed-host` / `--mcp-allowed-host` adds names for non-loopback by-name access. The auth check runs first, so a valid token holder who then spoofs `Host` still gets `403` — the allowlist is defense-in-depth, not the primary control.
+- **Validates the `Origin` header** when present, against `http://localhost`, `http://127.0.0.1`, and any added hosts; anything else returns `403`. Native MCP clients (Claude Code, Cursor, the dynoxide CLI) don't send an Origin header and pass through unaffected.
 
-dynoxide does not yet implement client authentication on the MCP HTTP transport. The Host and Origin controls work against browser-based attackers but don't help against direct-from-tooling callers who can spoof Host and send no Origin. This means dynoxide is currently suitable for:
+With authentication in place, dynoxide is suitable for:
 
 - Local development on a personal machine
-- CI environments where the runner is dedicated to a single job (e.g. GitHub Actions hosted runners)
+- CI environments
+- Dockerised and network-exposed deployments, **provided a token is set** and treated as a secret (passed via `DYNOXIDE_MCP_AUTH_TOKEN`, not a flag, to keep it out of process listings and shell history)
 
-It is not currently suitable for:
+A loopback-only escape hatch, `--no-auth` / `--mcp-no-auth`, disables authentication entirely; it refuses to start on a non-loopback bind. Use it only on a trusted single-user machine where no other local process is a concern.
 
-- Multi-tenant CI infrastructure
-- Dockerised deployments exposed beyond loopback
-- Any environment where untrusted code or users share network access with dynoxide
-
-Authentication is the next priority; see [#27](https://github.com/nubo-db/dynoxide/issues/27). Until it lands, restrict dynoxide MCP HTTP usage to environments matching the suitable-for list above, or use the stdio transport instead (`dynoxide mcp` without `--http`).
+The stdio transport is unaffected by all of the above — it is process-scoped and has no network surface.
 
 ## Known advisories
 

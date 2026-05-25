@@ -197,6 +197,14 @@ pub async fn execute<S: StorageBackend>(
             &request.expression_attribute_values,
         )
         .map_err(DynoxideError::ValidationException)?;
+        crate::expressions::condition::validate_operand_semantics(
+            &parsed,
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        )
+        .map_err(|e| {
+            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+        })?;
     }
 
     // Validate legacy Expected parameter BEFORE checking table existence

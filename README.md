@@ -4,7 +4,7 @@ A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for 
 
 ## Why Dynoxide?
 
-I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs Docker and a JVM. That's <!-- prose:ddb_local_cold_start -->2–3 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~188 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~471 MB<!-- /bench --> on disk) before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
+I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs a JVM, and the typical Docker-based setups adds <!-- prose:ddb_local_cold_start -->2–3 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~188 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~471 MB<!-- /bench --> on disk) before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.
 
 Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~4.9 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~3 MB<!-- /bench --> download. Point any DynamoDB SDK at it and your tests just work.
 
@@ -63,8 +63,7 @@ See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#resul
 | Conformance (601 tests) | **100%** | 88.2% | 89.0% | 78.0% |
 | Language | Rust | Java | Python + Java | Node.js |
 | Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
-| Docker required | — | ✓ | ✓ | — |
-| JVM required | — | ✓ | ✓ | — |
+| Runtime dependency | — | JVM | Docker + LocalStack | Node.js |
 | Embeddable (Rust / iOS) | ✓ | — | — | — |
 | MCP server for agents | ✓ | — | — | — |
 
@@ -131,6 +130,75 @@ dynoxide-rs = { version = "0.9", default-features = false, features = ["native-s
 
 See [action/action.yml](action/action.yml) for all inputs and outputs.
 
+### Docker
+
+A 5 MB drop-in for `amazon/dynamodb-local` in containerised test suites. Same DynamoDB-compatible API, faster startup, smaller image. Note that this is a packaging convenience for test fixtures, not a containerised database product; production-database-on-Kubernetes patterns are out of scope.
+
+```sh
+docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
+```
+
+With persistent storage:
+
+```sh
+docker run --rm -p 8000:8000 \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/nubo-db/dynoxide \
+  serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
+```
+
+The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
+
+If you override `CMD` to bind to a different port, set the healthcheck target with environment variables so the container's `HEALTHCHECK` follows:
+
+```sh
+docker run -e DYNOXIDE_HEALTHCHECK_PORT=9000 ghcr.io/nubo-db/dynoxide serve --port 9000
+```
+
+`DYNOXIDE_HEALTHCHECK_HOST` and `DYNOXIDE_HEALTHCHECK_PORT` are documented public surface and will not be renamed in a patch or minor release.
+
+#### Running as nonroot
+
+For security-conscious operators, opt into a nonroot uid:
+
+```sh
+docker run --rm -p 8000:8000 --user 65532:65532 ghcr.io/nubo-db/dynoxide
+```
+
+Persistent mode under nonroot needs a host-owned bind mount, since the in-image `/data` is owned by root:
+
+```sh
+docker run --rm -p 8000:8000 \
+  --user "$(id -u):$(id -g)" \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/nubo-db/dynoxide \
+  serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
+```
+
+The default in-memory mode needs no flags whether root or nonroot. The uid 65532 is the well-known nonroot uid used by Google's distroless images; pick any uid you prefer with `--user <uid>:<gid>`.
+
+#### MCP over HTTP in Docker
+
+The default image serves DynamoDB only. To also expose the [MCP](#mcp-server) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind — pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
+
+```sh
+TOKEN=$(openssl rand -base64 24)
+
+docker run --rm -p 8000:8000 -p 19280:19280 \
+  -e DYNOXIDE_MCP_AUTH_TOKEN="$TOKEN" \
+  ghcr.io/nubo-db/dynoxide \
+  serve --host 0.0.0.0 --port 8000 \
+        --mcp --mcp-host 0.0.0.0 --mcp-port 19280
+```
+
+DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localhost:19280/mcp`. Point an HTTP-transport MCP client at the latter with an `Authorization: Bearer <token>` header — see [MCP Server](#mcp-server) for the client config shape.
+
+A few things to know:
+
+- **The token is not optional.** Omit it and the container exits immediately with `a non-loopback MCP bind requires an explicit token`. The default `docker run ghcr.io/nubo-db/dynoxide` stays DynamoDB-only precisely because a token-less `0.0.0.0` MCP bind cannot boot.
+- **Reaching MCP from another container** by service name (rather than `localhost`) needs that name added to the Host allowlist: `--mcp-allowed-host <name>` (e.g. `--mcp-allowed-host dynoxide`). The `-p`-mapped `localhost` access above needs nothing extra.
+- **`--network host`** (Linux only) is an alternative to `-p`, but it bypasses Docker network isolation and binds MCP directly on the host's network interface — reachable from the LAN, not just the host. Prefer `-p` unless you specifically need host networking.
+
 ## HTTP Server
 
 Start the server:
@@ -192,6 +260,51 @@ dynoxide mcp --db-path data.db
 
 ```sh
 dynoxide mcp --http --port 19280
+```
+
+The HTTP transport requires a bearer token on every request. On a loopback
+bind with no token supplied, dynoxide generates one on first run, saves it to a
+per-user config file (`~/.config/dynoxide/mcp-token` on Linux,
+`~/Library/Application Support/dynoxide/mcp-token` on macOS), and prints a
+ready-to-paste client snippet; later runs reuse it silently. Supply your own
+with `--token` or the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (the flag
+wins if both are set).
+
+| Flag | Purpose |
+|------|---------|
+| `--host <HOST>` | Bind address (default `127.0.0.1`). Non-loopback binds require an explicit token. |
+| `--token <TOKEN>` / `DYNOXIDE_MCP_AUTH_TOKEN` | Use a fixed token instead of the persisted one. |
+| `--allowed-host <HOST>` | Accept an additional `Host` header by name (repeatable); needed for non-loopback access by hostname. |
+| `--no-auth` | Disable authentication. Loopback binds only; prints a warning. |
+
+Prefer the environment variable or the persisted file over `--token` for
+anything beyond one-shot debugging — flag values leak into shell history and
+`ps`. To rotate the token, delete the persisted file (or change
+`DYNOXIDE_MCP_AUTH_TOKEN`) and restart; there is no rotation mechanism by
+design.
+
+On the `serve` subcommand the equivalent flags are prefixed —
+`--mcp-host`, `--mcp-token`, `--mcp-no-auth`, `--mcp-allowed-host` — because
+`serve` already owns `--host`/`--port` for the DynamoDB server.
+
+To run the HTTP transport from the container image, see
+[MCP over HTTP in Docker](#mcp-over-http-in-docker).
+
+#### HTTP client configuration
+
+Point an HTTP-transport MCP client at the endpoint and send the token in an
+`Authorization` header:
+
+```json
+{
+  "mcpServers": {
+    "dynoxide": {
+      "type": "http",
+      "url": "http://127.0.0.1:19280/mcp",
+      "headers": { "Authorization": "Bearer <TOKEN>" }
+    }
+  }
+}
 ```
 
 ### Claude Code configuration

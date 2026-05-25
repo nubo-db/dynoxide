@@ -32,8 +32,11 @@ struct ScanRequestRaw {
     consistent_read: Option<bool>,
     #[serde(rename = "IndexName", default)]
     index_name: Option<String>,
+    // Signed so a negative Segment deserialises and can be rejected with the
+    // DynamoDB ValidationException rather than a serde error. Cast to u32 after
+    // the >= 0 check below.
     #[serde(rename = "Segment", default)]
-    segment: Option<u32>,
+    segment: Option<i64>,
     #[serde(rename = "TotalSegments", default)]
     total_segments: Option<u32>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
@@ -128,6 +131,18 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             }
         }
 
+        // Segment must be >= 0. (Segment vs TotalSegments and the TotalSegments
+        // range are checked in execute().)
+        if let Some(segment) = raw.segment {
+            if segment < 0 {
+                errors.push(format!(
+                    "Value '{}' at 'segment' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 0",
+                    segment
+                ));
+            }
+        }
+
         if let Some(msg) = format_validation_errors(&errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
@@ -143,7 +158,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             select: raw.select,
             consistent_read: raw.consistent_read,
             index_name: raw.index_name,
-            segment: raw.segment,
+            segment: raw.segment.map(|s| s as u32),
             total_segments: raw.total_segments,
             return_consumed_capacity: raw.return_consumed_capacity,
             attributes_to_get: raw.attributes_to_get,
@@ -302,6 +317,15 @@ pub async fn execute<S: StorageBackend>(
             if let Err(e) = expressions::condition::validate_name_refs(
                 &parsed_fe,
                 &request.expression_attribute_names,
+            ) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "Invalid FilterExpression: {e}"
+                )));
+            }
+            if let Err(e) = expressions::condition::validate_operand_semantics(
+                &parsed_fe,
+                &request.expression_attribute_names,
+                &request.expression_attribute_values,
             ) {
                 return Err(DynoxideError::ValidationException(format!(
                     "Invalid FilterExpression: {e}"

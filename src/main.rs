@@ -4,6 +4,7 @@
 //! - `dynoxide` or `dynoxide serve` — start the DynamoDB-compatible HTTP server
 //! - `dynoxide mcp` — start the MCP server (enabled by default)
 //! - `dynoxide import` — import DynamoDB Export data (enabled by default)
+//! - `dynoxide healthcheck` — probe a running server for liveness (used by Docker HEALTHCHECK)
 
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 use dynoxide::Database;
@@ -63,6 +64,10 @@ enum Commands {
     /// Import DynamoDB Export data into a Dynoxide database
     #[cfg(feature = "import")]
     Import(ImportArgs),
+
+    /// Probe a running Dynoxide server for liveness (used by Docker HEALTHCHECK and Kubernetes probes)
+    #[cfg(feature = "http-server")]
+    Healthcheck(HealthcheckArgs),
 }
 
 /// Arguments for the `serve` subcommand.
@@ -104,6 +109,48 @@ struct ServeArgs {
     #[cfg(feature = "mcp-server")]
     #[arg(long, value_name = "PATH", requires = "mcp")]
     mcp_data_model: Option<PathBuf>,
+
+    /// Host for the MCP HTTP transport (default: 127.0.0.1)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, default_value = "127.0.0.1", requires = "mcp")]
+    mcp_host: String,
+
+    /// Bearer token for the MCP HTTP transport. Overrides the persisted token.
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    mcp_token: Option<String>,
+
+    /// Disable MCP HTTP authentication (loopback binds only)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, requires = "mcp")]
+    mcp_no_auth: bool,
+
+    /// Extra Host header value to accept on a non-loopback MCP bind (repeatable)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, value_name = "HOST", requires = "mcp")]
+    mcp_allowed_host: Vec<String>,
+}
+
+/// Arguments for the `healthcheck` subcommand.
+///
+/// Defaults match what the `serve` subcommand listens on. The Docker image's
+/// HEALTHCHECK directive sets `DYNOXIDE_HEALTHCHECK_HOST` and
+/// `DYNOXIDE_HEALTHCHECK_PORT` so users who override `CMD` can also override
+/// the probe target with `-e DYNOXIDE_HEALTHCHECK_PORT=...`.
+#[cfg(feature = "http-server")]
+#[derive(clap::Args)]
+struct HealthcheckArgs {
+    /// Host to probe. Wildcard hosts (0.0.0.0, ::) are silently rewritten to loopback.
+    #[arg(long, env = "DYNOXIDE_HEALTHCHECK_HOST", default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port to probe.
+    #[arg(long, env = "DYNOXIDE_HEALTHCHECK_PORT", default_value_t = 8000)]
+    port: u16,
+
+    /// Total deadline in seconds for the entire probe (resolve + connect + write + read).
+    #[arg(long, default_value_t = 3)]
+    timeout: u64,
 }
 
 /// Arguments for the `mcp` subcommand.
@@ -122,9 +169,25 @@ struct McpArgs {
     #[arg(long)]
     http: bool,
 
+    /// Host to bind the HTTP transport to (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1", requires = "http")]
+    host: String,
+
     /// Port for the HTTP transport (default: 19280)
     #[arg(long, default_value_t = 19280)]
     port: u16,
+
+    /// Bearer token for the HTTP transport. Overrides the persisted token.
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    token: Option<String>,
+
+    /// Disable HTTP authentication (loopback binds only)
+    #[arg(long, requires = "http")]
+    no_auth: bool,
+
+    /// Extra Host header value to accept on a non-loopback bind (repeatable)
+    #[arg(long, value_name = "HOST", requires = "http")]
+    allowed_host: Vec<String>,
 
     /// Read-only mode: reject all write operations
     #[arg(long)]
@@ -225,6 +288,26 @@ struct ImportArgs {
     #[cfg(feature = "mcp-server")]
     #[arg(long, value_name = "PATH", requires = "mcp")]
     mcp_data_model: Option<PathBuf>,
+
+    /// Host for the MCP HTTP transport when using --serve --mcp (default: 127.0.0.1)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, default_value = "127.0.0.1", requires = "mcp")]
+    mcp_host: String,
+
+    /// Bearer token for the MCP HTTP transport. Overrides the persisted token.
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    mcp_token: Option<String>,
+
+    /// Disable MCP HTTP authentication (loopback binds only)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, requires = "mcp")]
+    mcp_no_auth: bool,
+
+    /// Extra Host header value to accept on a non-loopback MCP bind (repeatable)
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, value_name = "HOST", requires = "mcp")]
+    mcp_allowed_host: Vec<String>,
 }
 
 /// Returns the after_help text. Encryption builds include key guidance.
@@ -291,6 +374,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Import(args)) => run_import(args).await,
 
         #[cfg(feature = "http-server")]
+        Some(Commands::Healthcheck(args)) => run_healthcheck(args),
+
+        #[cfg(feature = "http-server")]
         None => {
             // Backward compatibility: no subcommand = serve with top-level args
             let args = ServeArgs {
@@ -306,6 +392,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 mcp_read_only: false,
                 #[cfg(feature = "mcp-server")]
                 mcp_data_model: None,
+                #[cfg(feature = "mcp-server")]
+                mcp_host: "127.0.0.1".to_string(),
+                #[cfg(feature = "mcp-server")]
+                mcp_token: None,
+                #[cfg(feature = "mcp-server")]
+                mcp_no_auth: false,
+                #[cfg(feature = "mcp-server")]
+                mcp_allowed_host: Vec::new(),
             };
             run_serve(args).await
         }
@@ -389,14 +483,20 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             data_model: mcp_data_model,
             ..Default::default()
         };
-        let mcp_port = args.mcp_port;
+        let opts = resolve_mcp_http_options(
+            &args.mcp_host,
+            args.mcp_port,
+            args.mcp_token.clone(),
+            args.mcp_no_auth,
+            args.mcp_allowed_host.clone(),
+        )?;
         let mcp_db = db.clone();
         let mcp_shutdown = CancellationToken::new();
         let mcp_shutdown_clone = mcp_shutdown.clone();
 
         eprintln!(
-            "Starting DynamoDB HTTP server on {}:{} + MCP server on 127.0.0.1:{}",
-            args.host, args.port, mcp_port
+            "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
+            args.host, args.port, args.mcp_host, args.mcp_port
         );
 
         let (http_result, mcp_result) = tokio::join!(
@@ -406,12 +506,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 mcp_shutdown_clone.cancel();
                 r
             },
-            dynoxide::mcp::serve_http_with_shutdown(
-                mcp_db,
-                mcp_port,
-                mcp_config,
-                Some(mcp_shutdown),
-            ),
+            dynoxide::mcp::serve_http_with_shutdown(mcp_db, opts, mcp_config, Some(mcp_shutdown),),
         );
         http_result?;
         mcp_result?;
@@ -532,8 +627,184 @@ fn wrap_encrypted_open_error(
 }
 
 // ---------------------------------------------------------------------------
+// Healthcheck subcommand (http-server feature)
+// ---------------------------------------------------------------------------
+
+/// Entry point for the `healthcheck` subcommand.
+///
+/// Runs `do_healthcheck`, prints any error to stderr, and exits with the
+/// status code that the Docker `HEALTHCHECK` directive contracts on:
+/// 0 on success, non-zero on any failure. Never returns.
+#[cfg(feature = "http-server")]
+fn run_healthcheck(args: HealthcheckArgs) -> ! {
+    match do_healthcheck(args) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("healthcheck: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Probe an HTTP endpoint for a 200 response.
+///
+/// Implementation is std-only (no tokio, no reqwest) so the binary's
+/// healthcheck path stays light and the scratch container has nothing extra
+/// to load. The single `--timeout` argument is a total wall-clock deadline,
+/// not a per-operation timeout: each of resolve, connect, write, and read
+/// shares the same budget so the worst case is one timeout, not three.
+#[cfg(feature = "http-server")]
+fn do_healthcheck(args: HealthcheckArgs) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::{Duration, Instant};
+
+    // Wildcard hosts cannot be probed; rewrite to loopback. This makes the
+    // env-var path safe when an operator copies their `serve --host 0.0.0.0`
+    // value into `DYNOXIDE_HEALTHCHECK_HOST`.
+    let probe_host = match args.host.as_str() {
+        "0.0.0.0" => {
+            eprintln!("healthcheck: rewriting wildcard host 0.0.0.0 to 127.0.0.1 for probe");
+            "127.0.0.1".to_string()
+        }
+        "::" | "[::]" => {
+            eprintln!(
+                "healthcheck: rewriting wildcard host {} to ::1 for probe",
+                args.host
+            );
+            "::1".to_string()
+        }
+        h => h.to_string(),
+    };
+
+    let total = Duration::from_secs(args.timeout);
+    let started = Instant::now();
+    let remaining = || total.saturating_sub(started.elapsed());
+
+    // IPv6 literal addresses must be bracketed for the SocketAddr parser.
+    let addr_str = if probe_host.contains(':') && !probe_host.starts_with('[') {
+        format!("[{probe_host}]:{}", args.port)
+    } else {
+        format!("{probe_host}:{}", args.port)
+    };
+    let sock_addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {addr_str}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no addresses for {addr_str}"))?;
+
+    let connect_budget = remaining();
+    if connect_budget.is_zero() {
+        return Err("timeout exceeded before connect".into());
+    }
+    let mut stream = TcpStream::connect_timeout(&sock_addr, connect_budget)
+        .map_err(|e| format!("connect {sock_addr}: {e}"))?;
+
+    let write_budget = remaining();
+    if write_budget.is_zero() {
+        return Err("timeout exceeded before write".into());
+    }
+    stream
+        .set_write_timeout(Some(write_budget))
+        .map_err(|e| format!("set_write_timeout: {e}"))?;
+
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n",
+        host = probe_host,
+        port = args.port,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("write request: {e}"))?;
+
+    let read_budget = remaining();
+    if read_budget.is_zero() {
+        return Err("timeout exceeded before read".into());
+    }
+    stream
+        .set_read_timeout(Some(read_budget))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+
+    // Read until first \r\n. TcpStream::read may return only a partial status
+    // line on a single call (especially over loopback under load), so loop
+    // until the terminator appears or the cap is reached. 512 bytes is more
+    // than any well-formed status line and guards against a malformed peer.
+    let mut buf = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        if buf.len() >= 512 {
+            return Err("status line exceeded 512 bytes".into());
+        }
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| format!("read status: {e}"))?;
+        if n == 0 {
+            return Err("connection closed before status line".into());
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    let status_line = std::str::from_utf8(&buf)
+        .map_err(|e| format!("status line not utf-8: {e}"))?
+        .trim_end_matches("\r\n");
+
+    if status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(format!("unexpected status: {status_line}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCP subcommand (mcp-server feature)
 // ---------------------------------------------------------------------------
+
+/// Resolve the auth mode and build HTTP transport options for an MCP HTTP
+/// server. Emits the one-time first-run token guidance or the auth-disabled
+/// warning to stderr. Startup guards (off-loopback requires a token, --no-auth
+/// is loopback-only) surface as errors from `resolve_auth`.
+#[cfg(feature = "mcp-server")]
+fn resolve_mcp_http_options(
+    host: &str,
+    port: u16,
+    cli_token: Option<String>,
+    no_auth: bool,
+    extra_allowed_hosts: Vec<String>,
+) -> Result<dynoxide::mcp::HttpOptions, Box<dyn std::error::Error>> {
+    use dynoxide::mcp::{self, AuthMode};
+
+    let resolved = mcp::resolve_auth(mcp::is_loopback_host(host), cli_token, no_auth, None)?;
+
+    match &resolved.mode {
+        AuthMode::Disabled => {
+            eprintln!(
+                "WARNING: MCP auth disabled (--no-auth, loopback only). \
+                 Any local process on this machine can call this server."
+            );
+        }
+        AuthMode::Enabled(token) if resolved.first_run => {
+            if let Some(path) = &resolved.token_path {
+                let authority = if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
+                let url = format!("http://{authority}/mcp");
+                eprintln!("{}", mcp::first_run_message(&url, token, path));
+            }
+        }
+        AuthMode::Enabled(_) => {}
+    }
+
+    Ok(mcp::HttpOptions {
+        host: host.to_string(),
+        port,
+        auth: resolved.mode,
+        extra_allowed_hosts,
+    })
+}
 
 #[cfg(feature = "mcp-server")]
 async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -573,7 +844,14 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.http {
-        dynoxide::mcp::serve_http(db, args.port, mcp_config).await
+        let opts = resolve_mcp_http_options(
+            &args.host,
+            args.port,
+            args.token.clone(),
+            args.no_auth,
+            args.allowed_host.clone(),
+        )?;
+        dynoxide::mcp::serve_http(db, opts, mcp_config).await
     } else {
         dynoxide::mcp::serve_stdio(db, mcp_config).await
     }
@@ -656,14 +934,20 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 data_model: mcp_data_model,
                 ..Default::default()
             };
-            let mcp_port = args.mcp_port;
+            let opts = resolve_mcp_http_options(
+                &args.mcp_host,
+                args.mcp_port,
+                args.mcp_token.clone(),
+                args.mcp_no_auth,
+                args.mcp_allowed_host.clone(),
+            )?;
             let mcp_db = db.clone();
             let mcp_shutdown = CancellationToken::new();
             let mcp_shutdown_clone = mcp_shutdown.clone();
 
             eprintln!(
-                "Starting DynamoDB HTTP server on {}:{} + MCP server on 127.0.0.1:{}",
-                args.host, args.port, mcp_port
+                "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
+                args.host, args.port, args.mcp_host, args.mcp_port
             );
 
             let (http_result, mcp_result) = tokio::join!(
@@ -674,7 +958,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 },
                 dynoxide::mcp::serve_http_with_shutdown(
                     mcp_db,
-                    mcp_port,
+                    opts,
                     mcp_config,
                     Some(mcp_shutdown),
                 ),

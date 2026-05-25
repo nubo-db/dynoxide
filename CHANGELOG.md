@@ -10,19 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A `StorageBackend` trait in the new `dynoxide::storage_backend` module, decoupling the data layer from a specific SQLite binding. The native rusqlite-backed `Storage` implements the trait, and the action handlers and `Database` now consume it (see Changed). The trait surface also carries a `clock()` accessor for the stream and TTL paths and batch-shaped `put_base_items` / `insert_gsi_items` methods that replaced the last two raw `Storage::conn()` escape hatches in the handlers.
-- A `BackendError` enum returned by the trait surface, with an explicit `rusqlite::Error -> BackendError` mapping for the common failure modes (`NotADatabase`, locked / busy, constraint violations, I/O failures).
+- A `BackendError` enum returned by the trait surface, with an explicit `rusqlite::Error -> BackendError` mapping for the common failure modes (`NotADatabase`, locked / busy, constraint violations, I/O failures). It is `#[non_exhaustive]` so future backends can add failure modes without a breaking change.
 - A `Clock` capability on `Storage` so the trait surface does not assume `std::time`. Stream and TTL paths route their `created_at` and sweep timestamps through the clock; `SystemClock` is the default and `ManualClock` ships as a deterministic test helper. Other `std::time` call sites (idempotency cache, action-handler timestamps, snapshots) remain native-only and are unchanged.
 - A `wasm-stub` cargo feature that builds a placeholder `WaSqliteBackend` whose method bodies are `unimplemented!()`. The stub exists to catch trait-shape drift at type-check time before a real wa-sqlite backend has to absorb it. CI gains a `wasm-stub-check` job that runs `cargo check --features wasm-stub --lib` on every PR.
+- Official Docker image. `docker run -p 8000:8000 ghcr.io/nubo-db/dynoxide` is a ~5 MB drop-in for `amazon/dynamodb-local` in containerised test suites: multi-arch (`linux/amd64` and `linux/arm64`), `FROM scratch`, published to GHCR on each release with Docker Hub and ECR Public mirrors pushed best-effort. The image ships a `HEALTHCHECK` backed by a new `dynoxide healthcheck` subcommand, so `docker ps` and Compose health gates report status without extra tooling ([#3](https://github.com/nubo-db/dynoxide/issues/3)).
+- `SECURITY.md`, documenting the MCP HTTP transport's threat model: the bearer-token authentication it now requires, plus the Host and Origin allowlists that back it ([#27](https://github.com/nubo-db/dynoxide/issues/27)).
+- MCP HTTP transport options: `--mcp-host`/`--host` to bind beyond loopback, `--mcp-allowed-host`/`--allowed-host` to accept additional `Host` headers by name, and `--mcp-no-auth`/`--no-auth` to disable authentication on loopback binds only. With a token set, these make the transport reachable from outside a container, unblocking the Docker MCP path ([#24](https://github.com/nubo-db/dynoxide/issues/24)).
 
 ### Changed
 
-- `Database` is now generic over its storage backend -- `Database<S>`, monomorphised, no `dyn`. The parameter defaults to the native rusqlite backend, so existing code that names `Database` is unaffected, and a new `NativeDatabase` alias names that default explicitly. The action handlers are now `async` and route through the `StorageBackend` trait. `NativeDatabase` keeps the historical synchronous public API: each method drives the handler future to completion with `block_on` (via `pollster`), and because the native backend's futures never suspend, that `block_on` never parks the thread, so it stays safe inside the tokio-based HTTP and MCP servers.
+- `Database` is now generic over its storage backend: `Database<S>`, monomorphised, no `dyn`. The parameter defaults to the native rusqlite backend, so existing code that names `Database` is unaffected, and a new `NativeDatabase` alias names that default explicitly. The action handlers are now `async` and route through the `StorageBackend` trait. `NativeDatabase` keeps the historical synchronous public API: each method drives the handler future to completion with `block_on` (via `pollster`), and because the native backend's futures never suspend, that `block_on` never parks the thread, so it stays safe inside the tokio-based HTTP and MCP servers.
+- `DynoxideError` is now `#[non_exhaustive]`. Match arms in downstream code must include a wildcard. Done now, while 0.10.0 is already a breaking release, so later variant additions stay non-breaking.
+- **Breaking:** the MCP HTTP transport (`dynoxide mcp --http`, `dynoxide serve --mcp`) now requires bearer-token authentication on every request. On a loopback bind, dynoxide generates a token on first run, persists it to a per-user config file, and prints a client-config snippet; later runs reuse it silently. **Existing clients break until updated**: add `"headers": { "Authorization": "Bearer <token>" }` to your MCP client config. A non-loopback bind requires an explicit token via `--mcp-token`/`--token` or `DYNOXIDE_MCP_AUTH_TOKEN` and will not start without one. The stdio transport is unaffected ([#27](https://github.com/nubo-db/dynoxide/issues/27)).
+- **Breaking (library API):** `dynoxide::mcp::serve_http` and `serve_http_with_shutdown` now take an `HttpOptions` struct (bind host, `AuthMode`, extra allowed hosts) in place of a bare `port: u16`. Embedders constructing the MCP HTTP server must build `HttpOptions` and choose an `AuthMode`.
 
 ### Fixed
 
 - A single-item write (`PutItem`, `DeleteItem`, `UpdateItem`) and its GSI/LSI index fan-out now run in a single transaction. A failure partway through the fan-out rolls the whole write back rather than leaving a base row with a half-applied (torn) index. The same per-item atomicity now also covers `BatchWriteItem` (each write request) and the TTL sweep (each expired-item delete). This matches DynamoDB, where a single-item write does not half-apply to its indexes.
 - Write paths now roll back on a failed `COMMIT` and surface a failed `ROLLBACK` rather than leaving the connection stuck mid-transaction, which would make the next write fail. Every write path shares one transaction helper for this.
 - A client-facing `ValidationException` raised inside a backend method (the 50-tag limit in `set_tags`) keeps its 400 status across the `StorageBackend` boundary instead of collapsing to a 500.
+- Tighter expression and scan validation, to match what real DynamoDB rejects
+  (surfaced by the conformance suite). Dynoxide now turns away redundant
+  parentheses like `((a = :b))` in condition, filter, and key-condition
+  expressions; `contains(x, x)` with the same operand on both sides; and
+  `begins_with` handed a number instead of a string or binary. These are
+  rejected up front, before any items are scanned
+  ([#31](https://github.com/nubo-db/dynoxide/issues/31)).
+- `size()` now measures strings in UTF-16 code units rather than bytes, so
+  values with emoji or accented characters report the length DynamoDB returns.
+- A negative `Segment` on a parallel scan is now rejected rather than accepted.
 
 ### Notes
 

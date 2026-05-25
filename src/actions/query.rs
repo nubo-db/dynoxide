@@ -281,6 +281,15 @@ pub async fn execute<S: StorageBackend>(
                     "Invalid FilterExpression: {e}"
                 )));
             }
+            if let Err(e) = expressions::condition::validate_operand_semantics(
+                &parsed_fe,
+                &request.expression_attribute_names,
+                &request.expression_attribute_values,
+            ) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "Invalid FilterExpression: {e}"
+                )));
+            }
         }
     }
     if let Some(ref pe) = request.projection_expression {

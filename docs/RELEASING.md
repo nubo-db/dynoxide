@@ -21,11 +21,11 @@ schedule. Versioning follows [SemVer](https://semver.org).
    `Cargo.toml` and `CHANGELOG.md`, build binaries for five targets in
    parallel, create a GitHub Release with artefacts and checksums, pause for
    one-click maintainer approval, then publish to crates.io, update the
-   Homebrew tap, and publish the npm packages.
+   Homebrew tap, publish the npm packages, and push the Docker image.
 
 The approval gate between the GitHub Release and any external publish means
 a release can still be aborted after the artefacts are built but before
-anything reaches crates.io, Homebrew, or npm.
+anything reaches crates.io, Homebrew, npm, or any container registry.
 
 ## Verifying a release
 
@@ -37,6 +37,12 @@ anything reaches crates.io, Homebrew, or npm.
 - **crates.io** is published by the same pipeline under the same tag, so
   `docs.rs`, the GitHub Release binaries, and the npm packages all
   correspond to a single commit.
+- **Docker images** carry SLSA provenance and SBOM attestations on the
+  GHCR canonical (`ghcr.io/nubo-db/dynoxide`). Verify with
+  `gh attestation verify oci://ghcr.io/nubo-db/dynoxide:<version> --owner nubo-db`.
+  Docker Hub and ECR Public mirrors hold the same image manifest and blobs
+  but not the OCI referrers, so attestation verification needs the GHCR
+  canonical.
 
 ## Release history
 
@@ -63,8 +69,9 @@ Public workflows a contributor may see when opening a PR:
 
 Additional workflows in `.github/workflows/` (`benchmark-refresh.yml`,
 `release-preflight.yml`, `test-build.yml`, `publish-crate.yml`,
-`homebrew.yml`, `npm.yml`) support release operations and recovery. They
-are maintainer workflows and are not exercised by PR traffic.
+`homebrew.yml`, `npm.yml`, `docker.yml`) support release operations and
+recovery. They are maintainer workflows and are not exercised by PR
+traffic.
 
 ## Maintainer runbook
 

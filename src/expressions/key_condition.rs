@@ -4,7 +4,9 @@
 //! Sort key conditions: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN ... AND ...`, `begins_with(sk, :prefix)`
 
 use crate::expressions::condition::parse_raw_path;
-use crate::expressions::tokenizer::{Token, TokenSpan, TokenStream, tokenize};
+use crate::expressions::tokenizer::{
+    Token, TokenSpan, TokenStream, check_redundant_parens, tokenize,
+};
 use crate::expressions::{PathElement, TrackedExpressionAttributes};
 use crate::types::AttributeValue;
 
@@ -37,6 +39,9 @@ pub enum SortKeyCondition {
 /// the entire expression, matching DynamoDB behavior.
 pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCondition, String> {
     let tokens = tokenize(expr).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
+    // Reject redundant parens before stripping outer ones (strip_outer_parens
+    // would otherwise silently accept `((pk = :pk))`).
+    check_redundant_parens(&tokens).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
     let tokens = strip_outer_parens(tokens);
     let mut stream = TokenStream::new(tokens);
 
@@ -546,20 +551,20 @@ mod tests {
         assert_eq!(kc.pk_name, "pk");
         assert!(matches!(kc.sk_condition, Some(SortKeyCondition::Eq(_, _))));
 
-        // Nested parens
+        // Genuinely nested (non-redundant) parens are accepted.
         let tracker = make_tracker(&no_names, &no_values);
-        let kc = parse("((pk = :pk)) AND ((sk > :sk))", &tracker).unwrap();
+        let kc = parse("(pk = :pk AND (sk > :sk))", &tracker).unwrap();
         assert_eq!(kc.pk_name, "pk");
         assert!(matches!(kc.sk_condition, Some(SortKeyCondition::Gt(_, _))));
 
-        // Multiple pairs: outer parens wrapping conditions with their own nested parens
+        // Redundant parentheses are rejected, matching real DynamoDB. Dynoxide
+        // previously stripped them and silently accepted.
         let tracker = make_tracker(&no_names, &no_values);
-        let kc = parse("(((pk = :pk)) AND ((begins_with(sk, :prefix))))", &tracker).unwrap();
-        assert_eq!(kc.pk_name, "pk");
-        assert!(matches!(
-            kc.sk_condition,
-            Some(SortKeyCondition::BeginsWith(_, _))
-        ));
+        let err = parse("((pk = :pk)) AND ((sk > :sk))", &tracker).unwrap_err();
+        assert!(
+            err.contains("redundant parentheses"),
+            "expected redundant-parentheses rejection, got: {err}"
+        );
 
         // Parens around begins_with
         let tracker = make_tracker(&no_names, &no_values);

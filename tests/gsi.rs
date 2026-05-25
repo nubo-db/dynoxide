@@ -2,6 +2,7 @@
 
 use dynoxide::Database;
 use dynoxide::types::AttributeValue;
+use std::collections::HashMap;
 
 /// Helper: create a table with a GSI.
 /// Table: pk=UserId(S), sk=Timestamp(S)
@@ -827,5 +828,96 @@ fn test_gsi_scan_pagination_with_filter() {
         20,
         "expected 20 special items out of 100, got {}",
         all_items.len()
+    );
+}
+
+/// Regression (#38): paginating a Scan over a GSI whose items share the same
+/// index partition + sort key must visit every tied item exactly once. This
+/// uses a **hash-only base table**, which is the case that actually breaks:
+/// with no base sort key, the GSI rows carry the empty-string default in their
+/// table_sk column, so the cursor must still disambiguate tied index keys by
+/// the base partition key. The earlier defect collapsed the cursor to
+/// `(gsi_pk, gsi_sk)` and stopped after the first page.
+#[test]
+fn test_scan_gsi_pagination_visits_all_tied_sort_keys() {
+    let db = Database::memory().unwrap();
+
+    // Hash-only base table (ID); GSI TieIndex (GType hash, GSort range).
+    let create_req = serde_json::json!({
+        "TableName": "TieScan",
+        "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "ID", "AttributeType": "S"},
+            {"AttributeName": "GType", "AttributeType": "S"},
+            {"AttributeName": "GSort", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "TieIndex",
+            "KeySchema": [
+                {"AttributeName": "GType", "KeyType": "HASH"},
+                {"AttributeName": "GSort", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "BillingMode": "PAY_PER_REQUEST"
+    });
+    db.create_table(serde_json::from_value(create_req).unwrap())
+        .unwrap();
+
+    // All five items share the GSI key (GType="tie", GSort="same") and differ
+    // only by the base partition key (ID).
+    let ids = ["id-0", "id-1", "id-2", "id-3", "id-4"];
+    for id in ids {
+        let put = serde_json::json!({
+            "TableName": "TieScan",
+            "Item": {
+                "ID": {"S": id},
+                "GType": {"S": "tie"},
+                "GSort": {"S": "same"}
+            }
+        });
+        db.put_item(serde_json::from_value(put).unwrap()).unwrap();
+    }
+
+    // Page through the GSI one item at a time, following LastEvaluatedKey.
+    let mut seen: Vec<String> = Vec::new();
+    let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= ids.len() + 1,
+            "paged GSI scan did not terminate (looping or stalling on tied keys)"
+        );
+
+        let mut req = serde_json::json!({
+            "TableName": "TieScan",
+            "IndexName": "TieIndex",
+            "Limit": 1
+        });
+        if let Some(ref lek) = exclusive_start_key {
+            req["ExclusiveStartKey"] = serde_json::to_value(lek).unwrap();
+        }
+        let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+
+        if let Some(items) = resp.items {
+            for item in items {
+                if let Some(AttributeValue::S(id)) = item.get("ID") {
+                    seen.push(id.clone());
+                }
+            }
+        }
+
+        match resp.last_evaluated_key {
+            Some(lek) => exclusive_start_key = Some(lek),
+            None => break,
+        }
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["id-0", "id-1", "id-2", "id-3", "id-4"],
+        "every tied GSI item should be visited exactly once across the paged scan"
     );
 }

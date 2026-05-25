@@ -54,24 +54,24 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                 };
 
                 if is_expired(&item, &ttl_attr, now) {
-                    // Delete the item
-                    let old_json = storage.delete_item(&meta.table_name, pk, sk).await?;
-
-                    // Maintain GSI tables
-                    let _ =
+                    // Each TTL deletion is atomic with its own index fan-out: a
+                    // mid-fan-out failure rolls that item's delete back rather
+                    // than leaving a torn index. Items are independent, so this
+                    // is one transaction per deleted item.
+                    crate::actions::helpers::with_write_transaction(storage, async {
+                        storage.delete_item(&meta.table_name, pk, sk).await?;
                         gsi::maintain_gsis_after_delete(storage, &meta.table_name, meta, pk, sk)
                             .await?;
+                        lsi::maintain_lsis_after_delete(storage, &meta.table_name, meta, pk, sk)
+                            .await?;
+                        // Generate stream REMOVE record with TTL service identity
+                        if meta.stream_enabled {
+                            record_ttl_stream_event(storage, meta, &item).await?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
 
-                    // Maintain LSI tables
-                    lsi::maintain_lsis_after_delete(storage, &meta.table_name, meta, pk, sk)
-                        .await?;
-
-                    // Generate stream REMOVE record with TTL service identity
-                    if meta.stream_enabled {
-                        record_ttl_stream_event(storage, meta, &item).await?;
-                    }
-
-                    let _ = old_json; // consumed by delete_item
                     total_deleted += 1;
                 }
             }

@@ -846,3 +846,75 @@ fn validate_not_key_attr(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::actions::{create_table, put_item, update_item};
+    use crate::storage::Storage;
+    use crate::storage_backend::StorageBackend;
+
+    /// An update and its GSI fan-out succeed or fail as one unit: a mid-fan-out
+    /// failure leaves the item at its pre-update value.
+    #[test]
+    fn update_item_rolls_back_base_write_when_gsi_fan_out_fails() {
+        let storage = Storage::memory().unwrap();
+
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "KeySchema": [{"AttributeName": "UserId", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "UserId", "AttributeType": "S"},
+                {"AttributeName": "Status", "AttributeType": "S"},
+                {"AttributeName": "Priority", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "StatusIndex", "KeySchema": [{"AttributeName": "Status", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}},
+                {"IndexName": "PriorityIndex", "KeySchema": [{"AttributeName": "Priority", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}
+            ]
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(&storage, create)).unwrap();
+
+        let put = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Item": {"UserId": {"S": "u1"}, "Status": {"S": "SHIPPED"}, "Priority": {"S": "HIGH"}, "Note": {"S": "before"}}
+        }))
+        .unwrap();
+        pollster::block_on(put_item::execute(&storage, put)).unwrap();
+
+        // Break the second GSI's fan-out by dropping its physical table.
+        storage.drop_gsi_table("Orders", "PriorityIndex").unwrap();
+
+        let update = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Key": {"UserId": {"S": "u1"}},
+            "UpdateExpression": "SET Note = :n",
+            "ExpressionAttributeValues": {":n": {"S": "after"}}
+        }))
+        .unwrap();
+        let res = pollster::block_on(update_item::execute(&storage, update));
+        assert!(
+            res.is_err(),
+            "a mid-fan-out failure must surface as an error"
+        );
+
+        // The base write must roll back: the item is still present at its
+        // pre-update value.
+        let rows = pollster::block_on(<Storage as StorageBackend>::scan_items(
+            &storage,
+            "Orders",
+            &Default::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the item must still be present after rollback"
+        );
+        let raw = &rows[0].2;
+        assert!(
+            raw.contains("\"before\"") && !raw.contains("\"after\""),
+            "update must roll back when fan-out fails, leaving the original value: {raw}"
+        );
+    }
+}

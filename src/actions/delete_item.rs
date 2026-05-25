@@ -375,3 +375,63 @@ pub async fn execute<S: StorageBackend>(
         item_collection_metrics,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::actions::{create_table, delete_item, put_item};
+    use crate::storage::Storage;
+    use crate::storage_backend::StorageBackend;
+
+    fn seed_two_gsi_table_with_item(storage: &Storage) {
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "KeySchema": [{"AttributeName": "UserId", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "UserId", "AttributeType": "S"},
+                {"AttributeName": "Status", "AttributeType": "S"},
+                {"AttributeName": "Priority", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "StatusIndex", "KeySchema": [{"AttributeName": "Status", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}},
+                {"IndexName": "PriorityIndex", "KeySchema": [{"AttributeName": "Priority", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}
+            ]
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(storage, create)).unwrap();
+
+        let put = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Item": {"UserId": {"S": "u1"}, "Status": {"S": "SHIPPED"}, "Priority": {"S": "HIGH"}}
+        }))
+        .unwrap();
+        pollster::block_on(put_item::execute(storage, put)).unwrap();
+    }
+
+    /// A delete and its GSI fan-out succeed or fail as one unit: a mid-fan-out
+    /// failure leaves the item (and its index entries) in place.
+    #[test]
+    fn delete_item_rolls_back_base_delete_when_gsi_fan_out_fails() {
+        let storage = Storage::memory().unwrap();
+        seed_two_gsi_table_with_item(&storage);
+
+        // Break the second GSI's fan-out by dropping its physical table.
+        storage.drop_gsi_table("Orders", "PriorityIndex").unwrap();
+
+        let del = serde_json::from_value(serde_json::json!({
+            "TableName": "Orders",
+            "Key": {"UserId": {"S": "u1"}}
+        }))
+        .unwrap();
+        let res = pollster::block_on(delete_item::execute(&storage, del));
+        assert!(
+            res.is_err(),
+            "a mid-fan-out failure must surface as an error"
+        );
+
+        // The base delete must roll back: the item is still present.
+        let count =
+            pollster::block_on(<Storage as StorageBackend>::count_items(&storage, "Orders"))
+                .unwrap();
+        assert_eq!(count, 1, "base delete must roll back when fan-out fails");
+    }
+}

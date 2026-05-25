@@ -78,3 +78,143 @@ jobs:
             echo "ERROR: no SQLite backend should cause compile_error!"
             exit 1
           fi
+
+  # Gate the Docker smoke test on the paths that can actually break the
+  # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
+  # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version — both can
+  # break the recipe without touching src/mcp/, so a src/mcp-only gate is too
+  # narrow. Implemented with git diff (no third-party action).
+  changes:
+    name: Detect recipe-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect changes
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch has no PR base, and a missing/unreachable base ref
+          # should fail open — run the smoke job rather than skip it silently.
+          if [ -z "${BASE_SHA:-}" ] || ! changed=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null); then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changed files:"; echo "$changed"
+          if echo "$changed" | grep -qE '^(Dockerfile|Cargo\.(toml|lock)|src/main\.rs|src/mcp/|README\.md|\.github/workflows/ci\.yml)'; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  docker-smoke:
+    name: Docker MCP smoke test
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      # FROM scratch needs a fully static binary; native-sqlite bundles SQLite
+      # via a C compiler, so the musl C toolchain (musl-gcc) is required. This
+      # mirrors the release-amd64 build (.github/workflows/release.yml).
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl --features full
+
+      - name: Stage binary into the Docker build context
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64
+          cp target/x86_64-unknown-linux-musl/release/dynoxide dist/amd64/dynoxide
+          chmod +x dist/amd64/dynoxide
+          file dist/amd64/dynoxide
+          file dist/amd64/dynoxide | grep -q 'statically linked'
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Two flags are load-bearing for `--load`:
+      #   --platform linux/amd64  — without it buildx builds a multi-platform
+      #     manifest that --load cannot export.
+      #   --provenance=false      — without it buildx attaches an attestation
+      #     manifest, which is also a manifest list and is rejected by --load on
+      #     the runner's classic (non-containerd) image store.
+      # Single-arch amd64 is enough for a smoke test; release.yml does multi-arch.
+      - name: Build image (linux/amd64)
+        run: docker buildx build --provenance=false --platform linux/amd64 --load -t dynoxide:smoke .
+
+      - name: Image declares the MCP port (R1)
+        run: |
+          docker image inspect dynoxide:smoke \
+            --format '{{json .Config.ExposedPorts}}' | tee /dev/stderr | grep -q '19280/tcp'
+
+      # The documented recipe. The token is a hardcoded throwaway, intentionally
+      # inline (not a repository secret): it has no value outside this job. The
+      # host-side bind is pinned to 127.0.0.1 so the ports are not reachable on
+      # the Actions Docker bridge.
+      - name: Start the documented DynamoDB + MCP recipe
+        env:
+          DYNOXIDE_MCP_AUTH_TOKEN: ci-smoke-test-token
+        run: |
+          set -euo pipefail
+          docker run -d --name dynoxide-smoke \
+            -p 127.0.0.1:8000:8000 -p 127.0.0.1:19280:19280 \
+            -e DYNOXIDE_MCP_AUTH_TOKEN \
+            dynoxide:smoke \
+            serve --host 0.0.0.0 --port 8000 \
+                  --mcp --mcp-host 0.0.0.0 --mcp-port 19280
+
+      # Poll the port directly; the container HEALTHCHECK's 30s interval lags a
+      # fast smoke run. GET / is the same liveness probe `dynoxide healthcheck`
+      # uses (an unsigned DynamoDB op would 400 on SigV4 auth).
+      - name: DynamoDB reachable on :8000 (R3)
+        run: |
+          set -euo pipefail
+          ok=
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/ | grep -q 'healthy'; then
+              echo "DynamoDB up"; ok=1; break
+            fi
+            sleep 1
+          done
+          [ "${ok:-}" = 1 ] || { echo "::error::DynamoDB never came up"; docker logs dynoxide-smoke; exit 1; }
+
+      - name: MCP authenticated-reachable on :19280 (R2, R4)
+        run: |
+          set -euo pipefail
+          body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'
+          resp=$(curl -fsS -X POST http://127.0.0.1:19280/mcp \
+            -H 'Authorization: Bearer ci-smoke-test-token' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d "$body")
+          echo "$resp"
+          echo "$resp" | grep -q 'dynoxide'
+
+      - name: MCP rejects a missing token with 401 (R4)
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19280/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
+          echo "status=$code"
+          [ "$code" = 401 ] || { echo "::error::expected 401 without token, got $code"; docker logs dynoxide-smoke; exit 1; }
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f dynoxide-smoke || true

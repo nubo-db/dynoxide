@@ -177,6 +177,28 @@ docker run --rm -p 8000:8000 \
 
 The default in-memory mode needs no flags whether root or nonroot. The uid 65532 is the well-known nonroot uid used by Google's distroless images; pick any uid you prefer with `--user <uid>:<gid>`.
 
+#### MCP over HTTP in Docker
+
+The default image serves DynamoDB only. To also expose the [MCP](#mcp-server) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind — pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
+
+```sh
+TOKEN=$(openssl rand -base64 24)
+
+docker run --rm -p 8000:8000 -p 19280:19280 \
+  -e DYNOXIDE_MCP_AUTH_TOKEN="$TOKEN" \
+  ghcr.io/nubo-db/dynoxide \
+  serve --host 0.0.0.0 --port 8000 \
+        --mcp --mcp-host 0.0.0.0 --mcp-port 19280
+```
+
+DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localhost:19280/mcp`. Point an HTTP-transport MCP client at the latter with an `Authorization: Bearer <token>` header — see [MCP Server](#mcp-server) for the client config shape.
+
+A few things to know:
+
+- **The token is not optional.** Omit it and the container exits immediately with `a non-loopback MCP bind requires an explicit token`. The default `docker run ghcr.io/nubo-db/dynoxide` stays DynamoDB-only precisely because a token-less `0.0.0.0` MCP bind cannot boot.
+- **Reaching MCP from another container** by service name (rather than `localhost`) needs that name added to the Host allowlist: `--mcp-allowed-host <name>` (e.g. `--mcp-allowed-host dynoxide`). The `-p`-mapped `localhost` access above needs nothing extra.
+- **`--network host`** (Linux only) is an alternative to `-p`, but it bypasses Docker network isolation and binds MCP directly on the host's network interface — reachable from the LAN, not just the host. Prefer `-p` unless you specifically need host networking.
+
 ## HTTP Server
 
 Start the server:
@@ -264,6 +286,9 @@ design.
 On the `serve` subcommand the equivalent flags are prefixed —
 `--mcp-host`, `--mcp-token`, `--mcp-no-auth`, `--mcp-allowed-host` — because
 `serve` already owns `--host`/`--port` for the DynamoDB server.
+
+To run the HTTP transport from the container image, see
+[MCP over HTTP in Docker](#mcp-over-http-in-docker).
 
 #### HTTP client configuration
 

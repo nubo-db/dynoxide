@@ -11,7 +11,13 @@ COPY dist/${TARGETARCH}/dynoxide /usr/local/bin/dynoxide
 
 WORKDIR /data
 
-EXPOSE 8000
+# 8000: DynamoDB HTTP API (started by the default CMD).
+# 19280: MCP Streamable-HTTP transport. Opt-in, not started by default — override
+# CMD with `serve --mcp --mcp-host 0.0.0.0` and supply a bearer token via
+# DYNOXIDE_MCP_AUTH_TOKEN (a non-loopback MCP bind refuses to boot without one).
+# See the README "MCP over HTTP in Docker" section. EXPOSE is metadata only; it
+# documents intent and lets `docker run -P` map the port.
+EXPOSE 8000 19280
 
 # Read by the healthcheck subcommand. Override with `docker run -e ...` when
 # CMD is overridden to bind to a non-default port.

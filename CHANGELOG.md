@@ -14,9 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `Clock` capability on `Storage` so the trait surface does not assume `std::time`. Stream and TTL paths route their `created_at` and sweep timestamps through the clock; `SystemClock` is the default and `ManualClock` ships as a deterministic test helper. Other `std::time` call sites (idempotency cache, action-handler timestamps, snapshots) remain native-only and are unchanged.
 - A `wasm-stub` cargo feature that builds a placeholder `WaSqliteBackend` whose method bodies are `unimplemented!()`. The stub exists to catch trait-shape drift at type-check time before a real wa-sqlite backend has to absorb it. CI gains a `wasm-stub-check` job that runs `cargo check --features wasm-stub --lib` on every PR.
 
+### Changed
+
+- `Database` is now generic over its storage backend -- `Database<S>`, monomorphised, no `dyn`. The parameter defaults to the native rusqlite backend, so existing code that names `Database` is unaffected, and a new `NativeDatabase` alias names that default explicitly. The action handlers are now `async` and route through the `StorageBackend` trait. `NativeDatabase` keeps the historical synchronous public API: each method drives the handler future to completion with `block_on` (via `pollster`), and because the native backend's futures never suspend, that `block_on` never parks the thread, so it stays safe inside the tokio-based HTTP and MCP servers.
+
+### Fixed
+
+- A single-item write (`PutItem`, `DeleteItem`, `UpdateItem`) and its GSI/LSI index fan-out now run in a single transaction. A failure partway through the fan-out rolls the whole write back rather than leaving a base row with a half-applied (torn) index. This matches DynamoDB, where a single-item write does not half-apply to its indexes.
+
 ### Notes
 
-- This release is behaviour-preserving: existing public APIs (`Database`, `Storage`, action handlers, error types) are unchanged. Tests, conformance suites, and benchmarks continue to pass against the same surface as 0.9.10.
+- Existing native code that names `Database` keeps working unchanged: the new generic parameter defaults to the rusqlite backend and the synchronous method signatures are identical. The one deliberate behaviour change is index fan-out atomicity (see Fixed); it is more DynamoDB-correct, and the conformance suite still passes. Tests, conformance, and benchmarks pass against the same observable surface as before.
 - Building dynoxide for `wasm32-unknown-unknown` is not yet supported. The trait surface is in place; making the rest of the codebase target-agnostic is the next pass and lands when a working WASM backend does.
 
 ## [0.9.13] - 2026-05-11

@@ -782,6 +782,23 @@ fn matches_conditions(
                     _ => return false,
                 }
             }
+            WhereCondition::NotBeginsWith(path, prefix_val) => {
+                // Logical negation of begins_with: the row matches unless the
+                // value is a string that starts with the prefix. A missing or
+                // non-string attribute does not begin with the prefix, so it is
+                // kept.
+                if let Some(item_val) = resolve_nested_path(item, path) {
+                    let prefix = match resolve_value(prefix_val, parameters) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    };
+                    if let (AttributeValue::S(s), AttributeValue::S(p)) = (item_val, &prefix) {
+                        if s.starts_with(p.as_str()) {
+                            return false;
+                        }
+                    }
+                }
+            }
             WhereCondition::Between(path, low, high) => {
                 let item_val = match resolve_nested_path(item, path) {
                     Some(v) => v,

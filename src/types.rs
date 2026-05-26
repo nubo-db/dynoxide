@@ -954,6 +954,23 @@ pub struct ProvisionedThroughput {
     pub write_capacity_units: Option<i64>,
 }
 
+/// On-demand (PAY_PER_REQUEST) throughput ceilings (stored but not enforced).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OnDemandThroughput {
+    #[serde(
+        rename = "MaxReadRequestUnits",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_read_request_units: Option<i64>,
+    #[serde(
+        rename = "MaxWriteRequestUnits",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_write_request_units: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Type conversion: From<T> / TryFrom<T> for AttributeValue
 // ---------------------------------------------------------------------------

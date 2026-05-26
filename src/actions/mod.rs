@@ -115,6 +115,9 @@ pub struct TableDescription {
         skip_serializing_if = "Option::is_none"
     )]
     pub deletion_protection_enabled: Option<bool>,
+
+    #[serde(rename = "OnDemandThroughput", skip_serializing_if = "Option::is_none")]
+    pub on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
 /// SSE description returned in TableDescription.
@@ -376,24 +379,44 @@ pub(crate) fn build_table_description(
         None
     };
 
-    // Build SSE description from stored specification
+    // Build SSE description from stored specification. When encryption is
+    // enabled, AWS reports SSEType=KMS and a KMS key ARN even if the request
+    // only set Enabled=true, so default those here rather than dropping them.
     let sse_description = meta.sse_specification.as_ref().and_then(|json| {
         serde_json::from_str::<crate::types::SseSpecification>(json)
             .ok()
-            .map(|spec| SseDescription {
-                status: if spec.enabled.unwrap_or(false) {
-                    "ENABLED".to_string()
-                } else {
-                    "DISABLED".to_string()
-                },
-                sse_type: spec.sse_type,
-                kms_master_key_arn: spec.kms_master_key_id,
+            .map(|spec| {
+                let enabled = spec.enabled.unwrap_or(false);
+                SseDescription {
+                    status: if enabled { "ENABLED" } else { "DISABLED" }.to_string(),
+                    sse_type: if enabled {
+                        spec.sse_type.or_else(|| Some("KMS".to_string()))
+                    } else {
+                        spec.sse_type
+                    },
+                    kms_master_key_arn: if enabled {
+                        Some(
+                            spec.kms_master_key_id
+                                .map(|id| streams::kms_key_arn(&id))
+                                .unwrap_or_else(|| {
+                                    streams::kms_key_arn(&uuid::Uuid::new_v4().to_string())
+                                }),
+                        )
+                    } else {
+                        None
+                    },
+                }
             })
     });
 
     let table_class_summary = meta.table_class.as_ref().map(|tc| TableClassSummary {
         table_class: tc.clone(),
     });
+
+    let on_demand_throughput = meta
+        .on_demand_throughput
+        .as_ref()
+        .and_then(|json| serde_json::from_str::<crate::types::OnDemandThroughput>(json).ok());
 
     let deletion_protection_enabled = Some(meta.deletion_protection_enabled);
 
@@ -430,5 +453,6 @@ pub(crate) fn build_table_description(
         sse_description,
         table_class_summary,
         deletion_protection_enabled,
+        on_demand_throughput,
     }
 }

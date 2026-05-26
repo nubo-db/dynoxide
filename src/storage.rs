@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Current schema version. Stored in the `_config` table for future migrations.
-const SCHEMA_VERSION: &str = "6";
+const SCHEMA_VERSION: &str = "7";
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -214,6 +214,7 @@ pub struct CreateTableMetadata<'a> {
     pub table_class: Option<&'a str>,
     pub deletion_protection_enabled: bool,
     pub billing_mode: Option<&'a str>,
+    pub on_demand_throughput: Option<&'a str>,
 }
 
 /// Parameters for query operations (base table or GSI).
@@ -384,7 +385,8 @@ impl Storage {
                 tags TEXT,
                 sse_specification TEXT,
                 table_class TEXT,
-                deletion_protection_enabled INTEGER DEFAULT 0
+                deletion_protection_enabled INTEGER DEFAULT 0,
+                on_demand_throughput TEXT
             );
 
             CREATE TABLE IF NOT EXISTS _stream_records (
@@ -438,6 +440,9 @@ impl Storage {
         }
         if version < 6 {
             self.migrate_v5_to_v6()?;
+        }
+        if version < 7 {
+            self.migrate_v6_to_v7()?;
         }
 
         Ok(())
@@ -574,6 +579,21 @@ impl Storage {
         Ok(())
     }
 
+    /// Migrate from schema v6 to v7: add `on_demand_throughput TEXT` column to `_tables`.
+    fn migrate_v6_to_v7(&self) -> Result<()> {
+        let _ = self.conn.execute(
+            "ALTER TABLE _tables ADD COLUMN on_demand_throughput TEXT",
+            [],
+        );
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '7')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     /// Get a reference to the underlying connection (for transactions, etc.).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -594,8 +614,8 @@ impl Storage {
         self.conn.execute(
             "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
              lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
-             deletion_protection_enabled, billing_mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             deletion_protection_enabled, billing_mode, on_demand_throughput)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 m.table_name,
                 m.key_schema,
@@ -608,6 +628,7 @@ impl Storage {
                 m.table_class,
                 m.deletion_protection_enabled as i32,
                 m.billing_mode,
+                m.on_demand_throughput,
             ],
         )?;
         self.metadata_cache.borrow_mut().remove(table_name);
@@ -2114,13 +2135,14 @@ pub struct TableMetadata {
     pub sse_specification: Option<String>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
+    pub on_demand_throughput: Option<String>,
 }
 
 /// The standard SELECT column list for _tables queries.
 const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \
-     sse_specification, table_class, deletion_protection_enabled";
+     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput";
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
 fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
@@ -2142,6 +2164,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
         sse_specification: row.get(14)?,
         table_class: row.get(15)?,
         deletion_protection_enabled: row.get::<_, i32>(16).unwrap_or(0) != 0,
+        on_demand_throughput: row.get(17)?,
     })
 }
 
@@ -2166,6 +2189,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v6_to_v7_adds_on_demand_throughput_column() {
+        // Issue #44: the on_demand_throughput column must be added to existing
+        // on-disk databases through the versioned migration chain, not just the
+        // fresh CREATE — otherwise DescribeTable on a pre-existing table errors.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build a v6-shape database by hand: _tables without on_demand_throughput,
+        // schema_version pinned at 6, and one pre-existing table row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE _tables (
+                    table_name TEXT PRIMARY KEY,
+                    key_schema TEXT NOT NULL,
+                    attribute_definitions TEXT NOT NULL,
+                    gsi_definitions TEXT,
+                    lsi_definitions TEXT,
+                    stream_enabled INTEGER DEFAULT 0,
+                    stream_view_type TEXT,
+                    stream_label TEXT,
+                    ttl_attribute TEXT,
+                    ttl_enabled INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                    provisioned_throughput TEXT,
+                    tags TEXT,
+                    sse_specification TEXT,
+                    table_class TEXT,
+                    deletion_protection_enabled INTEGER DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _config (key, value) VALUES ('schema_version', '6')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, created_at) \
+                 VALUES ('LegacyTable', ?1, ?2, 0)",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration chain; v6 -> v7 adds the column.
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "7");
+
+        // The pre-existing row survives and reads back through row_to_metadata,
+        // with the new column present and NULL.
+        let meta = storage.get_table_metadata("LegacyTable").unwrap().unwrap();
+        assert_eq!(meta.table_name, "LegacyTable");
+        assert!(meta.on_demand_throughput.is_none());
+
+        // A bare SELECT of the new column would error if the ALTER had not run.
+        let col: Option<String> = storage
+            .conn()
+            .query_row(
+                "SELECT on_demand_throughput FROM _tables WHERE table_name = 'LegacyTable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(col.is_none());
     }
 
     #[test]

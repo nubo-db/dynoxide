@@ -37,6 +37,8 @@ struct RawRequest {
     tags: Option<Vec<crate::types::Tag>>,
     #[serde(rename = "DeletionProtectionEnabled", default)]
     deletion_protection_enabled: Option<bool>,
+    #[serde(rename = "OnDemandThroughput", default)]
+    on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
 /// Public request type — fully validated, typed fields.
@@ -55,6 +57,7 @@ pub struct CreateTableRequest {
     pub table_class: Option<String>,
     pub tags: Option<Vec<crate::types::Tag>>,
     pub deletion_protection_enabled: Option<bool>,
+    pub on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
 /// Custom Deserialize that does loose JSON parsing first, validates, then builds typed fields.
@@ -136,8 +139,32 @@ pub async fn execute<S: StorageBackend>(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-    let sse_json = request
-        .sse_specification
+    // Normalise the SSE spec so a DescribeTable round-trip matches AWS: when
+    // encryption is enabled without an explicit type/key, AWS reports SSEType=KMS
+    // and a KMS key ARN (the AWS-managed `aws/dynamodb` key). Persisting the
+    // synthesised key id keeps the reported ARN stable across DescribeTable calls.
+    let normalized_sse = request.sse_specification.as_ref().map(|spec| {
+        if spec.enabled == Some(true) {
+            crate::types::SseSpecification {
+                enabled: Some(true),
+                sse_type: spec.sse_type.clone().or_else(|| Some("KMS".to_string())),
+                kms_master_key_id: spec.kms_master_key_id.clone().or_else(|| {
+                    Some(crate::streams::kms_key_arn(
+                        &uuid::Uuid::new_v4().to_string(),
+                    ))
+                }),
+            }
+        } else {
+            spec.clone()
+        }
+    });
+    let sse_json = normalized_sse
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+    let on_demand_json = request
+        .on_demand_throughput
         .as_ref()
         .map(serde_json::to_string)
         .transpose()
@@ -158,6 +185,7 @@ pub async fn execute<S: StorageBackend>(
             table_class: request.table_class.as_deref(),
             deletion_protection_enabled: deletion_protection,
             billing_mode: Some(billing_mode_str),
+            on_demand_throughput: on_demand_json.as_deref(),
         })
         .await?;
 
@@ -568,6 +596,7 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
         table_class: raw.table_class,
         tags: raw.tags,
         deletion_protection_enabled: raw.deletion_protection_enabled,
+        on_demand_throughput: raw.on_demand_throughput,
     })
 }
 

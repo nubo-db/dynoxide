@@ -33,6 +33,7 @@ fn make_metadata<'a>(table_name: &'a str, key_schema: &'a str) -> CreateTableMet
         table_class: None,
         deletion_protection_enabled: false,
         billing_mode: None,
+        on_demand_throughput: None,
     }
 }
 

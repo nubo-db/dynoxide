@@ -10,8 +10,13 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")
 
 #[test]
 fn option_a_unencrypted_db_readable_by_plain_sqlite() {
-    let path = format!("{FIXTURE_DIR}/option-a-unencrypted.db");
-    let db = Database::new(&path).expect("Should open Option A unencrypted DB with plain SQLite");
+    // Open a throwaway copy: Database::new runs schema migrations, which would
+    // otherwise mutate the committed fixture in place on every test run.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("option-a-unencrypted.db");
+    std::fs::copy(format!("{FIXTURE_DIR}/option-a-unencrypted.db"), &path).unwrap();
+    let db = Database::new(path.to_str().unwrap())
+        .expect("Should open Option A unencrypted DB with plain SQLite");
 
     // Verify the data written by the SQLCipher-linked build is readable
     let key = dynoxide::item! { "pk" => "user#1" };

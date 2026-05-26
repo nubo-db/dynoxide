@@ -29,6 +29,16 @@ pub fn stream_arn(table_name: &str, label: &str) -> String {
     format!("arn:aws:dynamodb:{LOCAL_REGION}:{LOCAL_ACCOUNT}:table/{table_name}/stream/{label}")
 }
 
+/// KMS key ARN format for local emulator. A value that already looks like an
+/// ARN is returned unchanged; a bare key id is wrapped into a `key/<id>` ARN.
+pub fn kms_key_arn(key_id: &str) -> String {
+    if key_id.starts_with("arn:") {
+        key_id.to_string()
+    } else {
+        format!("arn:aws:kms:{LOCAL_REGION}:{LOCAL_ACCOUNT}:key/{key_id}")
+    }
+}
+
 /// Shard ID for a table (one shard per table in simplified model).
 pub fn shard_id(table_name: &str) -> String {
     format!("shardId-00000001-{table_name}")

@@ -207,6 +207,92 @@ fn test_create_table_without_optional_params_succeeds() {
 }
 
 #[test]
+fn test_create_table_sse_enabled_only_completes_shape() {
+    // Issue #44: SSESpecification { Enabled: true } with no SSEType or
+    // KMSMasterKeyId must still round-trip SSEType=KMS and a KMS key ARN,
+    // matching real AWS's AWS-managed-key default.
+    let db = make_db();
+
+    let mut req = basic_request("SseDefaultKey");
+    req.sse_specification = Some(SseSpecification {
+        enabled: Some(true),
+        sse_type: None,
+        kms_master_key_id: None,
+    });
+    db.create_table(req).unwrap();
+
+    let desc = db
+        .describe_table(DescribeTableRequest {
+            table_name: "SseDefaultKey".to_string(),
+        })
+        .unwrap();
+    let sse = desc
+        .table
+        .sse_description
+        .expect("SSEDescription should be present");
+    assert_eq!(sse.status, "ENABLED");
+    assert_eq!(sse.sse_type.as_deref(), Some("KMS"));
+    assert!(
+        sse.kms_master_key_arn
+            .as_deref()
+            .is_some_and(|arn| arn.starts_with("arn:aws:kms:")),
+        "expected a KMS key ARN, got: {:?}",
+        sse.kms_master_key_arn
+    );
+}
+
+#[test]
+fn test_create_table_on_demand_throughput_round_trips() {
+    // Issue #44: OnDemandThroughput set at create time must round-trip through
+    // both the CreateTable response and a DescribeTable call.
+    let db = make_db();
+
+    let mut req = basic_request("OnDemandTable");
+    req.billing_mode = Some("PAY_PER_REQUEST".to_string());
+    req.on_demand_throughput = Some(OnDemandThroughput {
+        max_read_request_units: Some(10),
+        max_write_request_units: Some(5),
+    });
+
+    let resp = db.create_table(req).unwrap();
+    let created = resp
+        .table_description
+        .on_demand_throughput
+        .as_ref()
+        .expect("CreateTable response should carry OnDemandThroughput");
+    assert_eq!(created.max_read_request_units, Some(10));
+    assert_eq!(created.max_write_request_units, Some(5));
+
+    let desc = db
+        .describe_table(DescribeTableRequest {
+            table_name: "OnDemandTable".to_string(),
+        })
+        .unwrap();
+    let odt = desc
+        .table
+        .on_demand_throughput
+        .expect("OnDemandThroughput should round-trip via DescribeTable");
+    assert_eq!(odt.max_read_request_units, Some(10));
+    assert_eq!(odt.max_write_request_units, Some(5));
+}
+
+#[test]
+fn test_describe_table_omits_on_demand_throughput_when_unset() {
+    // Issue #44: a table created without OnDemandThroughput must not synthesise one.
+    let db = make_db();
+
+    let resp = db.create_table(basic_request("NoOnDemand")).unwrap();
+    assert!(resp.table_description.on_demand_throughput.is_none());
+
+    let desc = db
+        .describe_table(DescribeTableRequest {
+            table_name: "NoOnDemand".to_string(),
+        })
+        .unwrap();
+    assert!(desc.table.on_demand_throughput.is_none());
+}
+
+#[test]
 fn test_delete_table_protected_returns_exact_aws_message() {
     // Issue #46: DeleteTable on a protected table must return the exact AWS
     // message, not the ARN-prefixed form Dynoxide used to emit.

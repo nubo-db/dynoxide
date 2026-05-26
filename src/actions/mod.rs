@@ -395,12 +395,14 @@ pub(crate) fn build_table_description(
                         spec.sse_type
                     },
                     kms_master_key_arn: if enabled {
+                        // New tables persist a synthesised key id at create time;
+                        // fall back to a table-derived key for any older row that
+                        // enabled SSE without one, so the ARN stays stable across
+                        // repeated DescribeTable calls rather than changing each read.
                         Some(
                             spec.kms_master_key_id
                                 .map(|id| streams::kms_key_arn(&id))
-                                .unwrap_or_else(|| {
-                                    streams::kms_key_arn(&uuid::Uuid::new_v4().to_string())
-                                }),
+                                .unwrap_or_else(|| streams::kms_key_arn(table_name)),
                         )
                     } else {
                         None

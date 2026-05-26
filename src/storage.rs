@@ -2163,6 +2163,12 @@ pub struct TableMetadata {
 }
 
 /// The standard SELECT column list for _tables queries.
+///
+/// Columns are named explicitly (never `SELECT *`) and decoded positionally in
+/// `row_to_metadata`, so this order is load-bearing: append new columns at the
+/// end only. Keeping the projection explicit is also what lets an older binary
+/// read a database written by a newer one - the extra trailing column is simply
+/// not selected.
 const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \

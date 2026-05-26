@@ -905,6 +905,48 @@ fn test_update_table_single_field_on_demand_throughput() {
 }
 
 #[test]
+fn test_update_table_single_field_table_class_with_empty_gsi_updates() {
+    // Issue #45 edge: a lone TableClass change paired with an empty
+    // GlobalSecondaryIndexUpdates array must still be accepted, not rejected by
+    // the "at least one of ..." guard.
+    let db = make_db();
+    create_simple_table(&db, "TcEmptyGsi");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TcEmptyGsi",
+        "GlobalSecondaryIndexUpdates": [],
+        "TableClass": "STANDARD_INFREQUENT_ACCESS",
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let summary = describe(&db, "TcEmptyGsi")
+        .table_class_summary
+        .expect("TableClassSummary should be present after update");
+    assert_eq!(summary.table_class, "STANDARD_INFREQUENT_ACCESS");
+}
+
+#[test]
+fn test_update_table_empty_request_still_rejected() {
+    // Regression: a request that changes nothing must still be rejected.
+    let db = make_db();
+    create_simple_table(&db, "NoChange");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "NoChange",
+        "GlobalSecondaryIndexUpdates": [],
+    }))
+    .unwrap();
+    let err = db
+        .update_table(req)
+        .expect_err("a no-op UpdateTable must be rejected");
+    assert!(
+        matches!(err, dynoxide::errors::DynoxideError::ValidationException(_)),
+        "expected ValidationException, got: {err:?}"
+    );
+}
+
+#[test]
 fn test_update_table_invalid_table_class_rejected() {
     // Issue #45: an invalid TableClass enum value is a ValidationException.
     let db = make_db();

@@ -675,26 +675,22 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
         }
     }
 
-    // Empty GlobalSecondaryIndexUpdates
-    if let Some(ref updates) = request.global_secondary_index_updates {
-        if updates.is_empty() {
-            // "At least one of ..." - but only if nothing else is specified
-            if request.provisioned_throughput.is_none()
-                && request.billing_mode.is_none()
-                && request.stream_specification.is_none()
-            {
-                return Err(DynoxideError::ValidationException(
-                    "At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, GlobalSecondaryIndexUpdates or SSESpecification or ReplicaUpdates is required".to_string(),
-                ));
-            }
-        }
-    } else if request.provisioned_throughput.is_none()
+    // "At least one of ..." — a request must change something. A lone
+    // TableClass, OnDemandThroughput, or DeletionProtectionEnabled counts, the
+    // same as a throughput/billing/stream change. An empty
+    // GlobalSecondaryIndexUpdates array is treated as "no GSI change" rather
+    // than satisfying the requirement on its own.
+    let no_config_change = request.provisioned_throughput.is_none()
         && request.billing_mode.is_none()
         && request.stream_specification.is_none()
         && request.deletion_protection_enabled.is_none()
         && request.table_class.is_none()
-        && request.on_demand_throughput.is_none()
-    {
+        && request.on_demand_throughput.is_none();
+    let no_gsi_change = request
+        .global_secondary_index_updates
+        .as_ref()
+        .is_none_or(|updates| updates.is_empty());
+    if no_gsi_change && no_config_change {
         return Err(DynoxideError::ValidationException(
             "At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, GlobalSecondaryIndexUpdates or SSESpecification or ReplicaUpdates is required".to_string(),
         ));

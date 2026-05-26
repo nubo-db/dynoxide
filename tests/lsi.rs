@@ -2,6 +2,7 @@
 
 use dynoxide::Database;
 use dynoxide::types::AttributeValue;
+use std::collections::HashMap;
 
 /// Helper: create a table with an LSI.
 /// Table: pk=UserId(S), sk=Timestamp(S)
@@ -609,5 +610,68 @@ fn test_put_item_overwrite_changes_lsi_sk() {
     assert_eq!(
         items[0].get("Status"),
         Some(&AttributeValue::S("B".to_string()))
+    );
+}
+
+/// Regression (#38): paginating a Scan over an LSI whose items share the same
+/// index sort-key value must visit every tied item exactly once. The LSI scan
+/// cursor is `(pk, sk, base_pk, base_sk)`; if the storage ORDER BY omits the
+/// base-table columns, rows tied on `(pk, sk)` come back in an order that
+/// disagrees with the cursor tuple and the paged walk silently drops items.
+#[test]
+fn test_scan_lsi_pagination_visits_all_tied_sort_keys() {
+    let db = Database::memory().unwrap();
+    create_table_with_lsi(&db);
+
+    // All five orders share UserId + Status, so they tie on the LSI key
+    // (UserId, Status) and differ only by the base sort key (Timestamp). Insert
+    // in an order whose rowid sequence disagrees with Timestamp order, so a
+    // missing ORDER BY on the base key surfaces as dropped pages rather than
+    // being masked by an accidental rowid/sort-key agreement.
+    let timestamps = ["03", "01", "04", "00", "02"];
+    for ts in timestamps {
+        put_order(&db, "user1", ts, "OPEN", "100");
+    }
+
+    // Page through the LSI one item at a time, following LastEvaluatedKey.
+    let mut seen: Vec<String> = Vec::new();
+    let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= timestamps.len() + 1,
+            "paged LSI scan did not terminate (looping on tied sort keys)"
+        );
+
+        let mut req = serde_json::json!({
+            "TableName": "Orders",
+            "IndexName": "StatusIndex",
+            "Limit": 1
+        });
+        if let Some(ref lek) = exclusive_start_key {
+            req["ExclusiveStartKey"] = serde_json::to_value(lek).unwrap();
+        }
+        let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+
+        if let Some(items) = resp.items {
+            for item in items {
+                if let Some(AttributeValue::S(ts)) = item.get("Timestamp") {
+                    seen.push(ts.clone());
+                }
+            }
+        }
+
+        match resp.last_evaluated_key {
+            Some(lek) => exclusive_start_key = Some(lek),
+            None => break,
+        }
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["00", "01", "02", "03", "04"],
+        "every tied LSI item should be visited exactly once across the paged scan"
     );
 }

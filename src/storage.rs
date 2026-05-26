@@ -1335,7 +1335,13 @@ impl Storage {
             sql.push_str(&where_clauses.join(" AND "));
         }
 
-        sql.push_str(" ORDER BY pk ASC, sk ASC");
+        // Order by the full composite key so the scan order matches the
+        // `(pk, sk, base_pk, base_sk)` pagination cursor above. Without the
+        // base-key columns here, rows tied on (pk, sk) would only be ordered
+        // deterministically by the primary-key b-tree as an implementation
+        // accident; making it explicit mirrors `scan_gsi_items` and keeps the
+        // cursor/order invariant from depending on the query planner.
+        sql.push_str(" ORDER BY pk ASC, sk ASC, base_pk ASC, base_sk ASC");
 
         if let Some(lim) = params.limit {
             sql.push_str(&format!(" LIMIT {lim}"));

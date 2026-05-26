@@ -95,6 +95,13 @@ indicatif = { version = "0.17", optional = true }
 zstd = { version = "0.13", optional = true }
 tempfile = { version = "3", optional = true }
 
+# uuid needs an explicit randomness source on wasm32-unknown-unknown. The `js`
+# feature wires its RNG to the browser crypto via wasm-bindgen, so the wasm
+# build does not need getrandom's backend cfg. Native targets are unaffected
+# and keep the default getrandom-backed RNG.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["js"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }

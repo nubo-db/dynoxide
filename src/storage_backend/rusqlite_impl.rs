@@ -93,6 +93,23 @@ impl StorageBackend for Storage {
         Storage::update_billing_mode(self, table_name, billing_mode).map_err(dyno_to_backend)
     }
 
+    async fn update_table_class(
+        &self,
+        table_name: &str,
+        table_class: &str,
+    ) -> Result<(), BackendError> {
+        Storage::update_table_class(self, table_name, table_class).map_err(dyno_to_backend)
+    }
+
+    async fn update_on_demand_throughput(
+        &self,
+        table_name: &str,
+        on_demand_throughput: &str,
+    ) -> Result<(), BackendError> {
+        Storage::update_on_demand_throughput(self, table_name, on_demand_throughput)
+            .map_err(dyno_to_backend)
+    }
+
     async fn get_tags(&self, table_name: &str) -> Result<Vec<Tag>, BackendError> {
         Storage::get_tags(self, table_name).map_err(dyno_to_backend)
     }

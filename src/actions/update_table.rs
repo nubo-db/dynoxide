@@ -31,6 +31,12 @@ struct UpdateTableRequestRaw {
 
     #[serde(rename = "BillingMode", default)]
     billing_mode: Option<String>,
+
+    #[serde(rename = "TableClass", default)]
+    table_class: Option<String>,
+
+    #[serde(rename = "OnDemandThroughput", default)]
+    on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +48,8 @@ pub struct UpdateTableRequest {
     pub deletion_protection_enabled: Option<bool>,
     pub provisioned_throughput: Option<serde_json::Value>,
     pub billing_mode: Option<String>,
+    pub table_class: Option<String>,
+    pub on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
 impl<'de> serde::Deserialize<'de> for UpdateTableRequest {
@@ -95,6 +103,8 @@ impl<'de> serde::Deserialize<'de> for UpdateTableRequest {
             deletion_protection_enabled: raw.deletion_protection_enabled,
             provisioned_throughput: raw.provisioned_throughput,
             billing_mode: raw.billing_mode,
+            table_class: raw.table_class,
+            on_demand_throughput: raw.on_demand_throughput,
         })
     }
 }
@@ -438,6 +448,22 @@ pub async fn execute<S: StorageBackend>(
                 .await?;
         }
 
+        // Handle table class changes
+        if let Some(ref table_class) = request.table_class {
+            storage
+                .update_table_class(&request.table_name, table_class)
+                .await?;
+        }
+
+        // Handle on-demand throughput changes
+        if let Some(ref on_demand) = request.on_demand_throughput {
+            let json = serde_json::to_string(on_demand)
+                .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+            storage
+                .update_on_demand_throughput(&request.table_name, &json)
+                .await?;
+        }
+
         // Handle billing mode changes
         if let Some(ref billing_mode) = request.billing_mode {
             storage
@@ -599,6 +625,17 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
         }
     }
 
+    // TableClass enum validation (mirrors CreateTable)
+    if let Some(ref tc) = request.table_class {
+        if tc != "STANDARD" && tc != "STANDARD_INFREQUENT_ACCESS" {
+            return Err(DynoxideError::ValidationException(format!(
+                "1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy \
+                 constraint: Member must satisfy enum value set: \
+                 [STANDARD, STANDARD_INFREQUENT_ACCESS]"
+            )));
+        }
+    }
+
     // BillingMode PAY_PER_REQUEST with ProvisionedThroughput is not allowed
     if request.billing_mode.as_deref() == Some("PAY_PER_REQUEST")
         && request.provisioned_throughput.is_some()
@@ -655,6 +692,8 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
         && request.billing_mode.is_none()
         && request.stream_specification.is_none()
         && request.deletion_protection_enabled.is_none()
+        && request.table_class.is_none()
+        && request.on_demand_throughput.is_none()
     {
         return Err(DynoxideError::ValidationException(
             "At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, GlobalSecondaryIndexUpdates or SSESpecification or ReplicaUpdates is required".to_string(),

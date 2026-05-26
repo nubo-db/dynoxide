@@ -88,6 +88,22 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn update_table_class(
+        &self,
+        _table_name: &str,
+        _table_class: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn update_on_demand_throughput(
+        &self,
+        _table_name: &str,
+        _on_demand_throughput: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn get_tags(&self, _table_name: &str) -> Result<Vec<Tag>, BackendError> {
         unimplemented!()
     }

@@ -722,6 +722,30 @@ impl Storage {
         Ok(())
     }
 
+    /// Update the table class for a table.
+    pub fn update_table_class(&self, table_name: &str, table_class: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _tables SET table_class = ?1 WHERE table_name = ?2",
+            params![table_class, table_name],
+        )?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
+    /// Update the on-demand throughput (stored as JSON) for a table.
+    pub fn update_on_demand_throughput(
+        &self,
+        table_name: &str,
+        on_demand_throughput: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _tables SET on_demand_throughput = ?1 WHERE table_name = ?2",
+            params![on_demand_throughput, table_name],
+        )?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Tag operations
     // -----------------------------------------------------------------------

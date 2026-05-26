@@ -1398,6 +1398,8 @@ impl McpServer {
             deletion_protection_enabled: params.deletion_protection_enabled,
             billing_mode: None,
             provisioned_throughput: None,
+            table_class: None,
+            on_demand_throughput: None,
         };
         match self.db.update_table(request) {
             Ok(resp) => json_result(&resp),

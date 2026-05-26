@@ -150,6 +150,18 @@ pub trait StorageBackend {
         billing_mode: &str,
     ) -> Result<(), BackendError>;
 
+    async fn update_table_class(
+        &self,
+        table_name: &str,
+        table_class: &str,
+    ) -> Result<(), BackendError>;
+
+    async fn update_on_demand_throughput(
+        &self,
+        table_name: &str,
+        on_demand_throughput: &str,
+    ) -> Result<(), BackendError>;
+
     async fn get_tags(&self, table_name: &str) -> Result<Vec<Tag>, BackendError>;
 
     async fn set_tags(&self, table_name: &str, new_tags: &[Tag]) -> Result<(), BackendError>;

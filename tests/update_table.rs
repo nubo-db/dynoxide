@@ -1,5 +1,6 @@
 use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
+use dynoxide::actions::describe_table::DescribeTableRequest;
 use dynoxide::actions::update_table::UpdateTableRequest;
 use dynoxide::types::{AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType};
 use serde_json::json;
@@ -853,4 +854,72 @@ fn test_provisioned_to_provisioned_different_throughput_accepted() {
     .unwrap();
 
     db.update_table(req).unwrap();
+}
+
+fn describe(db: &Database, name: &str) -> dynoxide::actions::TableDescription {
+    db.describe_table(DescribeTableRequest {
+        table_name: name.to_string(),
+    })
+    .unwrap()
+    .table
+}
+
+#[test]
+fn test_update_table_single_field_table_class() {
+    // Issue #45: a lone TableClass change must be accepted and persisted, not
+    // rejected with "At least one of ...".
+    let db = make_db();
+    create_simple_table(&db, "TcTable");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TcTable",
+        "TableClass": "STANDARD_INFREQUENT_ACCESS",
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let summary = describe(&db, "TcTable")
+        .table_class_summary
+        .expect("TableClassSummary should be present after update");
+    assert_eq!(summary.table_class, "STANDARD_INFREQUENT_ACCESS");
+}
+
+#[test]
+fn test_update_table_single_field_on_demand_throughput() {
+    // Issue #45: a lone OnDemandThroughput change must be accepted and persisted.
+    let db = make_db();
+    create_simple_table(&db, "OdtTable");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtTable",
+        "OnDemandThroughput": {"MaxReadRequestUnits": 20, "MaxWriteRequestUnits": 15},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let odt = describe(&db, "OdtTable")
+        .on_demand_throughput
+        .expect("OnDemandThroughput should be present after update");
+    assert_eq!(odt.max_read_request_units, Some(20));
+    assert_eq!(odt.max_write_request_units, Some(15));
+}
+
+#[test]
+fn test_update_table_invalid_table_class_rejected() {
+    // Issue #45: an invalid TableClass enum value is a ValidationException.
+    let db = make_db();
+    create_simple_table(&db, "BadTcTable");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "BadTcTable",
+        "TableClass": "PREMIUM_NONSENSE",
+    }))
+    .unwrap();
+    let err = db
+        .update_table(req)
+        .expect_err("invalid TableClass must be rejected");
+    assert!(
+        matches!(err, dynoxide::errors::DynoxideError::ValidationException(_)),
+        "expected ValidationException, got: {err:?}"
+    );
 }

@@ -159,14 +159,20 @@ pub async fn execute<S: StorageBackend>(
             let meta = helpers::require_table_for_item_op(storage, table_name).await?;
             let key_schema = helpers::parse_key_schema(&meta)?;
             for wr in write_requests {
+                // Validate keys BEFORE extract_key_strings: that helper returns
+                // InternalServerError (HTTP 500) for a missing partition or sort
+                // key, but a key-less request is client input and must surface as
+                // a 400 ValidationException. Mirrors put_item.rs, which validates
+                // before extracting.
                 let key_item = if let Some(ref put) = wr.put_request {
+                    helpers::validate_item_keys(&put.item, &key_schema, &meta)?;
                     &put.item
                 } else if let Some(ref del) = wr.delete_request {
+                    helpers::validate_key_only(&del.key, &key_schema)?;
                     &del.key
                 } else {
                     continue;
                 };
-                // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(key_item, &key_schema)?;
                 let key = (table_name.clone(), pk, sk);
                 if !seen_keys.insert(key) {

@@ -171,10 +171,22 @@ pub async fn execute<S: StorageBackend>(
                     key_attrs.push(sk.clone());
                 }
 
-                let projected =
-                    expressions::projection::apply(&item, &projection, &tracker, &key_attrs)
-                        .map_err(DynoxideError::ValidationException)?;
-                Some(projected)
+                // AWS omits `Item` entirely when a ProjectionExpression matches
+                // no attribute on an otherwise-present item. `projection::apply`
+                // always re-injects the key attributes, so its result is never
+                // literally empty. Apply the projection without those keys to
+                // see whether any path actually resolved, then return the
+                // key-bearing result only when one did.
+                let matched = expressions::projection::apply(&item, &projection, &tracker, &[])
+                    .map_err(DynoxideError::ValidationException)?;
+                if matched.is_empty() {
+                    None
+                } else {
+                    let projected =
+                        expressions::projection::apply(&item, &projection, &tracker, &key_attrs)
+                            .map_err(DynoxideError::ValidationException)?;
+                    Some(projected)
+                }
             } else {
                 None
             }

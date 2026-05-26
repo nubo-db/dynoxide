@@ -15,27 +15,40 @@ name = "dynoxide"
 
 [features]
 default = ["native-sqlite", "http-server", "mcp-server", "import"]
-http-server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast"]
-native-sqlite = ["rusqlite/bundled"]
+
+# Marker feature for the CLI binary (`src/main.rs`). The binary always needs
+# clap and one of the CLI-capable features below; `[[bin]] required-features`
+# keys off `cli` so the binary is skipped in backend-neutral builds such as
+# `--no-default-features --features wasm-sqlite`, which ship the library only.
+cli = ["dep:clap"]
+http-server = ["cli", "dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast"]
+native-sqlite = ["dep:rusqlite", "rusqlite/bundled"]
 _has-encryption = ["dep:zeroize"]
 encryption = ["_has-encryption", "rusqlite/bundled-sqlcipher-vendored-openssl"]
 encryption-cc = ["_has-encryption", "rusqlite/bundled-sqlcipher"]
 encrypted-server = ["encryption", "http-server"]
 encrypted-server-cc = ["encryption-cc", "http-server"]
 encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
-mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
-import = ["dep:clap", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
+mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
+import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
 # Compile-only wa-sqlite stub. Surfaces trait-shape drift at type-check
 # time so a real wa-sqlite backend does not absorb that drift later. Not
 # a working backend; bodies are unimplemented!().
 wasm-stub = []
 
+# Real wa-sqlite backend. dynoxide compiles to wasm32-unknown-unknown and
+# runs against a JS wa-sqlite build over a wasm-bindgen bridge, persisting to
+# OPFS. The backend dependencies are pulled in alongside the WasmBridgeBackend
+# implementation. Preview: the wasm build is not verified by the conformance
+# suite (see the conformance note in the README).
+wasm-sqlite = []
+
 # Backward-compatible alias — identical to default features
 full = ["native-sqlite", "http-server", "mcp-server", "import"]
 
 [dependencies]
-rusqlite = { version = "0.36", features = ["backup", "functions"] }
+rusqlite = { version = "0.36", features = ["backup", "functions"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -97,3 +110,4 @@ strip = true
 [[bin]]
 name = "dynoxide"
 path = "src/main.rs"
+required-features = ["cli"]

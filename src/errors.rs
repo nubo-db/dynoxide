@@ -89,6 +89,7 @@ pub enum DynoxideError {
     ConversionError(#[from] crate::types::ConversionError),
 
     /// SQLite error (converted from rusqlite).
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     #[error("Internal error: {0}")]
     SqliteError(#[from] rusqlite::Error),
 }
@@ -159,7 +160,11 @@ impl DynoxideError {
                 "com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException"
             }
             DynoxideError::ConversionError(_) => "com.amazon.coral.validate#ValidationException",
-            DynoxideError::InternalServerError(_) | DynoxideError::SqliteError(_) => {
+            DynoxideError::InternalServerError(_) => {
+                "com.amazonaws.dynamodb.v20120810#InternalServerError"
+            }
+            #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+            DynoxideError::SqliteError(_) => {
                 "com.amazonaws.dynamodb.v20120810#InternalServerError"
             }
         }
@@ -189,16 +194,18 @@ impl DynoxideError {
             DynoxideError::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatch",
             DynoxideError::SerializationException(_) => "SerializationError",
             DynoxideError::LimitExceededException(_) => "RequestLimitExceeded",
-            DynoxideError::InternalServerError(_) | DynoxideError::SqliteError(_) => {
-                "InternalServerError"
-            }
+            DynoxideError::InternalServerError(_) => "InternalServerError",
+            #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+            DynoxideError::SqliteError(_) => "InternalServerError",
         }
     }
 
     /// Returns the HTTP status code for this error.
     pub fn status_code(&self) -> u16 {
         match self {
-            DynoxideError::InternalServerError(_) | DynoxideError::SqliteError(_) => 500,
+            DynoxideError::InternalServerError(_) => 500,
+            #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+            DynoxideError::SqliteError(_) => 500,
             _ => 400,
         }
     }
@@ -330,6 +337,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     #[test]
     fn test_sqlite_error_maps_to_internal() {
         let sqlite_err = rusqlite::Error::QueryReturnedNoRows;

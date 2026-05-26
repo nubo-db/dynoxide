@@ -1,12 +1,15 @@
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::errors::{DynoxideError, Result};
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::storage_backend::clock::{Clock, SystemClock};
 use crate::types::AttributeValue;
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use rusqlite::{Connection, params};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Current schema version. Stored in the `_config` table for future migrations.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const SCHEMA_VERSION: &str = "6";
 
 /// Number of hash buckets used for parallel scan segment assignment.
@@ -234,6 +237,10 @@ pub struct QueryParams<'a> {
 ///
 /// Manages the SQLite connection, metadata tables, and per-DynamoDB-table
 /// data tables. All SQL lives here — higher layers work with Rust types.
+///
+/// Native-only: this type is the rusqlite-backed backend and is compiled out
+/// of backend-neutral builds (for example `wasm-sqlite`).
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Storage {
     conn: Connection,
     /// In-memory cache of table metadata to avoid repeated SQLite reads.
@@ -243,6 +250,7 @@ pub struct Storage {
     clock: Arc<dyn Clock>,
 }
 
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 impl Storage {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
@@ -2086,6 +2094,10 @@ pub struct TableInfoEntry {
 }
 
 /// Escape double quotes in table names for safe SQL identifier use.
+///
+/// Used by the native SQL builders today; the wasm backend reuses it when it
+/// issues the same SQL, so it is gated to the SQL-issuing backends.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub(crate) fn escape_table_name(name: &str) -> String {
     name.replace('"', "\"\"")
 }
@@ -2117,12 +2129,14 @@ pub struct TableMetadata {
 }
 
 /// The standard SELECT column list for _tables queries.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \
      sse_specification, table_class, deletion_protection_enabled";
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
     Ok(TableMetadata {
         table_name: row.get(0)?,
@@ -2145,7 +2159,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;
 

@@ -44,7 +44,9 @@ use crate::storage::{
 use crate::types::Tag;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use error::{BackendError, from_rusqlite};
+pub use error::BackendError;
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+pub use error::from_rusqlite;
 
 /// One base-table row for a bulk insert via [`StorageBackend::put_base_items`].
 ///

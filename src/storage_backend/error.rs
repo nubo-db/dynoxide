@@ -61,6 +61,7 @@ pub enum BackendError {
 /// `?`-conversion would otherwise silently turn rusqlite errors into
 /// `BackendError` in code that should keep them rusqlite-typed (action handlers
 /// using `Storage::conn()` directly).
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub fn from_rusqlite(err: rusqlite::Error) -> BackendError {
     use rusqlite::Error::SqliteFailure;
     use rusqlite::ErrorCode;

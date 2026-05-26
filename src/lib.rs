@@ -29,11 +29,15 @@ compile_error!(
      Use the `encryption` feature for vendored OpenSSL on non-Apple platforms."
 );
 
-#[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
+#[cfg(not(any(
+    feature = "native-sqlite",
+    feature = "_has-encryption",
+    feature = "wasm-sqlite"
+)))]
 compile_error!(
-    "Either `native-sqlite`, `encryption`, or `encryption-cc` feature must be enabled. \
-     Default features include `native-sqlite`. If you used \
-     `default-features = false`, add one of these features."
+    "A storage backend feature must be enabled: `native-sqlite`, `encryption`, \
+     `encryption-cc`, or `wasm-sqlite`. Default features include `native-sqlite`. \
+     If you used `default-features = false`, add one of these features."
 );
 
 pub mod actions;
@@ -102,6 +106,7 @@ type TokenCache = HashMap<
 ///
 /// `Database`'s type parameter defaults to this, so existing native callers
 /// keep writing `Database` and get the synchronous rusqlite-backed engine.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub type RusqliteBackend = storage::Storage;
 
 /// The native, synchronous `Database`.
@@ -111,6 +116,7 @@ pub type RusqliteBackend = storage::Storage;
 /// unchanged: each method drives an async handler future to completion with
 /// `block_on`. Because the native backend's futures never suspend, that
 /// `block_on` never parks the thread.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub type NativeDatabase = Database<RusqliteBackend>;
 
 /// The main entry point for the DynamoDB emulator.
@@ -121,7 +127,22 @@ pub type NativeDatabase = Database<RusqliteBackend>;
 ///
 /// Wraps a storage layer and provides DynamoDB-compatible operations.
 /// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Database<S = RusqliteBackend> {
+    inner: Arc<Mutex<S>>,
+    idempotency_tokens: Arc<Mutex<TokenCache>>,
+}
+
+/// The main entry point for the DynamoDB emulator (backend-neutral build).
+///
+/// On a build with no native backend (for example the `wasm-sqlite` build)
+/// there is no native default, so the backend must be named explicitly — for
+/// example `Database<WasmBridgeBackend>`, aliased as `WasmDatabase`.
+///
+/// Wraps a storage layer and provides DynamoDB-compatible operations.
+/// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+#[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
+pub struct Database<S> {
     inner: Arc<Mutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
 }
@@ -136,6 +157,7 @@ impl<S> Clone for Database<S> {
     }
 }
 
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 impl Database<RusqliteBackend> {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
@@ -706,7 +728,7 @@ impl Database<RusqliteBackend> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;
 

@@ -79,10 +79,11 @@ pub async fn execute<S: StorageBackend>(
 
     // Check deletion protection
     if meta.deletion_protection_enabled {
-        return Err(DynoxideError::ValidationException(format!(
-            "Resource {} can't be deleted because deletion protection is enabled",
-            crate::streams::table_arn(&request.table_name)
-        )));
+        return Err(DynoxideError::ValidationException(
+            "Resource cannot be deleted as it is currently protected against deletion. \
+             Disable deletion protection first."
+                .to_string(),
+        ));
     }
 
     // Drop GSI tables first

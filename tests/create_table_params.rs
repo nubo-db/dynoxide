@@ -205,3 +205,30 @@ fn test_create_table_without_optional_params_succeeds() {
     assert!(resp.table_description.sse_description.is_none());
     assert!(resp.table_description.table_class_summary.is_none());
 }
+
+#[test]
+fn test_delete_table_protected_returns_exact_aws_message() {
+    // Issue #46: DeleteTable on a protected table must return the exact AWS
+    // message, not the ARN-prefixed form Dynoxide used to emit.
+    let db = make_db();
+
+    let mut req = basic_request("ProtectedExactMsg");
+    req.deletion_protection_enabled = Some(true);
+    db.create_table(req).unwrap();
+
+    let err = db
+        .delete_table(DeleteTableRequest {
+            table_name: "ProtectedExactMsg".to_string(),
+        })
+        .expect_err("delete of a protected table must fail");
+
+    assert!(
+        matches!(err, dynoxide::errors::DynoxideError::ValidationException(_)),
+        "expected ValidationException, got: {err:?}"
+    );
+    assert_eq!(
+        format!("{err}"),
+        "Resource cannot be deleted as it is currently protected against deletion. \
+         Disable deletion protection first."
+    );
+}

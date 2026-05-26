@@ -1,4 +1,5 @@
 use dynoxide::Database;
+use dynoxide::DynoxideError;
 use dynoxide::actions::batch_get_item::BatchGetItemRequest;
 use dynoxide::actions::batch_write_item::BatchWriteItemRequest;
 use dynoxide::actions::create_table::CreateTableRequest;
@@ -313,6 +314,41 @@ fn test_batch_write_nonexistent_table() {
 
     let err = db.batch_write_item(req).unwrap_err();
     assert!(format!("{err:?}").contains("not found"), "Got: {err:?}");
+}
+
+#[test]
+fn test_batch_write_keyless_put_rejected_with_400() {
+    // A PutRequest whose item is missing the table key is a client error: AWS
+    // rejects it with a 400 ValidationException. The duplicate-detection pass
+    // previously reached extract_key_strings before validating keys, surfacing
+    // a 500 InternalServerError. Mirrors the conformance assertion
+    // tests/tier1/batchWriteItem/validation.test.ts —
+    // "rejects a key-less item with a 400 ValidationException, not a 500".
+    let db = setup_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "HashTbl",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "HashTbl": [
+                {"PutRequest": {"Item": {"notkey": {"S": "x"}}}}
+            ]
+        }
+    }))
+    .unwrap();
+
+    let err = db.batch_write_item(req).unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(_)),
+        "key-less Put must be a ValidationException, got: {err:?}"
+    );
+    assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
 }
 
 #[test]

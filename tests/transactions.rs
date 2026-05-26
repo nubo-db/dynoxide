@@ -249,6 +249,43 @@ fn test_transact_get_with_projection() {
 }
 
 #[test]
+fn test_transact_get_projection_matching_nothing_omits_item() {
+    // AWS omits `Item` entirely when a ProjectionExpression matches no attribute
+    // on an otherwise-present item, rather than returning an empty `{}` (or a
+    // key-only object). Mirrors the conformance assertion
+    // tests/tier2/transactions/transactGet.test.ts —
+    // "omits Item when the projection matches no attribute on a present item".
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+
+    let req: serde_json::Value = json!({
+        "TableName": "Table1",
+        "Item": {"pk": {"S": "a"}, "real": {"S": "here"}}
+    });
+    let put_req = serde_json::from_value(req).unwrap();
+    db.put_item(put_req).unwrap();
+
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Get": {
+                "TableName": "Table1",
+                "Key": {"pk": {"S": "a"}},
+                "ProjectionExpression": "#x",
+                "ExpressionAttributeNames": {"#x": "doesNotExist"}
+            }}
+        ]
+    });
+    let transact_req = serde_json::from_value(req).unwrap();
+    let resp = db.transact_get_items(transact_req).unwrap();
+
+    assert!(
+        resp.responses[0].item.is_none(),
+        "projection matching nothing on a present item must omit Item, got: {:?}",
+        resp.responses[0].item
+    );
+}
+
+#[test]
 fn test_transact_write_with_condition_expression() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Table1");

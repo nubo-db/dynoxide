@@ -12,6 +12,9 @@ rust-version = "1.85"
 
 [lib]
 name = "dynoxide"
+# rlib for native consumers (bin, tests, benches); cdylib for the wasm-bindgen
+# build (wasm-pack emits the .wasm module from the cdylib).
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["native-sqlite", "http-server", "mcp-server", "import"]

@@ -7,12 +7,12 @@
  * backend via `sql_builders`) and hands it here with a positional parameter
  * array; this module only opens the database and runs statements.
  *
- * Preview: this wires wa-sqlite's async build to a main-thread OPFS VFS so the
- * database persists to OPFS without a Web Worker. It is not exercised by the
- * conformance suite (see the WASM note in the README). The VFS import is the
- * most version-sensitive line - if your wa-sqlite build exposes the
- * main-thread async VFS under a different name or path, adjust it here. The
- * IndexedDB VFS (`IDBBatchAtomicVFS`) is the documented fallback.
+ * Preview: this wires wa-sqlite's async build to its main-thread OPFS VFS
+ * (`OriginPrivateFileSystemVFS`) so the database persists to OPFS without a Web
+ * Worker. It is not exercised by the conformance suite (see the WASM note in
+ * the README). If a future wa-sqlite renames or moves that VFS, adjust the
+ * import below; the IndexedDB VFS (`IDBBatchAtomicVFS`) is the documented
+ * fallback when OPFS is unavailable.
  */
 
 import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
@@ -26,12 +26,12 @@ async function moduleHandle() {
   const module = await SQLiteESMFactory();
   sqlite3 = SQLite.Factory(module);
 
-  // Main-thread async OPFS VFS: persists to OPFS without a Worker. This is the
-  // adjustable preview integration point (see the file header).
-  const { OPFSAnyContextVFS } = await import(
-    "wa-sqlite/src/examples/OPFSAnyContextVFS.js"
+  // Main-thread async OPFS VFS: persists to OPFS without a Web Worker.
+  // Registered as the default VFS so open_v2 uses it.
+  const { OriginPrivateFileSystemVFS } = await import(
+    "wa-sqlite/src/examples/OriginPrivateFileSystemVFS.js"
   );
-  const vfs = await OPFSAnyContextVFS.create("dynoxide", module);
+  const vfs = new OriginPrivateFileSystemVFS();
   sqlite3.vfs_register(vfs, true);
   return sqlite3;
 }

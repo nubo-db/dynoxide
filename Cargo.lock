@@ -985,6 +985,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "web-time",
  "zeroize",
  "zstd",
 ]

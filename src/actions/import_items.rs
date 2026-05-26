@@ -6,7 +6,7 @@ use crate::storage_backend::BaseItemRow;
 use crate::storage_backend::StorageBackend;
 use crate::types::item_size;
 use crate::{ImportOptions, ImportResult};
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 /// Execute a bulk import of items into a table.
 ///

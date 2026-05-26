@@ -67,7 +67,7 @@ pub use macros::ItemInsert;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use web_time::Instant;
 
 pub use errors::{DynoxideError, Result};
 pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};

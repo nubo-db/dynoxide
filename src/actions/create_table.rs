@@ -7,7 +7,7 @@ use crate::types::{
     Projection, ProjectionType, ProvisionedThroughput,
 };
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Internal raw deserialization struct — uses serde_json::Value for fields
 /// that participate in DynamoDB's multi-field constraint validation.

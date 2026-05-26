@@ -314,8 +314,8 @@ pub async fn execute<S: StorageBackend>(
     let now = {
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST_TS: AtomicU64 = AtomicU64::new(0);
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let wall = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         loop {

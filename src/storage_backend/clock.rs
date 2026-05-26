@@ -2,14 +2,15 @@
 //!
 //! Clock injection is scoped to the call sites that the
 //! [`StorageBackend`](super::StorageBackend) trait surfaces, namely the
-//! stream and TTL paths in [`crate::streams`] and [`crate::ttl`]. Other
-//! `std::time::*` call sites in the codebase (idempotency cache,
-//! action-handler `created_at` stamps, snapshot epoch helpers) sit inside
-//! native-only code paths the trait does not expose, so they remain on
-//! `std::time::SystemTime` directly.
+//! stream and TTL paths in [`crate::streams`] and [`crate::ttl`]. The other
+//! wall-clock call sites that compile on every target (the idempotency cache
+//! and the action-handler `created_at` stamps) read time through `web_time`,
+//! which sources the browser clock on wasm and `std::time` everywhere else.
+//! Snapshot epoch helpers stay on `std::time` because they sit inside
+//! native-only code the trait does not expose.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Provides wall-clock time to the trait's stream and TTL paths.
 ///
@@ -25,7 +26,7 @@ pub trait Clock: Send + Sync {
     fn now_unix_secs_f64(&self) -> f64;
 }
 
-/// Production clock backed by [`std::time::SystemTime`].
+/// Production clock backed by [`web_time::SystemTime`] (`std::time` on native).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 

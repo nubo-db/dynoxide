@@ -56,6 +56,10 @@ base64 = "0.22"
 bigdecimal = "0.4"
 uuid = { version = "1", features = ["v4", "v7"] }
 md5 = "0.7"
+# Cross-platform time. Re-exports std::time on native (zero cost); on wasm32 it
+# sources Instant/SystemTime from the browser clock so the shared time-bearing
+# paths (idempotency cache, created_at stamps, SystemClock) do not panic.
+web-time = "1"
 # Drives the always-ready native handler futures to completion for the
 # synchronous `Database` facade. A minimal block_on that never spawns threads,
 # so it is safe to call from inside the tokio-based HTTP/MCP servers.

@@ -7,16 +7,20 @@
  * backend via `sql_builders`) and hands it here with a positional parameter
  * array; this module only opens the database and runs statements.
  *
- * Preview: this wires wa-sqlite's async build to its main-thread OPFS VFS
- * (`OriginPrivateFileSystemVFS`) so the database persists to OPFS without a Web
- * Worker. It is not exercised by the conformance suite (see the WASM note in
- * the README). If a future wa-sqlite renames or moves that VFS, adjust the
- * import below; the IndexedDB VFS (`IDBBatchAtomicVFS`) is the documented
- * fallback when OPFS is unavailable.
+ * Runs inside the dynoxide Web Worker (see js/dynoxide-worker.js). wa-sqlite's
+ * OPFS VFS persists through sync access handles, which browsers expose only in
+ * a Worker, so the engine runs in the Worker and the page talks to it over a
+ * coarse message RPC. No cross-origin isolation (COOP/COEP) is required.
+ *
+ * Preview packaging: wa-sqlite is imported by absolute `/node_modules` path so
+ * the Worker resolves it without a bundler or import map. A production/SDK
+ * build would bundle the Worker and import wa-sqlite by bare specifier. This
+ * backend is not exercised by the conformance suite (see the WASM note in the
+ * README).
  */
 
-import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite-async.mjs";
-import * as SQLite from "wa-sqlite";
+import * as SQLite from "/node_modules/wa-sqlite/src/sqlite-api.js";
+import SQLiteESMFactory from "/node_modules/wa-sqlite/dist/wa-sqlite-async.mjs";
 
 // Lazily initialised SQLite API handle, shared across opens.
 let sqlite3 = null;
@@ -26,10 +30,10 @@ async function moduleHandle() {
   const module = await SQLiteESMFactory();
   sqlite3 = SQLite.Factory(module);
 
-  // Main-thread async OPFS VFS: persists to OPFS without a Web Worker.
-  // Registered as the default VFS so open_v2 uses it.
+  // OPFS VFS via sync access handles (Worker-only), registered as the default
+  // so open_v2 uses it. Persists to the origin private file system.
   const { OriginPrivateFileSystemVFS } = await import(
-    "wa-sqlite/src/examples/OriginPrivateFileSystemVFS.js"
+    "/node_modules/wa-sqlite/src/examples/OriginPrivateFileSystemVFS.js"
   );
   const vfs = new OriginPrivateFileSystemVFS();
   sqlite3.vfs_register(vfs, true);

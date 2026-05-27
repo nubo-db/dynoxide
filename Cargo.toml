@@ -41,6 +41,10 @@ import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicati
 # conformance note in the README).
 wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys"]
 
+# Browser smoke-test entry point over the wasm-sqlite backend. Opt-in so the
+# `#[wasm_bindgen]` harness export stays out of the production wasm build.
+wasm-harness = ["wasm-sqlite"]
+
 # Backward-compatible alias — identical to default features
 full = ["native-sqlite", "http-server", "mcp-server", "import"]
 

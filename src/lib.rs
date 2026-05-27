@@ -61,6 +61,8 @@ pub mod streams;
 pub mod ttl;
 pub mod types;
 pub mod validation;
+#[cfg(feature = "wasm-harness")]
+pub mod wasm_harness;
 
 #[doc(hidden)]
 pub use macros::ItemInsert;

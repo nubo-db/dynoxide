@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>dynoxide wasm-sqlite smoke test</title>
+    <!--
+      Preview browser harness for the wasm-sqlite backend.
+
+      The engine runs in a Web Worker (js/dynoxide-worker.js) so wa-sqlite can
+      use OPFS sync access handles; this page drives it over a message RPC.
+
+      Build first (from the repo root):
+        npm install
+        wasm-pack build --dev --target web --out-dir pkg -- \
+          --no-default-features --features wasm-harness
+
+      Then serve the repo root over http and open /harness/ in a browser:
+        python3 -m http.server 8081
+        open http://localhost:8081/harness/
+
+      localhost is a secure context, so OPFS is available without COOP/COEP.
+    -->
+  </head>
+  <body>
+    <h1>dynoxide wasm-sqlite smoke test</h1>
+    <pre id="out">running...</pre>
+    <script type="module">
+      const out = document.getElementById("out");
+      const worker = new Worker("/js/dynoxide-worker.js", { type: "module" });
+
+      function call(op, payload) {
+        return new Promise((resolve, reject) => {
+          const id = Math.random().toString(36).slice(2);
+          const handler = (event) => {
+            if (event.data.id !== id) return;
+            worker.removeEventListener("message", handler);
+            event.data.ok
+              ? resolve(event.data.result)
+              : reject(new Error(event.data.error));
+          };
+          worker.addEventListener("message", handler);
+          worker.postMessage({ id, op, payload });
+        });
+      }
+
+      try {
+        const result = await call("smoke");
+        out.textContent = "PASS (engine in Worker, OPFS)\n" + result;
+        window.__SMOKE_RESULT__ = { ok: true, result };
+      } catch (e) {
+        out.textContent = "FAIL\n" + ((e && e.stack) || e);
+        window.__SMOKE_RESULT__ = { ok: false, error: String(e) };
+      }
+    </script>
+  </body>
+</html>

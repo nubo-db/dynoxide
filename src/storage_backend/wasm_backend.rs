@@ -317,68 +317,87 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn create_gsi_table(
         &self,
-        _table_name: &str,
-        _index_name: &str,
+        table_name: &str,
+        index_name: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("create_gsi_table"))
+        let (sql, params) = sql_builders::create_gsi_table(table_name, index_name);
+        self.exec(&sql, params).await
     }
 
     async fn drop_gsi_table(
         &self,
-        _table_name: &str,
-        _index_name: &str,
+        table_name: &str,
+        index_name: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("drop_gsi_table"))
+        let (sql, params) = sql_builders::drop_gsi_table(table_name, index_name);
+        self.exec(&sql, params).await
     }
 
     async fn create_lsi_table(
         &self,
-        _table_name: &str,
-        _index_name: &str,
+        table_name: &str,
+        index_name: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("create_lsi_table"))
+        let (sql, params) = sql_builders::create_lsi_table(table_name, index_name);
+        self.exec(&sql, params).await
     }
 
     async fn drop_lsi_table(
         &self,
-        _table_name: &str,
-        _index_name: &str,
+        table_name: &str,
+        index_name: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("drop_lsi_table"))
+        let (sql, params) = sql_builders::drop_lsi_table(table_name, index_name);
+        self.exec(&sql, params).await
     }
 
     // --- GSI items -------------------------------------------------------
 
     async fn insert_gsi_item(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _gsi_pk: &str,
-        _gsi_sk: &str,
-        _table_pk: &str,
-        _table_sk: &str,
-        _item_json: &str,
+        table_name: &str,
+        index_name: &str,
+        gsi_pk: &str,
+        gsi_sk: &str,
+        table_pk: &str,
+        table_sk: &str,
+        item_json: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("insert_gsi_item"))
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
+        let params = sql_builders::gsi_insert_params(gsi_pk, gsi_sk, table_pk, table_sk, item_json);
+        self.exec(&sql, params).await
     }
 
     async fn insert_gsi_items(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _rows: &[GsiItemRow],
+        table_name: &str,
+        index_name: &str,
+        rows: &[GsiItemRow],
     ) -> Result<(), BackendError> {
-        Err(not_yet("insert_gsi_items"))
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
+        for row in rows {
+            let params = sql_builders::gsi_insert_params(
+                &row.gsi_pk,
+                &row.gsi_sk,
+                &row.table_pk,
+                &row.table_sk,
+                &row.item_json,
+            );
+            self.exec(&sql, params).await?;
+        }
+        Ok(())
     }
 
     async fn delete_gsi_item(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _table_pk: &str,
-        _table_sk: &str,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("delete_gsi_item"))
+        let (sql, params) =
+            sql_builders::delete_gsi_item(table_name, index_name, table_pk, table_sk);
+        self.exec(&sql, params).await
     }
 
     async fn query_gsi_items(
@@ -404,25 +423,29 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn insert_lsi_item(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _pk: &str,
-        _sk: &str,
-        _base_pk: &str,
-        _base_sk: &str,
-        _item_json: &str,
+        table_name: &str,
+        index_name: &str,
+        pk: &str,
+        sk: &str,
+        base_pk: &str,
+        base_sk: &str,
+        item_json: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("insert_lsi_item"))
+        let sql = sql_builders::lsi_insert_sql(table_name, index_name);
+        let params = sql_builders::lsi_insert_params(pk, sk, base_pk, base_sk, item_json);
+        self.exec(&sql, params).await
     }
 
     async fn delete_lsi_item(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _base_pk: &str,
-        _base_sk: &str,
+        table_name: &str,
+        index_name: &str,
+        base_pk: &str,
+        base_sk: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("delete_lsi_item"))
+        let (sql, params) =
+            sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
+        self.exec(&sql, params).await
     }
 
     async fn query_lsi_items(
@@ -529,11 +552,17 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn get_lsi_partition_size(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _pk: &str,
+        table_name: &str,
+        index_name: &str,
+        pk: &str,
     ) -> Result<i64, BackendError> {
-        Err(not_yet("get_lsi_partition_size"))
+        let (sql, params) = sql_builders::get_lsi_partition_size(table_name, index_name, pk);
+        let rows = self.query(&sql, params).await?;
+        if rows.length() == 0 {
+            return Ok(0);
+        }
+        let row: js_sys::Array = rows.get(0).unchecked_into();
+        Ok(col_i64(&row, 0))
     }
 
     async fn delete_item(

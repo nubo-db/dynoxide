@@ -291,6 +291,166 @@ pub fn count_items(table_name: &str) -> (String, Vec<SqlParam>) {
     )
 }
 
+// --- Secondary index tables (GSI/LSI) -----------------------------------
+
+/// Create a GSI table plus its base-key index (a two-statement batch).
+pub fn create_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+    let gsi = format!("{table_name}::gsi::{index_name}");
+    let escaped = escape_table_name(&gsi);
+    let idx = escape_table_name(&format!("{gsi}::base_key"));
+    let sql = format!(
+        "CREATE TABLE \"{escaped}\" (
+                gsi_pk TEXT NOT NULL,
+                gsi_sk TEXT NOT NULL DEFAULT '',
+                table_pk TEXT NOT NULL,
+                table_sk TEXT NOT NULL DEFAULT '',
+                item_json TEXT NOT NULL,
+                PRIMARY KEY (gsi_pk, gsi_sk, table_pk, table_sk)
+            );
+            CREATE INDEX IF NOT EXISTS \"{idx}\" ON \"{escaped}\" (table_pk, table_sk);"
+    );
+    (sql, Vec::new())
+}
+
+/// Drop a GSI table if it exists.
+pub fn drop_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+    let gsi = format!("{table_name}::gsi::{index_name}");
+    (
+        format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&gsi)),
+        Vec::new(),
+    )
+}
+
+/// Insert-or-replace statement for a GSI row, shared by single and bulk insert.
+pub fn gsi_insert_sql(table_name: &str, index_name: &str) -> String {
+    let gsi = format!("{table_name}::gsi::{index_name}");
+    format!(
+        "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        escape_table_name(&gsi)
+    )
+}
+
+/// Bound parameters for one GSI row, matching [`gsi_insert_sql`].
+pub fn gsi_insert_params(
+    gsi_pk: &str,
+    gsi_sk: &str,
+    table_pk: &str,
+    table_sk: &str,
+    item_json: &str,
+) -> Vec<SqlParam> {
+    vec![
+        SqlParam::text(gsi_pk),
+        SqlParam::text(gsi_sk),
+        SqlParam::text(table_pk),
+        SqlParam::text(table_sk),
+        SqlParam::text(item_json),
+    ]
+}
+
+/// Delete a GSI row by base-table primary key.
+pub fn delete_gsi_item(
+    table_name: &str,
+    index_name: &str,
+    table_pk: &str,
+    table_sk: &str,
+) -> (String, Vec<SqlParam>) {
+    let gsi = format!("{table_name}::gsi::{index_name}");
+    (
+        format!(
+            "DELETE FROM \"{}\" WHERE table_pk = ?1 AND table_sk = ?2",
+            escape_table_name(&gsi)
+        ),
+        vec![SqlParam::text(table_pk), SqlParam::text(table_sk)],
+    )
+}
+
+/// Create an LSI table plus its base-key index (a two-statement batch).
+pub fn create_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    let escaped = escape_table_name(&lsi);
+    let idx = escape_table_name(&format!("{lsi}::base_key"));
+    let sql = format!(
+        "CREATE TABLE \"{escaped}\" (
+                pk TEXT NOT NULL,
+                sk TEXT NOT NULL DEFAULT '',
+                base_pk TEXT NOT NULL,
+                base_sk TEXT NOT NULL DEFAULT '',
+                item_json TEXT NOT NULL,
+                PRIMARY KEY (pk, sk, base_pk, base_sk)
+            );
+            CREATE INDEX IF NOT EXISTS \"{idx}\" ON \"{escaped}\" (base_pk, base_sk);"
+    );
+    (sql, Vec::new())
+}
+
+/// Drop an LSI table if it exists.
+pub fn drop_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    (
+        format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&lsi)),
+        Vec::new(),
+    )
+}
+
+/// Insert-or-replace statement for an LSI row.
+pub fn lsi_insert_sql(table_name: &str, index_name: &str) -> String {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    format!(
+        "INSERT OR REPLACE INTO \"{}\" (pk, sk, base_pk, base_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+        escape_table_name(&lsi)
+    )
+}
+
+/// Bound parameters for one LSI row, matching [`lsi_insert_sql`].
+pub fn lsi_insert_params(
+    pk: &str,
+    sk: &str,
+    base_pk: &str,
+    base_sk: &str,
+    item_json: &str,
+) -> Vec<SqlParam> {
+    vec![
+        SqlParam::text(pk),
+        SqlParam::text(sk),
+        SqlParam::text(base_pk),
+        SqlParam::text(base_sk),
+        SqlParam::text(item_json),
+    ]
+}
+
+/// Delete an LSI row by base-table primary key.
+pub fn delete_lsi_item(
+    table_name: &str,
+    index_name: &str,
+    base_pk: &str,
+    base_sk: &str,
+) -> (String, Vec<SqlParam>) {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    (
+        format!(
+            "DELETE FROM \"{}\" WHERE base_pk = ?1 AND base_sk = ?2",
+            escape_table_name(&lsi)
+        ),
+        vec![SqlParam::text(base_pk), SqlParam::text(base_sk)],
+    )
+}
+
+/// Sum the JSON length of LSI rows for one partition key.
+pub fn get_lsi_partition_size(
+    table_name: &str,
+    index_name: &str,
+    pk: &str,
+) -> (String, Vec<SqlParam>) {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    (
+        format!(
+            "SELECT COALESCE(SUM(length(item_json)), 0) FROM \"{}\" WHERE pk = ?1",
+            escape_table_name(&lsi)
+        ),
+        vec![SqlParam::text(pk)],
+    )
+}
+
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;

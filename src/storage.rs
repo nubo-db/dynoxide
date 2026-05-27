@@ -790,35 +790,16 @@ impl Storage {
 
     /// Create a GSI table.
     pub fn create_gsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let escaped = escape_table_name(&gsi_table_name);
-        let sql = format!(
-            "CREATE TABLE \"{escaped}\" (
-                gsi_pk TEXT NOT NULL,
-                gsi_sk TEXT NOT NULL DEFAULT '',
-                table_pk TEXT NOT NULL,
-                table_sk TEXT NOT NULL DEFAULT '',
-                item_json TEXT NOT NULL,
-                PRIMARY KEY (gsi_pk, gsi_sk, table_pk, table_sk)
-            )"
-        );
-        self.conn.execute(&sql, [])?;
-
-        let idx_name = escape_table_name(&format!("{gsi_table_name}::base_key"));
-        self.conn.execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{escaped}\" (table_pk, table_sk)"
-        ))?;
+        let (sql, _) = sql_builders::create_gsi_table(table_name, index_name);
+        self.conn.execute_batch(&sql)?;
         Ok(())
     }
 
     /// Drop a GSI table.
     pub fn drop_gsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            escape_table_name(&gsi_table_name)
-        );
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::drop_gsi_table(table_name, index_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -838,14 +819,11 @@ impl Storage {
         table_sk: &str,
         item_json: &str,
     ) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            escape_table_name(&gsi_table_name)
-        );
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
+        let params = sql_builders::gsi_insert_params(gsi_pk, gsi_sk, table_pk, table_sk, item_json);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![gsi_pk, gsi_sk, table_pk, table_sk, item_json])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -858,20 +836,17 @@ impl Storage {
         index_name: &str,
         rows: &[crate::storage_backend::GsiItemRow],
     ) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            escape_table_name(&gsi_table_name)
-        );
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
         let mut stmt = self.conn.prepare_cached(&sql)?;
         for row in rows {
-            stmt.execute(params![
-                row.gsi_pk,
-                row.gsi_sk,
-                row.table_pk,
-                row.table_sk,
-                row.item_json
-            ])?;
+            let params = sql_builders::gsi_insert_params(
+                &row.gsi_pk,
+                &row.gsi_sk,
+                &row.table_pk,
+                &row.table_sk,
+                &row.item_json,
+            );
+            stmt.execute(rusqlite::params_from_iter(params.iter()))?;
         }
         Ok(())
     }
@@ -884,14 +859,11 @@ impl Storage {
         table_pk: &str,
         table_sk: &str,
     ) -> Result<()> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE table_pk = ?1 AND table_sk = ?2",
-            escape_table_name(&gsi_table_name)
-        );
+        let (sql, params) =
+            sql_builders::delete_gsi_item(table_name, index_name, table_pk, table_sk);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![table_pk, table_sk])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1068,35 +1040,16 @@ impl Storage {
 
     /// Create an LSI table for a given base table and index name.
     pub fn create_lsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let escaped = escape_table_name(&lsi_table_name);
-        let sql = format!(
-            "CREATE TABLE \"{escaped}\" (
-                pk TEXT NOT NULL,
-                sk TEXT NOT NULL DEFAULT '',
-                base_pk TEXT NOT NULL,
-                base_sk TEXT NOT NULL DEFAULT '',
-                item_json TEXT NOT NULL,
-                PRIMARY KEY (pk, sk, base_pk, base_sk)
-            )"
-        );
-        self.conn.execute(&sql, [])?;
-
-        let idx_name = escape_table_name(&format!("{lsi_table_name}::base_key"));
-        self.conn.execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{escaped}\" (base_pk, base_sk)"
-        ))?;
+        let (sql, _) = sql_builders::create_lsi_table(table_name, index_name);
+        self.conn.execute_batch(&sql)?;
         Ok(())
     }
 
     /// Drop an LSI table.
     pub fn drop_lsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            escape_table_name(&lsi_table_name)
-        );
-        self.conn.execute(&sql, [])?;
+        let (sql, params) = sql_builders::drop_lsi_table(table_name, index_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1116,14 +1069,11 @@ impl Storage {
         base_sk: &str,
         item_json: &str,
     ) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (pk, sk, base_pk, base_sk, item_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            escape_table_name(&lsi_table_name)
-        );
+        let sql = sql_builders::lsi_insert_sql(table_name, index_name);
+        let params = sql_builders::lsi_insert_params(pk, sk, base_pk, base_sk, item_json);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![pk, sk, base_pk, base_sk, item_json])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1135,14 +1085,11 @@ impl Storage {
         base_pk: &str,
         base_sk: &str,
     ) -> Result<()> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE base_pk = ?1 AND base_sk = ?2",
-            escape_table_name(&lsi_table_name)
-        );
+        let (sql, params) =
+            sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
         self.conn
             .prepare_cached(&sql)?
-            .execute(params![base_pk, base_sk])?;
+            .execute(rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1453,12 +1400,12 @@ impl Storage {
         index_name: &str,
         pk: &str,
     ) -> Result<i64> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let sql = format!(
-            "SELECT COALESCE(SUM(length(item_json)), 0) FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(&lsi_table_name)
-        );
-        let size: i64 = self.conn.query_row(&sql, params![pk], |row| row.get(0))?;
+        let (sql, params) = sql_builders::get_lsi_partition_size(table_name, index_name, pk);
+        let size: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                row.get(0)
+            })?;
         Ok(size)
     }
 

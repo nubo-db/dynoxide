@@ -96,6 +96,7 @@ pub enum WhereCondition {
     Exists(String),
     NotExists(String),
     BeginsWith(String, PartiqlValue),
+    NotBeginsWith(String, PartiqlValue),
     Between(String, PartiqlValue, PartiqlValue),
     In(String, Vec<PartiqlValue>),
     Contains(String, PartiqlValue),
@@ -475,6 +476,16 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                 let path = parse_function_path(t)?;
                 expect_char(t, ")")?;
                 Ok(WhereCondition::NotExists(path))
+            } else if func.eq_ignore_ascii_case("BEGINS_WITH") {
+                expect_char(t, "(")?;
+                let path = parse_function_path(t)?;
+                let comma = t.next_token()?.ok_or("Expected ',' in NOT BEGINS_WITH")?;
+                if comma != "," {
+                    return Err(format!("Expected ',' but got '{comma}'"));
+                }
+                let value = parse_value(t)?;
+                expect_char(t, ")")?;
+                Ok(WhereCondition::NotBeginsWith(path, value))
             } else {
                 Err(format!("Unsupported NOT function: {func}"))
             }
@@ -500,11 +511,17 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                 }
                 "IN" => {
                     t.next_token()?; // consume IN
-                    let open = t.next_token()?.ok_or("Expected '(' after IN")?;
-                    if open != "(" {
-                        return Err(format!("Expected '(' after IN, got '{open}'"));
-                    }
-                    let close_char = ")";
+                    // Accept both the parenthesised form `IN (...)` (DynamoDB
+                    // FilterExpression style) and the bracket form `IN [...]`
+                    // (PartiQL style); the closing token must match the opener.
+                    let open = t.next_token()?.ok_or("Expected '(' or '[' after IN")?;
+                    let close_char = match open.as_str() {
+                        "(" => ")",
+                        "[" => "]",
+                        other => {
+                            return Err(format!("Expected '(' or '[' after IN, got '{other}'"));
+                        }
+                    };
                     let mut values = Vec::new();
                     loop {
                         let peek = t.peek_token()?.ok_or("Unexpected end of IN list")?;

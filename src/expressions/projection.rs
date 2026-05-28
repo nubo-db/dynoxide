@@ -161,7 +161,7 @@ fn default_for_next(next: &PathElement) -> AttributeValue {
 /// Insert a value at the path location in the result map.
 /// For simple top-level attributes, this is a direct insert.
 /// For nested paths, we build the necessary intermediate structure.
-fn insert_at_path(
+pub(crate) fn insert_at_path(
     result: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
     value: AttributeValue,

@@ -886,6 +886,208 @@ fn test_update_return_all_new() {
 }
 
 // ---------------------------------------------------------------------------
+// UpdateItem — SET evaluation semantics (#35) and ReturnValues granularity (#36)
+// ---------------------------------------------------------------------------
+
+/// #35(a): the whole UpdateExpression is evaluated against the pre-update image,
+/// so `SET a = :v, b = a` gives `b` the OLD value of `a`, not the value just
+/// assigned in the same call.
+#[test]
+fn test_update_set_reads_pre_update_snapshot() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", AttributeValue::S("k1".into())),
+            ("a", AttributeValue::S("OLD".into())),
+        ],
+    );
+
+    let resp = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET a = :v, b = a".into()),
+            expression_attribute_values: Some(make_item(&[(
+                ":v",
+                AttributeValue::S("NEW".into()),
+            )])),
+            return_values: Some("ALL_NEW".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let attrs = resp.attributes.unwrap();
+    assert_eq!(attrs["a"], AttributeValue::S("NEW".into()));
+    assert_eq!(attrs["b"], AttributeValue::S("OLD".into()));
+}
+
+/// #35(b): parenthesised arithmetic `SET c = (c - :v)` parses and applies on the
+/// BigDecimal path, rather than being rejected as a syntax error.
+#[test]
+fn test_update_parenthesised_arithmetic() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", AttributeValue::S("k1".into())),
+            ("c", AttributeValue::N("10".into())),
+        ],
+    );
+
+    let resp = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET c = (c - :v)".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::N("3".into()))])),
+            return_values: Some("ALL_NEW".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let attrs = resp.attributes.unwrap();
+    assert_eq!(attrs["c"], AttributeValue::N("7".into()));
+}
+
+/// #36(a): `UPDATED_NEW` for a nested `SET parent.child = :v` returns only the
+/// changed fragment `{parent: {M: {child}}}`, not the whole parent map.
+#[test]
+fn test_update_updated_new_nested_fragment() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let parent = AttributeValue::M(make_item(&[
+        ("keep", AttributeValue::S("k".into())),
+        ("child", AttributeValue::S("old".into())),
+    ]));
+    put(
+        &db,
+        "Tbl",
+        &[("pk", AttributeValue::S("k1".into())), ("parent", parent)],
+    );
+
+    let resp = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET parent.child = :v".into()),
+            expression_attribute_values: Some(make_item(&[(
+                ":v",
+                AttributeValue::S("new".into()),
+            )])),
+            return_values: Some("UPDATED_NEW".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let attrs = resp.attributes.unwrap();
+    match &attrs["parent"] {
+        AttributeValue::M(map) => {
+            assert_eq!(map.get("child"), Some(&AttributeValue::S("new".into())));
+            assert!(
+                !map.contains_key("keep"),
+                "UPDATED_NEW must return only the changed fragment, not sibling keys: {map:?}"
+            );
+        }
+        other => panic!("expected parent to be a map, got {other:?}"),
+    }
+}
+
+/// #36(b): a REMOVE-only update with `UPDATED_NEW` omits `Attributes` entirely,
+/// because nothing was set to a new value.
+#[test]
+fn test_update_updated_new_remove_omits_attributes() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", AttributeValue::S("k1".into())),
+            ("x", AttributeValue::S("keep".into())),
+            ("y", AttributeValue::S("drop".into())),
+        ],
+    );
+
+    let resp = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("REMOVE y".into()),
+            return_values: Some("UPDATED_NEW".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(
+        resp.attributes.is_none(),
+        "REMOVE-only UPDATED_NEW must omit Attributes, got {:?}",
+        resp.attributes
+    );
+}
+
+/// #36 regression guard: a SET targeting a list index must not mislocate the
+/// element or drop its siblings under UPDATED_NEW. `insert_at_path` rebuilds a
+/// list from index 0, so indexed targets fall back to the whole list attribute.
+#[test]
+fn test_update_updated_new_list_index_keeps_siblings() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let list = AttributeValue::L(vec![
+        AttributeValue::S("a".into()),
+        AttributeValue::S("b".into()),
+        AttributeValue::S("c".into()),
+    ]);
+    put(
+        &db,
+        "Tbl",
+        &[("pk", AttributeValue::S("k1".into())), ("list", list)],
+    );
+
+    let resp = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET #l[2] = :v".into()),
+            expression_attribute_names: Some(HashMap::from([(
+                "#l".to_string(),
+                "list".to_string(),
+            )])),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("z".into()))])),
+            return_values: Some("UPDATED_NEW".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let attrs = resp.attributes.unwrap();
+    match &attrs["list"] {
+        AttributeValue::L(items) => {
+            // The full updated list comes back, element at index 2 replaced, the
+            // preceding elements preserved in place. Never a length-1 list.
+            assert_eq!(
+                items,
+                &vec![
+                    AttributeValue::S("a".into()),
+                    AttributeValue::S("b".into()),
+                    AttributeValue::S("z".into()),
+                ],
+                "indexed SET must not collapse the list to its changed element"
+            );
+        }
+        other => panic!("expected list to be a list, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UpdateItem — cannot modify key attributes
 // ---------------------------------------------------------------------------
 

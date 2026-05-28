@@ -12,6 +12,10 @@
 //! Builders interpolate table names directly (SQLite cannot bind an
 //! identifier) via [`escape_table_name`] and bind values positionally with
 //! `?N` placeholders.
+//!
+//! Internal API. This module is `pub` only so both backends can share it; it is
+//! `#[doc(hidden)]` and carries no stability guarantee - treat it as a private
+//! contract between the rusqlite and wasm backends, not a public surface.
 
 use crate::storage::{CreateTableMetadata, HASH_BUCKETS, QueryParams, ScanParams, ceiling_div};
 use std::borrow::Cow;
@@ -148,11 +152,12 @@ pub const ROLLBACK: &str = "ROLLBACK";
 
 /// Insert a metadata row into `_tables`.
 pub fn insert_table_metadata<'a>(m: &CreateTableMetadata<'a>) -> (String, Vec<SqlParam<'a>>) {
-    let sql = "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
+    let sql =
+        "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
          lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
          deletion_protection_enabled, billing_mode) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
-        .to_string();
+            .to_string();
     let params = vec![
         SqlParam::text(m.table_name),
         SqlParam::text(m.key_schema),
@@ -646,8 +651,7 @@ pub fn scan_items<'a>(table_name: &str, params: &ScanParams<'a>) -> (String, Vec
 
     let is_parallel = params.segment.is_some() && params.total_segments.is_some();
 
-    if let (Some(start_pk), Some(start_sk)) =
-        (params.exclusive_start_pk, params.exclusive_start_sk)
+    if let (Some(start_pk), Some(start_sk)) = (params.exclusive_start_pk, params.exclusive_start_sk)
     {
         if is_parallel {
             where_clauses.push(format!(
@@ -711,8 +715,7 @@ pub fn scan_gsi_items<'a>(
     let mut where_clauses: Vec<String> = Vec::new();
     let mut param_idx = 1;
 
-    if let (Some(start_pk), Some(start_sk)) =
-        (params.exclusive_start_pk, params.exclusive_start_sk)
+    if let (Some(start_pk), Some(start_sk)) = (params.exclusive_start_pk, params.exclusive_start_sk)
     {
         if let (Some(base_pk), Some(base_sk)) = (
             params.exclusive_start_base_pk,
@@ -850,10 +853,7 @@ mod tests {
             sql,
             "SELECT item_json FROM \"Orders\" WHERE pk = ?1 AND sk = ?2"
         );
-        assert_eq!(
-            params,
-            vec![SqlParam::text("pk1"), SqlParam::text("sk1")]
-        );
+        assert_eq!(params, vec![SqlParam::text("pk1"), SqlParam::text("sk1")]);
     }
 
     #[test]
@@ -931,5 +931,208 @@ mod tests {
         assert_eq!(c, 1.5);
         assert_eq!(d, vec![1, 2, 3]);
         assert_eq!(e, None);
+    }
+
+    #[test]
+    fn query_items_combines_sk_condition_cursor_and_limit() {
+        let params = QueryParams {
+            sk_condition: Some("AND sk BETWEEN ?2 AND ?3"),
+            sk_params: &["a", "b"],
+            forward: true,
+            limit: Some(5),
+            exclusive_start_sk: Some("c"),
+            ..Default::default()
+        };
+        let (sql, out) = query_items("T", "u1", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T\" WHERE pk = ?1 AND sk BETWEEN ?2 AND ?3 AND sk > ?4 ORDER BY sk ASC LIMIT 5"
+        );
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("u1"),
+                SqlParam::text("a"),
+                SqlParam::text("b"),
+                SqlParam::text("c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn query_items_reverse_uses_descending_cursor_and_order() {
+        let params = QueryParams {
+            forward: false,
+            exclusive_start_sk: Some("c"),
+            ..Default::default()
+        };
+        let (sql, out) = query_items("T", "u1", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T\" WHERE pk = ?1 AND sk < ?2 ORDER BY sk DESC"
+        );
+        assert_eq!(out, vec![SqlParam::text("u1"), SqlParam::text("c")]);
+    }
+
+    #[test]
+    fn query_gsi_items_rewrites_sk_to_gsi_sk_and_paginates_composite() {
+        let params = QueryParams {
+            sk_condition: Some("AND sk > ?2"),
+            sk_params: &["m"],
+            forward: true,
+            exclusive_start_sk: Some("s"),
+            exclusive_start_base_pk: Some("bp"),
+            exclusive_start_base_sk: Some("bs"),
+            ..Default::default()
+        };
+        let (sql, out) = query_gsi_items("Orders", "byStatus", "OPEN", &params);
+        assert_eq!(
+            sql,
+            "SELECT gsi_pk, gsi_sk, item_json FROM \"Orders::gsi::byStatus\" WHERE gsi_pk = ?1 AND gsi_sk > ?2 AND (gsi_sk, table_pk, table_sk) > (?3, ?4, ?5) ORDER BY gsi_sk ASC, table_pk ASC, table_sk ASC"
+        );
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("OPEN"),
+                SqlParam::text("m"),
+                SqlParam::text("s"),
+                SqlParam::text("bp"),
+                SqlParam::text("bs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn query_lsi_items_paginates_composite_cursor() {
+        let params = QueryParams {
+            forward: true,
+            limit: Some(3),
+            exclusive_start_sk: Some("s"),
+            exclusive_start_base_pk: Some("bp"),
+            exclusive_start_base_sk: Some("bs"),
+            ..Default::default()
+        };
+        let (sql, out) = query_lsi_items("T", "lsi1", "p1", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T::lsi::lsi1\" WHERE pk = ?1 AND (sk, base_pk, base_sk) > (?2, ?3, ?4) ORDER BY sk ASC, base_pk ASC, base_sk ASC LIMIT 3"
+        );
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("p1"),
+                SqlParam::text("s"),
+                SqlParam::text("bp"),
+                SqlParam::text("bs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_items_parallel_segment_filters_by_hash_bucket() {
+        let params = ScanParams {
+            segment: Some(1),
+            total_segments: Some(4),
+            ..Default::default()
+        };
+        let (sql, out) = scan_items("T", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T\" WHERE substr(hash_prefix, 1, 3) >= ?1 AND substr(hash_prefix, 1, 3) <= ?2 ORDER BY hash_prefix ASC, pk ASC, sk ASC"
+        );
+        let start = ceiling_div(HASH_BUCKETS * 1, 4);
+        let end = ceiling_div(HASH_BUCKETS * 2, 4) - 1;
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text(format!("{start:03x}")),
+                SqlParam::text(format!("{end:03x}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_items_parallel_with_cursor_uses_hash_prefix_subquery() {
+        let params = ScanParams {
+            exclusive_start_pk: Some("p"),
+            exclusive_start_sk: Some("s"),
+            segment: Some(0),
+            total_segments: Some(2),
+            ..Default::default()
+        };
+        let (sql, out) = scan_items("T", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T\" WHERE (hash_prefix, pk, sk) > ((SELECT hash_prefix FROM \"T\" WHERE pk = ?1 AND sk = ?2 LIMIT 1), ?1, ?2) AND substr(hash_prefix, 1, 3) >= ?3 AND substr(hash_prefix, 1, 3) <= ?4 ORDER BY hash_prefix ASC, pk ASC, sk ASC"
+        );
+        let start = ceiling_div(HASH_BUCKETS * 0, 2);
+        let end = ceiling_div(HASH_BUCKETS * 1, 2) - 1;
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("p"),
+                SqlParam::text("s"),
+                SqlParam::text(format!("{start:03x}")),
+                SqlParam::text(format!("{end:03x}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_gsi_items_full_cursor_and_parallel_segment() {
+        let params = ScanParams {
+            exclusive_start_pk: Some("gp"),
+            exclusive_start_sk: Some("gs"),
+            exclusive_start_base_pk: Some("bp"),
+            exclusive_start_base_sk: Some("bs"),
+            segment: Some(2),
+            total_segments: Some(5),
+            ..Default::default()
+        };
+        let (sql, out) = scan_gsi_items("O", "byX", &params);
+        assert_eq!(
+            sql,
+            "SELECT gsi_pk, gsi_sk, item_json FROM \"O::gsi::byX\" WHERE (gsi_pk, gsi_sk, table_pk, table_sk) > (?1, ?2, ?3, ?4) AND (fnv1a_hash(table_pk) % ?5) = ?6 ORDER BY gsi_pk ASC, gsi_sk ASC, table_pk ASC, table_sk ASC"
+        );
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("gp"),
+                SqlParam::text("gs"),
+                SqlParam::text("bp"),
+                SqlParam::text("bs"),
+                SqlParam::Integer(5),
+                SqlParam::Integer(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_lsi_items_full_cursor_and_parallel_segment() {
+        let params = ScanParams {
+            exclusive_start_pk: Some("p"),
+            exclusive_start_sk: Some("s"),
+            exclusive_start_base_pk: Some("bp"),
+            exclusive_start_base_sk: Some("bs"),
+            segment: Some(1),
+            total_segments: Some(3),
+            ..Default::default()
+        };
+        let (sql, out) = scan_lsi_items("T", "lsi1", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T::lsi::lsi1\" WHERE (pk, sk, base_pk, base_sk) > (?1, ?2, ?3, ?4) AND (fnv1a_hash(base_pk) % ?5) = ?6 ORDER BY pk ASC, sk ASC, base_pk ASC, base_sk ASC"
+        );
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("p"),
+                SqlParam::text("s"),
+                SqlParam::text("bp"),
+                SqlParam::text("bs"),
+                SqlParam::Integer(3),
+                SqlParam::Integer(1),
+            ]
+        );
     }
 }

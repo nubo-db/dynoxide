@@ -24,6 +24,10 @@
 
 pub mod clock;
 pub mod error;
+// Internal: the shared SQL contract between the rusqlite and wasm backends.
+// `pub` only because both backend modules consume it across the cfg split; it
+// is not a stable API, hence `#[doc(hidden)]`.
+#[doc(hidden)]
 pub mod sql_builders;
 // The native rusqlite-backed `Storage` exists whenever either SQLite backend
 // feature is on (the crate refuses to build with neither), and the handlers
@@ -44,6 +48,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::BackendError;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub use error::from_rusqlite;
+#[doc(hidden)]
 pub use sql_builders::SqlParam;
 #[cfg(feature = "wasm-sqlite")]
 pub use wasm_backend::WasmBridgeBackend;

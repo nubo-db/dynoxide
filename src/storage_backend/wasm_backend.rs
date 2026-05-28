@@ -157,6 +157,20 @@ fn col_i64(row: &js_sys::Array, i: u32) -> i64 {
     row.get(i).as_f64().map(|f| f as i64).unwrap_or(0)
 }
 
+/// Map query/scan result rows (each `[c0, c1, c2]`) to `(String, String, String)`.
+fn rows_to_triples(rows: &js_sys::Array) -> Vec<(String, String, String)> {
+    let mut out = Vec::with_capacity(rows.length() as usize);
+    for i in 0..rows.length() {
+        let row: js_sys::Array = rows.get(i).unchecked_into();
+        out.push((
+            col_text(&row, 0).unwrap_or_default(),
+            col_text(&row, 1).unwrap_or_default(),
+            col_text(&row, 2).unwrap_or_default(),
+        ));
+    }
+    out
+}
+
 /// Map a `_tables` row (column order per [`sql_builders`]) to [`TableMetadata`].
 fn row_to_metadata(row: &js_sys::Array) -> TableMetadata {
     TableMetadata {
@@ -402,12 +416,14 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn query_gsi_items(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _gsi_pk: &str,
-        _params: &QueryParams<'_>,
+        table_name: &str,
+        index_name: &str,
+        gsi_pk: &str,
+        params: &QueryParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError> {
-        Err(not_yet("query_gsi_items"))
+        let (sql, p) = sql_builders::query_gsi_items(table_name, index_name, gsi_pk, params);
+        let rows = self.query(&sql, p).await?;
+        Ok(rows_to_triples(&rows))
     }
 
     async fn scan_gsi_items(
@@ -450,12 +466,14 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn query_lsi_items(
         &self,
-        _table_name: &str,
-        _index_name: &str,
-        _pk: &str,
-        _params: &QueryParams<'_>,
+        table_name: &str,
+        index_name: &str,
+        pk: &str,
+        params: &QueryParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError> {
-        Err(not_yet("query_lsi_items"))
+        let (sql, p) = sql_builders::query_lsi_items(table_name, index_name, pk, params);
+        let rows = self.query(&sql, p).await?;
+        Ok(rows_to_triples(&rows))
     }
 
     async fn scan_lsi_items(
@@ -579,11 +597,13 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn query_items(
         &self,
-        _table_name: &str,
-        _pk: &str,
-        _params: &QueryParams<'_>,
+        table_name: &str,
+        pk: &str,
+        params: &QueryParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError> {
-        Err(not_yet("query_items"))
+        let (sql, p) = sql_builders::query_items(table_name, pk, params);
+        let rows = self.query(&sql, p).await?;
+        Ok(rows_to_triples(&rows))
     }
 
     async fn scan_items(

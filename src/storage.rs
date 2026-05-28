@@ -875,73 +875,11 @@ impl Storage {
         gsi_pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let gsi_table_name = format!("{table_name}::gsi::{index_name}");
-        let mut sql = format!(
-            "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\" WHERE gsi_pk = ?1",
-            escape_table_name(&gsi_table_name)
-        );
-
-        let mut param_idx = 2;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(gsi_pk.to_string())];
-
-        if let Some(cond) = params.sk_condition {
-            // Replace "sk" with "gsi_sk" in the condition.
-            // N.B. This string replacement works because all SQL fragments generated
-            // by key_condition use the form ` sk ` or ` sk>` — they never embed
-            // `sk` without surrounding whitespace/operator. A more robust solution
-            // would thread the column name through the key condition builder, but
-            // that is a larger refactor deferred for now.
-            let gsi_cond = cond.replace(" sk ", " gsi_sk ").replace(" sk>", " gsi_sk>");
-            sql.push(' ');
-            sql.push_str(&gsi_cond);
-            for &p in params.sk_params {
-                all_params.push(Box::new(p.to_string()));
-                param_idx += 1;
-            }
-        }
-
-        // For GSI pagination, use a composite cursor (gsi_sk, table_pk, table_sk)
-        // so that hash-only GSIs (where gsi_sk is always '') paginate correctly.
-        if let (Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
-            params.exclusive_start_sk,
-            params.exclusive_start_base_pk,
-            params.exclusive_start_base_sk,
-        ) {
-            let op = if params.forward { ">" } else { "<" };
-            sql.push_str(&format!(
-                " AND (gsi_sk, table_pk, table_sk) {op} (?{}, ?{}, ?{})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2
-            ));
-            all_params.push(Box::new(start_sk.to_string()));
-            all_params.push(Box::new(start_base_pk.to_string()));
-            all_params.push(Box::new(start_base_sk.to_string()));
-        } else if let Some(start_sk) = params.exclusive_start_sk {
-            if params.forward {
-                sql.push_str(&format!(" AND gsi_sk > ?{param_idx}"));
-            } else {
-                sql.push_str(&format!(" AND gsi_sk < ?{param_idx}"));
-            }
-            all_params.push(Box::new(start_sk.to_string()));
-        }
-
-        sql.push_str(if params.forward {
-            " ORDER BY gsi_sk ASC, table_pk ASC, table_sk ASC"
-        } else {
-            " ORDER BY gsi_sk DESC, table_pk DESC, table_sk DESC"
-        });
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) =
+            sql_builders::query_gsi_items(table_name, index_name, gsi_pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1101,65 +1039,11 @@ impl Storage {
         pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let lsi_table_name = format!("{table_name}::lsi::{index_name}");
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(&lsi_table_name)
-        );
-
-        let mut param_idx = 2;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(pk.to_string())];
-
-        if let Some(cond) = params.sk_condition {
-            sql.push(' ');
-            sql.push_str(cond);
-            for &p in params.sk_params {
-                all_params.push(Box::new(p.to_string()));
-                param_idx += 1;
-            }
-        }
-
-        // Use composite cursor when all three LSI pagination values are present,
-        // otherwise fall back to simple sk comparison.
-        if let (Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
-            params.exclusive_start_sk,
-            params.exclusive_start_base_pk,
-            params.exclusive_start_base_sk,
-        ) {
-            let op = if params.forward { ">" } else { "<" };
-            sql.push_str(&format!(
-                " AND (sk, base_pk, base_sk) {op} (?{}, ?{}, ?{})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2
-            ));
-            all_params.push(Box::new(start_sk.to_string()));
-            all_params.push(Box::new(start_base_pk.to_string()));
-            all_params.push(Box::new(start_base_sk.to_string()));
-        } else if let Some(start_sk) = params.exclusive_start_sk {
-            if params.forward {
-                sql.push_str(&format!(" AND sk > ?{param_idx}"));
-            } else {
-                sql.push_str(&format!(" AND sk < ?{param_idx}"));
-            }
-            all_params.push(Box::new(start_sk.to_string()));
-        }
-
-        sql.push_str(if params.forward {
-            " ORDER BY sk ASC, base_pk ASC, base_sk ASC"
-        } else {
-            " ORDER BY sk DESC, base_pk DESC, base_sk DESC"
-        });
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) =
+            sql_builders::query_lsi_items(table_name, index_name, pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1430,47 +1314,10 @@ impl Storage {
         pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let mut sql = format!(
-            "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
-            escape_table_name(table_name)
-        );
-
-        let mut param_idx = 2;
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(pk.to_string())];
-
-        if let Some(cond) = params.sk_condition {
-            sql.push(' ');
-            sql.push_str(cond);
-            for &p in params.sk_params {
-                all_params.push(Box::new(p.to_string()));
-                param_idx += 1;
-            }
-        }
-
-        if let Some(start_sk) = params.exclusive_start_sk {
-            if params.forward {
-                sql.push_str(&format!(" AND sk > ?{param_idx}"));
-            } else {
-                sql.push_str(&format!(" AND sk < ?{param_idx}"));
-            }
-            all_params.push(Box::new(start_sk.to_string()));
-        }
-
-        sql.push_str(if params.forward {
-            " ORDER BY sk ASC"
-        } else {
-            " ORDER BY sk DESC"
-        });
-
-        if let Some(lim) = params.limit {
-            sql.push_str(&format!(" LIMIT {lim}"));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
+        let (sql, params_vec) = sql_builders::query_items(table_name, pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

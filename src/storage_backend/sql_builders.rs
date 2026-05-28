@@ -13,7 +13,7 @@
 //! identifier) via [`escape_table_name`] and bind values positionally with
 //! `?N` placeholders.
 
-use crate::storage::CreateTableMetadata;
+use crate::storage::{CreateTableMetadata, QueryParams};
 
 /// One bound SQL parameter, covering the SQLite value universe and nothing
 /// more.
@@ -449,6 +449,178 @@ pub fn get_lsi_partition_size(
         ),
         vec![SqlParam::text(pk)],
     )
+}
+
+// --- Queries (key condition + pagination) -------------------------------
+
+/// Query base-table items by partition key, with optional sort-key condition,
+/// cursor, ordering, and limit. Returns `(pk, sk, item_json)` rows.
+pub fn query_items(table_name: &str, pk: &str, params: &QueryParams) -> (String, Vec<SqlParam>) {
+    let mut sql = format!(
+        "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
+        escape_table_name(table_name)
+    );
+    let mut param_idx = 2;
+    let mut out = vec![SqlParam::text(pk)];
+
+    if let Some(cond) = params.sk_condition {
+        sql.push(' ');
+        sql.push_str(cond);
+        for &p in params.sk_params {
+            out.push(SqlParam::text(p));
+            param_idx += 1;
+        }
+    }
+
+    if let Some(start_sk) = params.exclusive_start_sk {
+        if params.forward {
+            sql.push_str(&format!(" AND sk > ?{param_idx}"));
+        } else {
+            sql.push_str(&format!(" AND sk < ?{param_idx}"));
+        }
+        out.push(SqlParam::text(start_sk));
+    }
+
+    sql.push_str(if params.forward {
+        " ORDER BY sk ASC"
+    } else {
+        " ORDER BY sk DESC"
+    });
+
+    if let Some(lim) = params.limit {
+        sql.push_str(&format!(" LIMIT {lim}"));
+    }
+
+    (sql, out)
+}
+
+/// Query a GSI by `gsi_pk`. The sort-key condition is rewritten from `sk` to
+/// `gsi_sk`, and pagination uses a composite `(gsi_sk, table_pk, table_sk)`
+/// cursor so hash-only GSIs paginate correctly.
+pub fn query_gsi_items(
+    table_name: &str,
+    index_name: &str,
+    gsi_pk: &str,
+    params: &QueryParams,
+) -> (String, Vec<SqlParam>) {
+    let gsi = format!("{table_name}::gsi::{index_name}");
+    let mut sql = format!(
+        "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\" WHERE gsi_pk = ?1",
+        escape_table_name(&gsi)
+    );
+    let mut param_idx = 2;
+    let mut out = vec![SqlParam::text(gsi_pk)];
+
+    if let Some(cond) = params.sk_condition {
+        // The key-condition builder emits ` sk ` / ` sk>` forms only, so this
+        // targeted rewrite is safe; threading the column name through would be
+        // a larger refactor.
+        let gsi_cond = cond.replace(" sk ", " gsi_sk ").replace(" sk>", " gsi_sk>");
+        sql.push(' ');
+        sql.push_str(&gsi_cond);
+        for &p in params.sk_params {
+            out.push(SqlParam::text(p));
+            param_idx += 1;
+        }
+    }
+
+    if let (Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
+        params.exclusive_start_sk,
+        params.exclusive_start_base_pk,
+        params.exclusive_start_base_sk,
+    ) {
+        let op = if params.forward { ">" } else { "<" };
+        sql.push_str(&format!(
+            " AND (gsi_sk, table_pk, table_sk) {op} (?{}, ?{}, ?{})",
+            param_idx,
+            param_idx + 1,
+            param_idx + 2
+        ));
+        out.push(SqlParam::text(start_sk));
+        out.push(SqlParam::text(start_base_pk));
+        out.push(SqlParam::text(start_base_sk));
+    } else if let Some(start_sk) = params.exclusive_start_sk {
+        if params.forward {
+            sql.push_str(&format!(" AND gsi_sk > ?{param_idx}"));
+        } else {
+            sql.push_str(&format!(" AND gsi_sk < ?{param_idx}"));
+        }
+        out.push(SqlParam::text(start_sk));
+    }
+
+    sql.push_str(if params.forward {
+        " ORDER BY gsi_sk ASC, table_pk ASC, table_sk ASC"
+    } else {
+        " ORDER BY gsi_sk DESC, table_pk DESC, table_sk DESC"
+    });
+
+    if let Some(lim) = params.limit {
+        sql.push_str(&format!(" LIMIT {lim}"));
+    }
+
+    (sql, out)
+}
+
+/// Query an LSI by base partition key, with a composite
+/// `(sk, base_pk, base_sk)` pagination cursor.
+pub fn query_lsi_items(
+    table_name: &str,
+    index_name: &str,
+    pk: &str,
+    params: &QueryParams,
+) -> (String, Vec<SqlParam>) {
+    let lsi = format!("{table_name}::lsi::{index_name}");
+    let mut sql = format!(
+        "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
+        escape_table_name(&lsi)
+    );
+    let mut param_idx = 2;
+    let mut out = vec![SqlParam::text(pk)];
+
+    if let Some(cond) = params.sk_condition {
+        sql.push(' ');
+        sql.push_str(cond);
+        for &p in params.sk_params {
+            out.push(SqlParam::text(p));
+            param_idx += 1;
+        }
+    }
+
+    if let (Some(start_sk), Some(start_base_pk), Some(start_base_sk)) = (
+        params.exclusive_start_sk,
+        params.exclusive_start_base_pk,
+        params.exclusive_start_base_sk,
+    ) {
+        let op = if params.forward { ">" } else { "<" };
+        sql.push_str(&format!(
+            " AND (sk, base_pk, base_sk) {op} (?{}, ?{}, ?{})",
+            param_idx,
+            param_idx + 1,
+            param_idx + 2
+        ));
+        out.push(SqlParam::text(start_sk));
+        out.push(SqlParam::text(start_base_pk));
+        out.push(SqlParam::text(start_base_sk));
+    } else if let Some(start_sk) = params.exclusive_start_sk {
+        if params.forward {
+            sql.push_str(&format!(" AND sk > ?{param_idx}"));
+        } else {
+            sql.push_str(&format!(" AND sk < ?{param_idx}"));
+        }
+        out.push(SqlParam::text(start_sk));
+    }
+
+    sql.push_str(if params.forward {
+        " ORDER BY sk ASC, base_pk ASC, base_sk ASC"
+    } else {
+        " ORDER BY sk DESC, base_pk DESC, base_sk DESC"
+    });
+
+    if let Some(lim) = params.limit {
+        sql.push_str(&format!(" LIMIT {lim}"));
+    }
+
+    (sql, out)
 }
 
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]

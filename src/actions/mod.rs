@@ -233,9 +233,22 @@ pub struct LocalSecondaryIndexDescription {
     pub index_size_bytes: Option<i64>,
 }
 
-/// Generate a UUID v4 for TableId.
-fn generate_table_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+/// Deterministic fallback `TableId` for a table that has no persisted id.
+///
+/// The primary scheme persists a random v4 UUID assigned at create time (see
+/// `Storage::insert_table_metadata` and the v8 migration's backfill), matching
+/// AWS: stable across reads, and a new id for a dropped-and-recreated table.
+/// This fallback only applies to a row whose stored `table_id` is `None` — for
+/// example one written by an older binary into a newer database. It derives a
+/// stable UUID (v5) from the table name and creation timestamp so such a row
+/// still reports a consistent id across reads, rather than the per-call random
+/// value that #55 fixed.
+fn table_id_for(table_name: &str, created_at: i64) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("dynoxide:table:{table_name}:{created_at}").as_bytes(),
+    )
+    .to_string()
 }
 
 /// Helper: Build a TableDescription from stored metadata.
@@ -424,7 +437,11 @@ pub(crate) fn build_table_description(
 
     TableDescription {
         table_name: meta.table_name.clone(),
-        table_id: Some(generate_table_id()),
+        table_id: Some(
+            meta.table_id
+                .clone()
+                .unwrap_or_else(|| table_id_for(&meta.table_name, meta.created_at)),
+        ),
         table_arn: streams::table_arn(table_name),
         table_status: meta.table_status.clone(),
         key_schema,

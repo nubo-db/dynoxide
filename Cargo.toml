@@ -41,7 +41,7 @@ serde_json = "1"
 thiserror = "2"
 base64 = "0.22"
 bigdecimal = "0.4"
-uuid = { version = "1", features = ["v4", "v7"] }
+uuid = { version = "1", features = ["v4", "v5", "v7"] }
 md5 = "0.7"
 # Drives the always-ready native handler futures to completion for the
 # synchronous `Database` facade. A minimal block_on that never spawns threads,

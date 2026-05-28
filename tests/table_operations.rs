@@ -262,6 +262,76 @@ fn test_describe_existing_table() {
     assert_eq!(resp.table.item_count, Some(0));
 }
 
+/// #55: TableId is assigned once and stays stable, rather than changing on
+/// every call. CreateTable and repeated DescribeTable calls all return the
+/// same TableId.
+#[test]
+fn test_table_id_is_stable_across_calls() {
+    let db = make_db();
+    let created = db.create_table(simple_create_request("StableId")).unwrap();
+    let create_id = created.table_description.table_id.clone();
+    assert!(create_id.is_some(), "CreateTable should return a TableId");
+
+    let d1 = db
+        .describe_table(DescribeTableRequest {
+            table_name: "StableId".to_string(),
+        })
+        .unwrap();
+    let d2 = db
+        .describe_table(DescribeTableRequest {
+            table_name: "StableId".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        d1.table.table_id, create_id,
+        "DescribeTable TableId must match the CreateTable TableId"
+    );
+    assert_eq!(
+        d2.table.table_id, d1.table.table_id,
+        "TableId must be stable across repeated DescribeTable calls"
+    );
+}
+
+/// #55: a dropped-and-recreated table gets a new TableId, matching AWS, even
+/// when the recreate happens immediately. The id is random per incarnation, not
+/// derived from table state, so a same-second recreate still changes it.
+#[test]
+fn test_table_id_changes_after_recreate() {
+    let db = make_db();
+
+    db.create_table(simple_create_request("RecreateId"))
+        .unwrap();
+    let first = db
+        .describe_table(DescribeTableRequest {
+            table_name: "RecreateId".to_string(),
+        })
+        .unwrap()
+        .table
+        .table_id;
+
+    db.delete_table(DeleteTableRequest {
+        table_name: "RecreateId".to_string(),
+    })
+    .unwrap();
+
+    db.create_table(simple_create_request("RecreateId"))
+        .unwrap();
+    let second = db
+        .describe_table(DescribeTableRequest {
+            table_name: "RecreateId".to_string(),
+        })
+        .unwrap()
+        .table
+        .table_id;
+
+    assert!(first.is_some() && second.is_some());
+    assert_ne!(
+        first, second,
+        "a recreated table must be assigned a new TableId"
+    );
+}
+
 #[test]
 fn test_describe_nonexistent_table() {
     let db = make_db();

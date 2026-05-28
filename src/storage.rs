@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Current schema version. Stored in the `_config` table for future migrations.
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -386,7 +386,8 @@ impl Storage {
                 sse_specification TEXT,
                 table_class TEXT,
                 deletion_protection_enabled INTEGER DEFAULT 0,
-                on_demand_throughput TEXT
+                on_demand_throughput TEXT,
+                table_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS _stream_records (
@@ -443,6 +444,9 @@ impl Storage {
         }
         if version < 7 {
             self.migrate_v6_to_v7()?;
+        }
+        if version < 8 {
+            self.migrate_v7_to_v8()?;
         }
 
         Ok(())
@@ -594,6 +598,44 @@ impl Storage {
         Ok(())
     }
 
+    /// Migrate from schema v7 to v8: add a `table_id TEXT` column to `_tables`
+    /// and backfill existing tables with a one-time random UUID.
+    ///
+    /// TableId must stay stable between reads of the same table (#55). New
+    /// tables get their id at insert time; tables created before this column
+    /// existed are assigned a persisted id here, once. The backfill `SELECT`
+    /// references `table_id`, so if the `ALTER` did not actually add the column
+    /// (a genuine failure, swallowed below for the duplicate-column re-run case)
+    /// this step errors out before the version is stamped, rather than stamping
+    /// a half-applied migration.
+    fn migrate_v7_to_v8(&self) -> Result<()> {
+        let _ = self
+            .conn
+            .execute("ALTER TABLE _tables ADD COLUMN table_id TEXT", []);
+
+        let names: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT table_name FROM _tables WHERE table_id IS NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        for name in names {
+            let id = uuid::Uuid::new_v4().to_string();
+            self.conn.execute(
+                "UPDATE _tables SET table_id = ?1 WHERE table_name = ?2",
+                params![id, name],
+            )?;
+        }
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '8')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     /// Get a reference to the underlying connection (for transactions, etc.).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -611,11 +653,18 @@ impl Storage {
     /// Insert a row into the `_tables` metadata table.
     pub fn insert_table_metadata(&self, m: &CreateTableMetadata) -> Result<()> {
         let table_name = m.table_name;
+        // TableId is assigned once, at create time, and never changes for this
+        // incarnation of the table. AWS uses a random v4 UUID; a recreated table
+        // gets a fresh one. Generating it here (not deriving it from table state)
+        // means a drop + recreate yields a different id even within the same
+        // second, matching AWS, and the value is persisted so it stays stable
+        // across reads. See #55.
+        let table_id = uuid::Uuid::new_v4().to_string();
         self.conn.execute(
             "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
              lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
-             deletion_protection_enabled, billing_mode, on_demand_throughput)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             deletion_protection_enabled, billing_mode, on_demand_throughput, table_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 m.table_name,
                 m.key_schema,
@@ -629,6 +678,7 @@ impl Storage {
                 m.deletion_protection_enabled as i32,
                 m.billing_mode,
                 m.on_demand_throughput,
+                table_id,
             ],
         )?;
         self.metadata_cache.borrow_mut().remove(table_name);
@@ -2160,6 +2210,9 @@ pub struct TableMetadata {
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
     pub on_demand_throughput: Option<String>,
+    /// Stable per-table identifier assigned at create time (#55). `None` only
+    /// for rows that predate the v8 migration's backfill.
+    pub table_id: Option<String>,
 }
 
 /// The standard SELECT column list for _tables queries.
@@ -2172,7 +2225,7 @@ pub struct TableMetadata {
 const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \
-     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput";
+     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id";
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
 fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
@@ -2195,6 +2248,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
         table_class: row.get(15)?,
         deletion_protection_enabled: row.get::<_, i32>(16).unwrap_or(0) != 0,
         on_demand_throughput: row.get(17)?,
+        table_id: row.get(18)?,
     })
 }
 
@@ -2273,7 +2327,8 @@ mod tests {
             .unwrap();
         }
 
-        // Reopening runs the migration chain; v6 -> v7 adds the column.
+        // Reopening runs the migration chain; v6 -> v7 adds the column, and the
+        // chain continues to the current SCHEMA_VERSION.
         let storage = Storage::new(&path).unwrap();
         let version: String = storage
             .conn()
@@ -2283,7 +2338,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, SCHEMA_VERSION);
 
         // The pre-existing row survives and reads back through row_to_metadata,
         // with the new column present and NULL.
@@ -2301,6 +2356,84 @@ mod tests {
             )
             .unwrap();
         assert!(col.is_none());
+    }
+
+    /// #55: the v7 -> v8 migration adds the `table_id` column and backfills any
+    /// pre-existing table with a one-time random id, so a legacy table reports a
+    /// stable TableId from then on.
+    #[test]
+    fn test_migrate_v7_to_v8_backfills_table_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build a v7-shape database by hand: _tables with on_demand_throughput
+        // but no table_id, schema_version pinned at 7, one pre-existing row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE _tables (
+                    table_name TEXT PRIMARY KEY,
+                    key_schema TEXT NOT NULL,
+                    attribute_definitions TEXT NOT NULL,
+                    gsi_definitions TEXT,
+                    lsi_definitions TEXT,
+                    stream_enabled INTEGER DEFAULT 0,
+                    stream_view_type TEXT,
+                    stream_label TEXT,
+                    ttl_attribute TEXT,
+                    ttl_enabled INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                    provisioned_throughput TEXT,
+                    tags TEXT,
+                    sse_specification TEXT,
+                    table_class TEXT,
+                    deletion_protection_enabled INTEGER DEFAULT 0,
+                    on_demand_throughput TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _config (key, value) VALUES ('schema_version', '7')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, created_at) \
+                 VALUES ('LegacyTable', ?1, ?2, 0)",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration chain through v8.
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The legacy row was backfilled with a non-empty table_id, and it reads
+        // back through row_to_metadata.
+        let meta = storage.get_table_metadata("LegacyTable").unwrap().unwrap();
+        let id = meta.table_id.expect("legacy table should be backfilled");
+        assert!(!id.is_empty());
+
+        // Reopening again keeps the same id (stable, not regenerated).
+        drop(storage);
+        let storage2 = Storage::new(&path).unwrap();
+        let meta2 = storage2.get_table_metadata("LegacyTable").unwrap().unwrap();
+        assert_eq!(meta2.table_id.as_deref(), Some(id.as_str()));
     }
 
     #[test]

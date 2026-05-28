@@ -160,17 +160,22 @@ pub async fn execute<S: StorageBackend>(
         request.return_consumed_capacity.as_deref(),
         Some("TOTAL") | Some("INDEXES")
     ) {
-        let mut table_sizes: HashMap<String, usize> = HashMap::new();
+        // AWS charges 2 WCU per item for a transactional write: round each item
+        // up to whole write units first, then apply the 2x factor, then sum per
+        // table. Aggregating sizes before rounding would undercharge items that
+        // straddle a 1KB boundary.
+        let mut table_units: HashMap<String, f64> = HashMap::new();
         for item in items {
             let (table, size) = get_action_table_and_size(item);
-            *table_sizes.entry(table).or_default() += size;
+            *table_units.entry(table).or_default() += crate::types::TRANSACTIONAL_CAPACITY_FACTOR
+                * crate::types::write_capacity_units(size);
         }
-        let caps: Vec<_> = table_sizes
+        let caps: Vec<_> = table_units
             .iter()
-            .filter_map(|(table, &size)| {
-                crate::types::consumed_capacity(
+            .filter_map(|(table, &units)| {
+                crate::types::transactional_write_capacity(
                     table,
-                    crate::types::write_capacity_units(size),
+                    units,
                     &request.return_consumed_capacity,
                 )
             })

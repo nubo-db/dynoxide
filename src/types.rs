@@ -739,7 +739,17 @@ pub struct ConsumedCapacity {
 pub struct CapacityDetail {
     #[serde(rename = "CapacityUnits")]
     pub capacity_units: f64,
+    #[serde(rename = "ReadCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub read_capacity_units: Option<f64>,
+    #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub write_capacity_units: Option<f64>,
 }
+
+/// The transactional capacity multiplier. `TransactWriteItems` and
+/// `TransactGetItems` cost twice the equivalent single-item operation, so each
+/// item's rounded-up units are doubled (the rounding happens per item, before
+/// the multiplier, to match AWS at the KB/4KB boundary).
+pub const TRANSACTIONAL_CAPACITY_FACTOR: f64 = 2.0;
 
 /// Calculate write capacity units (1 WCU = 1KB, rounded up).
 pub fn write_capacity_units(item_size_bytes: usize) -> f64 {
@@ -780,7 +790,10 @@ pub fn consumed_capacity(
         "INDEXES" => Some(ConsumedCapacity {
             table_name: table_name.to_string(),
             capacity_units,
-            table: Some(CapacityDetail { capacity_units }),
+            table: Some(CapacityDetail {
+                capacity_units,
+                ..Default::default()
+            }),
             global_secondary_indexes: None,
             local_secondary_indexes: None,
         }),
@@ -819,7 +832,15 @@ pub fn consumed_capacity_with_secondary_indexes(
             Some(
                 units
                     .iter()
-                    .map(|(name, &u)| (name.clone(), CapacityDetail { capacity_units: u }))
+                    .map(|(name, &u)| {
+                        (
+                            name.clone(),
+                            CapacityDetail {
+                                capacity_units: u,
+                                ..Default::default()
+                            },
+                        )
+                    })
                     .collect(),
             )
         }
@@ -834,6 +855,7 @@ pub fn consumed_capacity_with_secondary_indexes(
                 capacity_units: table_units + gsi_total + lsi_total,
                 table: Some(CapacityDetail {
                     capacity_units: table_units,
+                    ..Default::default()
                 }),
                 global_secondary_indexes: units_to_map(gsi_units),
                 local_secondary_indexes: units_to_map(lsi_units),
@@ -850,6 +872,64 @@ pub fn consumed_capacity_with_secondary_indexes(
                 local_secondary_indexes: None,
             })
         }
+        _ => None,
+    }
+}
+
+/// Build a `ConsumedCapacity` for one table in a transactional read
+/// (`TransactGetItems`). `units` is the table total and already includes the
+/// transactional 2x factor. Under `INDEXES` the Table detail reports
+/// `ReadCapacityUnits` alongside `CapacityUnits`, matching AWS.
+pub fn transactional_read_capacity(
+    table_name: &str,
+    units: f64,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    match mode.as_deref().unwrap_or("NONE") {
+        "TOTAL" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: units,
+            ..Default::default()
+        }),
+        "INDEXES" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: units,
+            table: Some(CapacityDetail {
+                capacity_units: units,
+                read_capacity_units: Some(units),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
+/// Build a `ConsumedCapacity` for one table in a transactional write
+/// (`TransactWriteItems`). `units` is the table total and already includes the
+/// transactional 2x factor. Under `INDEXES` the Table detail reports
+/// `WriteCapacityUnits` alongside `CapacityUnits`, matching AWS.
+pub fn transactional_write_capacity(
+    table_name: &str,
+    units: f64,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    match mode.as_deref().unwrap_or("NONE") {
+        "TOTAL" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: units,
+            ..Default::default()
+        }),
+        "INDEXES" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: units,
+            table: Some(CapacityDetail {
+                capacity_units: units,
+                write_capacity_units: Some(units),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         _ => None,
     }
 }

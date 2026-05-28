@@ -50,6 +50,19 @@ fn setup_put_item() -> (Database, PutItemRequest) {
 }
 
 #[cfg(feature = "iai-callgrind")]
+fn setup_put_item_large() -> (Database, PutItemRequest) {
+    let db = Database::memory().unwrap();
+    db.create_table(create_table_request(BENCH_TABLE)).unwrap();
+    let item = generate_item(0, ItemSize::Large);
+    let request = PutItemRequest {
+        table_name: BENCH_TABLE.to_string(),
+        item,
+        ..Default::default()
+    };
+    (db, request)
+}
+
+#[cfg(feature = "iai-callgrind")]
 fn setup_get_item() -> (Database, GetItemRequest) {
     let db = setup_database(1000, ItemSize::Medium);
     let item = generate_item(500, ItemSize::Medium);
@@ -137,6 +150,7 @@ fn setup_delete_item() -> (Database, DeleteItemRequest) {
 #[cfg(feature = "iai-callgrind")]
 #[library_benchmark]
 #[bench::medium(setup_put_item())]
+#[bench::large(setup_put_item_large())]
 fn bench_put_item((db, request): (Database, PutItemRequest)) {
     black_box(db.put_item(request).unwrap());
 }

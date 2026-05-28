@@ -14,36 +14,41 @@
 //! `?N` placeholders.
 
 use crate::storage::{CreateTableMetadata, HASH_BUCKETS, QueryParams, ScanParams, ceiling_div};
+use std::borrow::Cow;
 
 /// One bound SQL parameter, covering the SQLite value universe and nothing
 /// more.
 ///
-/// Owned rather than borrowed so builder signatures stay lifetime-free; the
-/// per-call allocation is negligible against the statement execution itself.
+/// Text and blob values are held as [`Cow`], so the common case (binding a
+/// `&str` that already lives in the caller, like an item's JSON) borrows with
+/// no allocation, while builders that compute an owned value (a formatted hash
+/// bucket, say) still store it inline. The native backend binds straight
+/// through [`rusqlite::ToSql`]; the wasm backend copies into a JS value, which
+/// it must do regardless.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SqlParam {
+pub enum SqlParam<'a> {
     /// A UTF-8 text value, bound as SQLite `TEXT`.
-    Text(String),
+    Text(Cow<'a, str>),
     /// A 64-bit signed integer, bound as SQLite `INTEGER`.
     Integer(i64),
     /// A double, bound as SQLite `REAL`.
     Real(f64),
     /// A byte string, bound as SQLite `BLOB`.
-    Blob(Vec<u8>),
+    Blob(Cow<'a, [u8]>),
     /// SQL `NULL`.
     Null,
 }
 
-impl SqlParam {
-    /// Owned text parameter.
-    pub fn text(s: impl Into<String>) -> Self {
+impl<'a> SqlParam<'a> {
+    /// Text parameter. A `&str` borrows; an owned `String` is taken as-is.
+    pub fn text(s: impl Into<Cow<'a, str>>) -> Self {
         SqlParam::Text(s.into())
     }
 
-    /// `TEXT` when `Some`, SQL `NULL` when `None`.
-    pub fn opt_text(s: Option<&str>) -> Self {
+    /// `TEXT` (borrowed) when `Some`, SQL `NULL` when `None`.
+    pub fn opt_text(s: Option<&'a str>) -> Self {
         match s {
-            Some(v) => SqlParam::Text(v.to_string()),
+            Some(v) => SqlParam::Text(Cow::Borrowed(v)),
             None => SqlParam::Null,
         }
     }
@@ -60,7 +65,7 @@ impl SqlParam {
 /// Bind `SqlParam` directly to a rusqlite statement, so the native backend can
 /// pass `rusqlite::params_from_iter(params.iter())` for any builder.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-impl rusqlite::ToSql for SqlParam {
+impl rusqlite::ToSql for SqlParam<'_> {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         use rusqlite::types::{ToSqlOutput, Value, ValueRef};
         Ok(match self {
@@ -142,7 +147,7 @@ pub const ROLLBACK: &str = "ROLLBACK";
 // --- Table metadata (`_tables`) -----------------------------------------
 
 /// Insert a metadata row into `_tables`.
-pub fn insert_table_metadata(m: &CreateTableMetadata) -> (String, Vec<SqlParam>) {
+pub fn insert_table_metadata<'a>(m: &CreateTableMetadata<'a>) -> (String, Vec<SqlParam<'a>>) {
     let sql = "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
          lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
          deletion_protection_enabled, billing_mode) \
@@ -165,7 +170,7 @@ pub fn insert_table_metadata(m: &CreateTableMetadata) -> (String, Vec<SqlParam>)
 }
 
 /// Select all metadata columns for one table.
-pub fn get_table_metadata(table_name: &str) -> (String, Vec<SqlParam>) {
+pub fn get_table_metadata(table_name: &str) -> (String, Vec<SqlParam<'_>>) {
     (
         format!("SELECT {TABLE_METADATA_COLUMNS} FROM _tables WHERE table_name = ?1"),
         vec![SqlParam::text(table_name)],
@@ -173,7 +178,7 @@ pub fn get_table_metadata(table_name: &str) -> (String, Vec<SqlParam>) {
 }
 
 /// Delete a table's metadata row.
-pub fn delete_table_metadata(table_name: &str) -> (String, Vec<SqlParam>) {
+pub fn delete_table_metadata(table_name: &str) -> (String, Vec<SqlParam<'_>>) {
     (
         "DELETE FROM _tables WHERE table_name = ?1".to_string(),
         vec![SqlParam::text(table_name)],
@@ -181,7 +186,7 @@ pub fn delete_table_metadata(table_name: &str) -> (String, Vec<SqlParam>) {
 }
 
 /// List every table name, ordered.
-pub fn list_table_names() -> (String, Vec<SqlParam>) {
+pub fn list_table_names() -> (String, Vec<SqlParam<'static>>) {
     (
         "SELECT table_name FROM _tables ORDER BY table_name".to_string(),
         Vec::new(),
@@ -189,7 +194,7 @@ pub fn list_table_names() -> (String, Vec<SqlParam>) {
 }
 
 /// Count the metadata rows matching a table name (existence check).
-pub fn table_exists(table_name: &str) -> (String, Vec<SqlParam>) {
+pub fn table_exists(table_name: &str) -> (String, Vec<SqlParam<'_>>) {
     (
         "SELECT COUNT(*) FROM _tables WHERE table_name = ?1".to_string(),
         vec![SqlParam::text(table_name)],
@@ -199,7 +204,7 @@ pub fn table_exists(table_name: &str) -> (String, Vec<SqlParam>) {
 // --- Data tables ---------------------------------------------------------
 
 /// Create the per-table data table.
-pub fn create_data_table(table_name: &str) -> (String, Vec<SqlParam>) {
+pub fn create_data_table(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let sql = format!(
         "CREATE TABLE \"{}\" (
                 pk TEXT NOT NULL,
@@ -216,7 +221,7 @@ pub fn create_data_table(table_name: &str) -> (String, Vec<SqlParam>) {
 }
 
 /// Drop the per-table data table if it exists.
-pub fn drop_data_table(table_name: &str) -> (String, Vec<SqlParam>) {
+pub fn drop_data_table(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
     (
         format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(table_name)),
         Vec::new(),
@@ -226,14 +231,14 @@ pub fn drop_data_table(table_name: &str) -> (String, Vec<SqlParam>) {
 // --- Item CRUD -----------------------------------------------------------
 
 /// Insert-or-replace one item, preserving any existing `cached_at`.
-pub fn put_item_with_hash(
+pub fn put_item_with_hash<'a>(
     table_name: &str,
-    pk: &str,
-    sk: &str,
-    item_json: &str,
+    pk: &'a str,
+    sk: &'a str,
+    item_json: &'a str,
     item_size: usize,
-    hash_prefix: &str,
-) -> (String, Vec<SqlParam>) {
+    hash_prefix: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
     let escaped = escape_table_name(table_name);
     let sql = format!(
         "INSERT OR REPLACE INTO \"{escaped}\" (pk, sk, item_json, item_size, cached_at, hash_prefix) \
@@ -251,7 +256,7 @@ pub fn put_item_with_hash(
 }
 
 /// Select one item's JSON by primary key.
-pub fn get_item(table_name: &str, pk: &str, sk: &str) -> (String, Vec<SqlParam>) {
+pub fn get_item<'a>(table_name: &str, pk: &'a str, sk: &'a str) -> (String, Vec<SqlParam<'a>>) {
     (
         format!(
             "SELECT item_json FROM \"{}\" WHERE pk = ?1 AND sk = ?2",
@@ -262,7 +267,7 @@ pub fn get_item(table_name: &str, pk: &str, sk: &str) -> (String, Vec<SqlParam>)
 }
 
 /// Delete one item by primary key.
-pub fn delete_item(table_name: &str, pk: &str, sk: &str) -> (String, Vec<SqlParam>) {
+pub fn delete_item<'a>(table_name: &str, pk: &'a str, sk: &'a str) -> (String, Vec<SqlParam<'a>>) {
     (
         format!(
             "DELETE FROM \"{}\" WHERE pk = ?1 AND sk = ?2",
@@ -273,7 +278,7 @@ pub fn delete_item(table_name: &str, pk: &str, sk: &str) -> (String, Vec<SqlPara
 }
 
 /// Sum `item_size` across one partition key.
-pub fn get_partition_size(table_name: &str, pk: &str) -> (String, Vec<SqlParam>) {
+pub fn get_partition_size<'a>(table_name: &str, pk: &'a str) -> (String, Vec<SqlParam<'a>>) {
     (
         format!(
             "SELECT COALESCE(SUM(item_size), 0) FROM \"{}\" WHERE pk = ?1",
@@ -284,7 +289,7 @@ pub fn get_partition_size(table_name: &str, pk: &str) -> (String, Vec<SqlParam>)
 }
 
 /// Count all items in a data table.
-pub fn count_items(table_name: &str) -> (String, Vec<SqlParam>) {
+pub fn count_items(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
     (
         format!("SELECT COUNT(*) FROM \"{}\"", escape_table_name(table_name)),
         Vec::new(),
@@ -294,7 +299,7 @@ pub fn count_items(table_name: &str) -> (String, Vec<SqlParam>) {
 // --- Secondary index tables (GSI/LSI) -----------------------------------
 
 /// Create a GSI table plus its base-key index (a two-statement batch).
-pub fn create_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+pub fn create_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let gsi = format!("{table_name}::gsi::{index_name}");
     let escaped = escape_table_name(&gsi);
     let idx = escape_table_name(&format!("{gsi}::base_key"));
@@ -313,7 +318,7 @@ pub fn create_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlP
 }
 
 /// Drop a GSI table if it exists.
-pub fn drop_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+pub fn drop_gsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let gsi = format!("{table_name}::gsi::{index_name}");
     (
         format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&gsi)),
@@ -331,13 +336,13 @@ pub fn gsi_insert_sql(table_name: &str, index_name: &str) -> String {
 }
 
 /// Bound parameters for one GSI row, matching [`gsi_insert_sql`].
-pub fn gsi_insert_params(
-    gsi_pk: &str,
-    gsi_sk: &str,
-    table_pk: &str,
-    table_sk: &str,
-    item_json: &str,
-) -> Vec<SqlParam> {
+pub fn gsi_insert_params<'a>(
+    gsi_pk: &'a str,
+    gsi_sk: &'a str,
+    table_pk: &'a str,
+    table_sk: &'a str,
+    item_json: &'a str,
+) -> Vec<SqlParam<'a>> {
     vec![
         SqlParam::text(gsi_pk),
         SqlParam::text(gsi_sk),
@@ -348,12 +353,12 @@ pub fn gsi_insert_params(
 }
 
 /// Delete a GSI row by base-table primary key.
-pub fn delete_gsi_item(
+pub fn delete_gsi_item<'a>(
     table_name: &str,
     index_name: &str,
-    table_pk: &str,
-    table_sk: &str,
-) -> (String, Vec<SqlParam>) {
+    table_pk: &'a str,
+    table_sk: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
     let gsi = format!("{table_name}::gsi::{index_name}");
     (
         format!(
@@ -365,7 +370,7 @@ pub fn delete_gsi_item(
 }
 
 /// Create an LSI table plus its base-key index (a two-statement batch).
-pub fn create_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+pub fn create_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let lsi = format!("{table_name}::lsi::{index_name}");
     let escaped = escape_table_name(&lsi);
     let idx = escape_table_name(&format!("{lsi}::base_key"));
@@ -384,7 +389,7 @@ pub fn create_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlP
 }
 
 /// Drop an LSI table if it exists.
-pub fn drop_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam>) {
+pub fn drop_lsi_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let lsi = format!("{table_name}::lsi::{index_name}");
     (
         format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&lsi)),
@@ -402,13 +407,13 @@ pub fn lsi_insert_sql(table_name: &str, index_name: &str) -> String {
 }
 
 /// Bound parameters for one LSI row, matching [`lsi_insert_sql`].
-pub fn lsi_insert_params(
-    pk: &str,
-    sk: &str,
-    base_pk: &str,
-    base_sk: &str,
-    item_json: &str,
-) -> Vec<SqlParam> {
+pub fn lsi_insert_params<'a>(
+    pk: &'a str,
+    sk: &'a str,
+    base_pk: &'a str,
+    base_sk: &'a str,
+    item_json: &'a str,
+) -> Vec<SqlParam<'a>> {
     vec![
         SqlParam::text(pk),
         SqlParam::text(sk),
@@ -419,12 +424,12 @@ pub fn lsi_insert_params(
 }
 
 /// Delete an LSI row by base-table primary key.
-pub fn delete_lsi_item(
+pub fn delete_lsi_item<'a>(
     table_name: &str,
     index_name: &str,
-    base_pk: &str,
-    base_sk: &str,
-) -> (String, Vec<SqlParam>) {
+    base_pk: &'a str,
+    base_sk: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
     let lsi = format!("{table_name}::lsi::{index_name}");
     (
         format!(
@@ -436,11 +441,11 @@ pub fn delete_lsi_item(
 }
 
 /// Sum the JSON length of LSI rows for one partition key.
-pub fn get_lsi_partition_size(
+pub fn get_lsi_partition_size<'a>(
     table_name: &str,
     index_name: &str,
-    pk: &str,
-) -> (String, Vec<SqlParam>) {
+    pk: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
     let lsi = format!("{table_name}::lsi::{index_name}");
     (
         format!(
@@ -455,7 +460,11 @@ pub fn get_lsi_partition_size(
 
 /// Query base-table items by partition key, with optional sort-key condition,
 /// cursor, ordering, and limit. Returns `(pk, sk, item_json)` rows.
-pub fn query_items(table_name: &str, pk: &str, params: &QueryParams) -> (String, Vec<SqlParam>) {
+pub fn query_items<'a>(
+    table_name: &str,
+    pk: &'a str,
+    params: &QueryParams<'a>,
+) -> (String, Vec<SqlParam<'a>>) {
     let mut sql = format!(
         "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
         escape_table_name(table_name)
@@ -497,12 +506,12 @@ pub fn query_items(table_name: &str, pk: &str, params: &QueryParams) -> (String,
 /// Query a GSI by `gsi_pk`. The sort-key condition is rewritten from `sk` to
 /// `gsi_sk`, and pagination uses a composite `(gsi_sk, table_pk, table_sk)`
 /// cursor so hash-only GSIs paginate correctly.
-pub fn query_gsi_items(
+pub fn query_gsi_items<'a>(
     table_name: &str,
     index_name: &str,
-    gsi_pk: &str,
-    params: &QueryParams,
-) -> (String, Vec<SqlParam>) {
+    gsi_pk: &'a str,
+    params: &QueryParams<'a>,
+) -> (String, Vec<SqlParam<'a>>) {
     let gsi = format!("{table_name}::gsi::{index_name}");
     let mut sql = format!(
         "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\" WHERE gsi_pk = ?1",
@@ -563,12 +572,12 @@ pub fn query_gsi_items(
 
 /// Query an LSI by base partition key, with a composite
 /// `(sk, base_pk, base_sk)` pagination cursor.
-pub fn query_lsi_items(
+pub fn query_lsi_items<'a>(
     table_name: &str,
     index_name: &str,
-    pk: &str,
-    params: &QueryParams,
-) -> (String, Vec<SqlParam>) {
+    pk: &'a str,
+    params: &QueryParams<'a>,
+) -> (String, Vec<SqlParam<'a>>) {
     let lsi = format!("{table_name}::lsi::{index_name}");
     let mut sql = format!(
         "SELECT pk, sk, item_json FROM \"{}\" WHERE pk = ?1",
@@ -628,10 +637,10 @@ pub fn query_lsi_items(
 /// Scan base-table items. Parallel scans (segment + total) filter and order by
 /// the stored `hash_prefix` column for dynalite-compatible behaviour; plain
 /// scans order by `(pk, sk)`.
-pub fn scan_items(table_name: &str, params: &ScanParams) -> (String, Vec<SqlParam>) {
+pub fn scan_items<'a>(table_name: &str, params: &ScanParams<'a>) -> (String, Vec<SqlParam<'a>>) {
     let escaped = escape_table_name(table_name);
     let mut sql = format!("SELECT pk, sk, item_json FROM \"{escaped}\"");
-    let mut out: Vec<SqlParam> = Vec::new();
+    let mut out: Vec<SqlParam<'a>> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
     let mut param_idx = 1;
 
@@ -664,8 +673,8 @@ pub fn scan_items(table_name: &str, params: &ScanParams) -> (String, Vec<SqlPara
             param_idx,
             param_idx + 1
         ));
-        out.push(SqlParam::Text(format!("{start_bucket:03x}")));
-        out.push(SqlParam::Text(format!("{end_bucket:03x}")));
+        out.push(SqlParam::text(format!("{start_bucket:03x}")));
+        out.push(SqlParam::text(format!("{end_bucket:03x}")));
     }
 
     if !where_clauses.is_empty() {
@@ -688,17 +697,17 @@ pub fn scan_items(table_name: &str, params: &ScanParams) -> (String, Vec<SqlPara
 
 /// Scan a GSI. Parallel scans hash the base-table key in SQL via
 /// `fnv1a_hash(table_pk)` (GSI tables carry no stored hash_prefix).
-pub fn scan_gsi_items(
+pub fn scan_gsi_items<'a>(
     table_name: &str,
     index_name: &str,
-    params: &ScanParams,
-) -> (String, Vec<SqlParam>) {
+    params: &ScanParams<'a>,
+) -> (String, Vec<SqlParam<'a>>) {
     let gsi = format!("{table_name}::gsi::{index_name}");
     let mut sql = format!(
         "SELECT gsi_pk, gsi_sk, item_json FROM \"{}\"",
         escape_table_name(&gsi)
     );
-    let mut out: Vec<SqlParam> = Vec::new();
+    let mut out: Vec<SqlParam<'a>> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
     let mut param_idx = 1;
 
@@ -759,17 +768,17 @@ pub fn scan_gsi_items(
 
 /// Scan an LSI. Parallel scans hash the base-table key in SQL via
 /// `fnv1a_hash(base_pk)`.
-pub fn scan_lsi_items(
+pub fn scan_lsi_items<'a>(
     table_name: &str,
     index_name: &str,
-    params: &ScanParams,
-) -> (String, Vec<SqlParam>) {
+    params: &ScanParams<'a>,
+) -> (String, Vec<SqlParam<'a>>) {
     let lsi = format!("{table_name}::lsi::{index_name}");
     let mut sql = format!(
         "SELECT pk, sk, item_json FROM \"{}\"",
         escape_table_name(&lsi)
     );
-    let mut out: Vec<SqlParam> = Vec::new();
+    let mut out: Vec<SqlParam<'a>> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
     let mut param_idx = 1;
 
@@ -898,7 +907,7 @@ mod tests {
             SqlParam::text("hello"),
             SqlParam::Integer(-9),
             SqlParam::Real(1.5),
-            SqlParam::Blob(vec![1, 2, 3]),
+            SqlParam::Blob(vec![1, 2, 3].into()),
             SqlParam::Null,
         ];
         conn.execute(

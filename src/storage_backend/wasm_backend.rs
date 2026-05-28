@@ -3,8 +3,10 @@
 //! `WasmBridgeBackend` runs the same SQL the native backend issues - both
 //! consume the shared builders in [`sql_builders`] - but executes it against a
 //! JS wa-sqlite database through the bridge in `js/wa-sqlite-bridge.js`. The
-//! bridge persists to OPFS via a main-thread async VFS, so no Web Worker is
-//! required for this preview.
+//! bridge runs inside a Web Worker and persists to OPFS via wa-sqlite's
+//! synchronous access-handle VFS, which browsers expose only in a Worker. The
+//! page drives the engine over a message RPC; no cross-origin isolation
+//! (COOP/COEP) is required.
 //!
 //! # Async, never blocking
 //!
@@ -86,7 +88,7 @@ impl WasmBridgeBackend {
     }
 
     /// Run a statement that returns no rows.
-    async fn exec(&self, sql: &str, params: Vec<SqlParam>) -> Result<(), BackendError> {
+    async fn exec(&self, sql: &str, params: Vec<SqlParam<'_>>) -> Result<(), BackendError> {
         wa_exec(&self.handle, sql, params_to_js(&params))
             .await
             .map_err(js_err)?;
@@ -94,7 +96,7 @@ impl WasmBridgeBackend {
     }
 
     /// Run a query, returning rows as a JS array of column arrays.
-    async fn query(&self, sql: &str, params: Vec<SqlParam>) -> Result<js_sys::Array, BackendError> {
+    async fn query(&self, sql: &str, params: Vec<SqlParam<'_>>) -> Result<js_sys::Array, BackendError> {
         let rows = wa_query(&self.handle, sql, params_to_js(&params))
             .await
             .map_err(js_err)?;
@@ -122,7 +124,7 @@ impl WasmBridgeBackend {
 // --- JS <-> SqlParam conversion and row readers -------------------------
 
 /// Convert bound parameters to a positional JS array (`?1` -> index 0).
-fn params_to_js(params: &[SqlParam]) -> js_sys::Array {
+fn params_to_js(params: &[SqlParam<'_>]) -> js_sys::Array {
     let arr = js_sys::Array::new();
     for p in params {
         arr.push(&sqlparam_to_js(p));
@@ -130,14 +132,14 @@ fn params_to_js(params: &[SqlParam]) -> js_sys::Array {
     arr
 }
 
-fn sqlparam_to_js(p: &SqlParam) -> JsValue {
+fn sqlparam_to_js(p: &SqlParam<'_>) -> JsValue {
     match p {
         SqlParam::Text(s) => JsValue::from_str(s),
         // JS numbers are f64. The integer parameters here (sizes, counts, epoch
         // seconds) stay well within 2^53, so this is lossless in practice.
         SqlParam::Integer(i) => JsValue::from_f64(*i as f64),
         SqlParam::Real(f) => JsValue::from_f64(*f),
-        SqlParam::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
+        SqlParam::Blob(b) => js_sys::Uint8Array::from(&**b).into(),
         SqlParam::Null => JsValue::NULL,
     }
 }

@@ -1091,3 +1091,177 @@ fn test_execute_statement_returns_consumed_capacity() {
         "CapacityUnits should be greater than zero: {cc:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// DELETE / UPDATE WHERE as a condition (#54)
+// -----------------------------------------------------------------------
+
+/// #54: a non-key WHERE predicate that is false on a present item makes DELETE
+/// raise ConditionalCheckFailedException and leaves the item intact.
+#[test]
+fn test_partiql_delete_condition_false_fails_and_keeps_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+    exec(
+        &db,
+        "INSERT INTO \"Cond\" VALUE {'pk': 'p1', 'kind': 'alpha'}",
+    );
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "DELETE FROM \"Cond\" WHERE pk = 'p1' AND kind = 'beta'".to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("conditional request failed"),
+        "expected ConditionalCheckFailed, got: {err}"
+    );
+
+    // The item must survive.
+    let sel = exec(&db, "SELECT * FROM \"Cond\" WHERE pk = 'p1'");
+    assert_eq!(sel.items.unwrap().len(), 1);
+}
+
+/// #54: a true non-key predicate lets DELETE through.
+#[test]
+fn test_partiql_delete_condition_true_deletes() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+    exec(
+        &db,
+        "INSERT INTO \"Cond\" VALUE {'pk': 'p1', 'kind': 'alpha'}",
+    );
+
+    exec(
+        &db,
+        "DELETE FROM \"Cond\" WHERE pk = 'p1' AND kind = 'alpha'",
+    );
+
+    let sel = exec(&db, "SELECT * FROM \"Cond\" WHERE pk = 'p1'");
+    assert!(sel.items.unwrap().is_empty());
+}
+
+/// #54: NOT begins_with as a false condition also blocks the delete.
+#[test]
+fn test_partiql_delete_not_begins_with_condition_false_fails() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+    exec(
+        &db,
+        "INSERT INTO \"Cond\" VALUE {'pk': 'p1', 'kind': 'alpha'}",
+    );
+
+    // kind='alpha' begins with 'al', so NOT begins_with(...) is false.
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "DELETE FROM \"Cond\" WHERE pk = 'p1' AND NOT begins_with(\"kind\", 'al')"
+                .to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("conditional request failed"),
+        "expected ConditionalCheckFailed, got: {err}"
+    );
+    assert_eq!(
+        exec(&db, "SELECT * FROM \"Cond\" WHERE pk = 'p1'")
+            .items
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// #54: a false non-key predicate makes UPDATE raise ConditionalCheckFailed and
+/// leaves the item unchanged.
+#[test]
+fn test_partiql_update_condition_false_fails_and_keeps_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+    exec(
+        &db,
+        "INSERT INTO \"Cond\" VALUE {'pk': 'p1', 'kind': 'alpha'}",
+    );
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "UPDATE \"Cond\" SET label = 'x' WHERE pk = 'p1' AND kind = 'beta'"
+                .to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("conditional request failed"),
+        "expected ConditionalCheckFailed, got: {err}"
+    );
+
+    // No label was written.
+    let item = &exec(&db, "SELECT * FROM \"Cond\" WHERE pk = 'p1'")
+        .items
+        .unwrap()[0];
+    assert!(!item.contains_key("label"));
+}
+
+/// #54: a true non-key predicate lets UPDATE through.
+#[test]
+fn test_partiql_update_condition_true_updates() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+    exec(
+        &db,
+        "INSERT INTO \"Cond\" VALUE {'pk': 'p1', 'kind': 'alpha'}",
+    );
+
+    exec(
+        &db,
+        "UPDATE \"Cond\" SET label = 'done' WHERE pk = 'p1' AND kind = 'alpha'",
+    );
+
+    let item = &exec(&db, "SELECT * FROM \"Cond\" WHERE pk = 'p1'")
+        .items
+        .unwrap()[0];
+    assert_eq!(item.get("label"), Some(&AttributeValue::S("done".into())));
+}
+
+/// #54: a DELETE whose key matches no item is a silent no-op, even with a
+/// non-key predicate present (a missing item is not a condition failure).
+#[test]
+fn test_partiql_delete_missing_key_is_noop_not_condition_failure() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+
+    // Must not error.
+    exec(
+        &db,
+        "DELETE FROM \"Cond\" WHERE pk = 'absent' AND kind = 'x'",
+    );
+}
+
+/// #54: a write WHERE without the full primary key is a ValidationException with
+/// the AWS message.
+#[test]
+fn test_partiql_delete_without_pk_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Cond");
+    exec(
+        &db,
+        "INSERT INTO \"Cond\" VALUE {'pk': 'p1', 'kind': 'alpha'}",
+    );
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "DELETE FROM \"Cond\" WHERE kind = 'alpha'".to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got: {err}"
+    );
+}

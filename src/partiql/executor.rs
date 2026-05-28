@@ -355,7 +355,8 @@ async fn execute_update<S: StorageBackend>(
     let pk_cond =
         find_comparison_in_groups(&wc.groups, &key_schema.partition_key).ok_or_else(|| {
             DynoxideError::ValidationException(
-                "UPDATE WHERE must include partition key equality".to_string(),
+                "Where clause does not contain a mandatory equality on all key attributes"
+                    .to_string(),
             )
         })?;
 
@@ -389,6 +390,17 @@ async fn execute_update<S: StorageBackend>(
         .unwrap_or_default();
 
     let old_item = item.clone();
+
+    // Non-key WHERE predicates act as a condition on the existing item, like a
+    // conditional write. When the item exists but the condition is false, AWS
+    // raises ConditionalCheckFailedException; a missing item is not a condition
+    // failure and falls through to the existing create/no-op behaviour below.
+    if existing_json.is_some() && !matches_where(&old_item, where_clause, parameters) {
+        return Err(DynoxideError::ConditionalCheckFailedException(
+            "The conditional request failed".to_string(),
+            None,
+        ));
+    }
 
     // Apply SET clauses with nested path support
     for clause in set_clauses {
@@ -492,7 +504,8 @@ async fn execute_delete<S: StorageBackend>(
     let pk_cond =
         find_comparison_in_groups(&wc.groups, &key_schema.partition_key).ok_or_else(|| {
             DynoxideError::ValidationException(
-                "DELETE WHERE must include partition key equality".to_string(),
+                "Where clause does not contain a mandatory equality on all key attributes"
+                    .to_string(),
             )
         })?;
 
@@ -526,6 +539,23 @@ async fn execute_delete<S: StorageBackend>(
     } else {
         String::new()
     };
+
+    // Non-key WHERE predicates act as a condition on the existing item, like a
+    // conditional write. AWS raises ConditionalCheckFailedException when the item
+    // is present but the condition is false, and a missing item is a silent
+    // no-op (the condition is never evaluated). Re-running the full WHERE via
+    // matches_where covers both the key equality (always true for the fetched
+    // item) and any extra predicates.
+    if let Some(json) = storage.get_item(table_name, &pk_str, &sk_str).await? {
+        let existing: Item = serde_json::from_str(&json)
+            .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
+        if !matches_where(&existing, where_clause, parameters) {
+            return Err(DynoxideError::ConditionalCheckFailedException(
+                "The conditional request failed".to_string(),
+                None,
+            ));
+        }
+    }
 
     let old_json = storage.delete_item(table_name, &pk_str, &sk_str).await?;
 

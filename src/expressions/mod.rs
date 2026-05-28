@@ -259,6 +259,7 @@ impl<'a> TrackedExpressionAttributes<'a> {
                 self.walk_set_operand(a);
                 self.walk_set_operand(b);
             }
+            update::SetOperand::Group(inner) => self.walk_set_value(inner),
         }
     }
 

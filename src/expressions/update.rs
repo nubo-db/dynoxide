@@ -47,6 +47,8 @@ pub enum SetOperand {
     ValueRef(String),
     IfNotExists(Vec<PathElement>, Box<SetOperand>),
     ListAppend(Box<SetOperand>, Box<SetOperand>),
+    /// A parenthesised sub-expression, e.g. `(c - :v)`.
+    Group(Box<SetValue>),
 }
 
 /// An ADD action: `path :value`
@@ -298,6 +300,9 @@ fn validate_arithmetic_operand(
             validate_list_append_operand(b, tracker)
         }
         SetOperand::Path(_) => Ok(()), // Path types checked at runtime
+        // A parenthesised group resolves to a number at runtime; validate its
+        // inner expression but leave the numeric check to evaluation.
+        SetOperand::Group(inner) => validate_set_value_types(inner, tracker),
     }
 }
 
@@ -312,6 +317,7 @@ fn validate_set_operand_types(
             validate_list_append_operand(b, tracker)
         }
         SetOperand::IfNotExists(_, default) => validate_set_operand_types(default, tracker),
+        SetOperand::Group(inner) => validate_set_value_types(inner, tracker),
         _ => Ok(()),
     }
 }
@@ -464,6 +470,7 @@ fn track_set_operand_refs(
             track_set_operand_refs(a, tracker)?;
             track_set_operand_refs(b, tracker)
         }
+        SetOperand::Group(inner) => track_set_value_refs(inner, tracker),
     }
 }
 
@@ -473,10 +480,18 @@ pub fn apply(
     expr: &UpdateExpr,
     tracker: &TrackedExpressionAttributes,
 ) -> Result<(), String> {
-    // Process SET actions
+    // Process SET actions.
+    //
+    // Every SET right-hand side is evaluated against the pre-update image, so
+    // that `SET a = :v, b = a` gives `b` the OLD value of `a` rather than the
+    // value assigned to `a` earlier in the same expression. DynamoDB applies
+    // the whole expression to the item as it appeared before the update, so all
+    // reads see the original snapshot. (Overlapping target paths are rejected by
+    // `check_path_overlaps`, so no SET can legitimately read another's output.)
+    let snapshot = item.clone();
     for action in &expr.set_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
-        let value = evaluate_set_value(&action.value, item, tracker)?;
+        let value = evaluate_set_value(&action.value, &snapshot, tracker)?;
         set_path(item, &resolved_path, value)?;
     }
 
@@ -583,6 +598,7 @@ fn evaluate_set_operand(
                 _ => Err("list_append requires two list operands".to_string()),
             }
         }
+        SetOperand::Group(inner) => evaluate_set_value(inner, item, tracker),
     }
 }
 
@@ -842,6 +858,14 @@ fn parse_set_operand(stream: &mut TokenStream) -> Result<SetOperand, String> {
     }
 
     match stream.peek() {
+        // Parenthesised sub-expression, e.g. `(c - :v)`. The contents are a full
+        // SET value (operand or arithmetic), evaluated on the same BigDecimal path.
+        Some(Token::LParen) => {
+            stream.next();
+            let inner = parse_set_value(stream)?;
+            stream.expect(&Token::RParen)?;
+            Ok(SetOperand::Group(Box::new(inner)))
+        }
         Some(Token::ValueRef(_)) => {
             if let Some(Token::ValueRef(name)) = stream.next().cloned() {
                 Ok(SetOperand::ValueRef(name))
@@ -1136,5 +1160,51 @@ mod tests {
         let result = parse("SET a = :v SET b = :w");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("only be used once"));
+    }
+
+    /// #35(a): a later SET reads the pre-update value of an earlier target.
+    #[test]
+    fn test_set_reads_pre_update_snapshot() {
+        let expr = parse("SET a = :v, b = a").unwrap();
+        let mut item = make_item(&[
+            ("pk", AttributeValue::S("k".into())),
+            ("a", AttributeValue::S("OLD".into())),
+        ]);
+        let av = vals(&[(":v", AttributeValue::S("NEW".into()))]);
+        let no_names = None;
+        let tracker = make_tracker(&no_names, &av);
+        apply(&mut item, &expr, &tracker).unwrap();
+        assert_eq!(item["a"], AttributeValue::S("NEW".into()));
+        assert_eq!(item["b"], AttributeValue::S("OLD".into()));
+    }
+
+    /// #35(b): a parenthesised arithmetic group parses and evaluates.
+    #[test]
+    fn test_set_parenthesised_arithmetic() {
+        let expr = parse("SET c = (c - :v)").unwrap();
+        let mut item = make_item(&[
+            ("pk", AttributeValue::S("k".into())),
+            ("c", AttributeValue::N("10".into())),
+        ]);
+        let av = vals(&[(":v", AttributeValue::N("3".into()))]);
+        let no_names = None;
+        let tracker = make_tracker(&no_names, &av);
+        apply(&mut item, &expr, &tracker).unwrap();
+        assert_eq!(item["c"], AttributeValue::N("7".into()));
+    }
+
+    /// #35(b): high-precision arithmetic inside a group stays exact (BigDecimal path).
+    #[test]
+    fn test_set_parenthesised_arithmetic_bigdecimal() {
+        let expr = parse("SET c = (c + :v)").unwrap();
+        let mut item = make_item(&[
+            ("pk", AttributeValue::S("k".into())),
+            ("c", AttributeValue::N("100000000000000000000".into())),
+        ]);
+        let av = vals(&[(":v", AttributeValue::N("1".into()))]);
+        let no_names = None;
+        let tracker = make_tracker(&no_names, &av);
+        apply(&mut item, &expr, &tracker).unwrap();
+        assert_eq!(item["c"], AttributeValue::N("100000000000000000001".into()));
     }
 }

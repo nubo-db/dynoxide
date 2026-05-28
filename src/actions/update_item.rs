@@ -621,7 +621,7 @@ pub async fn execute<S: StorageBackend>(
                 // Expression-based: extract only the attributes targeted by the expression.
                 let parsed = crate::expressions::update::parse(update_expr)
                     .map_err(DynoxideError::ValidationException)?;
-                Some(extract_updated_attrs(
+                omit_if_empty(extract_updated_attrs(
                     &old_item,
                     &parsed,
                     &request.expression_attribute_names,
@@ -631,6 +631,7 @@ pub async fn execute<S: StorageBackend>(
                 legacy_attr_names
                     .as_ref()
                     .map(|names| extract_named_attrs(&old_item, names))
+                    .and_then(omit_if_empty)
             }
         }
         "UPDATED_NEW" => {
@@ -640,18 +641,21 @@ pub async fn execute<S: StorageBackend>(
                     .map_err(DynoxideError::ValidationException)?;
                 let new_item: HashMap<String, AttributeValue> = serde_json::from_str(&item_json)
                     .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-                Some(extract_updated_attrs(
+                omit_if_empty(extract_updated_attrs(
                     &new_item,
                     &parsed,
                     &request.expression_attribute_names,
                 ))
             } else {
                 // Legacy AttributeUpdates: extract the named attributes from the new item.
-                legacy_attr_names.as_ref().map(|names| {
-                    let new_item: HashMap<String, AttributeValue> =
-                        serde_json::from_str(&item_json).unwrap_or_default();
-                    extract_named_attrs(&new_item, names)
-                })
+                legacy_attr_names
+                    .as_ref()
+                    .map(|names| {
+                        let new_item: HashMap<String, AttributeValue> =
+                            serde_json::from_str(&item_json).unwrap_or_default();
+                        extract_named_attrs(&new_item, names)
+                    })
+                    .and_then(omit_if_empty)
             }
         }
         _ => None, // "NONE" or default
@@ -751,51 +755,69 @@ fn apply_attribute_updates(
     Ok(())
 }
 
-/// Extract only the attributes that were affected by the update expression.
+/// Extract only the attributes that were affected by the update expression,
+/// at full path granularity.
+///
+/// For a nested target like `SET parent.child = :v` this returns only the
+/// changed fragment (`{parent: {M: {child}}}`), not the whole `parent` map,
+/// matching how AWS scopes `UPDATED_NEW` / `UPDATED_OLD`. A path that no longer
+/// resolves in `item` (a removed attribute under `UPDATED_NEW`) contributes
+/// nothing, so a REMOVE-only update yields an empty map.
 fn extract_updated_attrs(
     item: &HashMap<String, AttributeValue>,
     expr: &crate::expressions::update::UpdateExpr,
     attr_names: &Option<HashMap<String, String>>,
 ) -> HashMap<String, AttributeValue> {
+    use crate::expressions::{PathElement, resolve_path, resolve_path_elements};
+
+    let no_values: Option<HashMap<String, AttributeValue>> = None;
+    let tracker =
+        crate::expressions::TrackedExpressionAttributes::without_tracking(attr_names, &no_values);
+
+    // Collect every target path across all clauses, in clause order.
+    let mut paths: Vec<&[PathElement]> = Vec::new();
+    paths.extend(expr.set_actions.iter().map(|a| a.path.as_slice()));
+    paths.extend(expr.remove_actions.iter().map(|p| p.as_slice()));
+    paths.extend(expr.add_actions.iter().map(|a| a.path.as_slice()));
+    paths.extend(expr.delete_actions.iter().map(|a| a.path.as_slice()));
+
     let mut result = HashMap::new();
+    for path in paths {
+        let Ok(resolved) = resolve_path_elements(path, &tracker) else {
+            continue;
+        };
 
-    // SET actions
-    for action in &expr.set_actions {
-        if let Some(name) = get_top_level_name(&action.path, attr_names) {
-            if let Some(val) = item.get(&name) {
-                result.insert(name, val.clone());
+        // `insert_at_path` rebuilds a list from index 0, so it can't represent a
+        // target that dives through a list index (`list[2]`) as a pruned
+        // fragment without mislocating the element and dropping its siblings.
+        // For those, fall back to returning the whole top-level attribute, the
+        // coarse-but-correct shape. Pure attribute paths get the granular
+        // fragment AWS scopes `UPDATED_NEW` / `UPDATED_OLD` to.
+        if resolved.iter().any(|e| matches!(e, PathElement::Index(_))) {
+            if let Some(PathElement::Attribute(top)) = resolved.first() {
+                if let Some(val) = item.get(top) {
+                    result.insert(top.clone(), val.clone());
+                }
             }
+            continue;
         }
-    }
 
-    // REMOVE actions
-    for path in &expr.remove_actions {
-        if let Some(name) = get_top_level_name(path, attr_names) {
-            if let Some(val) = item.get(&name) {
-                result.insert(name, val.clone());
-            }
-        }
-    }
-
-    // ADD actions
-    for action in &expr.add_actions {
-        if let Some(name) = get_top_level_name(&action.path, attr_names) {
-            if let Some(val) = item.get(&name) {
-                result.insert(name, val.clone());
-            }
-        }
-    }
-
-    // DELETE actions
-    for action in &expr.delete_actions {
-        if let Some(name) = get_top_level_name(&action.path, attr_names) {
-            if let Some(val) = item.get(&name) {
-                result.insert(name, val.clone());
-            }
+        if let Some(val) = resolve_path(item, &resolved) {
+            crate::expressions::projection::insert_at_path(&mut result, &resolved, val);
         }
     }
 
     result
+}
+
+/// Collapse an empty projection to `None` so `Attributes` is omitted entirely.
+///
+/// AWS omits `Attributes` from a `UPDATED_NEW` / `UPDATED_OLD` response when
+/// nothing was projected — for example a REMOVE-only update under `UPDATED_NEW`,
+/// where no attribute was set to a new value. Returning `Some({})` instead would
+/// serialise an empty `Attributes` map, which AWS never does.
+fn omit_if_empty(map: HashMap<String, AttributeValue>) -> Option<HashMap<String, AttributeValue>> {
+    if map.is_empty() { None } else { Some(map) }
 }
 
 /// Extract named attributes from an item (used for legacy AttributeUpdates ReturnValues).
@@ -810,22 +832,6 @@ fn extract_named_attrs(
         }
     }
     result
-}
-
-fn get_top_level_name(
-    path: &[crate::expressions::PathElement],
-    attr_names: &Option<HashMap<String, String>>,
-) -> Option<String> {
-    match path.first() {
-        Some(crate::expressions::PathElement::Attribute(name)) => {
-            if name.starts_with('#') {
-                crate::expressions::resolve_name(name, attr_names).ok()
-            } else {
-                Some(name.clone())
-            }
-        }
-        _ => None,
-    }
 }
 
 /// Validate that a path element does not target a key attribute.

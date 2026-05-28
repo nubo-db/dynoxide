@@ -2,11 +2,11 @@
 use crate::errors::{DynoxideError, Result};
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::storage_backend::clock::{Clock, SystemClock};
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+use crate::storage_backend::sql_builders::{self, escape_table_name};
 use crate::types::AttributeValue;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use rusqlite::{Connection, params};
-#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-use crate::storage_backend::sql_builders::{self, escape_table_name};
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
@@ -754,11 +754,11 @@ impl Storage {
     /// Check if a table exists in metadata.
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
         let (sql, params) = sql_builders::table_exists(table_name);
-        let count: i32 = self
-            .conn
-            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
-                row.get(0)
-            })?;
+        let count: i32 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(count > 0)
     }
 
@@ -956,8 +956,7 @@ impl Storage {
         base_pk: &str,
         base_sk: &str,
     ) -> Result<()> {
-        let (sql, params) =
-            sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
+        let (sql, params) = sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
         self.conn
             .prepare_cached(&sql)?
             .execute(rusqlite::params_from_iter(params.iter()))?;
@@ -972,8 +971,7 @@ impl Storage {
         pk: &str,
         params: &QueryParams,
     ) -> Result<Vec<(String, String, String)>> {
-        let (sql, params_vec) =
-            sql_builders::query_lsi_items(table_name, index_name, pk, params);
+        let (sql, params_vec) = sql_builders::query_lsi_items(table_name, index_name, pk, params);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
@@ -1134,11 +1132,11 @@ impl Storage {
     /// Return the total item_size for all items sharing the given partition key.
     pub fn get_partition_size(&self, table_name: &str, pk: &str) -> Result<i64> {
         let (sql, params) = sql_builders::get_partition_size(table_name, pk);
-        let size: i64 = self
-            .conn
-            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
-                row.get(0)
-            })?;
+        let size: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(size)
     }
 
@@ -1151,11 +1149,11 @@ impl Storage {
         pk: &str,
     ) -> Result<i64> {
         let (sql, params) = sql_builders::get_lsi_partition_size(table_name, index_name, pk);
-        let size: i64 = self
-            .conn
-            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
-                row.get(0)
-            })?;
+        let size: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(size)
     }
 
@@ -1214,11 +1212,11 @@ impl Storage {
     /// Count items in a table.
     pub fn count_items(&self, table_name: &str) -> Result<i64> {
         let (sql, params) = sql_builders::count_items(table_name);
-        let count: i64 = self
-            .conn
-            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
-                row.get(0)
-            })?;
+        let count: i64 =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    row.get(0)
+                })?;
         Ok(count)
     }
 

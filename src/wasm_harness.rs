@@ -22,7 +22,8 @@ use crate::types::{
 /// JSON summary string. Rejects with the error message on failure.
 #[wasm_bindgen]
 pub async fn smoke_test() -> Result<JsValue, JsValue> {
-    run().await
+    run()
+        .await
         .map(|s| JsValue::from_str(&s))
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -53,7 +54,10 @@ async fn run() -> crate::Result<String> {
 
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S("smoke-1".to_string()));
-    item.insert("msg".to_string(), AttributeValue::S("hello wasm".to_string()));
+    item.insert(
+        "msg".to_string(),
+        AttributeValue::S("hello wasm".to_string()),
+    );
     db.put_item(actions::put_item::PutItemRequest {
         table_name: "SmokeTable".to_string(),
         item,
@@ -143,9 +147,17 @@ async fn run_index() -> std::result::Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
     for (pk, sk) in keys {
-        be.insert_gsi_item("IdxT", "gsi1", "G", sk, pk, sk, &format!("{{\"pk\":\"{pk}\"}}"))
-            .await
-            .map_err(|e| e.to_string())?;
+        be.insert_gsi_item(
+            "IdxT",
+            "gsi1",
+            "G",
+            sk,
+            pk,
+            sk,
+            &format!("{{\"pk\":\"{pk}\"}}"),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     let gsi_query = be

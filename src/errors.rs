@@ -164,9 +164,7 @@ impl DynoxideError {
                 "com.amazonaws.dynamodb.v20120810#InternalServerError"
             }
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-            DynoxideError::SqliteError(_) => {
-                "com.amazonaws.dynamodb.v20120810#InternalServerError"
-            }
+            DynoxideError::SqliteError(_) => "com.amazonaws.dynamodb.v20120810#InternalServerError",
         }
     }
 
@@ -361,7 +359,10 @@ mod tests {
         // A client-facing validation limit crosses the boundary as a 400.
         let v: DynoxideError = BackendError::Validation("too many tags".into()).into();
         assert_eq!(v.status_code(), 400);
-        assert_eq!(v.error_type(), "com.amazon.coral.validate#ValidationException");
+        assert_eq!(
+            v.error_type(),
+            "com.amazon.coral.validate#ValidationException"
+        );
 
         // Unsupported (e.g. TTL on wasm) surfaces as a 500 carrying the
         // capability tag, the documented AWS-style code for the preview.

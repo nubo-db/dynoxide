@@ -819,3 +819,165 @@ fn test_update_item_condition_rejects_nonexistent_item() {
         "item should not exist after failed condition"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ConsumedCapacity (#37)
+// ---------------------------------------------------------------------------
+
+/// #37: a transactional write charges 2 WCU per item. Two sub-1KB Puts cost
+/// 1 WCU each non-transactionally, doubled to 2 each, so 4 in total.
+#[test]
+fn test_transact_write_charges_two_wcu_per_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let req: serde_json::Value = json!({
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}},
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "b"}, "v": {"N": "1"}}}}
+        ]
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let total: f64 = resp
+        .consumed_capacity
+        .unwrap()
+        .iter()
+        .map(|c| c.capacity_units)
+        .sum();
+    assert_eq!(total, 4.0);
+}
+
+/// #37: a transactional read charges 2 RCU per requested item, including an
+/// item that turned out to be missing. One present + one missing = 4.
+#[test]
+fn test_transact_get_charges_two_rcu_per_item_including_missing() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let put: serde_json::Value =
+        json!({"TableName": "Txn", "Item": {"pk": {"S": "present"}, "v": {"N": "1"}}});
+    db.put_item(serde_json::from_value(put).unwrap()).unwrap();
+
+    let req: serde_json::Value = json!({
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": [
+            {"Get": {"TableName": "Txn", "Key": {"pk": {"S": "present"}}}},
+            {"Get": {"TableName": "Txn", "Key": {"pk": {"S": "missing"}}}}
+        ]
+    });
+    let resp = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let total: f64 = resp
+        .consumed_capacity
+        .unwrap()
+        .iter()
+        .map(|c| c.capacity_units)
+        .sum();
+    assert_eq!(total, 4.0);
+}
+
+/// #37: under INDEXES the TransactGet breakdown carries the table's read
+/// capacity units, not just the top-level CapacityUnits.
+#[test]
+fn test_transact_get_indexes_reports_table_read_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let put: serde_json::Value =
+        json!({"TableName": "Txn", "Item": {"pk": {"S": "present"}, "v": {"N": "1"}}});
+    db.put_item(serde_json::from_value(put).unwrap()).unwrap();
+
+    let req: serde_json::Value = json!({
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": [
+            {"Get": {"TableName": "Txn", "Key": {"pk": {"S": "present"}}}}
+        ]
+    });
+    let resp = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let caps = resp.consumed_capacity.unwrap();
+    let entry = &caps[0];
+    let table = entry
+        .table
+        .as_ref()
+        .expect("INDEXES breakdown must include the Table detail");
+    assert!(
+        table.read_capacity_units.unwrap_or(0.0) > 0.0,
+        "Table.ReadCapacityUnits should be populated under INDEXES: {table:?}"
+    );
+}
+
+/// #37: with ReturnConsumedCapacity omitted, the response carries no
+/// ConsumedCapacity block (the contract boundary AWS enforces).
+#[test]
+fn test_transact_write_no_consumed_capacity_when_not_requested() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+        ]
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+    assert!(resp.consumed_capacity.is_none());
+}
+
+/// #37: TransactGet with ReturnConsumedCapacity omitted carries no block.
+#[test]
+fn test_transact_get_no_consumed_capacity_when_not_requested() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let put: serde_json::Value =
+        json!({"TableName": "Txn", "Item": {"pk": {"S": "present"}, "v": {"N": "1"}}});
+    db.put_item(serde_json::from_value(put).unwrap()).unwrap();
+
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Get": {"TableName": "Txn", "Key": {"pk": {"S": "present"}}}}
+        ]
+    });
+    let resp = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+    assert!(resp.consumed_capacity.is_none());
+}
+
+/// #37: under INDEXES the TransactWrite breakdown carries the table's write
+/// capacity units, mirroring the read path.
+#[test]
+fn test_transact_write_indexes_reports_table_write_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let req: serde_json::Value = json!({
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+        ]
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let caps = resp.consumed_capacity.unwrap();
+    let table = caps[0]
+        .table
+        .as_ref()
+        .expect("INDEXES breakdown must include the Table detail");
+    assert!(
+        table.write_capacity_units.unwrap_or(0.0) > 0.0,
+        "Table.WriteCapacityUnits should be populated under INDEXES: {table:?}"
+    );
+}

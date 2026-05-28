@@ -1055,3 +1055,39 @@ fn test_where_in_parenthesised_still_works() {
     let resp = exec(&db, "SELECT * FROM \"Neg\" WHERE pk IN ('a','b')");
     assert_eq!(resp.items.unwrap().len(), 2);
 }
+
+// -----------------------------------------------------------------------
+// ConsumedCapacity (#37)
+// -----------------------------------------------------------------------
+
+/// #37: PartiQL ExecuteStatement returns a populated ConsumedCapacity block
+/// when ReturnConsumedCapacity is requested, rather than omitting it.
+#[test]
+fn test_execute_statement_returns_consumed_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Pql");
+
+    db.execute_statement(ExecuteStatementRequest {
+        statement: "INSERT INTO \"Pql\" VALUE { 'pk': 'cc', 'v': 1 }".to_string(),
+        parameters: None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let resp = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Pql\" WHERE pk = 'cc'".to_string(),
+            parameters: None,
+            return_consumed_capacity: Some("TOTAL".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let cc = resp
+        .consumed_capacity
+        .expect("ConsumedCapacity must be present when requested");
+    assert!(
+        cc.capacity_units > 0.0,
+        "CapacityUnits should be greater than zero: {cc:?}"
+    );
+}

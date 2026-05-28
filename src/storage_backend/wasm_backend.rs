@@ -17,33 +17,27 @@
 //!
 //! # Preview status
 //!
-//! This backend is not verified by the conformance suite. It covers the
-//! CRUD/query/scan/GSI/LSI surface. TTL and the cross-item `TransactWriteItems`
-//! action return [`BackendError::Unsupported`]. Streams are planned - their
-//! real-time delivery mechanism is a separate design - and currently return a
-//! preview "not yet implemented" error rather than a hard refusal. See the
-//! WASM note in the README.
-//!
-//! # Coverage in this commit
-//!
-//! The base-table CRUD spine (table metadata, data tables, put/get/delete,
-//! transactions) runs against the bridge here. The query/scan and GSI/LSI
-//! builders land in the following commit; until then those methods return a
-//! preview "not yet implemented" error. Streams are pending (delivery
-//! mechanism still to be designed) and return the same preview error; TTL is
-//! [`BackendError::Unsupported`].
+//! This backend is not verified by the conformance suite. It covers the CRUD,
+//! query, scan, and GSI/LSI surface. Capabilities it does not provide - streams
+//! (delivery mechanism still to be designed), TTL (which needs a background
+//! expiry sweep the browser does not drive), the cross-item `TransactWriteItems`
+//! action, tag and table-setting updates, stats, and bulk import - return the
+//! typed [`BackendError::Unsupported`], tagged with the capability so a caller
+//! can feature-detect on it. See the WASM note in the README.
 
 use std::sync::Arc;
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 
 use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
     TableStats,
 };
 use crate::storage_backend::sql_builders::{self, SqlParam};
-use crate::storage_backend::{BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, SystemClock};
+use crate::storage_backend::{
+    BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, SystemClock,
+};
 use crate::types::Tag;
 
 #[wasm_bindgen(module = "/js/wa-sqlite-bridge.js")]
@@ -52,7 +46,11 @@ extern "C" {
     async fn wa_open(name: &str) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "exec")]
-    async fn wa_exec(handle: &JsValue, sql: &str, params: js_sys::Array) -> Result<JsValue, JsValue>;
+    async fn wa_exec(
+        handle: &JsValue,
+        sql: &str,
+        params: js_sys::Array,
+    ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "query")]
     async fn wa_query(
@@ -96,7 +94,11 @@ impl WasmBridgeBackend {
     }
 
     /// Run a query, returning rows as a JS array of column arrays.
-    async fn query(&self, sql: &str, params: Vec<SqlParam<'_>>) -> Result<js_sys::Array, BackendError> {
+    async fn query(
+        &self,
+        sql: &str,
+        params: Vec<SqlParam<'_>>,
+    ) -> Result<js_sys::Array, BackendError> {
         let rows = wa_query(&self.handle, sql, params_to_js(&params))
             .await
             .map_err(js_err)?;
@@ -202,17 +204,14 @@ fn js_err(e: JsValue) -> BackendError {
     BackendError::Other(format!("wa-sqlite: {msg}"))
 }
 
-/// A capability the wasm backend does not provide (TTL needs a background
-/// expiry sweep that the browser runtime does not drive).
+/// A capability this preview backend does not provide. Some are simply not
+/// implemented yet (streams, pending a delivery design; the metadata-mutation,
+/// stats, and bulk paths); TTL needs a background expiry sweep the browser
+/// runtime does not drive. All surface as the typed
+/// `BackendError::Unsupported { capability }`, so a caller can feature-detect on
+/// the capability tag rather than parse a message.
 fn unsupported(capability: &'static str) -> BackendError {
     BackendError::Unsupported { capability }
-}
-
-/// A method that is planned but not yet implemented in this preview - the
-/// query/scan and GSI/LSI builders (next commit) and streams (delivery
-/// mechanism still to be designed).
-fn not_yet(what: &str) -> BackendError {
-    BackendError::Other(format!("wasm backend (preview): {what} not yet implemented"))
 }
 
 impl StorageBackend for WasmBridgeBackend {
@@ -253,7 +252,7 @@ impl StorageBackend for WasmBridgeBackend {
         _attribute_definitions: &str,
         _gsi_definitions: Option<&str>,
     ) -> Result<(), BackendError> {
-        Err(not_yet("update_table_metadata"))
+        Err(unsupported("update_table_metadata"))
     }
 
     async fn update_provisioned_throughput(
@@ -261,11 +260,11 @@ impl StorageBackend for WasmBridgeBackend {
         _table_name: &str,
         _provisioned_throughput: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("update_provisioned_throughput"))
+        Err(unsupported("update_provisioned_throughput"))
     }
 
     async fn clear_provisioned_throughput(&self, _table_name: &str) -> Result<(), BackendError> {
-        Err(not_yet("clear_provisioned_throughput"))
+        Err(unsupported("clear_provisioned_throughput"))
     }
 
     async fn update_billing_mode(
@@ -273,15 +272,15 @@ impl StorageBackend for WasmBridgeBackend {
         _table_name: &str,
         _billing_mode: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("update_billing_mode"))
+        Err(unsupported("update_billing_mode"))
     }
 
     async fn get_tags(&self, _table_name: &str) -> Result<Vec<Tag>, BackendError> {
-        Err(not_yet("get_tags"))
+        Err(unsupported("get_tags"))
     }
 
     async fn set_tags(&self, _table_name: &str, _new_tags: &[Tag]) -> Result<(), BackendError> {
-        Err(not_yet("set_tags"))
+        Err(unsupported("set_tags"))
     }
 
     async fn update_deletion_protection(
@@ -289,11 +288,11 @@ impl StorageBackend for WasmBridgeBackend {
         _table_name: &str,
         _enabled: bool,
     ) -> Result<(), BackendError> {
-        Err(not_yet("update_deletion_protection"))
+        Err(unsupported("update_deletion_protection"))
     }
 
     async fn remove_tags(&self, _table_name: &str, _keys: &[String]) -> Result<(), BackendError> {
-        Err(not_yet("remove_tags"))
+        Err(unsupported("remove_tags"))
     }
 
     async fn list_table_names(&self) -> Result<Vec<String>, BackendError> {
@@ -340,11 +339,7 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(&sql, params).await
     }
 
-    async fn drop_gsi_table(
-        &self,
-        table_name: &str,
-        index_name: &str,
-    ) -> Result<(), BackendError> {
+    async fn drop_gsi_table(&self, table_name: &str, index_name: &str) -> Result<(), BackendError> {
         let (sql, params) = sql_builders::drop_gsi_table(table_name, index_name);
         self.exec(&sql, params).await
     }
@@ -358,11 +353,7 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(&sql, params).await
     }
 
-    async fn drop_lsi_table(
-        &self,
-        table_name: &str,
-        index_name: &str,
-    ) -> Result<(), BackendError> {
+    async fn drop_lsi_table(&self, table_name: &str, index_name: &str) -> Result<(), BackendError> {
         let (sql, params) = sql_builders::drop_lsi_table(table_name, index_name);
         self.exec(&sql, params).await
     }
@@ -463,8 +454,7 @@ impl StorageBackend for WasmBridgeBackend {
         base_pk: &str,
         base_sk: &str,
     ) -> Result<(), BackendError> {
-        let (sql, params) =
-            sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
+        let (sql, params) = sql_builders::delete_lsi_item(table_name, index_name, base_pk, base_sk);
         self.exec(&sql, params).await
     }
 
@@ -546,7 +536,7 @@ impl StorageBackend for WasmBridgeBackend {
         _table_name: &str,
         _rows: &[BaseItemRow],
     ) -> Result<(), BackendError> {
-        Err(not_yet("put_base_items"))
+        Err(unsupported("put_base_items"))
     }
 
     async fn get_item(
@@ -635,23 +625,23 @@ impl StorageBackend for WasmBridgeBackend {
     // --- Introspection ---------------------------------------------------
 
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
-        Err(not_yet("db_size_bytes"))
+        Err(unsupported("db_size_bytes"))
     }
 
     async fn table_count(&self) -> Result<usize, BackendError> {
-        Err(not_yet("table_count"))
+        Err(unsupported("table_count"))
     }
 
     async fn table_stats(&self) -> Result<Vec<TableStats>, BackendError> {
-        Err(not_yet("table_stats"))
+        Err(unsupported("table_stats"))
     }
 
     async fn database_info(&self) -> Result<DatabaseInfo, BackendError> {
-        Err(not_yet("database_info"))
+        Err(unsupported("database_info"))
     }
 
     async fn vacuum(&self) -> Result<(), BackendError> {
-        Err(not_yet("vacuum"))
+        Err(unsupported("vacuum"))
     }
 
     // --- Streams (planned; delivery mechanism to be designed) ------------
@@ -662,11 +652,11 @@ impl StorageBackend for WasmBridgeBackend {
         _view_type: &str,
         _label: &str,
     ) -> Result<(), BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn disable_stream(&self, _table_name: &str) -> Result<(), BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn insert_stream_record(
@@ -680,7 +670,7 @@ impl StorageBackend for WasmBridgeBackend {
         _shard_id: &str,
         _created_at: i64,
     ) -> Result<(), BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn insert_stream_record_with_identity(
@@ -695,11 +685,11 @@ impl StorageBackend for WasmBridgeBackend {
         _created_at: i64,
         _user_identity: Option<&str>,
     ) -> Result<(), BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn next_stream_sequence_number(&self, _table_name: &str) -> Result<i64, BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn get_stream_records(
@@ -709,11 +699,11 @@ impl StorageBackend for WasmBridgeBackend {
         _after_sequence: i64,
         _limit: usize,
     ) -> Result<Vec<StreamRecord>, BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>, BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     async fn get_shard_sequence_range(
@@ -721,7 +711,7 @@ impl StorageBackend for WasmBridgeBackend {
         _table_name: &str,
         _shard_id: &str,
     ) -> Result<(Option<String>, Option<String>), BackendError> {
-        Err(not_yet("streams"))
+        Err(unsupported("streams"))
     }
 
     // --- TTL (unsupported on wasm) ---------------------------------------
@@ -748,7 +738,7 @@ impl StorageBackend for WasmBridgeBackend {
         _sk: &str,
         _timestamp: f64,
     ) -> Result<(), BackendError> {
-        Err(not_yet("touch_cached_at"))
+        Err(unsupported("touch_cached_at"))
     }
 
     async fn get_lru_items(
@@ -756,6 +746,6 @@ impl StorageBackend for WasmBridgeBackend {
         _table_name: &str,
         _limit: usize,
     ) -> Result<Vec<(String, String, i64)>, BackendError> {
-        Err(not_yet("get_lru_items"))
+        Err(unsupported("get_lru_items"))
     }
 }

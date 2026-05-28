@@ -132,6 +132,20 @@ pub type NativeDatabase = Database<RusqliteBackend>;
 #[cfg(feature = "wasm-sqlite")]
 pub type WasmDatabase = Database<WasmBridgeBackend>;
 
+/// Build-visible preview marker for the wasm-sqlite backend.
+///
+/// `true` when built with `--features wasm-sqlite`, `false` otherwise. The wasm
+/// backend covers CRUD, query, scan, and GSI/LSI, but it is not run against the
+/// dynamodb-conformance suite that covers the native build. Consumers can read
+/// this constant to tell whether the artifact they hold is the conformance-
+/// tested native build or the wasm preview.
+#[cfg(feature = "wasm-sqlite")]
+pub const WASM_PREVIEW: bool = true;
+/// Build-visible preview marker for the wasm-sqlite backend. See the
+/// `wasm-sqlite` variant for details.
+#[cfg(not(feature = "wasm-sqlite"))]
+pub const WASM_PREVIEW: bool = false;
+
 /// The main entry point for the DynamoDB emulator.
 ///
 /// Generic over the storage backend `S`, monomorphised (no `dyn`). The type

@@ -15,7 +15,7 @@ import init, {
   smoke_test,
   index_scan_test,
   error_fidelity_test,
-} from "/pkg/dynoxide.js";
+} from "../pkg/dynoxide.js";
 
 let ready = null;
 function ensureInit() {

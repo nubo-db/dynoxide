@@ -7,35 +7,44 @@
  * backend via `sql_builders`) and hands it here with a positional parameter
  * array; this module only opens the database and runs statements.
  *
- * Runs inside the dynoxide Web Worker (see js/dynoxide-worker.js). wa-sqlite's
- * OPFS VFS persists through sync access handles, which browsers expose only in
- * a Worker, so the engine runs in the Worker and the page talks to it over a
- * coarse message RPC. No cross-origin isolation (COOP/COEP) is required.
+ * Runs inside the dynoxide Web Worker (see js/dynoxide-worker.js). It uses
+ * wa-sqlite's synchronous OPFS VFS (`AccessHandlePoolVFS`), backed by sync
+ * access handles, which browsers expose only in a Worker. Because that VFS is
+ * synchronous it pairs with the smaller non-async wa-sqlite build (no Asyncify
+ * instrumentation), which roughly halves the wa-sqlite wasm. The engine runs
+ * in the Worker and the page talks to it over a coarse message RPC. No
+ * cross-origin isolation (COOP/COEP) is required.
  *
- * Preview packaging: wa-sqlite is imported by absolute `/node_modules` path so
- * the Worker resolves it without a bundler or import map. A production/SDK
- * build would bundle the Worker and import wa-sqlite by bare specifier. This
- * backend is not exercised by the conformance suite (see the WASM note in the
- * README).
+ * Imports use bare specifiers, so this module is bundler-friendly: the
+ * production build bundles it with esbuild, and a future bundler-target npm
+ * consumer resolves the same imports. wa-sqlite's `.wasm` is located at
+ * runtime via `locateFile` relative to the bundle, so it ships as a sibling
+ * asset rather than being inlined. Not exercised by the conformance suite (see
+ * the WASM note in the README).
  */
 
-import * as SQLite from "/node_modules/wa-sqlite/src/sqlite-api.js";
-import SQLiteESMFactory from "/node_modules/wa-sqlite/dist/wa-sqlite-async.mjs";
+import * as SQLite from "wa-sqlite";
+import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite.mjs";
+import { AccessHandlePoolVFS } from "wa-sqlite/src/examples/AccessHandlePoolVFS.js";
 
 // Lazily initialised SQLite API handle, shared across opens.
 let sqlite3 = null;
 
 async function moduleHandle() {
   if (sqlite3) return sqlite3;
-  const module = await SQLiteESMFactory();
+  // Locate wa-sqlite's .wasm next to this module at runtime. After bundling,
+  // import.meta.url is the bundle's URL, so the .wasm resolves as a sibling
+  // asset in dist/.
+  const module = await SQLiteESMFactory({
+    locateFile: (file) => new URL(file, import.meta.url).href,
+  });
   sqlite3 = SQLite.Factory(module);
 
-  // OPFS VFS via sync access handles (Worker-only), registered as the default
-  // so open_v2 uses it. Persists to the origin private file system.
-  const { OriginPrivateFileSystemVFS } = await import(
-    "/node_modules/wa-sqlite/src/examples/OriginPrivateFileSystemVFS.js"
-  );
-  const vfs = new OriginPrivateFileSystemVFS();
+  // Synchronous OPFS VFS (Worker-only). It keeps its pool of access handles in
+  // one OPFS directory; `isReady` resolves once that pool is acquired.
+  // Registered as the default so open_v2 uses it.
+  const vfs = new AccessHandlePoolVFS("/dynoxide");
+  await vfs.isReady;
   sqlite3.vfs_register(vfs, true);
   return sqlite3;
 }

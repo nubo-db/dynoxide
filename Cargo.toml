@@ -120,6 +120,21 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 tempfile = "3.25.0"
 
+# wasm-pack runs wasm-opt on release builds. Enable the wasm features rustc
+# emits for wasm32-unknown-unknown so wasm-opt validates the input, then
+# optimise for size. Without these it aborts with "all used features should be
+# allowed".
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    '-Os',
+    '--enable-bulk-memory',
+    '--enable-sign-ext',
+    '--enable-mutable-globals',
+    '--enable-nontrapping-float-to-int',
+    '--enable-multivalue',
+    '--enable-reference-types',
+]
+
 [profile.release]
 opt-level = "s"
 lto = true

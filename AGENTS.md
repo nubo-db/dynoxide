@@ -60,7 +60,9 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   - `--no-default-features --features encryption,http-server`
   A separate feature-guard job checks that deliberately incompatible
   feature combinations fail to compile (for example
-  `native-sqlite + encryption`). If you change feature gates or
+  `native-sqlite + encryption`). A `wasm-check` job builds the library
+  for `wasm32-unknown-unknown` with `--no-default-features --features
+  wasm-sqlite`. If you change feature gates or
   anything cross-cutting, running the relevant matrix leg locally
   saves a CI round-trip. `.github/workflows/ci.yml` is the
   authoritative list.
@@ -101,16 +103,22 @@ helps a reviewer but are not required.
 ## Storage layer boundary
 
 The data layer goes through the `StorageBackend` trait in
-`src/storage_backend/`; the native rusqlite-backed `Storage` implements it.
+`src/storage_backend/`. It has two implementations: the native rusqlite-backed
+`Storage`, and `WasmBridgeBackend` (the `wasm-sqlite` build, which runs the same
+SQL against wa-sqlite over a wasm-bindgen bridge). Both issue SQL from the
+shared builders in `src/storage_backend/sql_builders.rs`, so a statement fixed
+on one backend is fixed on both - add or change SQL there, not inline in a
+backend.
+
 The action handlers are async and generic over the trait
-(`execute<S: StorageBackend>`), and `Database` is `Database<S = RusqliteBackend>`
-with a `NativeDatabase` alias that preserves the historical synchronous public
-API through a `block_on` facade. The trait is consumed monomorphically (no
-`dyn`); a non-native (browser / WASM) backend is the next consumer. The raw
-`Storage::conn()` / `conn_mut()` escape hatches are no longer used by action
-handlers. Please open an issue before submitting changes to `src/storage.rs`
-or `src/storage_backend/`; we can advise whether your change fits the current
-shape or is better held until the next pass.
+(`execute<S: StorageBackend>`). `Database<S>` defaults to the rusqlite backend,
+with a `NativeDatabase` alias that keeps the historical synchronous public API
+through a `block_on` facade, and a `WasmDatabase` alias whose methods are async
+(the wasm main thread cannot block). The trait is consumed monomorphically (no
+`dyn`). The raw `Storage::conn()` / `conn_mut()` escape hatches are no longer
+used by action handlers. Please open an issue before submitting changes to
+`src/storage.rs` or `src/storage_backend/`; we can advise whether your change
+fits the current shape.
 
 ## Where to discuss
 

@@ -6,13 +6,15 @@
     <!--
       Preview browser harness for the wasm-sqlite backend.
 
-      The engine runs in a Web Worker (js/dynoxide-worker.js) so wa-sqlite can
-      use OPFS sync access handles; this page drives it over a message RPC.
+      This loads the SAME bundled Worker (dist/dynoxide-worker.js) that ships to
+      production consumers, so a green harness means the shipping artefact works
+      - not a parallel build. The engine runs in the Worker (wa-sqlite needs
+      OPFS sync access handles, which are Worker-only); this page drives it over
+      a message RPC.
 
-      Build first (from the repo root):
+      Build the dist/ first (from the repo root):
         npm install
-        wasm-pack build --dev --target web --out-dir pkg -- \
-          --no-default-features --features wasm-harness
+        npm run build:wasm        # or: npm run build:wasm:dev
 
       Then serve the repo root over http and open /harness/ in a browser:
         python3 -m http.server 8081
@@ -26,7 +28,7 @@
     <pre id="out">running...</pre>
     <script type="module">
       const out = document.getElementById("out");
-      const worker = new Worker("/js/dynoxide-worker.js", { type: "module" });
+      const worker = new Worker("/dist/dynoxide-worker.js", { type: "module" });
 
       function call(op, payload) {
         return new Promise((resolve, reject) => {

@@ -54,6 +54,8 @@ Verified against real DynamoDB by the [dynamodb-conformance](https://github.com/
 
 > Numbers reflect the conformance suite as of the v0.9.10 release.
 
+Those numbers are the native build. The [WebAssembly](#webassembly-preview) build is a preview and isn't run against the suite yet.
+
 See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#results).
 
 ### How It Compares
@@ -198,6 +200,53 @@ A few things to know:
 - **The token is not optional.** Omit it and the container exits immediately with `a non-loopback MCP bind requires an explicit token`. The default `docker run ghcr.io/nubo-db/dynoxide` stays DynamoDB-only precisely because a token-less `0.0.0.0` MCP bind cannot boot.
 - **Reaching MCP from another container** by service name (rather than `localhost`) needs that name added to the Host allowlist: `--mcp-allowed-host <name>` (e.g. `--mcp-allowed-host dynoxide`). The `-p`-mapped `localhost` access above needs nothing extra.
 - **`--network host`** (Linux only) is an alternative to `-p`, but it bypasses Docker network isolation and binds MCP directly on the host's network interface — reachable from the LAN, not just the host. Prefer `-p` unless you specifically need host networking.
+
+## WebAssembly (preview)
+
+Dynoxide compiles to `wasm32-unknown-unknown` and runs in the browser. The same engine that backs the native build runs against [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) - a WASM build of SQLite - over a wasm-bindgen bridge, with the database persisted to [OPFS](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) (the origin private file system).
+
+Both backends issue the same SQL. The native and wasm code share one set of query builders, so a query fixed on one is fixed on both.
+
+It's a preview. The wasm build is **not** run against the conformance suite that backs the native build, so its correctness rests on its own tests for now. A build made with `--features wasm-sqlite` exposes `dynoxide::WASM_PREVIEW` (`true`) so you can tell which path you're on.
+
+**What works:** create table, put, get, delete, query, and scan, over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, same as native.
+
+**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided. `TransactWriteItems`, tags, table-setting updates, table stats, and bulk import return a preview "not yet implemented" error.
+
+The engine runs in a Web Worker (OPFS's synchronous file handles are Worker-only), and the page talks to it over a message channel. It needs no special server headers (no COOP/COEP cross-origin isolation), so it works on ordinary static hosting.
+
+### Building and shipping it
+
+`npm install` then `npm run build:wasm` produces a self-contained `dist/` (use `build:wasm:dev` to skip wasm-opt for speed):
+
+```bash
+npm install
+npm run build:wasm
+```
+
+`dist/` is three files, kept separate so the two `.wasm` cache independently of the JS bundle:
+
+| File | Size | What |
+|---|---|---|
+| `dynoxide_bg.wasm` | ~530 KB | the engine (release, wasm-opt) |
+| `wa-sqlite.wasm` | ~545 KB | SQLite (the synchronous build) |
+| `dynoxide-worker.js` | ~120 KB | the bundled Web Worker (wa-sqlite glue + bridge) |
+
+About 1.2 MB total. Not tiny, but the `.wasm` files are immutable and cache well, and using wa-sqlite's synchronous build keeps it off the ~1.1 MB Asyncify async build.
+
+Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running wa-sqlite's synchronous OPFS VFS inside a Worker, where synchronous file handles are available directly.)
+
+Spawn the bundle as a module Worker and drive it over `postMessage`; the two `.wasm` files must sit next to `dynoxide-worker.js`, which is where the build puts them. The harness under `harness/` is a working example, and it loads the same bundled Worker a production consumer would:
+
+```bash
+npm run build:wasm
+python3 -m http.server 8081
+# then open http://localhost:8081/harness/
+```
+
+It runs a CRUD round-trip, a GSI write/query/scan, and an error-envelope check against the OPFS-backed database. Because it drives the shipping bundle rather than a parallel build, a green harness means the shipping artefact works.
+
+The bridge and Worker use bare module specifiers, so the same source also feeds a bundler-target build (vite, webpack, esbuild) for consumers who would rather an npm package. That path is a follow-up.
 
 ## HTTP Server
 

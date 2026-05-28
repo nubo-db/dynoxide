@@ -346,6 +346,45 @@ mod tests {
         assert!(err.error_type().contains("InternalServerError"));
     }
 
+    // Error-envelope fidelity for the wasm backend.
+    //
+    // Client-facing envelopes (ResourceNotFound, ConditionalCheckFailed,
+    // Validation, ...) are raised by the shared, generic action handlers, so
+    // they are backend-independent by construction. The only backend-specific
+    // boundary is `From<BackendError> for DynoxideError`, exercised here: the
+    // wasm backend's storage faults must land on the same envelopes the native
+    // rusqlite path produces.
+    #[test]
+    fn test_backend_error_envelopes_match_native() {
+        use crate::storage_backend::BackendError;
+
+        // A client-facing validation limit crosses the boundary as a 400.
+        let v: DynoxideError = BackendError::Validation("too many tags".into()).into();
+        assert_eq!(v.status_code(), 400);
+        assert_eq!(v.error_type(), "com.amazon.coral.validate#ValidationException");
+
+        // Unsupported (e.g. TTL on wasm) surfaces as a 500 carrying the
+        // capability tag, the documented AWS-style code for the preview.
+        let u: DynoxideError = BackendError::Unsupported { capability: "ttl" }.into();
+        assert_eq!(u.status_code(), 500);
+        assert!(u.error_type().contains("InternalServerError"));
+        assert!(u.to_string().contains("ttl"));
+
+        // Every other storage fault maps to a 500, matching the native
+        // `rusqlite::Error -> SqliteError -> InternalServerError` path.
+        for e in [
+            BackendError::NotADatabase,
+            BackendError::Locked,
+            BackendError::Constraint("constraint".into()),
+            BackendError::Io("io".into()),
+            BackendError::Other("wa-sqlite: boom".into()),
+        ] {
+            let d: DynoxideError = e.into();
+            assert_eq!(d.status_code(), 500);
+            assert!(d.error_type().contains("InternalServerError"));
+        }
+    }
+
     #[test]
     fn test_error_response_json_structure() {
         let err = DynoxideError::ValidationException("1 validation error detected".to_string());

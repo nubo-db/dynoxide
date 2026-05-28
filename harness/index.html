@@ -46,9 +46,15 @@
       try {
         const smoke = await call("smoke");
         const index = await call("index");
+        const errors = await call("errors");
         out.textContent =
-          "PASS (engine in Worker, OPFS)\nsmoke: " + smoke + "\nindex: " + index;
-        window.__SMOKE_RESULT__ = { ok: true, smoke, index };
+          "PASS (engine in Worker, OPFS)\nsmoke: " +
+          smoke +
+          "\nindex: " +
+          index +
+          "\nerrors: " +
+          errors;
+        window.__SMOKE_RESULT__ = { ok: true, smoke, index, errors };
       } catch (e) {
         out.textContent = "FAIL\n" + ((e && e.stack) || e);
         window.__SMOKE_RESULT__ = { ok: false, error: String(e) };

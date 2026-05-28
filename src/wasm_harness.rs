@@ -196,3 +196,40 @@ async fn run_index() -> std::result::Result<String, String> {
         seg0.len() + seg1.len()
     ))
 }
+
+/// Error-envelope fidelity: a client-facing error raised by the shared action
+/// handlers must surface the same AWS envelope on the wasm backend as on
+/// native. Returns the `__type` and HTTP status of a GetItem against a missing
+/// table (expected: ResourceNotFoundException, 400).
+#[wasm_bindgen]
+pub async fn error_fidelity_test() -> Result<JsValue, JsValue> {
+    run_errors()
+        .await
+        .map(|s| JsValue::from_str(&s))
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+async fn run_errors() -> std::result::Result<String, String> {
+    let db = WasmDatabase::open("dynoxide-smoke.db")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut key = HashMap::new();
+    key.insert("pk".to_string(), AttributeValue::S("x".to_string()));
+    let missing = db
+        .get_item(actions::get_item::GetItemRequest {
+            table_name: "NoSuchTable".to_string(),
+            key,
+            ..Default::default()
+        })
+        .await;
+
+    let (etype, status) = match missing {
+        Ok(_) => ("<no error>".to_string(), 0),
+        Err(e) => (e.error_type().to_string(), e.status_code()),
+    };
+
+    Ok(format!(
+        "{{\"missing_table_type\":\"{etype}\",\"missing_table_status\":{status}}}"
+    ))
+}

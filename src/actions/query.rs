@@ -640,11 +640,18 @@ pub async fn execute<S: StorageBackend>(
             let base_pk = esk
                 .get(&table_key_schema.partition_key)
                 .and_then(|v| v.to_key_string());
-            let base_sk = table_key_schema
-                .sort_key
-                .as_ref()
-                .and_then(|sk_name| esk.get(sk_name))
-                .and_then(|v| v.to_key_string());
+            // When the base table is hash-only there is no base sort key, but the
+            // GSI/LSI row stores the empty-string default in its table_sk column.
+            // Default base_sk to "" (mirroring start_sk) so the composite cursor
+            // keeps its full width and disambiguates tied index keys by table_pk.
+            // Leaving it None collapses query_gsi_items to the 1-column gsi_sk
+            // cursor, which cannot advance past rows sharing the same index key
+            // and silently drops them. See scan.rs for the Scan-path counterpart.
+            let base_sk = if let Some(sk_name) = table_key_schema.sort_key.as_ref() {
+                esk.get(sk_name).and_then(|v| v.to_key_string())
+            } else {
+                Some(String::new())
+            };
             (base_pk, base_sk)
         } else {
             (None, None)

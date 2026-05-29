@@ -126,7 +126,7 @@ dynoxide-rs = { version = "0.10", default-features = false, features = ["native-
 ### GitHub Actions
 
 ```yaml
-- uses: nubo-db/dynoxide@v1
+- uses: nubo-db/dynoxide/action@v0.10.0
   with:
     snapshot-url: https://example.com/test-data.db.zst  # optional
     port: 8000

@@ -164,7 +164,7 @@ if [ -n "$DDB_LOCAL_CONTAINER" ]; then
     CI_ARGS+=(--ddb-endpoint "http://localhost:${DDB_LOCAL_PORT}")
 fi
 cargo run --release --bin ci_pipeline_bench -- \
-    "${CI_ARGS[@]}" \
+    "${CI_ARGS[@]+"${CI_ARGS[@]}"}" \
     --output "$RESULTS_DIR/ci_pipeline.json"
 echo "Done"
 

@@ -40,29 +40,17 @@ Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:
 
 ### Conformance
 
-Verified against real DynamoDB by the [dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) suite:
+Dynoxide is continuously verified against real DynamoDB by the [dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) suite, which runs one test matrix against AWS itself and every major DynamoDB emulator. Pass rates move as the suite grows and each engine changes, so rather than pin a snapshot that goes stale, see the live standings:
 
-| Target | Tests | Pass Rate |
-|---|---|---|
-| DynamoDB | 601 | 100% |
-| **Dynoxide** | **601** | **100%** |
-| LocalStack | 601 | 89.0% |
-| DynamoDB Local | 601 | 88.2% |
-| dynalite | 601 | 78.0% |
-| ministack | 601 | 60.6% |
-| floci | 601 | 58.7% |
+- **[dynamodb-conformance.org](https://dynamodb-conformance.org)**: current pass rates for every engine, broken down by tier
+- **[nubo-db/dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance#results)**: the suite itself, the raw results, and how each target is run
 
-> Numbers reflect the conformance suite as of the v0.9.10 release.
-
-Those numbers are the native build. The [WebAssembly](#webassembly-preview) build is a preview and isn't run against the suite yet.
-
-See [full results by tier](https://github.com/nubo-db/dynamodb-conformance#results).
+This covers the native build. The [WebAssembly](#webassembly-preview) build is a preview and isn't run against the suite yet.
 
 ### How It Compares
 
 | | Dynoxide | DynamoDB Local | LocalStack (all services) | dynalite |
 |---|---|---|---|---|
-| Conformance (601 tests) | **100%** | 88.2% | 89.0% | 78.0% |
 | Language | Rust | Java | Python + Java | Node.js |
 | Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
 | Runtime dependency | — | JVM | Docker + LocalStack | Node.js |
@@ -115,11 +103,25 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "0.9", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "0.10", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "0.9", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "0.10", default-features = false, features = ["encryption"] }
 ```
+
+### Upgrading from 0.9.x
+
+0.10.0 is a breaking release, but most of the breaks are library-only. The [CHANGELOG](CHANGELOG.md) has the full list.
+
+**Running the binary** (Homebrew, npm, the release archives, or the Docker image)? One change affects you:
+
+- **MCP over HTTP now requires a bearer token.** Existing HTTP-transport clients break until they send an `Authorization: Bearer <token>` header. A loopback bind generates and persists a token on first run; a non-loopback bind will not start without one (`--mcp-token` or `DYNOXIDE_MCP_AUTH_TOKEN`). The stdio transport is unaffected, and plain `dynoxide serve` (DynamoDB only, no MCP) is unchanged. See [MCP Server](#mcp-server).
+
+**Depending on the `dynoxide-rs` crate?** Also note:
+
+- **`DynoxideError` is now `#[non_exhaustive]`.** Code that matches it exhaustively needs a `_ =>` arm.
+- **`Database` is now generic, `Database<S>`.** The parameter defaults to the native backend, so code that names `Database` keeps compiling; a new `NativeDatabase` alias names that default explicitly.
+- **Embedding the MCP HTTP server:** `dynoxide::mcp::serve_http` and `serve_http_with_shutdown` take an `HttpOptions` struct (bind host, auth mode, allowed hosts) in place of a bare port.
 
 ### GitHub Actions
 
@@ -181,7 +183,7 @@ The default in-memory mode needs no flags whether root or nonroot. The uid 65532
 
 #### MCP over HTTP in Docker
 
-The default image serves DynamoDB only. To also expose the [MCP](#mcp-server) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind — pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
+The default image serves DynamoDB only. To also expose the [MCP](#mcp-server) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind. Pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
 
 ```sh
 TOKEN=$(openssl rand -base64 24)
@@ -193,13 +195,13 @@ docker run --rm -p 8000:8000 -p 19280:19280 \
         --mcp --mcp-host 0.0.0.0 --mcp-port 19280
 ```
 
-DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localhost:19280/mcp`. Point an HTTP-transport MCP client at the latter with an `Authorization: Bearer <token>` header — see [MCP Server](#mcp-server) for the client config shape.
+DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localhost:19280/mcp`. Point an HTTP-transport MCP client at the latter with an `Authorization: Bearer <token>` header. See [MCP Server](#mcp-server) for the client config shape.
 
 A few things to know:
 
 - **The token is not optional.** Omit it and the container exits immediately with `a non-loopback MCP bind requires an explicit token`. The default `docker run ghcr.io/nubo-db/dynoxide` stays DynamoDB-only precisely because a token-less `0.0.0.0` MCP bind cannot boot.
 - **Reaching MCP from another container** by service name (rather than `localhost`) needs that name added to the Host allowlist: `--mcp-allowed-host <name>` (e.g. `--mcp-allowed-host dynoxide`). The `-p`-mapped `localhost` access above needs nothing extra.
-- **`--network host`** (Linux only) is an alternative to `-p`, but it bypasses Docker network isolation and binds MCP directly on the host's network interface — reachable from the LAN, not just the host. Prefer `-p` unless you specifically need host networking.
+- **`--network host`** (Linux only) is an alternative to `-p`, but it bypasses Docker network isolation and binds MCP directly on the host's network interface, reachable from the LAN, not just the host. Prefer `-p` unless you specifically need host networking.
 
 ## WebAssembly (preview)
 
@@ -327,13 +329,13 @@ wins if both are set).
 | `--no-auth` | Disable authentication. Loopback binds only; prints a warning. |
 
 Prefer the environment variable or the persisted file over `--token` for
-anything beyond one-shot debugging — flag values leak into shell history and
+anything beyond one-shot debugging, because flag values leak into shell history and
 `ps`. To rotate the token, delete the persisted file (or change
 `DYNOXIDE_MCP_AUTH_TOKEN`) and restart; there is no rotation mechanism by
 design.
 
-On the `serve` subcommand the equivalent flags are prefixed —
-`--mcp-host`, `--mcp-token`, `--mcp-no-auth`, `--mcp-allowed-host` — because
+On the `serve` subcommand the equivalent flags are prefixed
+(`--mcp-host`, `--mcp-token`, `--mcp-no-auth`, `--mcp-allowed-host`) because
 `serve` already owns `--host`/`--port` for the DynamoDB server.
 
 To run the HTTP transport from the container image, see
@@ -698,7 +700,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 `native-sqlite` and `encryption` are **mutually exclusive** - they select different SQLite backends. To use encryption:
 
 ```toml
-dynoxide-rs = { version = "0.9", default-features = false, features = ["encryption"] }
+dynoxide-rs = { version = "0.10", default-features = false, features = ["encryption"] }
 ```
 
 **Workspace note:** Cargo unifies features across a workspace. If any crate depends on `dynoxide-rs` with default features (getting `native-sqlite`) and another uses `encryption`, both activate and the build fails. Use `default-features = false` on all `dynoxide-rs` dependencies in the workspace.

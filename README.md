@@ -42,7 +42,7 @@ Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:
 
 Dynoxide is continuously verified against real DynamoDB by the [dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) suite, which runs one test matrix against AWS itself and every major DynamoDB emulator. Pass rates move as the suite grows and each engine changes, so rather than pin a snapshot that goes stale, see the live standings:
 
-- **[dynamodb-conformance.org](https://dynamodb-conformance.org)**: current pass rates for every engine, broken down by tier
+- **[paritysuite.org](https://paritysuite.org)**: current pass rates for every engine, broken down by tier
 - **[nubo-db/dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance#results)**: the suite itself, the raw results, and how each target is run
 
 This covers the native build. The [WebAssembly](#webassembly-preview) build is a preview and isn't run against the suite yet.

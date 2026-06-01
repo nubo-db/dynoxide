@@ -43,7 +43,7 @@ use crate::types::Tag;
 #[wasm_bindgen(module = "/js/wa-sqlite-bridge.js")]
 extern "C" {
     #[wasm_bindgen(catch, js_name = "open")]
-    async fn wa_open(name: &str) -> Result<JsValue, JsValue>;
+    async fn wa_open(name: &str, ephemeral: bool) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "exec")]
     async fn wa_exec(
@@ -64,15 +64,34 @@ extern "C" {
 pub struct WasmBridgeBackend {
     /// Opaque JS handle returned by the bridge `open`.
     handle: JsValue,
+    /// Active persistence mode reported by the bridge: `"opfs"` (survives
+    /// reload) or `"memory"` (ephemeral). Surfaced so the widget can warn when
+    /// a session will not persist.
+    persistence_mode: String,
     /// Wall clock for the trait's stream/TTL paths; `web-time`-backed on wasm.
     clock: Arc<dyn Clock>,
 }
 
 impl WasmBridgeBackend {
     /// Open (or create) a wa-sqlite database persisted under `name` (OPFS),
-    /// bootstrapping the shared metadata schema on first use.
+    /// bootstrapping the shared metadata schema on first use. Degrades to an
+    /// ephemeral in-memory session where OPFS sync access handles are
+    /// unavailable.
     pub async fn open(name: &str) -> Result<Self, BackendError> {
-        let handle = wa_open(name).await.map_err(js_err)?;
+        Self::open_with(name, false).await
+    }
+
+    /// Open as [`open`](Self::open), but force an ephemeral in-memory session
+    /// when `ephemeral` is true regardless of OPFS availability. The persistent
+    /// path still degrades to memory on its own when OPFS is unusable.
+    pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
+        let handle = wa_open(name, ephemeral).await.map_err(js_err)?;
+        // The bridge reports which VFS it actually opened against; read it off
+        // the handle before treating the handle as opaque.
+        let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "unknown".to_string());
         // Bootstrap the same metadata/config/stream schema the native backend
         // creates in `initialize`. `INIT_SCHEMA` is a multi-statement batch;
         // the bridge runs each statement in turn.
@@ -81,8 +100,14 @@ impl WasmBridgeBackend {
             .map_err(js_err)?;
         Ok(Self {
             handle,
+            persistence_mode,
             clock: SystemClock::arc(),
         })
+    }
+
+    /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
+    pub fn persistence_mode(&self) -> &str {
+        &self.persistence_mode
     }
 
     /// Run a statement that returns no rows.

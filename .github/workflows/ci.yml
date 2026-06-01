@@ -98,6 +98,21 @@ jobs:
       - name: cargo check (wasm32, wasm-harness)
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib
 
+  engine-client:
+    name: Engine client tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The EngineClient tests run against a stub worker over node:test, so they
+      # need no wasm build and no dependencies - just node --test.
+      - name: Test the engine client
+        run: node --test js/*.test.js
+
   # Gate the Docker smoke test on the paths that can actually break the
   # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
   # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version — both can

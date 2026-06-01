@@ -7,30 +7,51 @@
  * backend via `sql_builders`) and hands it here with a positional parameter
  * array; this module only opens the database and runs statements.
  *
- * Runs inside the dynoxide Web Worker (see js/dynoxide-worker.js). It uses
- * wa-sqlite's synchronous OPFS VFS (`AccessHandlePoolVFS`), backed by sync
+ * Runs inside the dynoxide Web Worker (see js/dynoxide-worker.js). Persistence
+ * uses wa-sqlite's synchronous OPFS VFS (`AccessHandlePoolVFS`), backed by sync
  * access handles, which browsers expose only in a Worker. Because that VFS is
  * synchronous it pairs with the smaller non-async wa-sqlite build (no Asyncify
- * instrumentation), which roughly halves the wa-sqlite wasm. The engine runs
- * in the Worker and the page talks to it over a coarse message RPC. No
- * cross-origin isolation (COOP/COEP) is required.
+ * instrumentation), which roughly halves the wa-sqlite wasm. No cross-origin
+ * isolation (COOP/COEP) is required.
  *
- * Imports use bare specifiers, so this module is bundler-friendly: the
- * production build bundles it with esbuild, and a future bundler-target npm
- * consumer resolves the same imports. wa-sqlite's `.wasm` is located at
- * runtime via `locateFile` relative to the bundle, so it ships as a sibling
- * asset rather than being inlined. Not exercised by the conformance suite (see
- * the WASM note in the README).
+ * Where OPFS sync access handles are unavailable - Firefox private windows,
+ * older Safari - or an embedder asks for it, `open` falls back to an in-memory
+ * VFS (`MemoryVFS`, also synchronous, so no async build): the session works but
+ * does not survive a reload. The active mode comes back on the open handle as
+ * `persistenceMode` so the engine can warn the user. A persistent IndexedDB
+ * fallback would need the Asyncify async build (~2x the wasm) and is out of
+ * scope here.
+ *
+ * Each database opens against its own named VFS over a per-name OPFS directory,
+ * so two engine instances (two Workers) never contend on a shared pool. The
+ * base `AccessHandlePoolVFS` hardcodes its registry name, so we shadow it with
+ * a per-pool name and select it explicitly through `open_v2`'s `zVfs` argument.
+ *
+ * Imports use bare specifiers, so this module is bundler-friendly. wa-sqlite's
+ * `.wasm` is located at runtime via `locateFile` relative to the bundle, so it
+ * ships as a sibling asset rather than being inlined. Not exercised by the
+ * conformance suite (see the WASM note in the README).
  */
 
 import * as SQLite from "wa-sqlite";
 import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite.mjs";
 import { AccessHandlePoolVFS } from "wa-sqlite/src/examples/AccessHandlePoolVFS.js";
+import { MemoryVFS } from "wa-sqlite/src/examples/MemoryVFS.js";
 
-// Lazily initialised SQLite API handle, shared across opens. We memoise the
-// in-flight promise rather than the resolved value, so two concurrent first
-// callers share one initialisation and the VFS is registered exactly once. On
-// failure we clear it so a later call can retry rather than caching the error.
+/** Persistent OPFS-backed session: survives reload. */
+const PERSISTENT = "opfs";
+/** Ephemeral in-memory session: lost on reload. */
+const EPHEMERAL = "memory";
+
+// Shared encoder for the fnv1a_hash scalar, which fires once per row in a
+// parallel-scan segment query; allocating one per call would churn the GC.
+const ENCODER = new TextEncoder();
+
+// Lazily initialised SQLite API handle, shared across opens within this Worker.
+// We memoise the in-flight promise rather than the resolved value, so two
+// concurrent first callers share one initialisation. On failure we clear it so
+// a later call can retry rather than caching the error. No VFS is registered
+// here; `open` registers the right one for its database.
 let sqlite3Promise = null;
 
 function moduleHandle() {
@@ -42,15 +63,7 @@ function moduleHandle() {
       const module = await SQLiteESMFactory({
         locateFile: (file) => new URL(file, import.meta.url).href,
       });
-      const s = SQLite.Factory(module);
-
-      // Synchronous OPFS VFS (Worker-only). It keeps its pool of access handles
-      // in one OPFS directory; `isReady` resolves once that pool is acquired.
-      // Registered as the default so open_v2 uses it.
-      const vfs = new AccessHandlePoolVFS("/dynoxide");
-      await vfs.isReady;
-      s.vfs_register(vfs, true);
-      return s;
+      return SQLite.Factory(module);
     })().catch((err) => {
       sqlite3Promise = null;
       throw err;
@@ -59,13 +72,101 @@ function moduleHandle() {
   return sqlite3Promise;
 }
 
+// VFS registry for this Worker, keyed by OPFS pool path so repeated opens of
+// one database reuse a single registration. Each entry records the SQLite VFS
+// name to pass to open_v2 and the persistence mode that won.
+const vfsByPool = new Map();
+
+// FNV-1a (32-bit) over the raw name, so two names that sanitise to the same
+// characters (e.g. "a.b" and "a_b") still get distinct pools.
+function nameHash(name) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < name.length; i += 1) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+// A filesystem-safe, collision-free slug for a database name, used to derive a
+// per-instance OPFS directory and VFS name so two engine instances never share
+// a pool. The hash suffix keeps distinct raw names distinct even when their
+// sanitised characters collide.
+function slug(name) {
+  const raw = name || "default";
+  return `${raw.replace(/[^a-zA-Z0-9_-]/g, "_")}-${nameHash(raw)}`;
+}
+
+// Whether this context can back the synchronous OPFS VFS. The definitive test
+// is constructing the pool and awaiting isReady (done in registerVfs); this is
+// the cheap pre-check that lets an obviously-unsupported context skip straight
+// to the in-memory fallback.
+function opfsSyncAvailable() {
+  try {
+    return (
+      typeof navigator !== "undefined" &&
+      !!navigator.storage &&
+      typeof navigator.storage.getDirectory === "function" &&
+      typeof FileSystemFileHandle !== "undefined" &&
+      "createSyncAccessHandle" in FileSystemFileHandle.prototype
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Register (once per pool path) a VFS for `name`. Prefers the persistent OPFS
+// pool; falls back to an ephemeral in-memory VFS when `ephemeral` is requested,
+// when OPFS sync access handles are unavailable, or when the pool fails to
+// initialise. Returns { vfsName, mode }.
+async function registerVfs(s, name, ephemeral) {
+  const poolPath = `/dynoxide/${slug(name)}`;
+  const cached = vfsByPool.get(poolPath);
+  if (cached) return cached;
+
+  let entry = null;
+  if (!ephemeral && opfsSyncAvailable()) {
+    try {
+      const vfsName = `dynoxide-opfs-${slug(name)}`;
+      const vfs = new AccessHandlePoolVFS(poolPath);
+      // The base class hardcodes `get name() { return 'AccessHandlePool' }`;
+      // shadow it with a per-pool name so distinct instances register distinct
+      // VFSes and open_v2 selects the right one.
+      Object.defineProperty(vfs, "name", { value: vfsName, configurable: true });
+      await vfs.isReady;
+      s.vfs_register(vfs, false);
+      entry = { vfsName, mode: PERSISTENT };
+    } catch {
+      entry = null; // OPFS present but unusable here: fall through to memory.
+    }
+  }
+
+  if (!entry) {
+    const vfsName = `dynoxide-memory-${slug(name)}`;
+    const vfs = new MemoryVFS();
+    vfs.name = vfsName; // MemoryVFS exposes `name` as a writable field.
+    s.vfs_register(vfs, false);
+    entry = { vfsName, mode: EPHEMERAL };
+  }
+
+  vfsByPool.set(poolPath, entry);
+  return entry;
+}
+
 /**
- * Open (or create) a database persisted under `name`.
- * Returns an opaque handle passed back to `exec`/`query`.
+ * Open (or create) a database under `name`. When `ephemeral` is true, or OPFS
+ * sync access handles are unavailable, the session is in-memory and does not
+ * persist. Returns an opaque handle (passed back to `exec`/`query`) carrying
+ * the active `persistenceMode`.
  */
-export async function open(name) {
+export async function open(name, ephemeral = false) {
   const s = await moduleHandle();
-  const db = await s.open_v2(name);
+  const { vfsName, mode } = await registerVfs(s, name, ephemeral);
+  const db = await s.open_v2(
+    name,
+    SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
+    vfsName,
+  );
 
   // Register fnv1a_hash for GSI/LSI parallel-scan segment filtering, matching
   // the native scalar function: FNV-1a (32-bit) over the value's UTF-8 bytes,
@@ -78,7 +179,7 @@ export async function open(name) {
     0,
     (context, values) => {
       const text = s.value(values[0]);
-      const bytes = new TextEncoder().encode(typeof text === "string" ? text : "");
+      const bytes = ENCODER.encode(typeof text === "string" ? text : "");
       let hash = 0x811c9dc5;
       for (const b of bytes) {
         hash ^= b;
@@ -90,7 +191,7 @@ export async function open(name) {
     null,
   );
 
-  return { db };
+  return { db, persistenceMode: mode };
 }
 
 /**

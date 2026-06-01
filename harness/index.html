@@ -10,7 +10,7 @@
       production consumers, so a green harness means the shipping artefact works
       - not a parallel build. The engine runs in the Worker (wa-sqlite needs
       OPFS sync access handles, which are Worker-only); this page drives it over
-      a message RPC.
+      a message RPC, exercising the operation-level `execute` API end to end.
 
       Build the dist/ first (from the repo root):
         npm install
@@ -24,7 +24,7 @@
     -->
   </head>
   <body>
-    <h1>dynoxide wasm-sqlite smoke test</h1>
+    <h1>dynoxide wasm-sqlite execute harness</h1>
     <pre id="out">running...</pre>
     <script type="module">
       const out = document.getElementById("out");
@@ -45,18 +45,69 @@
         });
       }
 
+      // Run one DynamoDB operation through the execute RPC, parsing the
+      // response JSON the engine returns.
+      const exec = async (op, request) =>
+        JSON.parse(await call("execute", { op, request }));
+
+      const TABLE = "HarnessMusic";
+
       try {
-        const smoke = await call("smoke");
-        const index = await call("index");
-        const errors = await call("errors");
+        // Boot: open the engine and read the contract descriptor.
+        const descriptor = JSON.parse(await call("open", { name: "harness.db" }));
+
+        // OPFS persists across runs, so drop any table left by a prior run.
+        try {
+          await exec("DeleteTable", { TableName: TABLE });
+        } catch {
+          /* first run: table does not exist yet */
+        }
+
+        await exec("CreateTable", {
+          TableName: TABLE,
+          KeySchema: [
+            { AttributeName: "artist", KeyType: "HASH" },
+            { AttributeName: "song", KeyType: "RANGE" },
+          ],
+          AttributeDefinitions: [
+            { AttributeName: "artist", AttributeType: "S" },
+            { AttributeName: "song", AttributeType: "S" },
+          ],
+          BillingMode: "PAY_PER_REQUEST",
+        });
+
+        for (const [song, genre] of [["s1", "rock"], ["s2", "jazz"], ["s3", "rock"]]) {
+          await exec("PutItem", {
+            TableName: TABLE,
+            Item: {
+              artist: { S: "a" },
+              song: { S: song },
+              genre: { S: genre },
+            },
+          });
+        }
+
+        const query = await exec("Query", {
+          TableName: TABLE,
+          KeyConditionExpression: "artist = :a",
+          ExpressionAttributeValues: { ":a": { S: "a" } },
+        });
+
+        const scan = await exec("Scan", {
+          TableName: TABLE,
+          FilterExpression: "genre = :g",
+          ExpressionAttributeValues: { ":g": { S: "rock" } },
+        });
+
+        const ok = query.Count === 3 && scan.Count === 2 && scan.ScannedCount === 3;
         out.textContent =
-          "PASS (engine in Worker, OPFS)\nsmoke: " +
-          smoke +
-          "\nindex: " +
-          index +
-          "\nerrors: " +
-          errors;
-        window.__SMOKE_RESULT__ = { ok: true, smoke, index, errors };
+          (ok ? "PASS" : "FAIL") +
+          " (engine in Worker, OPFS, execute API)\n" +
+          "contract: " + JSON.stringify(descriptor) + "\n" +
+          "query.Count: " + query.Count + "\n" +
+          "scan.Count / ScannedCount: " + scan.Count + " / " + scan.ScannedCount +
+          "  (filtered scan reads more than it returns)";
+        window.__SMOKE_RESULT__ = { ok, descriptor, query, scan };
       } catch (e) {
         out.textContent = "FAIL\n" + ((e && e.stack) || e);
         window.__SMOKE_RESULT__ = { ok: false, error: String(e) };

@@ -296,7 +296,7 @@ async fn handle_request(
         .or_else(|| target.strip_prefix(STREAMS_TARGET_PREFIX));
 
     let operation = match operation {
-        Some(op) if is_known_operation(op) => op,
+        Some(op) if crate::dynamo_ops::is_known_operation(op) => op,
         _ => {
             // Unrecognised target prefix or unknown operation
             return unknown_operation_response(response_ct);
@@ -482,40 +482,6 @@ fn validate_auth(headers: &HeaderMap, uri: &Uri, response_ct: &str) -> Option<Re
 
 /// Java ClassCastException message that DynamoDB leaks for certain type mismatches.
 const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl cannot be cast to class java.lang.Class (sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl and java.lang.Class are in module java.base of loader 'bootstrap')";
-
-/// Known DynamoDB operations — used to distinguish unknown targets from known ones.
-fn is_known_operation(op: &str) -> bool {
-    matches!(
-        op,
-        "CreateTable"
-            | "DeleteTable"
-            | "DescribeTable"
-            | "ListTables"
-            | "UpdateTable"
-            | "PutItem"
-            | "GetItem"
-            | "DeleteItem"
-            | "UpdateItem"
-            | "Query"
-            | "Scan"
-            | "BatchGetItem"
-            | "BatchWriteItem"
-            | "TransactWriteItems"
-            | "TransactGetItems"
-            | "ListStreams"
-            | "DescribeStream"
-            | "GetShardIterator"
-            | "GetRecords"
-            | "UpdateTimeToLive"
-            | "DescribeTimeToLive"
-            | "ExecuteStatement"
-            | "ExecuteTransaction"
-            | "BatchExecuteStatement"
-            | "TagResource"
-            | "UntagResource"
-            | "ListTagsOfResource"
-    )
-}
 
 /// SerializationException with no message (just `__type`).
 /// Used for JSON parse failures at the connection level.
@@ -1382,8 +1348,8 @@ fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String>
             serialize(&resp)
         }
         _ => {
-            // This should not be reachable because is_known_operation() filters first,
-            // but handle it defensively.
+            // This should not be reachable because the dynamo_ops::is_known_operation
+            // gate on the target match filters first, but handle it defensively.
             Err(crate::DynoxideError::SerializationException(
                 "UnknownOperationException".to_string(),
             ))

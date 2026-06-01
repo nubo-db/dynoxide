@@ -6,7 +6,9 @@
   "description": "JS bridge and build for the dynoxide wasm-sqlite backend (preview). Bundles the wa-sqlite glue and the wasm-bindgen Worker into a self-contained dist/.",
   "scripts": {
     "build:wasm": "./scripts/build-wasm.sh",
-    "build:wasm:dev": "./scripts/build-wasm.sh --dev"
+    "build:wasm:dev": "./scripts/build-wasm.sh --dev",
+    "build:wasm:harness": "./scripts/build-wasm.sh --dev --harness",
+    "test": "node --test js/*.test.js"
   },
   "devDependencies": {
     "esbuild": "^0.28.0",

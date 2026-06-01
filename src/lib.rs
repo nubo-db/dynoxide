@@ -61,6 +61,17 @@ pub mod streams;
 pub mod ttl;
 pub mod types;
 pub mod validation;
+// The single source of truth for DynamoDB operation names, shared by the HTTP
+// server and the wasm engine API so the two lists cannot drift. Compiled only
+// for the builds that consume it.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) mod dynamo_ops;
+// Operation-level engine API for the browser playground. The generic dispatch
+// is backend-agnostic and verified natively in tests, so the module compiles
+// for the wasm build and under `cargo test`; a plain native build gains no
+// extra public surface.
+#[cfg(any(feature = "wasm-sqlite", test))]
+pub mod wasm_api;
 #[cfg(feature = "wasm-harness")]
 pub mod wasm_harness;
 
@@ -787,9 +798,16 @@ impl Database<RusqliteBackend> {
 /// writer at a time, `BEGIN IMMEDIATE` cannot return `SQLITE_BUSY`.
 #[cfg(feature = "wasm-sqlite")]
 impl Database<WasmBridgeBackend> {
-    /// Open (or create) a wa-sqlite database persisted to OPFS under `name`.
+    /// Open (or create) a wa-sqlite database persisted to OPFS under `name`,
+    /// degrading to an ephemeral in-memory session where OPFS is unavailable.
     pub async fn open(name: &str) -> Result<Self> {
-        let backend = WasmBridgeBackend::open(name)
+        Self::open_with(name, false).await
+    }
+
+    /// Open as [`open`](Self::open), but force an ephemeral in-memory session
+    /// when `ephemeral` is true.
+    pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self> {
+        let backend = WasmBridgeBackend::open_with(name, ephemeral)
             .await
             .map_err(DynoxideError::from)?;
         Ok(Self {
@@ -798,11 +816,20 @@ impl Database<WasmBridgeBackend> {
         })
     }
 
+    /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
+    pub async fn persistence_mode(&self) -> String {
+        self.backend().await.persistence_mode().to_string()
+    }
+
     /// Lock the single backend for the span of one handler call. The guard is
     /// held across the whole call so the operation (including any transaction)
     /// is atomic; the async mutex queues concurrent callers rather than
     /// deadlocking, and never poisons.
-    async fn backend(&self) -> async_lock::MutexGuard<'_, WasmBridgeBackend> {
+    ///
+    /// `pub(crate)` so the operation-level [`wasm_api`](crate::wasm_api) engine
+    /// can hold the lock across a whole `execute` dispatch, matching the
+    /// per-handler atomicity of the wrappers below.
+    pub(crate) async fn backend(&self) -> async_lock::MutexGuard<'_, WasmBridgeBackend> {
         self.inner.lock().await
     }
 

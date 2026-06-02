@@ -2,6 +2,15 @@
 /pkg
 /dist
 /node_modules
+# Engine package build artefacts: scripts/build-wasm.sh assembles these into
+# npm/dynoxide-engine/. Only package.json and README.md there are source.
+/npm/dynoxide-engine/engine-client.js
+/npm/dynoxide-engine/dynoxide-worker.js
+/npm/dynoxide-engine/dynoxide_bg.wasm
+/npm/dynoxide-engine/wa-sqlite.wasm
+/npm/dynoxide-engine/manifest.json
+/npm/dynoxide-engine/LICENSE-MIT
+/npm/dynoxide-engine/LICENSE-APACHE
 *.swp
 *.swo
 *~

@@ -76,3 +76,35 @@ echo "dist/ ready ($profile, $feature):"
 for f in dist/*; do
   printf '  %-26s %8d bytes\n' "$(basename "$f")" "$(wc -c < "$f")"
 done
+
+# 5. Assemble the publishable engine package. It ships the runtime assets (the
+#    Worker, the two .wasm and the manifest) beside the EngineClient, so a
+#    consumer depends on the package rather than this repo's source.
+#    engine-client.js is the package entry; it resolves the Worker next to
+#    itself and the Worker resolves its .wasm next to the Worker - the same
+#    import.meta.url chain dist/ relies on, so dropping the package's files in
+#    one place works from any path or origin. package.json and README.md are the
+#    only checked-in files here; everything else is copied in and gitignored.
+#    Skipped for --harness, which is a smoke build and is never shipped.
+if [ "$feature" = "wasm-sqlite" ]; then
+  pkg="npm/dynoxide-engine"
+
+  # The JS client bakes in its own CONTRACT_VERSION and validates it against the
+  # engine on boot, so the two hand-written constants must ship equal. Catch a
+  # drift here, at build time, rather than in a consumer at runtime.
+  js_contract="$(grep -m1 'export const CONTRACT_VERSION' js/engine-client.js | sed -E 's/[^0-9]*([0-9]+).*/\1/')"
+  if [ "$js_contract" != "$contract_version" ]; then
+    echo "error: contract drift - js/engine-client.js CONTRACT_VERSION=$js_contract, src/wasm_api.rs=$contract_version" >&2
+    exit 1
+  fi
+
+  cp dist/dynoxide-worker.js dist/dynoxide_bg.wasm dist/wa-sqlite.wasm dist/manifest.json "$pkg/"
+  cp js/engine-client.js "$pkg/"
+  cp LICENSE-MIT LICENSE-APACHE "$pkg/"
+
+  echo
+  echo "engine package $pkg/ (npm pack-ready):"
+  for f in engine-client.js dynoxide-worker.js dynoxide_bg.wasm wa-sqlite.wasm manifest.json; do
+    printf '  %-26s %8d bytes\n' "$f" "$(wc -c < "$pkg/$f")"
+  done
+fi

@@ -1,0 +1,48 @@
+{
+  "name": "@nubo-db/dynoxide-engine",
+  "version": "0.0.0-development",
+  "type": "module",
+  "description": "The dynoxide DynamoDB-compatible engine compiled to WebAssembly, with a Web Worker client for running real DynamoDB operations in the browser. Preview.",
+  "author": "Martin Hicks",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nubo-db/dynoxide"
+  },
+  "homepage": "https://dynoxide.dev",
+  "keywords": [
+    "dynamodb",
+    "wasm",
+    "webassembly",
+    "sqlite",
+    "browser",
+    "web-worker",
+    "emulator",
+    "dynamodb-local"
+  ],
+  "main": "./engine-client.js",
+  "module": "./engine-client.js",
+  "exports": {
+    ".": "./engine-client.js",
+    "./worker": "./dynoxide-worker.js",
+    "./manifest.json": "./manifest.json",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "engine-client.js",
+    "dynoxide-worker.js",
+    "dynoxide_bg.wasm",
+    "wa-sqlite.wasm",
+    "manifest.json",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

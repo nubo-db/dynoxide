@@ -237,7 +237,7 @@ npm run build:wasm
 
 About 1.6 MB total. Not tiny, but the `.wasm` files are immutable and cache well, and using wa-sqlite's synchronous build keeps it off the larger Asyncify async build.
 
-Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running wa-sqlite's synchronous OPFS VFS inside a Worker, where synchronous file handles are available directly.)
+Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running wa-sqlite's synchronous OPFS VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
 
 ### The embed contract
 
@@ -267,7 +267,23 @@ python3 -m http.server 8081
 
 It opens the engine, creates a table, writes a few rows, then runs a query and a filtered scan against the OPFS-backed database so you can see `ScannedCount` come back higher than `Count`. Because it drives the shipping bundle rather than a parallel build, a green harness means the shipping artefact works. (The older smoke ops live behind `npm run build:wasm:harness`, which adds them on top of the same Worker.)
 
-The bridge and Worker use bare module specifiers, so the same source also feeds a bundler-target build (vite, webpack, esbuild) for consumers who would rather an npm package. That path is a follow-up.
+### The engine package
+
+Rather than build the engine yourself, you can depend on the same artefacts as an npm package, `@nubo-db/dynoxide-engine`. `npm run build:wasm` assembles it under `npm/dynoxide-engine/` - the Worker, the two `.wasm`, the manifest, and an `EngineClient` that owns the RPC above so you deal in objects, not `postMessage` envelopes:
+
+```js
+import { EngineClient } from "@nubo-db/dynoxide-engine";
+
+const client = new EngineClient();        // resolves the Worker beside the package
+await client.ready();
+
+await client.execute("CreateTable", { /* ... */ });
+const { Items } = await client.execute("Query", { /* ... */ });
+```
+
+`new EngineClient()` with no arguments resolves the Worker next to the package, and the Worker resolves the `.wasm` next to itself, so a bundler that copies the package's files - or a plain static deploy of them - needs no configuration. Serving the assets from a CDN or another origin? Pass `assetBase` (the directory they sit in) or `workerUrl` (the exact Worker URL).
+
+The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. It's a preview, like the rest of the wasm build.
 
 ## HTTP Server
 

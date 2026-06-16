@@ -73,10 +73,20 @@ Or run directly without installing:
 npx dynoxide --port 8000
 ```
 
-### Homebrew (macOS)
+### Homebrew (macOS and Linux)
 
 ```sh
 brew install nubo-db/tap/dynoxide
+```
+
+Homebrew 6.0.0 added [tap trust](https://docs.brew.sh/Tap-Trust). The fully-qualified command above still installs fine (Homebrew trusts a named formula at install time), but the tap stays untrusted after that, so `brew upgrade` will skip Dynoxide and `brew doctor` will flag the tap. Trust it once:
+
+```sh
+# Trust just Dynoxide - lets brew upgrade see it again
+brew trust --formula nubo-db/tap/dynoxide
+
+# Or trust the whole tap - also clears the brew doctor warning
+brew trust nubo-db/tap
 ```
 
 ### Pre-built binaries

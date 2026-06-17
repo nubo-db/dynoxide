@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a capability or a compatibility improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What are you trying to do, and what is getting in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: aws-behaviour
+    attributes:
+      label: AWS behaviour being matched
+      description: For a compatibility request, describe the AWS DynamoDB behaviour and link the AWS docs or note that motivates it. Leave blank otherwise.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?

@@ -471,3 +471,35 @@ fn test_put_item_from_json() {
     let item = resp.item.unwrap();
     assert_eq!(item["data"], AttributeValue::N("42".into()));
 }
+
+#[test]
+fn test_put_item_accepts_null_false() {
+    // AWS accepts {"NULL": false} on PutItem and reads it back as
+    // {"NULL": true}. Regression guard for that round-trip.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let json = r#"{
+        "TableName": "Items",
+        "Item": {
+            "pk": {"S": "null-false"},
+            "flag": {"NULL": false}
+        }
+    }"#;
+
+    let request: PutItemRequest = serde_json::from_str(json).unwrap();
+    db.put_item(request).unwrap();
+
+    let resp = db
+        .get_item(GetItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("null-false".into()))]),
+            consistent_read: None,
+            projection_expression: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let item = resp.item.unwrap();
+    assert_eq!(item["flag"], AttributeValue::NULL(true));
+}

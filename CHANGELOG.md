@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The wasm engine gained an operation-level `execute` API, and a new npm package, `@nubo-db/dynoxide-engine`, that ships it. The Worker answers a small versioned RPC - `open`, `execute`, `capabilities`, `contractVersion` - with `{id, op, payload}` in and `{id, ok, result|error}` out, and a bundled `EngineClient` owns the round trip so you deal in objects instead of hand-building postMessage envelopes. `npm run build:wasm` assembles the package: the Worker, the two `.wasm`, the `EngineClient`, and a `manifest.json` stamped with the engine and contract versions. Depend on that built package, not this repo's source. The client checks its `CONTRACT_VERSION` against the engine on boot and fails loudly if they differ, so a stale embed can't quietly mis-read a newer one. Still a preview: the wasm path isn't run against the conformance suite.
 
+### Fixed
+
+- `PutItem` and the other write paths now accept a `{"NULL": false}` attribute value and read it back as `{"NULL": true}`, where before they rejected it with `One or more parameter values were invalid: Null attribute value types must have the value of true`. The NULL member is typed as a plain boolean in the model, so `false` was valid input all along; AWS has dropped the server-side true-only rule and normalises `false` to `true` on read, and dynoxide now matches. A non-boolean NULL such as `{"NULL": "no"}` is still rejected as a type error ([#62](https://github.com/nubo-db/dynoxide/issues/62)).
+
 ## [0.10.0] - 2026-05-29
 
 ### Added

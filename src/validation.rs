@@ -341,11 +341,6 @@ fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> 
         ));
     }
     match value {
-        AttributeValue::NULL(b) if !b => Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Null attribute value types must have the value of true"
-                .to_string(),
-        )),
         AttributeValue::SS(set) if set.is_empty() => Err(DynoxideError::ValidationException(
             "One or more parameter values were invalid: An string set  may not be empty"
                 .to_string(),
@@ -429,7 +424,6 @@ fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> 
 /// This validates the attribute values in a Key map for:
 /// - Invalid/empty numbers
 /// - Empty sets, duplicate sets
-/// - NULL attribute with non-true value
 /// - Multiple datatypes
 ///
 /// These errors are returned with "One or more parameter values were invalid: " prefix.
@@ -442,13 +436,6 @@ pub fn validate_key_attribute_values(key: &Item) -> Result<()> {
 
 fn validate_key_attr_value(value: &AttributeValue) -> Result<()> {
     match value {
-        AttributeValue::NULL(b) if !b => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: \
-                 Null attribute value types must have the value of true"
-                    .to_string(),
-            ));
-        }
         AttributeValue::SS(set) if set.is_empty() => {
             return Err(DynoxideError::ValidationException(
                 "One or more parameter values were invalid: An string set  may not be empty"

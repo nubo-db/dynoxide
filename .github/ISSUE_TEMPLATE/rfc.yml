@@ -1,0 +1,22 @@
+name: RFC / substantial change
+description: Propose a change to the wire contract, storage backend, auth, on-disk format, or CLI/config, or a large new feature.
+labels: ["rfc"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Substantial changes go through a short RFC. See `docs/rfcs/README.md` for what needs one and how it works. Use this issue to sketch the idea before opening the RFC pull request.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What do you want to change?
+      description: A short summary of the change and the problem it solves.
+    validations:
+      required: true
+  - type: textarea
+    id: surfaces
+    attributes:
+      label: What does it touch?
+      description: Wire contract, StorageBackend trait, auth, on-disk format, CLI/config, or a new subsystem.
+    validations:
+      required: true

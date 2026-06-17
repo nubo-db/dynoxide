@@ -11,8 +11,6 @@ where direction was agreed. -->
 - [ ] Tests added or updated
 - [ ] `cargo fmt --check` and `cargo clippy -- -D warnings` pass locally
 - [ ] `CHANGELOG.md` updated if this is a user-visible change
-- [ ] If AI tools drafted or materially shaped this change, disclosed
-  in the description above
 - [ ] Linked issue, discussion, or a short note explaining the
   motivation
 

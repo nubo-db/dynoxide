@@ -268,10 +268,17 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 Ok(AttributeValue::BOOL(b))
             }
             "NULL" => {
-                // DynamoDB treats non-boolean NULL values (e.g. {"NULL": "no"}) as
-                // NULL(false) and rejects them during validation, not serialisation.
-                let n = val.as_bool().unwrap_or(false);
-                Ok(AttributeValue::NULL(n))
+                // The NULL member is a plain boolean in the model. AWS accepts both
+                // {"NULL": true} and {"NULL": false} and reads either back as
+                // {"NULL": true}, so normalise false to true here. A non-boolean
+                // value (e.g. {"NULL": "no"}) is a type error.
+                if val.as_bool().is_none() {
+                    return Err(de::Error::custom(
+                        "VALIDATION:One or more parameter values were invalid: \
+                         Null attribute value types must have the value of true",
+                    ));
+                }
+                Ok(AttributeValue::NULL(true))
             }
             "SS" => {
                 let arr = val
@@ -1370,6 +1377,31 @@ mod tests {
         let val = AttributeValue::NULL(true);
         let json = serde_json::to_string(&val).unwrap();
         assert_eq!(json, r#"{"NULL":true}"#);
+    }
+
+    #[test]
+    fn test_deserialize_null_true() {
+        let val: AttributeValue = serde_json::from_str(r#"{"NULL":true}"#).unwrap();
+        assert_eq!(val, AttributeValue::NULL(true));
+    }
+
+    #[test]
+    fn test_deserialize_null_false_normalises_to_true() {
+        // The NULL member is a plain boolean in the model, so {"NULL": false} is
+        // valid input. AWS accepts it and reads it back as {"NULL": true}, so
+        // normalise false to true on the way in.
+        let val: AttributeValue = serde_json::from_str(r#"{"NULL":false}"#).unwrap();
+        assert_eq!(val, AttributeValue::NULL(true));
+    }
+
+    #[test]
+    fn test_deserialize_null_non_boolean_rejected() {
+        // A non-boolean NULL (e.g. {"NULL": "no"}) is a type error, not a value.
+        let err = serde_json::from_str::<AttributeValue>(r#"{"NULL":"no"}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("must have the value of true"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

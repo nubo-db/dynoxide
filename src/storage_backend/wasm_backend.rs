@@ -58,6 +58,9 @@ extern "C" {
         sql: &str,
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = "close")]
+    async fn wa_close(handle: &JsValue) -> Result<JsValue, JsValue>;
 }
 
 /// wa-sqlite-backed storage backend driven through the JS bridge.
@@ -108,6 +111,15 @@ impl WasmBridgeBackend {
     /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
     pub fn persistence_mode(&self) -> &str {
         &self.persistence_mode
+    }
+
+    /// Close the underlying wa-sqlite connection. The wasm engine calls this
+    /// before a re-open swaps in a new database, so the previous connection -
+    /// and the OPFS handles it would otherwise hold past its lifetime - is
+    /// released rather than leaked.
+    pub async fn close(&self) -> Result<(), BackendError> {
+        wa_close(&self.handle).await.map_err(js_err)?;
+        Ok(())
     }
 
     /// Run a statement that returns no rows.

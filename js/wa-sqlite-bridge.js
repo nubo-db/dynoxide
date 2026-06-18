@@ -22,6 +22,13 @@
  * fallback would need the Asyncify async build (~2x the wasm) and is out of
  * scope here.
  *
+ * The fallback is for contexts where OPFS genuinely isn't available, not a
+ * catch-all. When OPFS *is* available but the pool cannot be acquired - most
+ * often because another tab or Worker already holds this database's sync access
+ * handles - `open` throws an `OpfsUnavailableError` rather than silently forking
+ * to a separate in-memory store, which would split reads and writes across two
+ * datasets and lose everything on reload.
+ *
  * Each database opens against its own named VFS over a per-name OPFS directory,
  * so two engine instances (two Workers) never contend on a shared pool. The
  * base `AccessHandlePoolVFS` hardcodes its registry name, so we shadow it with
@@ -73,9 +80,53 @@ function moduleHandle() {
 }
 
 // VFS registry for this Worker, keyed by OPFS pool path so repeated opens of
-// one database reuse a single registration. Each entry records the SQLite VFS
-// name to pass to open_v2 and the persistence mode that won.
+// one database reuse a single registration. Each entry is the *in-flight*
+// registration promise (resolving to { vfsName, mode }), not the resolved
+// value, so two concurrent opens of one database share a single registration
+// rather than both running vfs_register. A resolved registration stays cached
+// for the Worker's life; a failed one is dropped so a later open can retry.
 const vfsByPool = new Map();
+
+/**
+ * OPFS is present but its pool could not be acquired. Distinct from the
+ * unavailable case (no sync access handles at all), which falls back to memory:
+ * this is a real failure - usually another tab or Worker holding the lock - and
+ * is surfaced rather than silently swapped for an in-memory store.
+ */
+export class OpfsUnavailableError extends Error {
+  constructor(message, options) {
+    super(message);
+    this.name = "OpfsUnavailableError";
+    if (options && "cause" in options) this.cause = options.cause;
+  }
+}
+
+// A sync access handle already held elsewhere surfaces as one of these. Used to
+// phrase a "busy" message apart from a generic OPFS open failure.
+function isBusyLock(err) {
+  const name = err && err.name;
+  return name === "NoModificationAllowedError" || name === "InvalidStateError";
+}
+
+function registerMemoryVfs(s, name) {
+  const vfsName = `dynoxide-memory-${slug(name)}`;
+  const vfs = new MemoryVFS();
+  vfs.name = vfsName; // MemoryVFS exposes `name` as a writable field.
+  s.vfs_register(vfs, false);
+  return { vfsName, mode: EPHEMERAL };
+}
+
+async function registerOpfsVfs(s, name, poolPath) {
+  const vfsName = `dynoxide-opfs-${slug(name)}`;
+  const vfs = new AccessHandlePoolVFS(poolPath);
+  // The base class hardcodes `get name() { return 'AccessHandlePool' }`;
+  // shadow it with a per-pool name so distinct instances register distinct
+  // VFSes and open_v2 selects the right one.
+  Object.defineProperty(vfs, "name", { value: vfsName, configurable: true });
+  await vfs.isReady;
+  s.vfs_register(vfs, false);
+  return { vfsName, mode: PERSISTENT };
+}
 
 // FNV-1a (32-bit) over the raw name, so two names that sanitise to the same
 // characters (e.g. "a.b" and "a_b") still get distinct pools.
@@ -115,42 +166,46 @@ function opfsSyncAvailable() {
   }
 }
 
-// Register (once per pool path) a VFS for `name`. Prefers the persistent OPFS
-// pool; falls back to an ephemeral in-memory VFS when `ephemeral` is requested,
-// when OPFS sync access handles are unavailable, or when the pool fails to
-// initialise. Returns { vfsName, mode }.
-async function registerVfs(s, name, ephemeral) {
+// Register (once per pool path) a VFS for `name`, returning the in-flight
+// promise so concurrent opens share one registration. Uses the in-memory VFS
+// only when `ephemeral` is requested or OPFS sync access handles are genuinely
+// unavailable - both stable for the Worker's life, so caching them is correct.
+// When OPFS is available but the pool will not come up, it rejects with an
+// `OpfsUnavailableError` (distinguishing a busy lock) instead of silently
+// forking to memory. Resolves to { vfsName, mode }.
+function registerVfs(s, name, ephemeral) {
   const poolPath = `/dynoxide/${slug(name)}`;
   const cached = vfsByPool.get(poolPath);
   if (cached) return cached;
 
-  let entry = null;
-  if (!ephemeral && opfsSyncAvailable()) {
-    try {
-      const vfsName = `dynoxide-opfs-${slug(name)}`;
-      const vfs = new AccessHandlePoolVFS(poolPath);
-      // The base class hardcodes `get name() { return 'AccessHandlePool' }`;
-      // shadow it with a per-pool name so distinct instances register distinct
-      // VFSes and open_v2 selects the right one.
-      Object.defineProperty(vfs, "name", { value: vfsName, configurable: true });
-      await vfs.isReady;
-      s.vfs_register(vfs, false);
-      entry = { vfsName, mode: PERSISTENT };
-    } catch {
-      entry = null; // OPFS present but unusable here: fall through to memory.
+  const pending = (async () => {
+    if (ephemeral || !opfsSyncAvailable()) {
+      return registerMemoryVfs(s, name);
     }
-  }
+    try {
+      return await registerOpfsVfs(s, name, poolPath);
+    } catch (err) {
+      if (isBusyLock(err)) {
+        throw new OpfsUnavailableError(
+          `OPFS is busy for "${name}": another tab or client holds its lock. ` +
+            `Close the other session, or open with ephemeral: true for an in-memory session.`,
+          { cause: err },
+        );
+      }
+      throw new OpfsUnavailableError(
+        `OPFS failed to open for "${name}": ${err && err.message ? err.message : err}`,
+        { cause: err },
+      );
+    }
+  })();
 
-  if (!entry) {
-    const vfsName = `dynoxide-memory-${slug(name)}`;
-    const vfs = new MemoryVFS();
-    vfs.name = vfsName; // MemoryVFS exposes `name` as a writable field.
-    s.vfs_register(vfs, false);
-    entry = { vfsName, mode: EPHEMERAL };
-  }
-
-  vfsByPool.set(poolPath, entry);
-  return entry;
+  vfsByPool.set(poolPath, pending);
+  // Drop a failed registration so a later open can retry rather than being
+  // handed the same rejected promise. A resolved one stays cached.
+  pending.catch(() => {
+    if (vfsByPool.get(poolPath) === pending) vfsByPool.delete(poolPath);
+  });
+  return pending;
 }
 
 /**
@@ -231,4 +286,18 @@ export async function query(handle, sql, params) {
     }
   }
   return rows;
+}
+
+/**
+ * Close a database handle, releasing its wa-sqlite connection. Called before a
+ * re-open swaps in a new database so the previous connection does not leak. The
+ * per-name VFS registration is left in place: it is keyed by database name and
+ * deliberately reused across re-opens within this Worker, and the pool's OPFS
+ * handles stay owned by this Worker for the session. Safe to call with a handle
+ * that has no live connection.
+ */
+export async function close(handle) {
+  if (!handle || handle.db == null) return;
+  const s = await moduleHandle();
+  await s.close(handle.db);
 }

@@ -821,6 +821,17 @@ impl Database<WasmBridgeBackend> {
         self.backend().await.persistence_mode().to_string()
     }
 
+    /// Close the underlying wa-sqlite connection. The operation-level engine
+    /// calls this before re-opening, so the previous connection is released
+    /// rather than leaked when a new database replaces it.
+    pub async fn close(&self) -> Result<()> {
+        self.backend()
+            .await
+            .close()
+            .await
+            .map_err(DynoxideError::from)
+    }
+
     /// Lock the single backend for the span of one handler call. The guard is
     /// held across the whole call so the operation (including any transaction)
     /// is atomic; the async mutex queues concurrent callers rather than

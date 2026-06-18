@@ -177,6 +177,14 @@ mod engine {
     /// (`{ contractVersion, capabilities, persistenceMode }`).
     #[wasm_bindgen]
     pub async fn open(name: String, ephemeral: bool) -> Result<String, String> {
+        // Close any previously-opened database first, so re-opening releases the
+        // old wa-sqlite connection (it would otherwise leak) and frees the OPFS
+        // handles the new open needs before the new connection is created.
+        // Best-effort: a close failure must not block the re-open.
+        let previous = ENGINE.with(|cell| cell.borrow_mut().take());
+        if let Some(previous) = previous {
+            let _ = previous.close().await;
+        }
         let db = WasmDatabase::open_with(&name, ephemeral)
             .await
             .map_err(|e| e.to_json())?;

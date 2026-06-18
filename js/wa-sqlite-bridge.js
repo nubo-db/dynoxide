@@ -44,15 +44,12 @@ import * as SQLite from "wa-sqlite";
 import SQLiteESMFactory from "wa-sqlite/dist/wa-sqlite.mjs";
 import { AccessHandlePoolVFS } from "wa-sqlite/src/examples/AccessHandlePoolVFS.js";
 import { MemoryVFS } from "wa-sqlite/src/examples/MemoryVFS.js";
+import { fnv1aHash } from "./fnv1a.js";
 
 /** Persistent OPFS-backed session: survives reload. */
 const PERSISTENT = "opfs";
 /** Ephemeral in-memory session: lost on reload. */
 const EPHEMERAL = "memory";
-
-// Shared encoder for the fnv1a_hash scalar, which fires once per row in a
-// parallel-scan segment query; allocating one per call would churn the GC.
-const ENCODER = new TextEncoder();
 
 // Lazily initialised SQLite API handle, shared across opens within this Worker.
 // We memoise the in-flight promise rather than the resolved value, so two
@@ -233,14 +230,8 @@ export async function open(name, ephemeral = false) {
     SQLite.SQLITE_UTF8,
     0,
     (context, values) => {
-      const text = s.value(values[0]);
-      const bytes = ENCODER.encode(typeof text === "string" ? text : "");
-      let hash = 0x811c9dc5;
-      for (const b of bytes) {
-        hash ^= b;
-        hash = Math.imul(hash, 0x01000193) >>> 0;
-      }
-      s.result(context, BigInt(hash >>> 0));
+      // fnv1aHash matches the native scalar (src/storage.rs); see js/fnv1a.js.
+      s.result(context, BigInt(fnv1aHash(s.value(values[0]))));
     },
     null,
     null,

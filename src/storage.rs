@@ -1957,6 +1957,32 @@ mod tests {
         assert!(mode == "wal" || mode == "memory", "Got mode: {mode}");
     }
 
+    // FNV-1a parity contract. The wasm bridge registers its own `fnv1a_hash`
+    // (js/wa-sqlite-bridge.js) and parallel-scan segment assignment is only
+    // correct if it agrees with this native scalar byte-for-byte. These vectors
+    // are the shared truth: the browser test (tests/browser/bridge.spec.js)
+    // asserts the same inputs hash to the same values through the bridge, which
+    // pins the two implementations together.
+    #[test]
+    fn fnv1a_hash_matches_known_vectors() {
+        let storage = test_storage();
+        let cases: [(&str, i64); 6] = [
+            ("", 2166136261),
+            ("a", 3826002220),
+            ("u#1", 2199603432),
+            ("artist#42", 2385694177),
+            ("café", 2821410889),
+            ("tenant#9007199254740993", 2022216178),
+        ];
+        for (input, expected) in cases {
+            let got: i64 = storage
+                .conn()
+                .query_row("SELECT fnv1a_hash(?1)", [input], |row| row.get(0))
+                .unwrap();
+            assert_eq!(got, expected, "fnv1a_hash({input:?})");
+        }
+    }
+
     #[test]
     fn test_table_metadata_crud() {
         let storage = test_storage();

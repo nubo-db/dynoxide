@@ -174,9 +174,19 @@ fn params_to_js(params: &[SqlParam<'_>]) -> js_sys::Array {
 fn sqlparam_to_js(p: &SqlParam<'_>) -> JsValue {
     match p {
         SqlParam::Text(s) => JsValue::from_str(s),
-        // JS numbers are f64. The integer parameters here (sizes, counts, epoch
-        // seconds) stay well within 2^53, so this is lossless in practice.
-        SqlParam::Integer(i) => JsValue::from_f64(*i as f64),
+        // JS numbers are f64, lossless only within 2^53. The integer params here
+        // (sizes, counts, epoch seconds) stay well inside that, so they bind as
+        // numbers - wa-sqlite's common path. A value beyond the safe range would
+        // lose precision as an f64, so bind it as a BigInt (wa-sqlite stores it
+        // as int64), keeping a full 64-bit round-trip with col_i64's BigInt read.
+        SqlParam::Integer(i) => {
+            const SAFE: i64 = 1 << 53;
+            if (-SAFE..=SAFE).contains(i) {
+                JsValue::from_f64(*i as f64)
+            } else {
+                js_sys::BigInt::from(*i).into()
+            }
+        }
         SqlParam::Real(f) => JsValue::from_f64(*f),
         SqlParam::Blob(b) => js_sys::Uint8Array::from(&**b).into(),
         SqlParam::Null => JsValue::NULL,
@@ -194,8 +204,24 @@ fn col_text(row: &js_sys::Array, i: u32) -> Option<String> {
 }
 
 /// Read column `i` as an integer (0 when absent or non-numeric).
+///
+/// Most integers come back as a JS number. A value outside f64's safe range
+/// arrives as a BigInt, which `as_f64` cannot read - decode that path explicitly
+/// rather than letting it fall through to 0 (a silent truncation the bind side
+/// guards against by storing such values as BigInt in the first place).
 fn col_i64(row: &js_sys::Array, i: u32) -> i64 {
-    row.get(i).as_f64().map(|f| f as i64).unwrap_or(0)
+    let v = row.get(i);
+    if let Some(f) = v.as_f64() {
+        return f as i64;
+    }
+    if let Ok(big) = v.dyn_into::<js_sys::BigInt>() {
+        if let Some(s) = big.to_string(10).ok().and_then(|js| js.as_string()) {
+            if let Ok(n) = s.parse::<i64>() {
+                return n;
+            }
+        }
+    }
+    0
 }
 
 /// Map query/scan result rows (each `[c0, c1, c2]`) to `(String, String, String)`.

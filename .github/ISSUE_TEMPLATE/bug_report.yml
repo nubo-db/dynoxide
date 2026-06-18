@@ -1,0 +1,47 @@
+name: Bug report
+description: Report behaviour that does not match AWS DynamoDB, or otherwise looks wrong.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: dynoxide version
+      description: Output of `dynoxide --version`, or the crate or image tag.
+    validations:
+      required: true
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: How are you running dynoxide?
+      options:
+        - Binary (CLI)
+        - Docker image
+        - Rust library (embedded)
+        - WebAssembly (preview)
+    validations:
+      required: true
+  - type: input
+    id: operation
+    attributes:
+      label: DynamoDB operation involved
+      description: e.g. PutItem, Query, UpdateItem. Leave blank if not specific to one.
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+      description: Include the error or response, and how it differs from AWS DynamoDB if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal sequence - table setup, the request(s), and any SDK or CLI snippet.
+    validations:
+      required: true

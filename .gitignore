@@ -18,4 +18,5 @@
 tests/external/dynalite/
 tests/external/results/
 .claude/worktrees/
+.claude/settings.local.json
 .worktrees

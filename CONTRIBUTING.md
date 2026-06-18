@@ -25,6 +25,16 @@ same ground in a form those tools pick up automatically.
 - If you want to add a new dependency, open an issue so we can weigh
   binary size, build time, and licence.
 
+## When you need an RFC or an ADR
+
+Bigger changes get a short [RFC](docs/rfcs/) before they are built:
+anything touching the DynamoDB wire contract, the `StorageBackend`
+trait, SigV4 auth, the on-disk format, or the CLI and config surface,
+plus large new features. It is a lightweight process, and it overlaps
+with the "open an issue first" note above. [ADRs](docs/adr/) record the
+decisions that come out of it. Bug fixes, refactors that keep behaviour
+the same, docs, and tests need neither.
+
 ## The compatibility principle
 
 Dynoxide exists to behave like AWS DynamoDB. If a PR would make

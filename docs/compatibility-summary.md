@@ -6,7 +6,7 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 **Consistency model:** SQLite provides strong consistency. `ConsistentRead` is accepted but has no effect - all reads are strongly consistent.
 
-> **Updated:** 2026-03-24 · Reflects all fixes from compatibility phases 1–5, correctness audit, and conformance suite results.
+> **Updated:** 2026-03-24 · Reflects current behaviour, validated by the conformance suite.
 
 ---
 
@@ -207,11 +207,3 @@ All 10 DynamoDB types fully supported: `S`, `N`, `B`, `BOOL`, `NULL`, `SS`, `NS`
 Dynoxide returns DynamoDB-compatible error codes with the `com.amazonaws.dynamodb.v20120810#` prefix:
 
 `ResourceNotFoundException` · `ResourceInUseException` · `ValidationException` · `ConditionalCheckFailedException` (with optional Item) · `TransactionCanceledException` · `ItemCollectionSizeLimitExceededException` · `ProvisionedThroughputExceededException` · `LimitExceededException` · `DuplicateItemException` · `InternalServerError`
-
----
-
-## Audit History
-
-The original compatibility audit (2026-03-14, commit `45bd46c`) identified 12 actionable gaps (5 P1, 7 P2) and 9 intentionally out-of-scope items (P3). All 12 actionable gaps were resolved across five implementation phases. A subsequent correctness audit (2026-03-16) identified and resolved a further 41 issues: 10 critical silent-wrong-result bugs, 21 important behavioural issues, and 10 minor issues.
-
-See [compatibility-matrix.md](internal/compatibility-matrix.md) for the full detailed parameter-level audit, [gaps.md](gaps.md) for the gap resolution log, and [correctness-audit.md](internal/correctness-audit.md) for the correctness findings.

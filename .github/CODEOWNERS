@@ -1,0 +1,4 @@
+# Code ownership. GitHub auto-requests review from the owner when a pull
+# request touches matching paths.
+
+* @hicksy

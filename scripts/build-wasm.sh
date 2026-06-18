@@ -30,6 +30,10 @@ for arg in "$@"; do
   esac
 done
 
+# Harness builds keep the smoke/index/errors ops; the shipping build strips them
+# via this define so esbuild dead-code-eliminates the guarded block (#69).
+if [ "$feature" = "wasm-harness" ]; then harness_define="true"; else harness_define="false"; fi
+
 # 1. Compile the wasm-bindgen artefact into pkg/. The default `wasm-sqlite`
 #    feature exposes the operation-level engine API (open/execute/capabilities/
 #    contract_version); `--harness` adds the smoke ops on top.
@@ -58,15 +62,39 @@ done
 #    resolves wa-sqlite's bare specifiers from node_modules. The two
 #    `new URL("*.wasm", import.meta.url)` references stay as runtime URLs that
 #    resolve next to the bundle, so the .wasm files ship as siblings.
-#    The smoke ops are present only in `--harness` builds, so in the default
-#    `wasm-sqlite` build esbuild correctly sees them as undefined; that is by
-#    design (the Worker guards them at runtime), so silence that one warning.
+#    The --define folds __DYNOXIDE_HARNESS__ to a literal and --minify-syntax
+#    dead-code-eliminates the resulting `if (false)` block, so the shipping build
+#    drops the smoke/index/errors ops while the harness build keeps them. The
+#    define alone substitutes but does not remove the dead branch; --minify-syntax
+#    leaves identifiers and whitespace intact, so it is not a full minify.
+#    log-override silences the import-is-undefined note from the bracket access to
+#    the harness-only exports.
 rm -rf dist
 npx esbuild js/dynoxide-worker.js \
   --bundle \
   --format=esm \
+  "--define:__DYNOXIDE_HARNESS__=$harness_define" \
+  --minify-syntax \
   --log-override:import-is-undefined=silent \
   --outfile=dist/dynoxide-worker.js
+
+# 2b. Guard (#69). For the shipping build, assert the harness-only ops are gone;
+#     for the harness build, assert they are still present, so the strip is a
+#     proven toggle rather than a vacuous pass. `SMOKE_OPS` is the load-bearing
+#     sentinel for the negative check - it is the local const inside the stripped
+#     block; the export names usually fold to `void 0` in a non-harness compile.
+#     If a new harness op is added, mirror it here and in dynoxide-worker.js.
+if [ "$feature" != "wasm-harness" ]; then
+  if grep -qE 'SMOKE_OPS|smoke_test|index_scan_test|error_fidelity_test' dist/dynoxide-worker.js; then
+    echo "error: harness-only ops leaked into the shipping worker bundle (#69)" >&2
+    exit 1
+  fi
+else
+  if ! grep -qE 'smoke_test|index_scan_test|error_fidelity_test' dist/dynoxide-worker.js; then
+    echo "error: harness ops missing from the --harness worker bundle (#69)" >&2
+    exit 1
+  fi
+fi
 
 # 3. Copy the two .wasm next to the bundle. wa-sqlite.wasm is the synchronous
 #    (non-async) build, paired with the Worker-only AccessHandlePoolVFS; it is

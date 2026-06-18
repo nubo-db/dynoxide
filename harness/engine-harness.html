@@ -50,6 +50,8 @@
             open: (name, ephemeral = false) =>
               call("open", { name, ephemeral }).then(JSON.parse),
             execute: (op, request) => call("execute", { op, request }).then(JSON.parse),
+            // Raw op dispatch, for specs that need to send an arbitrary worker op.
+            call,
             terminate: () => worker.terminate(),
           };
         },

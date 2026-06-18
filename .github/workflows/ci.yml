@@ -56,6 +56,16 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   feature-guards:
     name: Feature guard checks
     runs-on: ubuntu-latest

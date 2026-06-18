@@ -1,0 +1,56 @@
+# cargo-deny configuration. Run with `cargo deny check`.
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Advisories are denied by default. Each ignore below is a dev-dependency-only
+# finding, pinned by the AWS SDK's legacy default TLS stack (hyper 0.14 +
+# rustls 0.21 + rustls-webpki 0.101), which `aws-config` / `aws-sdk-dynamodb`
+# pull in transitively for the integration and conformance tests. None of these
+# crates are compiled into the published crate or the installed binary
+# (confirmed with `cargo tree -e no-dev`). There is no fix by version bump: the
+# latest AWS SDK 1.x still ships this stack by default. The proper fix is to
+# migrate the AWS dev-deps to the modern `default-https-client` (hyper 1.x +
+# rustls 0.23 + aws-lc) under a 2025+ BehaviorVersion. Revisit and remove these
+# entries when that migration lands.
+ignore = [
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101: URI name constraints incorrectly accepted. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101: wildcard name constraints accepted. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101: reachable panic in CRL parsing. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
+    { id = "RUSTSEC-2026-0009", reason = "rustls-webpki 0.101: denial of service via stack exhaustion. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1.0 unmaintained. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
+]
+
+[licenses]
+# Mirrors about.toml's accepted set, plus MPL-2.0 for option-ext (a normal
+# transitive dep via the dirs / directories family). MPL-2.0 is weak copyleft
+# and standard to allow for a permissively-licensed binary.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+]
+# A few allowed licences (ISC, OpenSSL, MIT-0, CC0-1.0) are only reachable under
+# certain feature combinations; keep them for about.toml parity without warning
+# when the current graph does not use them.
+unused-allowed-license = "allow"
+
+[bans]
+# The TLS transition leaves duplicate major versions in the tree (rustls 0.21
+# and 0.23, rustls-webpki 0.101 and 0.103); allow duplicates rather than fail.
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

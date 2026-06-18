@@ -54,7 +54,7 @@ const { Items } = await client.execute("Query", {
 - `client.persistent` - `true` when the session persists across reloads (OPFS), `false` in the in-memory fallback.
 - `client.terminate()` - tear the Worker down and reject any in-flight calls.
 
-The package also exports `EngineError` (the engine's `__type` is on `.type`) and `CONTRACT_VERSION`.
+The package also exports `EngineError` (the engine's `__type` is on `.type`) and `CONTRACT_VERSION`. TypeScript declarations ship with it, so the client and its boot descriptor are typed out of the box.
 
 ## Where the assets live
 
@@ -64,6 +64,15 @@ Serving the assets from a CDN or a different origin? Two options:
 
 - `assetBase` - the directory the assets sit in, e.g. `new EngineClient({ assetBase: "https://cdn.example.com/dynoxide/" })`.
 - `workerUrl` - the exact Worker URL, if it doesn't sit beside its `.wasm` under a shared base.
+
+If you'd rather construct the Worker yourself - to let a bundler handle it, say - the package exposes it at the `./worker` subpath. Build it and hand it back through `createWorker`:
+
+```js
+new EngineClient({
+  createWorker: () =>
+    new Worker(new URL("@nubo-db/dynoxide-engine/worker", import.meta.url), { type: "module" }),
+});
+```
 
 Two clients on one page are fine: each gets its own storage pool, keyed on `name` (default `dynoxide.db`), so give them distinct names if both should persist.
 

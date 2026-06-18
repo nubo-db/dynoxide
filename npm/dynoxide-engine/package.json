@@ -22,8 +22,12 @@
   ],
   "main": "./engine-client.js",
   "module": "./engine-client.js",
+  "types": "./engine-client.d.ts",
   "exports": {
-    ".": "./engine-client.js",
+    ".": {
+      "types": "./engine-client.d.ts",
+      "default": "./engine-client.js"
+    },
     "./worker": "./dynoxide-worker.js",
     "./manifest.json": "./manifest.json",
     "./package.json": "./package.json"
@@ -31,6 +35,7 @@
   "sideEffects": false,
   "files": [
     "engine-client.js",
+    "engine-client.d.ts",
     "dynoxide-worker.js",
     "dynoxide_bg.wasm",
     "wa-sqlite.wasm",
@@ -39,9 +44,6 @@
     "LICENSE-MIT",
     "LICENSE-APACHE"
   ],
-  "engines": {
-    "node": ">=18"
-  },
   "publishConfig": {
     "access": "public"
   }

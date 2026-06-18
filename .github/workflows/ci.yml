@@ -123,6 +123,11 @@ jobs:
       - name: Test the engine client
         run: node --test js/*.test.js
 
+      # Fast guard that the client's CONTRACT_VERSION matches the Rust engine's,
+      # without building wasm; build-wasm.sh runs the same check before publish.
+      - name: Check CONTRACT_VERSION agreement
+        run: scripts/check-contract-version.sh
+
   browser-engine:
     name: Browser engine tests (real wa-sqlite + OPFS)
     runs-on: ubuntu-latest

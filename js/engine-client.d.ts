@@ -9,7 +9,7 @@ export const CONTRACT_VERSION: number;
 /** Whether a session persists across reload. */
 export type PersistenceMode = "opfs" | "memory" | "unknown";
 
-/** The descriptor `open` resolves with, validated by the client on boot. */
+/** The descriptor `ready()` resolves with, validated by the client on boot. */
 export interface BootDescriptor {
   contractVersion: number;
   capabilities: string[];
@@ -47,8 +47,11 @@ export class EngineClient {
   constructor(options?: EngineClientOptions);
   readonly name: string;
   readonly ephemeral: boolean;
+  /** Boot state, populated once `ready()` resolves; until then `null`. */
   contractVersion: number | null;
+  /** Boot state, populated once `ready()` resolves; until then `[]`. */
   capabilities: string[];
+  /** Boot state, populated once `ready()` resolves; until then `"unknown"`. */
   persistenceMode: PersistenceMode;
   /** Resolves with the boot descriptor once the engine is ready. */
   ready(): Promise<BootDescriptor>;
@@ -56,8 +59,12 @@ export class EngineClient {
   get persistent(): boolean;
   /** Whether the engine supports an operation, for capability-gating the UI. */
   supports(op: string): boolean;
-  /** Run one DynamoDB operation; resolves with the parsed response. */
-  execute(op: string, request?: unknown): Promise<any>;
+  /**
+   * Run one DynamoDB operation; resolves with the parsed response. The response
+   * shape is op-dependent, so it defaults to `unknown`; pass a type argument when
+   * you know it, e.g. `execute<ScanOutput>("Scan", request)`.
+   */
+  execute<T = unknown>(op: string, request?: unknown): Promise<T>;
   /** Tear down the Worker and reject any in-flight calls. */
   terminate(): void;
 }

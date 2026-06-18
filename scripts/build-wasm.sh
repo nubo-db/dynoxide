@@ -112,12 +112,12 @@ if [ "$feature" = "wasm-sqlite" ]; then
   scripts/check-contract-version.sh
 
   cp dist/dynoxide-worker.js dist/dynoxide_bg.wasm dist/wa-sqlite.wasm dist/manifest.json "$pkg/"
-  cp js/engine-client.js js/engine-client.d.ts "$pkg/"
+  cp js/engine-client.js js/engine-client.d.ts js/dynoxide-worker.d.ts "$pkg/"
   cp LICENSE-MIT LICENSE-APACHE "$pkg/"
 
   echo
   echo "engine package $pkg/ (npm pack-ready):"
-  for f in engine-client.js engine-client.d.ts dynoxide-worker.js dynoxide_bg.wasm wa-sqlite.wasm manifest.json; do
+  for f in engine-client.js engine-client.d.ts dynoxide-worker.js dynoxide-worker.d.ts dynoxide_bg.wasm wa-sqlite.wasm manifest.json; do
     printf '  %-26s %8d bytes\n' "$f" "$(wc -c < "$pkg/$f")"
   done
 fi

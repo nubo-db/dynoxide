@@ -28,7 +28,10 @@
       "types": "./engine-client.d.ts",
       "default": "./engine-client.js"
     },
-    "./worker": "./dynoxide-worker.js",
+    "./worker": {
+      "types": "./dynoxide-worker.d.ts",
+      "default": "./dynoxide-worker.js"
+    },
     "./manifest.json": "./manifest.json",
     "./package.json": "./package.json"
   },
@@ -37,6 +40,7 @@
     "engine-client.js",
     "engine-client.d.ts",
     "dynoxide-worker.js",
+    "dynoxide-worker.d.ts",
     "dynoxide_bg.wasm",
     "wa-sqlite.wasm",
     "manifest.json",

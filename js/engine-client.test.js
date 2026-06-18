@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { EngineClient, EngineError } from "./engine-client.js";
+import { EngineClient, EngineError, CONTRACT_VERSION } from "./engine-client.js";
 import { makeStubWorker } from "./test-support/stub-worker.js";
 
 // A minimal table the stub worker understands (HASH + RANGE on string keys).
@@ -204,4 +204,22 @@ test("a body-less op defaults its request to {} rather than sending undefined", 
   assert.deepEqual(captured.request, {}, "body-less request must default to {}");
   assert.deepEqual(res, { TableNames: [] });
   client.terminate();
+});
+
+test("the public surface declared in engine-client.d.ts exists at runtime", () => {
+  // A dependency-free guard that the hand-written .d.ts has not drifted from the
+  // exports it describes. It pins export names and kinds, not TypeScript types -
+  // a deeper check would need a tsc toolchain we deliberately don't depend on.
+  assert.equal(typeof CONTRACT_VERSION, "number");
+  for (const method of ["ready", "execute", "supports", "terminate"]) {
+    assert.equal(typeof EngineClient.prototype[method], "function", `EngineClient.${method}`);
+  }
+  assert.ok(
+    Object.getOwnPropertyDescriptor(EngineClient.prototype, "persistent")?.get,
+    "EngineClient.persistent getter",
+  );
+  const err = new EngineError(JSON.stringify({ __type: "X", message: "m" }));
+  assert.ok(err instanceof Error);
+  assert.equal(err.type, "X");
+  assert.equal(typeof err.envelope, "string");
 });

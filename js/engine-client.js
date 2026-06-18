@@ -225,9 +225,9 @@ export class EngineClient {
    * an {@link EngineError}. Queues behind boot if called before the engine is
    * ready.
    */
-  async execute(op, request) {
+  async execute(op, request = {}) {
     await this.#ready;
-    const raw = await this.#post("execute", { op, request });
+    const raw = await this.#post("execute", { op, request: request ?? {} });
     return JSON.parse(raw);
   }
 

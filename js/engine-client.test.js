@@ -164,3 +164,44 @@ test("execute after terminate rejects fast instead of posting to a dead worker",
     (e) => e instanceof EngineError && /terminated/.test(e.message),
   );
 });
+
+test("a body-less op defaults its request to {} rather than sending undefined", async () => {
+  // ListTables and other no-body ops carry no request. Sent as undefined, the
+  // worker stringifies it and the engine rejects the result as a
+  // SerializationException - a confusing error for a request that wasn't
+  // malformed, there just wasn't one. The client defaults a missing body to {}.
+  let captured;
+  const recordingWorker = () => {
+    const listeners = new Set();
+    const reply = (id, result) => {
+      queueMicrotask(() => {
+        for (const l of listeners) l({ data: { id, ok: true, result } });
+      });
+    };
+    return {
+      addEventListener(type, h) {
+        if (type === "message") listeners.add(h);
+      },
+      removeEventListener(type, h) {
+        listeners.delete(h);
+      },
+      postMessage(msg) {
+        if (msg.op === "open") {
+          reply(msg.id, JSON.stringify({ contractVersion: 1, capabilities: ["ListTables"], persistenceMode: "memory" }));
+        } else if (msg.op === "execute") {
+          captured = msg.payload;
+          reply(msg.id, JSON.stringify({ TableNames: [] }));
+        }
+      },
+      terminate() {
+        listeners.clear();
+      },
+    };
+  };
+
+  const client = new EngineClient({ createWorker: recordingWorker });
+  const res = await client.execute("ListTables");
+  assert.deepEqual(captured.request, {}, "body-less request must default to {}");
+  assert.deepEqual(res, { TableNames: [] });
+  client.terminate();
+});

@@ -93,7 +93,10 @@ self.onmessage = async (event) => {
         if (payload?.op == null) {
           throw envelope("com.dynoxide.wasm#InvalidRequest", "execute requires payload.op");
         }
-        result = await engine.execute(payload.op, JSON.stringify(payload.request));
+        // A body-less op (ListTables, say) carries no request. Default to {}
+        // rather than stringifying undefined, which the engine would reject as a
+        // SerializationException for a request that was never malformed.
+        result = await engine.execute(payload.op, JSON.stringify(payload.request ?? {}));
         break;
       case "capabilities":
         result = engine.capabilities();

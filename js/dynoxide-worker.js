@@ -14,17 +14,18 @@
  * | `open`         | `{ name, ephemeral? }`   | contract descriptor JSON string     |
  * | `execute`      | `{ op, request }`        | response JSON string (rejects with  |
  * |                |                          | an error-envelope string on failure)|
- * | `capabilities` | —                        | JSON array of supported op names    |
- * | `contractVersion` | —                     | the engine contract version (number)|
+ * | `capabilities` | (none)                   | JSON array of supported op names    |
+ * | `contractVersion` | (none)                | the engine contract version (number)|
  *
  * `ephemeral: true` on `open` forces an in-memory session. Every failure - the
  * engine's own errors and the Worker's (contract mismatch, unknown op) - is an
  * error-envelope string `{ __type, message }`, so the client always parses it
  * the same way. `request` is a plain object; the Worker serialises it for the
- * engine, so a caller never hand-builds JSON. The smoke ops (`smoke`/`index`/`errors`) exist
- * only in `wasm-harness` builds and are absent from the shipping `wasm-sqlite`
- * bundle — a namespace import leaves them `undefined` there rather than failing
- * to load.
+ * engine, so a caller never hand-builds JSON. The smoke ops (`smoke`/`index`/
+ * `errors`) exist only in `wasm-harness` builds; the shipping `wasm-sqlite`
+ * bundle strips them at build time via the `__DYNOXIDE_HARNESS__` esbuild define
+ * (see scripts/build-wasm.sh), so they are not dead weight in what consumers
+ * download.
  *
  * ## Contract version
  *
@@ -49,15 +50,6 @@ function ensureInit() {
 function envelope(type, message) {
   return JSON.stringify({ __type: type, message });
 }
-
-// Bracket access (not `engine.smoke_test`) so the bundler does not flag these
-// as missing exports: they are present only in `wasm-harness` builds and are
-// deliberately `undefined` in the shipping `wasm-sqlite` bundle.
-const SMOKE_OPS = {
-  smoke: () => engine["smoke_test"]?.(),
-  index: () => engine["index_scan_test"]?.(),
-  errors: () => engine["error_fidelity_test"]?.(),
-};
 
 self.onmessage = async (event) => {
   const { id, op, payload, contractVersion } = event.data ?? {};
@@ -104,18 +96,33 @@ self.onmessage = async (event) => {
       case "contractVersion":
         result = engineVersion;
         break;
-      case "smoke":
-      case "index":
-      case "errors": {
-        const run = SMOKE_OPS[op]();
-        if (run === undefined) {
-          throw envelope("com.dynoxide.wasm#UnsupportedOperation", `op "${op}" needs a wasm-harness build`);
+      default: {
+        // The smoke/index/errors harness ops exist only in `--harness` builds.
+        // esbuild replaces __DYNOXIDE_HARNESS__ with a literal, so for the
+        // shipping build this whole block (and the SMOKE_OPS table) is
+        // dead-code-eliminated (#69); build-wasm.sh asserts it is gone.
+        if (__DYNOXIDE_HARNESS__) {
+          // Bracket access (not `engine.smoke_test`) so the bundler does not
+          // flag these as missing exports in a non-harness compile. Adding an op
+          // here means updating the strip assertion in scripts/build-wasm.sh.
+          const SMOKE_OPS = {
+            smoke: () => engine["smoke_test"]?.(),
+            index: () => engine["index_scan_test"]?.(),
+            errors: () => engine["error_fidelity_test"]?.(),
+          };
+          if (op in SMOKE_OPS) {
+            const run = SMOKE_OPS[op]();
+            if (run === undefined) {
+              throw envelope("com.dynoxide.wasm#UnsupportedOperation", `op "${op}" needs a wasm-harness build`);
+            }
+            result = await run;
+            break;
+          }
         }
-        result = await run;
-        break;
-      }
-      default:
+        // Reached for any op not handled above: a genuine unknown op, or (in the
+        // shipping build, where the block above is stripped) a harness op.
         throw envelope("com.dynoxide.wasm#UnsupportedOperation", `unknown op: ${op}`);
+      }
     }
     self.postMessage({ id, ok: true, result });
   } catch (err) {

@@ -237,3 +237,28 @@ test("re-open keeps same-name data and frees the old database when switching nam
   expect(out.aReopen.mode).toBe("opfs");
   expect(out.aReopen.count).toBe(1); // nameA's data persisted across the switch
 });
+
+test("the shipping worker rejects a stripped harness op as unknown (#69)", async ({ page }) => {
+  // The shipping build strips the smoke/index/errors handling, so a harness op
+  // sent to it falls through to the unknown-op envelope - the runtime proof that
+  // the build-time strip is real, complementing build-wasm.sh's grep assertion.
+  const err = await page.evaluate(async () => {
+    const w = globalThis.dynoxide.makeRawWorker();
+    let parsed = null;
+    try {
+      await w.call("smoke", {});
+    } catch (e) {
+      try {
+        parsed = JSON.parse(e.message);
+      } catch {
+        parsed = { message: e.message };
+      }
+    }
+    w.terminate();
+    return parsed;
+  });
+
+  expect(err).not.toBeNull();
+  expect(err.__type).toBe("com.dynoxide.wasm#UnsupportedOperation");
+  expect(err.message).toMatch(/unknown op/);
+});

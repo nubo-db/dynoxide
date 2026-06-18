@@ -56,7 +56,7 @@ out:  { id, ok: true,  result }      // result is a JSON string
 
 Three ops carry the engine:
 
-- `open` - `payload: { name }` opens (or reopens) the OPFS-backed database and resolves with the contract descriptor, `{ contractVersion, capabilities }`. Call it once before any operation.
+- `open` - `payload: { name, ephemeral? }` opens (or reopens) the OPFS-backed database and resolves with the contract descriptor, `{ contractVersion, capabilities, persistenceMode }`. `ephemeral: true` forces an in-memory session. Call it once before any operation.
 - `execute` - `payload: { op, request }` runs one DynamoDB operation, where `op` is the operation name (`PutItem`, `Query`, `Scan`, ...) and `request` is a plain DynamoDB-JSON object. It resolves with the response JSON and rejects with an error envelope (the same `__type`/`message` shape the native HTTP server speaks). Ask `capabilities` for the supported set rather than guessing; anything outside it comes back as an `UnsupportedOperation` envelope.
 - `capabilities` and `contractVersion` - the supported op list and the engine's contract version, for a client that wants them without opening a database.
 

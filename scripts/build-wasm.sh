@@ -41,7 +41,15 @@ wasm-pack build "--$profile" --target web --out-dir pkg -- \
 #     follow its local imports - only the bare wa-sqlite specifiers, which
 #     esbuild later resolves from node_modules. Copy the shared fnv1a helper the
 #     bridge imports alongside it so that relative import resolves at bundle time.
-for snippet_js in pkg/snippets/*/js; do
+shopt -s nullglob
+snippet_js_dirs=(pkg/snippets/*/js)
+shopt -u nullglob
+if [ ${#snippet_js_dirs[@]} -eq 0 ]; then
+  echo "error: no pkg/snippets/*/js directory found - did wasm-pack run, or did" >&2
+  echo "       wasm-bindgen change how it emits the bridge module snippet?" >&2
+  exit 1
+fi
+for snippet_js in "${snippet_js_dirs[@]}"; do
   cp js/fnv1a.js "$snippet_js/"
 done
 

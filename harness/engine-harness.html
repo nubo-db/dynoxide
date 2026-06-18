@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>dynoxide engine browser test harness</title>
+    <!--
+      Test page for the browser engine specs (tests/browser/). It loads the
+      shipped EngineClient and points it at the bundled dist/ Worker, then
+      exposes a factory the Playwright specs drive from page.evaluate - so the
+      assertions exercise the real wa-sqlite + OPFS engine in a real browser,
+      not a stub.
+
+      Build the dist/ first (npm run build:wasm[:dev]); the spec's webServer
+      serves the repo root so /js/ and /dist/ resolve.
+    -->
+  </head>
+  <body>
+    <script type="module">
+      import { EngineClient, EngineError } from "/js/engine-client.js";
+
+      // The specs construct clients against the shipped Worker bundle. workerUrl
+      // is absolute so it resolves under the test server origin; the Worker then
+      // resolves its two .wasm as siblings in /dist/.
+      globalThis.dynoxide = {
+        EngineClient,
+        EngineError,
+        makeClient: (opts = {}) =>
+          new EngineClient({ workerUrl: "/dist/dynoxide-worker.js", ...opts }),
+      };
+      globalThis.__HARNESS_READY__ = true;
+    </script>
+  </body>
+</html>

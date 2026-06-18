@@ -123,6 +123,42 @@ jobs:
       - name: Test the engine client
         run: node --test js/*.test.js
 
+  browser-engine:
+    name: Browser engine tests (real wa-sqlite + OPFS)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      # wasm-pack drives the wasm-bindgen build inside scripts/build-wasm.sh.
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # Build the same self-contained bundle a consumer installs. The dev
+      # profile is functionally identical to release - it just skips wasm-opt -
+      # so it gates behaviour without the optimiser's cost on every PR.
+      - name: Build the wasm bundle
+        run: npm run build:wasm:dev
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Drives the shipped Worker in headless Chromium against real wa-sqlite and
+      # OPFS - the path the conformance suite (native backend) does not cover.
+      - name: Run the browser engine tests
+        run: npm run test:browser
+
   # Gate the Docker smoke test on the paths that can actually break the
   # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
   # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version — both can

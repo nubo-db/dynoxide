@@ -15,6 +15,9 @@
 *.swo
 *~
 .DS_Store
+# Playwright browser-test output (tests/browser/, run via npm run test:browser)
+/test-results
+/playwright-report
 tests/external/dynalite/
 tests/external/results/
 .claude/worktrees/

@@ -177,11 +177,19 @@ mod engine {
     /// (`{ contractVersion, capabilities, persistenceMode }`).
     #[wasm_bindgen]
     pub async fn open(name: String, ephemeral: bool) -> Result<String, String> {
+        // Open the new database before tearing down the old one, so a failed
+        // open (e.g. a busy OPFS lock) leaves the previous session intact. Once
+        // the new one is live, swap it in and close the old connection; the
+        // bridge's close frees the old pool's OPFS handles for another tab.
+        // Best-effort: a close failure must not fail the re-open.
         let db = WasmDatabase::open_with(&name, ephemeral)
             .await
             .map_err(|e| e.to_json())?;
         let persistence_mode = db.persistence_mode().await;
-        ENGINE.with(|cell| *cell.borrow_mut() = Some(db));
+        let previous = ENGINE.with(|cell| cell.borrow_mut().replace(db));
+        if let Some(previous) = previous {
+            let _ = previous.close().await;
+        }
         Ok(boot_descriptor(&persistence_mode))
     }
 

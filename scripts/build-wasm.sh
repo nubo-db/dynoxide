@@ -36,6 +36,23 @@ done
 wasm-pack build "--$profile" --target web --out-dir pkg -- \
   --no-default-features --features "$feature"
 
+# 1b. wasm-bindgen copies the bridge (referenced via #[wasm_bindgen(module =
+#     "/js/wa-sqlite-bridge.js")]) into pkg/snippets/<hash>/js/ but does not
+#     follow its local imports - only the bare wa-sqlite specifiers, which
+#     esbuild later resolves from node_modules. Copy the shared fnv1a helper the
+#     bridge imports alongside it so that relative import resolves at bundle time.
+shopt -s nullglob
+snippet_js_dirs=(pkg/snippets/*/js)
+shopt -u nullglob
+if [ ${#snippet_js_dirs[@]} -eq 0 ]; then
+  echo "error: no pkg/snippets/*/js directory found - did wasm-pack run, or did" >&2
+  echo "       wasm-bindgen change how it emits the bridge module snippet?" >&2
+  exit 1
+fi
+for snippet_js in "${snippet_js_dirs[@]}"; do
+  cp js/fnv1a.js "$snippet_js/"
+done
+
 # 2. Bundle the Worker into one ES module. esbuild follows the chain
 #    (worker -> wasm-bindgen glue -> the inlined bridge -> wa-sqlite) and
 #    resolves wa-sqlite's bare specifiers from node_modules. The two

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>dynoxide engine browser test harness</title>
+    <!--
+      Test page for the browser engine specs (tests/browser/). It loads the
+      shipped EngineClient and points it at the bundled dist/ Worker, then
+      exposes a factory the Playwright specs drive from page.evaluate - so the
+      assertions exercise the real wa-sqlite + OPFS engine in a real browser,
+      not a stub.
+
+      Build the dist/ first (npm run build:wasm[:dev]); the spec's webServer
+      serves the repo root so /js/ and /dist/ resolve. For interactive manual
+      verification, see harness/index.html instead.
+    -->
+  </head>
+  <body>
+    <script type="module">
+      import { EngineClient, EngineError } from "/js/engine-client.js";
+
+      // The specs construct clients against the shipped Worker bundle. workerUrl
+      // is absolute so it resolves under the test server origin; the Worker then
+      // resolves its two .wasm as siblings in /dist/.
+      globalThis.dynoxide = {
+        EngineClient,
+        EngineError,
+        makeClient: (opts = {}) =>
+          new EngineClient({ workerUrl: "/dist/dynoxide-worker.js", ...opts }),
+        // A thin driver over the raw Worker RPC, so a spec can call `open` more
+        // than once to exercise the re-open path - the EngineClient opens exactly
+        // once per Worker.
+        makeRawWorker: () => {
+          const worker = new Worker("/dist/dynoxide-worker.js", { type: "module" });
+          let seq = 0;
+          const call = (op, payload) =>
+            new Promise((resolve, reject) => {
+              const id = `r${seq++}`;
+              const onMsg = (event) => {
+                if (event.data.id !== id) return;
+                worker.removeEventListener("message", onMsg);
+                event.data.ok
+                  ? resolve(event.data.result)
+                  : reject(new Error(event.data.error));
+              };
+              worker.addEventListener("message", onMsg);
+              worker.postMessage({ id, op, payload });
+            });
+          return {
+            open: (name, ephemeral = false) =>
+              call("open", { name, ephemeral }).then(JSON.parse),
+            execute: (op, request) => call("execute", { op, request }).then(JSON.parse),
+            terminate: () => worker.terminate(),
+          };
+        },
+      };
+      globalThis.__HARNESS_READY__ = true;
+    </script>
+  </body>
+</html>

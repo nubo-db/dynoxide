@@ -8,9 +8,11 @@
     "build:wasm": "./scripts/build-wasm.sh",
     "build:wasm:dev": "./scripts/build-wasm.sh --dev",
     "build:wasm:harness": "./scripts/build-wasm.sh --dev --harness",
-    "test": "node --test js/*.test.js"
+    "test": "node --test js/*.test.js",
+    "test:browser": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.0",
     "esbuild": "^0.28.1",
     "wa-sqlite": "^1.0.0"
   }

@@ -58,6 +58,9 @@ extern "C" {
         sql: &str,
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_name = "close")]
+    async fn wa_close(handle: &JsValue) -> Result<JsValue, JsValue>;
 }
 
 /// wa-sqlite-backed storage backend driven through the JS bridge.
@@ -85,7 +88,7 @@ impl WasmBridgeBackend {
     /// when `ephemeral` is true regardless of OPFS availability. The persistent
     /// path still degrades to memory on its own when OPFS is unusable.
     pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
-        let handle = wa_open(name, ephemeral).await.map_err(js_err)?;
+        let handle = wa_open(name, ephemeral).await.map_err(open_err)?;
         // The bridge reports which VFS it actually opened against; read it off
         // the handle before treating the handle as opaque.
         let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))
@@ -108,6 +111,14 @@ impl WasmBridgeBackend {
     /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
     pub fn persistence_mode(&self) -> &str {
         &self.persistence_mode
+    }
+
+    /// Close the underlying wa-sqlite connection. The wasm engine calls this
+    /// before a re-open swaps in a new database, so the old connection (and the
+    /// OPFS handles behind it) is released rather than leaked.
+    pub async fn close(&self) -> Result<(), BackendError> {
+        wa_close(&self.handle).await.map_err(js_err)?;
+        Ok(())
     }
 
     /// Run a statement that returns no rows.
@@ -162,9 +173,17 @@ fn params_to_js(params: &[SqlParam<'_>]) -> js_sys::Array {
 fn sqlparam_to_js(p: &SqlParam<'_>) -> JsValue {
     match p {
         SqlParam::Text(s) => JsValue::from_str(s),
-        // JS numbers are f64. The integer parameters here (sizes, counts, epoch
-        // seconds) stay well within 2^53, so this is lossless in practice.
-        SqlParam::Integer(i) => JsValue::from_f64(*i as f64),
+        // JS numbers are f64, lossless only within 2^53. The integer params here
+        // (sizes, counts, epoch seconds) stay inside that and bind as numbers; a
+        // larger value binds as a BigInt so it round-trips with col_i64's read.
+        SqlParam::Integer(i) => {
+            const SAFE: i64 = 1 << 53;
+            if (-SAFE..=SAFE).contains(i) {
+                JsValue::from_f64(*i as f64)
+            } else {
+                js_sys::BigInt::from(*i).into()
+            }
+        }
         SqlParam::Real(f) => JsValue::from_f64(*f),
         SqlParam::Blob(b) => js_sys::Uint8Array::from(&**b).into(),
         SqlParam::Null => JsValue::NULL,
@@ -182,8 +201,22 @@ fn col_text(row: &js_sys::Array, i: u32) -> Option<String> {
 }
 
 /// Read column `i` as an integer (0 when absent or non-numeric).
+///
+/// A value outside f64's safe range comes back as a BigInt, which `as_f64`
+/// cannot read; decode it explicitly rather than truncating to 0.
 fn col_i64(row: &js_sys::Array, i: u32) -> i64 {
-    row.get(i).as_f64().map(|f| f as i64).unwrap_or(0)
+    let v = row.get(i);
+    if let Some(f) = v.as_f64() {
+        return f as i64;
+    }
+    if let Ok(big) = v.dyn_into::<js_sys::BigInt>() {
+        if let Some(s) = big.to_string(10).ok().and_then(|js| js.as_string()) {
+            if let Ok(n) = s.parse::<i64>() {
+                return n;
+            }
+        }
+    }
+    0
 }
 
 /// Map query/scan result rows (each `[c0, c1, c2]`) to `(String, String, String)`.
@@ -225,9 +258,39 @@ fn row_to_metadata(row: &js_sys::Array) -> TableMetadata {
     }
 }
 
+/// Map a JS error from the bridge's `open` to a backend error, recognising the
+/// `OpfsUnavailableError` the bridge throws for a busy database so it surfaces
+/// as a distinct [`BackendError::OpfsUnavailable`] (and thence a stable
+/// `com.dynoxide.wasm#OpfsUnavailable` envelope), not a generic failure.
+fn open_err(e: JsValue) -> BackendError {
+    let is_opfs = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .as_deref()
+        == Some("OpfsUnavailableError");
+    if is_opfs {
+        let msg = js_sys::Reflect::get(&e, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "OPFS is unavailable".to_string());
+        return BackendError::OpfsUnavailable(msg);
+    }
+    js_err(e)
+}
+
 /// Wrap a JS error from the bridge as a backend error.
 fn js_err(e: JsValue) -> BackendError {
-    let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+    // A thrown Error object is not a string primitive, so `as_string` is None and
+    // the message would fall through to noisy Debug output. Read its `.message`
+    // first so the bridge's curated text (e.g. the OPFS busy guidance) is clean.
+    let msg = e
+        .as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&e, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+        })
+        .unwrap_or_else(|| format!("{e:?}"));
     BackendError::Other(format!("wa-sqlite: {msg}"))
 }
 

@@ -22,12 +22,14 @@
  * fallback would need the Asyncify async build (~2x the wasm) and is out of
  * scope here.
  *
- * The fallback is for contexts where OPFS genuinely isn't available, not a
- * catch-all. When OPFS *is* available but the pool cannot be acquired - most
- * often because another tab or Worker already holds this database's sync access
- * handles - `open` throws an `OpfsUnavailableError` rather than silently forking
- * to a separate in-memory store, which would split reads and writes across two
- * datasets and lose everything on reload.
+ * One OPFS failure is surfaced rather than hidden: a *busy* database - another
+ * tab or Worker already holding its sync access handles - throws an
+ * `OpfsUnavailableError`, because silently forking to a separate in-memory store
+ * would split reads and writes across two datasets and lose everything on
+ * reload. Any other failure (a private window whose handles never come up, a
+ * quota or security error, a transient `DOMException`) means OPFS is advertised
+ * but unusable here, so `open` degrades to the in-memory session - the same as a
+ * context with no OPFS at all - rather than failing to boot.
  *
  * Each database opens against its own named VFS over a per-name OPFS directory,
  * so two engine instances (two Workers) never contend on a shared pool. The
@@ -78,11 +80,19 @@ function moduleHandle() {
 
 // VFS registry for this Worker, keyed by OPFS pool path so repeated opens of
 // one database reuse a single registration. Each entry is the *in-flight*
-// registration promise (resolving to { vfsName, mode }), not the resolved
-// value, so two concurrent opens of one database share a single registration
-// rather than both running vfs_register. A resolved registration stays cached
-// for the Worker's life; a failed one is dropped so a later open can retry.
+// registration promise, resolving to { vfsName, mode, vfs, poolPath, refs },
+// not the resolved value, so two concurrent opens of one database share a single
+// registration rather than both running vfs_register. `refs` counts live
+// connections on the pool; a failed registration is dropped so a later open can
+// retry, and a persistent pool is dropped once its last connection closes (see
+// `close`) so its OPFS handles are released. A memory pool stays cached.
 const vfsByPool = new Map();
+
+// Monotonic suffix so each fresh registration gets a unique SQLite VFS name.
+// wa-sqlite exposes no vfs_unregister, so once a released pool's name lingers in
+// SQLite's registry, a later registration for the same database must not collide
+// with it - a new suffix sidesteps that.
+let vfsSeq = 0;
 
 /**
  * OPFS is present but its pool could not be acquired. Distinct from the
@@ -105,16 +115,16 @@ function isBusyLock(err) {
   return name === "NoModificationAllowedError" || name === "InvalidStateError";
 }
 
-function registerMemoryVfs(s, name) {
-  const vfsName = `dynoxide-memory-${slug(name)}`;
+function registerMemoryVfs(s, name, poolPath) {
+  const vfsName = `dynoxide-memory-${slug(name)}-${vfsSeq++}`;
   const vfs = new MemoryVFS();
   vfs.name = vfsName; // MemoryVFS exposes `name` as a writable field.
   s.vfs_register(vfs, false);
-  return { vfsName, mode: EPHEMERAL };
+  return { vfsName, mode: EPHEMERAL, vfs, poolPath, refs: 0 };
 }
 
 async function registerOpfsVfs(s, name, poolPath) {
-  const vfsName = `dynoxide-opfs-${slug(name)}`;
+  const vfsName = `dynoxide-opfs-${slug(name)}-${vfsSeq++}`;
   const vfs = new AccessHandlePoolVFS(poolPath);
   // The base class hardcodes `get name() { return 'AccessHandlePool' }`;
   // shadow it with a per-pool name so distinct instances register distinct
@@ -122,11 +132,16 @@ async function registerOpfsVfs(s, name, poolPath) {
   Object.defineProperty(vfs, "name", { value: vfsName, configurable: true });
   await vfs.isReady;
   s.vfs_register(vfs, false);
-  return { vfsName, mode: PERSISTENT };
+  return { vfsName, mode: PERSISTENT, vfs, poolPath, refs: 0 };
 }
 
 // FNV-1a (32-bit) over the raw name, so two names that sanitise to the same
-// characters (e.g. "a.b" and "a_b") still get distinct pools.
+// characters (e.g. "a.b" and "a_b") still get distinct pools. Deliberately NOT
+// fnv1aHash from fnv1a.js: this hashes UTF-16 code units (charCodeAt) and emits
+// base-36 for a filesystem-safe slug, where fnv1aHash hashes UTF-8 bytes and
+// returns a number. They agree on ASCII names but diverge beyond it. Do not
+// consolidate them - the output feeds slug() and every OPFS pool path, so a
+// hash change would relocate persisted databases and lose their data.
 function nameHash(name) {
   let hash = 0x811c9dc5;
   for (let i = 0; i < name.length; i += 1) {
@@ -177,11 +192,15 @@ function registerVfs(s, name, ephemeral) {
 
   const pending = (async () => {
     if (ephemeral || !opfsSyncAvailable()) {
-      return registerMemoryVfs(s, name);
+      return registerMemoryVfs(s, name, poolPath);
     }
     try {
       return await registerOpfsVfs(s, name, poolPath);
     } catch (err) {
+      // A busy lock is the one OPFS failure worth surfacing: the API works here,
+      // another tab or Worker just holds this database. Throw so the caller can
+      // tell the user to close the other session, rather than silently forking
+      // to a separate in-memory store (the bug that motivated this path).
       if (isBusyLock(err)) {
         throw new OpfsUnavailableError(
           `OPFS is busy for "${name}": another tab or client holds its lock. ` +
@@ -189,10 +208,12 @@ function registerVfs(s, name, ephemeral) {
           { cause: err },
         );
       }
-      throw new OpfsUnavailableError(
-        `OPFS failed to open for "${name}": ${err && err.message ? err.message : err}`,
-        { cause: err },
-      );
+      // Any other failure means OPFS is advertised but not actually usable here
+      // (a private window whose handles never come up, a quota or security
+      // error, a transient DOMException). Degrade to an ephemeral session rather
+      // than failing to boot: opfsSyncAvailable() proves the API is present, not
+      // that it works.
+      return registerMemoryVfs(s, name, poolPath);
     }
   })();
 
@@ -213,12 +234,13 @@ function registerVfs(s, name, ephemeral) {
  */
 export async function open(name, ephemeral = false) {
   const s = await moduleHandle();
-  const { vfsName, mode } = await registerVfs(s, name, ephemeral);
+  const entry = await registerVfs(s, name, ephemeral);
   const db = await s.open_v2(
     name,
     SQLite.SQLITE_OPEN_CREATE | SQLite.SQLITE_OPEN_READWRITE,
-    vfsName,
+    entry.vfsName,
   );
+  entry.refs += 1; // count a live connection on this pool; close releases it
 
   // Register fnv1a_hash for GSI/LSI parallel-scan segment filtering, matching
   // the native scalar function: FNV-1a (32-bit) over the value's UTF-8 bytes,
@@ -237,7 +259,7 @@ export async function open(name, ephemeral = false) {
     null,
   );
 
-  return { db, persistenceMode: mode };
+  return { db, persistenceMode: entry.mode, poolPath: entry.poolPath };
 }
 
 /**
@@ -280,15 +302,34 @@ export async function query(handle, sql, params) {
 }
 
 /**
- * Close a database handle, releasing its wa-sqlite connection. Called before a
- * re-open swaps in a new database so the previous connection does not leak. The
- * per-name VFS registration is left in place: it is keyed by database name and
- * deliberately reused across re-opens within this Worker, and the pool's OPFS
- * handles stay owned by this Worker for the session. Safe to call with a handle
- * that has no live connection.
+ * Close a database handle, releasing its wa-sqlite connection. The engine calls
+ * this on the previous database after a re-open swaps in a new one, so the old
+ * connection does not leak.
+ *
+ * When the closed connection was the last one on a persistent pool, the pool's
+ * OPFS sync access handles are released too (they are owned by the VFS instance,
+ * not the connection, and survive SQLite's `xClose`), and its registration is
+ * forgotten - so re-opening a *different* database frees the old one's name for
+ * another tab, and a later open of the same name builds a fresh pool that
+ * re-acquires the persisted files. Memory pools hold no OS handles and stay
+ * cached. Nulling `handle.db` first makes a duplicate close a genuine no-op.
  */
 export async function close(handle) {
   if (!handle || handle.db == null) return;
   const s = await moduleHandle();
-  await s.close(handle.db);
+  const db = handle.db;
+  handle.db = null;
+  await s.close(db);
+
+  const pending = handle.poolPath != null ? vfsByPool.get(handle.poolPath) : null;
+  const entry = pending ? await pending.catch(() => null) : null;
+  if (entry) {
+    entry.refs -= 1;
+    if (entry.refs <= 0 && entry.mode === PERSISTENT) {
+      await entry.vfs.close();
+      if (vfsByPool.get(handle.poolPath) === pending) {
+        vfsByPool.delete(handle.poolPath);
+      }
+    }
+  }
 }

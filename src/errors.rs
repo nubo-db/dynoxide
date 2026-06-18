@@ -92,6 +92,15 @@ pub enum DynoxideError {
     #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     #[error("Internal error: {0}")]
     SqliteError(#[from] rusqlite::Error),
+
+    /// OPFS is present in the browser but its pool could not be acquired,
+    /// typically because another tab or Worker holds the database's sync access
+    /// handles. wasm backend only; surfaced with a dynoxide-specific `__type` so
+    /// a browser client can detect a busy database rather than parse a generic
+    /// internal error.
+    #[cfg(feature = "wasm-sqlite")]
+    #[error("{0}")]
+    OpfsUnavailable(String),
 }
 
 /// Most backend failures (`BackendError`) are storage-level faults: a locked
@@ -114,6 +123,8 @@ impl From<crate::storage_backend::BackendError> for DynoxideError {
         use crate::storage_backend::BackendError;
         match err {
             BackendError::Validation(msg) => DynoxideError::ValidationException(msg),
+            #[cfg(feature = "wasm-sqlite")]
+            BackendError::OpfsUnavailable(msg) => DynoxideError::OpfsUnavailable(msg),
             other => DynoxideError::InternalServerError(other.to_string()),
         }
     }
@@ -165,6 +176,8 @@ impl DynoxideError {
             }
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
             DynoxideError::SqliteError(_) => "com.amazonaws.dynamodb.v20120810#InternalServerError",
+            #[cfg(feature = "wasm-sqlite")]
+            DynoxideError::OpfsUnavailable(_) => "com.dynoxide.wasm#OpfsUnavailable",
         }
     }
 
@@ -195,6 +208,8 @@ impl DynoxideError {
             DynoxideError::InternalServerError(_) => "InternalServerError",
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
             DynoxideError::SqliteError(_) => "InternalServerError",
+            #[cfg(feature = "wasm-sqlite")]
+            DynoxideError::OpfsUnavailable(_) => "OpfsUnavailable",
         }
     }
 

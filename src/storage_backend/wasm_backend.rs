@@ -88,7 +88,7 @@ impl WasmBridgeBackend {
     /// when `ephemeral` is true regardless of OPFS availability. The persistent
     /// path still degrades to memory on its own when OPFS is unusable.
     pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
-        let handle = wa_open(name, ephemeral).await.map_err(js_err)?;
+        let handle = wa_open(name, ephemeral).await.map_err(open_err)?;
         // The bridge reports which VFS it actually opened against; read it off
         // the handle before treating the handle as opaque.
         let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))
@@ -263,9 +263,40 @@ fn row_to_metadata(row: &js_sys::Array) -> TableMetadata {
     }
 }
 
+/// Map a JS error from the bridge's `open` to a backend error, recognising the
+/// `OpfsUnavailableError` the bridge throws for a busy database so it surfaces
+/// as a distinct [`BackendError::OpfsUnavailable`] (and thence a stable
+/// `com.dynoxide.wasm#OpfsUnavailable` envelope), not a generic failure.
+fn open_err(e: JsValue) -> BackendError {
+    let is_opfs = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .as_deref()
+        == Some("OpfsUnavailableError");
+    if is_opfs {
+        let msg = js_sys::Reflect::get(&e, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "OPFS is unavailable".to_string());
+        return BackendError::OpfsUnavailable(msg);
+    }
+    js_err(e)
+}
+
 /// Wrap a JS error from the bridge as a backend error.
 fn js_err(e: JsValue) -> BackendError {
-    let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+    // A thrown Error object is not a string primitive, so `as_string` returns
+    // None for it and the message would otherwise fall through to the Debug
+    // rendering (JsValue("...") noise). Read its `.message` first so the bridge's
+    // curated text (for example the OPFS busy guidance) surfaces cleanly.
+    let msg = e
+        .as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&e, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+        })
+        .unwrap_or_else(|| format!("{e:?}"));
     BackendError::Other(format!("wa-sqlite: {msg}"))
 }
 

@@ -315,6 +315,89 @@ mod tests {
     }
 
     #[test]
+    fn batch_get_item_returns_seeded_items() {
+        let backend = Storage::memory().unwrap();
+        seed_music(&backend);
+
+        let batch_get = r#"{
+            "RequestItems": {
+                "Music": {
+                    "Keys": [
+                        {"artist": {"S": "a"}, "song": {"S": "s1"}},
+                        {"artist": {"S": "a"}, "song": {"S": "s3"}}
+                    ]
+                }
+            }
+        }"#;
+        let resp = run(&backend, "BatchGetItem", batch_get).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+        let items = v["Responses"]["Music"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // Exactly the two requested rows come back, distinct (not s1 twice) and not
+        // the unrequested s2. Keys order is not preserved, so sort before comparing.
+        let mut songs: Vec<&str> = items
+            .iter()
+            .map(|item| item["song"]["S"].as_str().unwrap())
+            .collect();
+        songs.sort_unstable();
+        assert_eq!(songs, ["s1", "s3"]);
+        assert!(v["UnprocessedKeys"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_write_item_puts_and_deletes_persist() {
+        let backend = Storage::memory().unwrap();
+        seed_music(&backend);
+
+        // One batch: delete an existing row, insert a new one.
+        let batch_write = r#"{
+            "RequestItems": {
+                "Music": [
+                    {"DeleteRequest": {"Key": {"artist": {"S": "a"}, "song": {"S": "s2"}}}},
+                    {"PutRequest": {"Item": {"artist": {"S": "a"}, "song": {"S": "s4"}, "genre": {"S": "pop"}}}}
+                ]
+            }
+        }"#;
+        let resp = run(&backend, "BatchWriteItem", batch_write).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["UnprocessedItems"].as_object().unwrap().is_empty());
+
+        // Read back through dispatch: the write actually mutated the backend.
+        let get_s2 = r#"{"TableName":"Music","Key":{"artist":{"S":"a"},"song":{"S":"s2"}}}"#;
+        let s2: serde_json::Value =
+            serde_json::from_str(&run(&backend, "GetItem", get_s2).unwrap()).unwrap();
+        assert!(s2.get("Item").is_none(), "s2 should have been deleted");
+
+        let get_s4 = r#"{"TableName":"Music","Key":{"artist":{"S":"a"},"song":{"S":"s4"}}}"#;
+        let s4: serde_json::Value =
+            serde_json::from_str(&run(&backend, "GetItem", get_s4).unwrap()).unwrap();
+        assert_eq!(s4["Item"]["genre"]["S"], "pop");
+    }
+
+    #[test]
+    fn transact_get_items_preserves_position_for_present_and_missing() {
+        let backend = Storage::memory().unwrap();
+        seed_music(&backend);
+
+        // One present key, one absent key: the response must keep both slots in order.
+        let transact_get = r#"{
+            "TransactItems": [
+                {"Get": {"TableName": "Music", "Key": {"artist": {"S": "a"}, "song": {"S": "s1"}}}},
+                {"Get": {"TableName": "Music", "Key": {"artist": {"S": "a"}, "song": {"S": "nope"}}}}
+            ]
+        }"#;
+        let resp = run(&backend, "TransactGetItems", transact_get).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+        let responses = v["Responses"].as_array().unwrap();
+        assert_eq!(responses.len(), 2);
+        // Position 0 is the present row; position 1 is the miss, serialised as {}.
+        assert_eq!(responses[0]["Item"]["genre"]["S"], "rock");
+        assert!(responses[1].get("Item").is_none());
+    }
+
+    #[test]
     fn unknown_op_returns_envelope_not_panic() {
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "FlyToTheMoon", "{}").unwrap_err();

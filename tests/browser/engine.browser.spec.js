@@ -488,3 +488,249 @@ test("a heavy multi-table workload stays within the SAH pool without exhausting 
   expect(result.created).toBe(6);
   expect(result.total).toBe(120); // 6 tables x 20 items, all readable: no capacity failure
 });
+
+// --- UpdateTable on the wasm preview ---------------------------------------
+
+test("UpdateTable adds a GSI to a populated table and backfills the existing rows (OPFS)", async ({ page }) => {
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `addgsi-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    for (const [song, genre] of [["s1", "rock"], ["s2", "jazz"], ["s3", "rock"]]) {
+      await client.execute("PutItem", {
+        TableName: table.TableName,
+        Item: { artist: { S: "a" }, song: { S: song }, genre: { S: genre } },
+      });
+    }
+    // The rows exist before the index does: adding the GSI must backfill them.
+    await client.execute("UpdateTable", {
+      TableName: table.TableName,
+      AttributeDefinitions: [
+        { AttributeName: "artist", AttributeType: "S" },
+        { AttributeName: "song", AttributeType: "S" },
+        { AttributeName: "genre", AttributeType: "S" },
+      ],
+      GlobalSecondaryIndexUpdates: [
+        {
+          Create: {
+            IndexName: "GenreIndex",
+            KeySchema: [{ AttributeName: "genre", KeyType: "HASH" }],
+            Projection: { ProjectionType: "ALL" },
+          },
+        },
+      ],
+    });
+    const q = await client.execute("Query", {
+      TableName: table.TableName,
+      IndexName: "GenreIndex",
+      KeyConditionExpression: "genre = :g",
+      ExpressionAttributeValues: { ":g": { S: "rock" } },
+    });
+    const out = { mode: client.persistenceMode, count: q.Count, songs: q.Items.map((i) => i.song.S).sort() };
+    client.terminate();
+    return out;
+  }, MUSIC);
+
+  expect(result.mode).toBe("opfs");
+  expect(result.count).toBe(2); // s1 and s3 were backfilled into the new index
+  expect(result.songs).toEqual(["s1", "s3"]);
+});
+
+test("UpdateTable deletes a GSI; the index stops answering and the base table survives", async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const client = globalThis.dynoxide.makeClient({ name: `delgsi-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", {
+      TableName: "Music",
+      KeySchema: [
+        { AttributeName: "artist", KeyType: "HASH" },
+        { AttributeName: "song", KeyType: "RANGE" },
+      ],
+      AttributeDefinitions: [
+        { AttributeName: "artist", AttributeType: "S" },
+        { AttributeName: "song", AttributeType: "S" },
+        { AttributeName: "genre", AttributeType: "S" },
+      ],
+      GlobalSecondaryIndexes: [
+        {
+          IndexName: "GenreIndex",
+          KeySchema: [{ AttributeName: "genre", KeyType: "HASH" }],
+          Projection: { ProjectionType: "ALL" },
+        },
+      ],
+      BillingMode: "PAY_PER_REQUEST",
+    });
+    await client.execute("PutItem", {
+      TableName: "Music",
+      Item: { artist: { S: "a" }, song: { S: "s1" }, genre: { S: "rock" } },
+    });
+    const queryGenre = () =>
+      client.execute("Query", {
+        TableName: "Music",
+        IndexName: "GenreIndex",
+        KeyConditionExpression: "genre = :g",
+        ExpressionAttributeValues: { ":g": { S: "rock" } },
+      });
+    const before = await queryGenre();
+    await client.execute("UpdateTable", {
+      TableName: "Music",
+      GlobalSecondaryIndexUpdates: [{ Delete: { IndexName: "GenreIndex" } }],
+    });
+    const baseScan = await client.execute("Scan", { TableName: "Music" });
+    let indexErr = null;
+    try {
+      await queryGenre();
+    } catch (e) {
+      indexErr = e.message;
+    }
+    const out = { beforeCount: before.Count, baseCount: baseScan.Count, indexErr };
+    client.terminate();
+    return out;
+  });
+
+  expect(result.beforeCount).toBe(1);
+  expect(result.baseCount).toBe(1); // the base table survives the GSI delete
+  expect(result.indexErr).not.toBeNull(); // the deleted index no longer answers
+});
+
+test("UpdateTable persists deletion protection and table class, reflected by DescribeTable", async ({ page }) => {
+  // Two distinct table-setting behaviours: a boolean flag and an enum class.
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `setters-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    await client.execute("UpdateTable", { TableName: table.TableName, DeletionProtectionEnabled: true });
+    await client.execute("UpdateTable", {
+      TableName: table.TableName,
+      TableClass: "STANDARD_INFREQUENT_ACCESS",
+    });
+    const d = await client.execute("DescribeTable", { TableName: table.TableName });
+    const out = {
+      deletionProtection: d.Table.DeletionProtectionEnabled,
+      tableClass: d.Table.TableClassSummary && d.Table.TableClassSummary.TableClass,
+    };
+    client.terminate();
+    return out;
+  }, MUSIC);
+
+  expect(result.deletionProtection).toBe(true);
+  expect(result.tableClass).toBe("STANDARD_INFREQUENT_ACCESS");
+});
+
+test("UpdateTable switches billing mode to provisioned with its throughput, reflected by DescribeTable", async ({ page }) => {
+  // The interrelated setter group: switching to PROVISIONED carries throughput,
+  // which the shared handler validates and DescribeTable then reflects.
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `billing-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table); // PAY_PER_REQUEST
+    await client.execute("UpdateTable", {
+      TableName: table.TableName,
+      BillingMode: "PROVISIONED",
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+    });
+    const d = await client.execute("DescribeTable", { TableName: table.TableName });
+    const out = {
+      // BillingModeSummary is absent for PROVISIONED tables (matches AWS and the
+      // native conformance suite); the persisted switch shows up as the
+      // provisioned throughput now being present with the values we set.
+      hasBillingModeSummary: !!d.Table.BillingModeSummary,
+      rcu: d.Table.ProvisionedThroughput && d.Table.ProvisionedThroughput.ReadCapacityUnits,
+      wcu: d.Table.ProvisionedThroughput && d.Table.ProvisionedThroughput.WriteCapacityUnits,
+    };
+    client.terminate();
+    return out;
+  }, MUSIC);
+
+  expect(result.hasBillingModeSummary).toBe(false); // absent for PROVISIONED, per AWS and conformance
+  expect(result.rcu).toBe(5); // the switch persisted: provisioned throughput now reflects it
+  expect(result.wcu).toBe(5);
+});
+
+test("UpdateTable with a StreamSpecification is refused and leaves the table intact", async ({ page }) => {
+  // Streams are a deeper preview gap on wasm, so a stream-spec change must be
+  // refused with a typed error and roll back rather than half-apply.
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `stream-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    await client.execute("PutItem", {
+      TableName: table.TableName,
+      Item: { artist: { S: "a" }, song: { S: "s1" } },
+    });
+    let err = null;
+    try {
+      await client.execute("UpdateTable", {
+        TableName: table.TableName,
+        StreamSpecification: { StreamEnabled: true, StreamViewType: "NEW_AND_OLD_IMAGES" },
+      });
+    } catch (e) {
+      err = { type: e.type, message: e.message };
+    }
+    const scan = await client.execute("Scan", { TableName: table.TableName });
+    const d = await client.execute("DescribeTable", { TableName: table.TableName });
+    const out = {
+      err,
+      count: scan.Count,
+      streamEnabled: (d.Table.StreamSpecification && d.Table.StreamSpecification.StreamEnabled) || false,
+    };
+    client.terminate();
+    return out;
+  }, MUSIC);
+
+  expect(result.err).not.toBeNull();
+  expect(result.err.message).toMatch(/not supported|streams/i);
+  expect(result.count).toBe(1); // the table survived the refused update
+  expect(result.streamEnabled).toBe(false); // streams were not enabled
+});
+
+test("a GSI added to a populated table survives a reload (OPFS)", async ({ page }) => {
+  const name = `addgsi-persist-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+
+  await page.evaluate(async ({ name, table }) => {
+    const client = globalThis.dynoxide.makeClient({ name });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    await client.execute("PutItem", {
+      TableName: table.TableName,
+      Item: { artist: { S: "a" }, song: { S: "s1" }, genre: { S: "rock" } },
+    });
+    await client.execute("UpdateTable", {
+      TableName: table.TableName,
+      AttributeDefinitions: [
+        { AttributeName: "artist", AttributeType: "S" },
+        { AttributeName: "song", AttributeType: "S" },
+        { AttributeName: "genre", AttributeType: "S" },
+      ],
+      GlobalSecondaryIndexUpdates: [
+        {
+          Create: {
+            IndexName: "GenreIndex",
+            KeySchema: [{ AttributeName: "genre", KeyType: "HASH" }],
+            Projection: { ProjectionType: "ALL" },
+          },
+        },
+      ],
+    });
+    client.terminate();
+  }, { name, table: MUSIC });
+
+  await page.waitForTimeout(150);
+
+  const reopened = await page.evaluate(async ({ name }) => {
+    const client = globalThis.dynoxide.makeClient({ name });
+    await client.ready();
+    const q = await client.execute("Query", {
+      TableName: "Music",
+      IndexName: "GenreIndex",
+      KeyConditionExpression: "genre = :g",
+      ExpressionAttributeValues: { ":g": { S: "rock" } },
+    });
+    const out = { mode: client.persistenceMode, count: q.Count };
+    client.terminate();
+    return out;
+  }, { name });
+
+  expect(reopened.mode).toBe("opfs");
+  expect(reopened.count).toBe(1); // the backfilled index persisted across reload
+});

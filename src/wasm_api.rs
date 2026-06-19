@@ -482,7 +482,10 @@ mod tests {
             ]
         }"#;
         let resp = run(&backend, "UpdateTable", update).unwrap();
-        assert!(resp.contains("GenreIndex"), "the response should describe the new GSI");
+        assert!(
+            resp.contains("GenreIndex"),
+            "the response should describe the new GSI"
+        );
 
         // The pre-existing rows were backfilled: a query on the new index returns
         // the two rock rows.

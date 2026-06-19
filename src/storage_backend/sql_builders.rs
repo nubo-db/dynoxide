@@ -310,7 +310,10 @@ pub fn update_on_demand_throughput<'a>(
 pub fn update_deletion_protection(table_name: &str, enabled: bool) -> (String, Vec<SqlParam<'_>>) {
     (
         "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2".to_string(),
-        vec![SqlParam::Integer(enabled as i64), SqlParam::text(table_name)],
+        vec![
+            SqlParam::Integer(enabled as i64),
+            SqlParam::text(table_name),
+        ],
     )
 }
 
@@ -1284,7 +1287,8 @@ mod tests {
         assert_eq!(
             clear_provisioned_throughput("T"),
             (
-                "UPDATE _tables SET provisioned_throughput = NULL WHERE table_name = ?1".to_string(),
+                "UPDATE _tables SET provisioned_throughput = NULL WHERE table_name = ?1"
+                    .to_string(),
                 vec![SqlParam::text("T")],
             )
         );
@@ -1299,7 +1303,10 @@ mod tests {
             update_table_class("T", "STANDARD_INFREQUENT_ACCESS"),
             (
                 "UPDATE _tables SET table_class = ?1 WHERE table_name = ?2".to_string(),
-                vec![SqlParam::text("STANDARD_INFREQUENT_ACCESS"), SqlParam::text("T")],
+                vec![
+                    SqlParam::text("STANDARD_INFREQUENT_ACCESS"),
+                    SqlParam::text("T")
+                ],
             )
         );
         assert_eq!(
@@ -1312,14 +1319,16 @@ mod tests {
         assert_eq!(
             update_deletion_protection("T", true),
             (
-                "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2".to_string(),
+                "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2"
+                    .to_string(),
                 vec![SqlParam::Integer(1), SqlParam::text("T")],
             )
         );
         assert_eq!(
             update_deletion_protection("T", false),
             (
-                "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2".to_string(),
+                "UPDATE _tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2"
+                    .to_string(),
                 vec![SqlParam::Integer(0), SqlParam::text("T")],
             )
         );

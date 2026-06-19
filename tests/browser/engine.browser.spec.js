@@ -262,3 +262,229 @@ test("the shipping worker rejects a stripped harness op as unknown (#69)", async
   expect(err.__type).toBe("com.dynoxide.wasm#UnsupportedOperation");
   expect(err.message).toMatch(/unknown op/);
 });
+
+// --- Migration to @sqlite.org/sqlite-wasm: re-proven guarantees ------------
+
+test("OPFS persistence works with no cross-origin isolation (no COOP/COEP)", async ({ page }) => {
+  // The whole reason for the SAHPool VFS: unlike the default OPFS VFS it needs
+  // no SharedArrayBuffer, so it works on a page served without COOP/COEP. This
+  // pins crossOriginIsolated === false while persistence still reports "opfs".
+  const result = await page.evaluate(async (table) => {
+    const isolated = globalThis.crossOriginIsolated;
+    const client = globalThis.dynoxide.makeClient({ name: `noiso-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    await client.execute("PutItem", {
+      TableName: table.TableName,
+      Item: { artist: { S: "a" }, song: { S: "s1" } },
+    });
+    const scan = await client.execute("Scan", { TableName: table.TableName });
+    const out = { isolated, mode: client.persistenceMode, count: scan.Count };
+    client.terminate();
+    return out;
+  }, MUSIC);
+
+  expect(result.isolated).toBe(false);
+  expect(result.mode).toBe("opfs");
+  expect(result.count).toBe(1);
+});
+
+test("persistence mode reports opfs for a persistent open and memory for an ephemeral one", async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const w1 = globalThis.dynoxide.makeRawWorker();
+    const persistent = await w1.open(`mode-opfs-${crypto.randomUUID()}`); // ephemeral defaults false
+    w1.terminate();
+
+    const w2 = globalThis.dynoxide.makeRawWorker();
+    const ephemeral = await w2.open(`mode-mem-${crypto.randomUUID()}`, true);
+    w2.terminate();
+
+    return { persistent: persistent.persistenceMode, ephemeral: ephemeral.persistenceMode };
+  });
+
+  expect(result.persistent).toBe("opfs");
+  expect(result.ephemeral).toBe("memory");
+});
+
+test("a busy OPFS database recovers once the holder releases, not sticky until reload", async ({ page }) => {
+  // The installer caches a failed init per VFS name, so without the bridge's
+  // forceReinitIfPreviouslyFailed a once-busy name would stay busy until reload.
+  // The retry here runs on the SAME worker that saw the busy failure, so a
+  // success proves the cached rejection was cleared rather than replayed.
+  const result = await page.evaluate(async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const name = `recover-${crypto.randomUUID()}`;
+
+    const a = globalThis.dynoxide.makeRawWorker();
+    await a.open(name); // holds this database's OPFS sync access handles
+
+    const b = globalThis.dynoxide.makeRawWorker();
+    let firstErr = null;
+    try {
+      await b.open(name);
+    } catch (e) {
+      try {
+        firstErr = JSON.parse(e.message);
+      } catch {
+        firstErr = { message: e.message };
+      }
+    }
+
+    a.terminate(); // release the handles
+
+    let recovered = null;
+    for (let attempt = 0; attempt < 20 && !recovered; attempt += 1) {
+      try {
+        const d = await b.open(name);
+        recovered = d.persistenceMode;
+      } catch {
+        await sleep(50);
+      }
+    }
+    b.terminate();
+    return { firstErr, recovered };
+  });
+
+  expect(result.firstErr).not.toBeNull();
+  expect(result.firstErr.__type).toBe("com.dynoxide.wasm#OpfsUnavailable");
+  expect(result.recovered).toBe("opfs");
+});
+
+const BIG_N = "9007199254740993"; // 2^53 + 1: beyond f64 integer precision
+
+test("a Number attribute beyond 2^53 round-trips bit-identical through put and read (sign-off gate)", async ({ page }) => {
+  const result = await page.evaluate(async ({ table, big }) => {
+    const client = globalThis.dynoxide.makeClient({ name: `bign-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    await client.execute("PutItem", {
+      TableName: table.TableName,
+      Item: { artist: { S: "a" }, song: { S: "s1" }, plays: { N: big } },
+    });
+    const read = await client.execute("Query", {
+      TableName: table.TableName,
+      KeyConditionExpression: "artist = :a",
+      ExpressionAttributeValues: { ":a": { S: "a" } },
+    });
+    const out = { plays: read.Items[0].plays.N };
+    client.terminate();
+    return out;
+  }, { table: MUSIC, big: BIG_N });
+
+  // DynamoDB Numbers are arbitrary-precision decimal strings; the value must
+  // come back verbatim, exactly as the native rusqlite backend returns it, with
+  // no float rounding at 2^53. The SQLite-level i64 > 2^53 round-trip is proven
+  // separately in the Node bridge test (js/sqlite-wasm-bridge.test.js).
+  expect(result.plays).toBe(BIG_N);
+});
+
+const SEGMENTED = {
+  TableName: "Segmented",
+  KeySchema: [
+    { AttributeName: "pk", KeyType: "HASH" },
+    { AttributeName: "sk", KeyType: "RANGE" },
+  ],
+  AttributeDefinitions: [
+    { AttributeName: "pk", AttributeType: "S" },
+    { AttributeName: "sk", AttributeType: "S" },
+    { AttributeName: "gpk", AttributeType: "S" },
+    { AttributeName: "gsk", AttributeType: "S" },
+  ],
+  GlobalSecondaryIndexes: [
+    {
+      IndexName: "byG",
+      KeySchema: [
+        { AttributeName: "gpk", KeyType: "HASH" },
+        { AttributeName: "gsk", KeyType: "RANGE" },
+      ],
+      Projection: { ProjectionType: "ALL" },
+    },
+  ],
+  BillingMode: "PAY_PER_REQUEST",
+};
+
+test("a segmented parallel scan over a GSI matches a full scan, proving the fnv1a scalar", async ({ page }) => {
+  // GSI scans filter by `fnv1a_hash(table_pk) % totalSegments` in SQL, so this
+  // exercises the bridge's registered scalar end to end. The union of all
+  // segments must equal a full scan exactly, with no item in two segments.
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `seg-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    for (let i = 0; i < 24; i += 1) {
+      await client.execute("PutItem", {
+        TableName: table.TableName,
+        Item: { pk: { S: `p${i}` }, sk: { S: "s" }, gpk: { S: `g${i % 7}` }, gsk: { S: `k${i}` } },
+      });
+    }
+    const keyOf = (it) => `${it.pk.S}|${it.sk.S}`;
+
+    const full = await client.execute("Scan", { TableName: table.TableName, IndexName: "byG" });
+    const fullKeys = full.Items.map(keyOf).sort();
+
+    const SEG = 4;
+    const segKeys = [];
+    for (let s = 0; s < SEG; s += 1) {
+      const part = await client.execute("Scan", {
+        TableName: table.TableName,
+        IndexName: "byG",
+        Segment: s,
+        TotalSegments: SEG,
+      });
+      segKeys.push(...part.Items.map(keyOf));
+    }
+    const out = {
+      fullCount: fullKeys.length,
+      dupes: segKeys.length !== new Set(segKeys).size,
+      unionMatches: JSON.stringify(segKeys.slice().sort()) === JSON.stringify(fullKeys),
+    };
+    client.terminate();
+    return out;
+  }, SEGMENTED);
+
+  expect(result.fullCount).toBe(24);
+  expect(result.dupes).toBe(false); // no item is assigned to two segments
+  expect(result.unionMatches).toBe(true); // the segments partition the full scan exactly
+});
+
+test("a heavy multi-table workload stays within the SAH pool without exhausting capacity", async ({ page }) => {
+  // dynoxide keeps every DynamoDB table and index inside one SQLite database
+  // file, so the SAH pool's slots are consumed by that file, its rollback
+  // journal and SQLite temp files, not by table count. This drives a realistic
+  // load (several tables, many items, a scan each) to prove the chosen
+  // initialCapacity is adequate and the pool never surfaces a spurious failure.
+  const result = await page.evaluate(async () => {
+    const client = globalThis.dynoxide.makeClient({ name: `cap-${crypto.randomUUID()}` });
+    await client.ready();
+    let created = 0;
+    let total = 0;
+    for (let t = 0; t < 6; t += 1) {
+      const TableName = `Cap${t}`;
+      await client.execute("CreateTable", {
+        TableName,
+        KeySchema: [
+          { AttributeName: "pk", KeyType: "HASH" },
+          { AttributeName: "sk", KeyType: "RANGE" },
+        ],
+        AttributeDefinitions: [
+          { AttributeName: "pk", AttributeType: "S" },
+          { AttributeName: "sk", AttributeType: "S" },
+        ],
+        BillingMode: "PAY_PER_REQUEST",
+      });
+      created += 1;
+      for (let i = 0; i < 20; i += 1) {
+        await client.execute("PutItem", {
+          TableName,
+          Item: { pk: { S: `p${i % 5}` }, sk: { S: `s${i}` } },
+        });
+      }
+      total += (await client.execute("Scan", { TableName })).Count;
+    }
+    client.terminate();
+    return { created, total };
+  });
+
+  expect(result.created).toBe(6);
+  expect(result.total).toBe(120); // 6 tables x 20 items, all readable: no capacity failure
+});

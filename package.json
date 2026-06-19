@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "JS bridge and build for the dynoxide wasm-sqlite backend (preview). Bundles the wa-sqlite glue and the wasm-bindgen Worker into a self-contained dist/.",
+  "description": "JS bridge and build for the dynoxide wasm-sqlite backend (preview). Bundles the official @sqlite.org/sqlite-wasm engine and the wasm-bindgen Worker into a self-contained dist/.",
   "scripts": {
     "build:wasm": "./scripts/build-wasm.sh",
     "build:wasm:dev": "./scripts/build-wasm.sh --dev",
@@ -13,7 +13,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.61.0",
-    "esbuild": "^0.28.1",
-    "wa-sqlite": "^1.0.0"
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
+    "esbuild": "^0.28.1"
   }
 }

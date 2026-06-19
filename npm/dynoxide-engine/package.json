@@ -42,7 +42,7 @@
     "dynoxide-worker.js",
     "dynoxide-worker.d.ts",
     "dynoxide_bg.wasm",
-    "wa-sqlite.wasm",
+    "sqlite3.wasm",
     "manifest.json",
     "README.md",
     "LICENSE-MIT",

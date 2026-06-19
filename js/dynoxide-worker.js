@@ -1,8 +1,8 @@
 /**
- * dynoxide Web Worker: owns the wasm engine and the wa-sqlite + OPFS database.
+ * dynoxide Web Worker: owns the wasm engine and the SQLite + OPFS database.
  *
- * The wasm-bindgen build runs here, not on the main thread, because wa-sqlite's
- * OPFS VFS needs sync access handles that browsers expose only inside a Worker.
+ * The wasm-bindgen build runs here, not on the main thread, because the official
+ * OPFS SAHPool VFS needs sync access handles that browsers expose only inside a Worker.
  * The page talks to this Worker over a coarse message RPC: one request per
  * operation, `{ id, op, payload, contractVersion? }` in,
  * `{ id, ok, result | error }` out.

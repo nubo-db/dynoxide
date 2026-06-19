@@ -1,12 +1,13 @@
-//! Working wa-sqlite [`StorageBackend`] over a wasm-bindgen bridge.
+//! Working [`StorageBackend`] over a wasm-bindgen bridge to the official
+//! @sqlite.org/sqlite-wasm engine.
 //!
 //! `WasmBridgeBackend` runs the same SQL the native backend issues - both
 //! consume the shared builders in [`sql_builders`] - but executes it against a
-//! JS wa-sqlite database through the bridge in `js/wa-sqlite-bridge.js`. The
-//! bridge runs inside a Web Worker and persists to OPFS via wa-sqlite's
-//! synchronous access-handle VFS, which browsers expose only in a Worker. The
-//! page drives the engine over a message RPC; no cross-origin isolation
-//! (COOP/COEP) is required.
+//! JS SQLite database through the bridge in `js/sqlite-wasm-bridge.js`. The
+//! bridge runs inside a Web Worker and persists to OPFS via the official OPFS
+//! SAHPool VFS, which browsers expose only in a Worker. The page drives the
+//! engine over a message RPC; no cross-origin isolation (COOP/COEP) is
+//! required.
 //!
 //! # Async, never blocking
 //!
@@ -40,30 +41,30 @@ use crate::storage_backend::{
 };
 use crate::types::Tag;
 
-#[wasm_bindgen(module = "/js/wa-sqlite-bridge.js")]
+#[wasm_bindgen(module = "/js/sqlite-wasm-bridge.js")]
 extern "C" {
     #[wasm_bindgen(catch, js_name = "open")]
-    async fn wa_open(name: &str, ephemeral: bool) -> Result<JsValue, JsValue>;
+    async fn bridge_open(name: &str, ephemeral: bool) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "exec")]
-    async fn wa_exec(
+    async fn bridge_exec(
         handle: &JsValue,
         sql: &str,
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "query")]
-    async fn wa_query(
+    async fn bridge_query(
         handle: &JsValue,
         sql: &str,
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(catch, js_name = "close")]
-    async fn wa_close(handle: &JsValue) -> Result<JsValue, JsValue>;
+    async fn bridge_close(handle: &JsValue) -> Result<JsValue, JsValue>;
 }
 
-/// wa-sqlite-backed storage backend driven through the JS bridge.
+/// SQLite-backed storage backend driven through the JS bridge.
 pub struct WasmBridgeBackend {
     /// Opaque JS handle returned by the bridge `open`.
     handle: JsValue,
@@ -76,7 +77,7 @@ pub struct WasmBridgeBackend {
 }
 
 impl WasmBridgeBackend {
-    /// Open (or create) a wa-sqlite database persisted under `name` (OPFS),
+    /// Open (or create) a SQLite database persisted under `name` (OPFS),
     /// bootstrapping the shared metadata schema on first use. Degrades to an
     /// ephemeral in-memory session where OPFS sync access handles are
     /// unavailable.
@@ -88,7 +89,7 @@ impl WasmBridgeBackend {
     /// when `ephemeral` is true regardless of OPFS availability. The persistent
     /// path still degrades to memory on its own when OPFS is unusable.
     pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
-        let handle = wa_open(name, ephemeral).await.map_err(open_err)?;
+        let handle = bridge_open(name, ephemeral).await.map_err(open_err)?;
         // The bridge reports which VFS it actually opened against; read it off
         // the handle before treating the handle as opaque.
         let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))
@@ -98,7 +99,7 @@ impl WasmBridgeBackend {
         // Bootstrap the same metadata/config/stream schema the native backend
         // creates in `initialize`. `INIT_SCHEMA` is a multi-statement batch;
         // the bridge runs each statement in turn.
-        wa_exec(&handle, sql_builders::INIT_SCHEMA, js_sys::Array::new())
+        bridge_exec(&handle, sql_builders::INIT_SCHEMA, js_sys::Array::new())
             .await
             .map_err(js_err)?;
         Ok(Self {
@@ -113,17 +114,17 @@ impl WasmBridgeBackend {
         &self.persistence_mode
     }
 
-    /// Close the underlying wa-sqlite connection. The wasm engine calls this
+    /// Close the underlying SQLite connection. The wasm engine calls this
     /// before a re-open swaps in a new database, so the old connection (and the
     /// OPFS handles behind it) is released rather than leaked.
     pub async fn close(&self) -> Result<(), BackendError> {
-        wa_close(&self.handle).await.map_err(js_err)?;
+        bridge_close(&self.handle).await.map_err(js_err)?;
         Ok(())
     }
 
     /// Run a statement that returns no rows.
     async fn exec(&self, sql: &str, params: Vec<SqlParam<'_>>) -> Result<(), BackendError> {
-        wa_exec(&self.handle, sql, params_to_js(&params))
+        bridge_exec(&self.handle, sql, params_to_js(&params))
             .await
             .map_err(js_err)?;
         Ok(())
@@ -135,7 +136,7 @@ impl WasmBridgeBackend {
         sql: &str,
         params: Vec<SqlParam<'_>>,
     ) -> Result<js_sys::Array, BackendError> {
-        let rows = wa_query(&self.handle, sql, params_to_js(&params))
+        let rows = bridge_query(&self.handle, sql, params_to_js(&params))
             .await
             .map_err(js_err)?;
         Ok(rows.unchecked_into())
@@ -291,7 +292,7 @@ fn js_err(e: JsValue) -> BackendError {
                 .and_then(|v| v.as_string())
         })
         .unwrap_or_else(|| format!("{e:?}"));
-    BackendError::Other(format!("wa-sqlite: {msg}"))
+    BackendError::Other(format!("sqlite-wasm: {msg}"))
 }
 
 /// A capability this preview backend does not provide. Some are simply not
@@ -601,7 +602,7 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(sql_builders::ROLLBACK, Vec::new()).await
     }
 
-    // Bulk-loading PRAGMAs do not apply to the wa-sqlite OPFS VFS; treat the
+    // Bulk-loading PRAGMAs do not apply to the OPFS SAHPool VFS; treat the
     // toggles as no-ops so callers that bracket writes still work.
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {
         Ok(())

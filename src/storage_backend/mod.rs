@@ -4,7 +4,7 @@
 //! from a specific SQLite binding. The native [`rusqlite`]-backed
 //! [`Storage`](crate::storage::Storage) implements the trait, and the
 //! `wasm-sqlite` build adds [`wasm_backend::WasmBridgeBackend`], which runs the
-//! same SQL against a JS wa-sqlite database over a wasm-bindgen bridge. Both
+//! same SQL against a JS SQLite database over a wasm-bindgen bridge. Both
 //! backends issue identical SQL because they share the builders in
 //! [`sql_builders`].
 //!
@@ -120,7 +120,7 @@ pub trait StorageBackend {
     /// Wall-clock access for the stream and TTL paths.
     ///
     /// Sync because reading the clock is not I/O. The native backend returns
-    /// its injected [`Clock`]; a real wa-sqlite backend supplies its own.
+    /// its injected [`Clock`]; the wasm SQLite backend supplies its own.
     fn clock(&self) -> &dyn Clock;
 
     // -----------------------------------------------------------------------

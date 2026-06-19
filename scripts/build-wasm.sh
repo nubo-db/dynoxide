@@ -6,7 +6,7 @@
 # and a manifest.json stamping the engine and contract versions.
 #
 # Prerequisites: a wasm32 target (`rustup target add wasm32-unknown-unknown`),
-# wasm-pack, and `npm install` (pulls wa-sqlite and esbuild).
+# wasm-pack, and `npm install` (pulls @sqlite.org/sqlite-wasm and esbuild).
 #
 # Usage:
 #   scripts/build-wasm.sh            # release build (wasm-opt, optimised)
@@ -41,10 +41,11 @@ wasm-pack build "--$profile" --target web --out-dir pkg -- \
   --no-default-features --features "$feature"
 
 # 1b. wasm-bindgen copies the bridge (referenced via #[wasm_bindgen(module =
-#     "/js/wa-sqlite-bridge.js")]) into pkg/snippets/<hash>/js/ but does not
-#     follow its local imports - only the bare wa-sqlite specifiers, which
-#     esbuild later resolves from node_modules. Copy the shared fnv1a helper the
-#     bridge imports alongside it so that relative import resolves at bundle time.
+#     "/js/sqlite-wasm-bridge.js")]) into pkg/snippets/<hash>/js/ but does not
+#     follow its local imports - only the bare @sqlite.org/sqlite-wasm specifier,
+#     which esbuild later resolves from node_modules. Copy the shared fnv1a
+#     helper the bridge imports alongside it so that relative import resolves at
+#     bundle time.
 shopt -s nullglob
 snippet_js_dirs=(pkg/snippets/*/js)
 shopt -u nullglob
@@ -58,8 +59,8 @@ for snippet_js in "${snippet_js_dirs[@]}"; do
 done
 
 # 2. Bundle the Worker into one ES module. esbuild follows the chain
-#    (worker -> wasm-bindgen glue -> the inlined bridge -> wa-sqlite) and
-#    resolves wa-sqlite's bare specifiers from node_modules. The two
+#    (worker -> wasm-bindgen glue -> the inlined bridge -> @sqlite.org/sqlite-wasm)
+#    and resolves the official engine's bare specifier from node_modules. The two
 #    `new URL("*.wasm", import.meta.url)` references stay as runtime URLs that
 #    resolve next to the bundle, so the .wasm files ship as siblings.
 #    The --define folds __DYNOXIDE_HARNESS__ to a literal and --minify-syntax
@@ -96,11 +97,11 @@ else
   fi
 fi
 
-# 3. Copy the two .wasm next to the bundle. wa-sqlite.wasm is the synchronous
-#    (non-async) build, paired with the Worker-only AccessHandlePoolVFS; it is
-#    about half the size of the Asyncify async build.
+# 3. Copy the two .wasm next to the bundle. sqlite3.wasm is the official SQLite
+#    engine, paired with the Worker-only OPFS SAHPool VFS; the worker locates it
+#    at runtime as a sibling of the bundle (see js/sqlite-wasm-bridge.js).
 cp pkg/dynoxide_bg.wasm dist/
-cp node_modules/wa-sqlite/dist/wa-sqlite.wasm dist/
+cp node_modules/@sqlite.org/sqlite-wasm/dist/sqlite3.wasm dist/
 
 # 4. Stamp a manifest so a consumer can pin and verify what it embeds. The
 #    engine version is the crate version; the contract version is the envelope
@@ -112,7 +113,7 @@ cat > dist/manifest.json <<JSON
   "engineVersion": "$engine_version",
   "contractVersion": $contract_version,
   "feature": "$feature",
-  "files": ["dynoxide-worker.js", "dynoxide_bg.wasm", "wa-sqlite.wasm"]
+  "files": ["dynoxide-worker.js", "dynoxide_bg.wasm", "sqlite3.wasm"]
 }
 JSON
 
@@ -139,13 +140,13 @@ if [ "$feature" = "wasm-sqlite" ]; then
   # drift fails before publish, not in a consumer at runtime.
   scripts/check-contract-version.sh
 
-  cp dist/dynoxide-worker.js dist/dynoxide_bg.wasm dist/wa-sqlite.wasm dist/manifest.json "$pkg/"
+  cp dist/dynoxide-worker.js dist/dynoxide_bg.wasm dist/sqlite3.wasm dist/manifest.json "$pkg/"
   cp js/engine-client.js js/engine-client.d.ts js/dynoxide-worker.d.ts "$pkg/"
   cp LICENSE-MIT LICENSE-APACHE "$pkg/"
 
   echo
   echo "engine package $pkg/ (npm pack-ready):"
-  for f in engine-client.js engine-client.d.ts dynoxide-worker.js dynoxide-worker.d.ts dynoxide_bg.wasm wa-sqlite.wasm manifest.json; do
+  for f in engine-client.js engine-client.d.ts dynoxide-worker.js dynoxide-worker.d.ts dynoxide_bg.wasm sqlite3.wasm manifest.json; do
     printf '  %-26s %8d bytes\n' "$f" "$(wc -c < "$pkg/$f")"
   done
 fi

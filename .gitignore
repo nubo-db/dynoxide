@@ -9,7 +9,7 @@
 /npm/dynoxide-engine/dynoxide-worker.js
 /npm/dynoxide-engine/dynoxide-worker.d.ts
 /npm/dynoxide-engine/dynoxide_bg.wasm
-/npm/dynoxide-engine/wa-sqlite.wasm
+/npm/dynoxide-engine/sqlite3.wasm
 /npm/dynoxide-engine/manifest.json
 /npm/dynoxide-engine/LICENSE-MIT
 /npm/dynoxide-engine/LICENSE-APACHE

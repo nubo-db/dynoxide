@@ -37,8 +37,9 @@ encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
 mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle"]
 import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
-# Real wa-sqlite backend. dynoxide compiles to wasm32-unknown-unknown and runs
-# against a JS wa-sqlite build over a wasm-bindgen bridge, persisting to OPFS.
+# Real wasm SQLite backend. dynoxide compiles to wasm32-unknown-unknown and
+# runs against the official @sqlite.org/sqlite-wasm engine over a wasm-bindgen
+# bridge, persisting to OPFS.
 # Preview: the wasm build is not verified by the conformance suite (see the
 # conformance note in the README).
 wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:async-lock"]
@@ -98,14 +99,14 @@ indicatif = { version = "0.18", optional = true }
 zstd = { version = "0.13", optional = true }
 tempfile = { version = "3", optional = true }
 
-# wasm wa-sqlite backend dependencies, enabled by the `wasm-sqlite` feature.
+# wasm SQLite backend dependencies, enabled by the `wasm-sqlite` feature.
 # All four are already in the lock (pulled by uuid/web-time on wasm), so this
 # only marks them as direct, feature-gated dependencies.
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["console"] }
-# Async mutex serialising access to the single wa-sqlite connection. A std
+# Async mutex serialising access to the single SQLite connection. A std
 # mutex held across the bridge await would deadlock concurrent callers on the
 # single-threaded runtime; this queues them instead.
 async-lock = { version = "3", optional = true }

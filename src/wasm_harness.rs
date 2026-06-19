@@ -2,7 +2,7 @@
 //!
 //! Gated behind the `wasm-harness` feature so this scaffolding stays out of the
 //! production `wasm-sqlite` build. [`smoke_test`] runs a create/put/get
-//! round-trip against [`WasmDatabase`](crate::WasmDatabase) (wa-sqlite + OPFS)
+//! round-trip against [`WasmDatabase`](crate::WasmDatabase) (SQLite + OPFS)
 //! and returns a JSON summary, letting a browser page confirm the bridge and
 //! the async boundary work end to end without any JS-facing API.
 
@@ -18,7 +18,7 @@ use crate::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 
-/// Run a CRUD round-trip against a fresh wa-sqlite database and resolve with a
+/// Run a CRUD round-trip against a fresh SQLite database and resolve with a
 /// JSON summary string. Rejects with the error message on failure.
 #[wasm_bindgen]
 pub async fn smoke_test() -> Result<JsValue, JsValue> {

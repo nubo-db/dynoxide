@@ -3,7 +3,7 @@
 //!
 //! Each builder returns the SQL string plus a `Vec<SqlParam>` of bound
 //! parameters. The native rusqlite backend binds `SqlParam` through its
-//! [`rusqlite::ToSql`] impl; the wasm wa-sqlite backend converts each
+//! [`rusqlite::ToSql`] impl; the wasm SQLite backend converts each
 //! `SqlParam` to a JS value for the bridge. Keeping the SQL here, rather than
 //! inside a backend, guarantees both backends issue identical statements: a
 //! query fixed on one is fixed for both, so the two backends cannot silently

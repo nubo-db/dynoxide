@@ -391,7 +391,7 @@ mod tests {
             BackendError::Locked,
             BackendError::Constraint("constraint".into()),
             BackendError::Io("io".into()),
-            BackendError::Other("wa-sqlite: boom".into()),
+            BackendError::Other("sqlite-wasm: boom".into()),
         ] {
             let d: DynoxideError = e.into();
             assert_eq!(d.status_code(), 500);

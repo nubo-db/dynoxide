@@ -24,7 +24,7 @@ test("fnv1a_hash matches the cross-backend known vectors", () => {
 
 test("fnv1a_hash hashes a non-string argument as the empty string", () => {
   // The scalar is only ever applied to TEXT key columns, but the bridge passes
-  // through whatever wa-sqlite hands it; a NULL or non-text value hashes as "".
+  // through whatever the engine hands it; a NULL or non-text value hashes as "".
   const empty = 2166136261;
   assert.equal(fnv1aHash(null), empty);
   assert.equal(fnv1aHash(undefined), empty);

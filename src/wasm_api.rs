@@ -131,7 +131,7 @@ pub async fn dispatch<S: StorageBackend>(
 // ---------------------------------------------------------------------------
 // wasm-bindgen engine surface
 //
-// One persistent engine per Worker. wa-sqlite is single-threaded, so a
+// One persistent engine per Worker. the wasm engine is single-threaded, so a
 // thread-local holding the opened database is sufficient and avoids exporting a
 // generic type across the wasm boundary. `WasmDatabase` is `Clone` (only `Arc`s
 // move), so each call clones the handle out of the cell before awaiting — the

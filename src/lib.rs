@@ -134,11 +134,11 @@ pub type RusqliteBackend = storage::Storage;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub type NativeDatabase = Database<RusqliteBackend>;
 
-/// The wasm, asynchronous `Database` over the wa-sqlite backend.
+/// The wasm, asynchronous `Database` over the wasm SQLite backend.
 ///
 /// Alias for [`Database`] monomorphised over [`WasmBridgeBackend`]. Unlike
 /// [`NativeDatabase`], its methods are `async fn` and never call `block_on`:
-/// the wasm backend awaits real wa-sqlite promises, and the wasm main thread
+/// the wasm backend awaits real SQLite-bridge promises, and the wasm main thread
 /// must not block.
 #[cfg(feature = "wasm-sqlite")]
 pub type WasmDatabase = Database<WasmBridgeBackend>;
@@ -783,14 +783,14 @@ impl Database<RusqliteBackend> {
     }
 }
 
-/// The wasm, asynchronous facade over the wa-sqlite backend.
+/// The wasm, asynchronous facade over the wasm SQLite backend.
 ///
 /// Mirrors the native facade method-for-method, but each call is `async` and
 /// awaits the shared action handler directly - there is no `block_on`, because
 /// the wasm backend's bridge calls genuinely suspend.
 ///
 /// Calls on one instance are serialised: each holds an async mutex over the
-/// single wa-sqlite connection for the whole handler, so a transaction's
+/// single SQLite connection for the whole handler, so a transaction's
 /// begin..commit cannot interleave with another call, and concurrent callers
 /// (for example two awaited operations on one `WasmDatabase`) queue rather
 /// than deadlock. Because the mutex is async, queuing suspends instead of
@@ -798,7 +798,7 @@ impl Database<RusqliteBackend> {
 /// writer at a time, `BEGIN IMMEDIATE` cannot return `SQLITE_BUSY`.
 #[cfg(feature = "wasm-sqlite")]
 impl Database<WasmBridgeBackend> {
-    /// Open (or create) a wa-sqlite database persisted to OPFS under `name`,
+    /// Open (or create) a SQLite database persisted to OPFS under `name`,
     /// degrading to an ephemeral in-memory session where OPFS is unavailable.
     pub async fn open(name: &str) -> Result<Self> {
         Self::open_with(name, false).await
@@ -821,7 +821,7 @@ impl Database<WasmBridgeBackend> {
         self.backend().await.persistence_mode().to_string()
     }
 
-    /// Close the underlying wa-sqlite connection. The operation-level engine
+    /// Close the underlying SQLite connection. The operation-level engine
     /// calls this before re-opening, so the previous connection is released
     /// rather than leaked when a new database replaces it.
     pub async fn close(&self) -> Result<()> {

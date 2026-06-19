@@ -118,8 +118,12 @@ jobs:
         with:
           node-version: "22"
 
-      # The EngineClient tests run against a stub worker over node:test, so they
-      # need no wasm build and no dependencies - just node --test.
+      # The EngineClient tests run against a stub worker, but the bridge unit
+      # test loads the real @sqlite.org/sqlite-wasm engine over an in-memory
+      # database, so the job installs npm deps (no wasm build needed) and runs
+      # node --test.
+      - name: Install npm dependencies
+        run: npm ci
       - name: Test the engine client
         run: node --test js/*.test.js
 

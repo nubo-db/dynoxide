@@ -373,47 +373,56 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn update_table_metadata(
         &self,
-        _table_name: &str,
-        _attribute_definitions: &str,
-        _gsi_definitions: Option<&str>,
+        table_name: &str,
+        attribute_definitions: &str,
+        gsi_definitions: Option<&str>,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_table_metadata"))
+        let (sql, params) =
+            sql_builders::update_table_metadata(table_name, attribute_definitions, gsi_definitions);
+        self.exec(&sql, params).await
     }
 
     async fn update_provisioned_throughput(
         &self,
-        _table_name: &str,
-        _provisioned_throughput: &str,
+        table_name: &str,
+        provisioned_throughput: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_provisioned_throughput"))
+        let (sql, params) =
+            sql_builders::update_provisioned_throughput(table_name, provisioned_throughput);
+        self.exec(&sql, params).await
     }
 
-    async fn clear_provisioned_throughput(&self, _table_name: &str) -> Result<(), BackendError> {
-        Err(unsupported("clear_provisioned_throughput"))
+    async fn clear_provisioned_throughput(&self, table_name: &str) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::clear_provisioned_throughput(table_name);
+        self.exec(&sql, params).await
     }
 
     async fn update_billing_mode(
         &self,
-        _table_name: &str,
-        _billing_mode: &str,
+        table_name: &str,
+        billing_mode: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_billing_mode"))
+        let (sql, params) = sql_builders::update_billing_mode(table_name, billing_mode);
+        self.exec(&sql, params).await
     }
 
     async fn update_table_class(
         &self,
-        _table_name: &str,
-        _table_class: &str,
+        table_name: &str,
+        table_class: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_table_class"))
+        let (sql, params) = sql_builders::update_table_class(table_name, table_class);
+        self.exec(&sql, params).await
     }
 
     async fn update_on_demand_throughput(
         &self,
-        _table_name: &str,
-        _on_demand_throughput: &str,
+        table_name: &str,
+        on_demand_throughput: &str,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_on_demand_throughput"))
+        let (sql, params) =
+            sql_builders::update_on_demand_throughput(table_name, on_demand_throughput);
+        self.exec(&sql, params).await
     }
 
     async fn get_tags(&self, _table_name: &str) -> Result<Vec<Tag>, BackendError> {
@@ -426,10 +435,11 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn update_deletion_protection(
         &self,
-        _table_name: &str,
-        _enabled: bool,
+        table_name: &str,
+        enabled: bool,
     ) -> Result<(), BackendError> {
-        Err(unsupported("update_deletion_protection"))
+        let (sql, params) = sql_builders::update_deletion_protection(table_name, enabled);
+        self.exec(&sql, params).await
     }
 
     async fn remove_tags(&self, _table_name: &str, _keys: &[String]) -> Result<(), BackendError> {

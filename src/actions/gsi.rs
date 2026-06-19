@@ -4,7 +4,7 @@
 
 use crate::errors::{DynoxideError, Result};
 use crate::storage::TableMetadata;
-use crate::storage_backend::StorageBackend;
+use crate::storage_backend::{IndexWriteOp, StorageBackend};
 use crate::types::{GlobalSecondaryIndex, Item, KeyType, ProjectionType};
 use std::collections::HashMap;
 
@@ -136,12 +136,16 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
+    let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for gsi in &gsi_defs {
         // First, remove any existing GSI entry for this base table key
-        storage
-            .delete_gsi_item(table_name, &gsi.index_name, table_pk_str, table_sk_str)
-            .await?;
+        ops.push(IndexWriteOp::DeleteGsi {
+            table_name: table_name.to_string(),
+            index_name: gsi.index_name.clone(),
+            table_pk: table_pk_str.to_string(),
+            table_sk: table_sk_str.to_string(),
+        });
 
         // If the item has the GSI pk attribute, insert into GSI
         if let Some(gsi_pk_val) = item.get(&gsi.pk_attr) {
@@ -158,17 +162,15 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
             let item_json = serde_json::to_string(&projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-            storage
-                .insert_gsi_item(
-                    table_name,
-                    &gsi.index_name,
-                    &gsi_pk,
-                    &gsi_sk,
-                    table_pk_str,
-                    table_sk_str,
-                    &item_json,
-                )
-                .await?;
+            ops.push(IndexWriteOp::InsertGsi {
+                table_name: table_name.to_string(),
+                index_name: gsi.index_name.clone(),
+                gsi_pk,
+                gsi_sk,
+                table_pk: table_pk_str.to_string(),
+                table_sk: table_sk_str.to_string(),
+                item_json,
+            });
 
             gsi_units.insert(
                 gsi.index_name.clone(),
@@ -177,6 +179,11 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
         }
     }
 
+    // One batched fan-out call: the per-op loop crossed the wasm bridge once per
+    // index operation; this hands the whole list over in a single crossing. The
+    // default impl replays it per-item, so native order and behaviour are
+    // unchanged.
+    storage.apply_index_writes(&ops).await?;
     Ok(gsi_units)
 }
 
@@ -191,15 +198,20 @@ pub async fn maintain_gsis_after_delete<S: StorageBackend>(
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
+    let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for gsi in &gsi_defs {
-        storage
-            .delete_gsi_item(table_name, &gsi.index_name, table_pk_str, table_sk_str)
-            .await?;
+        ops.push(IndexWriteOp::DeleteGsi {
+            table_name: table_name.to_string(),
+            index_name: gsi.index_name.clone(),
+            table_pk: table_pk_str.to_string(),
+            table_sk: table_sk_str.to_string(),
+        });
         // Delete operations consume 1 WCU minimum per GSI affected
         gsi_units.insert(gsi.index_name.clone(), 1.0);
     }
 
+    storage.apply_index_writes(&ops).await?;
     Ok(gsi_units)
 }
 

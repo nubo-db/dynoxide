@@ -4,7 +4,7 @@
 
 use crate::errors::{DynoxideError, Result};
 use crate::storage::TableMetadata;
-use crate::storage_backend::StorageBackend;
+use crate::storage_backend::{IndexWriteOp, StorageBackend};
 use crate::types::{Item, KeyType, LocalSecondaryIndex};
 
 /// Type alias: LSI definitions reuse the shared IndexDef from gsi.
@@ -76,12 +76,16 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
     table_sk_attr: Option<&str>,
 ) -> Result<()> {
     let lsi_defs = parse_lsi_defs(meta)?;
+    let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for lsi in &lsi_defs {
         // First, remove any existing LSI entry for this base table key
-        storage
-            .delete_lsi_item(table_name, &lsi.index_name, table_pk_str, table_sk_str)
-            .await?;
+        ops.push(IndexWriteOp::DeleteLsi {
+            table_name: table_name.to_string(),
+            index_name: lsi.index_name.clone(),
+            base_pk: table_pk_str.to_string(),
+            base_sk: table_sk_str.to_string(),
+        });
 
         // LSI pk is always the same as the table pk. Only insert if item
         // has the LSI sort key attribute (sparse index behaviour).
@@ -95,21 +99,20 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
                 let item_json = serde_json::to_string(&projected)
                     .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-                storage
-                    .insert_lsi_item(
-                        table_name,
-                        &lsi.index_name,
-                        &lsi_pk,
-                        &lsi_sk,
-                        table_pk_str,
-                        table_sk_str,
-                        &item_json,
-                    )
-                    .await?;
+                ops.push(IndexWriteOp::InsertLsi {
+                    table_name: table_name.to_string(),
+                    index_name: lsi.index_name.clone(),
+                    pk: lsi_pk,
+                    sk: lsi_sk,
+                    base_pk: table_pk_str.to_string(),
+                    base_sk: table_sk_str.to_string(),
+                    item_json,
+                });
             }
         }
     }
 
+    storage.apply_index_writes(&ops).await?;
     Ok(())
 }
 
@@ -122,12 +125,17 @@ pub async fn maintain_lsis_after_delete<S: StorageBackend>(
     table_sk_str: &str,
 ) -> Result<()> {
     let lsi_defs = parse_lsi_defs(meta)?;
+    let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for lsi in &lsi_defs {
-        storage
-            .delete_lsi_item(table_name, &lsi.index_name, table_pk_str, table_sk_str)
-            .await?;
+        ops.push(IndexWriteOp::DeleteLsi {
+            table_name: table_name.to_string(),
+            index_name: lsi.index_name.clone(),
+            base_pk: table_pk_str.to_string(),
+            base_sk: table_sk_str.to_string(),
+        });
     }
 
+    storage.apply_index_writes(&ops).await?;
     Ok(())
 }

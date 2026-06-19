@@ -93,6 +93,52 @@ pub struct GsiItemRow {
     pub item_json: String,
 }
 
+/// One index-table write operation, backend-neutral.
+///
+/// The per-write and per-delete GSI/LSI fan-out builds an ordered list of these
+/// and hands it to [`StorageBackend::apply_index_writes`] in a single call. The
+/// default impl replays each op through the matching per-item method, identical
+/// to the per-op loop it replaces; the wasm backend overrides it to collapse the
+/// list into one bridge crossing. Each variant's fields mirror the argument
+/// order of the per-item method it stands in for.
+#[derive(Debug, Clone)]
+pub enum IndexWriteOp {
+    /// Remove this base key's entry from a GSI table.
+    DeleteGsi {
+        table_name: String,
+        index_name: String,
+        table_pk: String,
+        table_sk: String,
+    },
+    /// Insert (or replace) this item's projected entry into a GSI table.
+    InsertGsi {
+        table_name: String,
+        index_name: String,
+        gsi_pk: String,
+        gsi_sk: String,
+        table_pk: String,
+        table_sk: String,
+        item_json: String,
+    },
+    /// Remove this base key's entry from an LSI table.
+    DeleteLsi {
+        table_name: String,
+        index_name: String,
+        base_pk: String,
+        base_sk: String,
+    },
+    /// Insert (or replace) this item's projected entry into an LSI table.
+    InsertLsi {
+        table_name: String,
+        index_name: String,
+        pk: String,
+        sk: String,
+        base_pk: String,
+        base_sk: String,
+        item_json: String,
+    },
+}
+
 /// Backend-neutral storage interface.
 ///
 /// Method signatures mirror [`Storage`](crate::storage::Storage)'s public
@@ -299,6 +345,76 @@ pub trait StorageBackend {
         index_name: &str,
         params: &ScanParams<'_>,
     ) -> Result<Vec<(String, String, String)>, BackendError>;
+
+    // -----------------------------------------------------------------------
+    // Index write fan-out
+    // -----------------------------------------------------------------------
+
+    /// Apply an ordered batch of GSI/LSI write operations.
+    ///
+    /// The GSI/LSI maintenance helpers build the list and call this once per
+    /// fan-out instead of invoking the per-item methods one at a time. The
+    /// default impl replays each op through the matching per-item method in
+    /// order, so a backend that does not override it behaves exactly as the
+    /// per-op loop did. The wasm backend overrides this to issue the whole list
+    /// in a single bridge crossing.
+    ///
+    /// Owns no transaction: the caller's open transaction supplies atomicity, so
+    /// a mid-batch failure is rolled back by that caller. An empty list does no
+    /// work.
+    async fn apply_index_writes(&self, ops: &[IndexWriteOp]) -> Result<(), BackendError> {
+        for op in ops {
+            match op {
+                IndexWriteOp::DeleteGsi {
+                    table_name,
+                    index_name,
+                    table_pk,
+                    table_sk,
+                } => {
+                    self.delete_gsi_item(table_name, index_name, table_pk, table_sk)
+                        .await?;
+                }
+                IndexWriteOp::InsertGsi {
+                    table_name,
+                    index_name,
+                    gsi_pk,
+                    gsi_sk,
+                    table_pk,
+                    table_sk,
+                    item_json,
+                } => {
+                    self.insert_gsi_item(
+                        table_name, index_name, gsi_pk, gsi_sk, table_pk, table_sk, item_json,
+                    )
+                    .await?;
+                }
+                IndexWriteOp::DeleteLsi {
+                    table_name,
+                    index_name,
+                    base_pk,
+                    base_sk,
+                } => {
+                    self.delete_lsi_item(table_name, index_name, base_pk, base_sk)
+                        .await?;
+                }
+                IndexWriteOp::InsertLsi {
+                    table_name,
+                    index_name,
+                    pk,
+                    sk,
+                    base_pk,
+                    base_sk,
+                    item_json,
+                } => {
+                    self.insert_lsi_item(
+                        table_name, index_name, pk, sk, base_pk, base_sk, item_json,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     // -----------------------------------------------------------------------
     // Transactions

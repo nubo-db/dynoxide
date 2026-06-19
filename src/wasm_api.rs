@@ -53,6 +53,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "CreateTable",
     "DeleteTable",
     "DescribeTable",
+    "UpdateTable",
     "ListTables",
     "PutItem",
     "GetItem",
@@ -114,6 +115,7 @@ pub async fn dispatch<S: StorageBackend>(
         "CreateTable" => run!(create_table),
         "DeleteTable" => run!(delete_table),
         "DescribeTable" => run!(describe_table),
+        "UpdateTable" => run!(update_table),
         "ListTables" => run!(list_tables),
         "PutItem" => run!(put_item),
         "GetItem" => run!(get_item),
@@ -454,5 +456,41 @@ mod tests {
         assert_eq!(CONTRACT_VERSION, 1);
         assert!(SUPPORTED_OPS.contains(&"Query"));
         assert!(SUPPORTED_OPS.contains(&"Scan"));
+    }
+
+    #[test]
+    fn update_table_adds_a_gsi_and_backfills_through_dispatch() {
+        let backend = Storage::memory().unwrap();
+        seed_music(&backend);
+
+        // UpdateTable is a dispatched op: adding a GSI on the genre attribute the
+        // seeded rows carry exercises the dispatch arm and the add-GSI handler
+        // path (create index, backfill existing rows, update metadata).
+        let update = r#"{
+            "TableName": "Music",
+            "AttributeDefinitions": [
+                {"AttributeName": "artist", "AttributeType": "S"},
+                {"AttributeName": "song", "AttributeType": "S"},
+                {"AttributeName": "genre", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexUpdates": [
+                {"Create": {
+                    "IndexName": "GenreIndex",
+                    "KeySchema": [{"AttributeName": "genre", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }}
+            ]
+        }"#;
+        let resp = run(&backend, "UpdateTable", update).unwrap();
+        assert!(resp.contains("GenreIndex"), "the response should describe the new GSI");
+
+        // The pre-existing rows were backfilled: a query on the new index returns
+        // the two rock rows.
+        let q = r#"{"TableName":"Music","IndexName":"GenreIndex","KeyConditionExpression":"genre = :g","ExpressionAttributeValues":{":g":{"S":"rock"}}}"#;
+        let qv: serde_json::Value =
+            serde_json::from_str(&run(&backend, "Query", q).unwrap()).unwrap();
+        assert_eq!(qv["Count"], 2);
+
+        assert!(SUPPORTED_OPS.contains(&"UpdateTable"));
     }
 }

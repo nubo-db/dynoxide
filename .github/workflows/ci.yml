@@ -129,7 +129,7 @@ jobs:
         run: scripts/check-contract-version.sh
 
   browser-engine:
-    name: Browser engine tests (real wa-sqlite + OPFS)
+    name: Browser engine tests (real SQLite-wasm + OPFS)
     runs-on: ubuntu-latest
 
     steps:
@@ -161,7 +161,7 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
-      # Drives the shipped Worker in headless Chromium against real wa-sqlite and
+      # Drives the shipped Worker in headless Chromium against the real SQLite-wasm engine and
       # OPFS - the path the conformance suite (native backend) does not cover.
       - name: Run the browser engine tests
         run: npm run test:browser

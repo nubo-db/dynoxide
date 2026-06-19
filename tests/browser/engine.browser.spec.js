@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 // End-to-end tests of the shipped wasm engine in a real browser: the bundled
-// Worker, both .wasm, wa-sqlite and OPFS. This is the path the conformance
+// Worker, both .wasm, the SQLite-wasm engine and OPFS. This is the path the conformance
 // suite does not exercise (it runs against the native backend), so it is the
 // safety net for the preview-to-stable transition - it builds the same dist/ a
 // consumer installs and runs real DynamoDB operations through EngineClient.

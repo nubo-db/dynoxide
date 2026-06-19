@@ -10,7 +10,7 @@
 
       This loads the SAME bundled Worker (dist/dynoxide-worker.js) that ships to
       production consumers, so a green harness means the shipping artefact works
-      - not a parallel build. The engine runs in the Worker (wa-sqlite needs
+      - not a parallel build. The engine runs in the Worker (the SAHPool VFS needs
       OPFS sync access handles, which are Worker-only); this page drives it over
       a message RPC, exercising the operation-level `execute` API end to end.
 

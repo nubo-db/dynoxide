@@ -105,7 +105,7 @@ helps a reviewer but are not required.
 The data layer goes through the `StorageBackend` trait in
 `src/storage_backend/`. It has two implementations: the native rusqlite-backed
 `Storage`, and `WasmBridgeBackend` (the `wasm-sqlite` build, which runs the same
-SQL against wa-sqlite over a wasm-bindgen bridge). Both issue SQL from the
+SQL against the official @sqlite.org/sqlite-wasm engine over a wasm-bindgen bridge). Both issue SQL from the
 shared builders in `src/storage_backend/sql_builders.rs`, so a statement fixed
 on one backend is fixed on both - add or change SQL there, not inline in a
 backend.

@@ -7,7 +7,7 @@
       Test page for the browser engine specs (tests/browser/). It loads the
       shipped EngineClient and points it at the bundled dist/ Worker, then
       exposes a factory the Playwright specs drive from page.evaluate - so the
-      assertions exercise the real wa-sqlite + OPFS engine in a real browser,
+      assertions exercise the real SQLite-wasm + OPFS engine in a real browser,
       not a stub.
 
       Build the dist/ first (npm run build:wasm[:dev]); the spec's webServer

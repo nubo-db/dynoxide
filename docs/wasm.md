@@ -1,6 +1,6 @@
 # WebAssembly (preview)
 
-Dynoxide compiles to `wasm32-unknown-unknown` and runs in the browser. The same engine that backs the native build runs against [wa-sqlite](https://github.com/rhashimoto/wa-sqlite) - a WASM build of SQLite - over a wasm-bindgen bridge, with the database persisted to [OPFS](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) (the origin private file system).
+Dynoxide compiles to `wasm32-unknown-unknown` and runs in the browser. The same engine that backs the native build runs against the official [@sqlite.org/sqlite-wasm](https://github.com/sqlite/sqlite-wasm) build of SQLite over a wasm-bindgen bridge, with the database persisted to [OPFS](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) (the origin private file system).
 
 Both backends issue the same SQL. The native and wasm code share one set of query builders, so a query fixed on one is fixed on both.
 
@@ -14,11 +14,11 @@ The engine runs in a Web Worker (OPFS's synchronous file handles are Worker-only
 
 ## Persistence and durability
 
-The database lives in OPFS, reached through wa-sqlite's synchronous access-handle VFS. Where a browser can't provide those handles - a Firefox private window, an older Safari - the engine falls back to an in-memory database that works for the session but doesn't survive a reload, and `open` reports which mode you got as `persistenceMode` so you can warn the user.
+The database lives in OPFS, reached through the official OPFS SAHPool VFS - a pool of synchronous access handles. Where a browser can't provide those handles - a Firefox private window, an older Safari - the engine falls back to an in-memory database that works for the session but doesn't survive a reload, and `open` reports which mode you got as `persistenceMode` so you can warn the user.
 
-Each database name gets its own OPFS directory and its own pool of file handles, so opening several databases on one page never makes them contend for a shared pool. Opening the *same* database a second time while another tab or client still holds it doesn't quietly fork to a private in-memory copy - that would split reads from writes and lose everything on reload - it fails with a clear "OPFS is busy" error instead.
+Each database name gets its own OPFS directory and its own pool of file handles, so opening several databases on one page never makes them contend for a shared pool. Opening the *same* database a second time while another tab or client still holds it doesn't quietly fork to a private in-memory copy - that would split reads from writes and lose everything on reload - it fails with a clear "OPFS is busy" error instead. That state is recoverable, not sticky: once the holder releases the database, a later open of the same name succeeds rather than replaying the earlier failure. Closing a database relinquishes its access handles (without destroying the data) so another tab can pick it up.
 
-The wasm path runs in rollback-journal mode, not WAL. The access-handle VFS doesn't implement WAL's shared-memory interface, so `PRAGMA journal_mode = WAL` is a no-op there and SQLite keeps a rollback journal. That costs no atomicity: the backend funnels every write through a single connection it serialises, so it never needs the concurrent readers WAL buys, and each commit flushes through the synchronous handle. (The native build enables WAL because it has the concurrency to gain from it.)
+The wasm path runs in rollback-journal mode, not WAL. The SAHPool VFS doesn't implement WAL's shared-memory interface, so `PRAGMA journal_mode = WAL` is a no-op there and SQLite keeps a rollback journal. That costs no atomicity: the backend funnels every write through a single connection it serialises, so it never needs the concurrent readers WAL buys, and each commit flushes through the synchronous handle. (The native build enables WAL because it has the concurrency to gain from it.)
 
 Integers round-trip at full 64-bit width - a value past 2^53 crosses the bridge as a BigInt rather than losing precision as a JavaScript double. DynamoDB number attributes travel as text inside the item JSON regardless, so this only touches the engine's own integer columns.
 
@@ -36,13 +36,13 @@ npm run build:wasm
 | File | Size | What |
 |---|---|---|
 | `dynoxide_bg.wasm` | ~960 KB | the engine (release, wasm-opt) |
-| `wa-sqlite.wasm` | ~545 KB | SQLite (the synchronous build) |
-| `dynoxide-worker.js` | ~130 KB | the bundled Web Worker (wa-sqlite glue + bridge) |
+| `sqlite3.wasm` | ~845 KB | SQLite (the official @sqlite.org/sqlite-wasm build) |
+| `dynoxide-worker.js` | ~415 KB | the bundled Web Worker (engine glue + bridge) |
 | `manifest.json` | <1 KB | engine version, contract version, file list |
 
-About 1.6 MB total. Not tiny, but the `.wasm` files are immutable and cache well, and using wa-sqlite's synchronous build keeps it off the larger Asyncify async build.
+About 2.2 MB total. Not tiny, but the `.wasm` files are immutable and cache well, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
 
-Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running wa-sqlite's synchronous OPFS VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
+Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running the official synchronous OPFS SAHPool VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
 
 ## The embed contract
 

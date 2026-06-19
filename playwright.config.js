@@ -1,7 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 // Drives the shipped wasm bundle (dist/) in a real browser against real
-// wa-sqlite and OPFS - the path the conformance suite does not cover. Run with
+// the official SQLite-wasm engine and OPFS - the path the conformance suite does not cover. Run with
 // `npm run test:browser` after building the bundle (npm run build:wasm[:dev]).
 const PORT = Number(process.env.HARNESS_PORT || 8099);
 

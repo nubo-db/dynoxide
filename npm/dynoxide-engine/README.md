@@ -1,6 +1,6 @@
 # @nubo-db/dynoxide-engine
 
-The [dynoxide](https://github.com/nubo-db/dynoxide) DynamoDB-compatible engine, compiled to WebAssembly and packaged to run in the browser. It carries the engine `.wasm`, [wa-sqlite](https://github.com/rhashimoto/wa-sqlite), the bundled Web Worker, and an `EngineClient` that drives them, so you can run real DynamoDB operations client-side against a SQLite-backed store persisted to OPFS.
+The [dynoxide](https://github.com/nubo-db/dynoxide) DynamoDB-compatible engine, compiled to WebAssembly and packaged to run in the browser. It carries the engine `.wasm`, the official [@sqlite.org/sqlite-wasm](https://github.com/sqlite/sqlite-wasm) SQLite build, the bundled Web Worker, and an `EngineClient` that drives them, so you can run real DynamoDB operations client-side against a SQLite-backed store persisted to OPFS.
 
 It's a preview. The wasm build is not run against the conformance suite that backs dynoxide's native build, so treat its behaviour as illustrative rather than authoritative.
 

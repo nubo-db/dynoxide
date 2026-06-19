@@ -303,6 +303,48 @@ export async function query(handle, sql, params) {
 }
 
 /**
+ * Run one statement once per parameter row, collapsing what would be N bridge
+ * crossings into a single call. The statement is prepared once and reused: per
+ * row it binds, steps to completion, then resets and clears the bindings (via
+ * `reset(true)`, the official build's native `clearBindings`), so no row
+ * inherits a previous row's values. It owns no transaction - it runs inside
+ * whatever the caller has open - so a mid-batch failure is rolled back by the
+ * caller's transaction, not here.
+ *
+ * Each row must carry exactly as many parameters as the statement has
+ * placeholders. A row of the wrong arity is rejected with its index rather than
+ * silently NULL-padded: for an internal primitive a mismatched row is a caller
+ * bug, not a shorthand. Any failure throws an Error naming the row index, so a
+ * mid-batch failure is diagnosable. An empty batch makes no work.
+ */
+export async function exec_batch(handle, sql, paramRows) {
+  if (!paramRows || !paramRows.length) return;
+  const stmt = handle.db.prepare(sql);
+  try {
+    const arity = stmt.parameterCount;
+    for (let i = 0; i < paramRows.length; i += 1) {
+      const row = paramRows[i] || [];
+      if (row.length !== arity) {
+        throw new Error(
+          `exec_batch row ${i}: expected ${arity} parameters, got ${row.length}`,
+        );
+      }
+      try {
+        if (arity) stmt.bind(row);
+        while (stmt.step()) {
+          // a row-less write; drain any result rows without collecting them
+        }
+        stmt.reset(true); // reset + clearBindings: no row inherits the prior binds
+      } catch (e) {
+        throw new Error(`exec_batch row ${i}: ${e.message}`);
+      }
+    }
+  } finally {
+    stmt.finalize();
+  }
+}
+
+/**
  * Close a database handle, releasing its connection so a re-open does not leak
  * the old one. When the last connection on a persistent pool closes, the pool
  * is paused: its OPFS sync access handles are relinquished (so another tab can

@@ -60,6 +60,13 @@ extern "C" {
         params: js_sys::Array,
     ) -> Result<JsValue, JsValue>;
 
+    #[wasm_bindgen(catch, js_name = "exec_batch")]
+    async fn bridge_exec_batch(
+        handle: &JsValue,
+        sql: &str,
+        param_rows: js_sys::Array,
+    ) -> Result<JsValue, JsValue>;
+
     #[wasm_bindgen(catch, js_name = "close")]
     async fn bridge_close(handle: &JsValue) -> Result<JsValue, JsValue>;
 }
@@ -130,6 +137,23 @@ impl WasmBridgeBackend {
         Ok(())
     }
 
+    /// Run one statement once per parameter row in a single bridge crossing,
+    /// reusing one prepared statement on the JS side. Owns no transaction: the
+    /// caller's open transaction supplies atomicity, and a mid-batch failure
+    /// (reported by the bridge with the failing row index) is rolled back by
+    /// that caller. Collapses what the per-row loop paid as N wasm/JS/Worker
+    /// crossings into one.
+    async fn exec_batch(
+        &self,
+        sql: &str,
+        rows: Vec<Vec<SqlParam<'_>>>,
+    ) -> Result<(), BackendError> {
+        bridge_exec_batch(&self.handle, sql, params_rows_to_js(&rows))
+            .await
+            .map_err(js_err)?;
+        Ok(())
+    }
+
     /// Run a query, returning rows as a JS array of column arrays.
     async fn query(
         &self,
@@ -167,6 +191,16 @@ fn params_to_js(params: &[SqlParam<'_>]) -> js_sys::Array {
     let arr = js_sys::Array::new();
     for p in params {
         arr.push(&sqlparam_to_js(p));
+    }
+    arr
+}
+
+/// Convert a batch of parameter rows to a JS array of positional arrays - the
+/// array-of-arrays shape `exec_batch` binds one row at a time.
+fn params_rows_to_js(rows: &[Vec<SqlParam<'_>>]) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for row in rows {
+        arr.push(&params_to_js(row));
     }
     arr
 }
@@ -488,18 +522,29 @@ impl StorageBackend for WasmBridgeBackend {
         index_name: &str,
         rows: &[GsiItemRow],
     ) -> Result<(), BackendError> {
-        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
-        for row in rows {
-            let params = sql_builders::gsi_insert_params(
-                &row.gsi_pk,
-                &row.gsi_sk,
-                &row.table_pk,
-                &row.table_sk,
-                &row.item_json,
-            );
-            self.exec(&sql, params).await?;
+        // Empty backfill window: cross zero times, exactly as the per-row loop
+        // did, so a sparse window with no keyed rows stays a strict improvement.
+        if rows.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        // Build the SQL once and assemble every row's parameters, then make a
+        // single bridge crossing instead of one per row. Atomicity is unchanged:
+        // the caller's open transaction (UpdateTable's backfill runs inside one)
+        // still commits or rolls back the whole batch.
+        let sql = sql_builders::gsi_insert_sql(table_name, index_name);
+        let param_rows = rows
+            .iter()
+            .map(|row| {
+                sql_builders::gsi_insert_params(
+                    &row.gsi_pk,
+                    &row.gsi_sk,
+                    &row.table_pk,
+                    &row.table_sk,
+                    &row.item_json,
+                )
+            })
+            .collect();
+        self.exec_batch(&sql, param_rows).await
     }
 
     async fn delete_gsi_item(

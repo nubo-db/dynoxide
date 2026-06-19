@@ -90,10 +90,12 @@ fn disable_ttl(db: &Database, table_name: &str, attribute_name: &str) {
 }
 
 fn item_count(db: &Database, table_name: &str) -> usize {
-    let mut req = dynoxide::actions::scan::ScanRequest::default();
-    req.table_name = table_name.to_string();
+    let req = dynoxide::actions::scan::ScanRequest {
+        table_name: table_name.to_string(),
+        ..Default::default()
+    };
     let resp = db.scan(req).unwrap();
-    resp.count as usize
+    resp.count
 }
 
 // -----------------------------------------------------------------------
@@ -291,7 +293,7 @@ fn test_ttl_deletion_generates_stream_remove_record() {
     let iter_resp = db
         .get_shard_iterator(GetShardIteratorRequest {
             stream_arn: stream_arn.clone(),
-            shard_id: format!("shardId-00000001-TestTable"),
+            shard_id: "shardId-00000001-TestTable".to_string(),
             shard_iterator_type: "TRIM_HORIZON".to_string(),
             sequence_number: None,
         })
@@ -427,9 +429,11 @@ fn test_ttl_deletion_removes_from_gsi() {
     .unwrap();
 
     // Verify item exists in GSI
-    let mut gsi_req = dynoxide::actions::scan::ScanRequest::default();
-    gsi_req.table_name = "TestTable".to_string();
-    gsi_req.index_name = Some("ByGsiPk".to_string());
+    let gsi_req = dynoxide::actions::scan::ScanRequest {
+        table_name: "TestTable".to_string(),
+        index_name: Some("ByGsiPk".to_string()),
+        ..Default::default()
+    };
     let gsi_scan = db.scan(gsi_req).unwrap();
     assert_eq!(gsi_scan.count, 1);
 
@@ -441,9 +445,11 @@ fn test_ttl_deletion_removes_from_gsi() {
     assert_eq!(item_count(&db, "TestTable"), 0);
 
     // Verify item removed from GSI
-    let mut gsi_req2 = dynoxide::actions::scan::ScanRequest::default();
-    gsi_req2.table_name = "TestTable".to_string();
-    gsi_req2.index_name = Some("ByGsiPk".to_string());
+    let gsi_req2 = dynoxide::actions::scan::ScanRequest {
+        table_name: "TestTable".to_string(),
+        index_name: Some("ByGsiPk".to_string()),
+        ..Default::default()
+    };
     let gsi_scan = db.scan(gsi_req2).unwrap();
     assert_eq!(gsi_scan.count, 0);
 }

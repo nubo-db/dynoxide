@@ -124,22 +124,23 @@ fn test_query_name_used_across_expressions_is_valid() {
     put_item(&db, "TestTable", "user#1", "2024-01-01");
 
     let result = db.query({
-        let mut req = QueryRequest::default();
-        req.table_name = "TestTable".to_string();
-        req.key_condition_expression = Some("#pk = :pk".to_string());
-        req.filter_expression = Some("#s = :status".to_string());
-        req.expression_attribute_names = Some(HashMap::from([
-            ("#pk".to_string(), "pk".to_string()),
-            ("#s".to_string(), "status".to_string()),
-        ]));
-        req.expression_attribute_values = Some(HashMap::from([
-            (":pk".to_string(), AttributeValue::S("user#1".to_string())),
-            (
-                ":status".to_string(),
-                AttributeValue::S("active".to_string()),
-            ),
-        ]));
-        req
+        QueryRequest {
+            table_name: "TestTable".to_string(),
+            key_condition_expression: Some("#pk = :pk".to_string()),
+            filter_expression: Some("#s = :status".to_string()),
+            expression_attribute_names: Some(HashMap::from([
+                ("#pk".to_string(), "pk".to_string()),
+                ("#s".to_string(), "status".to_string()),
+            ])),
+            expression_attribute_values: Some(HashMap::from([
+                (":pk".to_string(), AttributeValue::S("user#1".to_string())),
+                (
+                    ":status".to_string(),
+                    AttributeValue::S("active".to_string()),
+                ),
+            ])),
+            ..Default::default()
+        }
     });
 
     assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
@@ -152,17 +153,20 @@ fn test_query_name_used_only_in_projection_is_valid() {
     put_item(&db, "TestTable", "user#1", "2024-01-01");
 
     let result = db.query({
-        let mut req = QueryRequest::default();
-        req.table_name = "TestTable".to_string();
-        req.key_condition_expression = Some("pk = :pk".to_string());
-        req.projection_expression = Some("#s".to_string());
-        req.expression_attribute_names =
-            Some(HashMap::from([("#s".to_string(), "status".to_string())]));
-        req.expression_attribute_values = Some(HashMap::from([(
-            ":pk".to_string(),
-            AttributeValue::S("user#1".to_string()),
-        )]));
-        req
+        QueryRequest {
+            table_name: "TestTable".to_string(),
+            key_condition_expression: Some("pk = :pk".to_string()),
+            projection_expression: Some("#s".to_string()),
+            expression_attribute_names: Some(HashMap::from([(
+                "#s".to_string(),
+                "status".to_string(),
+            )])),
+            expression_attribute_values: Some(HashMap::from([(
+                ":pk".to_string(),
+                AttributeValue::S("user#1".to_string()),
+            )])),
+            ..Default::default()
+        }
     });
 
     assert!(result.is_ok(), "Expected success, got: {:?}", result.err());

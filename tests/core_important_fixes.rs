@@ -250,13 +250,15 @@ fn test_put_item_condition_failure_leaves_no_partial_state() {
     assert!(result.is_err());
 
     // Verify original item is still there, unchanged
-    let mut qr = QueryRequest::default();
-    qr.table_name = "TestTbl".to_string();
-    qr.key_condition_expression = Some("pk = :pk AND sk = :sk".to_string());
-    qr.expression_attribute_values = Some(item(&[
-        (":pk", AttributeValue::S("a".into())),
-        (":sk", AttributeValue::S("b".into())),
-    ]));
+    let qr = QueryRequest {
+        table_name: "TestTbl".to_string(),
+        key_condition_expression: Some("pk = :pk AND sk = :sk".to_string()),
+        expression_attribute_values: Some(item(&[
+            (":pk", AttributeValue::S("a".into())),
+            (":sk", AttributeValue::S("b".into())),
+        ])),
+        ..Default::default()
+    };
     let query_resp = db.query(qr).unwrap();
 
     let items = query_resp.items.unwrap();
@@ -287,14 +289,16 @@ fn test_size_on_number_type_returns_no_match() {
     );
 
     // Query with filter: size(num) > 0 — should NOT match since N doesn't support size()
-    let mut qr = QueryRequest::default();
-    qr.table_name = "TestTbl".to_string();
-    qr.key_condition_expression = Some("pk = :pk".to_string());
-    qr.filter_expression = Some("size(num) > :zero".to_string());
-    qr.expression_attribute_values = Some(item(&[
-        (":pk", AttributeValue::S("a".into())),
-        (":zero", AttributeValue::N("0".into())),
-    ]));
+    let qr = QueryRequest {
+        table_name: "TestTbl".to_string(),
+        key_condition_expression: Some("pk = :pk".to_string()),
+        filter_expression: Some("size(num) > :zero".to_string()),
+        expression_attribute_values: Some(item(&[
+            (":pk", AttributeValue::S("a".into())),
+            (":zero", AttributeValue::N("0".into())),
+        ])),
+        ..Default::default()
+    };
     let resp = db.query(qr).unwrap();
 
     // The item should not pass the filter since size() on N returns no match
@@ -318,15 +322,17 @@ fn test_size_on_string_type_still_works() {
     );
 
     // size(#n) = 5, so size(#n) > :three should pass (name is a reserved word)
-    let mut qr = QueryRequest::default();
-    qr.table_name = "TestTbl".to_string();
-    qr.key_condition_expression = Some("pk = :pk".to_string());
-    qr.filter_expression = Some("size(#n) > :three".to_string());
-    qr.expression_attribute_names = Some(HashMap::from([("#n".to_string(), "name".to_string())]));
-    qr.expression_attribute_values = Some(item(&[
-        (":pk", AttributeValue::S("a".into())),
-        (":three", AttributeValue::N("3".into())),
-    ]));
+    let qr = QueryRequest {
+        table_name: "TestTbl".to_string(),
+        key_condition_expression: Some("pk = :pk".to_string()),
+        filter_expression: Some("size(#n) > :three".to_string()),
+        expression_attribute_names: Some(HashMap::from([("#n".to_string(), "name".to_string())])),
+        expression_attribute_values: Some(item(&[
+            (":pk", AttributeValue::S("a".into())),
+            (":three", AttributeValue::N("3".into())),
+        ])),
+        ..Default::default()
+    };
     let resp = db.query(qr).unwrap();
 
     assert_eq!(resp.count, 1);

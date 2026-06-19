@@ -196,13 +196,15 @@ fn import_maintains_gsi() {
     use dynoxide::actions::query::QueryRequest;
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Users".to_string();
-            req.index_name = Some("email-index".to_string());
-            req.key_condition_expression = Some("email = :email".to_string());
-            req.expression_attribute_values =
-                Some(dynoxide::item! { ":email" => "alice@example.com" });
-            req
+            QueryRequest {
+                table_name: "Users".to_string(),
+                index_name: Some("email-index".to_string()),
+                key_condition_expression: Some("email = :email".to_string()),
+                expression_attribute_values: Some(
+                    dynoxide::item! { ":email" => "alice@example.com" },
+                ),
+                ..Default::default()
+            }
         })
         .unwrap();
 
@@ -233,10 +235,11 @@ fn import_sparse_gsi_skips_items_without_gsi_key() {
     use dynoxide::actions::scan::ScanRequest;
     let resp = db
         .scan({
-            let mut req = ScanRequest::default();
-            req.table_name = "Users".to_string();
-            req.index_name = Some("email-index".to_string());
-            req
+            ScanRequest {
+                table_name: "Users".to_string(),
+                index_name: Some("email-index".to_string()),
+                ..Default::default()
+            }
         })
         .unwrap();
     let gsi_items = resp.items.unwrap_or_default();

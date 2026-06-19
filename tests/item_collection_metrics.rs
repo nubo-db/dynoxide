@@ -355,21 +355,22 @@ fn test_query_gsi_with_indexes_mode_attributes_capacity_to_gsi() {
     // Query the GSI with INDEXES
     let resp = db
         .query({
-            let mut req = dynoxide::actions::query::QueryRequest::default();
-            req.table_name = "Products".to_string();
-            req.key_condition_expression = Some("category = :cat".to_string());
-            req.expression_attribute_values = Some({
-                let mut m = HashMap::new();
-                m.insert(
-                    ":cat".to_string(),
-                    AttributeValue::S("electronics".to_string()),
-                );
-                m
-            });
-            req.scan_index_forward = true;
-            req.index_name = Some("CategoryIndex".to_string());
-            req.return_consumed_capacity = Some("INDEXES".to_string());
-            req
+            dynoxide::actions::query::QueryRequest {
+                table_name: "Products".to_string(),
+                key_condition_expression: Some("category = :cat".to_string()),
+                expression_attribute_values: Some({
+                    let mut m = HashMap::new();
+                    m.insert(
+                        ":cat".to_string(),
+                        AttributeValue::S("electronics".to_string()),
+                    );
+                    m
+                }),
+                scan_index_forward: true,
+                index_name: Some("CategoryIndex".to_string()),
+                return_consumed_capacity: Some("INDEXES".to_string()),
+                ..Default::default()
+            }
         })
         .unwrap();
 

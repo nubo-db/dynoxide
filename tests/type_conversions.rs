@@ -125,8 +125,8 @@ fn from_btreeset_string() {
 
 #[test]
 fn try_from_f64_valid() {
-    let av = AttributeValue::try_from(3.14f64).unwrap();
-    assert_eq!(av, AttributeValue::N("3.14".to_string()));
+    let av = AttributeValue::try_from(3.5f64).unwrap();
+    assert_eq!(av, AttributeValue::N("3.5".to_string()));
 }
 
 #[test]
@@ -238,9 +238,9 @@ fn av_to_i64_wrong_type() {
 
 #[test]
 fn av_to_f64() {
-    let av = AttributeValue::N("3.14".to_string());
+    let av = AttributeValue::N("3.5".to_string());
     let n: f64 = av.try_into().unwrap();
-    assert!((n - 3.14).abs() < f64::EPSILON);
+    assert!((n - 3.5).abs() < f64::EPSILON);
 }
 
 #[test]

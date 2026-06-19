@@ -138,15 +138,16 @@ fn test_c1_number_comparison_38_digit_precision() {
     // Query with FilterExpression checking val < big_b  -- should match
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression = Some("pk = :pk".to_string());
-            req.filter_expression = Some("val < :limit".to_string());
-            req.expression_attribute_values = Some(HashMap::from([
-                (":pk".to_string(), AttributeValue::S("a".into())),
-                (":limit".to_string(), AttributeValue::N(big_b.to_string())),
-            ]));
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk".to_string()),
+                filter_expression: Some("val < :limit".to_string()),
+                expression_attribute_values: Some(HashMap::from([
+                    (":pk".to_string(), AttributeValue::S("a".into())),
+                    (":limit".to_string(), AttributeValue::N(big_b.to_string())),
+                ])),
+                ..Default::default()
+            }
         })
         .unwrap();
     assert_eq!(
@@ -157,15 +158,16 @@ fn test_c1_number_comparison_38_digit_precision() {
     // Now check val < big_a -- should NOT match (equal, not less)
     let resp2 = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression = Some("pk = :pk".to_string());
-            req.filter_expression = Some("val < :limit".to_string());
-            req.expression_attribute_values = Some(HashMap::from([
-                (":pk".to_string(), AttributeValue::S("a".into())),
-                (":limit".to_string(), AttributeValue::N(big_a.to_string())),
-            ]));
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk".to_string()),
+                filter_expression: Some("val < :limit".to_string()),
+                expression_attribute_values: Some(HashMap::from([
+                    (":pk".to_string(), AttributeValue::S("a".into())),
+                    (":limit".to_string(), AttributeValue::N(big_a.to_string())),
+                ])),
+                ..Default::default()
+            }
         })
         .unwrap();
     assert_eq!(
@@ -209,14 +211,15 @@ fn test_c2_number_arithmetic_preserves_precision() {
     // Verify: should be 100000000000000000000000000000000000000 (39 digits)
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression = Some("pk = :pk".to_string());
-            req.expression_attribute_values = Some(HashMap::from([(
-                ":pk".to_string(),
-                AttributeValue::S("a".into()),
-            )]));
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk".to_string()),
+                expression_attribute_values: Some(HashMap::from([(
+                    ":pk".to_string(),
+                    AttributeValue::S("a".into()),
+                )])),
+                ..Default::default()
+            }
         })
         .unwrap();
     let items = resp.items.unwrap();
@@ -261,14 +264,15 @@ fn test_c2_set_plus_minus_high_precision() {
 
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression = Some("pk = :pk".to_string());
-            req.expression_attribute_values = Some(HashMap::from([(
-                ":pk".to_string(),
-                AttributeValue::S("a".into()),
-            )]));
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk".to_string()),
+                expression_attribute_values: Some(HashMap::from([(
+                    ":pk".to_string(),
+                    AttributeValue::S("a".into()),
+                )])),
+                ..Default::default()
+            }
         })
         .unwrap();
     let items = resp.items.unwrap();
@@ -310,15 +314,15 @@ fn test_c4_begins_with_percent_in_sort_key() {
     // begins_with(sk, "100%") should match only the first item
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression =
-                Some("pk = :pk AND begins_with(sk, :prefix)".to_string());
-            req.expression_attribute_values = Some(HashMap::from([
-                (":pk".to_string(), AttributeValue::S("p".into())),
-                (":prefix".to_string(), AttributeValue::S("100%".into())),
-            ]));
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk AND begins_with(sk, :prefix)".to_string()),
+                expression_attribute_values: Some(HashMap::from([
+                    (":pk".to_string(), AttributeValue::S("p".into())),
+                    (":prefix".to_string(), AttributeValue::S("100%".into())),
+                ])),
+                ..Default::default()
+            }
         })
         .unwrap();
     assert_eq!(
@@ -357,15 +361,15 @@ fn test_c4_begins_with_underscore_in_sort_key() {
     // begins_with(sk, "a_") should match only "a_b", not "aXb"
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression =
-                Some("pk = :pk AND begins_with(sk, :prefix)".to_string());
-            req.expression_attribute_values = Some(HashMap::from([
-                (":pk".to_string(), AttributeValue::S("p".into())),
-                (":prefix".to_string(), AttributeValue::S("a_".into())),
-            ]));
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk AND begins_with(sk, :prefix)".to_string()),
+                expression_attribute_values: Some(HashMap::from([
+                    (":pk".to_string(), AttributeValue::S("p".into())),
+                    (":prefix".to_string(), AttributeValue::S("a_".into())),
+                ])),
+                ..Default::default()
+            }
         })
         .unwrap();
     assert_eq!(
@@ -399,16 +403,17 @@ fn test_c5_query_count_with_filter_expression() {
     // SELECT COUNT with filter: score >= 30 (items 3,4 = 2 items)
     let resp = db
         .query({
-            let mut req = QueryRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.key_condition_expression = Some("pk = :pk".to_string());
-            req.filter_expression = Some("score >= :min".to_string());
-            req.expression_attribute_values = Some(HashMap::from([
-                (":pk".to_string(), AttributeValue::S("p".into())),
-                (":min".to_string(), AttributeValue::N("30".to_string())),
-            ]));
-            req.select = Some("COUNT".to_string());
-            req
+            QueryRequest {
+                table_name: "Tbl".to_string(),
+                key_condition_expression: Some("pk = :pk".to_string()),
+                filter_expression: Some("score >= :min".to_string()),
+                expression_attribute_values: Some(HashMap::from([
+                    (":pk".to_string(), AttributeValue::S("p".into())),
+                    (":min".to_string(), AttributeValue::N("30".to_string())),
+                ])),
+                select: Some("COUNT".to_string()),
+                ..Default::default()
+            }
         })
         .unwrap();
 
@@ -438,15 +443,16 @@ fn test_c5_scan_count_with_filter_expression() {
     // Scan with COUNT + filter: score >= 30 (items 3,4 = 2 items)
     let resp = db
         .scan({
-            let mut req = ScanRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.filter_expression = Some("score >= :min".to_string());
-            req.expression_attribute_values = Some(HashMap::from([(
-                ":min".to_string(),
-                AttributeValue::N("30".to_string()),
-            )]));
-            req.select = Some("COUNT".to_string());
-            req
+            ScanRequest {
+                table_name: "Tbl".to_string(),
+                filter_expression: Some("score >= :min".to_string()),
+                expression_attribute_values: Some(HashMap::from([(
+                    ":min".to_string(),
+                    AttributeValue::N("30".to_string()),
+                )])),
+                select: Some("COUNT".to_string()),
+                ..Default::default()
+            }
         })
         .unwrap();
 

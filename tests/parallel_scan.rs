@@ -41,11 +41,12 @@ fn make_db_with_items(count: usize) -> Database {
 }
 
 fn scan_req(table: &str, segment: Option<u32>, total: Option<u32>) -> ScanRequest {
-    let mut req = ScanRequest::default();
-    req.table_name = table.to_string();
-    req.segment = segment;
-    req.total_segments = total;
-    req
+    ScanRequest {
+        table_name: table.to_string(),
+        segment,
+        total_segments: total,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -124,12 +125,14 @@ fn test_paginated_parallel_scan() {
     for segment in 0..total_segments {
         let mut start_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
-            let mut req = ScanRequest::default();
-            req.table_name = "Tbl".to_string();
-            req.segment = Some(segment);
-            req.total_segments = Some(total_segments);
-            req.limit = Some(5);
-            req.exclusive_start_key = start_key.clone();
+            let req = ScanRequest {
+                table_name: "Tbl".to_string(),
+                segment: Some(segment),
+                total_segments: Some(total_segments),
+                limit: Some(5),
+                exclusive_start_key: start_key.clone(),
+                ..Default::default()
+            };
             let resp = db.scan(req).unwrap();
 
             for item in resp.items.unwrap_or_default() {

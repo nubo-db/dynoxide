@@ -62,19 +62,6 @@ fn exec(db: &Database, statement: &str) -> ExecuteStatementResponse {
     .unwrap()
 }
 
-fn exec_with_params(
-    db: &Database,
-    statement: &str,
-    params: Vec<AttributeValue>,
-) -> ExecuteStatementResponse {
-    db.execute_statement(ExecuteStatementRequest {
-        statement: statement.to_string(),
-        parameters: Some(params),
-        ..Default::default()
-    })
-    .unwrap()
-}
-
 fn exec_with_limit(db: &Database, statement: &str, limit: usize) -> ExecuteStatementResponse {
     db.execute_statement(ExecuteStatementRequest {
         statement: statement.to_string(),
@@ -136,8 +123,8 @@ fn test_update_remove_clause() {
         items[0].get("name"),
         Some(&AttributeValue::S("Alicia".to_string()))
     );
-    assert!(items[0].get("age").is_none(), "age should be removed");
-    assert!(items[0].get("email").is_none(), "email should be removed");
+    assert!(!items[0].contains_key("age"), "age should be removed");
+    assert!(!items[0].contains_key("email"), "email should be removed");
 }
 
 #[test]
@@ -155,7 +142,7 @@ fn test_update_remove_only() {
     let sel = exec(&db, "SELECT * FROM \"Tbl\" WHERE pk = 'k1'");
     let items = sel.items.unwrap();
     assert_eq!(items.len(), 1);
-    assert!(items[0].get("temp").is_none(), "temp should be removed");
+    assert!(!items[0].contains_key("temp"), "temp should be removed");
 }
 
 // ---------------------------------------------------------------------------

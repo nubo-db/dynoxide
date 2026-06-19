@@ -914,7 +914,7 @@ fn test_select_nested_map_path() {
     );
     // Should NOT have the parent map key
     assert!(
-        items[0].get("mymap").is_none(),
+        !items[0].contains_key("mymap"),
         "should not have parent 'mymap' key in result"
     );
 }
@@ -981,7 +981,7 @@ fn test_select_nested_path_missing_returns_empty() {
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
     // Non-existent nested path should be absent, not error
-    assert!(items[0].get("nonexistent").is_none());
+    assert!(!items[0].contains_key("nonexistent"));
 }
 
 // ── Issue #40: bracket IN lists and negated predicates ────────────────────

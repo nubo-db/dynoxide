@@ -48,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (default)
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Clippy (encryption)
         run: cargo clippy --no-default-features --features encryption --lib -- -D warnings

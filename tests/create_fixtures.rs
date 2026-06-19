@@ -14,6 +14,7 @@ use dynoxide::Database;
 use std::path::Path;
 
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+#[cfg(feature = "encryption")]
 const TEST_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
 fn create_table_and_insert(db: &Database) {

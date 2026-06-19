@@ -359,7 +359,7 @@ fn test_get_shard_iterator_latest() {
     put_item(&db, "Table1", "b", "2");
 
     // Use the next iterator to read new records
-    let resp2 = get_records(&db, &resp.next_shard_iterator.as_ref().unwrap());
+    let resp2 = get_records(&db, resp.next_shard_iterator.as_ref().unwrap());
     assert_eq!(resp2.records.len(), 1);
     assert_eq!(resp2.records[0].event_name, "INSERT");
 }

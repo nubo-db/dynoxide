@@ -145,16 +145,18 @@ fn test_query_consumed_capacity() {
     })
     .unwrap();
 
-    let mut qr = dynoxide::actions::query::QueryRequest::default();
-    qr.table_name = "TestTable".to_string();
-    qr.key_condition_expression = Some("pk = :pk".to_string());
-    qr.expression_attribute_values = Some({
-        let mut m = HashMap::new();
-        m.insert(":pk".to_string(), AttributeValue::S("u1".to_string()));
-        m
-    });
-    qr.scan_index_forward = true;
-    qr.return_consumed_capacity = Some("TOTAL".to_string());
+    let qr = dynoxide::actions::query::QueryRequest {
+        table_name: "TestTable".to_string(),
+        key_condition_expression: Some("pk = :pk".to_string()),
+        expression_attribute_values: Some({
+            let mut m = HashMap::new();
+            m.insert(":pk".to_string(), AttributeValue::S("u1".to_string()));
+            m
+        }),
+        scan_index_forward: true,
+        return_consumed_capacity: Some("TOTAL".to_string()),
+        ..Default::default()
+    };
     let resp = db.query(qr).unwrap();
 
     let cc = resp.consumed_capacity.unwrap();

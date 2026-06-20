@@ -95,6 +95,20 @@ Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, C
 
 Dynoxide implements the DynamoDB API across tables, items, query and scan, batches, transactions, PartiQL, streams, TTL, and tags, with GSI and LSI support, the full expression syntax, and DynamoDB-compatible pagination, validation, and error codes. For the operation-by-operation breakdown and a comparison with DynamoDB Local, see the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
 
+## Limitations
+
+Dynoxide is built for local development, testing, and CI, not as a production DynamoDB replacement, so two classes of thing are missing on purpose.
+
+Cloud-only operations with no local equivalent aren't implemented: backups and point-in-time restore, global tables, Kinesis streaming, resource policies, and capacity management. Call one and you get an `UnknownOperationException`.
+
+A few behavioural differences are also worth knowing when you test against it:
+
+- `ConsistentRead` is accepted but changes nothing. SQLite is strongly consistent, so every read already is - you can't reproduce eventually-consistent reads.
+- Streams expose a single shard. `DescribeStream` returns one shard, and its `ExclusiveStartShardId` and `Limit` paging parameters are accepted but ignored.
+- Transaction-contention errors (`TransactionConflictException`, `TransactionInProgressException`) aren't emulated - there's no concurrent contention in a single process.
+
+For the live, per-feature support matrix across every emulator see [paritysuite.org/capabilities](https://paritysuite.org/capabilities), and the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+
 ## Acknowledgements
 
 Dynoxide's DynamoDB API semantics and validation logic were informed by [dynalite](https://github.com/architect/dynalite), the excellent DynamoDB emulator built on LevelDB by Michael Hart and now maintained by the Architect team.

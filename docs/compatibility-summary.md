@@ -6,35 +6,33 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 **Consistency model:** SQLite provides strong consistency. `ConsistentRead` is accepted but has no effect - all reads are strongly consistent.
 
-> **Updated:** 2026-03-24 · Reflects current behaviour, validated by the conformance suite.
+> Behaviour validated by the [conformance suite](https://github.com/nubo-db/dynamodb-conformance). Pass rates move as the suite grows, so this page links to the [live results](https://paritysuite.org) rather than pinning a snapshot.
 
 ---
 
 ## Conformance
 
 Dynoxide's DynamoDB compatibility is independently verified by the
-[dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) test
-suite - 526 tests across 3 tiers, validated against real DynamoDB ground truth.
+[dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) suite,
+which runs one test matrix against real DynamoDB and every major emulator across
+three tiers:
 
-| Target | Tier 1 (Core) | Tier 2 (Complete) | Tier 3 (Strict) | Total |
-|---|---|---|---|---|
-| DynamoDB | 100% | 100% | 100% | 100% (526/526) |
-| **Dynoxide** | **100%** | **100%** | **100%** | **100% (526/526)** |
-| DynamoDB Local | 98.9% (264/267) | 90.3% (84/93) | 81.9% (136/166) | 92.0% (484/526) |
+- **Tier 1 (Core)** - CRUD, queries, scans, batch operations, GSIs, and UpdateTable
+- **Tier 2 (Complete)** - transactions, PartiQL, LSIs, streams, TTL, and tags
+- **Tier 3 (Strict)** - validation ordering, error-message fidelity, reserved
+  words, legacy-API handling, and edge cases
 
-Tier 1 covers core CRUD, queries, scans, batch operations, and GSIs. Tier 2
-adds transactions, PartiQL, streams, TTL, tags, and UpdateTable. Tier 3 covers
-validation ordering, error message fidelity, reserved words, and edge cases.
+Pass rates move as the suite grows and each engine changes, so rather than pin a
+snapshot that goes stale, the current standings are published live:
 
-"100% conformance on 526 tests" means Dynoxide matches real DynamoDB behaviour
-for every test in the suite. It does not mean "100% DynamoDB compatible" - there
-are aspects of DynamoDB the suite does not yet cover.
+- **[paritysuite.org](https://paritysuite.org)** - pass rates for every engine, broken down by tier
+- **[paritysuite.org/capabilities](https://paritysuite.org/capabilities)** - the feature-by-feature support matrix
+- **[nubo-db/dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance#results)** - the suite, the raw results, and how each target is run
 
-**How Dynoxide compares to DynamoDB Local:** DynamoDB Local is itself a subset of
-the full DynamoDB API - it fails 42 of the 526 conformance tests that real
-DynamoDB passes. Where a feature is unsupported in both, it is marked as such.
-Where Dynoxide supports something DynamoDB Local does not, this is noted
-explicitly.
+A high conformance score means Dynoxide matches real DynamoDB behaviour for the
+tests in the suite. It does not mean "100% DynamoDB compatible" - there are
+aspects of DynamoDB the suite does not yet cover, and the limitations below are
+the ones worth knowing.
 
 ---
 
@@ -144,7 +142,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 
 ### Conformance advantages
 
-DynamoDB Local fails 42 of 526 conformance tests. Grouped by category:
+DynamoDB Local fails a sizeable share of the suite that real DynamoDB passes; the current count is on the [live results](https://paritysuite.org). The gaps cluster in a few categories (figures from a representative run):
 
 | Category | Failures | Details |
 |---|---|---|

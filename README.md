@@ -93,7 +93,21 @@ Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, C
 
 ## Supported Operations
 
-Dynoxide implements the DynamoDB API across tables, items, query and scan, batches, transactions, PartiQL, streams, TTL, and tags, with GSI and LSI support, the full expression syntax, and DynamoDB-compatible pagination, validation, and error codes. For the operation-by-operation breakdown and a comparison with DynamoDB Local, see the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+Dynoxide implements the DynamoDB API across tables, items, query and scan, batches, transactions, PartiQL, streams, TTL, and tags, with GSI and LSI support, the full expression syntax, and DynamoDB-compatible pagination, validation, and error codes. For the operation-by-operation breakdown and a comparison, see the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+
+## Limitations
+
+Dynoxide is built for local development, testing, and CI, not as a production DynamoDB replacement, so two classes of thing are missing on purpose.
+
+Cloud-only operations with no local equivalent aren't implemented: backups and point-in-time restore, global tables, Kinesis streaming, resource policies, and capacity management. Call one and you get an `UnknownOperationException`.
+
+A few behavioural differences are also worth knowing when you test against it:
+
+- `ConsistentRead` is accepted but changes nothing. SQLite is strongly consistent, so every read already is - you can't reproduce eventually-consistent reads.
+- Streams expose a single shard. `DescribeStream` returns one shard, and its `ExclusiveStartShardId` and `Limit` paging parameters are accepted but ignored.
+- Transaction-contention errors (`TransactionConflictException`, `TransactionInProgressException`) aren't emulated - there's no concurrent contention in a single process.
+
+For the live, per-feature support matrix see [paritysuite.org/capabilities](https://paritysuite.org/capabilities), and the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
 
 ## Acknowledgements
 
@@ -106,3 +120,7 @@ Dynoxide uses SQLite as its storage layer. (AWS's [DynamoDB Local](https://docs.
 ## License
 
 Dual-licensed under MIT and Apache 2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+## Trademarks
+
+Amazon DynamoDB, DynamoDB, and AWS are trademarks of Amazon.com, Inc. or its affiliates. Dynoxide is an independent project and is not affiliated with, endorsed by, or sponsored by Amazon, and nothing here grants any right to use those names or marks.

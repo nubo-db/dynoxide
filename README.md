@@ -93,7 +93,7 @@ Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, C
 
 ## Supported Operations
 
-Dynoxide implements the DynamoDB API across tables, items, query and scan, batches, transactions, PartiQL, streams, TTL, and tags, with GSI and LSI support, the full expression syntax, and DynamoDB-compatible pagination, validation, and error codes. For the operation-by-operation breakdown and a comparison with DynamoDB Local, see the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+Dynoxide implements the DynamoDB API across tables, items, query and scan, batches, transactions, PartiQL, streams, TTL, and tags, with GSI and LSI support, the full expression syntax, and DynamoDB-compatible pagination, validation, and error codes. For the operation-by-operation breakdown and a comparison, see the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
 
 ## Limitations
 
@@ -107,7 +107,7 @@ A few behavioural differences are also worth knowing when you test against it:
 - Streams expose a single shard. `DescribeStream` returns one shard, and its `ExclusiveStartShardId` and `Limit` paging parameters are accepted but ignored.
 - Transaction-contention errors (`TransactionConflictException`, `TransactionInProgressException`) aren't emulated - there's no concurrent contention in a single process.
 
-For the live, per-feature support matrix across every emulator see [paritysuite.org/capabilities](https://paritysuite.org/capabilities), and the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+For the live, per-feature support matrix see [paritysuite.org/capabilities](https://paritysuite.org/capabilities), and the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
 
 ## Acknowledgements
 

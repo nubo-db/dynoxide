@@ -1,0 +1,14 @@
+{
+  "put_item/put_item/small": 24878,
+  "put_item/put_item/medium": 44546,
+  "put_item/put_item/large": 298175,
+  "get_item": 17486,
+  "query_base_table": 1140746,
+  "query_gsi": 27066,
+  "scan_with_filter": 8804174,
+  "update_item": 180676,
+  "delete_item": 56002,
+  "batch_write_item_25": 1091855,
+  "batch_get_item_100": 1537274,
+  "transact_write_items_4": 259891
+}

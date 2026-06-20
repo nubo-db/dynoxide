@@ -1,6 +1,6 @@
 # Dynoxide
 
-[![crates.io](https://img.shields.io/crates/v/dynoxide-rs.svg)](https://crates.io/crates/dynoxide-rs) [![docs.rs](https://img.shields.io/docsrs/dynoxide-rs)](https://docs.rs/dynoxide-rs) [![CI](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml/badge.svg)](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml) [![license](https://img.shields.io/crates/l/dynoxide-rs.svg)](#license)
+[![crates.io](https://img.shields.io/crates/v/dynoxide-rs.svg)](https://crates.io/crates/dynoxide-rs) [![docs.rs](https://img.shields.io/docsrs/dynoxide-rs)](https://docs.rs/dynoxide-rs) [![CI](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml/badge.svg)](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml) [![conformance](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nubo-db/dynamodb-conformance/main/results/dynoxide.badge.json)](https://paritysuite.org) [![license](https://img.shields.io/crates/l/dynoxide-rs.svg)](#license)
 
 A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for coding agents, or embeds directly into Rust and iOS applications as a library.
 

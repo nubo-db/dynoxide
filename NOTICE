@@ -3,3 +3,8 @@ Copyright 2025-2026 Martin Hicks (https://martinhicks.dev)
 
 Licensed under the Apache License, Version 2.0 and the MIT License.
 See LICENSE-APACHE and LICENSE-MIT for details.
+
+DynamoDB and AWS are trademarks of Amazon.com, Inc. or its affiliates. This
+software is an independent project and is not affiliated with, endorsed by, or
+sponsored by Amazon. The licence does not grant permission to use those trade
+names, trademarks, service marks, or product names.

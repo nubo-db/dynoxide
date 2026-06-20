@@ -120,3 +120,7 @@ Dynoxide uses SQLite as its storage layer. (AWS's [DynamoDB Local](https://docs.
 ## License
 
 Dual-licensed under MIT and Apache 2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+## Trademarks
+
+Amazon DynamoDB, DynamoDB, and AWS are trademarks of Amazon.com, Inc. or its affiliates. Dynoxide is an independent project and is not affiliated with, endorsed by, or sponsored by Amazon, and nothing here grants any right to use those names or marks.

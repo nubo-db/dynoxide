@@ -21,6 +21,21 @@ pub struct IndexDef {
 /// Type alias retained for backward compatibility.
 pub type GsiDef = IndexDef;
 
+impl IndexDef {
+    /// The `(pk, sk)` key strings for this item's index entry, or `None` if the
+    /// item is excluded. Sparse-index behaviour: an item missing the partition
+    /// key, or the sort key when one is defined, or holding a non-scalar where a
+    /// key is expected, is not projected into the index.
+    pub fn index_key_strings(&self, item: &Item) -> Option<(String, String)> {
+        let pk = item.get(&self.pk_attr)?.to_key_string()?;
+        let sk = match self.sk_attr {
+            Some(ref sk_attr) => item.get(sk_attr)?.to_key_string()?,
+            None => String::new(),
+        };
+        Some((pk, sk))
+    }
+}
+
 /// Convert a single GlobalSecondaryIndex to a GsiDef.
 pub fn gsi_to_def(gsi: &GlobalSecondaryIndex) -> Result<GsiDef> {
     let pk_attr = gsi
@@ -147,16 +162,8 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
             table_sk: table_sk_str.to_string(),
         });
 
-        // If the item has the GSI pk attribute, insert into GSI
-        if let Some(gsi_pk_val) = item.get(&gsi.pk_attr) {
-            let gsi_pk = gsi_pk_val.to_key_string().unwrap_or_default();
-            let gsi_sk = gsi
-                .sk_attr
-                .as_ref()
-                .and_then(|sk| item.get(sk))
-                .and_then(|v| v.to_key_string())
-                .unwrap_or_default();
-
+        // Insert only when the item belongs in this index (sparse).
+        if let Some((gsi_pk, gsi_sk)) = gsi.index_key_strings(item) {
             let projected = build_index_item(item, gsi, table_pk_attr, table_sk_attr);
             let projected_size = crate::types::item_size(&projected);
             let item_json = serde_json::to_string(&projected)

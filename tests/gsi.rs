@@ -566,6 +566,358 @@ fn test_gsi_item_without_gsi_key_not_projected() {
     assert_eq!(resp.count, 0);
 }
 
+/// Sparse GSI: an item missing the GSI sort key (when the index defines one)
+/// must be excluded from the index entirely, the same way a missing partition
+/// key excludes it. The GSI sort key here is a non-key attribute, so it can be
+/// legitimately absent on some items. See issue #91.
+#[test]
+fn test_gsi_scan_excludes_item_missing_sort_key() {
+    let db = Database::memory().unwrap();
+
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "sparse_attribute", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [
+            {
+                "IndexName": "sparse_index",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sparse_attribute", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }
+        ]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    // Item missing the GSI sort key (sparse_attribute) -- excluded from the index.
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "Item": {"pk": {"S": "partition1"}, "sk": {"S": "sort1"}}
+    });
+    db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+
+    // Item with the GSI sort key -- included in the index.
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "Item": {"pk": {"S": "partition2"}, "sk": {"S": "sort2"}, "sparse_attribute": {"S": "hello"}}
+    });
+    db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "IndexName": "sparse_index"
+    });
+    let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+
+    assert_eq!(
+        resp.count, 1,
+        "only the item with the GSI sort key belongs in the index"
+    );
+    assert_eq!(
+        resp.scanned_count, 1,
+        "the item missing the GSI sort key must not be scanned"
+    );
+}
+
+/// Table with a composite GSI whose sort key is a non-key attribute, so it can
+/// legitimately be absent on some items. Used by the sparse-index tests below.
+fn create_sparse_gsi_table(db: &Database) {
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "sparse_attribute", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [
+            {
+                "IndexName": "sparse_index",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sparse_attribute", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }
+        ]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+}
+
+fn put_json(db: &Database, item: serde_json::Value) {
+    let req: serde_json::Value = serde_json::json!({"TableName": "table", "Item": item});
+    db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+}
+
+fn scan_sparse_index(db: &Database) -> dynoxide::actions::scan::ScanResponse {
+    let req: serde_json::Value =
+        serde_json::json!({"TableName": "table", "IndexName": "sparse_index"});
+    db.scan(serde_json::from_value(req).unwrap()).unwrap()
+}
+
+/// Query on the index excludes a sort-key-less item from its partition too.
+#[test]
+fn test_gsi_query_excludes_item_missing_sort_key() {
+    let db = Database::memory().unwrap();
+    create_sparse_gsi_table(&db);
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}}),
+    );
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p2"}, "sk": {"S": "s2"}, "sparse_attribute": {"S": "hi"}}),
+    );
+
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "IndexName": "sparse_index",
+        "KeyConditionExpression": "pk = :p",
+        "ExpressionAttributeValues": {":p": {"S": "p1"}}
+    });
+    let resp = db.query(serde_json::from_value(req).unwrap()).unwrap();
+    assert_eq!(
+        resp.count, 0,
+        "sort-key-less item must not appear in an index query"
+    );
+}
+
+/// A hash-only GSI still includes an item that has the GSI partition key, even
+/// with no sort key defined. Guards the helper from over-excluding.
+#[test]
+fn test_gsi_hash_only_index_includes_item() {
+    let db = Database::memory().unwrap();
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi_pk", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "hash_only",
+            "KeySchema": [{"AttributeName": "gsi_pk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}, "gsi_pk": {"S": "g1"}}),
+    );
+
+    let req: serde_json::Value =
+        serde_json::json!({"TableName": "table", "IndexName": "hash_only"});
+    let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+    assert_eq!(resp.count, 1);
+}
+
+/// Overwriting an indexed item with a sort-key-less version evicts it from the
+/// index (the unconditional delete fires; the gated insert is skipped).
+#[test]
+fn test_gsi_overwrite_with_missing_sort_key_evicts() {
+    let db = Database::memory().unwrap();
+    create_sparse_gsi_table(&db);
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}, "sparse_attribute": {"S": "hi"}}),
+    );
+    assert_eq!(scan_sparse_index(&db).count, 1);
+
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}}),
+    );
+    assert_eq!(
+        scan_sparse_index(&db).count,
+        0,
+        "overwrite without the sort key must evict the stale index entry"
+    );
+}
+
+/// REMOVE-ing the sort key via UpdateItem evicts the item from the index.
+#[test]
+fn test_gsi_update_remove_sort_key_evicts() {
+    let db = Database::memory().unwrap();
+    create_sparse_gsi_table(&db);
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}, "sparse_attribute": {"S": "hi"}}),
+    );
+    assert_eq!(scan_sparse_index(&db).count, 1);
+
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "Key": {"pk": {"S": "p1"}, "sk": {"S": "s1"}},
+        "UpdateExpression": "REMOVE sparse_attribute"
+    });
+    db.update_item(serde_json::from_value(req).unwrap())
+        .unwrap();
+    assert_eq!(scan_sparse_index(&db).count, 0);
+}
+
+/// A present-but-non-scalar sort key cannot form a key, so the item is excluded
+/// rather than indexed at a phantom empty-string position.
+#[test]
+fn test_gsi_non_scalar_sort_key_excluded() {
+    let db = Database::memory().unwrap();
+    create_sparse_gsi_table(&db);
+    put_json(
+        &db,
+        serde_json::json!({
+            "pk": {"S": "p1"}, "sk": {"S": "s1"},
+            "sparse_attribute": {"L": [{"S": "not a scalar key"}]}
+        }),
+    );
+    assert_eq!(scan_sparse_index(&db).count, 0);
+}
+
+/// Membership is decided per index: an item can qualify for one GSI and not
+/// another, and a GSI keyed on a non-key attribute excludes items lacking it.
+#[test]
+fn test_gsi_membership_is_per_index() {
+    let db = Database::memory().unwrap();
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "attr_a", "AttributeType": "S"},
+            {"AttributeName": "attr_b", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [
+            {
+                "IndexName": "index_a",
+                "KeySchema": [{"AttributeName": "attr_a", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            },
+            {
+                "IndexName": "index_b",
+                "KeySchema": [{"AttributeName": "attr_b", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }
+        ]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+    // Item carries attr_a but not attr_b.
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}, "attr_a": {"S": "a"}}),
+    );
+
+    let scan = |index: &str| {
+        let req: serde_json::Value = serde_json::json!({"TableName": "table", "IndexName": index});
+        db.scan(serde_json::from_value(req).unwrap()).unwrap().count
+    };
+    assert_eq!(scan("index_a"), 1, "item has attr_a, belongs in index_a");
+    assert_eq!(
+        scan("index_b"),
+        0,
+        "item lacks attr_b, excluded from index_b"
+    );
+}
+
+/// Projection type is orthogonal to membership: a KEYS_ONLY index still excludes
+/// a sort-key-less item.
+#[test]
+fn test_gsi_keys_only_excludes_item_missing_sort_key() {
+    let db = Database::memory().unwrap();
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "sparse_attribute", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "sparse_index",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sparse_attribute", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "KEYS_ONLY"}
+        }]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}}),
+    );
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p2"}, "sk": {"S": "s2"}, "sparse_attribute": {"S": "hi"}}),
+    );
+    assert_eq!(scan_sparse_index(&db).count, 1);
+}
+
+/// A numeric (N) GSI sort key forms a valid key, so sparse membership works the
+/// same as for string keys: the item with the key is included, the one without
+/// is excluded.
+#[test]
+fn test_gsi_numeric_sort_key_sparse_membership() {
+    let db = Database::memory().unwrap();
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "score", "AttributeType": "N"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "sparse_index",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "score", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p1"}, "sk": {"S": "s1"}}),
+    );
+    put_json(
+        &db,
+        serde_json::json!({"pk": {"S": "p2"}, "sk": {"S": "s2"}, "score": {"N": "42"}}),
+    );
+    assert_eq!(scan_sparse_index(&db).count, 1);
+}
+
 #[test]
 fn test_gsi_overwrite_updates_index() {
     let db = Database::memory().unwrap();

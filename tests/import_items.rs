@@ -246,6 +246,87 @@ fn import_sparse_gsi_skips_items_without_gsi_key() {
     assert_eq!(gsi_items.len(), 0);
 }
 
+/// Table with a composite GSI whose sort key is a non-key attribute.
+fn create_table_with_composite_gsi(db: &Database, table_name: &str) {
+    use dynoxide::actions::create_table::CreateTableRequest;
+    use dynoxide::types::{
+        AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
+        ProjectionType, ScalarAttributeType,
+    };
+
+    let request = CreateTableRequest {
+        table_name: table_name.to_string(),
+        key_schema: vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::HASH,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::RANGE,
+            },
+        ],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sparse_attribute".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
+            index_name: "sparse-index".to_string(),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::HASH,
+                },
+                KeySchemaElement {
+                    attribute_name: "sparse_attribute".to_string(),
+                    key_type: KeyType::RANGE,
+                },
+            ],
+            projection: Projection {
+                projection_type: Some(ProjectionType::ALL),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+        }]),
+        ..Default::default()
+    };
+    db.create_table(request).unwrap();
+}
+
+/// Sort-key absence (not just partition-key absence) excludes an item on import.
+#[test]
+fn import_sparse_gsi_skips_items_without_gsi_sort_key() {
+    let db = create_test_db();
+    create_table_with_composite_gsi(&db, "Events");
+
+    let items = vec![
+        dynoxide::item! { "pk" => "e#1", "sk" => "A" },
+        dynoxide::item! { "pk" => "e#2", "sk" => "B", "sparse_attribute" => "x" },
+    ];
+    db.import_items("Events", items, ImportOptions::default())
+        .unwrap();
+
+    use dynoxide::actions::scan::ScanRequest;
+    let resp = db
+        .scan(ScanRequest {
+            table_name: "Events".to_string(),
+            index_name: Some("sparse-index".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(resp.items.unwrap_or_default().len(), 1);
+}
+
 #[test]
 fn import_with_cached_at() {
     let db = create_test_db();

@@ -804,15 +804,8 @@ async fn backfill_gsi<S: StorageBackend>(
             let item: crate::types::Item = serde_json::from_str(item_json)
                 .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
 
-            if let Some(gsi_pk_val) = item.get(&gsi_def.pk_attr) {
-                let gsi_pk = gsi_pk_val.to_key_string().unwrap_or_default();
-                let gsi_sk = gsi_def
-                    .sk_attr
-                    .as_ref()
-                    .and_then(|sk_attr| item.get(sk_attr))
-                    .and_then(|v| v.to_key_string())
-                    .unwrap_or_default();
-
+            // Backfill only the items that belong in this index (sparse).
+            if let Some((gsi_pk, gsi_sk)) = gsi_def.index_key_strings(&item) {
                 let projected = gsi::build_index_item(
                     &item,
                     gsi_def,

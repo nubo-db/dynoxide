@@ -109,7 +109,7 @@ async fn execute_inner<S: StorageBackend>(
                 .map(crate::storage::compute_hash_prefix)
                 .unwrap_or_default();
 
-            // 8. Maintain GSI tables (sparse: skip items missing GSI pk)
+            // 8. Maintain GSI tables (sparse: skip items missing the GSI pk or sk)
             for gsi_def in &gsi_defs {
                 // Delete any existing GSI entry for this base table key
                 // (skipped on fresh import — no stale entries to clean up)
@@ -119,16 +119,8 @@ async fn execute_inner<S: StorageBackend>(
                         .await?;
                 }
 
-                // If item has GSI pk attribute, insert into GSI
-                if let Some(gsi_pk_val) = item.get(&gsi_def.pk_attr) {
-                    let gsi_pk = gsi_pk_val.to_key_string().unwrap_or_default();
-                    let gsi_sk = gsi_def
-                        .sk_attr
-                        .as_ref()
-                        .and_then(|sk_attr| item.get(sk_attr))
-                        .and_then(|v| v.to_key_string())
-                        .unwrap_or_default();
-
+                // Insert only when the item belongs in this index (sparse).
+                if let Some((gsi_pk, gsi_sk)) = gsi_def.index_key_strings(&item) {
                     // For ALL projection, reuse the base table JSON directly
                     // (avoids cloning the item HashMap and re-serializing)
                     let projected_json =
@@ -162,7 +154,7 @@ async fn execute_inner<S: StorageBackend>(
                 }
             }
 
-            // 8b. Maintain LSI tables (sparse: skip items missing LSI sk)
+            // 8b. Maintain LSI tables (sparse: skip items without a scalar LSI sk)
             for lsi_def in &lsi_defs {
                 // Delete any existing LSI entry for this base table key
                 if !skip_gsi_deletes {
@@ -171,42 +163,37 @@ async fn execute_inner<S: StorageBackend>(
                         .await?;
                 }
 
-                // If item has LSI sk attribute, insert into LSI
-                if let Some(ref lsi_sk_attr) = lsi_def.sk_attr {
-                    if let Some(lsi_sk_val) = item.get(lsi_sk_attr) {
-                        let lsi_pk = pk.clone();
-                        let lsi_sk = lsi_sk_val.to_key_string().unwrap_or_default();
+                // Insert only when the item belongs in this index (sparse).
+                if let Some((lsi_pk, lsi_sk)) = lsi_def.index_key_strings(&item) {
+                    // For ALL projection, reuse the base table JSON directly
+                    let projected_json =
+                        if lsi_def.projection_type == crate::types::ProjectionType::ALL {
+                            item_json.clone()
+                        } else {
+                            let projected = gsi::build_index_item(
+                                &item,
+                                lsi_def,
+                                &key_schema.partition_key,
+                                key_schema.sort_key.as_deref(),
+                            );
+                            serde_json::to_string(&projected).map_err(|e| {
+                                DynoxideError::InternalServerError(format!(
+                                    "LSI JSON serialization failed: {e}"
+                                ))
+                            })?
+                        };
 
-                        // For ALL projection, reuse the base table JSON directly
-                        let projected_json =
-                            if lsi_def.projection_type == crate::types::ProjectionType::ALL {
-                                item_json.clone()
-                            } else {
-                                let projected = gsi::build_index_item(
-                                    &item,
-                                    lsi_def,
-                                    &key_schema.partition_key,
-                                    key_schema.sort_key.as_deref(),
-                                );
-                                serde_json::to_string(&projected).map_err(|e| {
-                                    DynoxideError::InternalServerError(format!(
-                                        "LSI JSON serialization failed: {e}"
-                                    ))
-                                })?
-                            };
-
-                        storage
-                            .insert_lsi_item(
-                                table_name,
-                                &lsi_def.index_name,
-                                &lsi_pk,
-                                &lsi_sk,
-                                &pk,
-                                &sk,
-                                &projected_json,
-                            )
-                            .await?;
-                    }
+                    storage
+                        .insert_lsi_item(
+                            table_name,
+                            &lsi_def.index_name,
+                            &lsi_pk,
+                            &lsi_sk,
+                            &pk,
+                            &sk,
+                            &projected_json,
+                        )
+                        .await?;
                 }
             }
 

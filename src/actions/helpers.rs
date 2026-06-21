@@ -130,7 +130,7 @@ pub fn parse_key_schema(meta: &TableMetadata) -> Result<KeySchema> {
 pub fn validate_item_keys(
     item: &HashMap<String, AttributeValue>,
     schema: &KeySchema,
-    _meta: &TableMetadata,
+    meta: &TableMetadata,
 ) -> Result<()> {
     // Partition key must be present
     let pk_val = item.get(&schema.partition_key).ok_or_else(|| {
@@ -175,7 +175,179 @@ pub fn validate_item_keys(
         }
     }
 
+    // Reject any present-but-invalid GSI/LSI key attribute. Runs after the
+    // table-key checks so a bad table key is reported first.
+    validate_index_key_attributes(item, meta)?;
+
     Ok(())
+}
+
+/// A secondary-index key attribute and its declared scalar type.
+struct IndexKeyEntry {
+    index_name: String,
+    attr: String,
+    declared: ScalarAttributeType,
+}
+
+/// How a present index key value is invalid for its declared type.
+enum IndexKeyViolation {
+    TypeMismatch {
+        actual: &'static str,
+        expected: ScalarAttributeType,
+    },
+    EmptyString,
+    EmptyBinary,
+}
+
+impl IndexKeyViolation {
+    /// The exact DynamoDB `ValidationException` message for this violation.
+    fn message(&self, attr: &str, index: &str) -> String {
+        match self {
+            IndexKeyViolation::TypeMismatch { actual, expected } => format!(
+                "One or more parameter values were invalid: Type mismatch for Index Key \
+                 {attr} Expected: {} Actual: {actual} IndexName: {index}",
+                scalar_type_str(expected)
+            ),
+            IndexKeyViolation::EmptyString => format!(
+                "One or more parameter values are not valid. A value specified for a secondary \
+                 index key is not supported. The AttributeValue for a key attribute cannot \
+                 contain an empty string value. IndexName: {index}, IndexKey: {attr}"
+            ),
+            IndexKeyViolation::EmptyBinary => format!(
+                "One or more parameter values are not valid. A value specified for a secondary \
+                 index key is not supported. The AttributeValue for a key attribute cannot \
+                 contain an empty binary value. IndexName: {index}, IndexKey: {attr}"
+            ),
+        }
+    }
+}
+
+fn scalar_type_str(t: &ScalarAttributeType) -> &'static str {
+    match t {
+        ScalarAttributeType::S => "S",
+        ScalarAttributeType::N => "N",
+        ScalarAttributeType::B => "B",
+    }
+}
+
+/// Every GSI/LSI key attribute with its declared scalar type. Types come from
+/// `AttributeDefinitions`, joined by name like `parse_key_schema`; a missing
+/// definition is an internal error (an index key is always defined).
+fn index_key_entries(meta: &TableMetadata) -> Result<Vec<IndexKeyEntry>> {
+    let attr_defs: Vec<AttributeDefinition> = serde_json::from_str(&meta.attribute_definitions)
+        .map_err(|e| {
+            DynoxideError::InternalServerError(format!("Bad attribute definitions JSON: {e}"))
+        })?;
+    let declared = |attr: &str| -> Result<ScalarAttributeType> {
+        attr_defs
+            .iter()
+            .find(|d| d.attribute_name == attr)
+            .map(|d| d.attribute_type.clone())
+            .ok_or_else(|| {
+                DynoxideError::InternalServerError(format!(
+                    "Index key attribute {attr} missing from AttributeDefinitions"
+                ))
+            })
+    };
+
+    let mut entries = Vec::new();
+    for gsi in super::gsi::parse_gsi_defs(meta)? {
+        entries.push(IndexKeyEntry {
+            declared: declared(&gsi.pk_attr)?,
+            attr: gsi.pk_attr,
+            index_name: gsi.index_name.clone(),
+        });
+        if let Some(sk) = gsi.sk_attr {
+            entries.push(IndexKeyEntry {
+                declared: declared(&sk)?,
+                attr: sk,
+                index_name: gsi.index_name,
+            });
+        }
+    }
+    // An LSI shares the table partition key (validated as a table key), so only its
+    // sort key is index-specific.
+    for lsi in super::lsi::parse_lsi_defs(meta)? {
+        if let Some(sk) = lsi.sk_attr {
+            entries.push(IndexKeyEntry {
+                declared: declared(&sk)?,
+                attr: sk,
+                index_name: lsi.index_name,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Classify a present index key value against its declared type, or `None` if valid.
+fn check_index_key_value(
+    val: &AttributeValue,
+    declared: &ScalarAttributeType,
+) -> Option<IndexKeyViolation> {
+    match (val, declared) {
+        (AttributeValue::S(s), ScalarAttributeType::S) => {
+            s.is_empty().then_some(IndexKeyViolation::EmptyString)
+        }
+        (AttributeValue::N(_), ScalarAttributeType::N) => None,
+        (AttributeValue::B(b), ScalarAttributeType::B) => {
+            b.is_empty().then_some(IndexKeyViolation::EmptyBinary)
+        }
+        _ => Some(IndexKeyViolation::TypeMismatch {
+            actual: val.type_name(),
+            expected: declared.clone(),
+        }),
+    }
+}
+
+/// Reject the first invalid index key present in `item`, naming the
+/// alphabetically-first offending index as DynamoDB does. With `before` set, only
+/// attributes whose value changed are checked.
+fn run_index_key_validation(
+    item: &HashMap<String, AttributeValue>,
+    meta: &TableMetadata,
+    before: Option<&HashMap<String, AttributeValue>>,
+) -> Result<()> {
+    let entries = index_key_entries(meta)?;
+    let mut violations: Vec<(String, String, IndexKeyViolation)> = Vec::new();
+    for entry in &entries {
+        let Some(val) = item.get(&entry.attr) else {
+            continue; // absent -> sparse, not an error
+        };
+        if let Some(before) = before {
+            if before.get(&entry.attr) == Some(val) {
+                continue; // unchanged by this update
+            }
+        }
+        if let Some(violation) = check_index_key_value(val, &entry.declared) {
+            violations.push((entry.index_name.clone(), entry.attr.clone(), violation));
+        }
+    }
+    match violations.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
+        Some((index, attr, violation)) => Err(DynoxideError::ValidationException(
+            violation.message(&attr, &index),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Reject any present-but-invalid GSI/LSI key attribute. Absent attributes are
+/// fine (sparse index). Used by the put-shaped write paths via `validate_item_keys`.
+pub fn validate_index_key_attributes(
+    item: &HashMap<String, AttributeValue>,
+    meta: &TableMetadata,
+) -> Result<()> {
+    run_index_key_validation(item, meta, None)
+}
+
+/// Like [`validate_index_key_attributes`], but only checks index keys this update
+/// changed against `before`, so an unrelated update never re-rejects an untouched
+/// value. Used by the update-shaped paths.
+pub fn validate_updated_index_keys(
+    before: &HashMap<String, AttributeValue>,
+    after: &HashMap<String, AttributeValue>,
+    meta: &TableMetadata,
+) -> Result<()> {
+    run_index_key_validation(after, meta, Some(before))
 }
 
 /// Validate that a Key map has exactly the key attributes (for GetItem/DeleteItem/UpdateItem).

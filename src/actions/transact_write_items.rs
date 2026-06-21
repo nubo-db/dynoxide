@@ -413,6 +413,7 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
             item.insert(k.clone(), v.clone());
         }
     }
+    let before_item = item.clone();
 
     // Apply update expression
     let parsed = crate::expressions::update::parse(&update.update_expression)
@@ -425,6 +426,9 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
     // Validate attribute values after update expression applied
     crate::validation::validate_item_attribute_values(&item)?;
     crate::validation::normalize_item_sets(&mut item);
+
+    // Reject an index key this update set to an invalid value (see helpers).
+    helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
 
     let size = types::item_size(&item);
     if size > types::MAX_ITEM_SIZE {

@@ -402,6 +402,8 @@ async fn execute_update<S: StorageBackend>(
         ));
     }
 
+    let before_item = item.clone();
+
     // Apply SET clauses with nested path support
     for clause in set_clauses {
         let val = resolve_set_value(&clause.value, &item, parameters)?;
@@ -421,6 +423,9 @@ async fn execute_update<S: StorageBackend>(
     // Validate attribute values after SET clauses applied
     crate::validation::validate_item_attribute_values(&item)?;
     crate::validation::normalize_item_sets(&mut item);
+
+    // Reject an index key this update set to an invalid value (see helpers).
+    crate::actions::helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;

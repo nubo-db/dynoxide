@@ -496,10 +496,10 @@ fn test_update_item_removes_lsi_sk_disappears_from_lsi() {
     assert_eq!(resp.count, 0);
 }
 
-/// A present-but-non-scalar LSI sort key cannot form a key, so the item is
-/// excluded from the index rather than indexed at a phantom empty position.
+/// A present-but-non-scalar LSI sort key cannot form a key, so DynamoDB rejects
+/// the write (it is no longer silently excluded).
 #[test]
-fn test_lsi_non_scalar_sort_key_excluded() {
+fn test_lsi_non_scalar_sort_key_rejected() {
     let db = Database::memory().unwrap();
     create_table_with_lsi(&db);
 
@@ -508,15 +508,17 @@ fn test_lsi_non_scalar_sort_key_excluded() {
         "Item": {
             "UserId": {"S": "user1"},
             "Timestamp": {"S": "2024-01-01"},
-            "Status": {"L": [{"S": "not a scalar key"}]}
+            "Status": {"L": [{"S": "x"}]}
         }
     });
-    db.put_item(serde_json::from_value(req).unwrap()).unwrap();
-
-    let req: serde_json::Value =
-        serde_json::json!({"TableName": "Orders", "IndexName": "StatusIndex"});
-    let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
-    assert_eq!(resp.count, 0);
+    let err = db
+        .put_item(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Type mismatch for Index Key Status"),
+        "got: {err}"
+    );
 }
 
 #[test]

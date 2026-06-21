@@ -177,6 +177,55 @@ fn test_update_table_create_gsi_backfills_existing_items() {
     assert_eq!(resp.count, 1);
 }
 
+/// Backfill excludes an item that has the GSI partition key but not its sort key.
+#[test]
+fn test_update_table_create_gsi_backfill_skips_item_without_sort_key() {
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    // Has the GSI partition key but not the sort key — excluded.
+    put_item(&db, "TestTable", "user#1", "profile", Some("org#A"), None);
+    // Has both GSI keys — included.
+    put_item(
+        &db,
+        "TestTable",
+        "user#2",
+        "profile",
+        Some("org#A"),
+        Some("user#2"),
+    );
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "GSI1PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let scan_req = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "IndexName": "GSI1",
+    }))
+    .unwrap();
+    let resp = db.scan(scan_req).unwrap();
+    assert_eq!(resp.count, 1);
+}
+
 #[test]
 fn test_update_table_delete_gsi() {
     let db = make_db();

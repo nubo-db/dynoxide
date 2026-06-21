@@ -496,6 +496,29 @@ fn test_update_item_removes_lsi_sk_disappears_from_lsi() {
     assert_eq!(resp.count, 0);
 }
 
+/// A present-but-non-scalar LSI sort key cannot form a key, so the item is
+/// excluded from the index rather than indexed at a phantom empty position.
+#[test]
+fn test_lsi_non_scalar_sort_key_excluded() {
+    let db = Database::memory().unwrap();
+    create_table_with_lsi(&db);
+
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "Orders",
+        "Item": {
+            "UserId": {"S": "user1"},
+            "Timestamp": {"S": "2024-01-01"},
+            "Status": {"L": [{"S": "not a scalar key"}]}
+        }
+    });
+    db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+
+    let req: serde_json::Value =
+        serde_json::json!({"TableName": "Orders", "IndexName": "StatusIndex"});
+    let resp = db.scan(serde_json::from_value(req).unwrap()).unwrap();
+    assert_eq!(resp.count, 0);
+}
+
 #[test]
 fn test_scan_lsi() {
     let db = Database::memory().unwrap();

@@ -87,28 +87,22 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
             base_sk: table_sk_str.to_string(),
         });
 
-        // LSI pk is always the same as the table pk. Only insert if item
-        // has the LSI sort key attribute (sparse index behaviour).
-        if let Some(ref lsi_sk_attr) = lsi.sk_attr {
-            if let Some(lsi_sk_val) = item.get(lsi_sk_attr) {
-                let lsi_pk = table_pk_str.to_string();
-                let lsi_sk = lsi_sk_val.to_key_string().unwrap_or_default();
+        // Insert only when the item belongs in this index (sparse): an LSI shares
+        // the table partition key, so membership rests on a present, scalar sort key.
+        if let Some((lsi_pk, lsi_sk)) = lsi.index_key_strings(item) {
+            let projected = super::gsi::build_index_item(item, lsi, table_pk_attr, table_sk_attr);
+            let item_json = serde_json::to_string(&projected)
+                .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-                let projected =
-                    super::gsi::build_index_item(item, lsi, table_pk_attr, table_sk_attr);
-                let item_json = serde_json::to_string(&projected)
-                    .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-
-                ops.push(IndexWriteOp::InsertLsi {
-                    table_name: table_name.to_string(),
-                    index_name: lsi.index_name.clone(),
-                    pk: lsi_pk,
-                    sk: lsi_sk,
-                    base_pk: table_pk_str.to_string(),
-                    base_sk: table_sk_str.to_string(),
-                    item_json,
-                });
-            }
+            ops.push(IndexWriteOp::InsertLsi {
+                table_name: table_name.to_string(),
+                index_name: lsi.index_name.clone(),
+                pk: lsi_pk,
+                sk: lsi_sk,
+                base_pk: table_pk_str.to_string(),
+                base_sk: table_sk_str.to_string(),
+                item_json,
+            });
         }
     }
 

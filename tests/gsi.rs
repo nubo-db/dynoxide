@@ -775,20 +775,24 @@ fn test_gsi_update_remove_sort_key_evicts() {
     assert_eq!(scan_sparse_index(&db).count, 0);
 }
 
-/// A present-but-non-scalar sort key cannot form a key, so the item is excluded
-/// rather than indexed at a phantom empty-string position.
+/// A present-but-non-scalar GSI sort key cannot form a key, so DynamoDB rejects
+/// the write (it is no longer silently excluded).
 #[test]
-fn test_gsi_non_scalar_sort_key_excluded() {
+fn test_gsi_non_scalar_sort_key_rejected() {
     let db = Database::memory().unwrap();
     create_sparse_gsi_table(&db);
-    put_json(
-        &db,
-        serde_json::json!({
-            "pk": {"S": "p1"}, "sk": {"S": "s1"},
-            "sparse_attribute": {"L": [{"S": "not a scalar key"}]}
-        }),
+    let req: serde_json::Value = serde_json::json!({
+        "TableName": "table",
+        "Item": {"pk": {"S": "p1"}, "sk": {"S": "s1"}, "sparse_attribute": {"L": [{"S": "x"}]}}
+    });
+    let err = db
+        .put_item(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Type mismatch for Index Key sparse_attribute"),
+        "got: {err}"
     );
-    assert_eq!(scan_sparse_index(&db).count, 0);
 }
 
 /// Membership is decided per index: an item can qualify for one GSI and not

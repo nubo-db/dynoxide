@@ -538,6 +538,10 @@ pub async fn execute<S: StorageBackend>(
         crate::validation::validate_item_attribute_values(&item)?;
         crate::validation::normalize_item_sets(&mut item);
 
+        // Reject an index key set to an invalid value, before the fan-out so the
+        // error surfaces. Checks only what this update changed (see the helper).
+        helpers::validate_updated_index_keys(&old_item, &item, &meta)?;
+
         // Validate updated item size
         let size = types::item_size(&item);
         if size > types::MAX_ITEM_SIZE {

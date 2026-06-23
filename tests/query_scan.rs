@@ -776,3 +776,232 @@ fn test_query_projection_with_nested_path_and_list_index() {
         other => panic!("expected list for mylist, got {:?}", other),
     }
 }
+
+// ---------------------------------------------------------------------------
+// #96: Select / ProjectionExpression / IndexName combinations DynamoDB rejects
+// ---------------------------------------------------------------------------
+
+fn create_gsi_table(db: &Database, name: &str) {
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": name,
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsipk", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "GsiIndex",
+            "KeySchema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+}
+
+#[test]
+fn test_query_all_attributes_with_projection_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "a"}},
+        "Select": "ALL_ATTRIBUTES",
+        "ProjectionExpression": "sk"
+    }))
+    .unwrap();
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_scan_all_attributes_with_projection_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "Select": "ALL_ATTRIBUTES",
+        "ProjectionExpression": "sk"
+    }))
+    .unwrap();
+    let err = db.scan(req).unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_query_all_projected_without_index_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "a"}},
+        "Select": "ALL_PROJECTED_ATTRIBUTES"
+    }))
+    .unwrap();
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_scan_all_projected_without_index_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "Select": "ALL_PROJECTED_ATTRIBUTES"
+    }))
+    .unwrap();
+    let err = db.scan(req).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_query_count_with_projection_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "a"}},
+        "Select": "COUNT",
+        "ProjectionExpression": "sk"
+    }))
+    .unwrap();
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get only the Count"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_query_all_projected_with_index_accepted() {
+    // The enum-conditional rule must NOT reject when an IndexName is present.
+    let db = setup_db();
+    create_gsi_table(&db, "Gsi96");
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Gsi96",
+        "IndexName": "GsiIndex",
+        "KeyConditionExpression": "gsipk = :g",
+        "ExpressionAttributeValues": {":g": {"S": "x"}},
+        "Select": "ALL_PROJECTED_ATTRIBUTES"
+    }))
+    .unwrap();
+    db.query(req).unwrap();
+}
+
+#[test]
+fn test_query_projection_without_select_accepted() {
+    // A ProjectionExpression with no Select is legal (mutual-exclusion must not over-fire).
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    put(
+        &db,
+        "Tbl96",
+        serde_json::json!({"pk": {"S": "a"}, "sk": {"S": "1"}, "val": {"S": "v"}}),
+    );
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "a"}},
+        "ProjectionExpression": "val"
+    }))
+    .unwrap();
+    db.query(req).unwrap();
+}
+
+#[test]
+fn test_scan_count_with_projection_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "Select": "COUNT",
+        "ProjectionExpression": "sk"
+    }))
+    .unwrap();
+    let err = db.scan(req).unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get only the Count"
+        ),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_scan_all_projected_with_index_accepted() {
+    // The enum-conditional rule must NOT reject a Scan when an IndexName is present.
+    let db = setup_db();
+    create_gsi_table(&db, "Gsi96");
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Gsi96",
+        "IndexName": "GsiIndex",
+        "Select": "ALL_PROJECTED_ATTRIBUTES"
+    }))
+    .unwrap();
+    db.scan(req).unwrap();
+}
+
+#[test]
+fn test_scan_projection_without_select_accepted() {
+    // A ProjectionExpression with no Select is legal on Scan too.
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "ProjectionExpression": "sk"
+    }))
+    .unwrap();
+    db.scan(req).unwrap();
+}
+
+#[test]
+fn test_all_projected_with_projection_and_no_index_prefers_mutual_exclusion() {
+    // ALL_PROJECTED_ATTRIBUTES + ProjectionExpression + no IndexName breaks both rules.
+    // DynamoDB reports the mutual-exclusion message first; pin that ordering.
+    let db = setup_db();
+    create_test_table(&db, "Tbl96");
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl96",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "a"}},
+        "Select": "ALL_PROJECTED_ATTRIBUTES",
+        "ProjectionExpression": "sk"
+    }))
+    .unwrap();
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get ALL_PROJECTED_ATTRIBUTES"
+        ),
+        "got: {err}"
+    );
+}

@@ -351,6 +351,101 @@ fn test_batch_write_keyless_put_rejected_with_400() {
     assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
 }
 
+// =============================================================================
+// #97: BatchWriteItem collapses wrong-type / non-scalar table keys to the
+// generic schema error. Captured against real AWS in eu-west-2: a batch put
+// returns "The provided key element does not match the schema" for both,
+// rather than PutItem's "Type mismatch for key" wording.
+// =============================================================================
+
+const BATCH_KEY_SCHEMA_MSG: &str = "The provided key element does not match the schema";
+
+#[test]
+fn test_batch_write_wrong_type_table_key_returns_schema_error() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    // pk is declared S but supplied as N.
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "Tbl": [
+                {"PutRequest": {"Item": {"pk": {"N": "1"}, "sk": {"S": "a"}}}}
+            ]
+        }
+    }))
+    .unwrap();
+
+    let err = db.batch_write_item(req).unwrap_err();
+    assert!(
+        matches!(&err, DynoxideError::ValidationException(m) if m == BATCH_KEY_SCHEMA_MSG),
+        "wrong-type batch table key must return the generic schema error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_batch_write_non_scalar_table_key_returns_schema_error() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    // pk is declared S but supplied as a non-scalar (BOOL).
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "Tbl": [
+                {"PutRequest": {"Item": {"pk": {"BOOL": true}, "sk": {"S": "a"}}}}
+            ]
+        }
+    }))
+    .unwrap();
+
+    let err = db.batch_write_item(req).unwrap_err();
+    assert!(
+        matches!(&err, DynoxideError::ValidationException(m) if m == BATCH_KEY_SCHEMA_MSG),
+        "non-scalar batch table key must return the generic schema error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_batch_write_wrong_type_sort_key_returns_schema_error() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    // sk is declared S but supplied as N.
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "Tbl": [
+                {"PutRequest": {"Item": {"pk": {"S": "a"}, "sk": {"N": "1"}}}}
+            ]
+        }
+    }))
+    .unwrap();
+
+    let err = db.batch_write_item(req).unwrap_err();
+    assert!(
+        matches!(&err, DynoxideError::ValidationException(m) if m == BATCH_KEY_SCHEMA_MSG),
+        "wrong-type batch sort key must return the generic schema error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_put_item_wrong_type_key_keeps_type_mismatch_message() {
+    // Guard: collapsing the batch wording must not change PutItem, which keeps
+    // the specific "Type mismatch for key" message.
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    let req: PutItemRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl",
+        "Item": {"pk": {"N": "1"}, "sk": {"S": "a"}}
+    }))
+    .unwrap();
+
+    let err = db.put_item(req).unwrap_err();
+    assert!(
+        matches!(&err, DynoxideError::ValidationException(m) if m.contains("Type mismatch for key")),
+        "PutItem must keep the specific type-mismatch message, got: {err:?}"
+    );
+}
+
 #[test]
 fn test_batch_get_nonexistent_table() {
     let db = setup_db();

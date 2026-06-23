@@ -165,7 +165,7 @@ pub async fn execute<S: StorageBackend>(
                 // a 400 ValidationException. Mirrors put_item.rs, which validates
                 // before extracting.
                 let key_item = if let Some(ref put) = wr.put_request {
-                    helpers::validate_item_keys(&put.item, &key_schema, &meta)?;
+                    helpers::validate_item_keys_for_batch(&put.item, &key_schema, &meta)?;
                     &put.item
                 } else if let Some(ref del) = wr.delete_request {
                     helpers::validate_key_only(&del.key, &key_schema)?;
@@ -204,7 +204,7 @@ pub async fn execute<S: StorageBackend>(
         for wr in write_requests {
             if let Some(ref mut put_req) = wr.put_request {
                 // Validate keys
-                helpers::validate_item_keys(&put_req.item, &key_schema, &meta)?;
+                helpers::validate_item_keys_for_batch(&put_req.item, &key_schema, &meta)?;
 
                 // Validate attribute values (empty strings, empty sets)
                 crate::validation::validate_item_attribute_values(&put_req.item)?;

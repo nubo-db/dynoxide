@@ -133,14 +133,17 @@ pub async fn execute<S: StorageBackend>(
         )));
     }
 
-    // Validate: no duplicate item targets
+    // Validate: no duplicate item targets. A key that can't be stringified (non-scalar
+    // or missing) is skipped here and reported by the in-loop validation instead (#95).
     let mut seen_targets = HashSet::new();
     for item in items {
-        let target = get_item_target(storage, item).await?;
-        if !seen_targets.insert(target) {
-            return Err(DynoxideError::ValidationException(
-                "Transaction request cannot include multiple operations on one item".to_string(),
-            ));
+        if let Some(target) = get_item_target(storage, item).await? {
+            if !seen_targets.insert(target) {
+                return Err(DynoxideError::ValidationException(
+                    "Transaction request cannot include multiple operations on one item"
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -208,6 +211,11 @@ async fn execute_within_transaction<S: StorageBackend>(
                 });
             }
             Err(e) => {
+                // An empty-string key surfaces top-level: returning here rolls the
+                // transaction back. Other errors become cancellation reasons below (#95).
+                if matches!(e, DynoxideError::KeyEmptyStringValidation(_)) {
+                    return Err(e);
+                }
                 has_failure = true;
                 let message = Some(e.to_string());
                 let (code, item) = match e {
@@ -629,39 +637,37 @@ fn get_action_table_and_size(item: &TransactWriteItem) -> (String, usize) {
     }
 }
 
-/// Get a unique target key (table + pk + sk) for duplicate detection.
+/// Compute the dedup target (table + pk + sk) for one action's key source, or `None`
+/// when the key can't be stringified (non-scalar or missing). Table name and existence
+/// are still validated, so a bad name or missing table surfaces up front.
+async fn target_for<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    key_source: &HashMap<String, AttributeValue>,
+) -> Result<Option<String>> {
+    crate::validation::validate_table_name(table_name)?;
+    let meta = helpers::require_table_for_item_op(storage, table_name).await?;
+    let key_schema = helpers::parse_key_schema(&meta)?;
+    match helpers::extract_key_strings(key_source, &key_schema) {
+        Ok((pk, sk)) => Ok(Some(format!("{table_name}#{pk}#{sk}"))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Get a unique target key (table + pk + sk) for duplicate detection, or `None` when
+/// the action's key can't form one (see [`target_for`]).
 async fn get_item_target<S: StorageBackend>(
     storage: &S,
     item: &TransactWriteItem,
-) -> Result<String> {
+) -> Result<Option<String>> {
     if let Some(ref put) = item.put {
-        crate::validation::validate_table_name(&put.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &put.table_name).await?;
-        let key_schema = helpers::parse_key_schema(&meta)?;
-        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
-        let (pk, sk) = helpers::extract_key_strings(&put.item, &key_schema)?;
-        Ok(format!("{}#{}#{}", put.table_name, pk, sk))
+        target_for(storage, &put.table_name, &put.item).await
     } else if let Some(ref update) = item.update {
-        crate::validation::validate_table_name(&update.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &update.table_name).await?;
-        let key_schema = helpers::parse_key_schema(&meta)?;
-        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
-        let (pk, sk) = helpers::extract_key_strings(&update.key, &key_schema)?;
-        Ok(format!("{}#{}#{}", update.table_name, pk, sk))
+        target_for(storage, &update.table_name, &update.key).await
     } else if let Some(ref delete) = item.delete {
-        crate::validation::validate_table_name(&delete.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &delete.table_name).await?;
-        let key_schema = helpers::parse_key_schema(&meta)?;
-        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
-        let (pk, sk) = helpers::extract_key_strings(&delete.key, &key_schema)?;
-        Ok(format!("{}#{}#{}", delete.table_name, pk, sk))
+        target_for(storage, &delete.table_name, &delete.key).await
     } else if let Some(ref check) = item.condition_check {
-        crate::validation::validate_table_name(&check.table_name)?;
-        let meta = helpers::require_table_for_item_op(storage, &check.table_name).await?;
-        let key_schema = helpers::parse_key_schema(&meta)?;
-        // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
-        let (pk, sk) = helpers::extract_key_strings(&check.key, &key_schema)?;
-        Ok(format!("{}#{}#{}", check.table_name, pk, sk))
+        target_for(storage, &check.table_name, &check.key).await
     } else {
         Err(DynoxideError::ValidationException(
             "TransactItem must contain exactly one action".to_string(),

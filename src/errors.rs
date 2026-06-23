@@ -39,6 +39,13 @@ pub enum DynoxideError {
     #[error("{0}")]
     ValidationException(String),
 
+    /// An empty-string key value on a write. Serialises identically to
+    /// `ValidationException`, but is a distinct variant so the transaction loops can
+    /// surface it as a top-level error instead of a `ValidationError` cancellation
+    /// reason (#95).
+    #[error("{0}")]
+    KeyEmptyStringValidation(String),
+
     /// Conditional check (ConditionExpression) failed on write.
     /// Optionally carries the existing item when `ReturnValuesOnConditionCheckFailure` is `ALL_OLD`.
     #[error("{0}")]
@@ -138,7 +145,7 @@ impl DynoxideError {
             DynoxideError::ResourceInUseException(_) => {
                 "com.amazonaws.dynamodb.v20120810#ResourceInUseException"
             }
-            DynoxideError::ValidationException(_) => {
+            DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyStringValidation(_) => {
                 "com.amazon.coral.validate#ValidationException"
             }
             DynoxideError::ConditionalCheckFailedException(..) => {
@@ -187,9 +194,9 @@ impl DynoxideError {
         match self {
             DynoxideError::ResourceNotFoundException(_) => "ResourceNotFound",
             DynoxideError::ResourceInUseException(_) => "ResourceInUse",
-            DynoxideError::ValidationException(_) | DynoxideError::ConversionError(_) => {
-                "ValidationError"
-            }
+            DynoxideError::ValidationException(_)
+            | DynoxideError::KeyEmptyStringValidation(_)
+            | DynoxideError::ConversionError(_) => "ValidationError",
             DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailed",
             DynoxideError::TransactionCanceledException(..) => "TransactionConflict",
             DynoxideError::DuplicateItemException(_) => "DuplicateItem",
@@ -337,6 +344,20 @@ mod tests {
             DynoxideError::InternalServerError("".into()).status_code(),
             500
         );
+    }
+
+    #[test]
+    fn test_key_empty_string_validation_is_wire_identical_to_validation_exception() {
+        // The variant must be indistinguishable from ValidationException on every wire surface.
+        let msg = "One or more parameter values are not valid. The AttributeValue for a key \
+                   attribute cannot contain an empty string value. Key: pk";
+        let empty = DynoxideError::KeyEmptyStringValidation(msg.to_string());
+        let plain = DynoxideError::ValidationException(msg.to_string());
+        assert_eq!(empty.status_code(), plain.status_code());
+        assert_eq!(empty.error_type(), plain.error_type());
+        assert_eq!(empty.short_error_code(), plain.short_error_code());
+        assert_eq!(empty.to_json(), plain.to_json());
+        assert_eq!(empty.to_string(), plain.to_string());
     }
 
     #[test]

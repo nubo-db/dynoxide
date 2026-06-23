@@ -1,6 +1,7 @@
 //! Transaction integration tests.
 
 use dynoxide::Database;
+use dynoxide::DynoxideError;
 use dynoxide::types::AttributeValue;
 use serde_json::json;
 
@@ -980,4 +981,110 @@ fn test_transact_write_indexes_reports_table_write_capacity() {
         table.write_capacity_units.unwrap_or(0.0) > 0.0,
         "Table.WriteCapacityUnits should be populated under INDEXES: {table:?}"
     );
+}
+
+// ---- empty-string key values surface top-level; type-mismatch / non-scalar stay cancellation reasons ----
+
+#[test]
+fn test_transact_put_empty_string_table_key_is_top_level_validation() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-string table key must surface as a top-level ValidationException, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk"
+    );
+}
+
+#[test]
+fn test_transact_put_wrong_type_table_key_is_cancellation_reason() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"N": "5"}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                "One or more parameter values were invalid: Type mismatch for key pk expected: S actual: N"
+            );
+        }
+        other => panic!("wrong-type table key must stay a cancellation reason, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_transact_put_non_scalar_table_key_is_cancellation_reason() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"L": [{"S": "x"}]}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                "One or more parameter values were invalid: Type mismatch for key pk expected: S actual: L"
+            );
+        }
+        other => panic!(
+            "non-scalar table key must become a cancellation reason, not a top-level InternalServerError, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn test_transact_empty_string_key_short_circuit_no_partial_write() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    // First item is a valid put; the second carries an empty-string key.
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "a"}, "val": {"S": "1"}}}},
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "an empty-string key anywhere in the transaction must surface top-level, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    // The earlier valid put must have rolled back.
+    assert_eq!(get_val(&db, "Table1", "a"), None);
 }

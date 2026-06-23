@@ -299,6 +299,12 @@ fn check_index_key_value(
     }
 }
 
+/// AWS's message for an empty-string secondary-index key set by an update expression.
+/// Unlike the put form, it carries no `IndexName`/`IndexKey` suffix.
+const UPDATE_EMPTY_STRING_INDEX_KEY_MSG: &str = "One or more parameter values are not valid. \
+     The update expression attempted to update a secondary index key to a value that is not \
+     supported. The AttributeValue for a key attribute cannot contain an empty string value.";
+
 /// Reject the first invalid index key present in `item`, naming the
 /// alphabetically-first offending index as DynamoDB does. With `before` set, only
 /// attributes whose value changed are checked.
@@ -322,11 +328,21 @@ fn run_index_key_validation(
             violations.push((entry.index_name.clone(), entry.attr.clone(), violation));
         }
     }
-    match violations.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
-        Some((index, attr, violation)) => Err(DynoxideError::ValidationException(
-            violation.message(&attr, &index),
+    let Some((index, attr, violation)) = violations.into_iter().min_by(|a, b| a.0.cmp(&b.0)) else {
+        return Ok(());
+    };
+    match violation {
+        IndexKeyViolation::EmptyString => {
+            let msg = if before.is_some() {
+                UPDATE_EMPTY_STRING_INDEX_KEY_MSG.to_string()
+            } else {
+                IndexKeyViolation::EmptyString.message(&attr, &index)
+            };
+            Err(DynoxideError::KeyEmptyStringValidation(msg))
+        }
+        other => Err(DynoxideError::ValidationException(
+            other.message(&attr, &index),
         )),
-        None => Ok(()),
     }
 }
 
@@ -416,7 +432,7 @@ fn validate_key_type(
     let matches = match (val, expected) {
         (AttributeValue::S(s), ScalarAttributeType::S) => {
             if s.is_empty() {
-                return Err(DynoxideError::ValidationException(format!(
+                return Err(DynoxideError::KeyEmptyStringValidation(format!(
                     "One or more parameter values are not valid. The AttributeValue for a key \
                      attribute cannot contain an empty string value. Key: {attr_name}"
                 )));
@@ -426,6 +442,7 @@ fn validate_key_type(
         (AttributeValue::N(_), ScalarAttributeType::N) => true,
         (AttributeValue::B(b), ScalarAttributeType::B) => {
             if b.is_empty() {
+                // Only empty-string is distinguished; empty-binary stays a ValidationException.
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values are not valid. The AttributeValue for a key \
                      attribute cannot contain an empty binary value. Key: {attr_name}"

@@ -310,6 +310,27 @@ pub async fn execute<S: StorageBackend>(
                 .to_string(),
         ));
     }
+
+    // A ProjectionExpression is only valid with Select = SPECIFIC_ATTRIBUTES.
+    if request.projection_expression.is_some() {
+        if let Some(select) = request.select.as_deref() {
+            if select != "SPECIFIC_ATTRIBUTES" {
+                return Err(DynoxideError::ValidationException(format!(
+                    "Cannot specify the ProjectionExpression when choosing to get {select}"
+                )));
+            }
+        }
+    }
+
+    // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
+    if request.select.as_deref() == Some("ALL_PROJECTED_ATTRIBUTES") && request.index_name.is_none()
+    {
+        return Err(DynoxideError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_string(),
+        ));
+    }
+
     // For KeyConditionExpression, validate syntax early too
     if let Some(ref kce) = request.key_condition_expression {
         if !kce.is_empty() {

@@ -352,6 +352,27 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // A ProjectionExpression is only valid with Select = SPECIFIC_ATTRIBUTES.
+    if request.projection_expression.is_some() {
+        if let Some(select) = request.select.as_deref() {
+            if select != "SPECIFIC_ATTRIBUTES" {
+                return Err(DynoxideError::ValidationException(format!(
+                    "Cannot specify the ProjectionExpression when choosing to get {select}"
+                )));
+            }
+        }
+    }
+
+    // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
+    // AWS keeps the word "Querying" in this message even for Scan; preserve it verbatim.
+    if request.select.as_deref() == Some("ALL_PROJECTED_ATTRIBUTES") && request.index_name.is_none()
+    {
+        return Err(DynoxideError::ValidationException(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_string(),
+        ));
+    }
+
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
 

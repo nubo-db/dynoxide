@@ -894,8 +894,9 @@ fn test_query_count_with_projection_rejected() {
     .unwrap();
     let err = db.query(req).unwrap_err();
     assert!(
-        err.to_string()
-            .contains("Cannot specify the ProjectionExpression when choosing to get COUNT"),
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get only the Count"
+        ),
         "got: {err}"
     );
 }
@@ -948,8 +949,9 @@ fn test_scan_count_with_projection_rejected() {
     .unwrap();
     let err = db.scan(req).unwrap_err();
     assert!(
-        err.to_string()
-            .contains("Cannot specify the ProjectionExpression when choosing to get COUNT"),
+        err.to_string().contains(
+            "Cannot specify the ProjectionExpression when choosing to get only the Count"
+        ),
         "got: {err}"
     );
 }

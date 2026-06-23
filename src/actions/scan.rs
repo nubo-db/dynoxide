@@ -356,8 +356,14 @@ pub async fn execute<S: StorageBackend>(
     if request.projection_expression.is_some() {
         if let Some(select) = request.select.as_deref() {
             if select != "SPECIFIC_ATTRIBUTES" {
+                // AWS phrases COUNT as "only the Count"; other values use the literal.
+                let target = if select == "COUNT" {
+                    "only the Count"
+                } else {
+                    select
+                };
                 return Err(DynoxideError::ValidationException(format!(
-                    "Cannot specify the ProjectionExpression when choosing to get {select}"
+                    "Cannot specify the ProjectionExpression when choosing to get {target}"
                 )));
             }
         }

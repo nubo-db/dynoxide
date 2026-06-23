@@ -126,11 +126,43 @@ pub fn parse_key_schema(meta: &TableMetadata) -> Result<KeySchema> {
     })
 }
 
+/// Wording for a wrong-type or non-scalar *table* key. The put-shaped paths
+/// (PutItem, TransactWriteItems, ImportItems, PartiQL) report the specific
+/// "Type mismatch for key" message; BatchWriteItem collapses both cases to the
+/// generic schema error, matching real DynamoDB (#97).
+#[derive(Clone, Copy)]
+enum TableKeyTypeError {
+    TypeMismatch,
+    SchemaMismatch,
+}
+
 /// Validate that an item has the required key attributes with correct types.
 pub fn validate_item_keys(
     item: &HashMap<String, AttributeValue>,
     schema: &KeySchema,
     meta: &TableMetadata,
+) -> Result<()> {
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)
+}
+
+/// Like [`validate_item_keys`], but a wrong-type or non-scalar table key yields
+/// the generic "The provided key element does not match the schema" error
+/// rather than PutItem's "Type mismatch for key" wording. BatchWriteItem put
+/// requests use this: real DynamoDB collapses both cases in a batch (#97). The
+/// empty-string table-key message and the index-key messages are unchanged.
+pub fn validate_item_keys_for_batch(
+    item: &HashMap<String, AttributeValue>,
+    schema: &KeySchema,
+    meta: &TableMetadata,
+) -> Result<()> {
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::SchemaMismatch)
+}
+
+fn validate_item_keys_inner(
+    item: &HashMap<String, AttributeValue>,
+    schema: &KeySchema,
+    meta: &TableMetadata,
+    type_error: TableKeyTypeError,
 ) -> Result<()> {
     // Partition key must be present
     let pk_val = item.get(&schema.partition_key).ok_or_else(|| {
@@ -140,7 +172,12 @@ pub fn validate_item_keys(
         ))
     })?;
 
-    validate_key_type(pk_val, &schema.partition_key, &schema.partition_key_type)?;
+    validate_key_type(
+        pk_val,
+        &schema.partition_key,
+        &schema.partition_key_type,
+        type_error,
+    )?;
 
     // Validate hash key size (max 2048 bytes)
     let pk_size = key_attribute_size(pk_val);
@@ -161,7 +198,7 @@ pub fn validate_item_keys(
         })?;
 
         if let Some(ref sk_type) = schema.sort_key_type {
-            validate_key_type(sk_val, sk_name, sk_type)?;
+            validate_key_type(sk_val, sk_name, sk_type, type_error)?;
         }
 
         // Validate range key size (max 1024 bytes)
@@ -423,11 +460,14 @@ pub fn validate_key_only(key: &HashMap<String, AttributeValue>, schema: &KeySche
     Ok(())
 }
 
-/// Validate a key value matches its expected type.
+/// Validate a key value matches its expected type. `type_error` selects the
+/// wording for a wrong-type or non-scalar value (see [`TableKeyTypeError`]);
+/// the empty-string and empty-binary messages are the same either way.
 fn validate_key_type(
     val: &AttributeValue,
     attr_name: &str,
     expected: &ScalarAttributeType,
+    type_error: TableKeyTypeError,
 ) -> Result<()> {
     let matches = match (val, expected) {
         (AttributeValue::S(s), ScalarAttributeType::S) => {
@@ -454,22 +494,29 @@ fn validate_key_type(
     };
 
     if !matches {
-        let actual_type = match val {
-            AttributeValue::S(_) => "S",
-            AttributeValue::N(_) => "N",
-            AttributeValue::B(_) => "B",
-            AttributeValue::SS(_) => "SS",
-            AttributeValue::NS(_) => "NS",
-            AttributeValue::BS(_) => "BS",
-            AttributeValue::BOOL(_) => "BOOL",
-            AttributeValue::NULL(_) => "NULL",
-            AttributeValue::L(_) => "L",
-            AttributeValue::M(_) => "M",
-        };
-        return Err(DynoxideError::ValidationException(format!(
-            "One or more parameter values were invalid: Type mismatch for key \
-             {attr_name} expected: {expected:?} actual: {actual_type}"
-        )));
+        return Err(match type_error {
+            TableKeyTypeError::TypeMismatch => {
+                let actual_type = match val {
+                    AttributeValue::S(_) => "S",
+                    AttributeValue::N(_) => "N",
+                    AttributeValue::B(_) => "B",
+                    AttributeValue::SS(_) => "SS",
+                    AttributeValue::NS(_) => "NS",
+                    AttributeValue::BS(_) => "BS",
+                    AttributeValue::BOOL(_) => "BOOL",
+                    AttributeValue::NULL(_) => "NULL",
+                    AttributeValue::L(_) => "L",
+                    AttributeValue::M(_) => "M",
+                };
+                DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Type mismatch for key \
+                     {attr_name} expected: {expected:?} actual: {actual_type}"
+                ))
+            }
+            TableKeyTypeError::SchemaMismatch => DynoxideError::ValidationException(
+                "The provided key element does not match the schema".to_string(),
+            ),
+        });
     }
 
     Ok(())

@@ -1,4 +1,5 @@
 use dynoxide::Database;
+use dynoxide::DynoxideError;
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
 use dynoxide::actions::execute_transaction::{ExecuteTransactionRequest, ParameterizedStatement};
@@ -434,5 +435,36 @@ fn test_parameterised_statements() {
     match u1.unwrap().get("name") {
         Some(AttributeValue::S(s)) => assert_eq!(s, "Alice V2"),
         other => panic!("Expected updated name, got {:?}", other),
+    }
+}
+
+// -----------------------------------------------------------------------
+// An empty-string key inside ExecuteTransaction keeps the "ValidationError"
+// cancellation reason - it must not regress to "InternalError".
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_empty_string_key_insert_keeps_validation_error_reason() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let request = ExecuteTransactionRequest {
+        transact_statements: vec![ParameterizedStatement {
+            statement: "INSERT INTO \"Users\" VALUE {'pk': ''}".to_string(),
+            parameters: None,
+        }],
+        ..Default::default()
+    };
+
+    let err = db.execute_transaction(request).unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(
+                reasons[0].code, "ValidationError",
+                "empty-string key must keep the ValidationError reason, not InternalError: {:?}",
+                reasons[0]
+            );
+        }
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
     }
 }

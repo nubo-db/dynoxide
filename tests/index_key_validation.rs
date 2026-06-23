@@ -6,6 +6,7 @@
 //! strings captured from real DynamoDB.
 
 use dynoxide::Database;
+use dynoxide::DynoxideError;
 use serde_json::json;
 
 /// Table with GSIs on an S key (`g_s`), an N key (`g_n`), a B key (`g_b`), and an
@@ -298,9 +299,10 @@ fn update_set_empty_string_index_key_rejected() {
         json!({":v": {"S": ""}}),
     )
     .unwrap_err();
+    // The update path uses a distinct message with no IndexName/IndexKey suffix.
     assert_eq!(
         msg,
-        "One or more parameter values are not valid. A value specified for a secondary index key is not supported. The AttributeValue for a key attribute cannot contain an empty string value. IndexName: g_s, IndexKey: gk"
+        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty string value."
     );
 }
 
@@ -389,23 +391,33 @@ fn batch_put_rejects_bad_index_key() {
 
 #[test]
 fn transact_put_rejects_bad_index_key() {
+    // A wrong-type index key stays a cancellation reason (ValidationError) inside a transaction.
     let db = make_db();
-    let res = db.transact_write_items(
-        serde_json::from_value(json!({
-            "TransactItems": [
-                {"Put": {"TableName": "IdxT", "Item": {"pk": {"S": "p"}, "sk": {"S": "s"}, "gk": {"N": "5"}}}}
-            ]
-        }))
-        .unwrap(),
-    );
-    assert!(
-        res.is_err(),
-        "transact put with a bad index key should fail"
-    );
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Put": {"TableName": "IdxT", "Item": {"pk": {"S": "p"}, "sk": {"S": "s"}, "gk": {"N": "5"}}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                "One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: N IndexName: g_s"
+            );
+        }
+        other => panic!("wrong-type index key must stay a cancellation reason, got {other:?}"),
+    }
 }
 
 #[test]
 fn transact_update_rejects_bad_index_key() {
+    // A wrong-type index key set by an update stays a cancellation reason (ValidationError).
     let db = make_db();
     put(
         &db,
@@ -413,23 +425,33 @@ fn transact_update_rejects_bad_index_key() {
         json!({"pk": {"S": "p"}, "sk": {"S": "s"}, "gk": {"S": "ok"}}),
     )
     .unwrap();
-    let res = db.transact_write_items(
-        serde_json::from_value(json!({
-            "TransactItems": [
-                {"Update": {
-                    "TableName": "IdxT",
-                    "Key": {"pk": {"S": "p"}, "sk": {"S": "s"}},
-                    "UpdateExpression": "SET gk = :v",
-                    "ExpressionAttributeValues": {":v": {"N": "5"}}
-                }}
-            ]
-        }))
-        .unwrap(),
-    );
-    assert!(
-        res.is_err(),
-        "transact update setting a bad index key should fail"
-    );
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Update": {
+                        "TableName": "IdxT",
+                        "Key": {"pk": {"S": "p"}, "sk": {"S": "s"}},
+                        "UpdateExpression": "SET gk = :v",
+                        "ExpressionAttributeValues": {":v": {"N": "5"}}
+                    }}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                "One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: N IndexName: g_s"
+            );
+        }
+        other => {
+            panic!("wrong-type index key on update must stay a cancellation reason, got {other:?}")
+        }
+    }
 }
 
 #[test]
@@ -478,4 +500,104 @@ fn import_rejects_bad_index_key() {
         res.is_err(),
         "import of an item with a bad index key should fail"
     );
+}
+
+// ---- empty-string index keys surface top-level; non-scalar stays a cancellation reason ----
+
+#[test]
+fn transact_put_empty_string_index_key_is_top_level_validation() {
+    let db = make_db();
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Put": {"TableName": "IdxT", "Item": {"pk": {"S": "p"}, "sk": {"S": "s"}, "gk": {"S": ""}}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-string index key must surface as a top-level ValidationException, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values are not valid. A value specified for a secondary index key is not supported. The AttributeValue for a key attribute cannot contain an empty string value. IndexName: g_s, IndexKey: gk"
+    );
+}
+
+#[test]
+fn transact_update_empty_string_index_key_is_top_level_validation() {
+    let db = make_db();
+    put(
+        &db,
+        "IdxT",
+        json!({"pk": {"S": "p"}, "sk": {"S": "s"}, "gk": {"S": "ok"}}),
+    )
+    .unwrap();
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Update": {
+                        "TableName": "IdxT",
+                        "Key": {"pk": {"S": "p"}, "sk": {"S": "s"}},
+                        "UpdateExpression": "SET gk = :v",
+                        "ExpressionAttributeValues": {":v": {"S": ""}}
+                    }}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-string index key set by an update must surface top-level, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    let msg = err.to_string();
+    // AWS uses a distinct update-path wording with no IndexName/IndexKey suffix.
+    assert_eq!(
+        msg,
+        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty string value."
+    );
+    assert!(
+        !msg.contains("IndexName:"),
+        "the update form must drop the IndexName/IndexKey suffix: {msg}"
+    );
+}
+
+#[test]
+fn transact_put_non_scalar_index_key_is_cancellation_reason() {
+    let db = make_db();
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Put": {"TableName": "IdxT", "Item": {"pk": {"S": "p"}, "sk": {"S": "s"}, "gk": {"L": [{"S": "x"}]}}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                "One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: L IndexName: g_s"
+            );
+        }
+        other => panic!("non-scalar index key must stay a cancellation reason, got {other:?}"),
+    }
 }

@@ -128,7 +128,13 @@ async fn execute_within_transaction<S: StorageBackend>(
                         ("ConditionalCheckFailed".to_string(), item)
                     }
                     DynoxideError::DuplicateItemException(_) => ("DuplicateItem".to_string(), None),
-                    DynoxideError::ValidationException(_) => ("ValidationError".to_string(), None),
+                    // Group KeyEmptyStringValidation with ValidationException so an empty-string
+                    // key keeps the "ValidationError" reason instead of falling through to
+                    // InternalError (#95).
+                    DynoxideError::ValidationException(_)
+                    | DynoxideError::KeyEmptyStringValidation(_) => {
+                        ("ValidationError".to_string(), None)
+                    }
                     _ => ("InternalError".to_string(), None),
                 };
                 responses.push(ItemResponse { item: None });

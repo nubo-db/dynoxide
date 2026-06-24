@@ -574,3 +574,103 @@ fn test_update_item_empty_string_key_is_top_level_validation() {
     assert_eq!(err.status_code(), 400);
     assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
 }
+
+// ---------------------------------------------------------------------------
+// Empty-binary key value on the single-action key paths
+// ---------------------------------------------------------------------------
+//
+// Mirrors the empty-string cases on a binary-keyed table: a top-level
+// ValidationException with the "...empty binary value..." message (real AWS,
+// 2026-06-24 capture).
+
+const SINGLE_ACTION_EMPTY_BINARY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: pk";
+
+fn create_binary_key_table(db: &Database, name: &str) {
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "B"}]
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+}
+
+#[test]
+fn test_get_item_empty_binary_key_is_top_level_validation() {
+    let db = make_db();
+    create_binary_key_table(&db, "BinItems");
+    let err = db
+        .get_item(GetItemRequest {
+            table_name: "BinItems".to_string(),
+            key: key_map(&[("pk", AttributeValue::B(vec![]))]),
+            consistent_read: None,
+            projection_expression: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_BINARY_MSG);
+}
+
+#[test]
+fn test_delete_item_empty_binary_key_is_top_level_validation() {
+    let db = make_db();
+    create_binary_key_table(&db, "BinItems");
+    let err = db
+        .delete_item(DeleteItemRequest {
+            table_name: "BinItems".to_string(),
+            key: key_map(&[("pk", AttributeValue::B(vec![]))]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_BINARY_MSG);
+}
+
+#[test]
+fn test_update_item_empty_binary_key_is_top_level_validation() {
+    let db = make_db();
+    create_binary_key_table(&db, "BinItems");
+    let req: dynoxide::actions::update_item::UpdateItemRequest =
+        serde_json::from_value(serde_json::json!({
+            "TableName": "BinItems",
+            "Key": {"pk": {"B": ""}},
+            "UpdateExpression": "SET attr1 = :v",
+            "ExpressionAttributeValues": {":v": {"S": "x"}}
+        }))
+        .unwrap();
+    let err = db.update_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_BINARY_MSG);
+}
+
+#[test]
+fn test_put_item_empty_binary_key_is_top_level_validation() {
+    let db = make_db();
+    create_binary_key_table(&db, "BinItems");
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "BinItems".to_string(),
+            item: make_item(&[("pk", AttributeValue::B(vec![]))]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_BINARY_MSG);
+}

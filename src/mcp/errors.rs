@@ -12,7 +12,7 @@ fn short_error_type(err: &DynoxideError) -> &'static str {
     match err {
         DynoxideError::ResourceNotFoundException(_) => "ResourceNotFoundException",
         DynoxideError::ResourceInUseException(_) => "ResourceInUseException",
-        DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyStringValidation(_) => {
+        DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyValueValidation(_) => {
             "ValidationException"
         }
         DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
@@ -67,14 +67,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_string_key_validation_maps_to_validation_exception() {
-        // The MCP surface must treat KeyEmptyStringValidation exactly like ValidationException.
+    fn empty_value_key_validation_maps_to_validation_exception() {
+        // The MCP surface must treat KeyEmptyValueValidation exactly like ValidationException.
         assert_eq!(
-            short_error_type(&DynoxideError::KeyEmptyStringValidation(String::new())),
+            short_error_type(&DynoxideError::KeyEmptyValueValidation(String::new())),
             short_error_type(&DynoxideError::ValidationException(String::new())),
         );
         assert_eq!(
-            short_error_type(&DynoxideError::KeyEmptyStringValidation(String::new())),
+            short_error_type(&DynoxideError::KeyEmptyValueValidation(String::new())),
             "ValidationException",
         );
     }

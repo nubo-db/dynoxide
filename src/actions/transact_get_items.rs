@@ -95,13 +95,13 @@ pub async fn execute<S: StorageBackend>(
                 });
                 validated_schemas.push(Some(schema));
             }
-            // Group KeyEmptyStringValidation with ValidationException so an
-            // empty-string key stays a per-action ValidationError cancellation
+            // Group KeyEmptyValueValidation with ValidationException so an
+            // empty-value key stays a per-action ValidationError cancellation
             // reason here. Unlike TransactWriteItems, a transact read surfaces
             // per-action key validation through the cancellation channel rather
             // than as a top-level error (captured AWS behaviour).
             Err(DynoxideError::ValidationException(msg))
-            | Err(DynoxideError::KeyEmptyStringValidation(msg)) => {
+            | Err(DynoxideError::KeyEmptyValueValidation(msg)) => {
                 has_failure = true;
                 reasons.push(CancellationReason {
                     code: "ValidationError".to_string(),

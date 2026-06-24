@@ -1344,3 +1344,139 @@ fn test_transact_update_missing_sort_key_is_schema_mismatch_cancellation() {
         other => panic!("a missing sort key must stay a cancellation reason, got {other:?}"),
     }
 }
+
+// ---- empty-binary key value: top-level everywhere, mirroring empty-string ----
+//
+// Real AWS (four-region capture, 2026-06-24) returns a top-level ValidationException
+// for an empty-binary key value on every path, hoisting inside a transaction exactly
+// like the empty-string case. Needs a binary-keyed table to reach the binary key arm.
+
+const EMPTY_BINARY_KEY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: pk";
+
+fn create_binary_key_table(db: &Database, name: &str) {
+    let req: serde_json::Value = json!({
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "B"}]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+}
+
+fn assert_binary_key_top_level(transact_item: serde_json::Value) {
+    let db = Database::memory().unwrap();
+    create_binary_key_table(&db, "BinTable");
+    let req = json!({"TransactItems": [transact_item]});
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-binary key must surface as a top-level ValidationException, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    assert_eq!(err.to_string(), EMPTY_BINARY_KEY_MSG);
+}
+
+#[test]
+fn test_transact_update_empty_binary_lookup_key_is_top_level_validation() {
+    assert_binary_key_top_level(
+        json!({"Update": {"TableName": "BinTable", "Key": {"pk": {"B": ""}}, "UpdateExpression": "SET attr1 = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}}),
+    );
+}
+
+#[test]
+fn test_transact_delete_empty_binary_lookup_key_is_top_level_validation() {
+    assert_binary_key_top_level(
+        json!({"Delete": {"TableName": "BinTable", "Key": {"pk": {"B": ""}}}}),
+    );
+}
+
+#[test]
+fn test_transact_condition_check_empty_binary_lookup_key_is_top_level_validation() {
+    assert_binary_key_top_level(
+        json!({"ConditionCheck": {"TableName": "BinTable", "Key": {"pk": {"B": ""}}, "ConditionExpression": "attribute_not_exists(pk)"}}),
+    );
+}
+
+#[test]
+fn test_transact_put_empty_binary_item_key_is_top_level_validation() {
+    // The item-key path must hoist too: an empty-binary item key in a transact Put
+    // is top-level, not a cancellation reason.
+    assert_binary_key_top_level(
+        json!({"Put": {"TableName": "BinTable", "Item": {"pk": {"B": ""}}}}),
+    );
+}
+
+#[test]
+fn test_transact_get_empty_binary_key_stays_cancellation_reason() {
+    // As with empty-string, a transact READ surfaces per-action key validation
+    // through the cancellation channel, not top-level.
+    let db = Database::memory().unwrap();
+    create_binary_key_table(&db, "BinTable");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Get": {"TableName": "BinTable", "Key": {"pk": {"B": ""}}}}
+        ]
+    });
+    let err = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                EMPTY_BINARY_KEY_MSG
+            );
+        }
+        other => panic!(
+            "an empty-binary key in TransactGetItems must stay a cancellation reason, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn test_transact_update_empty_binary_sort_key_is_top_level_validation() {
+    // An empty-binary value in the SORT key slot of a binary composite table
+    // reaches the same validator and surfaces top-level, naming the sort key.
+    let db = Database::memory().unwrap();
+    let create: serde_json::Value = json!({
+        "TableName": "BinComposite",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "B"},
+            {"AttributeName": "sk", "AttributeType": "B"}
+        ]
+    });
+    db.create_table(serde_json::from_value(create).unwrap())
+        .unwrap();
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Update": {"TableName": "BinComposite", "Key": {"pk": {"B": "AQ=="}, "sk": {"B": ""}}, "UpdateExpression": "SET attr1 = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-binary sort key must surface top-level, got {err:?}"
+    );
+    assert!(!matches!(
+        err,
+        DynoxideError::TransactionCanceledException(..)
+    ));
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: sk"
+    );
+}

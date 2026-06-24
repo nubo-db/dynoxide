@@ -211,9 +211,10 @@ async fn execute_within_transaction<S: StorageBackend>(
                 });
             }
             Err(e) => {
-                // An empty-string key surfaces top-level: returning here rolls the
-                // transaction back. Other errors become cancellation reasons below (#95).
-                if matches!(e, DynoxideError::KeyEmptyStringValidation(_)) {
+                // An empty-value key (empty string or empty binary) surfaces top-level:
+                // returning here rolls the transaction back. Other errors become
+                // cancellation reasons below (#95).
+                if matches!(e, DynoxideError::KeyEmptyValueValidation(_)) {
                     return Err(e);
                 }
                 has_failure = true;

@@ -606,3 +606,71 @@ fn test_batch_get_empty_string_key_is_top_level_validation() {
     assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
     assert_eq!(err.to_string(), BATCH_EMPTY_KEY_MSG);
 }
+
+// =============================================================================
+// Empty-binary key value on the batch key paths surfaces top-level with the
+// "...empty binary value..." message (real AWS, 2026-06-24 capture).
+// =============================================================================
+
+const BATCH_EMPTY_BINARY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: pk";
+
+fn create_binary_key_table(db: &Database, name: &str) {
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "B"}]
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+}
+
+#[test]
+fn test_batch_write_delete_empty_binary_key_is_top_level_validation() {
+    let db = setup_db();
+    create_binary_key_table(&db, "BinTbl");
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": { "BinTbl": [{ "DeleteRequest": { "Key": { "pk": { "B": "" } } } }] }
+    }))
+    .unwrap();
+    let err = db.batch_write_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
+    assert_eq!(err.to_string(), BATCH_EMPTY_BINARY_MSG);
+}
+
+#[test]
+fn test_batch_write_put_empty_binary_key_is_top_level_validation() {
+    let db = setup_db();
+    create_binary_key_table(&db, "BinTbl");
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": { "BinTbl": [{ "PutRequest": { "Item": { "pk": { "B": "" } } } }] }
+    }))
+    .unwrap();
+    let err = db.batch_write_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
+    assert_eq!(err.to_string(), BATCH_EMPTY_BINARY_MSG);
+}
+
+#[test]
+fn test_batch_get_empty_binary_key_is_top_level_validation() {
+    let db = setup_db();
+    create_binary_key_table(&db, "BinTbl");
+    let req: BatchGetItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": { "BinTbl": { "Keys": [{ "pk": { "B": "" } }] } }
+    }))
+    .unwrap();
+    let err = db.batch_get_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
+    assert_eq!(err.to_string(), BATCH_EMPTY_BINARY_MSG);
+}

@@ -577,6 +577,103 @@ fn transact_update_empty_string_index_key_is_top_level_validation() {
     );
 }
 
+// ---- empty-binary index keys mirror empty-string: top-level, hoisting in a transaction ----
+
+#[test]
+fn update_set_empty_binary_index_key_rejected() {
+    let db = make_db();
+    put(
+        &db,
+        "IdxT",
+        json!({"pk": {"S": "p"}, "sk": {"S": "s"}, "bk": {"B": "AQ=="}}),
+    )
+    .unwrap();
+    let msg = update(
+        &db,
+        json!({"pk": {"S": "p"}, "sk": {"S": "s"}}),
+        "SET bk = :v",
+        json!({":v": {"B": ""}}),
+    )
+    .unwrap_err();
+    // The update path uses a distinct binary message with no IndexName/IndexKey suffix.
+    assert_eq!(
+        msg,
+        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty binary value."
+    );
+}
+
+#[test]
+fn transact_put_empty_binary_index_key_is_top_level_validation() {
+    let db = make_db();
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Put": {"TableName": "IdxT", "Item": {"pk": {"S": "p"}, "sk": {"S": "s"}, "bk": {"B": ""}}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-binary index key must surface as a top-level ValidationException, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values are not valid. A value specified for a secondary index key is not supported. The AttributeValue for a key attribute cannot contain an empty binary value. IndexName: g_b, IndexKey: bk"
+    );
+}
+
+#[test]
+fn transact_update_empty_binary_index_key_is_top_level_validation() {
+    let db = make_db();
+    put(
+        &db,
+        "IdxT",
+        json!({"pk": {"S": "p"}, "sk": {"S": "s"}, "bk": {"B": "AQ=="}}),
+    )
+    .unwrap();
+    let err = db
+        .transact_write_items(
+            serde_json::from_value(json!({
+                "TransactItems": [
+                    {"Update": {
+                        "TableName": "IdxT",
+                        "Key": {"pk": {"S": "p"}, "sk": {"S": "s"}},
+                        "UpdateExpression": "SET bk = :v",
+                        "ExpressionAttributeValues": {":v": {"B": ""}}
+                    }}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-binary index key set by an update must surface top-level, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    let msg = err.to_string();
+    assert_eq!(
+        msg,
+        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty binary value."
+    );
+    assert!(
+        !msg.contains("IndexName:"),
+        "the update form must drop the IndexName/IndexKey suffix: {msg}"
+    );
+}
+
 #[test]
 fn transact_put_non_scalar_index_key_is_cancellation_reason() {
     let db = make_db();

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-24
+
 ### Added
 
 - `UpdateTable` on the wasm preview engine: add or delete a global secondary index, with existing rows backfilled into a newly added index, and change the simple table settings (provisioned throughput, billing mode, table class, on-demand throughput, deletion protection). A stream-specification change through `UpdateTable` stays unsupported, since streams remain a preview gap, and a newly added GSI is reported immediately `ACTIVE` rather than transitioning through `CREATING`.
@@ -358,3 +360,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ReturnConsumedCapacity (TOTAL and INDEXES modes)
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
+
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/nubo-db/dynoxide/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/nubo-db/dynoxide/compare/v0.9.13...v0.10.0
+[0.9.13]: https://github.com/nubo-db/dynoxide/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/nubo-db/dynoxide/compare/v0.9.11...v0.9.12
+[0.9.11]: https://github.com/nubo-db/dynoxide/compare/v0.9.10...v0.9.11
+[0.9.10]: https://github.com/nubo-db/dynoxide/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/nubo-db/dynoxide/compare/v0.9.8...v0.9.9
+[0.9.8]: https://github.com/nubo-db/dynoxide/compare/v0.9.7...v0.9.8
+[0.9.7]: https://github.com/nubo-db/dynoxide/compare/v0.9.6...v0.9.7
+[0.9.6]: https://github.com/nubo-db/dynoxide/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/nubo-db/dynoxide/releases/tag/v0.9.5

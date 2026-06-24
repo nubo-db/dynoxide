@@ -63,19 +63,28 @@ done
 #    and resolves the official engine's bare specifier from node_modules. The two
 #    `new URL("*.wasm", import.meta.url)` references stay as runtime URLs that
 #    resolve next to the bundle, so the .wasm files ship as siblings.
-#    The --define folds __DYNOXIDE_HARNESS__ to a literal and --minify-syntax
-#    dead-code-eliminates the resulting `if (false)` block, so the shipping build
-#    drops the smoke/index/errors ops while the harness build keeps them. The
-#    define alone substitutes but does not remove the dead branch; --minify-syntax
-#    leaves identifiers and whitespace intact, so it is not a full minify.
+#    The --define folds __DYNOXIDE_HARNESS__ to a literal so the guarded block
+#    becomes `if (false)`; the minifier then dead-code-eliminates it, so the
+#    shipping build drops the smoke/index/errors ops while the harness build
+#    keeps them. The shipping build (release + wasm-sqlite) uses a full --minify:
+#    it renames local identifiers and strips whitespace, roughly halving the
+#    worker's raw size and trimming the gzipped transfer. Dev and any harness
+#    build stay on --minify-syntax, which still folds the dead branch but leaves
+#    identifiers intact, so those bundles stay readable and the harness-op guard
+#    below can still match op names by identifier.
 #    log-override silences the import-is-undefined note from the bracket access to
 #    the harness-only exports.
+if [ "$profile" = "release" ] && [ "$feature" = "wasm-sqlite" ]; then
+  minify_flag="--minify"
+else
+  minify_flag="--minify-syntax"
+fi
 rm -rf dist
 npx esbuild js/dynoxide-worker.js \
   --bundle \
   --format=esm \
   "--define:__DYNOXIDE_HARNESS__=$harness_define" \
-  --minify-syntax \
+  "$minify_flag" \
   --log-override:import-is-undefined=silent \
   --outfile=dist/dynoxide-worker.js
 

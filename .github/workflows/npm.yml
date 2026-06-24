@@ -71,10 +71,16 @@ jobs:
             --release-url "https://github.com/nubo-db/dynoxide/releases/download/$PUBLISH_TAG"
 
   # The browser engine package (@nubo-db/dynoxide-engine) is built from source
-  # here, since wasm is architecture-independent. Published via OIDC trusted
-  # publishing (no token), so its trusted publisher must be configured on
-  # npmjs.com first; the very first publish is bootstrapped manually, and the
-  # idempotent guard below then skips that already-published version.
+  # here, since wasm is architecture-independent. It rides its own preview track:
+  # the wasm path is not conformance-tested, so it publishes as <crate>-preview to
+  # the `preview` dist-tag, decoupled from the crate's stable version, and never
+  # lands on `latest`. Published via OIDC trusted publishing (no token), so its
+  # trusted publisher must be configured on npmjs.com first; the very first publish
+  # is bootstrapped manually, and the idempotent guard below then skips that
+  # already-published version. This job runs independently of the native `publish`
+  # job (no `needs:`): the engine and CLI packages are separate artefacts, each
+  # guarded by its own idempotent skip, so one failing neither blocks nor rolls
+  # back the other - a re-dispatch re-publishes only what is still missing.
   publish-engine:
     name: Publish @nubo-db/dynoxide-engine
     runs-on: ubuntu-latest
@@ -118,17 +124,34 @@ jobs:
             echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
             exit 1
           fi
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          VERSION="${TAG#v}"
+          # The engine rides its own preview track, versioned independently of the
+          # crate: it always ships as <crate-base>-preview, never a plain stable
+          # version. BASE strips any prerelease suffix off the tag, so a stable
+          # v0.11.0 tag yields an engine version of 0.11.0-preview.
+          BASE="${VERSION%%-*}"
+          # Defence in depth: the tag regex above already guarantees a non-empty
+          # version, but assert it before these values reach the skip check and the
+          # publish. An empty engine version would make the `npm view ...@` probe
+          # match the whole package and silently skip the publish.
+          if [ -z "$VERSION" ] || [ -z "$BASE" ]; then
+            echo "::error::could not derive a version from tag '$TAG'"
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "engine_version=${BASE}-preview"
+          } >> "$GITHUB_OUTPUT"
 
       # Idempotent: skip if this version is already on npm (the manual bootstrap
       # publish, or a re-run) rather than fail on a duplicate.
       - name: Skip if this version is already published
         id: published
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          ENGINE_VERSION: ${{ steps.version.outputs.engine_version }}
         run: |
-          if npm view "@nubo-db/dynoxide-engine@$VERSION" version >/dev/null 2>&1; then
-            echo "::notice::@nubo-db/dynoxide-engine@$VERSION already published; skipping."
+          if npm view "@nubo-db/dynoxide-engine@$ENGINE_VERSION" version >/dev/null 2>&1; then
+            echo "::notice::@nubo-db/dynoxide-engine@$ENGINE_VERSION already published; skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -146,42 +169,41 @@ jobs:
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/dynoxide-engine
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+          ENGINE_VERSION: ${{ steps.version.outputs.engine_version }}
+        run: npm version "$ENGINE_VERSION" --no-git-tag-version --allow-same-version
 
       - name: Verify the engine version matches the release
         if: steps.published.outputs.skip == 'false'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # build-wasm.sh stamps manifest.engineVersion from Cargo.toml, so a
-          # mismatch means Cargo.toml was not bumped to the release version.
+          # build-wasm.sh stamps manifest.engineVersion from Cargo.toml verbatim,
+          # which release.yml validate has already pinned to the full tag version,
+          # so the manifest must equal VERSION. A mismatch means Cargo.toml was not
+          # bumped to the release version. The published package layers the -preview
+          # suffix on top of this (see the stamp step); the manifest tracks the
+          # crate version, which is what this guards.
           MANIFEST_VERSION=$(node -p "require('./npm/dynoxide-engine/manifest.json').engineVersion")
           if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
             echo "::error::engine manifest version ($MANIFEST_VERSION) != release version ($VERSION); is Cargo.toml bumped to $VERSION?"
             exit 1
           fi
 
-      - name: Choose dist-tag
-        if: steps.published.outputs.skip == 'false'
-        id: disttag
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          # A prerelease (e.g. 0.10.1-pre.1) goes to `next` so it never clobbers
-          # `latest`; a normal version goes to `latest`.
-          if [[ "$VERSION" == *-* ]]; then
-            echo "tag=next" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-
+      # The engine always publishes to the `preview` dist-tag, never `latest`, so
+      # `npm install @nubo-db/dynoxide-engine` (which resolves `latest`) never
+      # picks up the preview build by default; consumers opt in with
+      # `@nubo-db/dynoxide-engine@preview`. When the wasm path graduates from
+      # preview (conformance-tested): drop the `-preview` suffix in "Determine
+      # version", switch `--tag preview` below to `--tag latest`, and once the
+      # stable version is on `latest`, run `npm deprecate
+      # @nubo-db/dynoxide-engine@"<x.y.z-preview>" "superseded by the stable release"`
+      # so pinned preview consumers get a deprecation nudge.
       - name: Publish (dry-run)
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/dynoxide-engine
-        run: npm publish --dry-run --access public --provenance --tag "${{ steps.disttag.outputs.tag }}"
+        run: npm publish --dry-run --access public --provenance --tag preview
 
       - name: Publish to npm
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/dynoxide-engine
-        run: npm publish --access public --provenance --tag "${{ steps.disttag.outputs.tag }}"
+        run: npm publish --access public --provenance --tag preview

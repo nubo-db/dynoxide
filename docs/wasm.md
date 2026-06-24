@@ -39,12 +39,12 @@ npm run build:wasm
 
 | File | Size | What |
 |---|---|---|
-| `dynoxide_bg.wasm` | ~960 KB | the engine (release, wasm-opt) |
+| `dynoxide_bg.wasm` | ~1.0 MB | the engine (release, wasm-opt) |
 | `sqlite3.wasm` | ~845 KB | SQLite (the official @sqlite.org/sqlite-wasm build) |
-| `dynoxide-worker.js` | ~415 KB | the bundled Web Worker (engine glue + bridge) |
+| `dynoxide-worker.js` | ~225 KB | the bundled Web Worker (engine glue + bridge, fully minified) |
 | `manifest.json` | <1 KB | engine version, contract version, file list |
 
-About 2.2 MB total. Not tiny, but the `.wasm` files are immutable and cache well, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
+About 2.1 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 860 KB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
 
 Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running the official synchronous OPFS SAHPool VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
 
@@ -92,5 +92,5 @@ const { Items } = await client.execute("Query", { /* ... */ });
 
 `new EngineClient()` with no arguments resolves the Worker next to the package, and the Worker resolves the `.wasm` next to itself, so a bundler that copies the package's files - or a plain static deploy of them - needs no configuration. Serving the assets from a CDN or another origin? Pass `assetBase` (the directory they sit in) or `workerUrl` (the exact Worker URL).
 
-The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. It's a preview, like the rest of the wasm build.
+The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. It's a preview, like the rest of the wasm build, so it's published only under the npm `preview` dist-tag: install it with `npm install @nubo-db/dynoxide-engine@preview` (a bare install resolves `latest`, which is intentionally unset).
 

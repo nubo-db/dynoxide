@@ -156,11 +156,16 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      # Build the same self-contained bundle a consumer installs. The dev
-      # profile is functionally identical to release - it just skips wasm-opt -
-      # so it gates behaviour without the optimiser's cost on every PR.
+      # Build the same self-contained bundle a consumer installs, on the release
+      # profile, so the full --minify path (renamed identifiers, the worker that
+      # actually ships) is exercised against real Chromium + OPFS on every PR -
+      # not only at publish time and in a manual run. This build also runs the
+      # harness-op strip guard (build-wasm.sh step 2b) against the minified
+      # output. The wasm-opt cost is the price of testing what ships; the dev
+      # profile (build:wasm:dev) only minifies syntax and would leave the
+      # identifier-renaming transform unverified.
       - name: Build the wasm bundle
-        run: npm run build:wasm:dev
+        run: npm run build:wasm
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium

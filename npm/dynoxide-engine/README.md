@@ -7,8 +7,10 @@ It's a preview. The wasm build is not run against the conformance suite that bac
 ## Install
 
 ```bash
-npm install @nubo-db/dynoxide-engine
+npm install @nubo-db/dynoxide-engine@preview
 ```
+
+The `@preview` is required. This is a preview build, published only under the `preview` dist-tag, so a bare `npm install @nubo-db/dynoxide-engine` resolves `latest`, which is intentionally unset, and a `^0.11.0-preview` range won't track it either. Pin the exact version or use the `@preview` tag.
 
 ## Quick start
 
@@ -78,11 +80,11 @@ Two clients on one page are fine: each gets its own storage pool, keyed on `name
 
 ## Hosting
 
-The engine needs a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) (HTTPS, or `localhost` for development) for OPFS, but **no COOP/COEP cross-origin isolation**. A Content-Security-Policy must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm`.
+The engine needs a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) (HTTPS, or `localhost` for development) for OPFS, but **no COOP/COEP cross-origin isolation**. A Content-Security-Policy must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm`, and serve the assets gzip- or brotli-encoded - the wasm and the Worker both more than halve over the wire.
 
 ## Versioning
 
-`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`.
+`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`. `manifest.engineVersion` is the dynoxide crate version (e.g. `0.11.0`); the npm package version layers a `-preview` suffix on top (e.g. `0.11.0-preview`), since the package is a preview distribution of that crate version.
 
 ## Persistence
 

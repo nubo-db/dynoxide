@@ -3,16 +3,16 @@
 /dist
 /node_modules
 # Engine package build artefacts: scripts/build-wasm.sh assembles these into
-# npm/dynoxide-engine/. Only package.json and README.md there are source.
-/npm/dynoxide-engine/engine-client.js
-/npm/dynoxide-engine/engine-client.d.ts
-/npm/dynoxide-engine/dynoxide-worker.js
-/npm/dynoxide-engine/dynoxide-worker.d.ts
-/npm/dynoxide-engine/dynoxide_bg.wasm
-/npm/dynoxide-engine/sqlite3.wasm
-/npm/dynoxide-engine/manifest.json
-/npm/dynoxide-engine/LICENSE-MIT
-/npm/dynoxide-engine/LICENSE-APACHE
+# npm/wasm-engine/. Only package.json and README.md there are source.
+/npm/wasm-engine/engine-client.js
+/npm/wasm-engine/engine-client.d.ts
+/npm/wasm-engine/dynoxide-worker.js
+/npm/wasm-engine/dynoxide-worker.d.ts
+/npm/wasm-engine/dynoxide_bg.wasm
+/npm/wasm-engine/sqlite3.wasm
+/npm/wasm-engine/manifest.json
+/npm/wasm-engine/LICENSE-MIT
+/npm/wasm-engine/LICENSE-APACHE
 *.swp
 *.swo
 *~

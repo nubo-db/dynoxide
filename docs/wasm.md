@@ -78,10 +78,10 @@ It opens the engine, creates a table, writes a few rows, then runs a query and a
 
 ## The engine package
 
-Rather than build the engine yourself, you can depend on the same artefacts as an npm package, `@nubo-db/dynoxide-engine`. `npm run build:wasm` assembles it under `npm/dynoxide-engine/` - the Worker, the two `.wasm`, the manifest, and an `EngineClient` that owns the RPC above so you deal in objects, not `postMessage` envelopes:
+Rather than build the engine yourself, you can depend on the same artefacts as an npm package, `@dynoxide/wasm-engine`. `npm run build:wasm` assembles it under `npm/wasm-engine/` - the Worker, the two `.wasm`, the manifest, and an `EngineClient` that owns the RPC above so you deal in objects, not `postMessage` envelopes:
 
 ```js
-import { EngineClient } from "@nubo-db/dynoxide-engine";
+import { EngineClient } from "@dynoxide/wasm-engine";
 
 const client = new EngineClient();        // resolves the Worker beside the package
 await client.ready();
@@ -92,5 +92,5 @@ const { Items } = await client.execute("Query", { /* ... */ });
 
 `new EngineClient()` with no arguments resolves the Worker next to the package, and the Worker resolves the `.wasm` next to itself, so a bundler that copies the package's files - or a plain static deploy of them - needs no configuration. Serving the assets from a CDN or another origin? Pass `assetBase` (the directory they sit in) or `workerUrl` (the exact Worker URL).
 
-The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. It's a preview, like the rest of the wasm build, so it's published only under the npm `preview` dist-tag: install it with `npm install @nubo-db/dynoxide-engine@preview` (a bare install resolves `latest`, which is intentionally unset).
+The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. It's a preview, like the rest of the wasm build, so it's published only under the npm `preview` dist-tag: install it with `npm install @dynoxide/wasm-engine@preview` (a bare install resolves `latest`, which is intentionally unset).
 

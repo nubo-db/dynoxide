@@ -72,9 +72,9 @@ jobs:
 
   # The browser engine package (@dynoxide/wasm-engine) is built from source
   # here, since wasm is architecture-independent. It rides its own preview track:
-  # the wasm path is not conformance-tested, so it publishes as <crate>-preview to
-  # the `preview` dist-tag, decoupled from the crate's stable version, and never
-  # lands on `latest`. Published via OIDC trusted publishing (no token), so its
+  # the wasm path is not conformance-tested. The `-preview` version string, not a
+  # dist-tag, marks it a preview; it publishes to `latest` (npm's mandatory tag)
+  # like a normal release. Published via OIDC trusted publishing (no token), so its
   # trusted publisher must be configured on npmjs.com first; the very first publish
   # is bootstrapped manually, and the idempotent guard below then skips that
   # already-published version. This job runs independently of the native `publish`
@@ -189,21 +189,19 @@ jobs:
             exit 1
           fi
 
-      # The engine always publishes to the `preview` dist-tag, never `latest`, so
-      # `npm install @dynoxide/wasm-engine` (which resolves `latest`) never
-      # picks up the preview build by default; consumers opt in with
-      # `@dynoxide/wasm-engine@preview`. When the wasm path graduates from
-      # preview (conformance-tested): drop the `-preview` suffix in "Determine
-      # version", switch `--tag preview` below to `--tag latest`, and once the
-      # stable version is on `latest`, run `npm deprecate
-      # @dynoxide/wasm-engine@"<x.y.z-preview>" "superseded by the stable release"`
-      # so pinned preview consumers get a deprecation nudge.
+      # Publish to `latest` (the default tag). The `-preview` version is the only
+      # preview marker; npm OIDC publishing can only set the tag it publishes to,
+      # so we do not maintain a separate `preview` dist-tag that would drift from
+      # `latest`. A normal `npm install @dynoxide/wasm-engine` therefore gets the
+      # current preview. When the wasm path graduates (conformance-tested), drop
+      # the `-preview` suffix in "Determine version" and `latest` lands on the
+      # stable release with no tag juggling.
       - name: Publish (dry-run)
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/wasm-engine
-        run: npm publish --dry-run --access public --provenance --tag preview
+        run: npm publish --dry-run --access public --provenance
 
       - name: Publish to npm
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/wasm-engine
-        run: npm publish --access public --provenance --tag preview
+        run: npm publish --access public --provenance

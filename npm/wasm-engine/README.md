@@ -7,10 +7,10 @@ It's a preview. The wasm build is not run against the conformance suite that bac
 ## Install
 
 ```bash
-npm install @dynoxide/wasm-engine@preview
+npm install @dynoxide/wasm-engine
 ```
 
-`npm install @dynoxide/wasm-engine@preview` pulls the preview build; you can also pin the exact version (`0.11.0-preview`). It's a preview, so its version carries `-preview` and the wasm path is not run against the conformance suite.
+This is a preview build: the version carries `-preview` and the wasm path is not run against the conformance suite. `npm install @dynoxide/wasm-engine` gets the current preview; pin the exact version (`0.11.0-preview`) to lock to one.
 
 ## Quick start
 

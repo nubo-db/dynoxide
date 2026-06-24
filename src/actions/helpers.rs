@@ -526,8 +526,10 @@ fn validate_key_type(
 /// (GetItem, DeleteItem, UpdateItem).
 ///
 /// Unlike `validate_key_type` (used by PutItem), this returns the generic
-/// "does not match the schema" error for type mismatches, and uses the
-/// "were invalid:" prefix for empty key values.
+/// "does not match the schema" error for type mismatches. An empty-string key
+/// value emits `KeyEmptyStringValidation` with the same "are not valid." wording
+/// as `validate_key_type`; an empty-binary key value stays a plain
+/// `ValidationException` with the legacy "were invalid:" wording (see below).
 fn validate_key_type_for_key_op(
     val: &AttributeValue,
     attr_name: &str,
@@ -536,10 +538,13 @@ fn validate_key_type_for_key_op(
     let matches = match (val, expected) {
         (AttributeValue::S(s), ScalarAttributeType::S) => {
             if s.is_empty() {
-                return Err(DynoxideError::ValidationException(format!(
-                    "One or more parameter values were invalid: \
-                     The AttributeValue for a key attribute cannot contain an \
-                     empty string value. Key: {attr_name}"
+                // Carry the routable KeyEmptyStringValidation class so the transact-write
+                // loop hoists this to a top-level ValidationException (matching real AWS),
+                // while single-action and batch callers surface the same top-level error
+                // through the shared error mapping. Mirrors validate_key_type's item-key arm.
+                return Err(DynoxideError::KeyEmptyStringValidation(format!(
+                    "One or more parameter values are not valid. The AttributeValue for a key \
+                     attribute cannot contain an empty string value. Key: {attr_name}"
                 )));
             }
             true
@@ -547,6 +552,11 @@ fn validate_key_type_for_key_op(
         (AttributeValue::N(_), ScalarAttributeType::N) => true,
         (AttributeValue::B(b), ScalarAttributeType::B) => {
             if b.is_empty() {
+                // Empty-binary keeps the legacy "were invalid:" wording and the plain
+                // ValidationException class, so a transaction does not hoist it top-level.
+                // Real-AWS behaviour for an empty-binary key on this path is not yet
+                // captured, so it is left unchanged here; only the empty-string case (#98)
+                // is aligned. Revisit once a capture confirms the wording and routing.
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values were invalid: \
                      The AttributeValue for a key attribute cannot contain an \

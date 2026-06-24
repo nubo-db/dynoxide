@@ -559,3 +559,50 @@ fn test_batch_write_exceeds_16mb_aggregate() {
     // Should succeed — 25 * 300KB ≈ 7.5MB, under 16MB
     db.batch_write_item(req).unwrap();
 }
+
+// =============================================================================
+// Empty-string key value on the batch key-only paths surfaces top-level with
+// the "...are not valid..." wording, matching the single-action baseline.
+// =============================================================================
+
+const BATCH_EMPTY_KEY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
+
+#[test]
+fn test_batch_write_delete_empty_string_key_is_top_level_validation() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "Tbl": [
+                {"DeleteRequest": {"Key": {"pk": {"S": ""}, "sk": {"S": "a"}}}}
+            ]
+        }
+    }))
+    .unwrap();
+    let err = db.batch_write_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
+    assert_eq!(err.to_string(), BATCH_EMPTY_KEY_MSG);
+}
+
+#[test]
+fn test_batch_get_empty_string_key_is_top_level_validation() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+    let req: BatchGetItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "Tbl": {"Keys": [{"pk": {"S": ""}, "sk": {"S": "a"}}]}
+        }
+    }))
+    .unwrap();
+    let err = db.batch_get_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
+    assert_eq!(err.to_string(), BATCH_EMPTY_KEY_MSG);
+}

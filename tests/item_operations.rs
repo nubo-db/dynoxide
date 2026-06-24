@@ -503,3 +503,66 @@ fn test_put_item_accepts_null_false() {
     let item = resp.item.unwrap();
     assert_eq!(item["flag"], AttributeValue::NULL(true));
 }
+
+// ---------------------------------------------------------------------------
+// Empty-string key value on the single-action key paths
+// ---------------------------------------------------------------------------
+//
+// An empty-string key value returns a top-level ValidationException carrying the
+// "...are not valid..." wording, matching the real-AWS GetItem/DeleteItem/
+// UpdateItem baseline. The error surfaces top-level (HTTP 400) on all three.
+
+const SINGLE_ACTION_EMPTY_KEY_MSG: &str =
+    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
+
+#[test]
+fn test_get_item_empty_string_key_is_top_level_validation() {
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+    let err = db
+        .get_item(GetItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S(String::new()))]),
+            consistent_read: None,
+            projection_expression: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
+}
+
+#[test]
+fn test_delete_item_empty_string_key_is_top_level_validation() {
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+    let err = db
+        .delete_item(DeleteItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S(String::new()))]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
+}
+
+#[test]
+fn test_update_item_empty_string_key_is_top_level_validation() {
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+    let req: dynoxide::actions::update_item::UpdateItemRequest =
+        serde_json::from_value(serde_json::json!({
+            "TableName": "Items",
+            "Key": {"pk": {"S": ""}},
+            "UpdateExpression": "SET attr1 = :v",
+            "ExpressionAttributeValues": {":v": {"S": "x"}}
+        }))
+        .unwrap();
+    let err = db.update_item(req).unwrap_err();
+    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
+}

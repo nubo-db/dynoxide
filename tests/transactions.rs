@@ -1088,3 +1088,257 @@ fn test_transact_empty_string_key_short_circuit_no_partial_write() {
     // The earlier valid put must have rolled back.
     assert_eq!(get_val(&db, "Table1", "a"), None);
 }
+
+// ---- malformed lookup Key on a transact Update / Delete / ConditionCheck ----
+//
+// #98: the lookup-key path (an Update / Delete / ConditionCheck `Key`) splits
+// the same way the Put item-key path does. Captured against real AWS across four
+// regions, byte-identical: an empty-string key value surfaces as a top-level
+// ValidationException, while a wrong-type or non-scalar key value stays a
+// cancellation reason whose message is the generic schema-mismatch string (not
+// the PutItem "Type mismatch for key" wording). ConditionCheck is caught at the
+// key stage, before its condition runs.
+
+const LOOKUP_EMPTY_KEY_MSG: &str =
+    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
+const LOOKUP_SCHEMA_MISMATCH_MSG: &str = "The provided key element does not match the schema";
+
+fn upd_lookup(key: serde_json::Value) -> serde_json::Value {
+    json!({"Update": {"TableName": "Table1", "Key": {"pk": key}, "UpdateExpression": "SET attr1 = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}})
+}
+fn del_lookup(key: serde_json::Value) -> serde_json::Value {
+    json!({"Delete": {"TableName": "Table1", "Key": {"pk": key}}})
+}
+fn cc_lookup(key: serde_json::Value) -> serde_json::Value {
+    json!({"ConditionCheck": {"TableName": "Table1", "Key": {"pk": key}, "ConditionExpression": "attribute_not_exists(pk)"}})
+}
+
+fn assert_lookup_key_top_level(transact_item: serde_json::Value) {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req = json!({"TransactItems": [transact_item]});
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-string lookup key must surface as a top-level ValidationException, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    assert_eq!(err.to_string(), LOOKUP_EMPTY_KEY_MSG);
+}
+
+fn assert_lookup_key_cancelled(transact_item: serde_json::Value) {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req = json!({"TransactItems": [transact_item]});
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                LOOKUP_SCHEMA_MISMATCH_MSG
+            );
+        }
+        other => panic!("malformed lookup key must stay a cancellation reason, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_transact_update_empty_string_lookup_key_is_top_level_validation() {
+    assert_lookup_key_top_level(upd_lookup(json!({"S": ""})));
+}
+
+#[test]
+fn test_transact_delete_empty_string_lookup_key_is_top_level_validation() {
+    assert_lookup_key_top_level(del_lookup(json!({"S": ""})));
+}
+
+#[test]
+fn test_transact_condition_check_empty_string_lookup_key_is_top_level_validation() {
+    assert_lookup_key_top_level(cc_lookup(json!({"S": ""})));
+}
+
+#[test]
+fn test_transact_update_wrong_type_lookup_key_is_cancellation_reason() {
+    assert_lookup_key_cancelled(upd_lookup(json!({"N": "5"})));
+}
+
+#[test]
+fn test_transact_update_non_scalar_lookup_key_is_cancellation_reason() {
+    assert_lookup_key_cancelled(upd_lookup(json!({"L": [{"S": "x"}]})));
+}
+
+#[test]
+fn test_transact_delete_wrong_type_lookup_key_is_cancellation_reason() {
+    assert_lookup_key_cancelled(del_lookup(json!({"N": "5"})));
+}
+
+#[test]
+fn test_transact_delete_non_scalar_lookup_key_is_cancellation_reason() {
+    assert_lookup_key_cancelled(del_lookup(json!({"L": [{"S": "x"}]})));
+}
+
+#[test]
+fn test_transact_condition_check_wrong_type_lookup_key_is_cancellation_reason() {
+    assert_lookup_key_cancelled(cc_lookup(json!({"N": "5"})));
+}
+
+#[test]
+fn test_transact_condition_check_non_scalar_lookup_key_is_cancellation_reason() {
+    assert_lookup_key_cancelled(cc_lookup(json!({"L": [{"S": "x"}]})));
+}
+
+#[test]
+fn test_transact_empty_string_lookup_key_rolls_back_earlier_action() {
+    // A valid Put followed by an Update with an empty-string lookup key: the
+    // empty key surfaces top-level and the earlier valid Put must roll back.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "a"}, "val": {"S": "1"}}}},
+            {"Update": {"TableName": "Table1", "Key": {"pk": {"S": ""}}, "UpdateExpression": "SET attr1 = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "an empty-string lookup key anywhere in the transaction must surface top-level, got {err:?}"
+    );
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "must not be wrapped as a transaction cancellation: {err:?}"
+    );
+    assert_eq!(get_val(&db, "Table1", "a"), None);
+}
+
+#[test]
+fn test_transact_get_empty_string_key_stays_cancellation_reason() {
+    // TransactGetItems surfaces per-action key validation through the
+    // cancellation channel (captured AWS behaviour), so an empty-string Key
+    // must NOT be hoisted top-level the way the transact-write path is.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Get": {"TableName": "Table1", "Key": {"pk": {"S": ""}}}}
+        ]
+    });
+    let err = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            // Pin the message too: the empty-string class carries the corrected
+            // "are not valid" wording even through the cancellation channel.
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                LOOKUP_EMPTY_KEY_MSG
+            );
+        }
+        other => panic!(
+            "an empty-string key in TransactGetItems must stay a cancellation reason, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn test_transact_get_mixed_empty_and_wrong_type_keys_both_validation_reasons() {
+    // Two transact-get actions: one empty-string Key, one wrong-typed Key. Both
+    // surface as per-action ValidationError cancellation reasons, in order, and
+    // the second action is still validated (the loop does not short-circuit).
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Get": {"TableName": "Table1", "Key": {"pk": {"S": ""}}}},
+            {"Get": {"TableName": "Table1", "Key": {"pk": {"N": "5"}}}}
+        ]
+    });
+    let err = db
+        .transact_get_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons.len(), 2);
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(reasons[1].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                LOOKUP_EMPTY_KEY_MSG
+            );
+            assert_eq!(
+                reasons[1].message.as_deref().unwrap_or_default(),
+                LOOKUP_SCHEMA_MISMATCH_MSG
+            );
+        }
+        other => panic!("mixed malformed transact-get keys must cancel, got {other:?}"),
+    }
+}
+
+// ---- empty-string SORT key on the lookup path; count-vs-value precedence ----
+
+#[test]
+fn test_transact_update_empty_string_sort_key_is_top_level_validation() {
+    // An empty-string value in the SORT key slot of a composite table reaches the
+    // same validator and surfaces top-level, naming the sort key.
+    let db = Database::memory().unwrap();
+    create_pk_sk_table(&db, "Composite");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Update": {"TableName": "Composite", "Key": {"PK": {"S": "x"}, "SK": {"S": ""}}, "UpdateExpression": "SET attr1 = :v", "ExpressionAttributeValues": {":v": {"S": "y"}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "empty-string sort key must surface top-level, got {err:?}"
+    );
+    assert!(!matches!(err, DynoxideError::TransactionCanceledException(..)));
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: SK"
+    );
+}
+
+#[test]
+fn test_transact_update_missing_sort_key_is_schema_mismatch_cancellation() {
+    // Omitting the sort key entirely fails the key-count/shape check before the
+    // per-value empty-string check is ever reached, so it stays a cancellation
+    // reason with the schema-mismatch message (count-vs-value precedence).
+    let db = Database::memory().unwrap();
+    create_pk_sk_table(&db, "Composite");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Update": {"TableName": "Composite", "Key": {"PK": {"S": ""}}, "UpdateExpression": "SET attr1 = :v", "ExpressionAttributeValues": {":v": {"S": "y"}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                LOOKUP_SCHEMA_MISMATCH_MSG
+            );
+        }
+        other => panic!("a missing sort key must stay a cancellation reason, got {other:?}"),
+    }
+}

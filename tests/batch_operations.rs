@@ -565,8 +565,7 @@ fn test_batch_write_exceeds_16mb_aggregate() {
 // the "...are not valid..." wording, matching the single-action baseline.
 // =============================================================================
 
-const BATCH_EMPTY_KEY_MSG: &str =
-    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
+const BATCH_EMPTY_KEY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
 
 #[test]
 fn test_batch_write_delete_empty_string_key_is_top_level_validation() {
@@ -581,7 +580,10 @@ fn test_batch_write_delete_empty_string_key_is_top_level_validation() {
     }))
     .unwrap();
     let err = db.batch_write_item(req).unwrap_err();
-    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
     assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
     assert_eq!(err.to_string(), BATCH_EMPTY_KEY_MSG);
 }
@@ -597,7 +599,10 @@ fn test_batch_get_empty_string_key_is_top_level_validation() {
     }))
     .unwrap();
     let err = db.batch_get_item(req).unwrap_err();
-    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
     assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
     assert_eq!(err.to_string(), BATCH_EMPTY_KEY_MSG);
 }

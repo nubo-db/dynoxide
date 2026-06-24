@@ -1099,8 +1099,7 @@ fn test_transact_empty_string_key_short_circuit_no_partial_write() {
 // the PutItem "Type mismatch for key" wording). ConditionCheck is caught at the
 // key stage, before its condition runs.
 
-const LOOKUP_EMPTY_KEY_MSG: &str =
-    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
+const LOOKUP_EMPTY_KEY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
 const LOOKUP_SCHEMA_MISMATCH_MSG: &str = "The provided key element does not match the schema";
 
 fn upd_lookup(key: serde_json::Value) -> serde_json::Value {
@@ -1309,7 +1308,10 @@ fn test_transact_update_empty_string_sort_key_is_top_level_validation() {
         "com.amazon.coral.validate#ValidationException",
         "empty-string sort key must surface top-level, got {err:?}"
     );
-    assert!(!matches!(err, DynoxideError::TransactionCanceledException(..)));
+    assert!(!matches!(
+        err,
+        DynoxideError::TransactionCanceledException(..)
+    ));
     assert_eq!(
         err.to_string(),
         "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: SK"

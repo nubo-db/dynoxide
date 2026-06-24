@@ -512,8 +512,7 @@ fn test_put_item_accepts_null_false() {
 // "...are not valid..." wording, matching the real-AWS GetItem/DeleteItem/
 // UpdateItem baseline. The error surfaces top-level (HTTP 400) on all three.
 
-const SINGLE_ACTION_EMPTY_KEY_MSG: &str =
-    "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
+const SINGLE_ACTION_EMPTY_KEY_MSG: &str = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk";
 
 #[test]
 fn test_get_item_empty_string_key_is_top_level_validation() {
@@ -528,7 +527,10 @@ fn test_get_item_empty_string_key_is_top_level_validation() {
             ..Default::default()
         })
         .unwrap_err();
-    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
     assert_eq!(err.status_code(), 400);
     assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
 }
@@ -544,7 +546,10 @@ fn test_delete_item_empty_string_key_is_top_level_validation() {
             ..Default::default()
         })
         .unwrap_err();
-    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
     assert_eq!(err.status_code(), 400);
     assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
 }
@@ -562,7 +567,10 @@ fn test_update_item_empty_string_key_is_top_level_validation() {
         }))
         .unwrap();
     let err = db.update_item(req).unwrap_err();
-    assert_eq!(err.error_type(), "com.amazon.coral.validate#ValidationException");
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
     assert_eq!(err.status_code(), 400);
     assert_eq!(err.to_string(), SINGLE_ACTION_EMPTY_KEY_MSG);
 }

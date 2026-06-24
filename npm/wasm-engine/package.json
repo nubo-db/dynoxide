@@ -1,6 +1,6 @@
 {
-  "name": "@nubo-db/dynoxide-engine",
-  "version": "0.0.0-development",
+  "name": "@dynoxide/wasm-engine",
+  "version": "0.11.0-preview",
   "type": "module",
   "description": "The dynoxide DynamoDB-compatible engine compiled to WebAssembly, with a Web Worker client for running real DynamoDB operations in the browser. Preview.",
   "author": "Martin Hicks",

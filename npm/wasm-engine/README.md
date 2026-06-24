@@ -1,4 +1,4 @@
-# @nubo-db/dynoxide-engine
+# @dynoxide/wasm-engine
 
 The [dynoxide](https://github.com/nubo-db/dynoxide) DynamoDB-compatible engine, compiled to WebAssembly and packaged to run in the browser. It carries the engine `.wasm`, the official [@sqlite.org/sqlite-wasm](https://github.com/sqlite/sqlite-wasm) SQLite build, the bundled Web Worker, and an `EngineClient` that drives them, so you can run real DynamoDB operations client-side against a SQLite-backed store persisted to OPFS.
 
@@ -7,15 +7,15 @@ It's a preview. The wasm build is not run against the conformance suite that bac
 ## Install
 
 ```bash
-npm install @nubo-db/dynoxide-engine@preview
+npm install @dynoxide/wasm-engine@preview
 ```
 
-The `@preview` is required. This is a preview build, published only under the `preview` dist-tag, so a bare `npm install @nubo-db/dynoxide-engine` resolves `latest`, which is intentionally unset, and a `^0.11.0-preview` range won't track it either. Pin the exact version or use the `@preview` tag.
+The `@preview` is required. This is a preview build, published only under the `preview` dist-tag, so a bare `npm install @dynoxide/wasm-engine` resolves `latest`, which is intentionally unset, and a `^0.11.0-preview` range won't track it either. Pin the exact version or use the `@preview` tag.
 
 ## Quick start
 
 ```js
-import { EngineClient } from "@nubo-db/dynoxide-engine";
+import { EngineClient } from "@dynoxide/wasm-engine";
 
 const client = new EngineClient();
 await client.ready();
@@ -72,7 +72,7 @@ If you'd rather construct the Worker yourself - to let a bundler handle it, say 
 ```js
 new EngineClient({
   createWorker: () =>
-    new Worker(new URL("@nubo-db/dynoxide-engine/worker", import.meta.url), { type: "module" }),
+    new Worker(new URL("@dynoxide/wasm-engine/worker", import.meta.url), { type: "module" }),
 });
 ```
 

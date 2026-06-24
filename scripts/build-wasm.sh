@@ -142,7 +142,7 @@ done
 #    only checked-in files here; everything else is copied in and gitignored.
 #    Skipped for --harness, which is a smoke build and is never shipped.
 if [ "$feature" = "wasm-sqlite" ]; then
-  pkg="npm/dynoxide-engine"
+  pkg="npm/wasm-engine"
 
   # The JS client and Rust engine each bake in a CONTRACT_VERSION; they must ship
   # equal (the client validates against the engine on boot). Shared with CI so a

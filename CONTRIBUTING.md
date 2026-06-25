@@ -78,15 +78,12 @@ Commits-style prefix (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`,
 subject is fine if no prefix fits. Bodies are welcome for anything
 non-obvious.
 
-## AI-assisted contributions
+## Licensing of contributions
 
-AI tools are welcome. If an AI tool drafted or materially shaped the
-change, say so in the PR description. A single line is enough and
-the bar is low: "drafted by Cursor, I ran the tests" or "Copilot
-autocomplete on the glue code" or "hand-written, Claude Code
-reviewed it" all work. The goal is that a maintainer knows what
-level of human review to apply, not that contributors match a
-specific phrasing.
+Dynoxide is dual-licensed under the MIT License and the Apache License,
+Version 2.0. By contributing, you agree that your contribution is
+offered under those same terms, and that you have the right to submit
+it.
 
 ## Where to ask
 

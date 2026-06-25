@@ -25,15 +25,6 @@ with AWS DynamoDB's observable behaviour is the headline goal.
    of files is worth a short issue first.
 3. **No new dependencies without discussion.** Open an issue so we can
    weigh binary size, build time, and licence.
-4. **Disclose AI assistance.** If an AI tool drafted or materially
-   shaped the change, note it in the PR description. A single line
-   is enough; the bar is "tell us, any level", not "match a specific
-   phrasing". Examples:
-   - "Drafted by Cursor; I reviewed and ran the tests."
-   - "Copilot autocomplete on the glue code, otherwise hand-written."
-   - "Hand-written; Claude Code reviewed it and flagged two edits I
-     took."
-   This keeps maintainer review calibrated; it is not a gate.
 
 ## Rust conventions
 

@@ -13,6 +13,8 @@ where direction was agreed. -->
 - [ ] `CHANGELOG.md` updated if this is a user-visible change
 - [ ] Linked issue, discussion, or a short note explaining the
   motivation
+- [ ] I agree my contribution is licensed under the project's terms
+  (MIT License and Apache License, Version 2.0)
 
 ## DynamoDB compatibility note (delete if not applicable)
 

@@ -610,24 +610,27 @@ fn compare_values(left: &AttributeValue, op: &CompOp, right: &AttributeValue) ->
             }
         }
 
-        // Number Set — set equality (order-independent)
+        // Number Set — set equality (order-independent). Compared via the canonical
+        // numeric form (full 38-digit precision), matching how NS duplicates are
+        // detected on write. f64 would collapse values differing only beyond ~15
+        // significant digits and wrongly report distinct sets as equal.
         (AttributeValue::NS(a), AttributeValue::NS(b)) => {
             if a.len() != b.len() {
                 return matches!(op, CompOp::Ne);
             }
-            let mut fa: Vec<f64> = match a.iter().map(|n| n.parse::<f64>()).collect() {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            let mut fb: Vec<f64> = match b.iter().map(|n| n.parse::<f64>()).collect() {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            fa.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            fb.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            let mut na: Vec<String> = a
+                .iter()
+                .map(|n| crate::types::normalize_dynamo_number(n))
+                .collect();
+            let mut nb: Vec<String> = b
+                .iter()
+                .map(|n| crate::types::normalize_dynamo_number(n))
+                .collect();
+            na.sort();
+            nb.sort();
             match op {
-                CompOp::Eq => fa == fb,
-                CompOp::Ne => fa != fb,
+                CompOp::Eq => na == nb,
+                CompOp::Ne => na != nb,
                 _ => false,
             }
         }
@@ -1730,5 +1733,31 @@ mod tests {
         )]);
         let miss = parse("contains(l, :p)").unwrap();
         assert!(!evaluate_without_tracking(&miss, &item, &None, &miss_av).unwrap());
+    }
+
+    // Number sets are compared at full precision: two 18-digit values differing only
+    // in the last digit are distinct, where an f64 comparison would wrongly match them.
+    #[test]
+    fn test_number_set_equality_full_precision() {
+        let item = make_item(&[("ns", AttributeValue::NS(vec!["100000000000000001".into()]))]);
+
+        let same = vals(&[(":p", AttributeValue::NS(vec!["100000000000000001".into()]))]);
+        let eq = parse("ns = :p").unwrap();
+        assert!(evaluate_without_tracking(&eq, &item, &None, &same).unwrap());
+
+        let off_by_one = vals(&[(":p", AttributeValue::NS(vec!["100000000000000002".into()]))]);
+        let eq2 = parse("ns = :p").unwrap();
+        assert!(!evaluate_without_tracking(&eq2, &item, &None, &off_by_one).unwrap());
+        let ne = parse("ns <> :p").unwrap();
+        assert!(evaluate_without_tracking(&ne, &item, &None, &off_by_one).unwrap());
+    }
+
+    // Equality is numeric, not textual: 1 and 1.0 are the same set member.
+    #[test]
+    fn test_number_set_equality_normalises_members() {
+        let item = make_item(&[("ns", AttributeValue::NS(vec!["1".into(), "2".into()]))]);
+        let av = vals(&[(":p", AttributeValue::NS(vec!["1.0".into(), "2.00".into()]))]);
+        let eq = parse("ns = :p").unwrap();
+        assert!(evaluate_without_tracking(&eq, &item, &None, &av).unwrap());
     }
 }

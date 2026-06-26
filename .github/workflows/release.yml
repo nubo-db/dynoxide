@@ -24,6 +24,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Cross-compile builds fetch a lot (toolchain, full index, crate sources)
+  # and GitHub runners intermittently drop crates.io downloads with an HTTP/2
+  # framing reset. Force HTTP/1.1 and retry hard so a transient blip does not
+  # fail a release build.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
   # -------------------------------------------------------------------
@@ -113,8 +119,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # The zig download mirror occasionally fails to fetch; one retry covers it.
       - name: Install zig (aarch64-musl)
+        id: setup-zig
         if: matrix.target == 'aarch64-unknown-linux-musl'
+        continue-on-error: true
+        uses: mlugg/setup-zig@v2
+
+      - name: Install zig (aarch64-musl, retry)
+        if: matrix.target == 'aarch64-unknown-linux-musl' && steps.setup-zig.outcome == 'failure'
         uses: mlugg/setup-zig@v2
 
       - name: Install cargo-zigbuild (aarch64-musl)

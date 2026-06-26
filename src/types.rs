@@ -359,31 +359,13 @@ impl<'de> Deserialize<'de> for AttributeValue {
 /// bypass the normal validation flow — the server routes them based on
 /// message content (see `server::deserialize`).
 fn validate_number_in_deser(n: &str) -> Result<(), String> {
-    if n.is_empty() {
-        return Err("VALIDATION:The parameter cannot be converted to a numeric value".to_string());
+    // validate_dynamo_number is the single source of truth for number format
+    // and precision/range; the deser path only reshapes the error message.
+    match validate_dynamo_number(n) {
+        Ok(()) => Ok(()),
+        Err(crate::errors::DynoxideError::ValidationException(m)) => Err(format!("VALIDATION:{m}")),
+        Err(e) => Err(format!("VALIDATION:{e}")),
     }
-    // Check if it's a valid number
-    let trimmed = n.trim();
-    let is_valid = trimmed.parse::<f64>().is_ok()
-        || trimmed
-            .to_lowercase()
-            .contains('e')
-            .then(|| trimmed.parse::<f64>().ok())
-            .is_some();
-    if !is_valid {
-        return Err(format!(
-            "VALIDATION:The parameter cannot be converted to a numeric value: {n}"
-        ));
-    }
-    // Use the full validate_dynamo_number for precision/range checks
-    if let Err(e) = validate_dynamo_number(n) {
-        let msg = match e {
-            crate::errors::DynoxideError::ValidationException(m) => format!("VALIDATION:{m}"),
-            _ => format!("VALIDATION:{}", e),
-        };
-        return Err(msg);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -431,37 +413,29 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
 pub fn validate_dynamo_number(
     num_str: &str,
 ) -> std::result::Result<(), crate::errors::DynoxideError> {
-    let trimmed = num_str.trim();
-
-    if trimmed.is_empty() {
+    if num_str.is_empty() {
         return Err(crate::errors::DynoxideError::ValidationException(
             "The parameter cannot be converted to a numeric value".to_string(),
         ));
     }
 
-    let negative = trimmed.starts_with('-');
-    let abs_str = if negative { &trimmed[1..] } else { trimmed };
-
-    // Validate that the string is a well-formed number: must contain at least one digit,
-    // and only valid number characters (digits, '.', 'e'/'E', '+', '-' in exponent).
-    // Rejects "NaN", "Infinity", "abc", etc.
-    if abs_str.is_empty() || !abs_str.chars().any(|c| c.is_ascii_digit()) {
+    // DynamoDB accepts a specific numeric grammar and rejects everything else,
+    // including any surrounding or internal whitespace. Verified against real
+    // DynamoDB (see the unit tests below and the dynamodb-conformance suite):
+    //   sign?  coefficient  exponent?
+    //   coefficient = at least one digit, at most one '.' (e.g. 5, 5., .5, +1.5)
+    //   exponent    = ('e'|'E') sign? at least one digit (e.g. e2, E+3, e-130)
+    // Accepts: +5, -7, +.5, 5., 1e+2, 1.5E+3, 1E-130, 00042
+    // Rejects: +e2, 1+2, 1.2.3, ++5, 1e, ., NaN, "1_000", " 5"
+    if !is_well_formed_dynamo_number(num_str) {
         return Err(crate::errors::DynoxideError::ValidationException(format!(
-            "The parameter cannot be converted to a numeric value: {}",
-            trimmed
-        )));
-    }
-    let valid = abs_str.chars().enumerate().all(|(i, c)| {
-        c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || ((c == '+' || c == '-') && i > 0) // sign only after 'e'/'E'
-    });
-    if !valid {
-        return Err(crate::errors::DynoxideError::ValidationException(format!(
-            "The parameter cannot be converted to a numeric value: {}",
-            trimmed
+            "The parameter cannot be converted to a numeric value: {num_str}"
         )));
     }
 
-    let (mantissa_digits, exponent) = parse_number_parts(abs_str);
+    // parse_number_parts ignores the sign characters, so the magnitude checks
+    // below hold for both signs.
+    let (mantissa_digits, exponent) = parse_number_parts(num_str);
 
     // Zero is always valid
     if mantissa_digits.is_empty() || mantissa_digits.iter().all(|&d| d == 0) {
@@ -498,6 +472,59 @@ pub fn validate_dynamo_number(
     }
 
     Ok(())
+}
+
+/// Returns true when `s` matches DynamoDB's numeric grammar exactly:
+/// `sign? coefficient exponent?` where the coefficient carries at least one
+/// digit and at most one `.`, and the exponent (if present) carries at least
+/// one digit. No whitespace or stray characters are tolerated. This mirrors
+/// what real DynamoDB accepts (verified against AWS).
+fn is_well_formed_dynamo_number(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+
+    // Optional leading sign.
+    if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+
+    // Coefficient: digits with at most one decimal point, at least one digit.
+    let mut coeff_digits = 0usize;
+    let mut dots = 0usize;
+    while i < n && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        if bytes[i] == b'.' {
+            dots += 1;
+            if dots > 1 {
+                return false;
+            }
+        } else {
+            coeff_digits += 1;
+        }
+        i += 1;
+    }
+    if coeff_digits == 0 {
+        return false;
+    }
+
+    // Optional exponent: 'e'/'E', optional sign, at least one digit.
+    if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let mut exp_digits = 0usize;
+        while i < n && bytes[i].is_ascii_digit() {
+            exp_digits += 1;
+            i += 1;
+        }
+        if exp_digits == 0 {
+            return false;
+        }
+    }
+
+    // Anything left over (stray chars, trailing whitespace) is invalid.
+    i == n
 }
 
 /// Normalize a DynamoDB number string to its canonical form.
@@ -1555,6 +1582,70 @@ mod tests {
         let c = normalize_number_for_sort("-1e11");
         let d = normalize_number_for_sort("-1e10");
         assert!(c < d);
+    }
+
+    // Number validation/normalisation is pinned to real DynamoDB behaviour
+    // (captured against AWS for issue #109). validate_dynamo_number accepts
+    // exactly the grammar DynamoDB accepts, including a leading '+'; the bare
+    // and '+'-prefixed malformed forms are both rejected, matching AWS.
+    #[test]
+    fn test_validate_number_accepts_dynamodb_grammar() {
+        for input in [
+            "+5", "+1.5", "+0", "-0", "+0.0", "+1e2", "1e+2", "1.5E+3", "-7", "+.5", ".5", "5.",
+            "00042", "1.23E10", "+1e-2", "1E-130", "+1E-130",
+        ] {
+            assert!(
+                validate_dynamo_number(input).is_ok(),
+                "expected {input} to validate, got {:?}",
+                validate_dynamo_number(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_number_rejects_malformed() {
+        // Every one of these is rejected by real DynamoDB. Note that whitespace
+        // (leading, trailing, or internal) is rejected, not trimmed.
+        for input in [
+            "+e2", "e2", "+1+2", "1+2", "+1.2.3", "1.2.3", "++5", "+-5", "-+5", "+", "-", "1e",
+            "1e+", ".", "1.2e3.4", "0x5", "NaN", "Infinity", "1_000", " 5", "5 ", "1 5", "",
+        ] {
+            assert!(
+                matches!(
+                    validate_dynamo_number(input),
+                    Err(crate::errors::DynoxideError::ValidationException(_))
+                ),
+                "expected {input:?} to be rejected with ValidationException, got {:?}",
+                validate_dynamo_number(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_number_matches_dynamodb() {
+        for (input, stored) in [
+            ("+5", "5"),
+            ("+1.5", "1.5"),
+            ("+0", "0"),
+            ("-0", "0"),
+            ("+0.0", "0"),
+            ("+1e2", "100"),
+            ("1e+2", "100"),
+            ("1.5E+3", "1500"),
+            ("-7", "-7"),
+            ("+.5", "0.5"),
+            (".5", "0.5"),
+            ("5.", "5"),
+            ("00042", "42"),
+            ("1.23E10", "12300000000"),
+            ("+1e-2", "0.01"),
+        ] {
+            assert_eq!(
+                normalize_dynamo_number(input),
+                stored,
+                "{input} should normalise to {stored}"
+            );
+        }
     }
 
     #[test]

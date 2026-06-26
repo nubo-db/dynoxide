@@ -119,6 +119,165 @@ fn test_leading_zeros_not_significant() {
 }
 
 #[test]
+fn test_leading_plus_sign_accepted_and_normalised() {
+    // Issue #109: real DynamoDB accepts a leading '+' on the mantissa and
+    // stores it normalised with the '+' dropped. dynoxide rejected it. The
+    // input -> stored pairs here were all captured against real DynamoDB.
+    let db = make_db();
+    for (input, stored) in [
+        ("+5", "5"),
+        ("+1.5", "1.5"),
+        ("+0", "0"),
+        ("+1e2", "100"),
+        ("+.5", "0.5"),
+        ("5.", "5"),
+        ("+0.0", "0"),
+    ] {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
+        item.insert("val".to_string(), AttributeValue::N(input.to_string()));
+        db.put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| panic!("put of {input} should succeed: {e}"));
+
+        let mut key = HashMap::new();
+        key.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
+        let resp = db
+            .get_item(dynoxide::actions::get_item::GetItemRequest {
+                table_name: "Tbl".to_string(),
+                key,
+                consistent_read: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let got = resp.item.expect("item present");
+        assert_eq!(
+            got.get("val"),
+            Some(&AttributeValue::N(stored.to_string())),
+            "{input} should read back as {stored}"
+        );
+    }
+}
+
+#[test]
+fn test_malformed_numbers_rejected_end_to_end() {
+    // These are all rejected by real DynamoDB; dynoxide must reject them too.
+    let db = make_db();
+    for input in [
+        "+e2", "1+2", "+1+2", "1.2.3", "++5", "1e", " 5", "5 ", "NaN",
+    ] {
+        let err = put_number(&db, input).expect_err(&format!("{input:?} should be rejected"));
+        assert!(
+            err.contains("cannot be converted to a numeric value"),
+            "unexpected error for {input:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_number_set_leading_plus_normalised() {
+    // NS elements with a leading '+' are accepted and stored normalised.
+    let db = make_db();
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
+    item.insert(
+        "nums".to_string(),
+        AttributeValue::NS(vec!["+5".to_string(), "+10".to_string()]),
+    );
+    db.put_item(PutItemRequest {
+        table_name: "Tbl".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut key = HashMap::new();
+    key.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
+    let resp = db
+        .get_item(dynoxide::actions::get_item::GetItemRequest {
+            table_name: "Tbl".to_string(),
+            key,
+            consistent_read: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    let got = resp.item.expect("item present");
+    match got.get("nums") {
+        Some(AttributeValue::NS(ns)) => {
+            let mut ns = ns.clone();
+            ns.sort();
+            assert_eq!(ns, vec!["10".to_string(), "5".to_string()]);
+        }
+        other => panic!("expected NS, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_leading_plus_numeric_sort_key_round_trips() {
+    // A '+'-prefixed Number used as a sort key normalises to the same key as
+    // its bare form, so it can be written with '+5' and read back with '5'
+    // (and vice versa). Exercises normalize_number_for_sort, not just the
+    // attribute-value normalisation.
+    let db = Database::memory().unwrap();
+    db.create_table(CreateTableRequest {
+        table_name: "Tbl2".to_string(),
+        key_schema: vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::HASH,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::RANGE,
+            },
+        ],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: ScalarAttributeType::N,
+            },
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("p".to_string()));
+    item.insert("sk".to_string(), AttributeValue::N("+5".to_string()));
+    db.put_item(PutItemRequest {
+        table_name: "Tbl2".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+
+    for lookup in ["5", "+5"] {
+        let mut key = HashMap::new();
+        key.insert("pk".to_string(), AttributeValue::S("p".to_string()));
+        key.insert("sk".to_string(), AttributeValue::N(lookup.to_string()));
+        let resp = db
+            .get_item(dynoxide::actions::get_item::GetItemRequest {
+                table_name: "Tbl2".to_string(),
+                key,
+                consistent_read: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let got = resp
+            .item
+            .unwrap_or_else(|| panic!("item not found via sort key {lookup:?}"));
+        assert_eq!(got.get("sk"), Some(&AttributeValue::N("5".to_string())));
+    }
+}
+
+#[test]
 fn test_number_set_validates_each_element() {
     let db = make_db();
     let mut item = HashMap::new();

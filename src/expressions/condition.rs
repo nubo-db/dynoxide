@@ -645,6 +645,36 @@ fn compare_values(left: &AttributeValue, op: &CompOp, right: &AttributeValue) ->
             }
         }
 
+        // List: element-wise deep equality, order-sensitive. Recurses so nested
+        // numbers and documents use the same comparison semantics as scalars.
+        // DynamoDB only allows = and <> on documents, not ordering.
+        (AttributeValue::L(a), AttributeValue::L(b)) => {
+            let equal = a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| compare_values(x, &CompOp::Eq, y));
+            match op {
+                CompOp::Eq => equal,
+                CompOp::Ne => !equal,
+                _ => false,
+            }
+        }
+
+        // Map: key-set plus per-key deep equality, order-independent. Recurses so
+        // nested numbers normalise (1 == 1.0) and nested documents compare deeply.
+        (AttributeValue::M(a), AttributeValue::M(b)) => {
+            let equal = a.len() == b.len()
+                && a.iter().all(|(k, av)| {
+                    b.get(k)
+                        .is_some_and(|bv| compare_values(av, &CompOp::Eq, bv))
+                });
+            match op {
+                CompOp::Eq => equal,
+                CompOp::Ne => !equal,
+                _ => false,
+            }
+        }
+
         // Different types — only <> is true
         _ => matches!(op, CompOp::Ne),
     }
@@ -1405,5 +1435,300 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn map_of(pairs: &[(&str, AttributeValue)]) -> AttributeValue {
+        AttributeValue::M(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    // #103: equality on Map (M) attributes always returned false because
+    // compare_values lacked an arm for M, falling through to the catch-all.
+    #[test]
+    fn test_map_equality_true() {
+        let expr = parse("#s = :p").unwrap();
+        let item = make_item(&[(
+            "Status",
+            map_of(&[("Union_Case", AttributeValue::S("Passive".into()))]),
+        )]);
+        let an = names(&[("#s", "Status")]);
+        let av = vals(&[(
+            ":p",
+            map_of(&[("Union_Case", AttributeValue::S("Passive".into()))]),
+        )]);
+        assert!(evaluate_without_tracking(&expr, &item, &an, &av).unwrap());
+    }
+
+    #[test]
+    fn test_map_equality_false_and_ne_true() {
+        let item = make_item(&[(
+            "Status",
+            map_of(&[("Union_Case", AttributeValue::S("Passive".into()))]),
+        )]);
+        let an = names(&[("#s", "Status")]);
+        let av = vals(&[(
+            ":p",
+            map_of(&[("Union_Case", AttributeValue::S("Active".into()))]),
+        )]);
+
+        let eq = parse("#s = :p").unwrap();
+        assert!(!evaluate_without_tracking(&eq, &item, &an, &av).unwrap());
+
+        let ne = parse("#s <> :p").unwrap();
+        assert!(evaluate_without_tracking(&ne, &item, &an, &av).unwrap());
+    }
+
+    #[test]
+    fn test_map_equality_is_key_order_independent() {
+        let item = make_item(&[(
+            "m",
+            map_of(&[
+                ("a", AttributeValue::S("1".into())),
+                ("b", AttributeValue::S("2".into())),
+            ]),
+        )]);
+        // Same entries, constructed in the opposite order.
+        let av = vals(&[(
+            ":p",
+            map_of(&[
+                ("b", AttributeValue::S("2".into())),
+                ("a", AttributeValue::S("1".into())),
+            ]),
+        )]);
+        let expr = parse("m = :p").unwrap();
+        assert!(evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_map_equality_differing_key_sets() {
+        // Same size, different keys: must not be equal.
+        let item = make_item(&[("m", map_of(&[("a", AttributeValue::N("1".into()))]))]);
+        let av = vals(&[(":p", map_of(&[("b", AttributeValue::N("1".into()))]))]);
+        let expr = parse("m = :p").unwrap();
+        assert!(!evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_nested_map_equality() {
+        let item = make_item(&[(
+            "m",
+            map_of(&[("inner", map_of(&[("x", AttributeValue::S("v".into()))]))]),
+        )]);
+        let av = vals(&[(
+            ":p",
+            map_of(&[("inner", map_of(&[("x", AttributeValue::S("v".into()))]))]),
+        )]);
+        let expr = parse("m = :p").unwrap();
+        assert!(evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_map_equality_normalises_nested_numbers() {
+        // Nested numbers compare numerically: 1 == 1.0, consistent with scalar N.
+        let item = make_item(&[("m", map_of(&[("n", AttributeValue::N("1".into()))]))]);
+        let av = vals(&[(":p", map_of(&[("n", AttributeValue::N("1.0".into()))]))]);
+        let expr = parse("m = :p").unwrap();
+        assert!(evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_list_equality_true() {
+        let item = make_item(&[(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::N("1".into()),
+            ]),
+        )]);
+        let av = vals(&[(
+            ":p",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::N("1".into()),
+            ]),
+        )]);
+        let expr = parse("l = :p").unwrap();
+        assert!(evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_list_equality_is_order_sensitive() {
+        let item = make_item(&[(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::S("b".into()),
+            ]),
+        )]);
+        let av = vals(&[(
+            ":p",
+            AttributeValue::L(vec![
+                AttributeValue::S("b".into()),
+                AttributeValue::S("a".into()),
+            ]),
+        )]);
+        let eq = parse("l = :p").unwrap();
+        assert!(!evaluate_without_tracking(&eq, &item, &None, &av).unwrap());
+        let ne = parse("l <> :p").unwrap();
+        assert!(evaluate_without_tracking(&ne, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_map_ordering_operators_are_false() {
+        let item = make_item(&[("m", map_of(&[("a", AttributeValue::S("1".into()))]))]);
+        let av = vals(&[(":p", map_of(&[("a", AttributeValue::S("1".into()))]))]);
+        for op in ["<", "<=", ">", ">="] {
+            let expr = parse(&format!("m {} :p", op)).unwrap();
+            assert!(
+                !evaluate_without_tracking(&expr, &item, &None, &av).unwrap(),
+                "ordering operator {} on maps should be false",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_list_ordering_operators_are_false() {
+        let item = make_item(&[("l", AttributeValue::L(vec![AttributeValue::S("a".into())]))]);
+        let av = vals(&[(":p", AttributeValue::L(vec![AttributeValue::S("a".into())]))]);
+        for op in ["<", "<=", ">", ">="] {
+            let expr = parse(&format!("l {} :p", op)).unwrap();
+            assert!(
+                !evaluate_without_tracking(&expr, &item, &None, &av).unwrap(),
+                "ordering operator {} on lists should be false",
+                op
+            );
+        }
+    }
+
+    // Ne on EQUAL documents must be false. The order-sensitivity tests only cover
+    // Ne on unequal operands, so a constant-true Ne branch would otherwise survive.
+    #[test]
+    fn test_ne_on_equal_map_and_list_is_false() {
+        let map_item = make_item(&[("m", map_of(&[("a", AttributeValue::S("1".into()))]))]);
+        let map_av = vals(&[(":p", map_of(&[("a", AttributeValue::S("1".into()))]))]);
+        let map_ne = parse("m <> :p").unwrap();
+        assert!(!evaluate_without_tracking(&map_ne, &map_item, &None, &map_av).unwrap());
+
+        let list_item = make_item(&[("l", AttributeValue::L(vec![AttributeValue::S("a".into())]))]);
+        let list_av = vals(&[(":p", AttributeValue::L(vec![AttributeValue::S("a".into())]))]);
+        let list_ne = parse("l <> :p").unwrap();
+        assert!(!evaluate_without_tracking(&list_ne, &list_item, &None, &list_av).unwrap());
+    }
+
+    // <> on maps with differing key sets (same length) must be true.
+    #[test]
+    fn test_ne_on_differing_key_sets_is_true() {
+        let item = make_item(&[("m", map_of(&[("a", AttributeValue::N("1".into()))]))]);
+        let av = vals(&[(":p", map_of(&[("b", AttributeValue::N("1".into()))]))]);
+        let expr = parse("m <> :p").unwrap();
+        assert!(evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_empty_map_equality() {
+        let item = make_item(&[("m", AttributeValue::M(HashMap::new()))]);
+        let av = vals(&[(":p", AttributeValue::M(HashMap::new()))]);
+        let eq = parse("m = :p").unwrap();
+        assert!(evaluate_without_tracking(&eq, &item, &None, &av).unwrap());
+        let ne = parse("m <> :p").unwrap();
+        assert!(!evaluate_without_tracking(&ne, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_empty_list_equality() {
+        let item = make_item(&[("l", AttributeValue::L(vec![]))]);
+        let av = vals(&[(":p", AttributeValue::L(vec![]))]);
+        let eq = parse("l = :p").unwrap();
+        assert!(evaluate_without_tracking(&eq, &item, &None, &av).unwrap());
+        let ne = parse("l <> :p").unwrap();
+        assert!(!evaluate_without_tracking(&ne, &item, &None, &av).unwrap());
+    }
+
+    // A shared key whose values differ in type (S vs N) routes through the
+    // cross-type catch-all on the recursive call and must compare not-equal.
+    #[test]
+    fn test_map_equality_type_mismatch_at_shared_key() {
+        let item = make_item(&[("m", map_of(&[("x", AttributeValue::S("1".into()))]))]);
+        let av = vals(&[(":p", map_of(&[("x", AttributeValue::N("1".into()))]))]);
+        let eq = parse("m = :p").unwrap();
+        assert!(!evaluate_without_tracking(&eq, &item, &None, &av).unwrap());
+        let ne = parse("m <> :p").unwrap();
+        assert!(evaluate_without_tracking(&ne, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn test_list_length_mismatch_is_not_equal() {
+        let item = make_item(&[("l", AttributeValue::L(vec![AttributeValue::S("a".into())]))]);
+        let av = vals(&[(
+            ":p",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::S("b".into()),
+            ]),
+        )]);
+        let expr = parse("l = :p").unwrap();
+        assert!(!evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    // IN routes through compare_values, so document operands now match correctly.
+    #[test]
+    fn test_in_operator_with_map_operands() {
+        let item = make_item(&[(
+            "m",
+            map_of(&[("status", AttributeValue::S("active".into()))]),
+        )]);
+        let av = vals(&[
+            (
+                ":p1",
+                map_of(&[("status", AttributeValue::S("closed".into()))]),
+            ),
+            (
+                ":p2",
+                map_of(&[("status", AttributeValue::S("active".into()))]),
+            ),
+        ]);
+        let hit = parse("m IN (:p1, :p2)").unwrap();
+        assert!(evaluate_without_tracking(&hit, &item, &None, &av).unwrap());
+
+        let miss_av = vals(&[
+            (
+                ":p1",
+                map_of(&[("status", AttributeValue::S("closed".into()))]),
+            ),
+            (
+                ":p2",
+                map_of(&[("status", AttributeValue::S("pending".into()))]),
+            ),
+        ]);
+        let miss = parse("m IN (:p1, :p2)").unwrap();
+        assert!(!evaluate_without_tracking(&miss, &item, &None, &miss_av).unwrap());
+    }
+
+    // contains(list, :v) compares each element via compare_values, so a map
+    // element now matches deeply.
+    #[test]
+    fn test_contains_list_of_maps() {
+        let item = make_item(&[(
+            "l",
+            AttributeValue::L(vec![
+                map_of(&[("role", AttributeValue::S("admin".into()))]),
+                map_of(&[("role", AttributeValue::S("viewer".into()))]),
+            ]),
+        )]);
+        let hit_av = vals(&[(":p", map_of(&[("role", AttributeValue::S("admin".into()))]))]);
+        let hit = parse("contains(l, :p)").unwrap();
+        assert!(evaluate_without_tracking(&hit, &item, &None, &hit_av).unwrap());
+
+        let miss_av = vals(&[(
+            ":p",
+            map_of(&[("role", AttributeValue::S("unknown".into()))]),
+        )]);
+        let miss = parse("contains(l, :p)").unwrap();
+        assert!(!evaluate_without_tracking(&miss, &item, &None, &miss_av).unwrap());
     }
 }

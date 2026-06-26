@@ -144,6 +144,135 @@ fn test_put_condition_with_comparison() {
     assert!(err.to_string().contains("conditional request failed"));
 }
 
+// #103: a ConditionExpression that compares a Map (M) attribute for equality
+// must succeed when the stored map equals the supplied value. Before the fix,
+// compare_values had no arm for M, so map equality always failed.
+#[test]
+fn test_condition_map_equality() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let status = || {
+        AttributeValue::M(HashMap::from([(
+            "Union_Case".to_string(),
+            AttributeValue::S("Passive".into()),
+        )]))
+    };
+
+    put(
+        &db,
+        "Tbl",
+        &[("pk", AttributeValue::S("k1".into())), ("Status", status())],
+    );
+
+    // Should succeed: Status equals the supplied map.
+    db.update_item(UpdateItemRequest {
+        table_name: "Tbl".to_string(),
+        key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+        update_expression: Some("SET Touched = :t".into()),
+        condition_expression: Some("#S = :p".into()),
+        expression_attribute_names: Some(HashMap::from([("#S".to_string(), "Status".to_string())])),
+        expression_attribute_values: Some(make_item(&[
+            (":t", AttributeValue::S("yes".into())),
+            (":p", status()),
+        ])),
+        return_values: None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Should fail: the stored map no longer matches a different map.
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET Touched = :t".into()),
+            condition_expression: Some("#S = :p".into()),
+            expression_attribute_names: Some(HashMap::from([(
+                "#S".to_string(),
+                "Status".to_string(),
+            )])),
+            expression_attribute_values: Some(make_item(&[
+                (":t", AttributeValue::S("again".into())),
+                (
+                    ":p",
+                    AttributeValue::M(HashMap::from([(
+                        "Union_Case".to_string(),
+                        AttributeValue::S("Active".into()),
+                    )])),
+                ),
+            ])),
+            return_values: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("conditional request failed"));
+}
+
+// #103: the List (L) counterpart to test_condition_map_equality. Element-wise,
+// order-sensitive deep equality must gate a real UpdateItem end-to-end.
+#[test]
+fn test_condition_list_equality() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let roles = || {
+        AttributeValue::L(vec![
+            AttributeValue::S("admin".into()),
+            AttributeValue::S("viewer".into()),
+        ])
+    };
+
+    put(
+        &db,
+        "Tbl",
+        &[("pk", AttributeValue::S("k1".into())), ("Roles", roles())],
+    );
+
+    // Should succeed: Roles equals the supplied list.
+    db.update_item(UpdateItemRequest {
+        table_name: "Tbl".to_string(),
+        key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+        update_expression: Some("SET Touched = :t".into()),
+        condition_expression: Some("#R = :p".into()),
+        expression_attribute_names: Some(HashMap::from([("#R".to_string(), "Roles".to_string())])),
+        expression_attribute_values: Some(make_item(&[
+            (":t", AttributeValue::S("yes".into())),
+            (":p", roles()),
+        ])),
+        return_values: None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Should fail: same elements, reversed order is not equal for a List.
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET Touched = :t".into()),
+            condition_expression: Some("#R = :p".into()),
+            expression_attribute_names: Some(HashMap::from([(
+                "#R".to_string(),
+                "Roles".to_string(),
+            )])),
+            expression_attribute_values: Some(make_item(&[
+                (":t", AttributeValue::S("again".into())),
+                (
+                    ":p",
+                    AttributeValue::L(vec![
+                        AttributeValue::S("viewer".into()),
+                        AttributeValue::S("admin".into()),
+                    ]),
+                ),
+            ])),
+            return_values: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("conditional request failed"));
+}
+
 // ---------------------------------------------------------------------------
 // ConditionExpression on DeleteItem
 // ---------------------------------------------------------------------------

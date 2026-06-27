@@ -42,19 +42,29 @@ above.
 
 ## Smithery (smithery.ai)
 
-One-off, and it needs a Smithery account. `smithery.yaml` at the repo root
-already tells Smithery to launch the server over stdio via `npx -y dynoxide mcp`,
-so the repo side is done. To list it:
+One-off, and it needs a Smithery account. Smithery distributes a local stdio
+server as an [MCPB bundle](https://github.com/anthropics/mcpb) that clients
+download and run. The bundle source is `mcpb/manifest.json`; it launches the
+server with `npx -y dynoxide mcp`, so the runtime always pulls the current npm
+release regardless of the bundle's own version.
+
+Build the bundle, sign in, and publish:
 
 ```sh
-npm install -g @smithery/cli
-smithery auth login
+npx -y @anthropic-ai/mcpb pack mcpb mcpb/dynoxide.mcpb
+npx -y @smithery/cli auth login
+npx -y @smithery/cli mcp publish mcpb/dynoxide.mcpb -n nubo-db/dynoxide
 ```
 
-Then publish following <https://smithery.ai/docs/build/publish> (the publish
-subcommand changed in CLI v1.1.0, so follow the current docs rather than a
-pinned command here). Optionally install the Smithery GitHub App on the repo
-for push-triggered redeploys.
+The empty `"tools": []` in the manifest is load-bearing. The Smithery CLI drops
+the `tools` field from its upload when the key is absent, and the registry then
+rejects the payload with `400 "No values to set"`
+(<https://github.com/smithery-ai/cli/issues/770>). Leave it empty; a populated
+list is rejected on a separate schema mismatch.
+
+To republish after a release, bump `version` in `mcpb/manifest.json`, rebuild,
+and re-run the publish command. The server already exists, so it goes straight
+to the new release.
 
 ## Glama (glama.ai)
 
@@ -62,10 +72,11 @@ One-off, and it needs your GitHub OAuth. `glama.json` at the repo root names the
 maintainer (`hicksy`) for the ownership claim. To list it:
 
 1. Go to <https://glama.ai/mcp/servers> and choose "Add MCP Server".
-2. Sign in with GitHub and enter the repo URL.
-3. Glama build-checks the server in a sandbox; it usually appears within minutes.
-4. Because this is an org-owned repo, complete the "Claim ownership" flow, which
-   reads `glama.json`.
+2. Sign in with GitHub and submit the repo URL for review.
+3. Glama build-checks the server in a sandbox and lists it, usually within minutes.
+
+`glama.json` names the maintainer (`hicksy`) so the listing is attributed to you;
+the current flow submits for review rather than offering a separate claim step.
 
 A directory listing needs no Dockerfile. To later have Glama host and run it
 through their gateway, point them at the `dynoxide` npm package in the admin

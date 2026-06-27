@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nubo-db/dynoxide",
+  "title": "Dynoxide",
+  "description": "DynamoDB-compatible database engine, written in Rust and backed by SQLite. Its MCP server exposes 34 DynamoDB operations (tables, items, query and scan, batch, transactions, PartiQL, TTL, tags, streams, and snapshots) as tools for coding agents.",
+  "version": "0.11.1",
+  "websiteUrl": "https://dynoxide.dev",
+  "repository": {
+    "url": "https://github.com/nubo-db/dynoxide",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "dynoxide",
+      "version": "0.11.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "isRequired": true
+        }
+      ]
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/nubo-db/dynoxide:0.11.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "isRequired": true
+        }
+      ]
+    }
+  ]
+}

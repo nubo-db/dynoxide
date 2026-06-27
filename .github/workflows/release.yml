@@ -526,6 +526,72 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------
+  # Publish to the official MCP registry (registry.modelcontextprotocol.io)
+  # via GitHub OIDC, so no token is needed. Runs after npm and Docker have
+  # published because the registry verifies ownership against the live npm
+  # package (its mcpName field) and the GHCR image (its OCI label). The
+  # GitHub MCP Registry ingests from the official registry, so this single
+  # publish covers that surface too.
+  # -------------------------------------------------------------------
+  publish-mcp-registry:
+    name: Publish to MCP registry
+    needs: [validate, publish-npm, publish-docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # publish-npm only dispatches npm.yml, so the npm publish finishes
+      # asynchronously. Wait for the version to appear before publishing the
+      # registry entry, otherwise the npm ownership check fails.
+      - name: Wait for npm package to go live
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          for i in $(seq 1 60); do
+            if npm view "dynoxide@$VERSION" version >/dev/null 2>&1; then
+              echo "dynoxide@$VERSION is live on npm"
+              exit 0
+            fi
+            echo "Waiting for dynoxide@$VERSION on npm ($i/60)..."
+            sleep 10
+          done
+          echo "::error::dynoxide@$VERSION did not appear on npm within 10 minutes"
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Stamp release version into server.json
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          jq --arg v "$VERSION" '
+            .version = $v
+            | (.packages[] | select(.registryType == "npm")).version = $v
+            | (.packages[] | select(.registryType == "oci")).identifier = "ghcr.io/nubo-db/dynoxide:\($v)"
+          ' server.json > server.json.tmp
+          mv server.json.tmp server.json
+          cat server.json
+
+      - name: Authenticate to the MCP registry via GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        run: ./mcp-publisher publish
+
+  # -------------------------------------------------------------------
   # Notify dynoxide.dev so the marketing site rebuilds and the banner /
   # changelog pick up the new version. The site reads CHANGELOG.md from
   # this repo at build time, so it only needs a kick.

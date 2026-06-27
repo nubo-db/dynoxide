@@ -9,6 +9,11 @@ ARG TARGETARCH
 
 COPY dist/${TARGETARCH}/dynoxide /usr/local/bin/dynoxide
 
+# Ownership marker for the MCP registry. Must match the `name` in server.json;
+# the registry reads this label off the published image to verify the OCI
+# package belongs to io.github.nubo-db/dynoxide.
+LABEL io.modelcontextprotocol.server.name="io.github.nubo-db/dynoxide"
+
 WORKDIR /data
 
 # 8000: DynamoDB HTTP API (started by the default CMD).

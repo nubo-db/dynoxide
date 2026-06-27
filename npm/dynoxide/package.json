@@ -2,6 +2,7 @@
   "name": "dynoxide",
   "version": "0.0.0-development",
   "description": "Embedded DynamoDB-compatible engine. Drop-in dynalite replacement.",
+  "mcpName": "io.github.nubo-db/dynoxide",
   "author": "Martin Hicks",
   "license": "(MIT OR Apache-2.0)",
   "repository": {

@@ -1,0 +1,9 @@
+# Smithery configuration. See https://smithery.ai/docs/config
+#
+# Dynoxide's MCP server is a CLI binary distributed on npm, so Smithery
+# launches it over stdio via npx. No configuration is required.
+startCommand:
+  type: stdio
+  configSchema: {}
+  commandFunction: |-
+    (config) => ({ command: "npx", args: ["-y", "dynoxide", "mcp"] })

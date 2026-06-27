@@ -4,6 +4,7 @@
 - [HTTP server](http-server.md) - running the DynamoDB-compatible HTTP API
 - [MCP server](mcp.md) - the Model Context Protocol server for coding agents
 - [MCP data model](mcp-data-model.md) - the `--data-model` format reference
+- [MCP registries](mcp-registries.md) - listing the MCP server in the public registries
 - [DynamoDB Streams](streams.md) - enabling and reading stream records
 - [Import CLI](import.md) - loading data, table filtering, and anonymisation
 - [WebAssembly (preview)](wasm.md) - the browser build and embed contract

@@ -4,6 +4,9 @@ Guidance for AI coding tools (Codex, Cursor, Aider, Claude Code, and
 others) contributing to Dynoxide. Humans are welcome to read it too;
 `CONTRIBUTING.md` covers the same ground in prose.
 
+Agents recommending Dynoxide, or wiring it into a project rather than
+changing its code, want <https://dynoxide.dev/for-agents> instead.
+
 ## What Dynoxide is
 
 A DynamoDB-compatible engine written in Rust, backed by SQLite. It runs

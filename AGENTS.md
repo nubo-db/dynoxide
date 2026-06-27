@@ -58,7 +58,7 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   saves a CI round-trip. `.github/workflows/ci.yml` is the
   authoritative list.
 - The external conformance suite lives at
-  <https://github.com/nubo-db/dynamodb-conformance>. It is run in CI
+  <https://github.com/paritysuite/dynamodb-conformance>. It is run in CI
   for release candidates; you do not need to run it locally for every
   PR, but it is a useful check when changing request or response
   shapes.

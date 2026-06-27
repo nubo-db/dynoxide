@@ -57,7 +57,7 @@ or behaviour note that motivates the change. Cleaner ergonomics or
   test that fails before the fix.
 - Tests live in `tests/` and as inline `#[cfg(test)]` modules.
 - The external conformance suite
-  (<https://github.com/nubo-db/dynamodb-conformance>) runs in CI for
+  (<https://github.com/paritysuite/dynamodb-conformance>) runs in CI for
   release candidates. Running it locally is optional but useful when
   you change request or response shapes.
 

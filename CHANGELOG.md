@@ -198,7 +198,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **DynamoDB conformance suite** - 526 independently written tests across 3 tiers, validated against real DynamoDB ground truth. Dynoxide: 100%. DynamoDB Local: 92%. See [dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance).
+- **DynamoDB conformance suite** - 526 independently written tests across 3 tiers, validated against real DynamoDB ground truth. Dynoxide: 100%. DynamoDB Local: 92%. See [dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance).
 - **Dynalite external conformance** - 817/1039 passing (87.1% DynamoDB parity) against Dynalite's test suite, where real DynamoDB itself only passes 51%
 - **DynamoDB compatibility documentation** - a public compatibility summary covering operation, expression, index, and PartiQL support, with a DynamoDB Local comparison column
 - **Correctness fixes** - 41 issues resolved across core operations and PartiQL

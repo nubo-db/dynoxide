@@ -1,6 +1,6 @@
 # Dynoxide
 
-[![crates.io](https://img.shields.io/crates/v/dynoxide-rs.svg)](https://crates.io/crates/dynoxide-rs) [![docs.rs](https://img.shields.io/docsrs/dynoxide-rs)](https://docs.rs/dynoxide-rs) [![CI](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml/badge.svg)](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml) [![conformance](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nubo-db/dynamodb-conformance/main/results/dynoxide.badge.json)](https://paritysuite.org) [![license](https://img.shields.io/crates/l/dynoxide-rs.svg)](#license)
+[![crates.io](https://img.shields.io/crates/v/dynoxide-rs.svg)](https://crates.io/crates/dynoxide-rs) [![docs.rs](https://img.shields.io/docsrs/dynoxide-rs)](https://docs.rs/dynoxide-rs) [![CI](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml/badge.svg)](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml) [![conformance](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/paritysuite/dynamodb-conformance/main/results/dynoxide.badge.json)](https://paritysuite.org) [![license](https://img.shields.io/crates/l/dynoxide-rs.svg)](#license)
 
 A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for coding agents, or embeds directly into Rust and iOS applications as a library.
 
@@ -42,10 +42,10 @@ Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:
 
 ### Conformance
 
-Dynoxide is continuously verified against real DynamoDB by the [dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) suite, which runs one test matrix against AWS itself and every major DynamoDB emulator. Pass rates move as the suite grows and each engine changes, so rather than pin a snapshot that goes stale, see the live standings:
+Dynoxide is continuously verified against real DynamoDB by the [dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance) suite, which runs one test matrix against AWS itself and every major DynamoDB emulator. Pass rates move as the suite grows and each engine changes, so rather than pin a snapshot that goes stale, see the live standings:
 
 - **[paritysuite.org](https://paritysuite.org)**: current pass rates for every engine, broken down by tier
-- **[nubo-db/dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance#results)**: the suite itself, the raw results, and how each target is run
+- **[paritysuite/dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance#results)**: the suite itself, the raw results, and how each target is run
 
 This covers the native build. The [WebAssembly](#webassembly-preview) build is a preview and isn't run against the suite yet.
 

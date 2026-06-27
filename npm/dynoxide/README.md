@@ -69,7 +69,7 @@ The binary is the same one available via [Homebrew](https://github.com/nubo-db/h
 
 - [Full documentation and benchmarks](https://github.com/nubo-db/dynoxide)
 - [Changelog](https://github.com/nubo-db/dynoxide/blob/main/CHANGELOG.md)
-- [DynamoDB conformance results](https://github.com/nubo-db/dynamodb-conformance#results)
+- [DynamoDB conformance results](https://github.com/paritysuite/dynamodb-conformance#results)
 
 ## Licence
 

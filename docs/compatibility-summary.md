@@ -6,14 +6,14 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 **Consistency model:** SQLite provides strong consistency. `ConsistentRead` is accepted but has no effect - all reads are strongly consistent.
 
-> Behaviour validated by the [conformance suite](https://github.com/nubo-db/dynamodb-conformance). Pass rates move as the suite grows, so this page links to the [live results](https://paritysuite.org) rather than pinning a snapshot.
+> Behaviour validated by the [conformance suite](https://github.com/paritysuite/dynamodb-conformance). Pass rates move as the suite grows, so this page links to the [live results](https://paritysuite.org) rather than pinning a snapshot.
 
 ---
 
 ## Conformance
 
 Dynoxide's DynamoDB compatibility is independently verified by the
-[dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance) suite,
+[dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance) suite,
 which runs one test matrix against real DynamoDB and every major emulator across
 three tiers:
 
@@ -27,7 +27,7 @@ snapshot that goes stale, the current standings are published live:
 
 - **[paritysuite.org](https://paritysuite.org)** - pass rates for every engine, broken down by tier
 - **[paritysuite.org/capabilities](https://paritysuite.org/capabilities)** - the feature-by-feature support matrix
-- **[nubo-db/dynamodb-conformance](https://github.com/nubo-db/dynamodb-conformance#results)** - the suite, the raw results, and how each target is run
+- **[paritysuite/dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance#results)** - the suite, the raw results, and how each target is run
 
 A high conformance score means Dynoxide matches real DynamoDB behaviour for the
 tests in the suite. It does not mean "100% DynamoDB compatible" - there are

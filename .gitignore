@@ -26,3 +26,5 @@ tests/external/results/
 .claude/settings.local.json
 .worktrees
 .kos
+# Built MCPB bundle for Smithery; rebuild with: mcpb pack mcpb mcpb/dynoxide.mcpb
+/mcpb/*.mcpb

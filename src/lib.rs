@@ -523,71 +523,73 @@ impl Database<RusqliteBackend> {
             }
         }
 
-        // Compute request hash for idempotency comparison.
-        // Normalise via serde_json::Value (uses BTreeMap internally) to ensure
-        // deterministic key ordering regardless of HashMap iteration order.
-        let request_hash = if request.client_request_token.is_some() {
-            use std::hash::{Hash, Hasher};
-            let normalised = serde_json::to_value(&request.transact_items)
-                .and_then(|v| serde_json::to_vec(&v))
-                .unwrap_or_default();
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            normalised.hash(&mut hasher);
-            hasher.finish()
-        } else {
-            0
+        // The transaction executor, shared by the cache-miss and tokenless paths.
+        let execute_txn = || {
+            self.with_storage(|s| {
+                pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
+            })
         };
 
-        // Check idempotency cache
+        // Idempotency. For a token-bearing request, hold the cache lock across
+        // the whole first call (check, execute, insert) so two concurrent
+        // same-token calls cannot both execute the transaction: the second
+        // serialises behind the first and replays its result. A replay (cache
+        // hit) only needs the lock to read the cached entry, so it clones what
+        // it needs, releases the lock, then re-derives capacity.
+        //
+        // Lock ordering: this holds `idempotency_tokens` and then takes the
+        // storage lock inside `execute_txn`. That order (idempotency -> storage)
+        // is the only one in `Database` - nothing takes the storage lock and then
+        // `idempotency_tokens` - so there is no reverse path to deadlock against.
+        // Any future code touching both locks must keep this order.
         if let Some(ref token) = request.client_request_token {
-            // Resolve the cache hit while holding the lock and clone what the
-            // replay needs, then release the lock before re-deriving capacity so
-            // a same-token retry storm does not serialise on the global mutex.
-            // `Some(metrics)` is a hit; the inner value is the cached first-call
-            // item-collection metrics.
-            let cached_metrics = {
-                let mut cache = self.idempotency_tokens.lock().map_err(|e| {
-                    DynoxideError::InternalServerError(format!("Lock poisoned: {e}"))
-                })?;
-                // Evict expired entries
-                cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
-                match cache.get(token) {
-                    Some((_, cached_hash, resp)) => {
-                        if *cached_hash != request_hash {
-                            return Err(DynoxideError::IdempotentParameterMismatchException(
-                                "An error occurred (IdempotentParameterMismatchException)"
-                                    .to_string(),
-                            ));
-                        }
-                        Some(resp.item_collection_metrics.clone())
-                    }
-                    None => None,
-                }
+            // Hash over the transaction items only, normalised for stable key
+            // ordering regardless of HashMap iteration order. A same-token call
+            // differing only in ReturnConsumedCapacity replays rather than
+            // mismatches.
+            let request_hash = {
+                use std::hash::{Hash, Hasher};
+                let normalised = serde_json::to_value(&request.transact_items)
+                    .and_then(|v| serde_json::to_vec(&v))
+                    .unwrap_or_default();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                normalised.hash(&mut hasher);
+                hasher.finish()
             };
-            // A same-token in-window replay re-reads the stored result, so it
-            // reports READ capacity at the same magnitude as the first call's
-            // write, honouring this replay's own ReturnConsumedCapacity mode.
-            if let Some(cached_metrics) = cached_metrics {
+
+            let mut cache = self
+                .idempotency_tokens
+                .lock()
+                .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
+            // Evict expired entries
+            cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
+            if let Some((_, cached_hash, resp)) = cache.get(token) {
+                if *cached_hash != request_hash {
+                    return Err(DynoxideError::IdempotentParameterMismatchException(
+                        "An error occurred (IdempotentParameterMismatchException)".to_string(),
+                    ));
+                }
+                // Replay: clone what the response needs, release the lock, then
+                // build read capacity at the same magnitude as the first call's
+                // write, honouring this replay's own ReturnConsumedCapacity mode.
+                let cached_metrics = resp.item_collection_metrics.clone();
+                drop(cache);
                 return Ok(actions::transact_write_items::replay_response(
                     &request.transact_items,
                     &request.return_consumed_capacity,
                     cached_metrics,
                 ));
             }
+            // Cache miss: execute and record the result while still holding the
+            // lock, so a concurrent same-token call waits and then replays
+            // rather than executing the transaction a second time.
+            let resp = execute_txn()?;
+            cache.insert(token.clone(), (Instant::now(), request_hash, resp.clone()));
+            return Ok(resp);
         }
 
-        let resp = self.with_storage(|s| {
-            pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
-        })?;
-
-        // Cache the response if token was provided
-        if let Some(ref token) = request.client_request_token {
-            if let Ok(mut cache) = self.idempotency_tokens.lock() {
-                cache.insert(token.clone(), (Instant::now(), request_hash, resp.clone()));
-            }
-        }
-
-        Ok(resp)
+        // No idempotency token: execute without touching the cache.
+        execute_txn()
     }
 
     /// Execute a transactional read (up to 100 gets).

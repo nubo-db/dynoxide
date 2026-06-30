@@ -1190,6 +1190,66 @@ fn test_transact_get_total_mode_reports_top_level_read_capacity() {
     assert_eq!(entry.write_capacity_units, None);
 }
 
+/// Concurrency: same-token calls racing must not both execute the transaction.
+/// Each Put carries attribute_not_exists(pk), so a second execution would cancel
+/// where the first succeeded. Idempotency must serialise them: one executes, the
+/// rest replay, so every call returns Ok.
+#[test]
+fn test_transact_write_concurrent_same_token_executes_once() {
+    use std::sync::{Arc, Barrier};
+
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    const N: usize = 16;
+    let barrier = Arc::new(Barrier::new(N));
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            // Parse on the spawning thread, before the barrier: a panic here
+            // fails the test rather than hanging the other threads on the barrier.
+            let parsed = serde_json::from_value(json!({
+                "ClientRequestToken": "race-token",
+                "TransactItems": [
+                    {"Put": {
+                        "TableName": "Txn",
+                        "Item": {"pk": {"S": "once"}},
+                        "ConditionExpression": "attribute_not_exists(pk)"
+                    }}
+                ]
+            }))
+            .unwrap();
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.transact_write_items(parsed).is_ok()
+            })
+        })
+        .collect();
+
+    let oks = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|&ok| ok)
+        .count();
+    assert_eq!(
+        oks, N,
+        "all {N} same-token calls should succeed (one executes, the rest replay); got {oks}"
+    );
+
+    // The transaction applied exactly once (not zero times): the item exists.
+    let got = db
+        .get_item(
+            serde_json::from_value(json!({"TableName": "Txn", "Key": {"pk": {"S": "once"}}}))
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        got.item.is_some(),
+        "the transaction's Put must have applied"
+    );
+}
+
 // ---- empty-string key values surface top-level; type-mismatch / non-scalar stay cancellation reasons ----
 
 #[test]

@@ -300,13 +300,15 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet
+    // SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet.
+    // Query wraps the phrase in the "1 validation error detected:" envelope;
+    // Scan returns it bare. This asymmetry matches real DynamoDB.
     if request.select.as_deref() == Some("SPECIFIC_ATTRIBUTES")
         && request.projection_expression.is_none()
         && request.attributes_to_get.is_none()
     {
         return Err(DynoxideError::ValidationException(
-            "SPECIFIC_ATTRIBUTES requires either ProjectionExpression or AttributesToGet"
+            "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
                 .to_string(),
         ));
     }

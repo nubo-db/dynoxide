@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Query` and `Scan` now return DynamoDB's exact message when `Select: SPECIFIC_ATTRIBUTES` is given with no `ProjectionExpression` or `AttributesToGet`, where dynoxide rejected the request correctly but with its own wording. Both carried the same non-AWS string; the corrected phrase is `Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES`, which `Query` wraps in the `1 validation error detected:` envelope and `Scan` returns bare, matching real DynamoDB ([#121](https://github.com/nubo-db/dynoxide/issues/121)).
+
 ## [0.11.1] - 2026-06-26
 
 ### Fixed

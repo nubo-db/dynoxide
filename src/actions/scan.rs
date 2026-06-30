@@ -347,7 +347,7 @@ pub async fn execute<S: StorageBackend>(
         && request.attributes_to_get.is_none()
     {
         return Err(DynoxideError::ValidationException(
-            "SPECIFIC_ATTRIBUTES requires either ProjectionExpression or AttributesToGet"
+            "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
                 .to_string(),
         ));
     }

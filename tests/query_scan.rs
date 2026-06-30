@@ -681,10 +681,12 @@ fn test_query_specific_attributes_without_projection_rejected() {
     .unwrap();
 
     let err = db.query(req).unwrap_err();
-    assert!(
-        err.to_string().contains("SPECIFIC_ATTRIBUTES"),
-        "expected error mentioning SPECIFIC_ATTRIBUTES, got: {}",
-        err
+    // Query wraps the phrase in the "1 validation error detected:" envelope;
+    // Scan returns it bare. Verified against real AWS by the conformance suite.
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
+        "expected DynamoDB's exact Query message, got: {err}"
     );
 }
 
@@ -700,10 +702,10 @@ fn test_scan_specific_attributes_without_projection_rejected() {
     .unwrap();
 
     let err = db.scan(req).unwrap_err();
-    assert!(
-        err.to_string().contains("SPECIFIC_ATTRIBUTES"),
-        "expected error mentioning SPECIFIC_ATTRIBUTES, got: {}",
-        err
+    assert_eq!(
+        err.to_string(),
+        "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
+        "expected DynamoDB's exact message, got: {err}"
     );
 }
 

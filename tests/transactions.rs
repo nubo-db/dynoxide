@@ -983,6 +983,97 @@ fn test_transact_write_indexes_reports_table_write_capacity() {
     );
 }
 
+/// A transactional write reports top-level WriteCapacityUnits (and no
+/// ReadCapacityUnits) under INDEXES, matching real DynamoDB. One sub-1KB Put
+/// costs 2 transactional write units.
+#[test]
+fn test_transact_write_reports_top_level_write_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let req: serde_json::Value = json!({
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+        ]
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
+    assert_eq!(entry.write_capacity_units, Some(2.0));
+    assert_eq!(entry.read_capacity_units, None);
+}
+
+/// A standalone ConditionCheck action costs 2 write capacity units, billed as
+/// write, on its own table line under INDEXES. The check sits on a different
+/// table from the write so the per-table breakdown isolates its cost.
+#[test]
+fn test_transact_condition_check_costs_two_write_units() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "WriteTbl");
+    create_test_table(&db, "CheckTbl");
+    put_item(&db, "CheckTbl", "present", "x");
+
+    let req: serde_json::Value = json!({
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": [
+            {"Put": {"TableName": "WriteTbl", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}},
+            {"ConditionCheck": {
+                "TableName": "CheckTbl",
+                "Key": {"pk": {"S": "present"}},
+                "ConditionExpression": "attribute_exists(pk)"
+            }}
+        ]
+    });
+    let resp = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let caps = resp.consumed_capacity.unwrap();
+    let check = caps
+        .iter()
+        .find(|c| c.table_name == "CheckTbl")
+        .expect("per-table entry for the check table");
+    assert_eq!(check.capacity_units, 2.0);
+    assert_eq!(check.write_capacity_units, Some(2.0));
+}
+
+/// A same-token idempotent replay re-reads the stored result: the first call
+/// reports transactional WRITE capacity, and the in-window replay reports the
+/// same magnitude as READ capacity (with the opposite axis omitted), matching
+/// real DynamoDB.
+#[test]
+fn test_transact_write_replay_reports_read_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    let body = json!({
+        "ClientRequestToken": "replay-token-1",
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "a"}, "v": {"N": "1"}}}}
+        ]
+    });
+
+    let first = db
+        .transact_write_items(serde_json::from_value(body.clone()).unwrap())
+        .unwrap();
+    let first_entry = &first.consumed_capacity.unwrap()[0];
+    assert_eq!(first_entry.write_capacity_units, Some(2.0));
+    assert_eq!(first_entry.read_capacity_units, None);
+
+    let replay = db
+        .transact_write_items(serde_json::from_value(body).unwrap())
+        .unwrap();
+    let replay_entry = &replay.consumed_capacity.unwrap()[0];
+    assert_eq!(replay_entry.capacity_units, 2.0);
+    assert_eq!(replay_entry.read_capacity_units, Some(2.0));
+    assert_eq!(replay_entry.write_capacity_units, None);
+}
+
 // ---- empty-string key values surface top-level; type-mismatch / non-scalar stay cancellation reasons ----
 
 #[test]

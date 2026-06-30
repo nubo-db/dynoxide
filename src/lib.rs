@@ -552,7 +552,35 @@ impl Database<RusqliteBackend> {
                         "An error occurred (IdempotentParameterMismatchException)".to_string(),
                     ));
                 }
-                return Ok(resp.clone());
+                // A same-token in-window replay re-reads the stored result, so it
+                // reports READ capacity at the same magnitude as the first call's
+                // write, honouring this replay's own ReturnConsumedCapacity mode
+                // (the original call's mode does not carry over). The items are
+                // identical (the hash matched), so re-derive the units here.
+                let consumed_capacity = if matches!(
+                    request.return_consumed_capacity.as_deref(),
+                    Some("TOTAL") | Some("INDEXES")
+                ) {
+                    let caps: Vec<_> = actions::transact_write_items::transact_write_table_units(
+                        &request.transact_items,
+                    )
+                    .iter()
+                    .filter_map(|(table, &units)| {
+                        crate::types::transactional_read_capacity(
+                            table,
+                            units,
+                            &request.return_consumed_capacity,
+                        )
+                    })
+                    .collect();
+                    Some(caps)
+                } else {
+                    None
+                };
+                return Ok(actions::transact_write_items::TransactWriteItemsResponse {
+                    consumed_capacity,
+                    item_collection_metrics: resp.item_collection_metrics.clone(),
+                });
             }
         }
 

@@ -163,17 +163,7 @@ pub async fn execute<S: StorageBackend>(
         request.return_consumed_capacity.as_deref(),
         Some("TOTAL") | Some("INDEXES")
     ) {
-        // AWS charges 2 WCU per item for a transactional write: round each item
-        // up to whole write units first, then apply the 2x factor, then sum per
-        // table. Aggregating sizes before rounding would undercharge items that
-        // straddle a 1KB boundary.
-        let mut table_units: HashMap<String, f64> = HashMap::new();
-        for item in items {
-            let (table, size) = get_action_table_and_size(item);
-            *table_units.entry(table).or_default() += crate::types::TRANSACTIONAL_CAPACITY_FACTOR
-                * crate::types::write_capacity_units(size);
-        }
-        let caps: Vec<_> = table_units
+        let caps: Vec<_> = transact_write_table_units(items)
             .iter()
             .filter_map(|(table, &units)| {
                 crate::types::transactional_write_capacity(
@@ -191,6 +181,22 @@ pub async fn execute<S: StorageBackend>(
         consumed_capacity,
         item_collection_metrics: None,
     })
+}
+
+/// Per-table transactional write units for a set of actions. AWS charges 2 WCU
+/// per item for a transactional write: each item is rounded up to whole write
+/// units first, then doubled by the transactional factor, then summed per table
+/// (aggregating sizes before rounding would undercharge items straddling a 1KB
+/// boundary). Shared by `execute` (first-call write capacity) and the
+/// idempotent-replay path, which reports the same magnitude as read capacity.
+pub(crate) fn transact_write_table_units(items: &[TransactWriteItem]) -> HashMap<String, f64> {
+    let mut table_units: HashMap<String, f64> = HashMap::new();
+    for item in items {
+        let (table, size) = get_action_table_and_size(item);
+        *table_units.entry(table).or_default() +=
+            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::write_capacity_units(size);
+    }
+    table_units
 }
 
 async fn execute_within_transaction<S: StorageBackend>(

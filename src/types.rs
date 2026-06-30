@@ -754,6 +754,10 @@ pub struct ConsumedCapacity {
     pub table_name: String,
     #[serde(rename = "CapacityUnits")]
     pub capacity_units: f64,
+    #[serde(rename = "ReadCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub read_capacity_units: Option<f64>,
+    #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
+    pub write_capacity_units: Option<f64>,
     #[serde(rename = "Table", skip_serializing_if = "Option::is_none")]
     pub table: Option<CapacityDetail>,
     #[serde(
@@ -820,6 +824,7 @@ pub fn consumed_capacity(
             table: None,
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            ..Default::default()
         }),
         "INDEXES" => Some(ConsumedCapacity {
             table_name: table_name.to_string(),
@@ -830,6 +835,7 @@ pub fn consumed_capacity(
             }),
             global_secondary_indexes: None,
             local_secondary_indexes: None,
+            ..Default::default()
         }),
         _ => None,
     }
@@ -893,6 +899,7 @@ pub fn consumed_capacity_with_secondary_indexes(
                 }),
                 global_secondary_indexes: units_to_map(gsi_units),
                 local_secondary_indexes: units_to_map(lsi_units),
+                ..Default::default()
             })
         }
         "TOTAL" => {
@@ -904,6 +911,7 @@ pub fn consumed_capacity_with_secondary_indexes(
                 table: None,
                 global_secondary_indexes: None,
                 local_secondary_indexes: None,
+                ..Default::default()
             })
         }
         _ => None,
@@ -923,11 +931,13 @@ pub fn transactional_read_capacity(
         "TOTAL" => Some(ConsumedCapacity {
             table_name: table_name.to_string(),
             capacity_units: units,
+            read_capacity_units: Some(units),
             ..Default::default()
         }),
         "INDEXES" => Some(ConsumedCapacity {
             table_name: table_name.to_string(),
             capacity_units: units,
+            read_capacity_units: Some(units),
             table: Some(CapacityDetail {
                 capacity_units: units,
                 read_capacity_units: Some(units),
@@ -952,11 +962,13 @@ pub fn transactional_write_capacity(
         "TOTAL" => Some(ConsumedCapacity {
             table_name: table_name.to_string(),
             capacity_units: units,
+            write_capacity_units: Some(units),
             ..Default::default()
         }),
         "INDEXES" => Some(ConsumedCapacity {
             table_name: table_name.to_string(),
             capacity_units: units,
+            write_capacity_units: Some(units),
             table: Some(CapacityDetail {
                 capacity_units: units,
                 write_capacity_units: Some(units),

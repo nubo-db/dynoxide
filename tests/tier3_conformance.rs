@@ -535,3 +535,247 @@ fn update_expression_missing_eav_carries_invalid_update_expression_prefix() {
         "Expected Invalid UpdateExpression: prefix on missing-EAV error, got: {err}"
     );
 }
+
+// ---- Group D: CreateTable INCLUDE-projection NonKeyAttributes validation ----
+//
+// A secondary index with ProjectionType INCLUDE must carry a NonKeyAttributes
+// list. The rejection fires in the typed validator (validate_proj_structure),
+// reached by both GSI and LSI, so the request deserialises and the
+// ValidationException surfaces at create_table time. The exact wording is
+// asserted against real AWS eu-west-2 by the Parity Suite.
+
+#[test]
+fn create_table_gsi_include_without_non_key_attributes_rejected() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "GsiIncludeNoNka",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsipk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi_inc",
+            "KeySchema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "INCLUDE"}
+        }]
+    }))
+    .expect("INCLUDE with no NonKeyAttributes deserialises; rejection happens at create_table");
+    match db.create_table(req) {
+        Err(DynoxideError::ValidationException(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified"
+        ),
+        other => panic!("Expected ValidationException, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_lsi_include_without_non_key_attributes_rejected() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "LsiIncludeNoNka",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "lsi_sk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "LocalSecondaryIndexes": [{
+            "IndexName": "lsi_inc",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "lsi_sk", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "INCLUDE"}
+        }]
+    }))
+    .expect("INCLUDE with no NonKeyAttributes deserialises; rejection happens at create_table");
+    match db.create_table(req) {
+        Err(DynoxideError::ValidationException(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes is not specified"
+        ),
+        other => panic!("Expected ValidationException, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_gsi_include_with_non_key_attributes_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "GsiIncludeOk",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsipk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi_inc",
+            "KeySchema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["extra"]}
+        }]
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("INCLUDE with a NonKeyAttributes list should succeed");
+}
+
+#[test]
+fn create_table_gsi_all_with_non_key_attributes_rejected() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "GsiAllWithNka",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsipk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi_all",
+            "KeySchema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL", "NonKeyAttributes": ["extra"]}
+        }]
+    }))
+    .unwrap();
+    match db.create_table(req) {
+        Err(DynoxideError::ValidationException(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values were invalid: ProjectionType is ALL, but NonKeyAttributes is specified"
+        ),
+        other => panic!("Expected ValidationException, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_gsi_keys_only_with_non_key_attributes_rejected() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "GsiKeysOnlyWithNka",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsipk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi_ko",
+            "KeySchema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY", "NonKeyAttributes": ["extra"]}
+        }]
+    }))
+    .unwrap();
+    match db.create_table(req) {
+        Err(DynoxideError::ValidationException(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values were invalid: ProjectionType is KEYS_ONLY, but NonKeyAttributes is specified"
+        ),
+        other => panic!("Expected ValidationException, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_gsi_include_empty_non_key_attributes_still_rejected() {
+    // The empty-list case is caught earlier, on the JSON collector path, with
+    // the multi-field "length greater than or equal to 1" envelope. This guards
+    // that the new INCLUDE/absent rule does not disturb it.
+    let result = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+        "TableName": "GsiIncludeEmpty",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "gsipk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi_inc",
+            "KeySchema": [{"AttributeName": "gsipk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": []}
+        }]
+    }));
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Member must have length greater than or equal to 1"),
+        "Expected empty-NonKeyAttributes length constraint, got: {err}"
+    );
+}
+
+// ---- Group E: CreateTable StreamSpecification consistency ----
+//
+// A stream that is disabled must not also carry a view type: the view type only
+// has meaning when the stream is enabled, and real DynamoDB (eu-west-2, asserted
+// by the Parity Suite) rejects the combination. The check lives in the typed
+// validator, so the request deserialises and the ValidationException surfaces at
+// create_table time.
+
+#[test]
+fn create_table_stream_disabled_with_view_type_rejected() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamDisabledView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": false, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+    }))
+    .expect("disabled stream with a view type deserialises; rejection happens at create_table");
+    match db.create_table(req) {
+        Err(DynoxideError::ValidationException(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified"
+        ),
+        other => panic!("Expected ValidationException, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_stream_disabled_without_view_type_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamDisabledNoView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": false}
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("disabled stream with no view type should succeed");
+}
+
+#[test]
+fn create_table_stream_enabled_with_view_type_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamEnabledView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("enabled stream with a view type should succeed");
+}
+
+#[test]
+fn create_table_stream_enabled_without_view_type_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamEnabledNoView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": true}
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("enabled stream with no view type should default and succeed");
+}

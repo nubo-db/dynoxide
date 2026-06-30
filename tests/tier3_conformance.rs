@@ -706,3 +706,76 @@ fn create_table_gsi_include_empty_non_key_attributes_still_rejected() {
         "Expected empty-NonKeyAttributes length constraint, got: {err}"
     );
 }
+
+// ---- Group E: CreateTable StreamSpecification consistency ----
+//
+// A stream that is disabled must not also carry a view type: the view type only
+// has meaning when the stream is enabled, and real DynamoDB (eu-west-2, asserted
+// by the Parity Suite) rejects the combination. The check lives in the typed
+// validator, so the request deserialises and the ValidationException surfaces at
+// create_table time.
+
+#[test]
+fn create_table_stream_disabled_with_view_type_rejected() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamDisabledView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": false, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+    }))
+    .expect("disabled stream with a view type deserialises; rejection happens at create_table");
+    match db.create_table(req) {
+        Err(DynoxideError::ValidationException(msg)) => assert_eq!(
+            msg,
+            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified"
+        ),
+        other => panic!("Expected ValidationException, got: {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_stream_disabled_without_view_type_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamDisabledNoView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": false}
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("disabled stream with no view type should succeed");
+}
+
+#[test]
+fn create_table_stream_enabled_with_view_type_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamEnabledView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("enabled stream with a view type should succeed");
+}
+
+#[test]
+fn create_table_stream_enabled_without_view_type_succeeds() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "StreamEnabledNoView",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {"StreamEnabled": true}
+    }))
+    .unwrap();
+    db.create_table(req)
+        .expect("enabled stream with no view type should default and succeed");
+}

@@ -300,6 +300,7 @@ fn ve(msg: String) -> DynoxideError {
 /// 8. LSI/GSI structural validation (key schema, projections, duplicates, limits)
 /// 9. Cross-index duplicate names
 /// 10. Attribute definition count mismatch
+/// 11. StreamSpecification consistency (a disabled stream must not set a view type)
 fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
     if request.table_name.is_empty() {
         return Err(DynoxideError::ValidationException(
@@ -412,7 +413,7 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
     )
     .map_err(ve)?;
 
-    // Attribute definition count (last)
+    // Attribute definition count (last of the key/index checks)
     validate_attr_def_count(
         &request.key_schema,
         &request.attribute_definitions,
@@ -420,6 +421,19 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
         &request.global_secondary_indexes,
     )
     .map_err(ve)?;
+
+    // StreamSpecification consistency: a disabled stream must not carry a view
+    // type. Real DynamoDB rejects the combination, because a view type only has
+    // meaning when the stream is enabled.
+    if let Some(ref spec) = request.stream_specification {
+        if !spec.stream_enabled && spec.stream_view_type.is_some() {
+            return Err(DynoxideError::ValidationException(
+                "One or more parameter values were invalid: Table is being created with a stream \
+                 disabled, UpdateViewType should not be specified"
+                    .to_string(),
+            ));
+        }
+    }
 
     Ok(())
 }

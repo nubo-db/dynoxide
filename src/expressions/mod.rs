@@ -620,3 +620,16 @@ pub enum PathElement {
     Attribute(String),
     Index(usize),
 }
+
+/// Format a resolved path for overlap error messages: `[a]`, `[a, b]`, `[a, [0]]`.
+/// Shared by the ProjectionExpression and UpdateExpression overlap checks.
+pub(crate) fn format_path_for_error(path: &[PathElement]) -> String {
+    let parts: Vec<String> = path
+        .iter()
+        .map(|elem| match elem {
+            PathElement::Attribute(name) => name.clone(),
+            PathElement::Index(i) => format!("[{i}]"),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}

@@ -5,7 +5,8 @@
 
 use crate::expressions::tokenizer::{Token, TokenStream, near_window_tokenizer, tokenize};
 use crate::expressions::{
-    PathElement, TrackedExpressionAttributes, resolve_path, resolve_path_elements,
+    PathElement, TrackedExpressionAttributes, format_path_for_error, resolve_path,
+    resolve_path_elements,
 };
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -66,6 +67,45 @@ fn projection_parser_error(_expr: &str, _stream: &mut TokenStream, msg: String) 
     format!("Invalid ProjectionExpression: {msg}")
 }
 
+/// Validate a ProjectionExpression before any item is read: reject undefined
+/// expression-attribute names and overlapping document paths. Run eagerly, so a
+/// Scan/Query/GetItem that matches nothing still rejects.
+pub fn validate(
+    projection: &ProjectionExpr,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<(), String> {
+    // Resolve first: surfaces undefined names, and lets the overlap check compare
+    // resolved names as AWS does.
+    let mut resolved: Vec<Vec<PathElement>> = Vec::with_capacity(projection.paths.len());
+    for raw_path in &projection.paths {
+        let r = resolve_path_elements(raw_path, tracker)
+            .map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
+        resolved.push(r);
+    }
+    check_path_overlaps(&resolved)
+}
+
+/// Reject two paths where one is a prefix of the other (a duplicate is the
+/// self-prefix case). Reported in expression order, matching AWS.
+fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
+    for i in 0..paths.len() {
+        for j in (i + 1)..paths.len() {
+            let (a, b) = (&paths[i], &paths[j]);
+            let min_len = a.len().min(b.len());
+            let common = (0..min_len).take_while(|&k| a[k] == b[k]).count();
+            if common == a.len() || common == b.len() {
+                return Err(format!(
+                    "Invalid ProjectionExpression: Two document paths overlap with each other; \
+                     must remove or rewrite one of these paths; path one: {}, path two: {}",
+                    format_path_for_error(a),
+                    format_path_for_error(b)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply a projection to an item, returning only the specified attributes.
 /// Key attributes are always included.
 pub fn apply(
@@ -83,15 +123,45 @@ pub fn apply(
         }
     }
 
-    // Add projected attributes
+    // Resolve every path first so name refs are concrete before ordering.
+    let mut resolved_paths: Vec<Vec<PathElement>> = Vec::with_capacity(projection.paths.len());
     for raw_path in &projection.paths {
-        let resolved = resolve_path_elements(raw_path, tracker)?;
-        if let Some(val) = resolve_path(item, &resolved) {
-            insert_at_path(&mut result, &resolved, val);
+        resolved_paths.push(resolve_path_elements(raw_path, tracker)?);
+    }
+
+    // DynamoDB returns projected list elements compacted and in ascending index
+    // order regardless of request order (`l[2], l[0]` yields `[l0, l2]`). Sort and
+    // dedup the resolved paths before insertion; only list order is affected,
+    // since map keys are unordered.
+    resolved_paths.sort_by(|a, b| compare_paths(a, b));
+    resolved_paths.dedup();
+
+    for resolved in &resolved_paths {
+        if let Some(val) = resolve_path(item, resolved) {
+            insert_at_path(&mut result, resolved, val);
         }
     }
 
     Ok(result)
+}
+
+/// Order resolved paths so a list's requested indices sort ascending. Attribute
+/// names sort lexicographically, which only groups siblings since result maps
+/// are unordered.
+fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (ea, eb) in a.iter().zip(b.iter()) {
+        let ord = match (ea, eb) {
+            (PathElement::Attribute(x), PathElement::Attribute(y)) => x.cmp(y),
+            (PathElement::Index(x), PathElement::Index(y)) => x.cmp(y),
+            (PathElement::Attribute(_), PathElement::Index(_)) => Ordering::Less,
+            (PathElement::Index(_), PathElement::Attribute(_)) => Ordering::Greater,
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
@@ -263,6 +333,95 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_overlapping_paths() {
+        let proj = parse("#a, #a.#b").unwrap();
+        let names = Some(HashMap::from([
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+        ]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_paths() {
+        let proj = parse("#a, #a").unwrap();
+        let names = Some(HashMap::from([("#a".to_string(), "a".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert!(err.contains("Two document paths overlap"), "got: {err}");
+        assert!(err.ends_with("path one: [a], path two: [a]"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_reports_overlap_in_expression_order() {
+        // Overlapping pair is the 2nd and 3rd path; reported in expression order.
+        let proj = parse("#x, #a, #a.#b").unwrap();
+        let names = Some(HashMap::from([
+            ("#x".to_string(), "x".to_string()),
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+        ]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert!(
+            err.ends_with("path one: [a], path two: [a, b]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_list_attr_and_its_index() {
+        let proj = parse("#l, #l[0]").unwrap();
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        assert!(validate(&proj, &tracker).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_sibling_list_indices() {
+        let proj = parse("#l[0], #l[1]").unwrap();
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        assert!(validate(&proj, &tracker).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sibling_paths() {
+        let proj = parse("#a.#b, #a.#c").unwrap();
+        let names = Some(HashMap::from([
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+            ("#c".to_string(), "c".to_string()),
+        ]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        assert!(validate(&proj, &tracker).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_undefined_name() {
+        let proj = parse("#undef").unwrap();
+        let no_names = None;
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&no_names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid ProjectionExpression: An expression attribute name used in the document path is not defined; attribute name: #undef"
+        );
+    }
+
+    #[test]
     fn test_apply_simple() {
         let proj = parse("label").unwrap();
         let item = make_item(&[
@@ -315,6 +474,61 @@ mod tests {
         let tracker = TrackedExpressionAttributes::new(&names, &no_values);
         let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
         assert!(result.contains_key("name"));
+    }
+
+    #[test]
+    fn test_apply_list_indices_compacted_and_ordered() {
+        // Real AWS returns projected list elements compacted and in ascending
+        // index order regardless of request order: `#l[2], #l[0]` -> [l0, l2].
+        let proj = parse("#l[2], #l[0]").unwrap();
+        let item = make_item(&[
+            ("pk", AttributeValue::S("key1".into())),
+            (
+                "l",
+                AttributeValue::L(vec![
+                    AttributeValue::S("l0".into()),
+                    AttributeValue::S("l1".into()),
+                    AttributeValue::S("l2".into()),
+                ]),
+            ),
+        ]);
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
+        match &result["l"] {
+            AttributeValue::L(list) => assert_eq!(
+                list,
+                &vec![
+                    AttributeValue::S("l0".into()),
+                    AttributeValue::S("l2".into()),
+                ]
+            ),
+            _ => panic!("expected list"),
+        }
+    }
+
+    #[test]
+    fn test_apply_single_list_index() {
+        let proj = parse("#l[1]").unwrap();
+        let item = make_item(&[
+            ("pk", AttributeValue::S("key1".into())),
+            (
+                "l",
+                AttributeValue::L(vec![
+                    AttributeValue::S("l0".into()),
+                    AttributeValue::S("l1".into()),
+                ]),
+            ),
+        ]);
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
+        match &result["l"] {
+            AttributeValue::L(list) => assert_eq!(list, &vec![AttributeValue::S("l1".into())]),
+            _ => panic!("expected list"),
+        }
     }
 
     #[test]

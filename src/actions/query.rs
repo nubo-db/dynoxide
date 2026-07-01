@@ -779,6 +779,10 @@ pub async fn execute<S: StorageBackend>(
     }
     if let Some(ref proj) = projection {
         tracker.track_projection_expr(proj);
+        // Reject undefined names and overlapping paths before the row loop, so a
+        // zero-match query still rejects.
+        expressions::projection::validate(proj, &tracker)
+            .map_err(DynoxideError::ValidationException)?;
     }
 
     // Untracked variant for the per-item hot loop — tracking already done above

@@ -88,17 +88,28 @@ pub async fn execute<S: StorageBackend>(
     // --- Pre-table validations ---
     // DynamoDB validates expression attributes, key values, projections, and duplicates
     // BEFORE checking table existence. Perform these checks first.
+
+    // Reject a request that pairs an expression projection with a non-expression
+    // AttributesToGet, whether in the same block or across blocks. AWS rejects the
+    // request as a whole even when each block is internally consistent.
+    // Order-independent over the request map.
+    let any_projection = request
+        .request_items
+        .values()
+        .any(|ka| ka.projection_expression.is_some());
+    let any_attributes_to_get = request
+        .request_items
+        .values()
+        .any(|ka| ka.attributes_to_get.is_some());
+    if any_projection && any_attributes_to_get {
+        return Err(DynoxideError::ValidationException(
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}".to_string(),
+        ));
+    }
+
     for keys_and_attrs in request.request_items.values() {
-        // Check AttributesToGet + expression conflict
-        let has_attributes_to_get = keys_and_attrs.attributes_to_get.is_some();
         let has_projection_expr = keys_and_attrs.projection_expression.is_some();
         let has_expr_attr_names = keys_and_attrs.expression_attribute_names.is_some();
-
-        if has_attributes_to_get && has_projection_expr {
-            return Err(DynoxideError::ValidationException(
-                "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}".to_string(),
-            ));
-        }
 
         // ExpressionAttributeNames without expression
         if has_expr_attr_names && !has_projection_expr {
@@ -203,6 +214,9 @@ pub async fn execute<S: StorageBackend>(
         // Pre-register projection expression references
         if let Some(ref proj) = projection {
             tracker.track_projection_expr(proj);
+            // Reject undefined names and overlapping paths before reading.
+            expressions::projection::validate(proj, &tracker)
+                .map_err(DynoxideError::ValidationException)?;
         }
 
         // BatchGetItem does NOT automatically include key attributes in projections.

@@ -188,6 +188,9 @@ pub async fn execute<S: StorageBackend>(
         let parsed = crate::expressions::projection::parse(proj_expr)
             .map_err(DynoxideError::ValidationException)?;
         tracker.track_projection_expr(&parsed);
+        // Reject undefined names and overlapping paths before the read, so a miss still rejects.
+        crate::expressions::projection::validate(&parsed, &tracker)
+            .map_err(DynoxideError::ValidationException)?;
 
         if let Some(full_item) = item {
             // GetItem does NOT automatically include key attributes in projection.

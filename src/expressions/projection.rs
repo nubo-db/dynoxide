@@ -83,15 +83,48 @@ pub fn apply(
         }
     }
 
-    // Add projected attributes
+    // Resolve every path first so name refs are concrete before ordering.
+    let mut resolved_paths: Vec<Vec<PathElement>> = Vec::with_capacity(projection.paths.len());
     for raw_path in &projection.paths {
-        let resolved = resolve_path_elements(raw_path, tracker)?;
-        if let Some(val) = resolve_path(item, &resolved) {
-            insert_at_path(&mut result, &resolved, val);
+        resolved_paths.push(resolve_path_elements(raw_path, tracker)?);
+    }
+
+    // DynamoDB returns projected list elements compacted and in ascending index
+    // order, independent of the order the indices were requested (e.g. `l[2], l[0]`
+    // yields `[l0, l2]`). Sorting the resolved paths index-aware before insertion
+    // produces that ordering; dropping identical paths compacts repeated indices.
+    // Top-level attributes and nested map keys land in unordered maps, so this
+    // reordering is observable only in list element order, which is exactly where
+    // AWS parity requires it.
+    resolved_paths.sort_by(|a, b| compare_paths(a, b));
+    resolved_paths.dedup();
+
+    for resolved in &resolved_paths {
+        if let Some(val) = resolve_path(item, resolved) {
+            insert_at_path(&mut result, resolved, val);
         }
     }
 
     Ok(result)
+}
+
+/// Order two resolved projection paths so that, within one list, the requested
+/// indices sort ascending. Attribute names sort lexicographically (their result
+/// map is unordered, so this only groups siblings); index elements sort by value.
+fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (ea, eb) in a.iter().zip(b.iter()) {
+        let ord = match (ea, eb) {
+            (PathElement::Attribute(x), PathElement::Attribute(y)) => x.cmp(y),
+            (PathElement::Index(x), PathElement::Index(y)) => x.cmp(y),
+            (PathElement::Attribute(_), PathElement::Index(_)) => Ordering::Less,
+            (PathElement::Index(_), PathElement::Attribute(_)) => Ordering::Greater,
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
@@ -315,6 +348,61 @@ mod tests {
         let tracker = TrackedExpressionAttributes::new(&names, &no_values);
         let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
         assert!(result.contains_key("name"));
+    }
+
+    #[test]
+    fn test_apply_list_indices_compacted_and_ordered() {
+        // Real AWS returns projected list elements compacted and in ascending
+        // index order regardless of request order: `#l[2], #l[0]` -> [l0, l2].
+        let proj = parse("#l[2], #l[0]").unwrap();
+        let item = make_item(&[
+            ("pk", AttributeValue::S("key1".into())),
+            (
+                "l",
+                AttributeValue::L(vec![
+                    AttributeValue::S("l0".into()),
+                    AttributeValue::S("l1".into()),
+                    AttributeValue::S("l2".into()),
+                ]),
+            ),
+        ]);
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
+        match &result["l"] {
+            AttributeValue::L(list) => assert_eq!(
+                list,
+                &vec![
+                    AttributeValue::S("l0".into()),
+                    AttributeValue::S("l2".into()),
+                ]
+            ),
+            _ => panic!("expected list"),
+        }
+    }
+
+    #[test]
+    fn test_apply_single_list_index() {
+        let proj = parse("#l[1]").unwrap();
+        let item = make_item(&[
+            ("pk", AttributeValue::S("key1".into())),
+            (
+                "l",
+                AttributeValue::L(vec![
+                    AttributeValue::S("l0".into()),
+                    AttributeValue::S("l1".into()),
+                ]),
+            ),
+        ]);
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
+        match &result["l"] {
+            AttributeValue::L(list) => assert_eq!(list, &vec![AttributeValue::S("l1".into())]),
+            _ => panic!("expected list"),
+        }
     }
 
     #[test]

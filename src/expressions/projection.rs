@@ -136,9 +136,17 @@ pub fn apply(
     resolved_paths.sort_by(|a, b| compare_paths(a, b));
     resolved_paths.dedup();
 
+    // Reconstruct each path in sorted order. Two paths sharing a list index
+    // (`l[0].a`, `l[0].b`) must land in one output element, not split across two.
+    // Because the paths are sorted, same-index paths are contiguous, so the
+    // common-prefix length with the previously inserted path says how deep to
+    // reuse existing list elements instead of pushing new ones.
+    let mut prev: Option<&[PathElement]> = None;
     for resolved in &resolved_paths {
         if let Some(val) = resolve_path(item, resolved) {
-            insert_at_path(&mut result, resolved, val);
+            let common = prev.map_or(0, |p| common_prefix_len(p, resolved));
+            insert_at_path_merging(&mut result, resolved, val, common);
+            prev = Some(resolved);
         }
     }
 
@@ -162,6 +170,11 @@ fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
         }
     }
     a.len().cmp(&b.len())
+}
+
+/// Number of leading path elements two resolved paths share.
+fn common_prefix_len(a: &[PathElement], b: &[PathElement]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
@@ -231,10 +244,29 @@ fn default_for_next(next: &PathElement) -> AttributeValue {
 /// Insert a value at the path location in the result map.
 /// For simple top-level attributes, this is a direct insert.
 /// For nested paths, we build the necessary intermediate structure.
+///
+/// Each call is independent: no list element is reused (a common prefix of
+/// zero). Projection reconstruction, which coalesces several paths that share a
+/// list index, goes through `insert_at_path_merging` instead.
 pub(crate) fn insert_at_path(
     result: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
     value: AttributeValue,
+) {
+    insert_at_path_merging(result, path, value, 0);
+}
+
+/// Insert a value at the path location, reusing already-built list elements
+/// within the first `common` path elements. `common` is the length of the
+/// prefix this path shares with the previously inserted path; because paths are
+/// inserted in sorted order, a shared prefix means the previous path already
+/// created the list element for each index inside it, so this path merges into
+/// the same element rather than pushing a fresh one.
+fn insert_at_path_merging(
+    result: &mut HashMap<String, AttributeValue>,
+    path: &[PathElement],
+    value: AttributeValue,
+    common: usize,
 ) {
     if path.is_empty() {
         return;
@@ -252,11 +284,20 @@ pub(crate) fn insert_at_path(
         let entry = result
             .entry(name.clone())
             .or_insert_with(|| default_for_next(&path[1]));
-        insert_nested(entry, &path[1..], value);
+        insert_nested(entry, &path[1..], value, common, 1);
     }
 }
 
-fn insert_nested(current: &mut AttributeValue, path: &[PathElement], value: AttributeValue) {
+/// Reconstruct `path` into `current`, merging into the last list element when
+/// this position falls inside the shared prefix with the previously inserted
+/// path (`depth < common`). `depth` is the index of `path[0]` in the full path.
+fn insert_nested(
+    current: &mut AttributeValue,
+    path: &[PathElement],
+    value: AttributeValue,
+    common: usize,
+    depth: usize,
+) {
     if path.is_empty() {
         return;
     }
@@ -283,15 +324,21 @@ fn insert_nested(current: &mut AttributeValue, path: &[PathElement], value: Attr
                 let entry = map
                     .entry(name.clone())
                     .or_insert_with(|| default_for_next(&path[1]));
-                insert_nested(entry, &path[1..], value);
+                insert_nested(entry, &path[1..], value, common, depth + 1);
             }
         }
         PathElement::Index(_) => {
             if let AttributeValue::L(list) = current {
-                // Push a new element for this projected index
-                list.push(default_for_next(&path[1]));
+                // Inside the shared prefix, the previously inserted path already
+                // built the element for this source index (paths are sorted, so
+                // same-index paths are adjacent and ascending), so merge into the
+                // last element. Otherwise start a new one.
+                let reuse_last = depth < common && !list.is_empty();
+                if !reuse_last {
+                    list.push(default_for_next(&path[1]));
+                }
                 let last = list.last_mut().unwrap();
-                insert_nested(last, &path[1..], value);
+                insert_nested(last, &path[1..], value, common, depth + 1);
             }
         }
     }
@@ -541,5 +588,172 @@ mod tests {
         let result = apply(&item, &proj, &tracker, &["pk".to_string()]).unwrap();
         assert!(!result.contains_key("nonexistent"));
         assert!(result.contains_key("pk")); // Key always present
+    }
+
+    // ---------------------------------------------------------------------------
+    // #126: paths sharing a list index merge into one reconstructed element.
+    // ---------------------------------------------------------------------------
+
+    /// A tracker whose names cover every segment used by the merge fixtures.
+    /// `apply` ignores names it does not resolve, so one shared map is fine.
+    fn merge_names() -> Option<HashMap<String, String>> {
+        Some(HashMap::from([
+            ("#l".to_string(), "l".to_string()),
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+            ("#c".to_string(), "c".to_string()),
+            ("#m".to_string(), "m".to_string()),
+            ("#n".to_string(), "n".to_string()),
+            ("#p".to_string(), "p".to_string()),
+            ("#q".to_string(), "q".to_string()),
+            ("#x".to_string(), "x".to_string()),
+            ("#y".to_string(), "y".to_string()),
+        ]))
+    }
+
+    /// Item whose list index 0 carries scalars, a nested map, and a nested list,
+    /// so same-index merges can be probed at depth. Indices 1 and 2 give a
+    /// distinct-index element to compact against.
+    fn merge_fixture_item() -> HashMap<String, AttributeValue> {
+        let map = |pairs: &[(&str, &str)]| {
+            AttributeValue::M(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), AttributeValue::S((*v).into())))
+                    .collect(),
+            )
+        };
+        let elem0 = AttributeValue::M(HashMap::from([
+            ("a".to_string(), AttributeValue::S("a0".into())),
+            ("b".to_string(), AttributeValue::S("b0".into())),
+            ("m".to_string(), map(&[("x", "x0"), ("y", "y0")])),
+            (
+                "n".to_string(),
+                AttributeValue::L(vec![
+                    map(&[("p", "p00"), ("q", "q00")]),
+                    map(&[("p", "p01"), ("q", "q01")]),
+                ]),
+            ),
+        ]));
+        make_item(&[
+            ("pk", AttributeValue::S("k".into())),
+            (
+                "l",
+                AttributeValue::L(vec![
+                    elem0,
+                    map(&[("a", "a1"), ("b", "b1")]),
+                    map(&[("a", "a2"), ("b", "b2"), ("c", "c2")]),
+                ]),
+            ),
+        ])
+    }
+
+    fn apply_merge(expr: &str) -> HashMap<String, AttributeValue> {
+        let names = merge_names();
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let proj = parse(expr).unwrap();
+        apply(&merge_fixture_item(), &proj, &tracker, &["pk".to_string()]).unwrap()
+    }
+
+    fn expect_list(item: &HashMap<String, AttributeValue>, key: &str) -> Vec<AttributeValue> {
+        as_list(&item[key])
+    }
+
+    fn as_list(value: &AttributeValue) -> Vec<AttributeValue> {
+        match value {
+            AttributeValue::L(l) => l.clone(),
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    fn expect_map(value: &AttributeValue) -> HashMap<String, AttributeValue> {
+        match value {
+            AttributeValue::M(m) => m.clone(),
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_same_list_index_merges_scalar_siblings() {
+        // #126 core case: `l[0].a, l[0].b` merges into one element, not two.
+        let result = apply_merge("#l[0].#a, #l[0].#b");
+        let list = expect_list(&result, "l");
+        assert_eq!(list.len(), 1, "same index must merge into one element");
+        let m = expect_map(&list[0]);
+        assert_eq!(m.get("a"), Some(&AttributeValue::S("a0".into())));
+        assert_eq!(m.get("b"), Some(&AttributeValue::S("b0".into())));
+        assert!(!m.contains_key("c"), "unprojected sibling is dropped");
+    }
+
+    #[test]
+    fn test_apply_same_list_index_merges_nested_map() {
+        // Depth case: `l[0].m.x, l[0].m.y` shares the nested map under index 0.
+        let result = apply_merge("#l[0].#m.#x, #l[0].#m.#y");
+        let list = expect_list(&result, "l");
+        assert_eq!(list.len(), 1);
+        let inner = expect_map(&expect_map(&list[0])["m"]);
+        assert_eq!(inner.get("x"), Some(&AttributeValue::S("x0".into())));
+        assert_eq!(inner.get("y"), Some(&AttributeValue::S("y0".into())));
+    }
+
+    #[test]
+    fn test_apply_same_list_index_merges_scalar_and_nested_siblings() {
+        // Mixed shape: a scalar and a nested-map sibling under one index merge.
+        let result = apply_merge("#l[0].#a, #l[0].#m.#x");
+        let list = expect_list(&result, "l");
+        assert_eq!(list.len(), 1);
+        let m = expect_map(&list[0]);
+        assert_eq!(m.get("a"), Some(&AttributeValue::S("a0".into())));
+        let inner = expect_map(&m["m"]);
+        assert_eq!(inner.get("x"), Some(&AttributeValue::S("x0".into())));
+        assert!(!inner.contains_key("y"));
+    }
+
+    #[test]
+    fn test_apply_same_and_distinct_list_index_compacts() {
+        // `l[0].a, l[0].b, l[2].c`: index 0 merged, index 2 separate, compacted.
+        let result = apply_merge("#l[0].#a, #l[0].#b, #l[2].#c");
+        let list = expect_list(&result, "l");
+        assert_eq!(list.len(), 2, "merge on index 0, keep index 2, compact");
+        let e0 = expect_map(&list[0]);
+        assert_eq!(e0.get("a"), Some(&AttributeValue::S("a0".into())));
+        assert_eq!(e0.get("b"), Some(&AttributeValue::S("b0".into())));
+        let e1 = expect_map(&list[1]);
+        assert_eq!(e1.get("c"), Some(&AttributeValue::S("c2".into())));
+        assert!(!e1.contains_key("a"));
+    }
+
+    #[test]
+    fn test_apply_same_list_index_merges_nested_list_element() {
+        // Nested list: `l[0].n[0].p, l[0].n[0].q` shares inner index 0 too.
+        let result = apply_merge("#l[0].#n[0].#p, #l[0].#n[0].#q");
+        let list = expect_list(&result, "l");
+        assert_eq!(list.len(), 1);
+        let n = as_list(&expect_map(&list[0])["n"]);
+        assert_eq!(n.len(), 1, "nested list element merged");
+        let n0 = expect_map(&n[0]);
+        assert_eq!(n0.get("p"), Some(&AttributeValue::S("p00".into())));
+        assert_eq!(n0.get("q"), Some(&AttributeValue::S("q00".into())));
+    }
+
+    #[test]
+    fn test_apply_distinct_inner_list_indices_stay_separate() {
+        // `l[0].n[0].p, l[0].n[1].q`: outer index shared, inner indices distinct.
+        let result = apply_merge("#l[0].#n[0].#p, #l[0].#n[1].#q");
+        let list = expect_list(&result, "l");
+        assert_eq!(list.len(), 1);
+        let n = as_list(&expect_map(&list[0])["n"]);
+        assert_eq!(
+            n.len(),
+            2,
+            "distinct inner indices stay separate, compacted"
+        );
+        let n0 = expect_map(&n[0]);
+        assert_eq!(n0.get("p"), Some(&AttributeValue::S("p00".into())));
+        assert!(!n0.contains_key("q"));
+        let n1 = expect_map(&n[1]);
+        assert_eq!(n1.get("q"), Some(&AttributeValue::S("q01".into())));
+        assert!(!n1.contains_key("p"));
     }
 }

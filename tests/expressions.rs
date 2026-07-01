@@ -1661,6 +1661,131 @@ fn test_projection_with_nested_path_and_list_index() {
 }
 
 // ---------------------------------------------------------------------------
+// #126: projected sub-attributes of one list index merge into one element
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_projection_same_list_index_merges() {
+    // Two projected paths sharing a list index return a single merged element,
+    // matching real DynamoDB (pinned in the parity suite).
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let elem0 = AttributeValue::M(
+        [
+            ("a".to_string(), AttributeValue::S("a0".into())),
+            ("b".to_string(), AttributeValue::S("b0".into())),
+            ("c".to_string(), AttributeValue::S("c0".into())),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", AttributeValue::S("k1".into())),
+            ("l", AttributeValue::L(vec![elem0])),
+        ],
+    );
+
+    let resp = db
+        .get_item(GetItemRequest {
+            table_name: "Tbl".into(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            projection_expression: Some("#l[0].#a, #l[0].#b".into()),
+            expression_attribute_names: Some(HashMap::from([
+                ("#l".to_string(), "l".to_string()),
+                ("#a".to_string(), "a".to_string()),
+                ("#b".to_string(), "b".to_string()),
+            ])),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let item = resp.item.unwrap();
+    let list = match &item["l"] {
+        AttributeValue::L(l) => l,
+        other => panic!("expected list, got {:?}", other),
+    };
+    assert_eq!(list.len(), 1, "same index must merge into one element");
+    let m = match &list[0] {
+        AttributeValue::M(m) => m,
+        other => panic!("expected map, got {:?}", other),
+    };
+    assert_eq!(m["a"], AttributeValue::S("a0".into()));
+    assert_eq!(m["b"], AttributeValue::S("b0".into()));
+    assert!(!m.contains_key("c"));
+}
+
+#[test]
+fn test_projection_same_list_index_mixed_compacts() {
+    // Merge on the shared index, keep a distinct index separate, and compact to
+    // ascending order: `l[0].a, l[0].b, l[2].c` -> [ {a,b}, {c} ].
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let elem = |n: &str| {
+        AttributeValue::M(
+            [
+                ("a".to_string(), AttributeValue::S(format!("a{n}"))),
+                ("b".to_string(), AttributeValue::S(format!("b{n}"))),
+                ("c".to_string(), AttributeValue::S(format!("c{n}"))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", AttributeValue::S("k1".into())),
+            (
+                "l",
+                AttributeValue::L(vec![elem("0"), elem("1"), elem("2")]),
+            ),
+        ],
+    );
+
+    let resp = db
+        .get_item(GetItemRequest {
+            table_name: "Tbl".into(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            projection_expression: Some("#l[0].#a, #l[0].#b, #l[2].#c".into()),
+            expression_attribute_names: Some(HashMap::from([
+                ("#l".to_string(), "l".to_string()),
+                ("#a".to_string(), "a".to_string()),
+                ("#b".to_string(), "b".to_string()),
+                ("#c".to_string(), "c".to_string()),
+            ])),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let item = resp.item.unwrap();
+    let list = match &item["l"] {
+        AttributeValue::L(l) => l,
+        other => panic!("expected list, got {:?}", other),
+    };
+    assert_eq!(list.len(), 2);
+    let e0 = match &list[0] {
+        AttributeValue::M(m) => m,
+        other => panic!("expected map, got {:?}", other),
+    };
+    assert_eq!(e0["a"], AttributeValue::S("a0".into()));
+    assert_eq!(e0["b"], AttributeValue::S("b0".into()));
+    let e1 = match &list[1] {
+        AttributeValue::M(m) => m,
+        other => panic!("expected map, got {:?}", other),
+    };
+    assert_eq!(e1["c"], AttributeValue::S("c2".into()));
+    assert!(!e1.contains_key("a"));
+}
+
+// ---------------------------------------------------------------------------
 // SET intermediate map path — auto-create missing intermediate maps
 // ---------------------------------------------------------------------------
 

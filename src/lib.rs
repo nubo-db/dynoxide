@@ -107,8 +107,9 @@ pub struct ImportResult {
     pub bytes_imported: usize,
 }
 
-/// Cached transaction response with timestamp and request hash for idempotency.
-type TokenCache = HashMap<
+/// Cached `TransactWriteItems` response with timestamp and request hash for
+/// idempotency.
+type TransactWriteTokenCache = HashMap<
     String,
     (
         Instant,
@@ -118,10 +119,11 @@ type TokenCache = HashMap<
 >;
 
 /// Cached `ExecuteTransaction` response with timestamp and request hash for
-/// idempotency. Separate from [`TokenCache`] because the response type differs
-/// and `ClientRequestToken` idempotency is scoped per API operation in AWS: a
-/// token reused across `TransactWriteItems` and `ExecuteTransaction` executes
-/// once in each, so the two caches are independent by design.
+/// idempotency. Separate from [`TransactWriteTokenCache`] because the response
+/// type differs and `ClientRequestToken` idempotency is scoped per API
+/// operation in AWS: a token reused across `TransactWriteItems` and
+/// `ExecuteTransaction` executes once in each, so the two caches are
+/// independent by design.
 type ExecuteTransactionTokenCache = HashMap<
     String,
     (
@@ -130,6 +132,98 @@ type ExecuteTransactionTokenCache = HashMap<
         actions::execute_transaction::ExecuteTransactionResponse,
     ),
 >;
+
+/// AWS caps `ClientRequestToken` at 36 characters. Shared by the two
+/// transactional idempotency paths ([`run_idempotent`]).
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const MAX_TOKEN_LEN: usize = 36;
+
+/// AWS scopes transactional idempotency to a 10-minute window. Entries older
+/// than this are evicted on the next token-bearing call.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const TOKEN_EXPIRY_SECS: u64 = 600;
+
+/// Run a transactional operation with `ClientRequestToken` idempotency, shared
+/// by [`Database::transact_write_items`] and [`Database::execute_transaction`].
+///
+/// For a token-bearing request the cache lock is held across the whole first
+/// call (check, execute, insert) so two concurrent same-token calls cannot both
+/// execute: the second serialises behind the first and replays. A cache hit
+/// clones the stored response, releases the lock, then rebuilds the reply via
+/// `replay` (which re-derives read capacity). Lock ordering is cache-then-
+/// storage: `execute` takes the storage lock second, and nothing takes storage
+/// first and then a token cache, so there is no reverse path to deadlock
+/// against. Any future code touching both locks must keep this order.
+///
+/// `hash_input` is the stable idempotency key material - the items or
+/// statements only, never `ReturnConsumedCapacity` - so a same-token call
+/// differing only in the capacity mode replays rather than mismatches. A failed
+/// `execute` is propagated without caching, so a same-token retry re-executes.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+fn run_idempotent<T, H, E, R>(
+    cache: &Mutex<HashMap<String, (Instant, u64, T)>>,
+    token: Option<&str>,
+    hash_input: &H,
+    execute: E,
+    replay: R,
+) -> Result<T>
+where
+    T: Clone,
+    H: serde::Serialize,
+    E: FnOnce() -> Result<T>,
+    R: FnOnce(&T) -> T,
+{
+    if let Some(token) = token {
+        if token.len() > MAX_TOKEN_LEN {
+            return Err(DynoxideError::ValidationException(format!(
+                "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
+            )));
+        }
+    }
+
+    // No idempotency token: execute without touching the cache.
+    let Some(token) = token else {
+        return execute();
+    };
+
+    // Hash over the key material only, normalised for stable ordering
+    // regardless of HashMap iteration order.
+    let request_hash = {
+        use std::hash::{Hash, Hasher};
+        let normalised = serde_json::to_value(hash_input)
+            .and_then(|v| serde_json::to_vec(&v))
+            .unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        normalised.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    let mut cache = cache
+        .lock()
+        .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
+    // Evict expired entries.
+    cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
+    if let Some((_, cached_hash, resp)) = cache.get(token) {
+        if *cached_hash != request_hash {
+            return Err(DynoxideError::IdempotentParameterMismatchException(
+                "An error occurred (IdempotentParameterMismatchException)".to_string(),
+            ));
+        }
+        // Clone the cached response, release the lock, then rebuild the reply.
+        let cached = resp.clone();
+        drop(cache);
+        return Ok(replay(&cached));
+    }
+    // Cache miss: execute and record the result while still holding the lock,
+    // so a concurrent same-token call waits and then replays rather than
+    // executing the transaction a second time.
+    let resp = execute()?;
+    cache.insert(
+        token.to_string(),
+        (Instant::now(), request_hash, resp.clone()),
+    );
+    Ok(resp)
+}
 
 /// The native storage backend: the rusqlite-backed [`storage::Storage`].
 ///
@@ -182,7 +276,7 @@ pub const WASM_PREVIEW: bool = false;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Database<S = RusqliteBackend> {
     inner: Arc<Mutex<S>>,
-    idempotency_tokens: Arc<Mutex<TokenCache>>,
+    idempotency_tokens: Arc<Mutex<TransactWriteTokenCache>>,
     execute_transaction_tokens: Arc<Mutex<ExecuteTransactionTokenCache>>,
 }
 
@@ -214,7 +308,7 @@ use std::sync::Mutex as BackendMutex;
 #[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
 pub struct Database<S> {
     inner: Arc<BackendMutex<S>>,
-    idempotency_tokens: Arc<Mutex<TokenCache>>,
+    idempotency_tokens: Arc<Mutex<TransactWriteTokenCache>>,
     execute_transaction_tokens: Arc<Mutex<ExecuteTransactionTokenCache>>,
 }
 
@@ -526,92 +620,36 @@ impl Database<RusqliteBackend> {
     // -------------------------------------------------------------------
 
     /// Execute a transactional write (up to 100 actions, all-or-nothing).
+    ///
+    /// Honours `ClientRequestToken` idempotency via [`run_idempotent`]: a
+    /// same-token, same-items call within the expiry window replays the stored
+    /// result (reported as transactional read capacity) without re-applying the
+    /// writes.
     pub fn transact_write_items(
         &self,
         request: actions::transact_write_items::TransactWriteItemsRequest,
     ) -> Result<actions::transact_write_items::TransactWriteItemsResponse> {
-        const TOKEN_EXPIRY_SECS: u64 = 600; // 10 minutes
-        const MAX_TOKEN_LEN: usize = 36;
-
-        // Validate token length
-        if let Some(ref token) = request.client_request_token {
-            if token.len() > MAX_TOKEN_LEN {
-                return Err(DynoxideError::ValidationException(format!(
-                    "1 validation error detected: Value '{}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {}",
-                    token, MAX_TOKEN_LEN
-                )));
-            }
-        }
-
-        // The transaction executor, shared by the cache-miss and tokenless paths.
-        let execute_txn = || {
-            self.with_storage(|s| {
-                pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
-            })
-        };
-
-        // Idempotency. For a token-bearing request, hold the cache lock across
-        // the whole first call (check, execute, insert) so two concurrent
-        // same-token calls cannot both execute the transaction: the second
-        // serialises behind the first and replays its result. A replay (cache
-        // hit) only needs the lock to read the cached entry, so it clones what
-        // it needs, releases the lock, then re-derives capacity.
-        //
-        // Lock ordering: this holds `idempotency_tokens` and then takes the
-        // storage lock inside `execute_txn`. That order (idempotency -> storage)
-        // is the only one in `Database` - nothing takes the storage lock and then
-        // `idempotency_tokens` - so there is no reverse path to deadlock against.
-        // Any future code touching both locks must keep this order.
-        if let Some(ref token) = request.client_request_token {
-            // Hash over the transaction items only, normalised for stable key
-            // ordering regardless of HashMap iteration order. A same-token call
-            // differing only in ReturnConsumedCapacity replays rather than
-            // mismatches.
-            let request_hash = {
-                use std::hash::{Hash, Hasher};
-                let normalised = serde_json::to_value(&request.transact_items)
-                    .and_then(|v| serde_json::to_vec(&v))
-                    .unwrap_or_default();
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                normalised.hash(&mut hasher);
-                hasher.finish()
-            };
-
-            let mut cache = self
-                .idempotency_tokens
-                .lock()
-                .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
-            // Evict expired entries
-            cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
-            if let Some((_, cached_hash, resp)) = cache.get(token) {
-                if *cached_hash != request_hash {
-                    return Err(DynoxideError::IdempotentParameterMismatchException(
-                        "An error occurred (IdempotentParameterMismatchException)".to_string(),
-                    ));
-                }
-                // Replay: clone what the response needs, release the lock, then
-                // recompute a transactional read cost against the item sizes
-                // (4KB read granularity, which diverges from the first call's
-                // 1KB-granular write above 1KB), honouring this replay's own
-                // ReturnConsumedCapacity mode.
-                let cached_metrics = resp.item_collection_metrics.clone();
-                drop(cache);
-                return Ok(actions::transact_write_items::replay_response(
+        run_idempotent(
+            &self.idempotency_tokens,
+            request.client_request_token.as_deref(),
+            &request.transact_items,
+            || {
+                self.with_storage(|s| {
+                    pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
+                })
+            },
+            |cached| {
+                // The replay recomputes a transactional read cost against the
+                // item sizes (4KB read granularity, diverging from the first
+                // call's 1KB-granular write above 1KB) and carries over the
+                // cached item collection metrics.
+                actions::transact_write_items::replay_response(
                     &request.transact_items,
                     &request.return_consumed_capacity,
-                    cached_metrics,
-                ));
-            }
-            // Cache miss: execute and record the result while still holding the
-            // lock, so a concurrent same-token call waits and then replays
-            // rather than executing the transaction a second time.
-            let resp = execute_txn()?;
-            cache.insert(token.clone(), (Instant::now(), request_hash, resp.clone()));
-            return Ok(resp);
-        }
-
-        // No idempotency token: execute without touching the cache.
-        execute_txn()
+                    cached.item_collection_metrics.clone(),
+                )
+            },
+        )
     }
 
     /// Execute a transactional read (up to 100 gets).
@@ -700,8 +738,8 @@ impl Database<RusqliteBackend> {
 
     /// Execute PartiQL statements transactionally (all-or-nothing).
     ///
-    /// Honours `ClientRequestToken` idempotency the same way as
-    /// [`transact_write_items`](Self::transact_write_items): a same-token,
+    /// Honours `ClientRequestToken` idempotency via [`run_idempotent`], the same
+    /// way as [`transact_write_items`](Self::transact_write_items): a same-token,
     /// same-statements call within the expiry window replays the stored result
     /// without re-applying the statements. The cache is separate from the
     /// `TransactWriteItems` one (see [`ExecuteTransactionTokenCache`]).
@@ -709,85 +747,25 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
-        const TOKEN_EXPIRY_SECS: u64 = 600; // 10 minutes
-        const MAX_TOKEN_LEN: usize = 36;
-
-        // Validate token length
-        if let Some(ref token) = request.client_request_token {
-            if token.len() > MAX_TOKEN_LEN {
-                return Err(DynoxideError::ValidationException(format!(
-                    "1 validation error detected: Value '{}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {}",
-                    token, MAX_TOKEN_LEN
-                )));
-            }
-        }
-
-        // The transaction executor, shared by the cache-miss and tokenless paths.
-        let execute_txn = || {
-            self.with_storage(|s| {
-                pollster::block_on(actions::execute_transaction::execute(s, request.clone()))
-            })
-        };
-
-        // Idempotency. For a token-bearing request, hold the cache lock across
-        // the whole first call (check, execute, insert) so two concurrent
-        // same-token calls cannot both execute the transaction: the second
-        // serialises behind the first and replays its result. A replay (cache
-        // hit) only needs the lock to read the cached entry, so it clones what
-        // it needs, releases the lock, then re-derives read capacity.
-        //
-        // Lock ordering matches `transact_write_items`: hold the token cache and
-        // then take the storage lock inside `execute_txn`. Only these two methods
-        // touch their token caches, and each takes storage second, so there is no
-        // reverse path to deadlock against. Any future code touching both locks
-        // must keep this order.
-        if let Some(ref token) = request.client_request_token {
-            // Hash over the statements (and their parameters) only, so a
-            // same-token call differing only in ReturnConsumedCapacity replays
-            // rather than mismatches.
-            let request_hash = {
-                use std::hash::{Hash, Hasher};
-                let normalised = serde_json::to_value(&request.transact_statements)
-                    .and_then(|v| serde_json::to_vec(&v))
-                    .unwrap_or_default();
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                normalised.hash(&mut hasher);
-                hasher.finish()
-            };
-
-            let mut cache = self
-                .execute_transaction_tokens
-                .lock()
-                .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
-            // Evict expired entries
-            cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
-            if let Some((_, cached_hash, resp)) = cache.get(token) {
-                if *cached_hash != request_hash {
-                    return Err(DynoxideError::IdempotentParameterMismatchException(
-                        "An error occurred (IdempotentParameterMismatchException)".to_string(),
-                    ));
-                }
-                // Replay: clone the stored responses, release the lock, then
-                // recompute transactional read capacity, honouring this replay's
-                // own ReturnConsumedCapacity mode.
-                let cached_responses = resp.responses.clone();
-                drop(cache);
-                return Ok(actions::execute_transaction::replay_response(
+        run_idempotent(
+            &self.execute_transaction_tokens,
+            request.client_request_token.as_deref(),
+            &request.transact_statements,
+            || {
+                self.with_storage(|s| {
+                    pollster::block_on(actions::execute_transaction::execute(s, request.clone()))
+                })
+            },
+            |cached| {
+                // The replay reports transactional read capacity and carries
+                // over the cached first-call responses.
+                actions::execute_transaction::replay_response(
                     &request.transact_statements,
                     &request.return_consumed_capacity,
-                    cached_responses,
-                ));
-            }
-            // Cache miss: execute and record the result while still holding the
-            // lock, so a concurrent same-token call waits and then replays
-            // rather than executing the transaction a second time.
-            let resp = execute_txn()?;
-            cache.insert(token.clone(), (Instant::now(), request_hash, resp.clone()));
-            return Ok(resp);
-        }
-
-        // No idempotency token: execute without touching the cache.
-        execute_txn()
+                    cached.responses.clone(),
+                )
+            },
+        )
     }
 
     /// Execute a batch of PartiQL statements.

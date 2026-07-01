@@ -89,7 +89,7 @@ pub async fn execute<S: StorageBackend>(
     } else {
         crate::types::transactional_write_capacity
     };
-    let consumed_capacity = build_transaction_capacity(
+    let consumed_capacity = crate::types::build_transactional_capacity(
         &statement_table_units(parsed.iter().map(|(stmt, _)| stmt)),
         &request.return_consumed_capacity,
         builder,
@@ -130,27 +130,6 @@ fn statement_table_units<'a>(
     table_units
 }
 
-/// Build the per-table `ConsumedCapacity` vec from the per-table units using
-/// `builder` (write for a first-call write set, read for a read set or a
-/// replay). Returns `None` unless `ReturnConsumedCapacity` is `TOTAL` or
-/// `INDEXES`, so the mode guard lives in one place.
-fn build_transaction_capacity(
-    table_units: &std::collections::HashMap<String, f64>,
-    mode: &Option<String>,
-    builder: fn(&str, f64, &Option<String>) -> Option<crate::types::ConsumedCapacity>,
-) -> Option<Vec<crate::types::ConsumedCapacity>> {
-    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        Some(
-            table_units
-                .iter()
-                .filter_map(|(table, &units)| builder(table, units, mode))
-                .collect(),
-        )
-    } else {
-        None
-    }
-}
-
 /// Build the response for a same-token idempotent replay. The statements are
 /// identical to the first call (the idempotency hash matched), so `Responses`
 /// carry over from the cached first call and capacity is reported as a
@@ -170,7 +149,7 @@ pub(crate) fn replay_response(
         .collect();
     ExecuteTransactionResponse {
         responses: cached_responses,
-        consumed_capacity: build_transaction_capacity(
+        consumed_capacity: crate::types::build_transactional_capacity(
             &statement_table_units(parsed.iter()),
             mode,
             crate::types::transactional_read_capacity,

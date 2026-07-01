@@ -505,6 +505,13 @@ fn increment_counter(pk: &str) -> Vec<ParameterizedStatement> {
     }]
 }
 
+fn stmt(statement: &str) -> ParameterizedStatement {
+    ParameterizedStatement {
+        statement: statement.to_string(),
+        parameters: None,
+    }
+}
+
 /// A same-token replay returns the stored result without re-applying the
 /// statements: the counter moves exactly once. The first call reports
 /// transactional WRITE capacity, the in-window replay transactional READ.
@@ -611,8 +618,13 @@ fn test_execute_transaction_read_set_reports_read_capacity() {
         })
         .unwrap();
     let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
     assert_eq!(entry.read_capacity_units, Some(2.0));
     assert_eq!(entry.write_capacity_units, None);
+    assert!(
+        entry.table.is_some(),
+        "INDEXES mode carries a Table breakdown"
+    );
 }
 
 /// A transactional write reports write capacity under TOTAL too (top-level
@@ -772,4 +784,106 @@ fn test_execute_transaction_concurrent_same_token_executes_once() {
         1,
         "the increment must apply exactly once"
     );
+}
+
+/// A ClientRequestToken longer than 36 characters is rejected up front with a
+/// ValidationException, matching DynamoDB and the TransactWriteItems path.
+#[test]
+fn test_execute_transaction_rejects_overlong_token() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![stmt("INSERT INTO \"Users\" VALUE {'pk': 'u1'}")],
+            client_request_token: Some("x".repeat(37)),
+            return_consumed_capacity: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(_)),
+        "expected ValidationException, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("clientRequestToken"), "message was: {msg}");
+    assert!(msg.contains("36"), "message was: {msg}");
+}
+
+/// A first call that cancels is not cached: a same-token retry with different
+/// (valid) statements re-executes rather than replaying a phantom success or
+/// raising IdempotentParameterMismatchException.
+#[test]
+fn test_execute_transaction_failed_call_not_cached() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    // Seed u1 so the first transaction's INSERT collides and cancels.
+    db.execute_statement(ExecuteStatementRequest {
+        statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
+        parameters: None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // First call under the token fails (duplicate key) and must not be cached.
+    let first = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![stmt("INSERT INTO \"Users\" VALUE {'pk': 'u1'}")],
+        client_request_token: Some("retry-token".to_string()),
+        return_consumed_capacity: None,
+    });
+    assert!(first.is_err(), "duplicate-key insert should cancel");
+
+    // Same token, different valid statements: re-executes (not a mismatch, not
+    // a replay), proving the failed first call left no cache entry.
+    let second = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![stmt("INSERT INTO \"Users\" VALUE {'pk': 'u2'}")],
+        client_request_token: Some("retry-token".to_string()),
+        return_consumed_capacity: None,
+    });
+    assert!(
+        second.is_ok(),
+        "failed first call must not be cached, so the retry executes: {second:?}"
+    );
+    let pks: Vec<String> = select_all(&db, "Users")
+        .iter()
+        .filter_map(|i| match i.get("pk") {
+            Some(AttributeValue::S(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        pks.contains(&"u2".to_string()),
+        "the retry must have applied"
+    );
+}
+
+/// Capacity aggregates per target table: a transaction touching two tables
+/// under INDEXES reports one entry per table, each transactional write 2 units
+/// with a Table breakdown.
+#[test]
+fn test_execute_transaction_multi_table_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "TableA");
+    create_test_table(&db, "TableB");
+
+    let resp = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![
+                stmt("INSERT INTO \"TableA\" VALUE {'pk': 'a'}"),
+                stmt("INSERT INTO \"TableB\" VALUE {'pk': 'b'}"),
+            ],
+            client_request_token: None,
+            return_consumed_capacity: Some("INDEXES".to_string()),
+        })
+        .unwrap();
+    let caps = resp.consumed_capacity.unwrap();
+    assert_eq!(caps.len(), 2, "one ConsumedCapacity entry per table");
+    for entry in &caps {
+        assert_eq!(entry.capacity_units, 2.0);
+        assert_eq!(entry.write_capacity_units, Some(2.0));
+        assert_eq!(entry.read_capacity_units, None);
+        assert!(entry.table.is_some(), "INDEXES carries a Table breakdown");
+    }
+    let mut tables: Vec<&str> = caps.iter().map(|c| c.table_name.as_str()).collect();
+    tables.sort_unstable();
+    assert_eq!(tables, vec!["TableA", "TableB"]);
 }

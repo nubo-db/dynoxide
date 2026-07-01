@@ -88,6 +88,24 @@ pub async fn execute<S: StorageBackend>(
     // --- Pre-table validations ---
     // DynamoDB validates expression attributes, key values, projections, and duplicates
     // BEFORE checking table existence. Perform these checks first.
+
+    // Mixing an expression projection on one table's block with a non-expression
+    // AttributesToGet on another is rejected as a whole, even when each block is
+    // internally consistent. Order-independent over the request map.
+    let any_projection = request
+        .request_items
+        .values()
+        .any(|ka| ka.projection_expression.is_some());
+    let any_attributes_to_get = request
+        .request_items
+        .values()
+        .any(|ka| ka.attributes_to_get.is_some());
+    if any_projection && any_attributes_to_get {
+        return Err(DynoxideError::ValidationException(
+            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}".to_string(),
+        ));
+    }
+
     for keys_and_attrs in request.request_items.values() {
         // Check AttributesToGet + expression conflict
         let has_attributes_to_get = keys_and_attrs.attributes_to_get.is_some();
@@ -203,6 +221,9 @@ pub async fn execute<S: StorageBackend>(
         // Pre-register projection expression references
         if let Some(ref proj) = projection {
             tracker.track_projection_expr(proj);
+            // Reject undefined names and overlapping paths before reading.
+            expressions::projection::validate(proj, &tracker)
+                .map_err(DynoxideError::ValidationException)?;
         }
 
         // BatchGetItem does NOT automatically include key attributes in projections.

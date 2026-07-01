@@ -57,15 +57,20 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
             TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
-        // Collect constraint validation errors (DynamoDB checks all at once)
-        let mut errors = Vec::new();
+        // AWS validates the table name first and short-circuits: an empty or
+        // otherwise invalid table name is reported on its own, before the item
+        // and Return* enum parameters are checked (eu-west-2, 2026-06). A valid
+        // table name lets the remaining constraint errors aggregate below.
         let table_name_opt = raw.table_name.as_deref();
-
-        errors.extend(table_name_constraint_errors(
-            table_name_opt,
-            TableNameContext::ReadWrite,
-        ));
+        let table_name_errors =
+            table_name_constraint_errors(table_name_opt, TableNameContext::ReadWrite);
+        if let Some(msg) = format_validation_errors(&table_name_errors) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        }
         let table_name = raw.table_name.unwrap_or_default();
+
+        // Collect remaining constraint validation errors (DynamoDB aggregates these)
+        let mut errors = Vec::new();
 
         // Item constraint validation
         if raw.item.is_none() {
@@ -465,6 +470,46 @@ mod tests {
     use crate::actions::{create_table, put_item};
     use crate::storage::Storage;
     use crate::storage_backend::StorageBackend;
+
+    #[test]
+    fn empty_table_name_short_circuits_before_return_values() {
+        // eu-west-2 (2026-06): an empty TableName is reported on its own, before
+        // the invalid ReturnValues enum is considered.
+        let err = serde_json::from_value::<super::PutItemRequest>(serde_json::json!({
+            "TableName": "",
+            "ReturnValues": "INVALID",
+            "Item": {}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("1 validation error detected"), "got: {err}");
+        assert!(err.to_lowercase().contains("tablename"), "got: {err}");
+        assert!(!err.to_lowercase().contains("returnvalues"), "got: {err}");
+    }
+
+    #[test]
+    fn valid_table_name_aggregates_all_invalid_enums() {
+        // With a valid table name, PutItem aggregates every invalid Return* enum
+        // (unlike UpdateItem, which stops at the first).
+        let err = serde_json::from_value::<super::PutItemRequest>(serde_json::json!({
+            "TableName": "_conformance_valid_table_name",
+            "Item": {"pk": {"S": "test"}},
+            "ReturnConsumedCapacity": "INVALID",
+            "ReturnItemCollectionMetrics": "INVALID",
+            "ReturnValues": "INVALID"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("3 validation errors detected"), "got: {err}");
+        assert!(
+            err.to_lowercase().contains("returnconsumedcapacity"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("returnitemcollectionmetrics"),
+            "got: {err}"
+        );
+    }
 
     /// A single-item write and its GSI fan-out succeed or fail as one unit:
     /// when a later GSI write fails mid-fan-out, the base write and the GSI

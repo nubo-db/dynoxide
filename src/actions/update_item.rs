@@ -61,6 +61,46 @@ pub struct UpdateItemRequest {
     pub conditional_operator: Option<String>,
 }
 
+/// Return the first invalid `Return*` enum error for UpdateItem, in the order AWS
+/// reports them (ReturnValues first). UpdateItem stops at the first invalid enum
+/// and reports one error, unlike PutItem which aggregates all of them
+/// (eu-west-2, 2026-06). Returns `None` when every supplied enum is valid.
+fn first_invalid_return_enum(
+    return_values: Option<&str>,
+    return_consumed_capacity: Option<&str>,
+    return_item_collection_metrics: Option<&str>,
+) -> Option<String> {
+    if let Some(rv) = return_values {
+        if !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv) {
+            return Some(format!(
+                "Value '{}' at 'returnValues' failed to satisfy constraint: \
+                 Member must satisfy enum value set: \
+                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
+                rv
+            ));
+        }
+    }
+    if let Some(rcc) = return_consumed_capacity {
+        if !["INDEXES", "TOTAL", "NONE"].contains(&rcc) {
+            return Some(format!(
+                "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+                rcc
+            ));
+        }
+    }
+    if let Some(ricm) = return_item_collection_metrics {
+        if !["SIZE", "NONE"].contains(&ricm) {
+            return Some(format!(
+                "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [SIZE, NONE]",
+                ricm
+            ));
+        }
+    }
+    None
+}
+
 impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -70,14 +110,17 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
-        let mut errors = Vec::new();
-
-        // Table name constraints
-        errors.extend(table_name_constraint_errors(
-            raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
-        ));
+        // AWS validates the table name first and short-circuits (eu-west-2, 2026-06):
+        // an invalid table name is reported on its own, before the key and Return*
+        // enum parameters are checked.
+        let table_name_errors =
+            table_name_constraint_errors(raw.table_name.as_deref(), TableNameContext::ReadWrite);
+        if let Some(msg) = format_validation_errors(&table_name_errors) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        }
         let table_name = raw.table_name.unwrap_or_default();
+
+        let mut errors = Vec::new();
 
         // Key constraint
         if raw.key.is_none() {
@@ -88,39 +131,16 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             );
         }
 
-        // ReturnConsumedCapacity enum
-        if let Some(ref rcc) = raw.return_consumed_capacity {
-            if !["INDEXES", "TOTAL", "NONE"].contains(&rcc.as_str()) {
-                errors.push(format!(
-                    "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                    rcc
-                ));
-            }
-        }
-
-        // ReturnValues enum
-        if let Some(ref rv) = raw.return_values {
-            if !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
-            {
-                errors.push(format!(
-                    "Value '{}' at 'returnValues' failed to satisfy constraint: \
-                     Member must satisfy enum value set: \
-                     [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-                    rv
-                ));
-            }
-        }
-
-        // ReturnItemCollectionMetrics enum
-        if let Some(ref ricm) = raw.return_item_collection_metrics {
-            if !["SIZE", "NONE"].contains(&ricm.as_str()) {
-                errors.push(format!(
-                    "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [SIZE, NONE]",
-                    ricm
-                ));
-            }
+        // Return* enum validation. Unlike PutItem (which aggregates every invalid
+        // enum into one envelope), UpdateItem stops at the first invalid enum and
+        // reports a single error, with ReturnValues checked first (eu-west-2,
+        // 2026-06). Do not fold these two paths together - the divergence is real.
+        if let Some(enum_err) = first_invalid_return_enum(
+            raw.return_values.as_deref(),
+            raw.return_consumed_capacity.as_deref(),
+            raw.return_item_collection_metrics.as_deref(),
+        ) {
+            errors.push(enum_err);
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -870,6 +890,36 @@ mod tests {
     use crate::actions::{create_table, put_item, update_item};
     use crate::storage::Storage;
     use crate::storage_backend::StorageBackend;
+
+    #[test]
+    fn update_item_stops_at_first_invalid_enum() {
+        // eu-west-2 (2026-06): UpdateItem reports a single error for the first
+        // invalid enum (ReturnValues checked first), unlike PutItem which
+        // aggregates every invalid Return* enum.
+        let err = serde_json::from_value::<super::UpdateItemRequest>(serde_json::json!({
+            "TableName": "_conformance_valid_table_name",
+            "Key": {"pk": {"S": "test"}},
+            "ReturnValues": "INVALID",
+            "ReturnConsumedCapacity": "INVALID"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("1 validation error detected"), "got: {err}");
+        assert!(err.contains("enum value set"), "got: {err}");
+        assert!(err.contains("returnValues"), "got: {err}");
+    }
+
+    #[test]
+    fn update_item_empty_table_name_reports_only_table_name() {
+        let err = serde_json::from_value::<super::UpdateItemRequest>(serde_json::json!({
+            "TableName": "",
+            "Key": {}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("1 validation error detected"), "got: {err}");
+        assert!(err.to_lowercase().contains("tablename"), "got: {err}");
+    }
 
     /// An update and its GSI fan-out succeed or fail as one unit: a mid-fan-out
     /// failure leaves the item at its pre-update value.

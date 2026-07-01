@@ -159,7 +159,7 @@ pub async fn execute<S: StorageBackend>(
     helpers::with_write_transaction(storage, execute_within_transaction(storage, items)).await?;
 
     // Build consumed capacity per table
-    let consumed_capacity = build_transact_capacity(
+    let consumed_capacity = crate::types::build_transactional_capacity(
         &transact_write_table_units(items),
         &request.return_consumed_capacity,
         crate::types::transactional_write_capacity,
@@ -174,8 +174,7 @@ pub async fn execute<S: StorageBackend>(
 /// per item for a transactional write: each item is rounded up to whole write
 /// units first, then doubled by the transactional factor, then summed per table
 /// (aggregating sizes before rounding would undercharge items straddling a 1KB
-/// boundary). Shared by `execute` (first-call write capacity) and the
-/// idempotent-replay path, which reports the same magnitude as read capacity.
+/// boundary). Backs `execute`'s first-call write capacity.
 pub(crate) fn transact_write_table_units(items: &[TransactWriteItem]) -> HashMap<String, f64> {
     let mut table_units: HashMap<String, f64> = HashMap::new();
     for item in items {
@@ -186,43 +185,37 @@ pub(crate) fn transact_write_table_units(items: &[TransactWriteItem]) -> HashMap
     table_units
 }
 
-/// Build the per-table `ConsumedCapacity` vec for a transactional op from the
-/// per-table units, using `builder` (write for the first call, read for an
-/// idempotent replay). Returns `None` when `ReturnConsumedCapacity` is not
-/// `TOTAL` or `INDEXES`. Shared by `execute` and `replay_response` so the mode
-/// guard and per-table iteration live in one place.
-fn build_transact_capacity(
-    table_units: &HashMap<String, f64>,
-    mode: &Option<String>,
-    builder: fn(&str, f64, &Option<String>) -> Option<crate::types::ConsumedCapacity>,
-) -> Option<Vec<crate::types::ConsumedCapacity>> {
-    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        Some(
-            table_units
-                .iter()
-                .filter_map(|(table, &units)| builder(table, units, mode))
-                .collect(),
-        )
-    } else {
-        None
+/// Per-table transactional read units for a set of actions. Real AWS recomputes
+/// a same-token replay as a transactional read against each item's size: 2 RCU
+/// per item, rounded at 4KB read granularity before the transactional factor,
+/// summed per table. This differs from the write magnitude above 1KB, where
+/// writes round at 1KB and reads at 4KB. Backs `replay_response`.
+fn transact_read_table_units(items: &[TransactWriteItem]) -> HashMap<String, f64> {
+    let mut table_units: HashMap<String, f64> = HashMap::new();
+    for item in items {
+        let (table, size) = get_action_table_and_size(item);
+        *table_units.entry(table).or_default() +=
+            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::read_capacity_units(size);
     }
+    table_units
 }
 
 /// Build the response for a same-token idempotent replay. The items are
-/// identical to the first call (the idempotency hash matched), so the units
-/// re-derive equally; capacity is reported as READ at that same magnitude
-/// rather than re-serving the first call's write numbers, honouring the replay
-/// request's own `ReturnConsumedCapacity` mode (the original call's mode does
-/// not carry over). `cached_metrics` carries the item collection metrics from
-/// the cached first-call response.
+/// identical to the first call (the idempotency hash matched), so capacity is
+/// recomputed as a transactional READ against the item sizes rather than
+/// re-serving the first call's write numbers, honouring the replay request's
+/// own `ReturnConsumedCapacity` mode (the original call's mode does not carry
+/// over). The read cost is computed at 4KB read granularity, which diverges
+/// from the first-call write magnitude above 1KB. `cached_metrics` carries the
+/// item collection metrics from the cached first-call response.
 pub(crate) fn replay_response(
     items: &[TransactWriteItem],
     mode: &Option<String>,
     cached_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
 ) -> TransactWriteItemsResponse {
     TransactWriteItemsResponse {
-        consumed_capacity: build_transact_capacity(
-            &transact_write_table_units(items),
+        consumed_capacity: crate::types::build_transactional_capacity(
+            &transact_read_table_units(items),
             mode,
             crate::types::transactional_read_capacity,
         ),

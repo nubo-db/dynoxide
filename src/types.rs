@@ -949,6 +949,29 @@ pub fn transactional_read_capacity(
     }
 }
 
+/// Build the per-table `ConsumedCapacity` vec for a transactional op from the
+/// per-table units, using `builder` (`transactional_write_capacity` for a
+/// first-call write, `transactional_read_capacity` for a read set or a
+/// same-token replay). Returns `None` unless `ReturnConsumedCapacity` is
+/// `TOTAL` or `INDEXES`, so the mode guard lives in one place. Shared by
+/// `TransactWriteItems` and `ExecuteTransaction`.
+pub fn build_transactional_capacity(
+    table_units: &HashMap<String, f64>,
+    mode: &Option<String>,
+    builder: fn(&str, f64, &Option<String>) -> Option<ConsumedCapacity>,
+) -> Option<Vec<ConsumedCapacity>> {
+    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        Some(
+            table_units
+                .iter()
+                .filter_map(|(table, &units)| builder(table, units, mode))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Build a `ConsumedCapacity` for one table in a transactional write
 /// (`TransactWriteItems`). `units` is the table total and already includes the
 /// transactional 2x factor. Under `INDEXES` the Table detail reports

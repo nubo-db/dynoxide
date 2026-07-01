@@ -322,6 +322,30 @@ fn parse_single_condition(
         }
     }
 
+    // Reversed operand order (:val op #attr). AWS accepts the value on the left
+    // for the comparators and treats it as the attr-on-left form (`:lo <= #sk`
+    // is `#sk >= :lo`). begins_with keeps the key first and is handled above.
+    if matches!(stream.peek(), Some(Token::ValueRef(_))) {
+        let val_ref = expect_value_ref(stream)?;
+        // Match here rather than bind, to release the stream borrow before the path parse.
+        let build: Option<fn(String, String) -> ParsedCond> = match stream.next() {
+            Some(Token::Eq) => Some(ParsedCond::Eq),
+            Some(Token::Lt) => Some(ParsedCond::Gt),
+            Some(Token::Le) => Some(ParsedCond::Ge),
+            Some(Token::Gt) => Some(ParsedCond::Lt),
+            Some(Token::Ge) => Some(ParsedCond::Le),
+            _ => None,
+        };
+        let build = build.ok_or_else(|| {
+            "Invalid KeyConditionExpression: unsupported operator with a value on the left"
+                .to_string()
+        })?;
+        let path = parse_raw_path(stream)?;
+        let attr_name = resolve_path_to_name(&path, tracker)?;
+        consume_close_parens(stream, parens)?;
+        return Ok(build(attr_name, val_ref));
+    }
+
     // attr op :val
     let path = parse_raw_path(stream)?;
     let attr_name = resolve_path_to_name(&path, tracker)?;
@@ -389,7 +413,11 @@ fn resolve_path_to_name(
     tracker: &TrackedExpressionAttributes,
 ) -> Result<String, String> {
     if path.len() != 1 {
-        return Err("KeyConditionExpression only supports top-level attributes".to_string());
+        // A dotted or indexed document path on a key attribute.
+        return Err(
+            "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes"
+                .to_string(),
+        );
     }
     match &path[0] {
         PathElement::Attribute(name) => {
@@ -455,6 +483,41 @@ mod tests {
         values: &'a Option<HashMap<String, AttributeValue>>,
     ) -> TrackedExpressionAttributes<'a> {
         TrackedExpressionAttributes::new(names, values)
+    }
+
+    #[test]
+    fn accepts_reversed_operand_sort_key() {
+        let names = Some(HashMap::from([
+            ("#pk".to_string(), "pk".to_string()),
+            ("#sk".to_string(), "sk".to_string()),
+        ]));
+        let values = Some(HashMap::from([
+            (":pk".to_string(), AttributeValue::S("x".into())),
+            (":lo".to_string(), AttributeValue::S("a".into())),
+        ]));
+        let tracker = make_tracker(&names, &values);
+        for op in ["<", "<=", ">", ">="] {
+            let expr = format!("#pk = :pk AND :lo {op} #sk");
+            assert!(parse(&expr, &tracker).is_ok(), "reversed {op} should parse");
+        }
+    }
+
+    #[test]
+    fn rejects_nested_path_on_key() {
+        let names = Some(HashMap::from([
+            ("#pk".to_string(), "pk".to_string()),
+            ("#sk".to_string(), "sk".to_string()),
+        ]));
+        let values = Some(HashMap::from([
+            (":pk".to_string(), AttributeValue::S("x".into())),
+            (":v".to_string(), AttributeValue::S("y".into())),
+        ]));
+        let tracker = make_tracker(&names, &values);
+        let err = parse("#pk = :pk AND #sk.foo = :v", &tracker).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes"
+        );
     }
 
     #[test]

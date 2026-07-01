@@ -5,7 +5,7 @@ use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExecuteTransactionRequest {
     #[serde(rename = "TransactStatements")]
     pub transact_statements: Vec<ParameterizedStatement>,
@@ -15,7 +15,10 @@ pub struct ExecuteTransactionRequest {
     pub return_consumed_capacity: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+// `Serialize` backs the idempotency request hash (the statements and their
+// parameters are serialised via `serde_json`), so a same-token call differing
+// only in `ReturnConsumedCapacity` replays rather than mismatches.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ParameterizedStatement {
     #[serde(rename = "Statement")]
     pub statement: String,
@@ -23,7 +26,9 @@ pub struct ParameterizedStatement {
     pub parameters: Option<Vec<AttributeValue>>,
 }
 
-#[derive(Debug, Default, Serialize)]
+// `Clone` so the idempotency cache can store the first-call response and clone
+// its `Responses` for the replay.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ExecuteTransactionResponse {
     #[serde(rename = "Responses", skip_serializing_if = "Option::is_none")]
     pub responses: Option<Vec<ItemResponse>>,
@@ -31,7 +36,7 @@ pub struct ExecuteTransactionResponse {
     pub consumed_capacity: Option<Vec<crate::types::ConsumedCapacity>>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ItemResponse {
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
     pub item: Option<Item>,
@@ -72,34 +77,105 @@ pub async fn execute<S: StorageBackend>(
         helpers::with_write_transaction(storage, execute_within_transaction(storage, &parsed))
             .await?;
 
-    // Build ConsumedCapacity if requested (simple estimate: 1 WCU per statement)
-    let consumed_capacity = if matches!(
-        request.return_consumed_capacity.as_deref(),
-        Some("TOTAL") | Some("INDEXES")
-    ) {
-        // Aggregate capacity by table name from parsed statements
-        let mut table_units: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
-        for (stmt, _) in &parsed {
-            if let Some(tbl) = partiql::parser::table_name(stmt) {
-                *table_units.entry(tbl.to_string()).or_default() += 1.0;
-            }
-        }
-        let caps: Vec<_> = table_units
-            .iter()
-            .filter_map(|(table, &units)| {
-                crate::types::consumed_capacity(table, units, &request.return_consumed_capacity)
-            })
-            .collect();
-        Some(caps)
+    // Transactional capacity, split by statement kind: an all-SELECT read set
+    // reports read capacity, any INSERT/UPDATE/DELETE makes it a write set.
+    //
+    // TODO: capacity is charged a flat per-statement transactional unit, not an
+    // item-size computation, so it under-counts PartiQL items above 1KB (writes
+    // round at 1KB, reads at 4KB). Correct for the small items conformance pins;
+    // size-accurate rounding for large PartiQL statements is a tracked follow-up.
+    let builder = if is_read_set(&parsed) {
+        crate::types::transactional_read_capacity
     } else {
-        None
+        crate::types::transactional_write_capacity
     };
+    let consumed_capacity = build_transaction_capacity(
+        &statement_table_units(parsed.iter().map(|(stmt, _)| stmt)),
+        &request.return_consumed_capacity,
+        builder,
+    );
 
     Ok(ExecuteTransactionResponse {
         responses: Some(responses),
         consumed_capacity,
     })
+}
+
+/// A transaction is a read set only when every statement is a `SELECT`; any
+/// `INSERT`/`UPDATE`/`DELETE` makes it a write set. AWS requires a transaction
+/// to be all-read or all-write and rejects a mixed set before capacity is
+/// computed, but dynoxide does not enforce that, so a mixed set is classified
+/// here as a write set. Revisit the predicate if condition-only checks (which
+/// AWS counts in the write set) are ever parsed.
+fn is_read_set(parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)]) -> bool {
+    parsed
+        .iter()
+        .all(|(stmt, _)| matches!(stmt, partiql::parser::Statement::Select { .. }))
+}
+
+/// Per-table transactional units for a set of parsed statements. Each statement
+/// costs the per-statement base (1 unit) doubled by the transactional factor,
+/// summed by target table (matching `TransactWriteItems`, which doubles per
+/// item). Item-size rounding is not applied here (see the TODO in `execute`).
+fn statement_table_units<'a>(
+    statements: impl Iterator<Item = &'a partiql::parser::Statement>,
+) -> std::collections::HashMap<String, f64> {
+    let mut table_units: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for stmt in statements {
+        if let Some(tbl) = partiql::parser::table_name(stmt) {
+            *table_units.entry(tbl.to_string()).or_default() +=
+                crate::types::TRANSACTIONAL_CAPACITY_FACTOR;
+        }
+    }
+    table_units
+}
+
+/// Build the per-table `ConsumedCapacity` vec from the per-table units using
+/// `builder` (write for a first-call write set, read for a read set or a
+/// replay). Returns `None` unless `ReturnConsumedCapacity` is `TOTAL` or
+/// `INDEXES`, so the mode guard lives in one place.
+fn build_transaction_capacity(
+    table_units: &std::collections::HashMap<String, f64>,
+    mode: &Option<String>,
+    builder: fn(&str, f64, &Option<String>) -> Option<crate::types::ConsumedCapacity>,
+) -> Option<Vec<crate::types::ConsumedCapacity>> {
+    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        Some(
+            table_units
+                .iter()
+                .filter_map(|(table, &units)| builder(table, units, mode))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Build the response for a same-token idempotent replay. The statements are
+/// identical to the first call (the idempotency hash matched), so `Responses`
+/// carry over from the cached first call and capacity is reported as a
+/// transactional READ, honouring the replay request's own
+/// `ReturnConsumedCapacity` mode (the original call's mode does not carry over).
+/// The statements are re-parsed to recover per-table units; they parsed
+/// successfully on the first call, so an unexpected parse error just drops that
+/// statement from the estimate rather than failing the replay.
+pub(crate) fn replay_response(
+    statements: &[ParameterizedStatement],
+    mode: &Option<String>,
+    cached_responses: Option<Vec<ItemResponse>>,
+) -> ExecuteTransactionResponse {
+    let parsed: Vec<partiql::parser::Statement> = statements
+        .iter()
+        .filter_map(|s| partiql::parser::parse(&s.statement).ok())
+        .collect();
+    ExecuteTransactionResponse {
+        responses: cached_responses,
+        consumed_capacity: build_transaction_capacity(
+            &statement_table_units(parsed.iter()),
+            mode,
+            crate::types::transactional_read_capacity,
+        ),
+    }
 }
 
 async fn execute_within_transaction<S: StorageBackend>(

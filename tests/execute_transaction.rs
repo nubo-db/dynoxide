@@ -468,3 +468,308 @@ fn test_empty_string_key_insert_keeps_validation_error_reason() {
         other => panic!("expected TransactionCanceledException, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------------
+// ClientRequestToken idempotency and transactional capacity
+// -----------------------------------------------------------------------
+
+fn seed_counter(db: &Database, table: &str, pk: &str) {
+    db.execute_statement(ExecuteStatementRequest {
+        statement: format!("INSERT INTO \"{table}\" VALUE {{'pk': '{pk}', 'n': 0}}"),
+        parameters: None,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+fn counter_value(db: &Database, table: &str, pk: &str) -> i64 {
+    let resp = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: format!("SELECT * FROM \"{table}\" WHERE pk = '{pk}'"),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap();
+    let items = resp.items.unwrap_or_default();
+    let item = items.first().expect("counter row must exist");
+    match item.get("n") {
+        Some(AttributeValue::N(n)) => n.parse().expect("n must be numeric"),
+        other => panic!("expected numeric n, got {other:?}"),
+    }
+}
+
+fn increment_counter(pk: &str) -> Vec<ParameterizedStatement> {
+    vec![ParameterizedStatement {
+        statement: format!("UPDATE \"Counters\" SET n = n + 1 WHERE pk = '{pk}'"),
+        parameters: None,
+    }]
+}
+
+/// A same-token replay returns the stored result without re-applying the
+/// statements: the counter moves exactly once. The first call reports
+/// transactional WRITE capacity, the in-window replay transactional READ.
+#[test]
+fn test_execute_transaction_same_token_replays_without_reapplying() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+
+    let make_request = || ExecuteTransactionRequest {
+        transact_statements: increment_counter("c1"),
+        client_request_token: Some("counter-token".to_string()),
+        return_consumed_capacity: Some("INDEXES".to_string()),
+    };
+
+    let first = db.execute_transaction(make_request()).unwrap();
+    let first_cap = &first.consumed_capacity.unwrap()[0];
+    assert_eq!(first_cap.capacity_units, 2.0);
+    assert_eq!(first_cap.write_capacity_units, Some(2.0));
+    assert_eq!(first_cap.read_capacity_units, None);
+
+    let replay = db.execute_transaction(make_request()).unwrap();
+    let replay_cap = &replay.consumed_capacity.unwrap()[0];
+    assert_eq!(replay_cap.capacity_units, 2.0);
+    assert_eq!(replay_cap.read_capacity_units, Some(2.0));
+    assert_eq!(replay_cap.write_capacity_units, None);
+
+    assert_eq!(
+        counter_value(&db, "Counters", "c1"),
+        1,
+        "the replay must not re-apply the statement"
+    );
+}
+
+/// A same-token replay honours the replay request's own ReturnConsumedCapacity
+/// mode, not the first call's. First call INDEXES; a TOTAL replay reports read
+/// capacity in TOTAL shape (no Table breakdown); a no-mode replay reports none.
+#[test]
+fn test_execute_transaction_replay_honours_replay_mode() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+
+    db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: increment_counter("c1"),
+        client_request_token: Some("mode-token".to_string()),
+        return_consumed_capacity: Some("INDEXES".to_string()),
+    })
+    .unwrap();
+
+    let total = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: increment_counter("c1"),
+            client_request_token: Some("mode-token".to_string()),
+            return_consumed_capacity: Some("TOTAL".to_string()),
+        })
+        .unwrap();
+    let entry = &total.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
+    assert_eq!(entry.read_capacity_units, Some(2.0));
+    assert_eq!(entry.write_capacity_units, None);
+    assert!(
+        entry.table.is_none(),
+        "TOTAL mode carries no Table breakdown"
+    );
+
+    let none = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: increment_counter("c1"),
+            client_request_token: Some("mode-token".to_string()),
+            return_consumed_capacity: None,
+        })
+        .unwrap();
+    assert!(none.consumed_capacity.is_none());
+
+    assert_eq!(
+        counter_value(&db, "Counters", "c1"),
+        1,
+        "all three same-token calls apply the increment once"
+    );
+}
+
+/// An all-SELECT transaction is a read set: the first call reports transactional
+/// READ capacity, not write. A read set must not be mislabelled as a write.
+#[test]
+fn test_execute_transaction_read_set_reports_read_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    db.execute_statement(ExecuteStatementRequest {
+        statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
+        parameters: None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let resp = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
+                parameters: None,
+            }],
+            client_request_token: None,
+            return_consumed_capacity: Some("INDEXES".to_string()),
+        })
+        .unwrap();
+    let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.read_capacity_units, Some(2.0));
+    assert_eq!(entry.write_capacity_units, None);
+}
+
+/// A transactional write reports write capacity under TOTAL too (top-level
+/// WriteCapacityUnits, no ReadCapacityUnits, no Table breakdown).
+#[test]
+fn test_execute_transaction_write_set_total_mode() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let resp = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
+                parameters: None,
+            }],
+            client_request_token: None,
+            return_consumed_capacity: Some("TOTAL".to_string()),
+        })
+        .unwrap();
+    let entry = &resp.consumed_capacity.unwrap()[0];
+    assert_eq!(entry.capacity_units, 2.0);
+    assert_eq!(entry.write_capacity_units, Some(2.0));
+    assert_eq!(entry.read_capacity_units, None);
+    assert!(
+        entry.table.is_none(),
+        "TOTAL mode carries no Table breakdown"
+    );
+}
+
+/// A same-token call with different statements is a parameter mismatch.
+#[test]
+fn test_execute_transaction_same_token_different_statements_mismatch() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![ParameterizedStatement {
+            statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
+            parameters: None,
+        }],
+        client_request_token: Some("mismatch-token".to_string()),
+        return_consumed_capacity: None,
+    })
+    .unwrap();
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2'}".to_string(),
+                parameters: None,
+            }],
+            client_request_token: Some("mismatch-token".to_string()),
+            return_consumed_capacity: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::IdempotentParameterMismatchException(_)),
+        "expected IdempotentParameterMismatchException, got: {err:?}"
+    );
+}
+
+/// A same-token call differing only in ReturnConsumedCapacity replays rather
+/// than mismatching (the hash covers the statements and parameters, not the
+/// capacity mode).
+#[test]
+fn test_execute_transaction_same_token_differing_only_in_capacity_mode_replays() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+
+    db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: increment_counter("c1"),
+        client_request_token: Some("mode-only-token".to_string()),
+        return_consumed_capacity: None,
+    })
+    .unwrap();
+
+    // Same statements, same token, different capacity mode: must replay, not error.
+    let replay = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: increment_counter("c1"),
+            client_request_token: Some("mode-only-token".to_string()),
+            return_consumed_capacity: Some("INDEXES".to_string()),
+        })
+        .unwrap();
+    assert_eq!(
+        replay.consumed_capacity.unwrap()[0].read_capacity_units,
+        Some(2.0)
+    );
+    assert_eq!(counter_value(&db, "Counters", "c1"), 1);
+}
+
+/// A tokenless transaction is never cached: repeated calls re-execute.
+#[test]
+fn test_execute_transaction_tokenless_reexecutes() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+
+    let run = || {
+        db.execute_transaction(ExecuteTransactionRequest {
+            transact_statements: increment_counter("c1"),
+            client_request_token: None,
+            return_consumed_capacity: None,
+        })
+        .unwrap();
+    };
+    run();
+    run();
+    assert_eq!(
+        counter_value(&db, "Counters", "c1"),
+        2,
+        "tokenless calls re-execute each time"
+    );
+}
+
+/// Concurrency: N threads racing the same token apply the statements exactly
+/// once. The hold-lock-across-execute guard serialises them: one executes, the
+/// rest replay, so the counter moves once and every call returns Ok.
+#[test]
+fn test_execute_transaction_concurrent_same_token_executes_once() {
+    use std::sync::{Arc, Barrier};
+
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+
+    const N: usize = 16;
+    let barrier = Arc::new(Barrier::new(N));
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.execute_transaction(ExecuteTransactionRequest {
+                    transact_statements: increment_counter("c1"),
+                    client_request_token: Some("race-token".to_string()),
+                    return_consumed_capacity: None,
+                })
+                .is_ok()
+            })
+        })
+        .collect();
+
+    let oks = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|&ok| ok)
+        .count();
+    assert_eq!(
+        oks, N,
+        "all {N} same-token calls should return Ok (one executes, the rest replay); got {oks}"
+    );
+    assert_eq!(
+        counter_value(&db, "Counters", "c1"),
+        1,
+        "the increment must apply exactly once"
+    );
+}

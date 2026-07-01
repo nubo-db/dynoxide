@@ -117,6 +117,20 @@ type TokenCache = HashMap<
     ),
 >;
 
+/// Cached `ExecuteTransaction` response with timestamp and request hash for
+/// idempotency. Separate from [`TokenCache`] because the response type differs
+/// and `ClientRequestToken` idempotency is scoped per API operation in AWS: a
+/// token reused across `TransactWriteItems` and `ExecuteTransaction` executes
+/// once in each, so the two caches are independent by design.
+type ExecuteTransactionTokenCache = HashMap<
+    String,
+    (
+        Instant,
+        u64,
+        actions::execute_transaction::ExecuteTransactionResponse,
+    ),
+>;
+
 /// The native storage backend: the rusqlite-backed [`storage::Storage`].
 ///
 /// `Database`'s type parameter defaults to this, so existing native callers
@@ -169,6 +183,7 @@ pub const WASM_PREVIEW: bool = false;
 pub struct Database<S = RusqliteBackend> {
     inner: Arc<Mutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
+    execute_transaction_tokens: Arc<Mutex<ExecuteTransactionTokenCache>>,
 }
 
 /// Serialises backend access on the backend-neutral build. On wasm this is an
@@ -200,6 +215,7 @@ use std::sync::Mutex as BackendMutex;
 pub struct Database<S> {
     inner: Arc<BackendMutex<S>>,
     idempotency_tokens: Arc<Mutex<TokenCache>>,
+    execute_transaction_tokens: Arc<Mutex<ExecuteTransactionTokenCache>>,
 }
 
 // Hand-written so cloning never requires `S: Clone`; only the `Arc`s clone.
@@ -208,6 +224,7 @@ impl<S> Clone for Database<S> {
         Self {
             inner: Arc::clone(&self.inner),
             idempotency_tokens: Arc::clone(&self.idempotency_tokens),
+            execute_transaction_tokens: Arc::clone(&self.execute_transaction_tokens),
         }
     }
 }
@@ -220,6 +237,7 @@ impl Database<RusqliteBackend> {
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
             idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
+            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -255,6 +273,7 @@ impl Database<RusqliteBackend> {
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
             idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
+            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -264,6 +283,7 @@ impl Database<RusqliteBackend> {
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
             idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
+            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -679,11 +699,95 @@ impl Database<RusqliteBackend> {
     }
 
     /// Execute PartiQL statements transactionally (all-or-nothing).
+    ///
+    /// Honours `ClientRequestToken` idempotency the same way as
+    /// [`transact_write_items`](Self::transact_write_items): a same-token,
+    /// same-statements call within the expiry window replays the stored result
+    /// without re-applying the statements. The cache is separate from the
+    /// `TransactWriteItems` one (see [`ExecuteTransactionTokenCache`]).
     pub fn execute_transaction(
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
-        self.with_storage(|s| pollster::block_on(actions::execute_transaction::execute(s, request)))
+        const TOKEN_EXPIRY_SECS: u64 = 600; // 10 minutes
+        const MAX_TOKEN_LEN: usize = 36;
+
+        // Validate token length
+        if let Some(ref token) = request.client_request_token {
+            if token.len() > MAX_TOKEN_LEN {
+                return Err(DynoxideError::ValidationException(format!(
+                    "1 validation error detected: Value '{}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {}",
+                    token, MAX_TOKEN_LEN
+                )));
+            }
+        }
+
+        // The transaction executor, shared by the cache-miss and tokenless paths.
+        let execute_txn = || {
+            self.with_storage(|s| {
+                pollster::block_on(actions::execute_transaction::execute(s, request.clone()))
+            })
+        };
+
+        // Idempotency. For a token-bearing request, hold the cache lock across
+        // the whole first call (check, execute, insert) so two concurrent
+        // same-token calls cannot both execute the transaction: the second
+        // serialises behind the first and replays its result. A replay (cache
+        // hit) only needs the lock to read the cached entry, so it clones what
+        // it needs, releases the lock, then re-derives read capacity.
+        //
+        // Lock ordering matches `transact_write_items`: hold the token cache and
+        // then take the storage lock inside `execute_txn`. Only these two methods
+        // touch their token caches, and each takes storage second, so there is no
+        // reverse path to deadlock against. Any future code touching both locks
+        // must keep this order.
+        if let Some(ref token) = request.client_request_token {
+            // Hash over the statements (and their parameters) only, so a
+            // same-token call differing only in ReturnConsumedCapacity replays
+            // rather than mismatches.
+            let request_hash = {
+                use std::hash::{Hash, Hasher};
+                let normalised = serde_json::to_value(&request.transact_statements)
+                    .and_then(|v| serde_json::to_vec(&v))
+                    .unwrap_or_default();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                normalised.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            let mut cache = self
+                .execute_transaction_tokens
+                .lock()
+                .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
+            // Evict expired entries
+            cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
+            if let Some((_, cached_hash, resp)) = cache.get(token) {
+                if *cached_hash != request_hash {
+                    return Err(DynoxideError::IdempotentParameterMismatchException(
+                        "An error occurred (IdempotentParameterMismatchException)".to_string(),
+                    ));
+                }
+                // Replay: clone the stored responses, release the lock, then
+                // recompute transactional read capacity, honouring this replay's
+                // own ReturnConsumedCapacity mode.
+                let cached_responses = resp.responses.clone();
+                drop(cache);
+                return Ok(actions::execute_transaction::replay_response(
+                    &request.transact_statements,
+                    &request.return_consumed_capacity,
+                    cached_responses,
+                ));
+            }
+            // Cache miss: execute and record the result while still holding the
+            // lock, so a concurrent same-token call waits and then replays
+            // rather than executing the transaction a second time.
+            let resp = execute_txn()?;
+            cache.insert(token.clone(), (Instant::now(), request_hash, resp.clone()));
+            return Ok(resp);
+        }
+
+        // No idempotency token: execute without touching the cache.
+        execute_txn()
     }
 
     /// Execute a batch of PartiQL statements.
@@ -837,6 +941,7 @@ impl Database<WasmBridgeBackend> {
         Ok(Self {
             inner: Arc::new(BackendMutex::new(backend)),
             idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
+            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 

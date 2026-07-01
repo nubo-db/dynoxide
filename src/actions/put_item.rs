@@ -507,6 +507,7 @@ mod tests {
             err.to_lowercase().contains("returnitemcollectionmetrics"),
             "got: {err}"
         );
+        assert!(err.to_lowercase().contains("returnvalues"), "got: {err}");
     }
 
     /// A single-item write and its GSI fan-out succeed or fail as one unit:

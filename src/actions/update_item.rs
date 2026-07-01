@@ -901,6 +901,7 @@ mod tests {
         assert!(err.contains("1 validation error detected"), "got: {err}");
         assert!(err.contains("enum value set"), "got: {err}");
         assert!(err.contains("returnValues"), "got: {err}");
+        assert!(!err.contains("returnConsumedCapacity"), "got: {err}");
     }
 
     #[test]

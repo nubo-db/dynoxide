@@ -674,3 +674,38 @@ fn test_batch_get_empty_binary_key_is_top_level_validation() {
     assert_eq!(err.status_code(), 400, "must be HTTP 400, got: {err:?}");
     assert_eq!(err.to_string(), BATCH_EMPTY_BINARY_MSG);
 }
+
+#[test]
+fn batch_get_rejects_cross_table_expression_mix() {
+    let db = setup_db();
+    create_test_table(&db, "BgMixA");
+    create_test_table(&db, "BgMixB");
+    let req: BatchGetItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "BgMixA": { "Keys": [{ "pk": { "S": "a" }, "sk": { "S": "z" } }], "ProjectionExpression": "pk" },
+            "BgMixB": { "Keys": [{ "pk": { "S": "b" }, "sk": { "S": "z" } }], "AttributesToGet": ["pk"] }
+        }
+    }))
+    .unwrap();
+    let err = db.batch_get_item(req).unwrap_err();
+    assert!(
+        matches!(&err, DynoxideError::ValidationException(m)
+            if m.contains("Can not use both expression and non-expression parameters")),
+        "cross-table expression/non-expression mix must be a ValidationException, got: {err:?}"
+    );
+}
+
+#[test]
+fn batch_get_allows_uniform_projection_across_tables() {
+    let db = setup_db();
+    create_test_table(&db, "BgUniA");
+    create_test_table(&db, "BgUniB");
+    let req: BatchGetItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {
+            "BgUniA": { "Keys": [{ "pk": { "S": "a" }, "sk": { "S": "z" } }], "ProjectionExpression": "pk" },
+            "BgUniB": { "Keys": [{ "pk": { "S": "b" }, "sk": { "S": "z" } }], "ProjectionExpression": "pk" }
+        }
+    }))
+    .unwrap();
+    assert!(db.batch_get_item(req).is_ok());
+}

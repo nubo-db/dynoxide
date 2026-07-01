@@ -496,10 +496,54 @@ mod tests {
             (":lo".to_string(), AttributeValue::S("a".into())),
         ]));
         let tracker = make_tracker(&names, &values);
-        for op in ["<", "<=", ">", ">="] {
+        // Each reversed comparator maps to its attribute-on-left equivalent.
+        for (op, expected) in [("<", "Gt"), ("<=", "Ge"), (">", "Lt"), (">=", "Le")] {
             let expr = format!("#pk = :pk AND :lo {op} #sk");
-            assert!(parse(&expr, &tracker).is_ok(), "reversed {op} should parse");
+            let kc = parse(&expr, &tracker).unwrap();
+            let tag = match &kc.sk_condition {
+                Some(SortKeyCondition::Gt(n, v)) if n == "sk" && v == ":lo" => "Gt",
+                Some(SortKeyCondition::Ge(n, v)) if n == "sk" && v == ":lo" => "Ge",
+                Some(SortKeyCondition::Lt(n, v)) if n == "sk" && v == ":lo" => "Lt",
+                Some(SortKeyCondition::Le(n, v)) if n == "sk" && v == ":lo" => "Le",
+                _ => "other",
+            };
+            assert_eq!(tag, expected, "reversed {op} should flip to {expected}");
         }
+    }
+
+    #[test]
+    fn accepts_reversed_equality_on_sort_key() {
+        let names = Some(HashMap::from([
+            ("#pk".to_string(), "pk".to_string()),
+            ("#sk".to_string(), "sk".to_string()),
+        ]));
+        let values = Some(HashMap::from([
+            (":pk".to_string(), AttributeValue::S("x".into())),
+            (":sk".to_string(), AttributeValue::S("m".into())),
+        ]));
+        let tracker = make_tracker(&names, &values);
+        let kc = parse("#pk = :pk AND :sk = #sk", &tracker).unwrap();
+        assert!(
+            matches!(&kc.sk_condition, Some(SortKeyCondition::Eq(n, v)) if n == "sk" && v == ":sk")
+        );
+    }
+
+    #[test]
+    fn rejects_reversed_operand_with_nested_key_path() {
+        let names = Some(HashMap::from([
+            ("#pk".to_string(), "pk".to_string()),
+            ("#sk".to_string(), "sk".to_string()),
+        ]));
+        let values = Some(HashMap::from([
+            (":pk".to_string(), AttributeValue::S("x".into())),
+            (":lo".to_string(), AttributeValue::S("a".into())),
+        ]));
+        let tracker = make_tracker(&names, &values);
+        let err = parse("#pk = :pk AND :lo <= #sk.foo", &tracker).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes"
+        );
     }
 
     #[test]

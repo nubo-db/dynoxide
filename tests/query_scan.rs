@@ -1007,3 +1007,41 @@ fn test_all_projected_with_projection_and_no_index_prefers_mutual_exclusion() {
         "got: {err}"
     );
 }
+
+#[test]
+fn scan_rejects_undefined_projection_name_on_zero_match() {
+    let db = setup_db();
+    create_test_table(&db, "ProjZeroScan");
+    // No items inserted, so the scan matches nothing; the undefined name must
+    // still reject rather than returning an empty result.
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "ProjZeroScan",
+        "ProjectionExpression": "#undef"
+    }))
+    .unwrap();
+    let err = db.scan(req).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("An expression attribute name used in the document path is not defined"),
+        "undefined projection name must reject even with zero matches, got: {err}"
+    );
+}
+
+#[test]
+fn query_rejects_overlapping_projection_paths_on_zero_match() {
+    let db = setup_db();
+    create_test_table(&db, "ProjOverlapQuery");
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "ProjOverlapQuery",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": { ":pk": { "S": "no-such" } },
+        "ProjectionExpression": "#a, #a.#b",
+        "ExpressionAttributeNames": { "#a": "a", "#b": "b" }
+    }))
+    .unwrap();
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string().contains("Two document paths overlap"),
+        "overlapping projection paths must reject, got: {err}"
+    );
+}

@@ -5,7 +5,8 @@
 
 use crate::expressions::tokenizer::{Token, TokenStream, near_window_tokenizer, tokenize};
 use crate::expressions::{
-    PathElement, TrackedExpressionAttributes, resolve_path, resolve_path_elements,
+    PathElement, TrackedExpressionAttributes, format_path_for_error, resolve_path,
+    resolve_path_elements,
 };
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -103,18 +104,6 @@ fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Format a resolved path for overlap errors: `[a]`, `[a, b]`, `[a, [0]]`.
-fn format_path_for_error(path: &[PathElement]) -> String {
-    let parts: Vec<String> = path
-        .iter()
-        .map(|elem| match elem {
-            PathElement::Attribute(name) => name.clone(),
-            PathElement::Index(i) => format!("[{i}]"),
-        })
-        .collect();
-    format!("[{}]", parts.join(", "))
 }
 
 /// Apply a projection to an item, returning only the specified attributes.
@@ -368,6 +357,42 @@ mod tests {
         let err = validate(&proj, &tracker).unwrap_err();
         assert!(err.contains("Two document paths overlap"), "got: {err}");
         assert!(err.ends_with("path one: [a], path two: [a]"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_reports_overlap_in_expression_order() {
+        // Overlapping pair is the 2nd and 3rd path; reported in expression order.
+        let proj = parse("#x, #a, #a.#b").unwrap();
+        let names = Some(HashMap::from([
+            ("#x".to_string(), "x".to_string()),
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+        ]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert!(
+            err.ends_with("path one: [a], path two: [a, b]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_list_attr_and_its_index() {
+        let proj = parse("#l, #l[0]").unwrap();
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        assert!(validate(&proj, &tracker).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_sibling_list_indices() {
+        let proj = parse("#l[0], #l[1]").unwrap();
+        let names = Some(HashMap::from([("#l".to_string(), "l".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        assert!(validate(&proj, &tracker).is_ok());
     }
 
     #[test]

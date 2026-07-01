@@ -7,8 +7,8 @@ use crate::expressions::tokenizer::{
     Token, TokenStream, near_window_parser, near_window_tokenizer, tokenize,
 };
 use crate::expressions::{
-    PathElement, TrackedExpressionAttributes, remove_path, resolve_path, resolve_path_elements,
-    set_path,
+    PathElement, TrackedExpressionAttributes, format_path_for_error, remove_path, resolve_path,
+    resolve_path_elements, set_path,
 };
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -358,18 +358,6 @@ fn resolve_tracked_path(
             elem.clone()
         })
         .collect()
-}
-
-/// Format a path for error messages in dynalite format: [a, b, [1], c].
-fn format_path_for_error(path: &[PathElement]) -> String {
-    let parts: Vec<String> = path
-        .iter()
-        .map(|elem| match elem {
-            PathElement::Attribute(name) => name.clone(),
-            PathElement::Index(i) => format!("[{i}]"),
-        })
-        .collect();
-    format!("[{}]", parts.join(", "))
 }
 
 /// Check for overlapping or conflicting document paths.

@@ -89,9 +89,10 @@ pub async fn execute<S: StorageBackend>(
     // DynamoDB validates expression attributes, key values, projections, and duplicates
     // BEFORE checking table existence. Perform these checks first.
 
-    // Mixing an expression projection on one table's block with a non-expression
-    // AttributesToGet on another is rejected as a whole, even when each block is
-    // internally consistent. Order-independent over the request map.
+    // Reject a request that pairs an expression projection with a non-expression
+    // AttributesToGet, whether in the same block or across blocks. AWS rejects the
+    // request as a whole even when each block is internally consistent.
+    // Order-independent over the request map.
     let any_projection = request
         .request_items
         .values()
@@ -107,16 +108,8 @@ pub async fn execute<S: StorageBackend>(
     }
 
     for keys_and_attrs in request.request_items.values() {
-        // Check AttributesToGet + expression conflict
-        let has_attributes_to_get = keys_and_attrs.attributes_to_get.is_some();
         let has_projection_expr = keys_and_attrs.projection_expression.is_some();
         let has_expr_attr_names = keys_and_attrs.expression_attribute_names.is_some();
-
-        if has_attributes_to_get && has_projection_expr {
-            return Err(DynoxideError::ValidationException(
-                "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}".to_string(),
-            ));
-        }
 
         // ExpressionAttributeNames without expression
         if has_expr_attr_names && !has_projection_expr {

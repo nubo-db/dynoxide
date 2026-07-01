@@ -570,8 +570,10 @@ impl Database<RusqliteBackend> {
                     ));
                 }
                 // Replay: clone what the response needs, release the lock, then
-                // build read capacity at the same magnitude as the first call's
-                // write, honouring this replay's own ReturnConsumedCapacity mode.
+                // recompute a transactional read cost against the item sizes
+                // (4KB read granularity, which diverges from the first call's
+                // 1KB-granular write above 1KB), honouring this replay's own
+                // ReturnConsumedCapacity mode.
                 let cached_metrics = resp.item_collection_metrics.clone();
                 drop(cache);
                 return Ok(actions::transact_write_items::replay_response(

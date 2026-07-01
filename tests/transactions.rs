@@ -1075,6 +1075,44 @@ fn test_transact_write_replay_reports_read_capacity() {
     assert_eq!(replay_entry.write_capacity_units, None);
 }
 
+/// A same-token replay of a >1KB item recomputes the read cost at 4KB read
+/// granularity rather than relabelling the first call's 1KB-granular write
+/// magnitude. For a ~1.5KB Put the first call reports write `4` (2 WCU at 1KB,
+/// doubled) but the replay reports read `2` (1 RCU at 4KB, doubled), where the
+/// two magnitudes diverge. This is the case the sub-1KB test cannot catch,
+/// since below 1KB both round to the same number.
+#[test]
+fn test_transact_write_replay_recomputes_read_above_1kb() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Txn");
+
+    // ~1.5KB item: write rounds to 2 units (1KB granularity), read to 1 (4KB).
+    let blob = "x".repeat(1500);
+    let body = json!({
+        "ClientRequestToken": "replay-token-1kb",
+        "ReturnConsumedCapacity": "INDEXES",
+        "TransactItems": [
+            {"Put": {"TableName": "Txn", "Item": {"pk": {"S": "big"}, "blob": {"S": blob}}}}
+        ]
+    });
+
+    let first = db
+        .transact_write_items(serde_json::from_value(body.clone()).unwrap())
+        .unwrap();
+    let first_entry = &first.consumed_capacity.unwrap()[0];
+    assert_eq!(first_entry.capacity_units, 4.0);
+    assert_eq!(first_entry.write_capacity_units, Some(4.0));
+    assert_eq!(first_entry.read_capacity_units, None);
+
+    let replay = db
+        .transact_write_items(serde_json::from_value(body).unwrap())
+        .unwrap();
+    let replay_entry = &replay.consumed_capacity.unwrap()[0];
+    assert_eq!(replay_entry.capacity_units, 2.0);
+    assert_eq!(replay_entry.read_capacity_units, Some(2.0));
+    assert_eq!(replay_entry.write_capacity_units, None);
+}
+
 /// A same-token replay honours the replay request's own ReturnConsumedCapacity
 /// mode, not the first call's. First call INDEXES, replay TOTAL: the replay
 /// reports read capacity in TOTAL shape (no Table breakdown).

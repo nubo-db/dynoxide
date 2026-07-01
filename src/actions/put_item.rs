@@ -57,10 +57,8 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
             TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
-        // AWS validates the table name first and short-circuits: an empty or
-        // otherwise invalid table name is reported on its own, before the item
-        // and Return* enum parameters are checked (eu-west-2, 2026-06). A valid
-        // table name lets the remaining constraint errors aggregate below.
+        // AWS reports an invalid table name on its own, before the item and
+        // Return* enum checks (eu-west-2). A valid name lets the rest aggregate.
         let table_name_opt = raw.table_name.as_deref();
         let table_name_errors =
             table_name_constraint_errors(table_name_opt, TableNameContext::ReadWrite);
@@ -473,8 +471,8 @@ mod tests {
 
     #[test]
     fn empty_table_name_short_circuits_before_return_values() {
-        // eu-west-2 (2026-06): an empty TableName is reported on its own, before
-        // the invalid ReturnValues enum is considered.
+        // eu-west-2: an empty TableName is reported alone, before the invalid
+        // ReturnValues enum.
         let err = serde_json::from_value::<super::PutItemRequest>(serde_json::json!({
             "TableName": "",
             "ReturnValues": "INVALID",

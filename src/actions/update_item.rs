@@ -61,10 +61,8 @@ pub struct UpdateItemRequest {
     pub conditional_operator: Option<String>,
 }
 
-/// Return the first invalid `Return*` enum error for UpdateItem, in the order AWS
-/// reports them (ReturnValues first). UpdateItem stops at the first invalid enum
-/// and reports one error, unlike PutItem which aggregates all of them
-/// (eu-west-2, 2026-06). Returns `None` when every supplied enum is valid.
+/// First invalid `Return*` enum for UpdateItem, ReturnValues first, or `None` if
+/// all valid. UpdateItem stops at the first; PutItem aggregates.
 fn first_invalid_return_enum(
     return_values: Option<&str>,
     return_consumed_capacity: Option<&str>,
@@ -110,9 +108,8 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
-        // AWS validates the table name first and short-circuits (eu-west-2, 2026-06):
-        // an invalid table name is reported on its own, before the key and Return*
-        // enum parameters are checked.
+        // AWS reports an invalid table name on its own, before the key and
+        // Return* enum checks (eu-west-2).
         let table_name_errors =
             table_name_constraint_errors(raw.table_name.as_deref(), TableNameContext::ReadWrite);
         if let Some(msg) = format_validation_errors(&table_name_errors) {
@@ -131,10 +128,8 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             );
         }
 
-        // Return* enum validation. Unlike PutItem (which aggregates every invalid
-        // enum into one envelope), UpdateItem stops at the first invalid enum and
-        // reports a single error, with ReturnValues checked first (eu-west-2,
-        // 2026-06). Do not fold these two paths together - the divergence is real.
+        // UpdateItem stops at the first invalid enum (ReturnValues first) and
+        // reports one error, where PutItem aggregates all of them. Keep separate.
         if let Some(enum_err) = first_invalid_return_enum(
             raw.return_values.as_deref(),
             raw.return_consumed_capacity.as_deref(),
@@ -893,9 +888,8 @@ mod tests {
 
     #[test]
     fn update_item_stops_at_first_invalid_enum() {
-        // eu-west-2 (2026-06): UpdateItem reports a single error for the first
-        // invalid enum (ReturnValues checked first), unlike PutItem which
-        // aggregates every invalid Return* enum.
+        // eu-west-2: UpdateItem reports one error for the first invalid enum
+        // (ReturnValues first), unlike PutItem which aggregates them.
         let err = serde_json::from_value::<super::UpdateItemRequest>(serde_json::json!({
             "TableName": "_conformance_valid_table_name",
             "Key": {"pk": {"S": "test"}},

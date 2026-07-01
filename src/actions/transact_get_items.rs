@@ -170,6 +170,9 @@ pub async fn execute<S: StorageBackend>(
             let projection = expressions::projection::parse(proj_expr)
                 .map_err(DynoxideError::ValidationException)?;
             tracker.track_projection_expr(&projection);
+            // Reject undefined names and overlapping paths before the read.
+            expressions::projection::validate(&projection, &tracker)
+                .map_err(DynoxideError::ValidationException)?;
 
             if let Some(item) = item {
                 let mut key_attrs = vec![key_schema.partition_key.clone()];

@@ -66,6 +66,57 @@ fn projection_parser_error(_expr: &str, _stream: &mut TokenStream, msg: String) 
     format!("Invalid ProjectionExpression: {msg}")
 }
 
+/// Validate a ProjectionExpression before any item is read: reject undefined
+/// expression-attribute names and overlapping document paths. Run eagerly, so a
+/// Scan/Query/GetItem that matches nothing still rejects.
+pub fn validate(
+    projection: &ProjectionExpr,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<(), String> {
+    // Resolve first: surfaces undefined names, and lets the overlap check compare
+    // resolved names as AWS does.
+    let mut resolved: Vec<Vec<PathElement>> = Vec::with_capacity(projection.paths.len());
+    for raw_path in &projection.paths {
+        let r = resolve_path_elements(raw_path, tracker)
+            .map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
+        resolved.push(r);
+    }
+    check_path_overlaps(&resolved)
+}
+
+/// Reject two paths where one is a prefix of the other (a duplicate is the
+/// self-prefix case). Reported in expression order, matching AWS.
+fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
+    for i in 0..paths.len() {
+        for j in (i + 1)..paths.len() {
+            let (a, b) = (&paths[i], &paths[j]);
+            let min_len = a.len().min(b.len());
+            let common = (0..min_len).take_while(|&k| a[k] == b[k]).count();
+            if common == a.len() || common == b.len() {
+                return Err(format!(
+                    "Invalid ProjectionExpression: Two document paths overlap with each other; \
+                     must remove or rewrite one of these paths; path one: {}, path two: {}",
+                    format_path_for_error(a),
+                    format_path_for_error(b)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Format a resolved path for overlap errors: `[a]`, `[a, b]`, `[a, [0]]`.
+fn format_path_for_error(path: &[PathElement]) -> String {
+    let parts: Vec<String> = path
+        .iter()
+        .map(|elem| match elem {
+            PathElement::Attribute(name) => name.clone(),
+            PathElement::Index(i) => format!("[{i}]"),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
 /// Apply a projection to an item, returning only the specified attributes.
 /// Key attributes are always included.
 pub fn apply(
@@ -90,12 +141,9 @@ pub fn apply(
     }
 
     // DynamoDB returns projected list elements compacted and in ascending index
-    // order, independent of the order the indices were requested (e.g. `l[2], l[0]`
-    // yields `[l0, l2]`). Sorting the resolved paths index-aware before insertion
-    // produces that ordering; dropping identical paths compacts repeated indices.
-    // Top-level attributes and nested map keys land in unordered maps, so this
-    // reordering is observable only in list element order, which is exactly where
-    // AWS parity requires it.
+    // order regardless of request order (`l[2], l[0]` yields `[l0, l2]`). Sort and
+    // dedup the resolved paths before insertion; only list order is affected,
+    // since map keys are unordered.
     resolved_paths.sort_by(|a, b| compare_paths(a, b));
     resolved_paths.dedup();
 
@@ -108,9 +156,9 @@ pub fn apply(
     Ok(result)
 }
 
-/// Order two resolved projection paths so that, within one list, the requested
-/// indices sort ascending. Attribute names sort lexicographically (their result
-/// map is unordered, so this only groups siblings); index elements sort by value.
+/// Order resolved paths so a list's requested indices sort ascending. Attribute
+/// names sort lexicographically, which only groups siblings since result maps
+/// are unordered.
 fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for (ea, eb) in a.iter().zip(b.iter()) {
@@ -293,6 +341,59 @@ mod tests {
         let proj = parse("RelatedItems[0]").unwrap();
         assert_eq!(proj.paths[0].len(), 2);
         assert_eq!(proj.paths[0][1], PathElement::Index(0));
+    }
+
+    #[test]
+    fn validate_rejects_overlapping_paths() {
+        let proj = parse("#a, #a.#b").unwrap();
+        let names = Some(HashMap::from([
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+        ]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_paths() {
+        let proj = parse("#a, #a").unwrap();
+        let names = Some(HashMap::from([("#a".to_string(), "a".to_string())]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert!(err.contains("Two document paths overlap"), "got: {err}");
+        assert!(err.ends_with("path one: [a], path two: [a]"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_sibling_paths() {
+        let proj = parse("#a.#b, #a.#c").unwrap();
+        let names = Some(HashMap::from([
+            ("#a".to_string(), "a".to_string()),
+            ("#b".to_string(), "b".to_string()),
+            ("#c".to_string(), "c".to_string()),
+        ]));
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&names, &no_values);
+        assert!(validate(&proj, &tracker).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_undefined_name() {
+        let proj = parse("#undef").unwrap();
+        let no_names = None;
+        let no_values = None;
+        let tracker = TrackedExpressionAttributes::new(&no_names, &no_values);
+        let err = validate(&proj, &tracker).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid ProjectionExpression: An expression attribute name used in the document path is not defined; attribute name: #undef"
+        );
     }
 
     #[test]

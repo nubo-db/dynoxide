@@ -269,15 +269,28 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // Use provided attribute definitions or fall back to existing
-    let existing_attr_defs: Vec<AttributeDefinition> =
-        serde_json::from_str(&meta.attribute_definitions)
-            .map_err(|e| DynoxideError::InternalServerError(format!("Bad attr defs JSON: {e}")))?;
+    // Merge provided attribute definitions into the existing set. DynamoDB
+    // treats UpdateTable's AttributeDefinitions as a delta: adding a GSI only
+    // requires the new index's key attributes, and the existing definitions
+    // (table keys, prior GSI keys) are preserved. Replacing them outright would
+    // drop attributes still referenced by the key schema and other indexes.
+    let mut attr_defs: Vec<AttributeDefinition> = serde_json::from_str(&meta.attribute_definitions)
+        .map_err(|e| DynoxideError::InternalServerError(format!("Bad attr defs JSON: {e}")))?;
 
-    let attr_defs = request
-        .attribute_definitions
-        .as_ref()
-        .unwrap_or(&existing_attr_defs);
+    if let Some(ref provided) = request.attribute_definitions {
+        for def in provided {
+            // An already-declared attribute keeps its existing type. Real
+            // DynamoDB ignores a redeclaration (even one carrying a different
+            // type) rather than overwriting or rejecting it, so only genuinely
+            // new attributes are appended. Verified against AWS in eu-west-2.
+            if !attr_defs
+                .iter()
+                .any(|d| d.attribute_name == def.attribute_name)
+            {
+                attr_defs.push(def.clone());
+            }
+        }
+    }
 
     // Parse table key schema for backfill
     let key_schema = helpers::parse_key_schema(&meta)?;
@@ -302,7 +315,7 @@ pub async fn execute<S: StorageBackend>(
                     projection: create.projection.clone(),
                     provisioned_throughput: None,
                 };
-                validation::validate_gsi(&gsi_def, attr_defs)?;
+                validation::validate_gsi(&gsi_def, &attr_defs)?;
             }
             if let Some(ref delete) = update.delete {
                 if !current_gsis
@@ -398,7 +411,7 @@ pub async fn execute<S: StorageBackend>(
         }
 
         // Update metadata
-        let attr_defs_json = serde_json::to_string(attr_defs)
+        let attr_defs_json = serde_json::to_string(&attr_defs)
             .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
         let gsi_json = if current_gsis.is_empty() {
             None

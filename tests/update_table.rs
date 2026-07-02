@@ -505,6 +505,60 @@ fn test_update_table_create_gsi_merges_delta_attribute_definitions() {
         .expect("PutItem on table keys should succeed after merging GSI attrs");
 }
 
+// Redeclaring an already-defined attribute keeps its existing type. Verified
+// against real DynamoDB (eu-west-2): an UpdateTable that adds a GSI while
+// redeclaring the table key `PK` with a conflicting type is accepted, and
+// DescribeTable still reports `PK` with its original type. AWS ignores the
+// incoming type rather than overwriting or rejecting it.
+#[test]
+fn test_update_table_redeclaring_attribute_keeps_existing_type() {
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    // Add a GSI while redeclaring the table key PK as N (its stored type is S).
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "N"},
+            {"AttributeName": "gsiPk", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req)
+        .expect("UpdateTable redeclaring an attribute with a different type should be accepted");
+
+    // PK must retain its original type S; gsiPk is added as S.
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let pk = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .find(|d| d.attribute_name == "PK")
+        .expect("PK definition present");
+    assert_eq!(
+        pk.attribute_type,
+        ScalarAttributeType::S,
+        "PK must keep its existing type S, not be overwritten by the redeclared N"
+    );
+
+    // A PutItem keyed with the original string type still succeeds.
+    let put_req = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "Item": {"PK": {"S": "a"}, "SK": {"S": "b"}},
+    }))
+    .unwrap();
+    db.put_item(put_req)
+        .expect("PutItem with the original key type should still succeed");
+}
+
 #[test]
 fn test_update_table_response_includes_table_description() {
     let db = make_db();

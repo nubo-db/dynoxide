@@ -559,6 +559,285 @@ fn test_update_table_redeclaring_attribute_keeps_existing_type() {
         .expect("PutItem with the original key type should still succeed");
 }
 
+// Deleting a GSI prunes its now-orphaned key attributes from
+// AttributeDefinitions. Verified against real DynamoDB (eu-west-2): after
+// deleting the only GSI, DescribeTable reports just the table keys.
+#[test]
+fn test_update_table_delete_gsi_prunes_orphaned_attributes() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "KeySchema": [
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "gsiPk", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }]
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi1"}}]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let names: Vec<&str> = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    assert!(
+        !names.contains(&"gsiPk"),
+        "orphaned gsiPk should be pruned after the GSI is deleted: got {names:?}"
+    );
+    assert!(names.contains(&"PK") && names.contains(&"SK"));
+    assert_eq!(names.len(), 2);
+}
+
+// An AttributeDefinitions entry used by no key schema is silently dropped, not
+// stored and not rejected. Verified against real DynamoDB (eu-west-2).
+#[test]
+fn test_update_table_drops_unused_attribute_definition() {
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "gsiPk", "AttributeType": "S"},
+            {"AttributeName": "extraUnused", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req)
+        .expect("an unused attribute in the delta must not cause an error");
+
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let names: Vec<&str> = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"gsiPk"),
+        "the used GSI key should be stored"
+    );
+    assert!(
+        !names.contains(&"extraUnused"),
+        "an unused attribute should be dropped, not stored: got {names:?}"
+    );
+    assert!(names.contains(&"PK") && names.contains(&"SK"));
+}
+
+// Reconciliation must not prune attributes still used by an LSI. Delete a GSI
+// on a table that also has an LSI and confirm the LSI's key attribute survives
+// while the GSI's is pruned.
+#[test]
+fn test_update_table_delete_gsi_keeps_lsi_attributes() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "KeySchema": [
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "lsiSK", "AttributeType": "S"},
+            {"AttributeName": "gsiPk", "AttributeType": "S"},
+        ],
+        "LocalSecondaryIndexes": [{
+            "IndexName": "lsi1",
+            "KeySchema": [
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "lsiSK", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }]
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi1"}}]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let names: Vec<&str> = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"lsiSK"),
+        "an LSI key attribute must survive a GSI delete: got {names:?}"
+    );
+    assert!(
+        !names.contains(&"gsiPk"),
+        "the deleted GSI's attribute should be pruned: got {names:?}"
+    );
+    assert!(names.contains(&"PK") && names.contains(&"SK"));
+}
+
+// Reconciliation runs on every UpdateTable, so a single-field update that
+// touches no indexes must leave AttributeDefinitions (including LSI and GSI key
+// attributes) untouched.
+#[test]
+fn test_update_table_non_index_update_preserves_attribute_definitions() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "KeySchema": [
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "lsiSK", "AttributeType": "S"},
+            {"AttributeName": "gsiPk", "AttributeType": "S"},
+        ],
+        "LocalSecondaryIndexes": [{
+            "IndexName": "lsi1",
+            "KeySchema": [
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "lsiSK", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }]
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+
+    // A single-field update with no GlobalSecondaryIndexUpdates and no
+    // AttributeDefinitions.
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "TableClass": "STANDARD_INFREQUENT_ACCESS",
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let names: Vec<&str> = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    for expected in ["PK", "SK", "lsiSK", "gsiPk"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} must survive a non-index update: got {names:?}"
+        );
+    }
+    assert_eq!(names.len(), 4);
+}
+
+// Deleting one of two GSIs that share a key attribute must keep the shared
+// attribute (still used by the survivor) along with the survivor's other keys.
+#[test]
+fn test_update_table_delete_gsi_keeps_shared_attribute() {
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "KeySchema": [
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "sharedPk", "AttributeType": "S"},
+            {"AttributeName": "gsi2sk", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexes": [
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "sharedPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "gsi2",
+                "KeySchema": [
+                    {"AttributeName": "sharedPk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi2sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ]
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+
+    // Delete gsi1; gsi2 still references sharedPk (plus gsi2sk).
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi1"}}]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let names: Vec<&str> = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"sharedPk"),
+        "the shared attribute still used by gsi2 must be kept: got {names:?}"
+    );
+    assert!(
+        names.contains(&"gsi2sk"),
+        "the surviving gsi2's range key must be kept: got {names:?}"
+    );
+    assert!(names.contains(&"PK") && names.contains(&"SK"));
+    assert_eq!(names.len(), 4);
+}
+
 #[test]
 fn test_update_table_response_includes_table_description() {
     let db = make_db();

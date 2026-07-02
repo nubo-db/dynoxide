@@ -410,6 +410,12 @@ pub async fn execute<S: StorageBackend>(
             }
         }
 
+        // Reconcile AttributeDefinitions to exactly the attributes still
+        // referenced by the table key schema and surviving index key schemas.
+        // See reconcile_attribute_definitions for the AWS-verified rules.
+        let lsi_defs = crate::actions::lsi::parse_lsi_defs(&meta)?;
+        reconcile_attribute_definitions(&mut attr_defs, &key_schema, &current_gsis, &lsi_defs);
+
         // Update metadata
         let attr_defs_json = serde_json::to_string(&attr_defs)
             .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
@@ -535,6 +541,36 @@ pub async fn execute<S: StorageBackend>(
     Ok(UpdateTableResponse {
         table_description: desc,
     })
+}
+
+/// Reconcile `attr_defs` to exactly the attributes referenced by the table key
+/// schema plus every surviving index key schema. Real DynamoDB keeps the two in
+/// lockstep: an attribute orphaned by a GSI delete is pruned, and an entry used
+/// by no key schema is dropped rather than stored (neither is an error).
+/// Verified against AWS in eu-west-2.
+fn reconcile_attribute_definitions(
+    attr_defs: &mut Vec<AttributeDefinition>,
+    key_schema: &helpers::KeySchema,
+    gsis: &[GlobalSecondaryIndex],
+    lsi_defs: &[crate::actions::lsi::LsiDef],
+) {
+    let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    used.insert(key_schema.partition_key.as_str());
+    if let Some(ref sk) = key_schema.sort_key {
+        used.insert(sk.as_str());
+    }
+    for g in gsis {
+        for k in &g.key_schema {
+            used.insert(k.attribute_name.as_str());
+        }
+    }
+    for lsi in lsi_defs {
+        used.insert(lsi.pk_attr.as_str());
+        if let Some(ref sk) = lsi.sk_attr {
+            used.insert(sk.as_str());
+        }
+    }
+    attr_defs.retain(|d| used.contains(d.attribute_name.as_str()));
 }
 
 /// Validate UpdateTable request parameters before checking table existence.

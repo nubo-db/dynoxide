@@ -390,7 +390,7 @@ pub struct UpdateTableParams {
     pub table_name: String,
 
     #[schemars(
-        description = "Attribute definitions for new GSI key attributes, as array of {attribute_name, attribute_type} objects"
+        description = "Attribute definitions for new GSI key attributes, as array of {attribute_name, attribute_type} objects. Only attributes used by a key schema are kept; any others are dropped, and a redeclared attribute keeps its existing type, matching DynamoDB"
     )]
     pub attribute_definitions: Option<serde_json::Value>,
 

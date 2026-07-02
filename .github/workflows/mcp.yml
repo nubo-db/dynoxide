@@ -1,0 +1,92 @@
+name: Publish to MCP registry
+# Manual recovery workflow. The primary release path is release.yml
+# (triggered by a v* tag push). Use this only to re-run the MCP registry
+# publish in isolation when the main pipeline has partially failed, or to
+# publish a server.json fix that landed after the tag.
+#
+# Checks out the default branch (not the tag) so a server.json fix on main is
+# picked up; the release version is stamped in from the tag input. Auth is
+# GitHub OIDC, so no token is needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.11.2)"
+        required: true
+        type: string
+
+concurrency:
+  group: mcp-publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to MCP registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: $VERSION (tag: $TAG)"
+
+      # The registry verifies ownership against the live npm package, so make
+      # sure this version is on npm before publishing the registry entry.
+      - name: Wait for npm package to go live
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for i in $(seq 1 60); do
+            if npm view "dynoxide@$VERSION" version >/dev/null 2>&1; then
+              echo "dynoxide@$VERSION is live on npm"
+              exit 0
+            fi
+            echo "Waiting for dynoxide@$VERSION on npm ($i/60)..."
+            sleep 10
+          done
+          echo "::error::dynoxide@$VERSION did not appear on npm within 10 minutes"
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Stamp release version into server.json
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          jq --arg v "$VERSION" '
+            .version = $v
+            | (.packages[] | select(.registryType == "npm")).version = $v
+            | (.packages[] | select(.registryType == "oci")).identifier = "ghcr.io/nubo-db/dynoxide:\($v)"
+          ' server.json > server.json.tmp
+          mv server.json.tmp server.json
+          cat server.json
+
+      - name: Authenticate to the MCP registry via GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        run: ./mcp-publisher publish

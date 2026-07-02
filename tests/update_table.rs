@@ -423,6 +423,142 @@ fn test_update_table_create_multiple_gsis_sequentially() {
     assert!(names.contains(&"GSI2"));
 }
 
+// Regression test for https://github.com/nubo-db/dynoxide/issues/129.
+//
+// DynamoDB treats UpdateTable's AttributeDefinitions as a delta: adding a GSI
+// only requires the new index's key attributes, and existing definitions (table
+// keys, prior GSI keys) are preserved. Passing delta-only attrs on each call
+// must not wipe out the definitions declared earlier.
+#[test]
+fn test_update_table_create_gsi_merges_delta_attribute_definitions() {
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    // Add GSI1 passing ONLY the new index's key attributes.
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "GSI1PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    // Add GSI2, again passing ONLY the new index's key attributes.
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "GSI2PK", "AttributeType": "S"},
+            {"AttributeName": "GSI2SK", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "GSI2",
+                "KeySchema": [
+                    {"AttributeName": "GSI2PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI2SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    // DescribeTable must report the union of all declared attributes: the table
+    // keys plus both GSIs' keys.
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let names: Vec<&str> = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    for expected in ["PK", "SK", "GSI1PK", "GSI1SK", "GSI2PK", "GSI2SK"] {
+        assert!(
+            names.contains(&expected),
+            "AttributeDefinitions missing {expected}: got {names:?}"
+        );
+    }
+
+    // PutItem on the table keys must succeed. Before the fix this failed with
+    // "Index key attribute GSI1PK missing from AttributeDefinitions" because the
+    // second UpdateTable had replaced the definitions instead of merging them.
+    let put_req = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "Item": {"PK": {"S": "a"}, "SK": {"S": "b"}},
+    }))
+    .unwrap();
+    db.put_item(put_req)
+        .expect("PutItem on table keys should succeed after merging GSI attrs");
+}
+
+// Redeclaring an already-defined attribute keeps its existing type. Verified
+// against real DynamoDB (eu-west-2): an UpdateTable that adds a GSI while
+// redeclaring the table key `PK` with a conflicting type is accepted, and
+// DescribeTable still reports `PK` with its original type. AWS ignores the
+// incoming type rather than overwriting or rejecting it.
+#[test]
+fn test_update_table_redeclaring_attribute_keeps_existing_type() {
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    // Add a GSI while redeclaring the table key PK as N (its stored type is S).
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "N"},
+            {"AttributeName": "gsiPk", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req)
+        .expect("UpdateTable redeclaring an attribute with a different type should be accepted");
+
+    // PK must retain its original type S; gsiPk is added as S.
+    let desc_req = serde_json::from_value(json!({"TableName": "TestTable"})).unwrap();
+    let resp = db.describe_table(desc_req).unwrap();
+    let pk = resp
+        .table
+        .attribute_definitions
+        .iter()
+        .find(|d| d.attribute_name == "PK")
+        .expect("PK definition present");
+    assert_eq!(
+        pk.attribute_type,
+        ScalarAttributeType::S,
+        "PK must keep its existing type S, not be overwritten by the redeclared N"
+    );
+
+    // A PutItem keyed with the original string type still succeeds.
+    let put_req = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "Item": {"PK": {"S": "a"}, "SK": {"S": "b"}},
+    }))
+    .unwrap();
+    db.put_item(put_req)
+        .expect("PutItem with the original key type should still succeed");
+}
+
 #[test]
 fn test_update_table_response_includes_table_description() {
     let db = make_db();

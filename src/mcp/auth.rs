@@ -410,15 +410,18 @@ mod tests {
 
     #[test]
     fn unreadable_file_errors_without_regenerating() {
-        // A directory where the token file is expected is unreadable as a file.
-        let dir =
-            std::env::temp_dir().join(format!("dynoxide-unreadable-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // path points at a directory, so create_new fails with AlreadyExists,
-        // then read_to_string fails -> Unreadable.
-        let result = resolve_auth(true, None, false, Some(dir.clone()));
+        let path = temp_token_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An existing token file that is not valid UTF-8 fails read_to_string
+        // on every platform (a directory at the path only reproduces this on
+        // Unix; Windows rejects it at create_new with a different error).
+        let junk = [0xFF, 0xFE, 0x00, 0x9F];
+        std::fs::write(&path, junk).unwrap();
+        let result = resolve_auth(true, None, false, Some(path.clone()));
         assert!(matches!(result, Err(AuthError::Unreadable { .. })));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Still the same bytes: the failure must not regenerate the file.
+        assert_eq!(std::fs::read(&path).unwrap(), junk);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

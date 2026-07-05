@@ -637,7 +637,14 @@ mod tests {
 
         let path = resolve_snapshot_path(&db, "my-snap").unwrap();
         assert!(path.to_str().unwrap().ends_with("my-snap.db"));
-        assert!(path.to_str().unwrap().contains(".dynoxide/snapshots"));
+        // Compare components rather than a substring so the assertion holds
+        // under Windows path separators.
+        let comps: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+        let expected = [
+            std::ffi::OsStr::new(".dynoxide"),
+            std::ffi::OsStr::new("snapshots"),
+        ];
+        assert!(comps.windows(2).any(|w| w == expected));
     }
 
     #[test]

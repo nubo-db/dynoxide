@@ -101,6 +101,34 @@ pub struct TableImportResult {
     pub lines_skipped: usize,
 }
 
+/// Scaffold empty tables from a DynamoDB DescribeTable JSON schema file.
+///
+/// Reads the schema file, creates each table defined in it, and skips any
+/// tables that already exist. Returns the number of tables created.
+///
+/// The schema file format is identical to `import --schema`: a JSON file
+/// containing a single `aws dynamodb describe-table` response or an array
+/// of them.
+pub fn scaffold_from_schema(
+    db: &Database,
+    path: &std::path::Path,
+) -> Result<usize, ImportError> {
+    let (schemas, _) = schema::load_schemas(path).map_err(ImportError::Config)?;
+    let mut created = 0;
+    for table_schema in schemas {
+        match db.create_table(table_schema.create_request) {
+            Ok(_) => {
+                created += 1;
+            }
+            Err(crate::errors::DynoxideError::ResourceInUseException(_)) => {
+                // Table already exists — skip silently.
+            }
+            Err(e) => return Err(ImportError::Database(e.to_string())),
+        }
+    }
+    Ok(created)
+}
+
 /// Execute the import pipeline into a caller-provided database.
 ///
 /// This is the core import logic — database-agnostic. The caller is

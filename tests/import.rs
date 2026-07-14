@@ -460,6 +460,126 @@ fields = ["email"]
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // scaffold_from_schema tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_scaffold_creates_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let tables = db
+            .list_tables(dynoxide::actions::list_tables::ListTablesRequest::default())
+            .unwrap();
+        assert_eq!(tables.table_names, vec!["Users"]);
+    }
+
+    #[test]
+    fn test_scaffold_multiple_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        create_schema_file(
+            &schema_file,
+            &[
+                simple_table_schema("Users"),
+                simple_table_schema("Orders"),
+                simple_table_schema("Products"),
+            ],
+        );
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 3);
+
+        let mut tables = db
+            .list_tables(dynoxide::actions::list_tables::ListTablesRequest::default())
+            .unwrap()
+            .table_names;
+        tables.sort();
+        assert_eq!(tables, vec!["Orders", "Products", "Users"]);
+    }
+
+    #[test]
+    fn test_scaffold_skips_existing_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+
+        let db = dynoxide::Database::memory().unwrap();
+
+        // First call creates the table.
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        // Second call should succeed and skip the already-existing table.
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 0);
+
+        // Still exactly one table.
+        let tables = db
+            .list_tables(dynoxide::actions::list_tables::ListTablesRequest::default())
+            .unwrap();
+        assert_eq!(tables.table_names.len(), 1);
+    }
+
+    #[test]
+    fn test_scaffold_with_gsi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "Table": {
+                "TableName": "Events",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                    {"AttributeName": "gsi1pk", "AttributeType": "S"}
+                ],
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": "gsi1",
+                    "KeySchema": [{"AttributeName": "gsi1pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }]
+            }
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let info = db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "Events".to_string(),
+            })
+            .unwrap();
+        assert!(info.table.global_secondary_indexes.is_some());
+        assert_eq!(
+            info.table.global_secondary_indexes.unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_scaffold_missing_file_errors() {
+        let db = dynoxide::Database::memory().unwrap();
+        let result = import::scaffold_from_schema(
+            &db,
+            std::path::Path::new("/tmp/dynoxide-nonexistent-schema-file.json"),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to read schema file"));
+    }
+
     #[test]
     fn test_import_into_memory_database() {
         let tmp = tempfile::tempdir().unwrap();

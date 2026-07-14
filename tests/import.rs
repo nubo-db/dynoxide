@@ -563,10 +563,7 @@ fields = ["email"]
             })
             .unwrap();
         assert!(info.table.global_secondary_indexes.is_some());
-        assert_eq!(
-            info.table.global_secondary_indexes.unwrap().len(),
-            1
-        );
+        assert_eq!(info.table.global_secondary_indexes.unwrap().len(), 1);
     }
 
     #[test]
@@ -577,7 +574,12 @@ fields = ["email"]
             std::path::Path::new("/tmp/dynoxide-nonexistent-schema-file.json"),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Failed to read schema file"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to read schema file")
+        );
     }
 
     #[test]

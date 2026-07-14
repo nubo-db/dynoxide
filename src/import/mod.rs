@@ -109,10 +109,7 @@ pub struct TableImportResult {
 /// The schema file format is identical to `import --schema`: a JSON file
 /// containing a single `aws dynamodb describe-table` response or an array
 /// of them.
-pub fn scaffold_from_schema(
-    db: &Database,
-    path: &std::path::Path,
-) -> Result<usize, ImportError> {
+pub fn scaffold_from_schema(db: &Database, path: &std::path::Path) -> Result<usize, ImportError> {
     let (schemas, _) = schema::load_schemas(path).map_err(ImportError::Config)?;
     let mut created = 0;
     for table_schema in schemas {

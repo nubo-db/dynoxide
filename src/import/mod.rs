@@ -110,16 +110,29 @@ pub struct TableImportResult {
 /// containing a single `aws dynamodb describe-table` response or an array
 /// of them.
 pub fn scaffold_from_schema(db: &Database, path: &std::path::Path) -> Result<usize, ImportError> {
-    let (schemas, _) = schema::load_schemas(path).map_err(ImportError::Config)?;
+    let (schemas, schema_json) = schema::load_schemas(path).map_err(ImportError::Config)?;
     let mut created = 0;
-    for table_schema in schemas {
-        match db.create_table(table_schema.create_request) {
-            Ok(_) => {
-                created += 1;
-            }
-            Err(crate::errors::DynoxideError::ResourceInUseException(_)) => {
-                // Table already exists — skip silently.
-            }
+    for table_schema in &schemas {
+        // Use raw JSON + find_table_json (same path as run_into) so the full
+        // CreateTableRequest Deserialize impl runs — LSIs, billing mode, and
+        // table class are preserved rather than dropped by the hand-parser.
+        let table_json =
+            find_table_json(&schema_json, &table_schema.table_name).ok_or_else(|| {
+                ImportError::Config(format!(
+                    "Schema JSON not found for table '{}'",
+                    table_schema.table_name
+                ))
+            })?;
+        let create_request: crate::actions::create_table::CreateTableRequest =
+            serde_json::from_value(table_json).map_err(|e| {
+                ImportError::Config(format!(
+                    "Failed to deserialize schema for '{}': {e}",
+                    table_schema.table_name
+                ))
+            })?;
+        match db.create_table(create_request) {
+            Ok(_) => created += 1,
+            Err(crate::errors::DynoxideError::ResourceInUseException(_)) => {} // already exists
             Err(e) => return Err(ImportError::Database(e.to_string())),
         }
     }

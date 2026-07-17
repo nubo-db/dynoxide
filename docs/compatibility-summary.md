@@ -12,9 +12,9 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 ## Conformance
 
-Dynoxide's DynamoDB compatibility is independently verified by the
-[dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance) suite,
-which runs one test matrix against real DynamoDB and every major emulator across
+Dynoxide's DynamoDB compatibility is independently verified by **Parity Suite**, the
+[DynamoDB conformance suite](https://github.com/paritysuite/dynamodb-conformance) that
+runs one test matrix against real DynamoDB and every major emulator across
 three tiers:
 
 - **Tier 1 (Core)** - CRUD, queries, scans, batch operations, GSIs, and UpdateTable
@@ -22,11 +22,13 @@ three tiers:
 - **Tier 3 (Strict)** - validation ordering, error-message fidelity, reserved
   words, legacy-API handling, and edge cases
 
+Disclosure: Dynoxide and Parity Suite are maintained by the same person. The suite scores Dynoxide on the same public matrix it runs against every other engine, and the results and test code are open.
+
 Pass rates move as the suite grows and each engine changes, so rather than pin a
 snapshot that goes stale, the current standings are published live:
 
-- **[paritysuite.org](https://paritysuite.org)** - pass rates for every engine, broken down by tier
-- **[paritysuite.org/capabilities](https://paritysuite.org/capabilities)** - the feature-by-feature support matrix
+- **[Live standings](https://paritysuite.org)** - pass rates for every engine, broken down by tier
+- **[Live capability matrix](https://paritysuite.org/capabilities)** - the feature-by-feature support matrix
 - **[paritysuite/dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance#results)** - the suite, the raw results, and how each target is run
 
 A high conformance score means Dynoxide matches real DynamoDB behaviour for the
@@ -142,19 +144,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 
 ### Conformance advantages
 
-DynamoDB Local fails a sizeable share of the suite that real DynamoDB passes; the current count is on the [live results](https://paritysuite.org). The gaps cluster in a few categories (figures from a representative run):
-
-| Category | Failures | Details |
-|---|---|---|
-| Table name validation messages | 15 | DDB Local returns generic "Invalid table/index name" instead of specific AWS constraint messages |
-| Tags (TagResource, UntagResource, ListTagsOfResource) | 8 | DDB Local returns `UnknownOperationException: Tagging is not currently supported` |
-| Validation ordering - wrong exception type | 4 | DDB Local returns `ResourceNotFoundException` or `InternalFailure` instead of `ValidationException` |
-| CreateTable error message fidelity | 4 | DDB Local uses its own wording for KeySchema and index validation errors |
-| ItemCollectionMetrics | 3 | DDB Local returns `undefined` for `ReturnItemCollectionMetrics: SIZE` |
-| Scan parallel validation messages | 3 | DDB Local uses different wording for Segment/TotalSegments validation |
-| Batch operation error messages | 2 | DDB Local uses its own wording for empty RequestItems errors |
-| Query validation messages | 2 | DDB Local conflates Select and ReturnConsumedCapacity validation |
-| PartiQL error code | 1 | DDB Local returns `DuplicateItem` instead of `DuplicateItemException` |
+DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered in table- and index-name validation messages, tag operations, and validation ordering and error codes. For the current per-engine counts, broken down by tier, see the [live results](https://paritysuite.org).
 
 ### Capability advantages
 

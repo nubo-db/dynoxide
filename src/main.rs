@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
     version,
     about = "A fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite",
     after_help = after_help_text(),
+    args_conflicts_with_subcommands = true,
 )]
 struct Cli {
     #[command(subcommand)]
@@ -34,7 +35,10 @@ struct Cli {
 
     // --- Top-level args for backward compatibility (no subcommand = serve) ---
     // These are only used when no subcommand is given, for backward compat
-    // with `dynoxide --port 8000` style invocations.
+    // with `dynoxide --port 8000` style invocations. Combining one with an
+    // explicit subcommand is a parse error (args_conflicts_with_subcommands
+    // above): the subcommands take these options themselves, so accepting
+    // both would silently drop the top-level value.
     /// Host to bind to
     #[arg(long, default_value = "127.0.0.1")]
     host: Option<String>,
@@ -1160,6 +1164,55 @@ fn validate_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     #[cfg(feature = "encryption")]
     use super::*;
+
+    mod cli_parse_tests {
+        use super::super::*;
+
+        #[test]
+        fn top_level_args_are_rejected_alongside_a_subcommand() {
+            for argv in [
+                vec!["dynoxide", "--db-path", "data.db", "serve"],
+                vec!["dynoxide", "--port", "8893", "serve"],
+                vec!["dynoxide", "--host", "0.0.0.0", "serve"],
+                vec!["dynoxide", "--encryption-key-file", "key.hex", "serve"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(&argv).is_err(),
+                    "expected parse error for {argv:?}, top-level args must not be \
+                     silently dropped when a subcommand is given"
+                );
+            }
+        }
+
+        #[cfg(feature = "mcp-server")]
+        #[test]
+        fn top_level_args_are_rejected_alongside_mcp_subcommand() {
+            assert!(Cli::try_parse_from(["dynoxide", "--db-path", "data.db", "mcp"]).is_err());
+        }
+
+        #[test]
+        fn bare_subcommand_still_parses() {
+            assert!(Cli::try_parse_from(["dynoxide", "serve"]).is_ok());
+        }
+
+        #[test]
+        fn top_level_args_still_parse_without_a_subcommand() {
+            let cli = Cli::try_parse_from(["dynoxide", "--port", "8893", "--db-path", "data.db"])
+                .unwrap();
+            assert!(cli.command.is_none());
+            assert_eq!(cli.port, Some(8893));
+            assert_eq!(cli.db_path.as_deref(), Some("data.db"));
+        }
+
+        #[test]
+        fn subcommand_level_args_still_parse() {
+            let cli = Cli::try_parse_from(["dynoxide", "serve", "--port", "8893"]).unwrap();
+            match cli.command {
+                Some(Commands::Serve(args)) => assert_eq!(args.port, 8893),
+                _ => panic!("expected serve subcommand"),
+            }
+        }
+    }
 
     #[cfg(feature = "encryption")]
     mod validate_key_tests {

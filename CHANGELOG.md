@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `dynoxide serve` and `dynoxide` (no-subcommand) now accept a `--schema` flag, taking the same DynamoDB DescribeTable JSON format as `import --schema`. On startup, dynoxide creates each table defined in the file and skips any that already exist. This lets you pre-populate an empty database — in-memory or persistent — with the correct table structure without running an import first.
 
+## [0.11.4] - 2026-07-17
+
+### Fixed
+
+- Passing a top-level argument together with a subcommand is now a hard parse error, where the argument was silently ignored. The top-level `--host`, `--port`, `--db-path` and `--encryption-key-file` exist for the bare pre-subcommand form (`dynoxide --port 8000`) and only fed the no-subcommand path, so `dynoxide --db-path data.db serve` started an in-memory server, never created the file, and the data was gone on exit with nothing said about it; `dynoxide --port 8893 serve` listened on 8000. Combining one with `serve`, `mcp`, `import` or `healthcheck` now fails up front with clap's conflict error naming the offending option, and the same option after the subcommand keeps working as before ([#141](https://github.com/nubo-db/dynoxide/issues/141)).
+
 ## [0.11.3] - 2026-07-05
 
 ### Security
@@ -398,7 +404,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...HEAD
+[0.11.4]: https://github.com/nubo-db/dynoxide/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/nubo-db/dynoxide/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/nubo-db/dynoxide/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/nubo-db/dynoxide/compare/v0.11.0...v0.11.1

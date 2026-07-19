@@ -42,10 +42,12 @@ Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:
 
 ### Conformance
 
-Dynoxide is continuously verified against real DynamoDB by the [dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance) suite, which runs one test matrix against AWS itself and every major DynamoDB emulator. Pass rates move as the suite grows and each engine changes, so rather than pin a snapshot that goes stale, see the live standings:
+Dynoxide is continuously verified against real DynamoDB by **Parity Suite**, the [DynamoDB conformance suite](https://github.com/paritysuite/dynamodb-conformance) that runs one test matrix against AWS itself and every major DynamoDB emulator. Pass rates move as the suite grows and each engine changes, so rather than pin a snapshot that goes stale, see the live standings:
 
-- **[paritysuite.org](https://paritysuite.org)**: current pass rates for every engine, broken down by tier
+- **[Live standings](https://paritysuite.org)**: current pass rates for every engine, broken down by tier
 - **[paritysuite/dynamodb-conformance](https://github.com/paritysuite/dynamodb-conformance#results)**: the suite itself, the raw results, and how each target is run
+
+Disclosure: Dynoxide and Parity Suite are maintained by the same person. The suite scores Dynoxide on the same public matrix it runs against every other engine, and the results and test code are open.
 
 This covers the native build. The [WebAssembly](#webassembly-preview) build is a preview and isn't run against the suite yet.
 
@@ -107,7 +109,7 @@ A few behavioural differences are also worth knowing when you test against it:
 - Streams expose a single shard. `DescribeStream` returns one shard, and its `ExclusiveStartShardId` and `Limit` paging parameters are accepted but ignored.
 - Transaction-contention errors (`TransactionConflictException`, `TransactionInProgressException`) aren't emulated - there's no concurrent contention in a single process.
 
-For the live, per-feature support matrix see [paritysuite.org/capabilities](https://paritysuite.org/capabilities), and the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+For the per-feature support matrix, see the [live capability matrix](https://paritysuite.org/capabilities); the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
 
 ## Acknowledgements
 

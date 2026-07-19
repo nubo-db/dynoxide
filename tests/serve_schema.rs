@@ -6,7 +6,7 @@
 #![cfg(all(feature = "http-server", feature = "import"))]
 
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn dynoxide_bin() -> &'static str {
@@ -31,37 +31,62 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-/// Spawn `dynoxide` with the given args, wait up to `timeout` for a line on
-/// stderr matching `needle`, kill the process, then return whether it was found.
-fn spawn_and_wait_for_stderr(args: &[&str], needle: &str, timeout: Duration) -> bool {
+/// Spawn `dynoxide` with the given args and a piped stderr stream.
+fn spawn_dynoxide(args: &[&str]) -> (Child, BufReader<ChildStderr>) {
     let mut child = Command::new(dynoxide_bin())
         .args(args)
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .expect("spawn dynoxide");
-
     let stderr = child.stderr.take().unwrap();
-    let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + timeout;
-    let mut found = false;
-    let mut line = String::new();
+    (child, BufReader::new(stderr))
+}
 
+/// Read lines from `reader` until one contains `needle` or `timeout` elapses.
+fn wait_for_line(reader: &mut impl BufRead, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut line = String::new();
     while Instant::now() < deadline {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
-            Ok(_) if line.contains(needle) => {
-                found = true;
-                break;
-            }
+            Ok(_) if line.contains(needle) => return true,
             Ok(_) => {}
         }
     }
+    false
+}
 
+/// Spawn `dynoxide` with the given args, wait up to `timeout` for a line on
+/// stderr matching `needle`, kill the process, then return whether it was found.
+fn spawn_and_wait_for_stderr(args: &[&str], needle: &str, timeout: Duration) -> bool {
+    let (mut child, mut reader) = spawn_dynoxide(args);
+    let found = wait_for_line(&mut reader, needle, timeout);
     let _ = child.kill();
     let _ = child.wait();
     found
+}
+
+/// Send a minimal DynamoDB `DescribeTable` request. Dynoxide doesn't verify
+/// SigV4 signatures, so a well-formed-but-fake Authorization header is enough.
+async fn describe_table(port: u16, table_name: &str) -> serde_json::Value {
+    reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}"))
+        .header("x-amz-target", "DynamoDB_20120810.DescribeTable")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+        )
+        .header("x-amz-date", "20260101T000000Z")
+        .json(&serde_json::json!({ "TableName": table_name }))
+        .send()
+        .await
+        .expect("send DescribeTable request")
+        .json()
+        .await
+        .expect("parse DescribeTable response")
 }
 
 #[test]
@@ -137,4 +162,63 @@ fn root_schema_scaffolds_tables_on_startup() {
         found,
         "`dynoxide --schema` (no subcommand) did not emit scaffold message within timeout"
     );
+}
+
+/// Regression test: `created_at` is used only by the LSI's sort key, not by
+/// the table's own key schema or any other index. A hand-parsed
+/// `CreateTableRequest` that drops `LocalSecondaryIndexes` leaves this
+/// attribute definition orphaned, which real table creation rejects outright.
+#[tokio::test]
+async fn serve_schema_scaffolds_lsi_with_orphaned_attribute() {
+    let tmp = tempfile::tempdir().unwrap();
+    let schema_file = tmp.path().join("schema.json");
+    let schema = serde_json::json!([{
+        "Table": {
+            "TableName": "Orders",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"}
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "by-created-at",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "created_at", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }
+    }]);
+    std::fs::write(&schema_file, serde_json::to_string_pretty(&schema).unwrap()).unwrap();
+
+    let port = free_port();
+    let (mut child, mut reader) = spawn_dynoxide(&[
+        "serve",
+        "--port",
+        &port.to_string(),
+        "--schema",
+        schema_file.to_str().unwrap(),
+    ]);
+    let scaffolded = wait_for_line(
+        &mut reader,
+        "Scaffolded 1 table(s) from schema",
+        Duration::from_secs(10),
+    );
+    assert!(scaffolded, "server did not report scaffolding the table");
+
+    let body = describe_table(port, "Orders").await;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lsis = &body["Table"]["LocalSecondaryIndexes"];
+    assert!(
+        lsis.is_array(),
+        "expected LocalSecondaryIndexes in DescribeTable response: {body}"
+    );
+    assert_eq!(lsis[0]["IndexName"], "by-created-at");
 }

@@ -567,6 +567,50 @@ fields = ["email"]
     }
 
     #[test]
+    fn test_scaffold_with_lsi() {
+        // `created_at` is used only by the LSI's sort key, not by the table's
+        // own key schema. A hand-parsed CreateTableRequest that drops
+        // LocalSecondaryIndexes leaves it orphaned and table creation fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "Table": {
+                "TableName": "Orders",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                    {"AttributeName": "created_at", "AttributeType": "S"}
+                ],
+                "LocalSecondaryIndexes": [{
+                    "IndexName": "by-created-at",
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                }]
+            }
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let info = db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "Orders".to_string(),
+            })
+            .unwrap();
+        assert!(info.table.local_secondary_indexes.is_some());
+        assert_eq!(info.table.local_secondary_indexes.unwrap().len(), 1);
+    }
+
+    #[test]
     fn test_scaffold_missing_file_errors() {
         let db = dynoxide::Database::memory().unwrap();
         let result = import::scaffold_from_schema(

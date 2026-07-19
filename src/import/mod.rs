@@ -113,23 +113,7 @@ pub fn scaffold_from_schema(db: &Database, path: &std::path::Path) -> Result<usi
     let (schemas, schema_json) = schema::load_schemas(path).map_err(ImportError::Config)?;
     let mut created = 0;
     for table_schema in &schemas {
-        // Use raw JSON + find_table_json (same path as run_into) so the full
-        // CreateTableRequest Deserialize impl runs — LSIs, billing mode, and
-        // table class are preserved rather than dropped by the hand-parser.
-        let table_json =
-            find_table_json(&schema_json, &table_schema.table_name).ok_or_else(|| {
-                ImportError::Config(format!(
-                    "Schema JSON not found for table '{}'",
-                    table_schema.table_name
-                ))
-            })?;
-        let create_request: crate::actions::create_table::CreateTableRequest =
-            serde_json::from_value(table_json).map_err(|e| {
-                ImportError::Config(format!(
-                    "Failed to deserialize schema for '{}': {e}",
-                    table_schema.table_name
-                ))
-            })?;
+        let create_request = build_create_request(&schema_json, &table_schema.table_name)?;
         match db.create_table(create_request) {
             Ok(_) => created += 1,
             Err(crate::errors::DynoxideError::ResourceInUseException(_)) => {} // already exists
@@ -137,6 +121,24 @@ pub fn scaffold_from_schema(db: &Database, path: &std::path::Path) -> Result<usi
         }
     }
     Ok(created)
+}
+
+/// Build a `CreateTableRequest` for `table_name` from raw schema JSON.
+///
+/// Deserializes through `CreateTableRequest`'s `Deserialize` impl (rather than
+/// building the struct by hand) so GlobalSecondaryIndexes and
+/// LocalSecondaryIndexes are picked up from the schema. Shared by `run_into`
+/// and `scaffold_from_schema` so the two can't drift apart on which fields a
+/// schema-sourced table ends up with.
+fn build_create_request(
+    schema_json: &serde_json::Value,
+    table_name: &str,
+) -> Result<crate::actions::create_table::CreateTableRequest, String> {
+    let table_json = find_table_json(schema_json, table_name)
+        .ok_or_else(|| format!("Schema JSON not found for table '{table_name}'"))?;
+
+    serde_json::from_value(table_json)
+        .map_err(|e| format!("Failed to deserialize schema for '{table_name}': {e}"))
 }
 
 /// Execute the import pipeline into a caller-provided database.
@@ -204,13 +206,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             )));
         }
 
-        // Find the matching schema JSON and deserialize into a fresh CreateTableRequest
-        let table_json = find_table_json(&schema_json, table_name)
-            .ok_or_else(|| format!("Schema JSON not found for table '{table_name}'"))?;
-
-        let create_request: crate::actions::create_table::CreateTableRequest =
-            serde_json::from_value(table_json)
-                .map_err(|e| format!("Failed to deserialize schema for '{}': {e}", table_name))?;
+        let create_request = build_create_request(&schema_json, table_name)?;
 
         db.create_table(create_request)
             .map_err(|e| format!("Failed to create table '{}': {e}", table_name))?;

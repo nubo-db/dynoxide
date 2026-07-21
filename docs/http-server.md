@@ -26,6 +26,16 @@ dynoxide --db-path data.db --encryption-key-file key.hex
 DYNOXIDE_ENCRYPTION_KEY=$(cat key.hex) dynoxide --db-path data.db
 ```
 
+With tables pre-created from a schema:
+
+```sh
+# Generate schema
+aws dynamodb describe-table --table-name Users > schema.json
+
+# Start with schema
+dynoxide --schema schema.json --port 8000
+```
+
 Then use the AWS CLI or any DynamoDB SDK pointed at localhost:
 
 ```sh

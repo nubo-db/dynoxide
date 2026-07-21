@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - PartiQL now honours the `RETURNING` clause on `ExecuteStatement`, where dynoxide previously parsed the statement but silently dropped the clause. `DELETE ... RETURNING ALL OLD *` returns the deleted item in `Items` (a present but empty `Items` array on a missing target, matching DynamoDB rather than the classic `DeleteItem` path), and `UPDATE ... RETURNING <ALL|MODIFIED> <OLD|NEW> *` returns the matching projection of the item; the `MODIFIED` variants return only the changed paths (a nested `SET a.b` returns just the changed leaf, not the whole `a` attribute), exclude the primary key, and return an empty `Items` array when nothing was projected. `BatchExecuteStatement` honours a member's `RETURNING` clause; `ExecuteTransaction` rejects one with a top-level `ValidationException`. The `RETURNING` variants DynamoDB does not allow on `DELETE` (`MODIFIED OLD *`, `ALL NEW *`, `MODIFIED NEW *`) are rejected with its exact validation message instead of being ignored ([#137](https://github.com/nubo-db/dynoxide/issues/137)).
+### Added
+
+- `dynoxide serve` and `dynoxide` (no-subcommand) now accept a `--schema` flag, taking the same DynamoDB DescribeTable JSON format as `import --schema`. On startup, dynoxide creates each table defined in the file and skips any that already exist. This lets you pre-populate an empty database — in-memory or persistent — with the correct table structure without running an import first.
 
 ## [0.11.4] - 2026-07-17
 

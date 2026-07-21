@@ -813,6 +813,31 @@ fn test_batch_update_returning_surfaces_projection() {
 }
 
 #[test]
+fn test_batch_update_empty_modified_omits_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "b1", &[("data", "old")]);
+
+    // An empty MODIFIED projection inside a batch drops the singular Item field
+    // entirely (the batch analogue of ExecuteStatement's Items: []), matching AWS.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "UPDATE \"Users\" REMOVE data WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                    .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    assert_eq!(resp.responses.len(), 1);
+    assert!(resp.responses[0].error.is_none());
+    assert!(
+        resp.responses[0].item.is_none(),
+        "an empty MODIFIED projection omits Item in a batch response"
+    );
+}
+
+#[test]
 fn test_batch_invalid_delete_returning_variant_is_a_per_statement_error() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");

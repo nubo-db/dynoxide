@@ -83,8 +83,16 @@ pub async fn execute_measured<S: StorageBackend>(
             )
             .await?;
             // RETURNING surfaces the requested projection of the updated item;
-            // without a clause an UPDATE returns no items.
-            let items = projection.map(|item| vec![item]);
+            // without a clause an UPDATE returns no items. An empty MODIFIED
+            // projection surfaces as a present but empty Items array (no row),
+            // matching DynamoDB, rather than a row holding an empty object.
+            let items = projection.map(|item| {
+                if item.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![item]
+                }
+            });
             Ok((items, size))
         }
         Statement::Delete {
@@ -513,15 +521,14 @@ async fn execute_update<S: StorageBackend>(
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
     // Build the RETURNING projection from the item's before/after states. The
-    // "modified" attributes are the top-level names the SET/REMOVE clauses
-    // touched (the first segment of any nested path); the MODIFIED variants
-    // project only those, which never includes the key.
+    // "modified" paths are the full document paths the SET/REMOVE clauses
+    // touched; the MODIFIED variants project only those (a nested `a.b` yields
+    // just the changed leaf, never the whole `a` attribute and never the key).
     let projection = returning.map(|variant| {
         let modified: std::collections::BTreeSet<String> = set_clauses
             .iter()
-            .map(|c| c.path.as_str())
-            .chain(remove_paths.iter().map(|p| p.as_str()))
-            .map(|p| p.split('.').next().unwrap_or(p).to_string())
+            .map(|c| c.path.clone())
+            .chain(remove_paths.iter().cloned())
             .collect();
         project_returning(variant, &old_item, &item, &modified)
     });
@@ -531,8 +538,10 @@ async fn execute_update<S: StorageBackend>(
 
 /// Build the `RETURNING` projection for an UPDATE from the item's before/after
 /// states. `ALL` variants return the whole item (key included); `MODIFIED`
-/// variants return only the attributes the statement touched, at their old or
-/// new values, which never includes the key.
+/// variants return only the paths the statement touched, at their old or new
+/// values, which never includes the key. A `MODIFIED` projection can be empty
+/// (e.g. a REMOVE under `MODIFIED NEW`, or a newly-created attribute under
+/// `MODIFIED OLD`), which the caller surfaces as an empty `Items` array.
 fn project_returning(
     variant: ReturningVariant,
     old_item: &Item,
@@ -542,15 +551,42 @@ fn project_returning(
     match variant {
         ReturningVariant::AllOld => old_item.clone(),
         ReturningVariant::AllNew => new_item.clone(),
-        ReturningVariant::ModifiedOld => modified
-            .iter()
-            .filter_map(|name| old_item.get(name).map(|v| (name.clone(), v.clone())))
-            .collect(),
-        ReturningVariant::ModifiedNew => modified
-            .iter()
-            .filter_map(|name| new_item.get(name).map(|v| (name.clone(), v.clone())))
-            .collect(),
+        ReturningVariant::ModifiedOld => project_modified(modified, old_item),
+        ReturningVariant::ModifiedNew => project_modified(modified, new_item),
     }
+}
+
+/// Project only the modified paths from `source`, rebuilding nested map
+/// structure so a nested `SET a.b` yields `{a: {b: ...}}` (just the changed
+/// leaf, matching DynamoDB) rather than the whole `a` attribute. A path absent
+/// from `source` contributes nothing, so the projection may be empty.
+fn project_modified(paths: &std::collections::BTreeSet<String>, source: &Item) -> Item {
+    let mut projection = Item::new();
+    for path in paths {
+        if let Some(val) = get_nested_value(source, path) {
+            // set_nested_value only errors on a non-map intermediate, which
+            // cannot arise when the value was just read from `source` along the
+            // same path.
+            let _ = set_nested_value(&mut projection, path, val.clone());
+        }
+    }
+    projection
+}
+
+/// Read the value at a dotted document path, mirroring `set_nested_value`'s
+/// navigation: dots descend into maps, and a segment is matched as a whole key
+/// (so a bracket-index path like `a[0]` is treated as the single key `a[0]`,
+/// consistent with how SET stored it).
+fn get_nested_value<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeValue> {
+    let mut parts = path.split('.');
+    let mut current = item.get(parts.next()?)?;
+    for part in parts {
+        match current {
+            AttributeValue::M(map) => current = map.get(part)?,
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 /// Returns the deleted item (None when the target was missing and the delete

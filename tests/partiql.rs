@@ -61,6 +61,30 @@ fn put_item_with_attrs(db: &Database, table_name: &str, pk: &str, attrs: &[(&str
     .unwrap();
 }
 
+/// Seed an item with `pk` plus one nested map attribute, so nested-path UPDATE
+/// RETURNING tests can check that MODIFIED projects only the changed leaf.
+fn put_nested_item(
+    db: &Database,
+    table_name: &str,
+    pk: &str,
+    map_attr: &str,
+    entries: &[(&str, &str)],
+) {
+    let mut inner = HashMap::new();
+    for (k, v) in entries {
+        inner.insert(k.to_string(), AttributeValue::S(v.to_string()));
+    }
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    item.insert(map_attr.to_string(), AttributeValue::M(inner));
+    db.put_item(PutItemRequest {
+        table_name: table_name.to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
 fn exec(
     db: &Database,
     statement: &str,
@@ -441,6 +465,140 @@ fn test_update_returning_modified_new_returns_only_changed_new_value() {
 }
 
 // -----------------------------------------------------------------------
+// UPDATE MODIFIED edge cases, per the real-AWS follow-up capture: a nested
+// SET projects only the changed leaf, and an empty MODIFIED projection
+// returns Items: [] (no row), not a row holding an empty object.
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_update_returning_modified_nested_path_projects_only_changed_leaf() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED NEW: only the changed leaf, nested; sibling and key excluded.
+    put_nested_item(
+        &db,
+        "Users",
+        "m1",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.sub = 'new' WHERE pk = 'm1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert!(!it.contains_key("pk"), "MODIFIED excludes the key");
+    let profile = match it.get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        profile.get("sub"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+    assert!(
+        profile.get("sib").is_none(),
+        "nested MODIFIED excludes the untouched sibling"
+    );
+    assert_eq!(profile.len(), 1);
+
+    // MODIFIED OLD: the old value of the changed leaf, same shape.
+    put_nested_item(
+        &db,
+        "Users",
+        "m2",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.sub = 'new' WHERE pk = 'm2' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    let profile = match items[0].get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        profile.get("sub"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+    assert_eq!(profile.len(), 1);
+}
+
+#[test]
+fn test_update_returning_modified_after_remove() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD: the removed attribute at its old value.
+    put_item_with_attrs(&db, "Users", "r1", &[("data", "old"), ("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE data WHERE pk = 'r1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("data"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+    assert_eq!(items[0].len(), 1);
+
+    // MODIFIED NEW: the removed attribute is gone, so the projection is empty ->
+    // a present but empty Items array, not a row holding an empty object.
+    put_item_with_attrs(&db, "Users", "r2", &[("data", "old"), ("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE data WHERE pk = 'r2' RETURNING MODIFIED NEW *",
+    );
+    let items = resp
+        .items
+        .expect("an empty MODIFIED projection still returns a present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED NEW after REMOVE returns Items: [] (no row)"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_on_newly_created_attribute() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD on an attribute that did not exist: empty projection -> Items: [].
+    put_item_with_attrs(&db, "Users", "e1", &[("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'e1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp
+        .items
+        .expect("an empty MODIFIED projection still returns a present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED OLD on a newly-created attribute returns Items: [] (no row)"
+    );
+
+    // MODIFIED NEW: the new value.
+    put_item_with_attrs(&db, "Users", "e2", &[("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'e2' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("data"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+    assert_eq!(items[0].len(), 1);
+}
+
+// -----------------------------------------------------------------------
 // RETURNING inside BatchExecuteStatement (honoured) and ExecuteTransaction
 // (rejected), per the real-AWS ground truth.
 // -----------------------------------------------------------------------
@@ -475,6 +633,89 @@ fn test_batch_delete_returning_all_old_surfaces_item() {
     // The item is gone.
     let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'b1'");
     assert!(sel.items.unwrap().is_empty());
+}
+
+#[test]
+fn test_batch_update_returning_surfaces_projection() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "b1", &[("data", "old")]);
+
+    // ALL NEW: the full new item, key included.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1' RETURNING ALL NEW *"
+                    .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("batch honours an UPDATE member's RETURNING");
+    assert_eq!(item.get("pk"), Some(&AttributeValue::S("b1".to_string())));
+    assert_eq!(
+        item.get("data"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+
+    // MODIFIED NEW: only the changed attribute, no key.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement:
+                    "UPDATE \"Users\" SET data = 'newer' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                        .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("batch honours an UPDATE member's RETURNING");
+    assert_eq!(
+        item.get("data"),
+        Some(&AttributeValue::S("newer".to_string()))
+    );
+    assert!(item.get("pk").is_none(), "MODIFIED excludes the key");
+    assert_eq!(item.len(), 1);
+}
+
+#[test]
+fn test_batch_invalid_delete_returning_variant_is_a_per_statement_error() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "b1", "Batch");
+
+    // The batch call itself succeeds; the invalid variant surfaces as a
+    // per-statement error, not a thrown exception.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING MODIFIED OLD *"
+                    .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    assert_eq!(resp.responses.len(), 1);
+    assert!(resp.responses[0].item.is_none());
+    let err = resp.responses[0]
+        .error
+        .as_ref()
+        .expect("an invalid variant surfaces a per-statement error");
+    assert_eq!(err.code, "ValidationError");
+    assert_eq!(
+        err.message,
+        "Invalid returning clause: RETURNING MODIFIED OLD *. Only RETURNING ALL OLD * is allowed in DELETE statements."
+    );
+
+    // The rejected statement must not have deleted the item.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'b1'");
+    assert_eq!(sel.items.unwrap().len(), 1);
 }
 
 #[test]

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dynoxide serve` and `dynoxide` (no-subcommand) now accept a `--schema` flag, taking the same DynamoDB DescribeTable JSON format as `import --schema`. On startup, dynoxide creates each table defined in the file and skips any that already exist. This lets you pre-populate an empty database — in-memory or persistent — with the correct table structure without running an import first.
+
 ## [0.11.4] - 2026-07-17
 
 ### Fixed

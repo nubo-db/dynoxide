@@ -54,6 +54,11 @@ struct Cli {
     /// Path to file containing the encryption key (requires encryption feature)
     #[arg(long, value_name = "PATH")]
     encryption_key_file: Option<PathBuf>,
+
+    /// Schema file (JSON with DescribeTable responses) — scaffolds empty tables on startup
+    #[cfg(feature = "import")]
+    #[arg(long, value_name = "PATH")]
+    schema: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -133,6 +138,11 @@ struct ServeArgs {
     #[cfg(feature = "mcp-server")]
     #[arg(long, value_name = "HOST", requires = "mcp")]
     mcp_allowed_host: Vec<String>,
+
+    /// Schema file (JSON with DescribeTable responses) — scaffolds empty tables on startup
+    #[cfg(feature = "import")]
+    #[arg(long, value_name = "PATH")]
+    schema: Option<PathBuf>,
 }
 
 /// Arguments for the `healthcheck` subcommand.
@@ -404,6 +414,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 mcp_no_auth: false,
                 #[cfg(feature = "mcp-server")]
                 mcp_allowed_host: Vec::new(),
+                #[cfg(feature = "import")]
+                schema: cli.schema,
             };
             run_serve(args).await
         }
@@ -476,6 +488,13 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             None::<&str>
         }
     })?;
+
+    #[cfg(feature = "import")]
+    if let Some(schema_path) = &args.schema {
+        let n = dynoxide::import::scaffold_from_schema(&db, schema_path)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        eprintln!("Scaffolded {} table(s) from schema", n);
+    }
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {

@@ -31,6 +31,9 @@ pub enum Statement {
     Delete {
         table_name: String,
         where_clause: Option<WhereClause>,
+        /// True when the statement ends with `RETURNING ALL OLD *`, the only
+        /// returning variant DynamoDB supports for DELETE.
+        returning_all_old: bool,
     },
 }
 
@@ -385,11 +388,43 @@ fn parse_delete(t: &mut Tokenizer) -> Result<Statement, String> {
     expect_keyword(t, "FROM")?;
     let table_name = parse_table_name(t)?;
     let where_clause = parse_optional_where(t)?;
+    let returning_all_old = parse_optional_delete_returning(t)?;
 
     Ok(Statement::Delete {
         table_name,
         where_clause,
+        returning_all_old,
     })
+}
+
+/// Parse an optional `RETURNING ALL OLD *` clause on a DELETE statement.
+///
+/// DynamoDB supports only the `ALL OLD *` variant for DELETE; the other
+/// returning variants (`MODIFIED OLD *`, `ALL NEW *`, `MODIFIED NEW *`) are
+/// rejected rather than silently ignored.
+fn parse_optional_delete_returning(t: &mut Tokenizer) -> Result<bool, String> {
+    match t.peek_token()? {
+        Some(ref s) if s.eq_ignore_ascii_case("RETURNING") => {
+            t.next_token()?; // consume RETURNING
+            let first = t
+                .next_token()?
+                .ok_or("Expected returning variant after RETURNING")?;
+            let second = t
+                .next_token()?
+                .ok_or("Expected returning variant after RETURNING")?;
+            let star = t.next_token()?.ok_or("Expected '*' in RETURNING clause")?;
+            if first.eq_ignore_ascii_case("ALL")
+                && second.eq_ignore_ascii_case("OLD")
+                && star == "*"
+                && t.peek_token()?.is_none()
+            {
+                Ok(true)
+            } else {
+                Err("DELETE supports only the RETURNING ALL OLD * variant".to_string())
+            }
+        }
+        _ => Ok(false),
+    }
 }
 
 fn parse_table_name(t: &mut Tokenizer) -> Result<String, String> {
@@ -1361,12 +1396,61 @@ mod tests {
             Statement::Delete {
                 table_name,
                 where_clause,
+                returning_all_old,
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
+                assert!(!returning_all_old);
             }
             _ => panic!("Expected DELETE"),
         }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_all_old() {
+        let stmt = parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD *").unwrap();
+        match stmt {
+            Statement::Delete {
+                table_name,
+                where_clause,
+                returning_all_old,
+            } => {
+                assert_eq!(table_name, "T");
+                assert!(where_clause.is_some());
+                assert!(returning_all_old);
+            }
+            _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_is_case_insensitive() {
+        let stmt = parse("DELETE FROM \"T\" WHERE pk = 'k1' returning all old *").unwrap();
+        match stmt {
+            Statement::Delete {
+                returning_all_old, ..
+            } => assert!(returning_all_old),
+            _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_rejects_unsupported_variants() {
+        for variant in [
+            "RETURNING MODIFIED OLD *",
+            "RETURNING ALL NEW *",
+            "RETURNING MODIFIED NEW *",
+        ] {
+            let result = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {variant}"));
+            assert!(result.is_err(), "expected rejection of '{variant}'");
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_rejects_incomplete_clause() {
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD").is_err());
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING").is_err());
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD attr").is_err());
     }
 
     #[test]

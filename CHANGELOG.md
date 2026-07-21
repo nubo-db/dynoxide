@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PartiQL `DELETE` now supports `RETURNING ALL OLD *`, returning the deleted item in the `ExecuteStatement` `Items` field, where dynoxide parsed the statement but silently dropped the clause and returned nothing. A delete of a missing item remains a silent no-op with no returned items, and the returning variants DynamoDB does not allow on `DELETE` (`MODIFIED OLD *`, `ALL NEW *`, `MODIFIED NEW *`) are now rejected with a `ValidationException` instead of being ignored ([#137](https://github.com/nubo-db/dynoxide/issues/137)).
+
 ## [0.11.4] - 2026-07-17
 
 ### Fixed

@@ -83,10 +83,18 @@ pub async fn execute_measured<S: StorageBackend>(
         Statement::Delete {
             table_name,
             where_clause,
+            returning_all_old,
         } => {
-            let size =
+            let (old_item, size) =
                 execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
-            Ok((None, size))
+            // RETURNING ALL OLD * surfaces the deleted item; a missing target
+            // stays a silent no-op with no returned items, matching DynamoDB.
+            let items = if *returning_all_old {
+                old_item.map(|item| vec![item])
+            } else {
+                None
+            };
+            Ok((items, size))
         }
     }
 }
@@ -484,14 +492,14 @@ async fn execute_update<S: StorageBackend>(
     Ok(item_size)
 }
 
-/// Returns the deleted item's size in bytes (0 when the target was missing and
-/// the delete was a no-op), for `ConsumedCapacity` accounting.
+/// Returns the deleted item (None when the target was missing and the delete
+/// was a no-op) and its size in bytes for `ConsumedCapacity` accounting.
 async fn execute_delete<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<usize> {
+) -> Result<(Option<Item>, usize)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -583,7 +591,7 @@ async fn execute_delete<S: StorageBackend>(
     // A delete is charged for the size of the item it removed; a no-op delete
     // (missing target) reports 0.
     let deleted_size = old_item.as_ref().map(crate::types::item_size).unwrap_or(0);
-    Ok(deleted_size)
+    Ok((old_item, deleted_size))
 }
 
 // ---------------------------------------------------------------------------

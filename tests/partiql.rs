@@ -233,6 +233,77 @@ fn test_delete_nonexistent_item() {
     exec(&db, "DELETE FROM \"Users\" WHERE pk = 'nonexistent'");
 }
 
+#[test]
+fn test_delete_returning_all_old_returns_deleted_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice");
+
+    let resp = exec(
+        &db,
+        "DELETE FROM \"Users\" WHERE pk = 'u1' RETURNING ALL OLD *",
+    );
+    let items = resp
+        .items
+        .expect("RETURNING ALL OLD * should return the deleted item");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("pk"),
+        Some(&AttributeValue::S("u1".to_string()))
+    );
+    assert_eq!(
+        items[0].get("name"),
+        Some(&AttributeValue::S("Alice".to_string()))
+    );
+
+    // The item is actually gone
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert!(sel.items.unwrap().is_empty());
+}
+
+#[test]
+fn test_delete_returning_all_old_missing_item_is_silent_noop() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let resp = exec(
+        &db,
+        "DELETE FROM \"Users\" WHERE pk = 'nonexistent' RETURNING ALL OLD *",
+    );
+    assert!(resp.items.is_none());
+}
+
+#[test]
+fn test_delete_without_returning_still_returns_no_items() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice");
+
+    let resp = exec(&db, "DELETE FROM \"Users\" WHERE pk = 'u1'");
+    assert!(resp.items.is_none());
+}
+
+#[test]
+fn test_delete_returning_unsupported_variant_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice");
+
+    let result = db.execute_statement(ExecuteStatementRequest {
+        statement: "DELETE FROM \"Users\" WHERE pk = 'u1' RETURNING ALL NEW *".to_string(),
+        parameters: None,
+        ..Default::default()
+    });
+    assert!(
+        result.is_err(),
+        "RETURNING ALL NEW * should be rejected for DELETE"
+    );
+
+    // The rejected statement must not have deleted the item
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert_eq!(sel.items.unwrap().len(), 1);
+}
+
 // -----------------------------------------------------------------------
 // Parameterized queries
 // -----------------------------------------------------------------------

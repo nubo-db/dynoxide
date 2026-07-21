@@ -115,12 +115,12 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Projections:** Nested dot-notation paths, `COUNT(*)`
 - **Pagination:** `LIMIT`, `NextToken`
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
-- **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
+- **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics
 
 Parameter placeholders (`?`) supported in all positions including nested list/map values.
 
-**Not supported:** `RETURNING` clause on `UPDATE` (all four variants); `DELETE` supports only `RETURNING ALL OLD *` and rejects the other variants, matching DynamoDB.
+**`RETURNING`:** honoured on `ExecuteStatement` (`DELETE ALL OLD *`, and `UPDATE` in all four `ALL`/`MODIFIED` × `OLD`/`NEW` variants, with `MODIFIED` excluding the key) and on `BatchExecuteStatement`; rejected inside `ExecuteTransaction` with a `ValidationException`. `DELETE` accepts only `RETURNING ALL OLD *` and rejects the other variants, matching DynamoDB.
 
 ---
 

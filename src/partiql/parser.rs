@@ -27,14 +27,46 @@ pub enum Statement {
         set_clauses: Vec<SetClause>,
         remove_paths: Vec<String>,
         where_clause: Option<WhereClause>,
+        /// The `RETURNING` variant when the statement ends with a `RETURNING`
+        /// clause. All four variants are valid on `UPDATE`. `None` when absent.
+        returning: Option<ReturningVariant>,
     },
     Delete {
         table_name: String,
         where_clause: Option<WhereClause>,
-        /// True when the statement ends with `RETURNING ALL OLD *`, the only
-        /// returning variant DynamoDB supports for DELETE.
-        returning_all_old: bool,
+        /// The `RETURNING` variant when the statement ends with a `RETURNING`
+        /// clause. DynamoDB allows only `ALL OLD *` on `DELETE`; the executor
+        /// rejects the other variants. `None` when there is no clause.
+        returning: Option<ReturningVariant>,
     },
+}
+
+/// A PartiQL `RETURNING` clause variant: the cross product of `ALL`/`MODIFIED`
+/// and `OLD`/`NEW`, as in `RETURNING MODIFIED NEW *`.
+///
+/// All four are valid on `UPDATE`; only `AllOld` is valid on `DELETE` (the
+/// executor rejects the others). The parser recognises any well-formed variant
+/// and defers semantic validity to the executor, so the rejection can carry
+/// DynamoDB's exact `ValidationException` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturningVariant {
+    AllOld,
+    ModifiedOld,
+    AllNew,
+    ModifiedNew,
+}
+
+impl ReturningVariant {
+    /// The clause keywords as they appear after `RETURNING` (e.g. `ALL OLD`),
+    /// used to reconstruct DynamoDB's error message for a rejected variant.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            ReturningVariant::AllOld => "ALL OLD",
+            ReturningVariant::ModifiedOld => "MODIFIED OLD",
+            ReturningVariant::AllNew => "ALL NEW",
+            ReturningVariant::ModifiedNew => "MODIFIED NEW",
+        }
+    }
 }
 
 /// Extract the table name from a parsed statement.
@@ -44,6 +76,15 @@ pub fn table_name(stmt: &Statement) -> Option<&str> {
         | Statement::Insert { table_name, .. }
         | Statement::Update { table_name, .. }
         | Statement::Delete { table_name, .. } => Some(table_name),
+    }
+}
+
+/// The `RETURNING` variant a statement carries, if any. Only `UPDATE` and
+/// `DELETE` can carry one; every other statement returns `None`.
+pub fn returning_variant(stmt: &Statement) -> Option<ReturningVariant> {
+    match stmt {
+        Statement::Update { returning, .. } | Statement::Delete { returning, .. } => *returning,
+        _ => None,
     }
 }
 
@@ -316,12 +357,14 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
     }
 
     let where_clause = parse_optional_where(t)?;
+    let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Update {
         table_name,
         set_clauses,
         remove_paths,
         where_clause,
+        returning,
     })
 }
 
@@ -388,21 +431,22 @@ fn parse_delete(t: &mut Tokenizer) -> Result<Statement, String> {
     expect_keyword(t, "FROM")?;
     let table_name = parse_table_name(t)?;
     let where_clause = parse_optional_where(t)?;
-    let returning_all_old = parse_optional_delete_returning(t)?;
+    let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Delete {
         table_name,
         where_clause,
-        returning_all_old,
+        returning,
     })
 }
 
-/// Parse an optional `RETURNING ALL OLD *` clause on a DELETE statement.
+/// Parse an optional trailing `RETURNING <ALL|MODIFIED> <OLD|NEW> *` clause.
 ///
-/// DynamoDB supports only the `ALL OLD *` variant for DELETE; the other
-/// returning variants (`MODIFIED OLD *`, `ALL NEW *`, `MODIFIED NEW *`) are
-/// rejected rather than silently ignored.
-fn parse_optional_delete_returning(t: &mut Tokenizer) -> Result<bool, String> {
+/// Recognises any of the four well-formed variants and returns it; a malformed
+/// clause (missing `*`, unknown keywords, trailing tokens) is a syntax error.
+/// Which variants a given command actually permits is enforced by the executor,
+/// so it can surface DynamoDB's exact validation message.
+fn parse_optional_returning(t: &mut Tokenizer) -> Result<Option<ReturningVariant>, String> {
     match t.peek_token()? {
         Some(ref s) if s.eq_ignore_ascii_case("RETURNING") => {
             t.next_token()?; // consume RETURNING
@@ -413,17 +457,31 @@ fn parse_optional_delete_returning(t: &mut Tokenizer) -> Result<bool, String> {
                 .next_token()?
                 .ok_or("Expected returning variant after RETURNING")?;
             let star = t.next_token()?.ok_or("Expected '*' in RETURNING clause")?;
-            if first.eq_ignore_ascii_case("ALL")
-                && second.eq_ignore_ascii_case("OLD")
-                && star == "*"
-                && t.peek_token()?.is_none()
-            {
-                Ok(true)
-            } else {
-                Err("DELETE supports only the RETURNING ALL OLD * variant".to_string())
+            if star != "*" || t.peek_token()?.is_some() {
+                return Err(
+                    "Malformed RETURNING clause; expected RETURNING <ALL|MODIFIED> <OLD|NEW> *"
+                        .to_string(),
+                );
             }
+            let variant = match (
+                first.to_ascii_uppercase().as_str(),
+                second.to_ascii_uppercase().as_str(),
+            ) {
+                ("ALL", "OLD") => ReturningVariant::AllOld,
+                ("MODIFIED", "OLD") => ReturningVariant::ModifiedOld,
+                ("ALL", "NEW") => ReturningVariant::AllNew,
+                ("MODIFIED", "NEW") => ReturningVariant::ModifiedNew,
+                _ => {
+                    return Err(format!(
+                        "Unsupported RETURNING clause: RETURNING {} {} *",
+                        first.to_ascii_uppercase(),
+                        second.to_ascii_uppercase()
+                    ));
+                }
+            };
+            Ok(Some(variant))
         }
-        _ => Ok(false),
+        _ => Ok(None),
     }
 }
 
@@ -1396,11 +1454,11 @@ mod tests {
             Statement::Delete {
                 table_name,
                 where_clause,
-                returning_all_old,
+                returning,
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
-                assert!(!returning_all_old);
+                assert!(returning.is_none());
             }
             _ => panic!("Expected DELETE"),
         }
@@ -1413,11 +1471,11 @@ mod tests {
             Statement::Delete {
                 table_name,
                 where_clause,
-                returning_all_old,
+                returning,
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
-                assert!(returning_all_old);
+                assert_eq!(returning, Some(ReturningVariant::AllOld));
             }
             _ => panic!("Expected DELETE"),
         }
@@ -1427,22 +1485,54 @@ mod tests {
     fn test_parse_delete_returning_is_case_insensitive() {
         let stmt = parse("DELETE FROM \"T\" WHERE pk = 'k1' returning all old *").unwrap();
         match stmt {
-            Statement::Delete {
-                returning_all_old, ..
-            } => assert!(returning_all_old),
+            Statement::Delete { returning, .. } => {
+                assert_eq!(returning, Some(ReturningVariant::AllOld))
+            }
             _ => panic!("Expected DELETE"),
         }
     }
 
     #[test]
-    fn test_parse_delete_returning_rejects_unsupported_variants() {
-        for variant in [
-            "RETURNING MODIFIED OLD *",
-            "RETURNING ALL NEW *",
-            "RETURNING MODIFIED NEW *",
-        ] {
-            let result = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {variant}"));
-            assert!(result.is_err(), "expected rejection of '{variant}'");
+    fn test_parse_delete_returning_recognises_all_variants() {
+        // All four well-formed variants parse; DynamoDB's semantic rule (only
+        // ALL OLD is valid on DELETE) is enforced by the executor so the
+        // rejection can carry the exact validation message.
+        let cases = [
+            ("RETURNING ALL OLD *", ReturningVariant::AllOld),
+            ("RETURNING MODIFIED OLD *", ReturningVariant::ModifiedOld),
+            ("RETURNING ALL NEW *", ReturningVariant::AllNew),
+            ("RETURNING MODIFIED NEW *", ReturningVariant::ModifiedNew),
+        ];
+        for (clause, expected) in cases {
+            let stmt = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {clause}")).unwrap();
+            match stmt {
+                Statement::Delete { returning, .. } => {
+                    assert_eq!(returning, Some(expected), "clause {clause}")
+                }
+                _ => panic!("Expected DELETE for {clause}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_update_returning_recognises_all_variants() {
+        let cases = [
+            ("RETURNING ALL OLD *", ReturningVariant::AllOld),
+            ("RETURNING MODIFIED OLD *", ReturningVariant::ModifiedOld),
+            ("RETURNING ALL NEW *", ReturningVariant::AllNew),
+            ("RETURNING MODIFIED NEW *", ReturningVariant::ModifiedNew),
+        ];
+        for (clause, expected) in cases {
+            let stmt = parse(&format!(
+                "UPDATE \"T\" SET data = 'x' WHERE pk = 'k1' {clause}"
+            ))
+            .unwrap();
+            match stmt {
+                Statement::Update { returning, .. } => {
+                    assert_eq!(returning, Some(expected), "clause {clause}")
+                }
+                _ => panic!("Expected UPDATE for {clause}"),
+            }
         }
     }
 

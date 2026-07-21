@@ -62,12 +62,20 @@ pub async fn execute<S: StorageBackend>(
 
     // Parse all statements before executing any, to fail fast on syntax errors
     let mut parsed = Vec::with_capacity(statements.len());
-    for stmt in statements {
+    for (index, stmt) in statements.iter().enumerate() {
         let ast = partiql::parser::parse(&stmt.statement).map_err(|e| {
             DynoxideError::ValidationException(format!(
                 "Statement wasn't well formed, got error: {e}"
             ))
         })?;
+        // DynamoDB rejects a RETURNING clause on any member of a transaction with
+        // a top-level ValidationException, before applying any write. This is a
+        // plain validation failure, not a TransactionCanceledException.
+        if partiql::parser::returning_variant(&ast).is_some() {
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: RETURNING clause is not supported in ExecuteTransaction."
+            )));
+        }
         let params = stmt.parameters.clone().unwrap_or_default();
         parsed.push((ast, params));
     }

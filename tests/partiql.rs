@@ -4,7 +4,9 @@ use dynoxide::actions::batch_execute_statement::{
 };
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
+use dynoxide::actions::execute_transaction::{ExecuteTransactionRequest, ParameterizedStatement};
 use dynoxide::actions::put_item::PutItemRequest;
+use dynoxide::errors::DynoxideError;
 use dynoxide::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
@@ -38,6 +40,22 @@ fn put_test_item(db: &Database, table_name: &str, pk: &str, name: &str) {
         expression_attribute_names: None,
         expression_attribute_values: None,
         return_values: None,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// Seed an item with `pk` plus arbitrary string attributes, so UPDATE RETURNING
+/// tests can distinguish a changed attribute from an untouched one.
+fn put_item_with_attrs(db: &Database, table_name: &str, pk: &str, attrs: &[(&str, &str)]) {
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    for (k, v) in attrs {
+        item.insert(k.to_string(), AttributeValue::S(v.to_string()));
+    }
+    db.put_item(PutItemRequest {
+        table_name: table_name.to_string(),
+        item,
         ..Default::default()
     })
     .unwrap();
@@ -262,7 +280,7 @@ fn test_delete_returning_all_old_returns_deleted_item() {
 }
 
 #[test]
-fn test_delete_returning_all_old_missing_item_is_silent_noop() {
+fn test_delete_returning_all_old_missing_item_returns_empty_items() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
@@ -270,7 +288,13 @@ fn test_delete_returning_all_old_missing_item_is_silent_noop() {
         &db,
         "DELETE FROM \"Users\" WHERE pk = 'nonexistent' RETURNING ALL OLD *",
     );
-    assert!(resp.items.is_none());
+    // A missing target is a no-op success that still returns an Items array, an
+    // empty one, present rather than absent. This differs from classic
+    // DeleteItem, which omits Attributes on a miss.
+    let items = resp
+        .items
+        .expect("RETURNING must surface an Items array even on a miss");
+    assert!(items.is_empty());
 }
 
 #[test]
@@ -284,24 +308,286 @@ fn test_delete_without_returning_still_returns_no_items() {
 }
 
 #[test]
-fn test_delete_returning_unsupported_variant_is_rejected() {
+fn test_delete_returning_unsupported_variants_are_rejected_with_exact_message() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
-    put_test_item(&db, "Users", "u1", "Alice");
 
-    let result = db.execute_statement(ExecuteStatementRequest {
-        statement: "DELETE FROM \"Users\" WHERE pk = 'u1' RETURNING ALL NEW *".to_string(),
-        parameters: None,
-        ..Default::default()
-    });
+    let cases = [
+        (
+            "MODIFIED OLD",
+            "Invalid returning clause: RETURNING MODIFIED OLD *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        ),
+        (
+            "ALL NEW",
+            "Invalid returning clause: RETURNING ALL NEW *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        ),
+        (
+            "MODIFIED NEW",
+            "Invalid returning clause: RETURNING MODIFIED NEW *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        ),
+    ];
+
+    for (variant, expected) in cases {
+        put_test_item(&db, "Users", "u1", "Alice");
+        let err = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: format!("DELETE FROM \"Users\" WHERE pk = 'u1' RETURNING {variant} *"),
+                parameters: None,
+                ..Default::default()
+            })
+            .unwrap_err();
+        match err {
+            DynoxideError::ValidationException(msg) => {
+                assert_eq!(msg, expected, "variant {variant}")
+            }
+            other => panic!("expected ValidationException for {variant}, got {other:?}"),
+        }
+
+        // The rejected statement must not have deleted the item.
+        let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+        assert_eq!(sel.items.unwrap().len(), 1, "variant {variant}");
+    }
+}
+
+// -----------------------------------------------------------------------
+// UPDATE ... RETURNING (all four variants on a present item)
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_update_returning_all_old_returns_full_prior_item_with_key() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING ALL OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("pk"), Some(&AttributeValue::S("u1".to_string())));
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("old".to_string())));
+    assert_eq!(it.get("keep"), Some(&AttributeValue::S("same".to_string())));
+
+    // The write applied.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert_eq!(
+        sel.items.unwrap()[0].get("data"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+}
+
+#[test]
+fn test_update_returning_modified_old_excludes_key_and_untouched_attrs() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("old".to_string())));
+    assert!(it.get("pk").is_none(), "MODIFIED excludes the key");
     assert!(
-        result.is_err(),
-        "RETURNING ALL NEW * should be rejected for DELETE"
+        it.get("keep").is_none(),
+        "MODIFIED excludes untouched attrs"
+    );
+    assert_eq!(it.len(), 1);
+}
+
+#[test]
+fn test_update_returning_all_new_returns_full_new_item_with_key() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING ALL NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("pk"), Some(&AttributeValue::S("u1".to_string())));
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("new".to_string())));
+    assert_eq!(it.get("keep"), Some(&AttributeValue::S("same".to_string())));
+}
+
+#[test]
+fn test_update_returning_modified_new_returns_only_changed_new_value() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("new".to_string())));
+    assert!(it.get("pk").is_none(), "MODIFIED excludes the key");
+    assert!(
+        it.get("keep").is_none(),
+        "MODIFIED excludes untouched attrs"
+    );
+    assert_eq!(it.len(), 1);
+}
+
+// -----------------------------------------------------------------------
+// RETURNING inside BatchExecuteStatement (honoured) and ExecuteTransaction
+// (rejected), per the real-AWS ground truth.
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_batch_delete_returning_all_old_surfaces_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "b1", "Batch");
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING ALL OLD *".to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+
+    assert_eq!(resp.responses.len(), 1);
+    assert!(resp.responses[0].error.is_none());
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("BatchExecuteStatement honours RETURNING on the member statement");
+    assert_eq!(item.get("pk"), Some(&AttributeValue::S("b1".to_string())));
+    assert_eq!(
+        item.get("name"),
+        Some(&AttributeValue::S("Batch".to_string()))
     );
 
-    // The rejected statement must not have deleted the item
-    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    // The item is gone.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'b1'");
+    assert!(sel.items.unwrap().is_empty());
+}
+
+#[test]
+fn test_transaction_delete_returning_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "t1", "Trans");
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "DELETE FROM \"Users\" WHERE pk = 't1' RETURNING ALL OLD *".to_string(),
+                parameters: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Validation failed in TransactStatements[0]: RETURNING clause is not supported in ExecuteTransaction."
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // The write must not have applied.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 't1'");
     assert_eq!(sel.items.unwrap().len(), 1);
+}
+
+#[test]
+fn test_transaction_update_returning_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "t1", &[("data", "old")]);
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 't1' RETURNING ALL NEW *"
+                    .to_string(),
+                parameters: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Validation failed in TransactStatements[0]: RETURNING clause is not supported in ExecuteTransaction."
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // The write must not have applied; data stays 'old'.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 't1'");
+    assert_eq!(
+        sel.items.unwrap()[0].get("data"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+}
+
+#[test]
+fn test_transaction_returning_reports_offending_index_and_rolls_back() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "keep-a", "A");
+    put_test_item(&db, "Users", "keep-b", "B");
+
+    // The RETURNING clause is on the second member (index 1); the whole
+    // transaction is rejected before any write, so neither delete applies.
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![
+                ParameterizedStatement {
+                    statement: "DELETE FROM \"Users\" WHERE pk = 'keep-a'".to_string(),
+                    parameters: None,
+                },
+                ParameterizedStatement {
+                    statement: "DELETE FROM \"Users\" WHERE pk = 'keep-b' RETURNING ALL OLD *"
+                        .to_string(),
+                    parameters: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Validation failed in TransactStatements[1]: RETURNING clause is not supported in ExecuteTransaction."
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // Neither item was deleted.
+    assert_eq!(
+        exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'keep-a'")
+            .items
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'keep-b'")
+            .items
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // -----------------------------------------------------------------------

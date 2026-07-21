@@ -4,7 +4,7 @@
 
 use crate::errors::{DynoxideError, Result};
 use crate::partiql::parser::{
-    CompOp, PartiqlValue, SetValue, Statement, WhereClause, WhereCondition,
+    CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
 };
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
@@ -68,29 +68,47 @@ pub async fn execute_measured<S: StorageBackend>(
             set_clauses,
             remove_paths,
             where_clause,
+            returning,
         } => {
-            let size = execute_update(
+            let (projection, size) = execute_update(
                 storage,
                 table_name,
                 set_clauses,
                 remove_paths,
                 where_clause.as_ref(),
                 parameters,
+                *returning,
             )
             .await?;
-            Ok((None, size))
+            // RETURNING surfaces the requested projection of the updated item;
+            // without a clause an UPDATE returns no items.
+            let items = projection.map(|item| vec![item]);
+            Ok((items, size))
         }
         Statement::Delete {
             table_name,
             where_clause,
-            returning_all_old,
+            returning,
         } => {
+            // DynamoDB permits only RETURNING ALL OLD * on DELETE; the other
+            // well-formed variants are rejected with a ValidationException whose
+            // message echoes the offending variant.
+            if let Some(variant) = returning {
+                if *variant != ReturningVariant::AllOld {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "Invalid returning clause: RETURNING {} *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+                        variant.as_sql()
+                    )));
+                }
+            }
             let (old_item, size) =
                 execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
-            // RETURNING ALL OLD * surfaces the deleted item; a missing target
-            // stays a silent no-op with no returned items, matching DynamoDB.
-            let items = if *returning_all_old {
-                old_item.map(|item| vec![item])
+            // RETURNING ALL OLD * always surfaces an Items array: the deleted
+            // item on a hit, an empty array on a miss (a no-op success). This
+            // differs from the classic DeleteItem ReturnValues path, which omits
+            // Attributes on a miss.
+            let items = if returning.is_some() {
+                Some(old_item.map(|item| vec![item]).unwrap_or_default())
             } else {
                 None
             };
@@ -334,8 +352,10 @@ async fn execute_insert<S: StorageBackend>(
     Ok(item_size)
 }
 
-/// Returns the updated item's new size in bytes (0 when the update resolves to
-/// an empty item and is skipped), for `ConsumedCapacity` accounting.
+/// Applies an UPDATE and returns the `RETURNING` projection (or `None` when the
+/// statement carried no `RETURNING` clause) and the updated item's new size in
+/// bytes (0 when the update resolves to an empty item and is skipped), for
+/// `ConsumedCapacity` accounting.
 async fn execute_update<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -343,7 +363,8 @@ async fn execute_update<S: StorageBackend>(
     remove_paths: &[String],
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<usize> {
+    returning: Option<ReturningVariant>,
+) -> Result<(Option<Item>, usize)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -425,7 +446,7 @@ async fn execute_update<S: StorageBackend>(
 
     // Ensure keys are present
     if item.is_empty() {
-        return Ok(0);
+        return Ok((None, 0));
     }
 
     // Validate attribute values after SET clauses applied
@@ -489,7 +510,45 @@ async fn execute_update<S: StorageBackend>(
     };
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
-    Ok(item_size)
+    // Build the RETURNING projection from the item's before/after states. The
+    // "modified" attributes are the top-level names the SET/REMOVE clauses
+    // touched (the first segment of any nested path); the MODIFIED variants
+    // project only those, which never includes the key.
+    let projection = returning.map(|variant| {
+        let modified: std::collections::BTreeSet<String> = set_clauses
+            .iter()
+            .map(|c| c.path.as_str())
+            .chain(remove_paths.iter().map(|p| p.as_str()))
+            .map(|p| p.split('.').next().unwrap_or(p).to_string())
+            .collect();
+        project_returning(variant, &old_item, &item, &modified)
+    });
+
+    Ok((projection, item_size))
+}
+
+/// Build the `RETURNING` projection for an UPDATE from the item's before/after
+/// states. `ALL` variants return the whole item (key included); `MODIFIED`
+/// variants return only the attributes the statement touched, at their old or
+/// new values, which never includes the key.
+fn project_returning(
+    variant: ReturningVariant,
+    old_item: &Item,
+    new_item: &Item,
+    modified: &std::collections::BTreeSet<String>,
+) -> Item {
+    match variant {
+        ReturningVariant::AllOld => old_item.clone(),
+        ReturningVariant::AllNew => new_item.clone(),
+        ReturningVariant::ModifiedOld => modified
+            .iter()
+            .filter_map(|name| old_item.get(name).map(|v| (name.clone(), v.clone())))
+            .collect(),
+        ReturningVariant::ModifiedNew => modified
+            .iter()
+            .filter_map(|name| new_item.get(name).map(|v| (name.clone(), v.clone())))
+            .collect(),
+    }
 }
 
 /// Returns the deleted item (None when the target was missing and the delete

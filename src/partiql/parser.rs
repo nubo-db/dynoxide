@@ -10,6 +10,12 @@ use crate::types::AttributeValue;
 use std::collections::HashMap;
 
 /// A parsed PartiQL statement.
+///
+/// The `Update` and `Delete` variants are `#[non_exhaustive]`: they carry a
+/// growing set of clauses (a `RETURNING` variant was added in 0.12.0), so
+/// downstream code must match them with `..` and cannot build them by struct
+/// literal. This keeps later clause additions non-breaking, matching the
+/// precedent set by `DynoxideError`.
 #[derive(Debug, Clone)]
 pub enum Statement {
     Select {
@@ -22,6 +28,7 @@ pub enum Statement {
         item: HashMap<String, PartiqlValue>,
         if_not_exists: bool,
     },
+    #[non_exhaustive]
     Update {
         table_name: String,
         set_clauses: Vec<SetClause>,
@@ -31,6 +38,7 @@ pub enum Statement {
         /// clause. All four variants are valid on `UPDATE`. `None` when absent.
         returning: Option<ReturningVariant>,
     },
+    #[non_exhaustive]
     Delete {
         table_name: String,
         where_clause: Option<WhereClause>,
@@ -1541,6 +1549,24 @@ mod tests {
         assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD").is_err());
         assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING").is_err());
         assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD attr").is_err());
+    }
+
+    #[test]
+    fn test_parse_returning_rejects_invalid_keyword_pairs() {
+        // Well-formed shape (two keywords + star) but not one of the four valid
+        // ALL/MODIFIED x OLD/NEW pairs -> the catch-all rejection.
+        for clause in [
+            "RETURNING OLD ALL *",
+            "RETURNING NEW MODIFIED *",
+            "RETURNING ALL ALL *",
+            "RETURNING FOO BAR *",
+        ] {
+            let err = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {clause}")).unwrap_err();
+            assert!(
+                err.contains("Unsupported RETURNING clause"),
+                "clause {clause} gave unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

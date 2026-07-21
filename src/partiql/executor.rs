@@ -12,8 +12,10 @@ use std::collections::HashMap;
 
 /// Execute a parsed PartiQL statement.
 ///
-/// Returns `Some(items)` for SELECT (may be empty), `None` for write operations.
-/// An optional `limit` restricts how many items a SELECT returns.
+/// Returns `Some(items)` for SELECT (may be empty) and for a DELETE or UPDATE
+/// carrying a `RETURNING` clause (the deleted item or the requested projection);
+/// `None` for a write with no `RETURNING` clause. An optional `limit` restricts
+/// how many items a SELECT returns.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     stmt: &Statement,

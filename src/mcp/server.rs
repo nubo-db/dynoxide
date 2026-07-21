@@ -1149,7 +1149,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Execute a PartiQL statement. Supports SELECT (with COUNT(*), LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths. Write statements are blocked in read-only mode."
+        description = "Execute a PartiQL statement. Supports SELECT (with COUNT(*), LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths. Write statements are blocked in read-only mode."
     )]
     fn execute_partiql(
         &self,
@@ -1462,7 +1462,7 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "[WRITE] Execute a batch of PartiQL statements. Each statement can be SELECT, INSERT, UPDATE, or DELETE. Write statements are blocked in read-only mode."
+        description = "[WRITE] Execute a batch of PartiQL statements. Each statement can be SELECT, INSERT, UPDATE, or DELETE. A member's RETURNING clause is honoured, with the returned item surfaced on that response's Item field. Write statements are blocked in read-only mode."
     )]
     fn batch_execute_partiql(
         &self,
@@ -1505,7 +1505,7 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "[WRITE] [DESTRUCTIVE] Execute PartiQL statements transactionally (all-or-nothing). Max 100 statements. If any fails, the entire transaction is rolled back. Example transact_statements: [{\"Statement\": \"INSERT INTO Users VALUE {'pk': 'u1', 'name': 'Alice'}\"}]"
+        description = "[WRITE] [DESTRUCTIVE] Execute PartiQL statements transactionally (all-or-nothing). Max 100 statements. If any fails, the entire transaction is rolled back. A RETURNING clause is not supported inside a transaction and is rejected with a ValidationException. Example transact_statements: [{\"Statement\": \"INSERT INTO Users VALUE {'pk': 'u1', 'name': 'Alice'}\"}]"
     )]
     fn execute_transaction_partiql(
         &self,

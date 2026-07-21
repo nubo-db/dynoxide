@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (Rust API):** the public `partiql::parser::Statement` enum gained a `returning` field on its `Update` and `Delete` variants, and both variants are now `#[non_exhaustive]`. Library consumers that construct or exhaustively match these AST variants must add `..`. This is a source-breaking change for the crate's public API, so the next release is a minor bump (0.12.0). The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
+
 ### Added
 
 - PartiQL now honours the `RETURNING` clause on `ExecuteStatement`, where dynoxide previously parsed the statement but silently dropped the clause. `DELETE ... RETURNING ALL OLD *` returns the deleted item in `Items` (a present but empty `Items` array on a missing target, matching DynamoDB rather than the classic `DeleteItem` path), and `UPDATE ... RETURNING <ALL|MODIFIED> <OLD|NEW> *` returns the matching projection of the item, with the `MODIFIED` variants excluding the primary key. `BatchExecuteStatement` honours a member's `RETURNING` clause; `ExecuteTransaction` rejects one with a top-level `ValidationException`. The `RETURNING` variants DynamoDB does not allow on `DELETE` (`MODIFIED OLD *`, `ALL NEW *`, `MODIFIED NEW *`) are rejected with its exact validation message instead of being ignored ([#137](https://github.com/nubo-db/dynoxide/issues/137)).

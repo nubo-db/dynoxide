@@ -598,6 +598,134 @@ fn test_update_returning_modified_on_newly_created_attribute() {
     assert_eq!(items[0].len(), 1);
 }
 
+#[test]
+fn test_update_returning_modified_merges_sibling_nested_paths() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_nested_item(
+        &db,
+        "Users",
+        "m3",
+        "profile",
+        &[("a", "oldA"), ("b", "oldB"), ("keep", "same")],
+    );
+
+    // Two sibling nested SETs must merge under the shared parent map, and the
+    // untouched sibling `keep` is excluded. This exercises the set_nested_value
+    // merge path that reconstructs the projection.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.a = 'x', profile.b = 'y' WHERE pk = 'm3' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let profile = match items[0].get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(profile.get("a"), Some(&AttributeValue::S("x".to_string())));
+    assert_eq!(profile.get("b"), Some(&AttributeValue::S("y".to_string())));
+    assert!(
+        !profile.contains_key("keep"),
+        "untouched sibling excluded from MODIFIED"
+    );
+    assert_eq!(profile.len(), 2);
+}
+
+#[test]
+fn test_update_returning_modified_after_nested_remove() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD: the removed nested leaf at its old value, nested, no sibling.
+    put_nested_item(
+        &db,
+        "Users",
+        "n1",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE profile.sub WHERE pk = 'n1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    let profile = match items[0].get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        profile.get("sub"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+    assert_eq!(profile.len(), 1);
+
+    // MODIFIED NEW: the removed leaf is gone, so the projection is empty -> [].
+    put_nested_item(
+        &db,
+        "Users",
+        "n2",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE profile.sub WHERE pk = 'n2' RETURNING MODIFIED NEW *",
+    );
+    let items = resp
+        .items
+        .expect("an empty MODIFIED projection still returns a present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED NEW after a nested REMOVE returns Items: [] (no row)"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_deep_nested_path() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Seed profile = { inner: { leaf: 'old', sib: 'keep' } } (three levels).
+    let mut inner = HashMap::new();
+    inner.insert("leaf".to_string(), AttributeValue::S("old".to_string()));
+    inner.insert("sib".to_string(), AttributeValue::S("keep".to_string()));
+    let mut profile = HashMap::new();
+    profile.insert("inner".to_string(), AttributeValue::M(inner));
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("d1".to_string()));
+    item.insert("profile".to_string(), AttributeValue::M(profile));
+    db.put_item(PutItemRequest {
+        table_name: "Users".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // A three-level SET projects only the changed leaf, nested all the way down.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.inner.leaf = 'new' WHERE pk = 'd1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    let inner = match items[0].get("profile") {
+        Some(AttributeValue::M(p)) => match p.get("inner") {
+            Some(AttributeValue::M(i)) => i,
+            other => panic!("expected inner map, got {other:?}"),
+        },
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        inner.get("leaf"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+    assert!(
+        !inner.contains_key("sib"),
+        "deep MODIFIED excludes the untouched sibling"
+    );
+    assert_eq!(inner.len(), 1);
+}
+
 // -----------------------------------------------------------------------
 // RETURNING inside BatchExecuteStatement (honoured) and ExecuteTransaction
 // (rejected), per the real-AWS ground truth.

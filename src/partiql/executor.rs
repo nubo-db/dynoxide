@@ -577,6 +577,11 @@ fn project_modified(paths: &std::collections::BTreeSet<String>, source: &Item) -
 /// navigation: dots descend into maps, and a segment is matched as a whole key
 /// (so a bracket-index path like `a[0]` is treated as the single key `a[0]`,
 /// consistent with how SET stored it).
+///
+/// This deliberately mirrors `set_nested_value`, not `resolve_nested_path`
+/// (which navigates real list indices). The projection must read a path exactly
+/// as SET wrote it, so swapping in `resolve_nested_path` would silently
+/// mishandle a bracket-index `SET`/`REMOVE` under a `MODIFIED` projection.
 fn get_nested_value<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeValue> {
     let mut parts = path.split('.');
     let mut current = item.get(parts.next()?)?;

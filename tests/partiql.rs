@@ -4,7 +4,9 @@ use dynoxide::actions::batch_execute_statement::{
 };
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
+use dynoxide::actions::execute_transaction::{ExecuteTransactionRequest, ParameterizedStatement};
 use dynoxide::actions::put_item::PutItemRequest;
+use dynoxide::errors::DynoxideError;
 use dynoxide::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
@@ -38,6 +40,46 @@ fn put_test_item(db: &Database, table_name: &str, pk: &str, name: &str) {
         expression_attribute_names: None,
         expression_attribute_values: None,
         return_values: None,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// Seed an item with `pk` plus arbitrary string attributes, so UPDATE RETURNING
+/// tests can distinguish a changed attribute from an untouched one.
+fn put_item_with_attrs(db: &Database, table_name: &str, pk: &str, attrs: &[(&str, &str)]) {
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    for (k, v) in attrs {
+        item.insert(k.to_string(), AttributeValue::S(v.to_string()));
+    }
+    db.put_item(PutItemRequest {
+        table_name: table_name.to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// Seed an item with `pk` plus one nested map attribute, so nested-path UPDATE
+/// RETURNING tests can check that MODIFIED projects only the changed leaf.
+fn put_nested_item(
+    db: &Database,
+    table_name: &str,
+    pk: &str,
+    map_attr: &str,
+    entries: &[(&str, &str)],
+) {
+    let mut inner = HashMap::new();
+    for (k, v) in entries {
+        inner.insert(k.to_string(), AttributeValue::S(v.to_string()));
+    }
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    item.insert(map_attr.to_string(), AttributeValue::M(inner));
+    db.put_item(PutItemRequest {
+        table_name: table_name.to_string(),
+        item,
         ..Default::default()
     })
     .unwrap();
@@ -231,6 +273,715 @@ fn test_delete_nonexistent_item() {
 
     // Should not error, just silently succeed
     exec(&db, "DELETE FROM \"Users\" WHERE pk = 'nonexistent'");
+}
+
+#[test]
+fn test_delete_returning_all_old_returns_deleted_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice");
+
+    let resp = exec(
+        &db,
+        "DELETE FROM \"Users\" WHERE pk = 'u1' RETURNING ALL OLD *",
+    );
+    let items = resp
+        .items
+        .expect("RETURNING ALL OLD * should return the deleted item");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("pk"),
+        Some(&AttributeValue::S("u1".to_string()))
+    );
+    assert_eq!(
+        items[0].get("name"),
+        Some(&AttributeValue::S("Alice".to_string()))
+    );
+
+    // The item is actually gone
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert!(sel.items.unwrap().is_empty());
+}
+
+#[test]
+fn test_delete_returning_all_old_missing_item_returns_empty_items() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let resp = exec(
+        &db,
+        "DELETE FROM \"Users\" WHERE pk = 'nonexistent' RETURNING ALL OLD *",
+    );
+    // A missing target is a no-op success that still returns an Items array, an
+    // empty one, present rather than absent. This differs from classic
+    // DeleteItem, which omits Attributes on a miss.
+    let items = resp
+        .items
+        .expect("RETURNING must surface an Items array even on a miss");
+    assert!(items.is_empty());
+}
+
+#[test]
+fn test_delete_without_returning_still_returns_no_items() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice");
+
+    let resp = exec(&db, "DELETE FROM \"Users\" WHERE pk = 'u1'");
+    assert!(resp.items.is_none());
+}
+
+#[test]
+fn test_delete_returning_unsupported_variants_are_rejected_with_exact_message() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let cases = [
+        (
+            "MODIFIED OLD",
+            "Invalid returning clause: RETURNING MODIFIED OLD *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        ),
+        (
+            "ALL NEW",
+            "Invalid returning clause: RETURNING ALL NEW *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        ),
+        (
+            "MODIFIED NEW",
+            "Invalid returning clause: RETURNING MODIFIED NEW *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+        ),
+    ];
+
+    for (variant, expected) in cases {
+        put_test_item(&db, "Users", "u1", "Alice");
+        let err = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: format!("DELETE FROM \"Users\" WHERE pk = 'u1' RETURNING {variant} *"),
+                parameters: None,
+                ..Default::default()
+            })
+            .unwrap_err();
+        match err {
+            DynoxideError::ValidationException(msg) => {
+                assert_eq!(msg, expected, "variant {variant}")
+            }
+            other => panic!("expected ValidationException for {variant}, got {other:?}"),
+        }
+
+        // The rejected statement must not have deleted the item.
+        let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+        assert_eq!(sel.items.unwrap().len(), 1, "variant {variant}");
+    }
+}
+
+// -----------------------------------------------------------------------
+// UPDATE ... RETURNING (all four variants on a present item)
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_update_returning_all_old_returns_full_prior_item_with_key() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING ALL OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("pk"), Some(&AttributeValue::S("u1".to_string())));
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("old".to_string())));
+    assert_eq!(it.get("keep"), Some(&AttributeValue::S("same".to_string())));
+
+    // The write applied.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert_eq!(
+        sel.items.unwrap()[0].get("data"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+}
+
+#[test]
+fn test_update_returning_modified_old_excludes_key_and_untouched_attrs() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("old".to_string())));
+    assert!(it.get("pk").is_none(), "MODIFIED excludes the key");
+    assert!(
+        it.get("keep").is_none(),
+        "MODIFIED excludes untouched attrs"
+    );
+    assert_eq!(it.len(), 1);
+}
+
+#[test]
+fn test_update_returning_all_new_returns_full_new_item_with_key() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING ALL NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("pk"), Some(&AttributeValue::S("u1".to_string())));
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("new".to_string())));
+    assert_eq!(it.get("keep"), Some(&AttributeValue::S("same".to_string())));
+}
+
+#[test]
+fn test_update_returning_modified_new_returns_only_changed_new_value() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("data", "old"), ("keep", "same")]);
+
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'u1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert_eq!(it.get("data"), Some(&AttributeValue::S("new".to_string())));
+    assert!(it.get("pk").is_none(), "MODIFIED excludes the key");
+    assert!(
+        it.get("keep").is_none(),
+        "MODIFIED excludes untouched attrs"
+    );
+    assert_eq!(it.len(), 1);
+}
+
+// -----------------------------------------------------------------------
+// UPDATE MODIFIED edge cases, per the real-AWS follow-up capture: a nested
+// SET projects only the changed leaf, and an empty MODIFIED projection
+// returns Items: [] (no row), not a row holding an empty object.
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_update_returning_modified_nested_path_projects_only_changed_leaf() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED NEW: only the changed leaf, nested; sibling and key excluded.
+    put_nested_item(
+        &db,
+        "Users",
+        "m1",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.sub = 'new' WHERE pk = 'm1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let it = &items[0];
+    assert!(!it.contains_key("pk"), "MODIFIED excludes the key");
+    let profile = match it.get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        profile.get("sub"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+    assert!(
+        profile.get("sib").is_none(),
+        "nested MODIFIED excludes the untouched sibling"
+    );
+    assert_eq!(profile.len(), 1);
+
+    // MODIFIED OLD: the old value of the changed leaf, same shape.
+    put_nested_item(
+        &db,
+        "Users",
+        "m2",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.sub = 'new' WHERE pk = 'm2' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    let profile = match items[0].get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        profile.get("sub"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+    assert_eq!(profile.len(), 1);
+}
+
+#[test]
+fn test_update_returning_modified_after_remove() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD: the removed attribute at its old value.
+    put_item_with_attrs(&db, "Users", "r1", &[("data", "old"), ("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE data WHERE pk = 'r1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("data"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+    assert_eq!(items[0].len(), 1);
+
+    // MODIFIED NEW: the removed attribute is gone, so the projection is empty ->
+    // a present but empty Items array, not a row holding an empty object.
+    put_item_with_attrs(&db, "Users", "r2", &[("data", "old"), ("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE data WHERE pk = 'r2' RETURNING MODIFIED NEW *",
+    );
+    let items = resp
+        .items
+        .expect("an empty MODIFIED projection still returns a present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED NEW after REMOVE returns Items: [] (no row)"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_on_newly_created_attribute() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD on an attribute that did not exist: empty projection -> Items: [].
+    put_item_with_attrs(&db, "Users", "e1", &[("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'e1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp
+        .items
+        .expect("an empty MODIFIED projection still returns a present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED OLD on a newly-created attribute returns Items: [] (no row)"
+    );
+
+    // MODIFIED NEW: the new value.
+    put_item_with_attrs(&db, "Users", "e2", &[("keep", "same")]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'e2' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("data"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+    assert_eq!(items[0].len(), 1);
+}
+
+#[test]
+fn test_update_returning_modified_merges_sibling_nested_paths() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_nested_item(
+        &db,
+        "Users",
+        "m3",
+        "profile",
+        &[("a", "oldA"), ("b", "oldB"), ("keep", "same")],
+    );
+
+    // Two sibling nested SETs must merge under the shared parent map, and the
+    // untouched sibling `keep` is excluded. This exercises the set_nested_value
+    // merge path that reconstructs the projection.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.a = 'x', profile.b = 'y' WHERE pk = 'm3' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    let profile = match items[0].get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(profile.get("a"), Some(&AttributeValue::S("x".to_string())));
+    assert_eq!(profile.get("b"), Some(&AttributeValue::S("y".to_string())));
+    assert!(
+        !profile.contains_key("keep"),
+        "untouched sibling excluded from MODIFIED"
+    );
+    assert_eq!(profile.len(), 2);
+}
+
+#[test]
+fn test_update_returning_modified_after_nested_remove() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD: the removed nested leaf at its old value, nested, no sibling.
+    put_nested_item(
+        &db,
+        "Users",
+        "n1",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE profile.sub WHERE pk = 'n1' RETURNING MODIFIED OLD *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    let profile = match items[0].get("profile") {
+        Some(AttributeValue::M(m)) => m,
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        profile.get("sub"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+    assert_eq!(profile.len(), 1);
+
+    // MODIFIED NEW: the removed leaf is gone, so the projection is empty -> [].
+    put_nested_item(
+        &db,
+        "Users",
+        "n2",
+        "profile",
+        &[("sub", "old"), ("sib", "keep")],
+    );
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE profile.sub WHERE pk = 'n2' RETURNING MODIFIED NEW *",
+    );
+    let items = resp
+        .items
+        .expect("an empty MODIFIED projection still returns a present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED NEW after a nested REMOVE returns Items: [] (no row)"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_deep_nested_path() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Seed profile = { inner: { leaf: 'old', sib: 'keep' } } (three levels).
+    let mut inner = HashMap::new();
+    inner.insert("leaf".to_string(), AttributeValue::S("old".to_string()));
+    inner.insert("sib".to_string(), AttributeValue::S("keep".to_string()));
+    let mut profile = HashMap::new();
+    profile.insert("inner".to_string(), AttributeValue::M(inner));
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("d1".to_string()));
+    item.insert("profile".to_string(), AttributeValue::M(profile));
+    db.put_item(PutItemRequest {
+        table_name: "Users".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // A three-level SET projects only the changed leaf, nested all the way down.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.inner.leaf = 'new' WHERE pk = 'd1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    let inner = match items[0].get("profile") {
+        Some(AttributeValue::M(p)) => match p.get("inner") {
+            Some(AttributeValue::M(i)) => i,
+            other => panic!("expected inner map, got {other:?}"),
+        },
+        other => panic!("expected profile map, got {other:?}"),
+    };
+    assert_eq!(
+        inner.get("leaf"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+    assert!(
+        !inner.contains_key("sib"),
+        "deep MODIFIED excludes the untouched sibling"
+    );
+    assert_eq!(inner.len(), 1);
+}
+
+// -----------------------------------------------------------------------
+// RETURNING inside BatchExecuteStatement (honoured) and ExecuteTransaction
+// (rejected), per the real-AWS ground truth.
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_batch_delete_returning_all_old_surfaces_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "b1", "Batch");
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING ALL OLD *".to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+
+    assert_eq!(resp.responses.len(), 1);
+    assert!(resp.responses[0].error.is_none());
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("BatchExecuteStatement honours RETURNING on the member statement");
+    assert_eq!(item.get("pk"), Some(&AttributeValue::S("b1".to_string())));
+    assert_eq!(
+        item.get("name"),
+        Some(&AttributeValue::S("Batch".to_string()))
+    );
+
+    // The item is gone.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'b1'");
+    assert!(sel.items.unwrap().is_empty());
+}
+
+#[test]
+fn test_batch_update_returning_surfaces_projection() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "b1", &[("data", "old")]);
+
+    // ALL NEW: the full new item, key included.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1' RETURNING ALL NEW *"
+                    .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("batch honours an UPDATE member's RETURNING");
+    assert_eq!(item.get("pk"), Some(&AttributeValue::S("b1".to_string())));
+    assert_eq!(
+        item.get("data"),
+        Some(&AttributeValue::S("new".to_string()))
+    );
+
+    // MODIFIED NEW: only the changed attribute, no key.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement:
+                    "UPDATE \"Users\" SET data = 'newer' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                        .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("batch honours an UPDATE member's RETURNING");
+    assert_eq!(
+        item.get("data"),
+        Some(&AttributeValue::S("newer".to_string()))
+    );
+    assert!(item.get("pk").is_none(), "MODIFIED excludes the key");
+    assert_eq!(item.len(), 1);
+}
+
+#[test]
+fn test_batch_update_empty_modified_omits_item() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "b1", &[("data", "old")]);
+
+    // An empty MODIFIED projection inside a batch drops the singular Item field
+    // entirely (the batch analogue of ExecuteStatement's Items: []), matching AWS.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "UPDATE \"Users\" REMOVE data WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                    .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    assert_eq!(resp.responses.len(), 1);
+    assert!(resp.responses[0].error.is_none());
+    assert!(
+        resp.responses[0].item.is_none(),
+        "an empty MODIFIED projection omits Item in a batch response"
+    );
+}
+
+#[test]
+fn test_batch_invalid_delete_returning_variant_is_a_per_statement_error() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "b1", "Batch");
+
+    // The batch call itself succeeds; the invalid variant surfaces as a
+    // per-statement error, not a thrown exception.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING MODIFIED OLD *"
+                    .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    assert_eq!(resp.responses.len(), 1);
+    assert!(resp.responses[0].item.is_none());
+    let err = resp.responses[0]
+        .error
+        .as_ref()
+        .expect("an invalid variant surfaces a per-statement error");
+    assert_eq!(err.code, "ValidationError");
+    assert_eq!(
+        err.message,
+        "Invalid returning clause: RETURNING MODIFIED OLD *. Only RETURNING ALL OLD * is allowed in DELETE statements."
+    );
+
+    // The rejected statement must not have deleted the item.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'b1'");
+    assert_eq!(sel.items.unwrap().len(), 1);
+}
+
+#[test]
+fn test_transaction_delete_returning_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "t1", "Trans");
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "DELETE FROM \"Users\" WHERE pk = 't1' RETURNING ALL OLD *".to_string(),
+                parameters: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Validation failed in TransactStatements[0]: RETURNING clause is not supported in ExecuteTransaction."
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // The write must not have applied.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 't1'");
+    assert_eq!(sel.items.unwrap().len(), 1);
+}
+
+#[test]
+fn test_transaction_update_returning_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "t1", &[("data", "old")]);
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 't1' RETURNING ALL NEW *"
+                    .to_string(),
+                parameters: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Validation failed in TransactStatements[0]: RETURNING clause is not supported in ExecuteTransaction."
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // The write must not have applied; data stays 'old'.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 't1'");
+    assert_eq!(
+        sel.items.unwrap()[0].get("data"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+}
+
+#[test]
+fn test_transaction_returning_reports_offending_index_and_rolls_back() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "keep-a", "A");
+    put_test_item(&db, "Users", "keep-b", "B");
+
+    // The RETURNING clause is on the second member (index 1); the whole
+    // transaction is rejected before any write, so neither delete applies.
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![
+                ParameterizedStatement {
+                    statement: "DELETE FROM \"Users\" WHERE pk = 'keep-a'".to_string(),
+                    parameters: None,
+                },
+                ParameterizedStatement {
+                    statement: "DELETE FROM \"Users\" WHERE pk = 'keep-b' RETURNING ALL OLD *"
+                        .to_string(),
+                    parameters: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Validation failed in TransactStatements[1]: RETURNING clause is not supported in ExecuteTransaction."
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // Neither item was deleted.
+    assert_eq!(
+        exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'keep-a'")
+            .items
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'keep-b'")
+            .items
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // -----------------------------------------------------------------------

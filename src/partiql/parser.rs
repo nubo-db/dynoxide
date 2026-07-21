@@ -10,6 +10,12 @@ use crate::types::AttributeValue;
 use std::collections::HashMap;
 
 /// A parsed PartiQL statement.
+///
+/// The `Update` and `Delete` variants are `#[non_exhaustive]`: they carry a
+/// growing set of clauses (a `RETURNING` variant was added in 0.12.0), so
+/// downstream code must match them with `..` and cannot build them by struct
+/// literal. This keeps later clause additions non-breaking, matching the
+/// precedent set by `DynoxideError`.
 #[derive(Debug, Clone)]
 pub enum Statement {
     Select {
@@ -22,16 +28,53 @@ pub enum Statement {
         item: HashMap<String, PartiqlValue>,
         if_not_exists: bool,
     },
+    #[non_exhaustive]
     Update {
         table_name: String,
         set_clauses: Vec<SetClause>,
         remove_paths: Vec<String>,
         where_clause: Option<WhereClause>,
+        /// The `RETURNING` variant when the statement ends with a `RETURNING`
+        /// clause. All four variants are valid on `UPDATE`. `None` when absent.
+        returning: Option<ReturningVariant>,
     },
+    #[non_exhaustive]
     Delete {
         table_name: String,
         where_clause: Option<WhereClause>,
+        /// The `RETURNING` variant when the statement ends with a `RETURNING`
+        /// clause. DynamoDB allows only `ALL OLD *` on `DELETE`; the executor
+        /// rejects the other variants. `None` when there is no clause.
+        returning: Option<ReturningVariant>,
     },
+}
+
+/// A PartiQL `RETURNING` clause variant: the cross product of `ALL`/`MODIFIED`
+/// and `OLD`/`NEW`, as in `RETURNING MODIFIED NEW *`.
+///
+/// All four are valid on `UPDATE`; only `AllOld` is valid on `DELETE` (the
+/// executor rejects the others). The parser recognises any well-formed variant
+/// and defers semantic validity to the executor, so the rejection can carry
+/// DynamoDB's exact `ValidationException` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturningVariant {
+    AllOld,
+    ModifiedOld,
+    AllNew,
+    ModifiedNew,
+}
+
+impl ReturningVariant {
+    /// The clause keywords as they appear after `RETURNING` (e.g. `ALL OLD`),
+    /// used to reconstruct DynamoDB's error message for a rejected variant.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            ReturningVariant::AllOld => "ALL OLD",
+            ReturningVariant::ModifiedOld => "MODIFIED OLD",
+            ReturningVariant::AllNew => "ALL NEW",
+            ReturningVariant::ModifiedNew => "MODIFIED NEW",
+        }
+    }
 }
 
 /// Extract the table name from a parsed statement.
@@ -41,6 +84,15 @@ pub fn table_name(stmt: &Statement) -> Option<&str> {
         | Statement::Insert { table_name, .. }
         | Statement::Update { table_name, .. }
         | Statement::Delete { table_name, .. } => Some(table_name),
+    }
+}
+
+/// The `RETURNING` variant a statement carries, if any. Only `UPDATE` and
+/// `DELETE` can carry one; every other statement returns `None`.
+pub fn returning_variant(stmt: &Statement) -> Option<ReturningVariant> {
+    match stmt {
+        Statement::Update { returning, .. } | Statement::Delete { returning, .. } => *returning,
+        _ => None,
     }
 }
 
@@ -313,12 +365,14 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
     }
 
     let where_clause = parse_optional_where(t)?;
+    let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Update {
         table_name,
         set_clauses,
         remove_paths,
         where_clause,
+        returning,
     })
 }
 
@@ -385,11 +439,58 @@ fn parse_delete(t: &mut Tokenizer) -> Result<Statement, String> {
     expect_keyword(t, "FROM")?;
     let table_name = parse_table_name(t)?;
     let where_clause = parse_optional_where(t)?;
+    let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Delete {
         table_name,
         where_clause,
+        returning,
     })
+}
+
+/// Parse an optional trailing `RETURNING <ALL|MODIFIED> <OLD|NEW> *` clause.
+///
+/// Recognises any of the four well-formed variants and returns it; a malformed
+/// clause (missing `*`, unknown keywords, trailing tokens) is a syntax error.
+/// Which variants a given command actually permits is enforced by the executor,
+/// so it can surface DynamoDB's exact validation message.
+fn parse_optional_returning(t: &mut Tokenizer) -> Result<Option<ReturningVariant>, String> {
+    match t.peek_token()? {
+        Some(ref s) if s.eq_ignore_ascii_case("RETURNING") => {
+            t.next_token()?; // consume RETURNING
+            let first = t
+                .next_token()?
+                .ok_or("Expected returning variant after RETURNING")?;
+            let second = t
+                .next_token()?
+                .ok_or("Expected returning variant after RETURNING")?;
+            let star = t.next_token()?.ok_or("Expected '*' in RETURNING clause")?;
+            if star != "*" || t.peek_token()?.is_some() {
+                return Err(
+                    "Malformed RETURNING clause; expected RETURNING <ALL|MODIFIED> <OLD|NEW> *"
+                        .to_string(),
+                );
+            }
+            let variant = match (
+                first.to_ascii_uppercase().as_str(),
+                second.to_ascii_uppercase().as_str(),
+            ) {
+                ("ALL", "OLD") => ReturningVariant::AllOld,
+                ("MODIFIED", "OLD") => ReturningVariant::ModifiedOld,
+                ("ALL", "NEW") => ReturningVariant::AllNew,
+                ("MODIFIED", "NEW") => ReturningVariant::ModifiedNew,
+                _ => {
+                    return Err(format!(
+                        "Unsupported RETURNING clause: RETURNING {} {} *",
+                        first.to_ascii_uppercase(),
+                        second.to_ascii_uppercase()
+                    ));
+                }
+            };
+            Ok(Some(variant))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn parse_table_name(t: &mut Tokenizer) -> Result<String, String> {
@@ -1361,11 +1462,110 @@ mod tests {
             Statement::Delete {
                 table_name,
                 where_clause,
+                returning,
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
+                assert!(returning.is_none());
             }
             _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_all_old() {
+        let stmt = parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD *").unwrap();
+        match stmt {
+            Statement::Delete {
+                table_name,
+                where_clause,
+                returning,
+            } => {
+                assert_eq!(table_name, "T");
+                assert!(where_clause.is_some());
+                assert_eq!(returning, Some(ReturningVariant::AllOld));
+            }
+            _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_is_case_insensitive() {
+        let stmt = parse("DELETE FROM \"T\" WHERE pk = 'k1' returning all old *").unwrap();
+        match stmt {
+            Statement::Delete { returning, .. } => {
+                assert_eq!(returning, Some(ReturningVariant::AllOld))
+            }
+            _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_recognises_all_variants() {
+        // All four well-formed variants parse; DynamoDB's semantic rule (only
+        // ALL OLD is valid on DELETE) is enforced by the executor so the
+        // rejection can carry the exact validation message.
+        let cases = [
+            ("RETURNING ALL OLD *", ReturningVariant::AllOld),
+            ("RETURNING MODIFIED OLD *", ReturningVariant::ModifiedOld),
+            ("RETURNING ALL NEW *", ReturningVariant::AllNew),
+            ("RETURNING MODIFIED NEW *", ReturningVariant::ModifiedNew),
+        ];
+        for (clause, expected) in cases {
+            let stmt = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {clause}")).unwrap();
+            match stmt {
+                Statement::Delete { returning, .. } => {
+                    assert_eq!(returning, Some(expected), "clause {clause}")
+                }
+                _ => panic!("Expected DELETE for {clause}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_update_returning_recognises_all_variants() {
+        let cases = [
+            ("RETURNING ALL OLD *", ReturningVariant::AllOld),
+            ("RETURNING MODIFIED OLD *", ReturningVariant::ModifiedOld),
+            ("RETURNING ALL NEW *", ReturningVariant::AllNew),
+            ("RETURNING MODIFIED NEW *", ReturningVariant::ModifiedNew),
+        ];
+        for (clause, expected) in cases {
+            let stmt = parse(&format!(
+                "UPDATE \"T\" SET data = 'x' WHERE pk = 'k1' {clause}"
+            ))
+            .unwrap();
+            match stmt {
+                Statement::Update { returning, .. } => {
+                    assert_eq!(returning, Some(expected), "clause {clause}")
+                }
+                _ => panic!("Expected UPDATE for {clause}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning_rejects_incomplete_clause() {
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD").is_err());
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING").is_err());
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 'k1' RETURNING ALL OLD attr").is_err());
+    }
+
+    #[test]
+    fn test_parse_returning_rejects_invalid_keyword_pairs() {
+        // Well-formed shape (two keywords + star) but not one of the four valid
+        // ALL/MODIFIED x OLD/NEW pairs -> the catch-all rejection.
+        for clause in [
+            "RETURNING OLD ALL *",
+            "RETURNING NEW MODIFIED *",
+            "RETURNING ALL ALL *",
+            "RETURNING FOO BAR *",
+        ] {
+            let err = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {clause}")).unwrap_err();
+            assert!(
+                err.contains("Unsupported RETURNING clause"),
+                "clause {clause} gave unexpected error: {err}"
+            );
         }
     }
 

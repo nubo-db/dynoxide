@@ -73,7 +73,9 @@ pub async fn execute<S: StorageBackend>(
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
                 match partiql::executor::execute(storage, &stmt, params, None).await {
                     Ok(Some(items)) => {
-                        // For SELECT, return first item (batch returns single item per statement)
+                        // A SELECT yields its row here; a DELETE/UPDATE carrying a
+                        // RETURNING clause yields the returned item. Batch surfaces
+                        // a single item per statement, so take the first.
                         BatchStatementResponse {
                             error: None,
                             item: items.into_iter().next(),

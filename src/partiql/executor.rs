@@ -4,7 +4,7 @@
 
 use crate::errors::{DynoxideError, Result};
 use crate::partiql::parser::{
-    CompOp, PartiqlValue, SetValue, Statement, WhereClause, WhereCondition,
+    CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
 };
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
@@ -12,8 +12,10 @@ use std::collections::HashMap;
 
 /// Execute a parsed PartiQL statement.
 ///
-/// Returns `Some(items)` for SELECT (may be empty), `None` for write operations.
-/// An optional `limit` restricts how many items a SELECT returns.
+/// Returns `Some(items)` for SELECT (may be empty) and for a DELETE or UPDATE
+/// carrying a `RETURNING` clause (the deleted item or the requested projection);
+/// `None` for a write with no `RETURNING` clause. An optional `limit` restricts
+/// how many items a SELECT returns.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     stmt: &Statement,
@@ -68,25 +70,59 @@ pub async fn execute_measured<S: StorageBackend>(
             set_clauses,
             remove_paths,
             where_clause,
+            returning,
         } => {
-            let size = execute_update(
+            let (projection, size) = execute_update(
                 storage,
                 table_name,
                 set_clauses,
                 remove_paths,
                 where_clause.as_ref(),
                 parameters,
+                *returning,
             )
             .await?;
-            Ok((None, size))
+            // RETURNING surfaces the requested projection of the updated item;
+            // without a clause an UPDATE returns no items. An empty MODIFIED
+            // projection surfaces as a present but empty Items array (no row),
+            // matching DynamoDB, rather than a row holding an empty object.
+            let items = projection.map(|item| {
+                if item.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![item]
+                }
+            });
+            Ok((items, size))
         }
         Statement::Delete {
             table_name,
             where_clause,
+            returning,
         } => {
-            let size =
+            // DynamoDB permits only RETURNING ALL OLD * on DELETE; the other
+            // well-formed variants are rejected with a ValidationException whose
+            // message echoes the offending variant.
+            if let Some(variant) = returning {
+                if *variant != ReturningVariant::AllOld {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "Invalid returning clause: RETURNING {} *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+                        variant.as_sql()
+                    )));
+                }
+            }
+            let (old_item, size) =
                 execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
-            Ok((None, size))
+            // RETURNING ALL OLD * always surfaces an Items array: the deleted
+            // item on a hit, an empty array on a miss (a no-op success). This
+            // differs from the classic DeleteItem ReturnValues path, which omits
+            // Attributes on a miss.
+            let items = if returning.is_some() {
+                Some(old_item.map(|item| vec![item]).unwrap_or_default())
+            } else {
+                None
+            };
+            Ok((items, size))
         }
     }
 }
@@ -326,8 +362,10 @@ async fn execute_insert<S: StorageBackend>(
     Ok(item_size)
 }
 
-/// Returns the updated item's new size in bytes (0 when the update resolves to
-/// an empty item and is skipped), for `ConsumedCapacity` accounting.
+/// Applies an UPDATE and returns the `RETURNING` projection (or `None` when the
+/// statement carried no `RETURNING` clause) and the updated item's new size in
+/// bytes (0 when the update resolves to an empty item and is skipped), for
+/// `ConsumedCapacity` accounting.
 async fn execute_update<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -335,7 +373,8 @@ async fn execute_update<S: StorageBackend>(
     remove_paths: &[String],
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<usize> {
+    returning: Option<ReturningVariant>,
+) -> Result<(Option<Item>, usize)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -417,7 +456,7 @@ async fn execute_update<S: StorageBackend>(
 
     // Ensure keys are present
     if item.is_empty() {
-        return Ok(0);
+        return Ok((None, 0));
     }
 
     // Validate attribute values after SET clauses applied
@@ -481,17 +520,88 @@ async fn execute_update<S: StorageBackend>(
     };
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
-    Ok(item_size)
+    // Build the RETURNING projection from the item's before/after states. The
+    // "modified" paths are the full document paths the SET/REMOVE clauses
+    // touched; the MODIFIED variants project only those (a nested `a.b` yields
+    // just the changed leaf, never the whole `a` attribute and never the key).
+    let projection = returning.map(|variant| {
+        let modified: std::collections::BTreeSet<String> = set_clauses
+            .iter()
+            .map(|c| c.path.clone())
+            .chain(remove_paths.iter().cloned())
+            .collect();
+        project_returning(variant, &old_item, &item, &modified)
+    });
+
+    Ok((projection, item_size))
 }
 
-/// Returns the deleted item's size in bytes (0 when the target was missing and
-/// the delete was a no-op), for `ConsumedCapacity` accounting.
+/// Build the `RETURNING` projection for an UPDATE from the item's before/after
+/// states. `ALL` variants return the whole item (key included); `MODIFIED`
+/// variants return only the paths the statement touched, at their old or new
+/// values, which never includes the key. A `MODIFIED` projection can be empty
+/// (e.g. a REMOVE under `MODIFIED NEW`, or a newly-created attribute under
+/// `MODIFIED OLD`), which the caller surfaces as an empty `Items` array.
+fn project_returning(
+    variant: ReturningVariant,
+    old_item: &Item,
+    new_item: &Item,
+    modified: &std::collections::BTreeSet<String>,
+) -> Item {
+    match variant {
+        ReturningVariant::AllOld => old_item.clone(),
+        ReturningVariant::AllNew => new_item.clone(),
+        ReturningVariant::ModifiedOld => project_modified(modified, old_item),
+        ReturningVariant::ModifiedNew => project_modified(modified, new_item),
+    }
+}
+
+/// Project only the modified paths from `source`, rebuilding nested map
+/// structure so a nested `SET a.b` yields `{a: {b: ...}}` (just the changed
+/// leaf, matching DynamoDB) rather than the whole `a` attribute. A path absent
+/// from `source` contributes nothing, so the projection may be empty.
+fn project_modified(paths: &std::collections::BTreeSet<String>, source: &Item) -> Item {
+    let mut projection = Item::new();
+    for path in paths {
+        if let Some(val) = get_nested_value(source, path) {
+            // set_nested_value only errors on a non-map intermediate, which
+            // cannot arise when the value was just read from `source` along the
+            // same path.
+            let _ = set_nested_value(&mut projection, path, val.clone());
+        }
+    }
+    projection
+}
+
+/// Read the value at a dotted document path, mirroring `set_nested_value`'s
+/// navigation: dots descend into maps, and a segment is matched as a whole key
+/// (so a bracket-index path like `a[0]` is treated as the single key `a[0]`,
+/// consistent with how SET stored it).
+///
+/// This deliberately mirrors `set_nested_value`, not `resolve_nested_path`
+/// (which navigates real list indices). The projection must read a path exactly
+/// as SET wrote it, so swapping in `resolve_nested_path` would silently
+/// mishandle a bracket-index `SET`/`REMOVE` under a `MODIFIED` projection.
+fn get_nested_value<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeValue> {
+    let mut parts = path.split('.');
+    let mut current = item.get(parts.next()?)?;
+    for part in parts {
+        match current {
+            AttributeValue::M(map) => current = map.get(part)?,
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// Returns the deleted item (None when the target was missing and the delete
+/// was a no-op) and its size in bytes for `ConsumedCapacity` accounting.
 async fn execute_delete<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<usize> {
+) -> Result<(Option<Item>, usize)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -583,7 +693,7 @@ async fn execute_delete<S: StorageBackend>(
     // A delete is charged for the size of the item it removed; a no-op delete
     // (missing target) reports 0.
     let deleted_size = old_item.as_ref().map(crate::types::item_size).unwrap_or(0);
-    Ok(deleted_size)
+    Ok((old_item, deleted_size))
 }
 
 // ---------------------------------------------------------------------------

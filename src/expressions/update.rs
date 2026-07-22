@@ -67,6 +67,10 @@ pub struct DeleteAction {
 
 /// Parse an UpdateExpression string.
 pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
+    // Prefix the size error like every other UpdateExpression error; real
+    // DynamoDB returns "Invalid UpdateExpression: Expression size has exceeded
+    // the maximum allowed size". Confirmed against real DynamoDB (eu-west-2).
+    super::check_expression_size(expr).map_err(|e| format!("Invalid UpdateExpression: {e}"))?;
     let tokens = match tokenize(expr) {
         Ok(t) => t,
         Err(err) => {

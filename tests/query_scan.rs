@@ -1045,3 +1045,89 @@ fn query_rejects_overlapping_projection_paths_on_zero_match() {
         "overlapping projection paths must reject, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Expression size limit (4096 bytes) - FilterExpression on Query and Scan.
+// Confirmed against real DynamoDB (eu-west-2).
+// ---------------------------------------------------------------------------
+
+// Filter and key-condition surfaces prefix the size error with
+// `Invalid <Type>Expression:`, matching real DynamoDB (eu-west-2).
+const FILTER_OVERSIZE_MSG: &str =
+    "Invalid FilterExpression: Expression size has exceeded the maximum allowed size";
+const KEY_CONDITION_OVERSIZE_MSG: &str =
+    "Invalid KeyConditionExpression: Expression size has exceeded the maximum allowed size";
+
+#[test]
+fn test_query_filter_expression_over_size_limit_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    // 4097-byte FilterExpression: one byte past the 4096 limit.
+    let filter = format!("{} = :v", "a".repeat(4092));
+    assert_eq!(filter.len(), 4097);
+
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl",
+        "KeyConditionExpression": "pk = :pk",
+        "FilterExpression": filter,
+        "ExpressionAttributeValues": {":pk": {"S": "a"}, ":v": {"S": "x"}}
+    }))
+    .unwrap();
+
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string().contains(FILTER_OVERSIZE_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_scan_filter_expression_over_size_limit_rejected() {
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    // 4097-byte FilterExpression.
+    let filter = format!("{} = :v", "a".repeat(4092));
+    assert_eq!(filter.len(), 4097);
+
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl",
+        "FilterExpression": filter,
+        "ExpressionAttributeValues": {":v": {"S": "x"}}
+    }))
+    .unwrap();
+
+    let err = db.scan(req).unwrap_err();
+    assert!(
+        err.to_string().contains(FILTER_OVERSIZE_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_query_key_condition_expression_over_size_limit_rejected() {
+    // KeyConditionExpression is subject to the same 4096-byte limit, and the
+    // size check wins over syntax: real DynamoDB returns the size error even
+    // when the key condition is otherwise malformed (here, `pk = :pk AND aaa…`
+    // is invalid past the AND). Confirmed against real DynamoDB (eu-west-2).
+    let db = setup_db();
+    create_test_table(&db, "Tbl");
+
+    // Over the 4096-byte limit; the size guard runs before parsing.
+    let kce = format!("pk = :pk AND {}", "a".repeat(4090));
+    assert!(kce.len() > 4096);
+
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Tbl",
+        "KeyConditionExpression": kce,
+        "ExpressionAttributeValues": {":pk": {"S": "a"}}
+    }))
+    .unwrap();
+
+    let err = db.query(req).unwrap_err();
+    assert!(
+        err.to_string().contains(KEY_CONDITION_OVERSIZE_MSG),
+        "unexpected error: {err}"
+    );
+}

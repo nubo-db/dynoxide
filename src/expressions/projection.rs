@@ -19,6 +19,11 @@ pub struct ProjectionExpr {
 
 /// Parse a ProjectionExpression string.
 pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
+    // Prefix the size error like every other ProjectionExpression error; real
+    // DynamoDB returns "Invalid ProjectionExpression: Expression size has
+    // exceeded the maximum allowed size". Confirmed against real DynamoDB
+    // (eu-west-2).
+    super::check_expression_size(expr).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
     let tokens = match tokenize(expr) {
         Ok(t) => t,
         Err(err) => {

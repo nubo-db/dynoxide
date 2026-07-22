@@ -215,9 +215,13 @@ pub fn validate_key_attributes_in_definitions(
 }
 
 /// Validate a Global Secondary Index definition.
+///
+/// `request_definitions` must be the AttributeDefinitions declared in the
+/// current request, not the table's merged stored set: DynamoDB requires a new
+/// index's key attributes to be (re)declared in the request itself.
 pub fn validate_gsi(
     gsi: &GlobalSecondaryIndex,
-    all_definitions: &[AttributeDefinition],
+    request_definitions: &[AttributeDefinition],
 ) -> Result<()> {
     // Validate index name length
     if gsi.index_name.len() < 3 || gsi.index_name.len() > 255 {
@@ -248,7 +252,7 @@ pub fn validate_gsi(
     validate_projection(&gsi.projection, &gsi.index_name)?;
 
     // Validate GSI key attributes exist in definitions
-    validate_key_attributes_in_definitions(&gsi.key_schema, all_definitions)?;
+    validate_key_attributes_in_definitions(&gsi.key_schema, request_definitions)?;
 
     Ok(())
 }

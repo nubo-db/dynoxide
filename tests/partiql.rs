@@ -281,6 +281,39 @@ fn test_update_adds_new_attribute() {
     );
 }
 
+#[test]
+fn test_update_on_missing_key_is_not_an_upsert() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    // The key is deliberately not seeded.
+
+    // PartiQL UPDATE requires the item to exist: a missing key fails
+    // ConditionalCheckFailedException rather than creating the item. This holds
+    // with or without a RETURNING clause.
+    for statement in [
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'ghost'",
+        "UPDATE \"Users\" SET data = 'new' WHERE pk = 'ghost' RETURNING ALL OLD *",
+    ] {
+        let err = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: statement.to_string(),
+                parameters: None,
+                ..Default::default()
+            })
+            .unwrap_err();
+        match err {
+            DynoxideError::ConditionalCheckFailedException(msg, _) => {
+                assert_eq!(msg, "The conditional request failed", "for `{statement}`")
+            }
+            other => panic!("expected ConditionalCheckFailedException, got {other:?}"),
+        }
+    }
+
+    // The rejected updates did not create the item.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'ghost'");
+    assert!(sel.items.unwrap().is_empty());
+}
+
 // -----------------------------------------------------------------------
 // DELETE
 // -----------------------------------------------------------------------

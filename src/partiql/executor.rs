@@ -430,11 +430,11 @@ async fn execute_update<S: StorageBackend>(
 
     let old_item = item.clone();
 
-    // Non-key WHERE predicates act as a condition on the existing item, like a
-    // conditional write. When the item exists but the condition is false, AWS
-    // raises ConditionalCheckFailedException; a missing item is not a condition
-    // failure and falls through to the existing create/no-op behaviour below.
-    if existing_json.is_some() && !matches_where(&old_item, where_clause, parameters) {
+    // PartiQL UPDATE is not an upsert: the target item must already exist, so a
+    // missing item fails ConditionalCheckFailedException and creates nothing.
+    // Non-key WHERE predicates act as a further condition on the existing item;
+    // if that predicate is false the update fails the same way. Neither writes.
+    if existing_json.is_none() || !matches_where(&old_item, where_clause, parameters) {
         return Err(DynoxideError::ConditionalCheckFailedException(
             "The conditional request failed".to_string(),
             None,

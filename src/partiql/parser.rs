@@ -195,7 +195,9 @@ pub fn parse(input: &str) -> Result<Statement, String> {
         "INSERT" => parse_insert(&mut tokenizer),
         "UPDATE" => parse_update(&mut tokenizer),
         "DELETE" => parse_delete(&mut tokenizer),
-        other => Err(format!("Unsupported statement type: {other}")),
+        // A statement that does not begin with a DML keyword is not valid
+        // PartiQL; DynamoDB reports this as "Expected data manipulation".
+        _ => Err("Expected data manipulation".to_string()),
     }
 }
 

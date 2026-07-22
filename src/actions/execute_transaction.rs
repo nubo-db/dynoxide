@@ -65,7 +65,7 @@ pub async fn execute<S: StorageBackend>(
     for (index, stmt) in statements.iter().enumerate() {
         let ast = partiql::parser::parse(&stmt.statement).map_err(|e| {
             DynoxideError::ValidationException(format!(
-                "Statement wasn't well formed, got error: {e}"
+                "Statement wasn't well formed, can't be processed: {e}"
             ))
         })?;
         // DynamoDB rejects a RETURNING clause on any member of a transaction with

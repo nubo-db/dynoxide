@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PartiQL `UPDATE` now performs real list-index writes. `SET tags[0] = :v` updates the list element (appending when the index is at or beyond the end) and `REMOVE tags[0]` deletes it and shifts the rest, where dynoxide previously treated `tags[0]` as a literal map key so both the stored item and a `RETURNING MODIFIED` projection over it diverged from DynamoDB. A `RETURNING MODIFIED` projection over list-index paths now packs the changed elements into a dense list in ascending index order (`SET a[0], a[2]` yields `{a: [v0, v2]}`), matching DynamoDB.
 - `BatchExecuteStatement` now echoes `TableName` on each successful member response, and a member that fails to parse now carries the short-form `ValidationError` code (matching a per-statement execution error) instead of the long-form `ValidationException`. Both match DynamoDB.
+- PartiQL parse errors now use DynamoDB's message wording: `Statement wasn't well formed, can't be processed: <detail>` (previously `... got error: ...`), and a statement that does not begin with a DML keyword reports `Expected data manipulation`. Applies to `ExecuteStatement`, `BatchExecuteStatement`, and `ExecuteTransaction`.
 
 ## [0.11.4] - 2026-07-17
 

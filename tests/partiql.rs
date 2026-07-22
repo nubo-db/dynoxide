@@ -995,8 +995,10 @@ fn test_update_returning_modified_append_is_empty() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
-    // The write appends (stored ['a','b','c']), but tags[5] does not resolve on
-    // the new 3-element list, so MODIFIED NEW projects nothing.
+    // The write appends (stored ['a','b','c']), but a far-out-of-range index
+    // (tags[5]) does not resolve on the new 3-element list, so MODIFIED NEW
+    // projects nothing. This is specific to a far index, not appends in general
+    // (see the at-length case below, where the index resolves).
     put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
     let resp = exec(
         &db,
@@ -1005,7 +1007,7 @@ fn test_update_returning_modified_append_is_empty() {
     let items = resp.items.expect("present Items array");
     assert!(
         items.is_empty(),
-        "MODIFIED NEW over an out-of-range append returns Items: []"
+        "MODIFIED NEW over a far-out-of-range append returns Items: []"
     );
     assert_string_list(&db, "l1", "tags", &["a", "b", "c"]);
 
@@ -1017,8 +1019,71 @@ fn test_update_returning_modified_append_is_empty() {
     );
     assert!(
         resp.items.expect("present Items array").is_empty(),
-        "MODIFIED OLD over an out-of-range append returns Items: []"
+        "MODIFIED OLD over a far-out-of-range append returns Items: []"
     );
+}
+
+#[test]
+fn test_update_returning_modified_append_at_length() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Appending at exactly the old length: the index resolves on the new list
+    // under NEW (so the element is projected) but is out of range on the old
+    // list under OLD (so nothing is projected).
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'c' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("c".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'c' WHERE pk = 'l2' RETURNING MODIFIED OLD *",
+    );
+    assert!(
+        resp.items.expect("present Items array").is_empty(),
+        "the appended index is out of range on the old list"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_remove_last_index() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Removing the last index: nothing shifts into it, so under NEW the index no
+    // longer resolves and the projection is empty; under OLD it still resolves
+    // on the pre-remove list.
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE tags[2] WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    assert!(
+        resp.items.expect("present Items array").is_empty(),
+        "removing the last index leaves nothing to project under MODIFIED NEW"
+    );
+    assert_string_list(&db, "l1", "tags", &["a", "b"]);
+
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE tags[2] WHERE pk = 'l2' RETURNING MODIFIED OLD *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("c".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
 }
 
 #[test]

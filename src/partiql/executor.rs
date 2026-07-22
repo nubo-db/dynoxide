@@ -521,9 +521,9 @@ async fn execute_update<S: StorageBackend>(
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
     // Build the RETURNING projection from the item's before/after states. The
-    // "modified" paths are the full document paths the SET/REMOVE clauses
-    // touched; the MODIFIED variants project only those (a nested `a.b` yields
-    // just the changed leaf, never the whole `a` attribute and never the key).
+    // MODIFIED variants project each touched path (a nested `a.b` yields just
+    // the changed leaf, never the whole `a` attribute and never the key),
+    // resolved against the relevant item.
     let projection = returning.map(|variant| {
         let modified: std::collections::BTreeSet<String> = set_clauses
             .iter()
@@ -538,10 +538,11 @@ async fn execute_update<S: StorageBackend>(
 
 /// Build the `RETURNING` projection for an UPDATE from the item's before/after
 /// states. `ALL` variants return the whole item (key included); `MODIFIED`
-/// variants return only the paths the statement touched, at their old or new
-/// values, which never includes the key. A `MODIFIED` projection can be empty
-/// (e.g. a REMOVE under `MODIFIED NEW`, or a newly-created attribute under
-/// `MODIFIED OLD`), which the caller surfaces as an empty `Items` array.
+/// variants project only the touched paths, resolved against the old item
+/// (`MODIFIED OLD *`) or the new item (`MODIFIED NEW *`), which never includes
+/// the key. A `MODIFIED` projection can be empty (a path that no longer
+/// resolves contributes nothing), which the caller surfaces as an empty `Items`
+/// array.
 fn project_returning(
     variant: ReturningVariant,
     old_item: &Item,
@@ -556,42 +557,94 @@ fn project_returning(
     }
 }
 
-/// Project only the modified paths from `source`, rebuilding nested map
-/// structure so a nested `SET a.b` yields `{a: {b: ...}}` (just the changed
-/// leaf, matching DynamoDB) rather than the whole `a` attribute. A path absent
-/// from `source` contributes nothing, so the projection may be empty.
-fn project_modified(paths: &std::collections::BTreeSet<String>, source: &Item) -> Item {
-    let mut projection = Item::new();
-    for path in paths {
-        if let Some(val) = get_nested_value(source, path) {
-            // set_nested_value only errors on a non-map intermediate, which
-            // cannot arise when the value was just read from `source` along the
-            // same path.
-            let _ = set_nested_value(&mut projection, path, val.clone());
-        }
-    }
-    projection
+/// An intermediate `MODIFIED` projection node. List positions are collected by
+/// their real index in a `BTreeMap` so that, on conversion, the contributed
+/// elements emerge as a dense list in ascending index order: DynamoDB does not
+/// keep gaps, so `SET a[0], a[2]` projects `{a: [v0, v2]}`, not a sparse list.
+enum ProjNode {
+    Leaf(AttributeValue),
+    Map(HashMap<String, ProjNode>),
+    List(std::collections::BTreeMap<usize, ProjNode>),
 }
 
-/// Read the value at a dotted document path, mirroring `set_nested_value`'s
-/// navigation: dots descend into maps, and a segment is matched as a whole key
-/// (so a bracket-index path like `a[0]` is treated as the single key `a[0]`,
-/// consistent with how SET stored it).
-///
-/// This deliberately mirrors `set_nested_value`, not `resolve_nested_path`
-/// (which navigates real list indices). The projection must read a path exactly
-/// as SET wrote it, so swapping in `resolve_nested_path` would silently
-/// mishandle a bracket-index `SET`/`REMOVE` under a `MODIFIED` projection.
-fn get_nested_value<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeValue> {
-    let mut parts = path.split('.');
-    let mut current = item.get(parts.next()?)?;
-    for part in parts {
-        match current {
-            AttributeValue::M(map) => current = map.get(part)?,
-            _ => return None,
+/// Project the touched paths from `source` into a `MODIFIED` projection. Each
+/// path is resolved against `source` (navigating map keys and real list
+/// indices); a path that resolves contributes its value, one that does not
+/// contributes nothing. This is why a map REMOVE yields nothing under
+/// `MODIFIED NEW` (the key is gone) while a list REMOVE contributes the
+/// shifted-in element (`tags[1]` still resolves after `REMOVE tags[1]`).
+/// Contributed list elements pack densely in ascending index order. This is by
+/// index, not statement order: for `SET a[2]=.., a[0]=..` real DynamoDB returns
+/// `{a: [v0, v2]}`, which the `BTreeMap`-keyed pack matches.
+fn project_modified(paths: &std::collections::BTreeSet<String>, source: &Item) -> Item {
+    let mut root: HashMap<String, ProjNode> = HashMap::new();
+    for path in paths {
+        if let (Some(val), Some(segments)) =
+            (resolve_nested_path(source, path), split_path_segments(path))
+        {
+            // The top-level of an item is always addressed by a map key.
+            if let Some((PathSegment::Key(key), rest)) = segments.split_first() {
+                let node = root
+                    .entry((*key).to_string())
+                    .or_insert_with(|| fresh_proj_node(rest));
+                insert_proj_node(node, rest, val.clone());
+            }
         }
     }
-    Some(current)
+    root.into_iter()
+        .map(|(k, node)| (k, proj_node_to_value(node)))
+        .collect()
+}
+
+/// The container a projection node needs for its next segment: a list for an
+/// index, a map otherwise. An empty `segments` is a leaf position, overwritten
+/// immediately by the value, so the placeholder type there is immaterial.
+fn fresh_proj_node(segments: &[PathSegment]) -> ProjNode {
+    match segments.first() {
+        Some(PathSegment::Index(_)) => ProjNode::List(std::collections::BTreeMap::new()),
+        _ => ProjNode::Map(HashMap::new()),
+    }
+}
+
+/// Insert `val` at `segments` within `node`, creating intermediate map/list
+/// nodes as needed.
+fn insert_proj_node(node: &mut ProjNode, segments: &[PathSegment], val: AttributeValue) {
+    let Some((seg, rest)) = segments.split_first() else {
+        *node = ProjNode::Leaf(val);
+        return;
+    };
+    match seg {
+        PathSegment::Key(k) => {
+            if let ProjNode::Map(map) = node {
+                let child = map
+                    .entry((*k).to_string())
+                    .or_insert_with(|| fresh_proj_node(rest));
+                insert_proj_node(child, rest, val);
+            }
+        }
+        PathSegment::Index(i) => {
+            if let ProjNode::List(list) = node {
+                let child = list.entry(*i).or_insert_with(|| fresh_proj_node(rest));
+                insert_proj_node(child, rest, val);
+            }
+        }
+    }
+}
+
+/// Convert a projection node into an `AttributeValue`. A `List` node's
+/// `BTreeMap` yields its elements in ascending index order, densely.
+fn proj_node_to_value(node: ProjNode) -> AttributeValue {
+    match node {
+        ProjNode::Leaf(v) => v,
+        ProjNode::Map(map) => AttributeValue::M(
+            map.into_iter()
+                .map(|(k, n)| (k, proj_node_to_value(n)))
+                .collect(),
+        ),
+        ProjNode::List(list) => {
+            AttributeValue::L(list.into_values().map(proj_node_to_value).collect())
+        }
+    }
 }
 
 /// Returns the deleted item (None when the target was missing and the delete
@@ -841,53 +894,146 @@ fn resolve_set_value(
     }
 }
 
-/// Set a value at a potentially nested path (e.g. `address.city`).
-fn set_nested_value(item: &mut Item, path: &str, val: AttributeValue) -> Result<()> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.len() == 1 {
-        item.insert(path.to_string(), val);
-        return Ok(());
-    }
-    // Navigate into nested maps, creating them if needed
-    let mut current = item;
-    for part in &parts[..parts.len() - 1] {
-        let entry = current
-            .entry(part.to_string())
-            .or_insert_with(|| AttributeValue::M(HashMap::new()));
-        match entry {
-            AttributeValue::M(map) => {
-                current = map;
-            }
-            _ => {
-                return Err(DynoxideError::ValidationException(
-                    "The document path provided in the update expression is invalid for update"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-    current.insert(parts.last().unwrap().to_string(), val);
-    Ok(())
+/// The `ValidationException` DynamoDB raises for a document path that cannot be
+/// applied by an update (e.g. indexing a scalar, or a missing intermediate).
+fn invalid_update_path() -> DynoxideError {
+    DynoxideError::ValidationException(
+        "The document path provided in the update expression is invalid for update".to_string(),
+    )
 }
 
-/// Remove a value at a potentially nested path (e.g. `address.city`).
+/// Set a value at a document path, navigating both map keys and list indices,
+/// so `SET tags[0] = :v` writes the real list element rather than a literal
+/// `tags[0]` key. A list index at or beyond the end appends, matching DynamoDB.
+/// Intermediate map keys are created if absent, preserving the prior behaviour
+/// for dotted map paths.
+fn set_nested_value(item: &mut Item, path: &str, val: AttributeValue) -> Result<()> {
+    let segments = split_path_segments(path).ok_or_else(invalid_update_path)?;
+    let (first, rest) = segments.split_first().ok_or_else(invalid_update_path)?;
+    let key = match first {
+        PathSegment::Key(k) => (*k).to_string(),
+        // The top-level item is a map; it cannot be indexed.
+        PathSegment::Index(_) => return Err(invalid_update_path()),
+    };
+    if rest.is_empty() {
+        item.insert(key, val);
+        return Ok(());
+    }
+    let entry = item
+        .entry(key)
+        .or_insert_with(|| AttributeValue::M(HashMap::new()));
+    set_into_value(entry, rest, val)
+}
+
+/// Recursive helper for [`set_nested_value`]: apply the remaining path segments
+/// to `current`.
+fn set_into_value(
+    current: &mut AttributeValue,
+    segments: &[PathSegment],
+    val: AttributeValue,
+) -> Result<()> {
+    let (seg, rest) = segments.split_first().expect("segments is non-empty");
+    if rest.is_empty() {
+        return match seg {
+            PathSegment::Key(k) => match current {
+                AttributeValue::M(map) => {
+                    map.insert((*k).to_string(), val);
+                    Ok(())
+                }
+                _ => Err(invalid_update_path()),
+            },
+            PathSegment::Index(i) => match current {
+                AttributeValue::L(list) => {
+                    if *i < list.len() {
+                        list[*i] = val;
+                    } else {
+                        list.push(val);
+                    }
+                    Ok(())
+                }
+                _ => Err(invalid_update_path()),
+            },
+        };
+    }
+    match seg {
+        PathSegment::Key(k) => match current {
+            AttributeValue::M(map) => {
+                let next = map
+                    .entry((*k).to_string())
+                    .or_insert_with(|| AttributeValue::M(HashMap::new()));
+                set_into_value(next, rest, val)
+            }
+            _ => Err(invalid_update_path()),
+        },
+        PathSegment::Index(i) => match current {
+            AttributeValue::L(list) => match list.get_mut(*i) {
+                Some(next) => set_into_value(next, rest, val),
+                None => Err(invalid_update_path()),
+            },
+            _ => Err(invalid_update_path()),
+        },
+    }
+}
+
+/// Remove the value at a document path, navigating both map keys and list
+/// indices, so `REMOVE tags[0]` deletes the list element (shifting the rest)
+/// rather than a literal `tags[0]` key.
 fn remove_nested_value(item: &mut Item, path: &str) {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.len() == 1 {
-        item.remove(path);
+    let Some(segments) = split_path_segments(path) else {
+        return;
+    };
+    let Some((first, rest)) = segments.split_first() else {
+        return;
+    };
+    let PathSegment::Key(key) = first else {
+        return; // the top-level item cannot be indexed
+    };
+    if rest.is_empty() {
+        item.remove(*key);
         return;
     }
-    // Navigate into nested maps
-    let mut current = item;
-    for part in &parts[..parts.len() - 1] {
-        match current.get_mut(*part) {
-            Some(AttributeValue::M(map)) => {
-                current = map;
+    if let Some(current) = item.get_mut(*key) {
+        remove_from_value(current, rest);
+    }
+}
+
+/// Recursive helper for [`remove_nested_value`]. A path that does not exist or
+/// whose type does not match is a no-op, mirroring DynamoDB's tolerant REMOVE.
+fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
+    let (seg, rest) = segments.split_first().expect("segments is non-empty");
+    if rest.is_empty() {
+        match seg {
+            PathSegment::Key(k) => {
+                if let AttributeValue::M(map) = current {
+                    map.remove(*k);
+                }
             }
-            _ => return, // Path doesn't exist or isn't a map — nothing to remove
+            PathSegment::Index(i) => {
+                if let AttributeValue::L(list) = current {
+                    if *i < list.len() {
+                        list.remove(*i);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    match seg {
+        PathSegment::Key(k) => {
+            if let AttributeValue::M(map) = current {
+                if let Some(next) = map.get_mut(*k) {
+                    remove_from_value(next, rest);
+                }
+            }
+        }
+        PathSegment::Index(i) => {
+            if let AttributeValue::L(list) = current {
+                if let Some(next) = list.get_mut(*i) {
+                    remove_from_value(next, rest);
+                }
+            }
         }
     }
-    current.remove(*parts.last().unwrap());
 }
 
 /// Check if an item matches a WHERE clause (with OR-group support).

@@ -25,11 +25,17 @@ pub struct BatchExecuteStatementResponse {
 }
 
 #[derive(Debug, Default, Serialize)]
+#[non_exhaustive]
 pub struct BatchStatementResponse {
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     pub error: Option<BatchStatementError>,
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
     pub item: Option<Item>,
+    /// The member statement's target table, echoed on a successful response
+    /// (with or without an `Item`), matching DynamoDB. Omitted on a
+    /// per-statement error and when the statement fails to parse.
+    #[serde(rename = "TableName", skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -64,12 +70,19 @@ pub async fn execute<S: StorageBackend>(
         let response = match parsed {
             Err(e) => BatchStatementResponse {
                 error: Some(BatchStatementError {
-                    code: "ValidationException".to_string(),
+                    // A per-statement parse failure carries the short-form
+                    // `ValidationError` code, the same as an execution error,
+                    // matching DynamoDB.
+                    code: "ValidationError".to_string(),
                     message: format!("Statement wasn't well formed, got error: {e}"),
                 }),
                 item: None,
+                table_name: None,
             },
             Ok(stmt) => {
+                // DynamoDB echoes the target table on a successful response, but
+                // not on a per-statement error.
+                let table = partiql::parser::table_name(&stmt).map(str::to_string);
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
                 match partiql::executor::execute(storage, &stmt, params, None).await {
                     Ok(Some(items)) => {
@@ -79,11 +92,13 @@ pub async fn execute<S: StorageBackend>(
                         BatchStatementResponse {
                             error: None,
                             item: items.into_iter().next(),
+                            table_name: table,
                         }
                     }
                     Ok(None) => BatchStatementResponse {
                         error: None,
                         item: None,
+                        table_name: table,
                     },
                     Err(e) => BatchStatementResponse {
                         error: Some(BatchStatementError {
@@ -91,6 +106,7 @@ pub async fn execute<S: StorageBackend>(
                             message: e.to_string(),
                         }),
                         item: None,
+                        table_name: None,
                     },
                 }
             }

@@ -85,6 +85,38 @@ fn put_nested_item(
     .unwrap();
 }
 
+/// Seed an item with `pk` plus one list attribute of strings, for list-index
+/// UPDATE tests.
+fn put_list_item(db: &Database, table_name: &str, pk: &str, list_attr: &str, elems: &[&str]) {
+    let list = elems
+        .iter()
+        .map(|e| AttributeValue::S(e.to_string()))
+        .collect();
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    item.insert(list_attr.to_string(), AttributeValue::L(list));
+    db.put_item(PutItemRequest {
+        table_name: table_name.to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// Read `pk` back and assert its `attr` is a string list equal to `expected`.
+fn assert_string_list(db: &Database, pk: &str, attr: &str, expected: &[&str]) {
+    let sel = exec(db, &format!("SELECT * FROM \"Users\" WHERE pk = '{pk}'"));
+    let items = sel.items.unwrap();
+    let want: Vec<AttributeValue> = expected
+        .iter()
+        .map(|e| AttributeValue::S(e.to_string()))
+        .collect();
+    match items[0].get(attr) {
+        Some(AttributeValue::L(list)) => assert_eq!(list, &want),
+        other => panic!("expected {attr} list, got {other:?}"),
+    }
+}
+
 fn exec(
     db: &Database,
     statement: &str,
@@ -727,6 +759,501 @@ fn test_update_returning_modified_deep_nested_path() {
 }
 
 // -----------------------------------------------------------------------
+// List-index SET/REMOVE: a real list-index write, and the MODIFIED projection
+// returning the changed element in list shape (index collapsed to 0).
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_update_set_list_index_writes_the_element() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
+
+    exec(&db, "UPDATE \"Users\" SET tags[0] = 'x' WHERE pk = 'l1'");
+
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'l1'");
+    match sel.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => assert_eq!(
+            list,
+            &vec![
+                AttributeValue::S("x".to_string()),
+                AttributeValue::S("b".to_string()),
+            ],
+            "SET tags[0] writes the real list element, not a literal tags[0] key"
+        ),
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_remove_list_index_removes_the_element() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b", "c"]);
+
+    exec(&db, "UPDATE \"Users\" REMOVE tags[1] WHERE pk = 'l1'");
+
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'l1'");
+    match sel.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => assert_eq!(
+            list,
+            &vec![
+                AttributeValue::S("a".to_string()),
+                AttributeValue::S("c".to_string()),
+            ],
+            "REMOVE tags[1] deletes the element and shifts the rest"
+        ),
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_list_index_projects_changed_element() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED NEW: only the changed element, in list shape, collapsed to [x].
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[0] = 'x' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("RETURNING should return items");
+    assert_eq!(items.len(), 1);
+    assert!(!items[0].contains_key("pk"), "MODIFIED excludes the key");
+    match items[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("x".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+
+    // MODIFIED OLD: the prior element value, same collapsed list shape.
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[0] = 'x' WHERE pk = 'l2' RETURNING MODIFIED OLD *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("a".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_after_list_remove() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // MODIFIED OLD: the removed element's old value at that index.
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE tags[1] WHERE pk = 'l1' RETURNING MODIFIED OLD *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("b".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+
+    // MODIFIED NEW: a list REMOVE shifts rather than deletes, so `tags[1]` still
+    // resolves on the new list `['a','c']` and points at the shifted-in 'c'.
+    // (This differs from a map REMOVE, whose key is gone and yields no row.)
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE tags[1] WHERE pk = 'l2' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("c".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_list_index_non_zero_and_multiple() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // A single non-zero index projects a single-element list of the changed value.
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'y' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("y".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+
+    // Several indices pack into a dense list in ascending index order, dropping
+    // the untouched positions (not collapsed onto one slot).
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[0] = 'x', tags[2] = 'y' WHERE pk = 'l2' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => assert_eq!(
+            list,
+            &vec![
+                AttributeValue::S("x".to_string()),
+                AttributeValue::S("y".to_string()),
+            ]
+        ),
+        other => panic!("expected tags list, got {other:?}"),
+    }
+    // The stored item keeps positions: ['x','b','y'].
+    assert_string_list(&db, "l2", "tags", &["x", "b", "y"]);
+
+    // MODIFIED OLD packs the prior values at the touched indices the same way.
+    put_list_item(&db, "Users", "l3", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[0] = 'x', tags[2] = 'y' WHERE pk = 'l3' RETURNING MODIFIED OLD *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => assert_eq!(
+            list,
+            &vec![
+                AttributeValue::S("a".to_string()),
+                AttributeValue::S("c".to_string()),
+            ]
+        ),
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_list_index_orders_by_index_not_statement() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b", "c"]);
+
+    // The indices are listed descending in the statement (tags[2] then tags[0]),
+    // but AWS packs the projection by index, so the result is ['x','y'] (index 0
+    // before index 2), not statement order ['y','x'].
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'y', tags[0] = 'x' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => assert_eq!(
+            list,
+            &vec![
+                AttributeValue::S("x".to_string()),
+                AttributeValue::S("y".to_string()),
+            ]
+        ),
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_list_index_multi_digit_ordering() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    // An 11-element list so index 10 exists.
+    put_list_item(
+        &db,
+        "Users",
+        "l1",
+        "tags",
+        &[
+            "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10",
+        ],
+    );
+
+    // The path set sorts "tags[10]" before "tags[2]" as strings, but the pack is
+    // keyed by numeric index, so index 2's value comes before index 10's.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'y', tags[10] = 'k' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => assert_eq!(
+            list,
+            &vec![
+                AttributeValue::S("y".to_string()),
+                AttributeValue::S("k".to_string()),
+            ]
+        ),
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_append_is_empty() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // The write appends (stored ['a','b','c']), but a far-out-of-range index
+    // (tags[5]) does not resolve on the new 3-element list, so MODIFIED NEW
+    // projects nothing. This is specific to a far index, not appends in general
+    // (see the at-length case below, where the index resolves).
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[5] = 'c' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    let items = resp.items.expect("present Items array");
+    assert!(
+        items.is_empty(),
+        "MODIFIED NEW over a far-out-of-range append returns Items: []"
+    );
+    assert_string_list(&db, "l1", "tags", &["a", "b", "c"]);
+
+    // MODIFIED OLD: tags[5] does not resolve on the old 2-element list either.
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[5] = 'c' WHERE pk = 'l2' RETURNING MODIFIED OLD *",
+    );
+    assert!(
+        resp.items.expect("present Items array").is_empty(),
+        "MODIFIED OLD over a far-out-of-range append returns Items: []"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_append_at_length() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Appending at exactly the old length: the index resolves on the new list
+    // under NEW (so the element is projected) but is out of range on the old
+    // list under OLD (so nothing is projected).
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'c' WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("c".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET tags[2] = 'c' WHERE pk = 'l2' RETURNING MODIFIED OLD *",
+    );
+    assert!(
+        resp.items.expect("present Items array").is_empty(),
+        "the appended index is out of range on the old list"
+    );
+}
+
+#[test]
+fn test_update_returning_modified_remove_last_index() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Removing the last index: nothing shifts into it, so under NEW the index no
+    // longer resolves and the projection is empty; under OLD it still resolves
+    // on the pre-remove list.
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE tags[2] WHERE pk = 'l1' RETURNING MODIFIED NEW *",
+    );
+    assert!(
+        resp.items.expect("present Items array").is_empty(),
+        "removing the last index leaves nothing to project under MODIFIED NEW"
+    );
+    assert_string_list(&db, "l1", "tags", &["a", "b"]);
+
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b", "c"]);
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" REMOVE tags[2] WHERE pk = 'l2' RETURNING MODIFIED OLD *",
+    );
+    match resp.items.unwrap()[0].get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("c".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_set_list_index_on_absent_attribute_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice"); // no `newlist` attribute
+
+    // You cannot set a nested path whose parent is absent; AWS rejects with this
+    // exact message rather than creating the list.
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "UPDATE \"Users\" SET newlist[0] = 'x' WHERE pk = 'u1'".to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "The document path provided in the update expression is invalid for update"
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert!(
+        !sel.items.unwrap()[0].contains_key("newlist"),
+        "the rejected statement must not create the attribute"
+    );
+}
+
+#[test]
+fn test_update_set_list_index_at_or_beyond_end_appends() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Index == length: appended.
+    put_list_item(&db, "Users", "l1", "tags", &["a", "b"]);
+    exec(&db, "UPDATE \"Users\" SET tags[2] = 'c' WHERE pk = 'l1'");
+    assert_string_list(&db, "l1", "tags", &["a", "b", "c"]);
+
+    // Index beyond the end: also appended (no gap), matching DynamoDB.
+    put_list_item(&db, "Users", "l2", "tags", &["a", "b"]);
+    exec(&db, "UPDATE \"Users\" SET tags[5] = 'c' WHERE pk = 'l2'");
+    assert_string_list(&db, "l2", "tags", &["a", "b", "c"]);
+}
+
+#[test]
+fn test_update_set_list_index_on_non_list_is_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice"); // `name` is a scalar string
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "UPDATE \"Users\" SET name[0] = 'x' WHERE pk = 'u1'".to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        DynoxideError::ValidationException(msg) => assert!(
+            msg.contains("invalid for update"),
+            "unexpected message: {msg}"
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+
+    // The rejected statement must not have changed the attribute.
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
+    assert_eq!(
+        sel.items.unwrap()[0].get("name"),
+        Some(&AttributeValue::S("Alice".to_string()))
+    );
+}
+
+#[test]
+fn test_update_set_nested_list_index_writes_element() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Seed profile = { tags: ['a', 'b'] } (a map holding a list).
+    let mut inner = HashMap::new();
+    inner.insert(
+        "tags".to_string(),
+        AttributeValue::L(vec![
+            AttributeValue::S("a".to_string()),
+            AttributeValue::S("b".to_string()),
+        ]),
+    );
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("n1".to_string()));
+    item.insert("profile".to_string(), AttributeValue::M(inner));
+    db.put_item(PutItemRequest {
+        table_name: "Users".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+
+    exec(
+        &db,
+        "UPDATE \"Users\" SET profile.tags[0] = 'x' WHERE pk = 'n1'",
+    );
+
+    let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'n1'");
+    match sel.items.unwrap()[0].get("profile") {
+        Some(AttributeValue::M(p)) => match p.get("tags") {
+            Some(AttributeValue::L(list)) => assert_eq!(
+                list,
+                &vec![
+                    AttributeValue::S("x".to_string()),
+                    AttributeValue::S("b".to_string()),
+                ]
+            ),
+            other => panic!("expected tags list, got {other:?}"),
+        },
+        other => panic!("expected profile map, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_modified_nested_list_index() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // Seed profile = { tags: ['a', 'b'] } (a map holding a list), so the
+    // projection builds a Map node holding a List node.
+    let mut inner = HashMap::new();
+    inner.insert(
+        "tags".to_string(),
+        AttributeValue::L(vec![
+            AttributeValue::S("a".to_string()),
+            AttributeValue::S("b".to_string()),
+        ]),
+    );
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("n1".to_string()));
+    item.insert("profile".to_string(), AttributeValue::M(inner));
+    db.put_item(PutItemRequest {
+        table_name: "Users".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // MODIFIED NEW: only the changed nested list element, in list shape.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.tags[0] = 'x' WHERE pk = 'n1' RETURNING MODIFIED NEW *",
+    );
+    let want_new = AttributeValue::M(HashMap::from([(
+        "tags".to_string(),
+        AttributeValue::L(vec![AttributeValue::S("x".to_string())]),
+    )]));
+    assert_eq!(resp.items.unwrap()[0].get("profile"), Some(&want_new));
+
+    // MODIFIED OLD: the prior value at that nested index, same shape.
+    let resp = exec(
+        &db,
+        "UPDATE \"Users\" SET profile.tags[0] = 'z' WHERE pk = 'n1' RETURNING MODIFIED OLD *",
+    );
+    let want_old = AttributeValue::M(HashMap::from([(
+        "tags".to_string(),
+        AttributeValue::L(vec![AttributeValue::S("x".to_string())]),
+    )]));
+    assert_eq!(resp.items.unwrap()[0].get("profile"), Some(&want_old));
+}
+
+// -----------------------------------------------------------------------
 // RETURNING inside BatchExecuteStatement (honoured) and ExecuteTransaction
 // (rejected), per the real-AWS ground truth.
 // -----------------------------------------------------------------------
@@ -756,6 +1283,11 @@ fn test_batch_delete_returning_all_old_surfaces_item() {
     assert_eq!(
         item.get("name"),
         Some(&AttributeValue::S("Batch".to_string()))
+    );
+    assert_eq!(
+        resp.responses[0].table_name.as_deref(),
+        Some("Users"),
+        "batch echoes TableName on a successful response"
     );
 
     // The item is gone.
@@ -788,6 +1320,7 @@ fn test_batch_update_returning_surfaces_projection() {
         item.get("data"),
         Some(&AttributeValue::S("new".to_string()))
     );
+    assert_eq!(resp.responses[0].table_name.as_deref(), Some("Users"));
 
     // MODIFIED NEW: only the changed attribute, no key.
     let resp = db
@@ -835,6 +1368,97 @@ fn test_batch_update_empty_modified_omits_item() {
         resp.responses[0].item.is_none(),
         "an empty MODIFIED projection omits Item in a batch response"
     );
+    assert_eq!(
+        resp.responses[0].table_name.as_deref(),
+        Some("Users"),
+        "TableName is still echoed even when Item is omitted"
+    );
+}
+
+#[test]
+fn test_batch_update_list_index_modified_projects_changed_element() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_list_item(&db, "Users", "b1", "tags", &["a", "b"]);
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement:
+                    "UPDATE \"Users\" SET tags[0] = 'x' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                        .to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    let item = resp.responses[0]
+        .item
+        .as_ref()
+        .expect("batch surfaces the list-index MODIFIED projection");
+    match item.get("tags") {
+        Some(AttributeValue::L(list)) => {
+            assert_eq!(list, &vec![AttributeValue::S("x".to_string())])
+        }
+        other => panic!("expected tags list, got {other:?}"),
+    }
+    assert_eq!(resp.responses[0].table_name.as_deref(), Some("Users"));
+}
+
+#[test]
+fn test_batch_plain_update_echoes_table_name() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "b1", &[("data", "old")]);
+
+    // A plain (no-RETURNING) member still echoes TableName, with no Item.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![BatchStatementRequest {
+                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1'".to_string(),
+                parameters: None,
+            }],
+        })
+        .unwrap();
+    assert!(resp.responses[0].error.is_none());
+    assert!(
+        resp.responses[0].item.is_none(),
+        "no RETURNING means no Item"
+    );
+    assert_eq!(resp.responses[0].table_name.as_deref(), Some("Users"));
+}
+
+#[test]
+fn test_batch_parse_error_uses_short_validation_code() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "b1", "Batch");
+
+    // A malformed member fails per-statement with the short-form code (as a
+    // per-statement execution error does), while a valid sibling still executes.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![
+                BatchStatementRequest {
+                    statement: "SLECT * FROM \"Users\"".to_string(),
+                    parameters: None,
+                },
+                BatchStatementRequest {
+                    statement: "SELECT * FROM \"Users\" WHERE pk = 'b1'".to_string(),
+                    parameters: None,
+                },
+            ],
+        })
+        .unwrap();
+    let err = resp.responses[0]
+        .error
+        .as_ref()
+        .expect("the malformed member errors");
+    assert_eq!(err.code, "ValidationError");
+    assert!(
+        resp.responses[1].error.is_none(),
+        "the valid sibling executes"
+    );
+    assert!(resp.responses[1].item.is_some());
 }
 
 #[test]
@@ -864,6 +1488,10 @@ fn test_batch_invalid_delete_returning_variant_is_a_per_statement_error() {
     assert_eq!(
         err.message,
         "Invalid returning clause: RETURNING MODIFIED OLD *. Only RETURNING ALL OLD * is allowed in DELETE statements."
+    );
+    assert!(
+        resp.responses[0].table_name.is_none(),
+        "TableName is not echoed on a per-statement error"
     );
 
     // The rejected statement must not have deleted the item.

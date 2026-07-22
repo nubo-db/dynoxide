@@ -37,7 +37,9 @@ pub async fn execute<S: StorageBackend>(
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
     let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
-        DynoxideError::ValidationException(format!("Statement wasn't well formed, got error: {e}"))
+        DynoxideError::ValidationException(format!(
+            "Statement wasn't well formed, can't be processed: {e}"
+        ))
     })?;
 
     let params = request.parameters.unwrap_or_default();

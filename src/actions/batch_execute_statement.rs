@@ -74,7 +74,7 @@ pub async fn execute<S: StorageBackend>(
                     // `ValidationError` code, the same as an execution error,
                     // matching DynamoDB.
                     code: "ValidationError".to_string(),
-                    message: format!("Statement wasn't well formed, got error: {e}"),
+                    message: format!("Statement wasn't well formed, can't be processed: {e}"),
                 }),
                 item: None,
                 table_name: None,

@@ -1454,11 +1454,37 @@ fn test_batch_parse_error_uses_short_validation_code() {
         .as_ref()
         .expect("the malformed member errors");
     assert_eq!(err.code, "ValidationError");
+    assert_eq!(
+        err.message,
+        "Statement wasn't well formed, can't be processed: Expected data manipulation"
+    );
     assert!(
         resp.responses[1].error.is_none(),
         "the valid sibling executes"
     );
     assert!(resp.responses[1].item.is_some());
+}
+
+#[test]
+fn test_execute_statement_parse_error_message() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    // A single malformed statement rejects with the same envelope and detail.
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SLECT * FROM \"Users\"".to_string(),
+            parameters: None,
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        DynoxideError::ValidationException(msg) => assert_eq!(
+            msg,
+            "Statement wasn't well formed, can't be processed: Expected data manipulation"
+        ),
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
 }
 
 #[test]

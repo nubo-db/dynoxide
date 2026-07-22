@@ -9,14 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking (Rust API):** the public `partiql::parser::Statement` enum gained a `returning` field on its `Update` and `Delete` variants, and both variants are now `#[non_exhaustive]`. Library consumers that construct or exhaustively match these AST variants must add `..`. This is a source-breaking change for the crate's public API, so the next release is a minor bump (0.12.0). The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
+- **Breaking (Rust API):** the public `partiql::parser::Statement` enum gained a `returning` field on its `Update` and `Delete` variants, and both variants are now `#[non_exhaustive]`; the public `actions::batch_execute_statement::BatchStatementResponse` struct gained a `table_name` field and is now `#[non_exhaustive]` too. Library consumers that construct or exhaustively match these types must add `..`. This is a source-breaking change for the crate's public API, so the next release is a minor bump (0.12.0). The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
 
 ### Added
 
 - PartiQL now honours the `RETURNING` clause on `ExecuteStatement`, where dynoxide previously parsed the statement but silently dropped the clause. `DELETE ... RETURNING ALL OLD *` returns the deleted item in `Items` (a present but empty `Items` array on a missing target, matching DynamoDB rather than the classic `DeleteItem` path), and `UPDATE ... RETURNING <ALL|MODIFIED> <OLD|NEW> *` returns the matching projection of the item; the `MODIFIED` variants return only the changed paths (a nested `SET a.b` returns just the changed leaf, not the whole `a` attribute), exclude the primary key, and return an empty `Items` array when nothing was projected. `BatchExecuteStatement` honours a member's `RETURNING` clause; `ExecuteTransaction` rejects one with a top-level `ValidationException`. The `RETURNING` variants DynamoDB does not allow on `DELETE` (`MODIFIED OLD *`, `ALL NEW *`, `MODIFIED NEW *`) are rejected with its exact validation message instead of being ignored ([#137](https://github.com/nubo-db/dynoxide/issues/137)).
-### Added
+- `dynoxide serve` and `dynoxide` (no-subcommand) now accept a `--schema` flag, taking the same DynamoDB DescribeTable JSON format as `import --schema`. On startup, dynoxide creates each table defined in the file and skips any that already exist. This lets you pre-populate an empty database (in-memory or persistent) with the correct table structure without running an import first.
 
-- `dynoxide serve` and `dynoxide` (no-subcommand) now accept a `--schema` flag, taking the same DynamoDB DescribeTable JSON format as `import --schema`. On startup, dynoxide creates each table defined in the file and skips any that already exist. This lets you pre-populate an empty database — in-memory or persistent — with the correct table structure without running an import first.
+### Fixed
+
+- PartiQL `UPDATE` now performs real list-index writes. `SET tags[0] = :v` updates the list element (appending when the index is at or beyond the end) and `REMOVE tags[0]` deletes it and shifts the rest, where dynoxide previously treated `tags[0]` as a literal map key so both the stored item and a `RETURNING MODIFIED` projection over it diverged from DynamoDB. A `RETURNING MODIFIED` projection over list-index paths now packs the changed elements into a dense list in ascending index order (`SET a[0], a[2]` yields `{a: [v0, v2]}`), matching DynamoDB.
+- `BatchExecuteStatement` now echoes `TableName` on each successful member response, and a member that fails to parse now carries the short-form `ValidationError` code (matching a per-statement execution error) instead of the long-form `ValidationException`. Both match DynamoDB.
 
 ## [0.11.4] - 2026-07-17
 

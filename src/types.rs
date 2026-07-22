@@ -268,11 +268,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 Ok(AttributeValue::BOOL(b))
             }
             "NULL" => {
-                // The NULL member is a plain boolean in the model. AWS accepts both
-                // {"NULL": true} and {"NULL": false} and reads either back as
-                // {"NULL": true}, so normalise false to true here. A non-boolean
-                // value (e.g. {"NULL": "no"}) is a type error.
-                if val.as_bool().is_none() {
+                // AWS requires the NULL member to be exactly `true`; `{"NULL": false}`
+                // and non-boolean values (e.g. `{"NULL": "no"}`) are both rejected.
+                // dynoxide previously normalised `false` to `true` (#62/#74); real
+                // DynamoDB (eu-west-2) rejects it, so we match that here.
+                if val.as_bool() != Some(true) {
                     return Err(de::Error::custom(
                         "VALIDATION:One or more parameter values were invalid: \
                          Null attribute value types must have the value of true",
@@ -1448,12 +1448,14 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_null_false_normalises_to_true() {
-        // The NULL member is a plain boolean in the model, so {"NULL": false} is
-        // valid input. AWS accepts it and reads it back as {"NULL": true}, so
-        // normalise false to true on the way in.
-        let val: AttributeValue = serde_json::from_str(r#"{"NULL":false}"#).unwrap();
-        assert_eq!(val, AttributeValue::NULL(true));
+    fn test_deserialize_null_false_rejected() {
+        // AWS requires the NULL member to be exactly `true`; {"NULL": false} is
+        // rejected with a ValidationException, same as a non-boolean value.
+        let err = serde_json::from_str::<AttributeValue>(r#"{"NULL":false}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("must have the value of true"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -113,6 +113,11 @@ pub struct CreateTableParams {
     pub sse_specification: Option<serde_json::Value>,
 
     #[schemars(
+        description = "Optional billing mode: PROVISIONED or PAY_PER_REQUEST. Defaults to PROVISIONED."
+    )]
+    pub billing_mode: Option<String>,
+
+    #[schemars(
         description = "Optional table class: STANDARD or STANDARD_INFREQUENT_ACCESS. Accepted for compatibility."
     )]
     pub table_class: Option<String>,
@@ -849,6 +854,7 @@ impl McpServer {
             local_secondary_indexes,
             stream_specification,
             sse_specification,
+            billing_mode: params.billing_mode,
             table_class: params.table_class,
             tags,
             deletion_protection_enabled: params.deletion_protection_enabled,

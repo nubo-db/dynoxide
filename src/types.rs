@@ -1101,9 +1101,9 @@ pub struct LocalSecondaryIndex {
 /// Provisioned throughput settings (stored but not enforced).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvisionedThroughput {
-    #[serde(rename = "ReadCapacityUnits", default)]
+    #[serde(rename = "ReadCapacityUnits", alias = "read_capacity_units", default)]
     pub read_capacity_units: Option<i64>,
-    #[serde(rename = "WriteCapacityUnits", default)]
+    #[serde(rename = "WriteCapacityUnits", alias = "write_capacity_units", default)]
     pub write_capacity_units: Option<i64>,
 }
 

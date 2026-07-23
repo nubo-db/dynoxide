@@ -95,6 +95,16 @@ pub async fn execute<S: StorageBackend>(
     // Structural validation (runs for both programmatic and JSON paths)
     validate_typed_request(&request)?;
 
+    if let Some(ref bm) = request.billing_mode {
+        if bm != "PROVISIONED" && bm != "PAY_PER_REQUEST" {
+            return Err(DynoxideError::ValidationException(format!(
+                "1 validation error detected: Value '{bm}' at 'billingMode' failed to satisfy \
+                 constraint: Member must satisfy enum value set: \
+                 [PROVISIONED, PAY_PER_REQUEST]"
+            )));
+        }
+    }
+
     if let Some(ref tc) = request.table_class {
         if tc != "STANDARD" && tc != "STANDARD_INFREQUENT_ACCESS" {
             return Err(DynoxideError::ValidationException(format!(

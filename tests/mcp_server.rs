@@ -250,6 +250,132 @@ fn test_create_table_and_describe() {
 }
 
 #[test]
+fn test_create_table_billing_mode_pay_per_request() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "OnDemand",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+    assert!(!is_tool_error(&resp), "create_table failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "OnDemand", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["BillingModeSummary"]["BillingMode"],
+        "PAY_PER_REQUEST"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_create_table_invalid_billing_mode_rejected() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "BadMode",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "ON_DEMAND"
+        }),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "1 validation error detected: Value 'ON_DEMAND' at 'billingMode' failed to satisfy \
+         constraint: Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]",
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_create_table_provisioned_with_throughput() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Provisioned",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PROVISIONED",
+            "provisioned_throughput": {"read_capacity_units": 7, "write_capacity_units": 3}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "create_table failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "Provisioned", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"],
+        7
+    );
+    assert_eq!(
+        content["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"],
+        3
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_create_table_provisioned_without_throughput_rejected() {
+    // Explicit PROVISIONED requires throughput, exactly as on real DynamoDB.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "NoThroughput",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PROVISIONED"
+        }),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "One or more parameter values were invalid: ReadCapacityUnits and \
+         WriteCapacityUnits must both be specified when BillingMode is PROVISIONED",
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
 fn test_put_get_delete_item() {
     let mut child = spawn_mcp();
     init_mcp(&mut child);

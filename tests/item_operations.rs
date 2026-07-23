@@ -389,7 +389,7 @@ fn test_update_item_return_values_invalid_enveloped_exactly_once() {
         err,
         "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy \
          constraint: Member must satisfy enum value set: \
-         [ALL_NEW, ALL_OLD, NONE, UPDATED_NEW, UPDATED_OLD]"
+         [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
     );
     assert_eq!(
         err.matches("validation error detected").count(),

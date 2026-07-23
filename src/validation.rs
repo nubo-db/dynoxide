@@ -183,8 +183,11 @@ pub(crate) fn tag_request_validation(err: DynoxideError) -> DynoxideError {
 /// for untagged errors, so applying this to an already-enveloped action error
 /// is safe.
 ///
-/// Single owner of the operation split; the HTTP and wasm dispatch seams both
-/// route through here.
+/// Owner of the operation split for the HTTP and wasm dispatch seams, which
+/// both route through here. The same PutItem/UpdateItem membership is encoded
+/// at the action boundaries (`put_item::execute` / `update_item::execute`
+/// apply the envelope for the in-process API) and in the MCP tools' choice of
+/// resolver, so a future enveloped operation must update all three places.
 pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
     match operation {
         "PutItem" | "UpdateItem" => envelope_request_validation(err),

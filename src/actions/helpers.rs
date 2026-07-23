@@ -758,8 +758,9 @@ fn validate_expression_attribute_value(
     // Check for empty/unsupported datatypes
     match value {
         // Unreachable from PutItem and UpdateItem, whose execute paths reject
-        // NULL(false) first with the bare enveloped message; this arm serves
-        // the other operations' pre-parsed in-process EAV paths.
+        // NULL(false) first with the captured message (no per-key wrapper),
+        // tagged for the envelope; this arm serves the other operations'
+        // pre-parsed in-process EAV paths.
         AttributeValue::NULL(b) if !b => {
             return Err(ClassifiedValidationError::bare(format!(
                 "ExpressionAttributeValues contains invalid value: \

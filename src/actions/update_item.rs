@@ -428,7 +428,8 @@ async fn execute_inner<S: StorageBackend>(
 
     // Validate ReturnValues parameter. The constraint text is tagged without
     // the envelope prefix; the operation boundary applies it, so the prefix
-    // has a single producer and the wire output is unchanged.
+    // has a single producer. The enum list mirrors first_invalid_return_enum's
+    // ordering so the in-process message matches the request deserialiser.
     if let Some(ref rv) = request.return_values {
         let rv_upper = rv.to_uppercase();
         if !["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"]
@@ -436,7 +437,8 @@ async fn execute_inner<S: StorageBackend>(
         {
             return Err(DynoxideError::EnvelopedValidation(format!(
                 "Value '{rv}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [ALL_NEW, ALL_OLD, NONE, UPDATED_NEW, UPDATED_OLD]"
+                 Member must satisfy enum value set: \
+                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
             )));
         }
     }

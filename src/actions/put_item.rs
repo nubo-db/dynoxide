@@ -149,6 +149,18 @@ pub struct PutItemResponse {
 
 pub async fn execute<S: StorageBackend>(
     storage: &S,
+    request: PutItemRequest,
+) -> Result<PutItemResponse> {
+    // Apply the request-validation envelope exactly once at the operation
+    // boundary, so every early return inside is covered and the tagged
+    // variant never escapes.
+    execute_inner(storage, request)
+        .await
+        .map_err(crate::validation::envelope_request_validation)
+}
+
+async fn execute_inner<S: StorageBackend>(
+    storage: &S,
     mut request: PutItemRequest,
 ) -> Result<PutItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
@@ -156,7 +168,9 @@ pub async fn execute<S: StorageBackend>(
 
     // Validate attribute values (empty strings, empty sets, number precision)
     // DynamoDB validates item values before expression parameter checks for PutItem.
-    crate::validation::validate_item_attribute_values(&request.item)?;
+    // The set families are tagged for the request-validation envelope.
+    crate::validation::validate_item_attribute_values(&request.item)
+        .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
 
     // Validate expression/non-expression parameter conflicts
     {
@@ -176,7 +190,10 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &None,
         };
-        helpers::validate_expression_params(&ctx)?; // Raw EAV not used for PutItem HTTP path
+        // Raw EAV not used for PutItem HTTP path. Enveloped families are
+        // tagged for the request-validation envelope.
+        helpers::validate_expression_params(&ctx)
+            .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
     }
 
     // Validate empty ConditionExpression
@@ -188,31 +205,34 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.) before table lookup
+    // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.) before table lookup.
+    // Every parse-time error here is a family DynamoDB wraps in the
+    // request-validation envelope, so the whole block is tagged.
     if let Some(ref ce) = request.condition_expression {
         let parsed = crate::expressions::condition::parse(ce).map_err(|e| {
-            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+            DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
         })?;
         crate::expressions::condition::validate_static(
             &parsed,
             &request.expression_attribute_values,
         )
-        .map_err(DynoxideError::ValidationException)?;
+        .map_err(DynoxideError::EnvelopedValidation)?;
         crate::expressions::condition::validate_operand_semantics(
             &parsed,
             &request.expression_attribute_names,
             &request.expression_attribute_values,
         )
         .map_err(|e| {
-            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+            DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
         })?;
     }
 
-    // Validate ReturnValues parameter (PutItem only supports NONE and ALL_OLD)
+    // Validate ReturnValues parameter (PutItem only supports NONE and ALL_OLD).
+    // Wrapped in the request-validation envelope (eu-west-2).
     if let Some(ref rv) = request.return_values {
         let rv_upper = rv.to_uppercase();
         if rv_upper != "NONE" && rv_upper != "ALL_OLD" {
-            return Err(DynoxideError::ValidationException(
+            return Err(DynoxideError::EnvelopedValidation(
                 "ReturnValues can only be ALL_OLD or NONE".to_string(),
             ));
         }
@@ -508,6 +528,24 @@ mod tests {
             "got: {err}"
         );
         assert!(err.to_lowercase().contains("returnvalues"), "got: {err}");
+    }
+
+    #[test]
+    fn deserialiser_constraint_error_carries_exactly_one_envelope() {
+        // Constraint errors raised during deserialisation envelope themselves;
+        // they never reach the execute boundary, so no second envelope appears.
+        let err = serde_json::from_value::<super::PutItemRequest>(serde_json::json!({
+            "TableName": "Tbl",
+            "Item": {"pk": {"S": "test"}},
+            "ReturnValues": "INVALID"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err.matches("validation error detected").count(),
+            1,
+            "expected exactly one envelope, got: {err}"
+        );
     }
 
     /// A single-item write and its GSI fan-out succeed or fail as one unit:

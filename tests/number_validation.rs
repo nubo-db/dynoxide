@@ -178,6 +178,18 @@ fn test_malformed_numbers_rejected_end_to_end() {
 }
 
 #[test]
+fn test_malformed_number_message_stays_bare() {
+    // Number-format errors on PutItem are not a captured enveloped family and
+    // keep the bare message, byte for byte.
+    let db = make_db();
+    let err = put_number(&db, "1.2.3").unwrap_err();
+    assert_eq!(
+        err,
+        "The parameter cannot be converted to a numeric value: 1.2.3"
+    );
+}
+
+#[test]
 fn test_number_set_leading_plus_normalised() {
     // NS elements with a leading '+' are accepted and stored normalised.
     let db = make_db();

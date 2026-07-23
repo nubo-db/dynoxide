@@ -53,12 +53,20 @@ fn test_ss_duplicate_rejected() {
         "tags".to_string(),
         AttributeValue::SS(vec!["a".to_string(), "b".to_string(), "a".to_string()]),
     );
-    let result = db.put_item(PutItemRequest {
-        table_name: "Tbl".to_string(),
-        item,
-        ..Default::default()
-    });
-    assert!(result.is_err(), "expected duplicate SS to be rejected");
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap_err();
+    // PutItem wraps the duplicate rejection in the request-validation envelope
+    // (eu-west-2).
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Input collection [a, b, a] contains duplicates."
+    );
 }
 
 #[test]
@@ -70,12 +78,17 @@ fn test_ns_numeric_duplicate_rejected() {
         "nums".to_string(),
         AttributeValue::NS(vec!["1".to_string(), "1.0".to_string()]),
     );
-    let result = db.put_item(PutItemRequest {
-        table_name: "Tbl".to_string(),
-        item,
-        ..Default::default()
-    });
-    assert!(result.is_err(), "expected duplicate NS to be rejected");
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Input collection contains duplicates"
+    );
 }
 
 #[test]
@@ -87,12 +100,18 @@ fn test_bs_duplicate_rejected() {
         "bins".to_string(),
         AttributeValue::BS(vec![vec![1, 2], vec![3, 4], vec![1, 2]]),
     );
-    let result = db.put_item(PutItemRequest {
-        table_name: "Tbl".to_string(),
-        item,
-        ..Default::default()
-    });
-    assert!(result.is_err(), "expected duplicate BS to be rejected");
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Input collection [AQI=, AwQ=, AQI=]of type BS contains duplicates."
+    );
 }
 
 #[test]
@@ -149,13 +168,71 @@ fn test_nested_set_in_map_duplicate_rejected() {
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
     item.insert("data".to_string(), AttributeValue::M(nested));
-    let result = db.put_item(PutItemRequest {
-        table_name: "Tbl".to_string(),
-        item,
-        ..Default::default()
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Input collection [x, y, x] contains duplicates."
+    );
+}
+
+#[test]
+fn test_duplicate_value_matching_bare_message_still_enveloped() {
+    // The envelope decision is typed at the call site, never matched on message
+    // text, so a duplicated value that happens to spell a bare-family message
+    // still gets the envelope.
+    let db = make_db();
+    let sneaky = "This attribute is part of the key";
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
+    item.insert(
+        "tags".to_string(),
+        AttributeValue::SS(vec![sneaky.to_string(), sneaky.to_string()]),
+    );
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "1 validation error detected: One or more parameter values were invalid: \
+             Input collection [{sneaky}, {sneaky}] contains duplicates."
+        )
+    );
+}
+
+#[test]
+fn test_batch_write_duplicate_ss_stays_bare() {
+    // Only PutItem envelopes the duplicate-set families; BatchWriteItem keeps
+    // the bare message.
+    let db = make_db();
+    let req: serde_json::Value = serde_json::json!({
+        "RequestItems": {
+            "Tbl": [{
+                "PutRequest": {
+                    "Item": {
+                        "pk": {"S": "k1"},
+                        "tags": {"SS": ["a", "a"]}
+                    }
+                }
+            }]
+        }
     });
-    assert!(
-        result.is_err(),
-        "expected nested duplicate SS to be rejected"
+    let batch_req: dynoxide::actions::batch_write_item::BatchWriteItemRequest =
+        serde_json::from_value(req).unwrap();
+    let err = db.batch_write_item(batch_req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Input collection [a, a] contains duplicates."
     );
 }

@@ -1973,9 +1973,11 @@ fn test_condition_expression_over_size_limit_rejected() {
         })
         .unwrap_err();
 
-    assert!(
-        err.to_string().contains(CONDITION_OVERSIZE_MSG),
-        "unexpected error: {err}"
+    // PutItem wraps ConditionExpression parse-time errors in the
+    // request-validation envelope (eu-west-2).
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG}; expression size: 4097")
     );
 }
 
@@ -2028,5 +2030,145 @@ fn test_expression_at_size_limit_not_rejected_for_size() {
         result.is_ok(),
         "4096-byte expression should be within the limit, got: {:?}",
         result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PutItem request-validation envelope.
+// PutItem wraps its action-time request-validation families in the
+// `1 validation error detected: ` envelope; families the capture shows bare
+// stay bare. Confirmed against real DynamoDB (eu-west-2).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_put_condition_syntax_error_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("pk = !!".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+    );
+}
+
+#[test]
+fn test_put_condition_redundant_parentheses_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("((pk = :v))".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: \
+         The expression has redundant parentheses;"
+    );
+}
+
+#[test]
+fn test_put_condition_contains_distinct_operand_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("contains(pk, pk)".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: \
+         The first operand must be distinct from the remaining operands for this operator or \
+         function; operator: contains, first operand: [pk]"
+    );
+}
+
+#[test]
+fn test_put_eav_without_expression_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: ExpressionAttributeValues can only be specified when \
+         using expressions: ConditionExpression is null"
+    );
+}
+
+#[test]
+fn test_put_mixing_expected_and_condition_expression_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("attribute_not_exists(pk)".into()),
+            expected: Some(serde_json::json!({"pk": {"Exists": false}})),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Can not use both expression and non-expression \
+         parameters in the same request: Non-expression parameters: {Expected} \
+         Expression parameters: {ConditionExpression}"
+    );
+}
+
+#[test]
+fn test_put_ean_without_expression_stays_bare() {
+    // ExpressionAttributeNames misuse is not a captured enveloped family and
+    // keeps the bare message.
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            expression_attribute_names: Some(
+                [("#a".to_string(), "a".to_string())].into_iter().collect(),
+            ),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "ExpressionAttributeNames can only be specified when using expressions"
     );
 }

@@ -272,6 +272,109 @@ fn test_put_item_empty_string_key() {
 }
 
 #[test]
+fn test_put_item_return_values_all_new_enveloped() {
+    // PutItem only supports NONE and ALL_OLD; the action-level rejection is
+    // wrapped in the request-validation envelope (eu-west-2).
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            return_values: Some("ALL_NEW".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: ReturnValues can only be ALL_OLD or NONE"
+    );
+}
+
+#[test]
+fn test_put_item_key_type_mismatch_stays_bare() {
+    // Type mismatch for a key attribute is captured bare (eu-west-2); it must
+    // not gain the request-validation envelope.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[("pk", AttributeValue::N("5".into()))]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: Type mismatch for key pk expected: S actual: N"
+    );
+}
+
+#[test]
+fn test_put_item_empty_string_key_stays_bare() {
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("".into()))]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values are not valid. The AttributeValue for a key attribute \
+         cannot contain an empty string value. Key: pk"
+    );
+}
+
+#[test]
+fn test_put_item_oversized_item_stays_bare() {
+    // Item-size-exceeded is captured bare (eu-west-2).
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[
+                ("pk", AttributeValue::S("k1".into())),
+                ("blob", AttributeValue::S("x".repeat(400 * 1024))),
+            ]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Item size has exceeded the maximum allowed size"
+    );
+}
+
+#[test]
+fn test_put_item_invalid_table_name_enveloped_exactly_once() {
+    // The table-name constraint error already carries its own envelope; the
+    // operation boundary must not add a second one.
+    let db = make_db();
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "bad name".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err.matches("validation error detected").count(),
+        1,
+        "expected exactly one envelope, got: {err}"
+    );
+}
+
+#[test]
 fn test_put_item_nonexistent_table() {
     let db = make_db();
     let err = db

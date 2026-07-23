@@ -77,6 +77,7 @@ pub enum Operand {
 /// Errors returned are the raw error text without the "Invalid FilterExpression: " etc.
 /// prefix — callers must add the appropriate prefix for their expression type.
 pub fn parse(expr: &str) -> Result<ConditionExpr, String> {
+    super::check_expression_size(expr)?;
     let tokens = tokenize(expr).map_err(|e| e.to_string())?;
     check_redundant_parens(&tokens)?;
     let mut stream = TokenStream::new(tokens);

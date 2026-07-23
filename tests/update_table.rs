@@ -99,6 +99,76 @@ fn test_update_table_create_gsi() {
 }
 
 #[test]
+fn test_update_table_create_gsi_requires_key_in_request_attribute_definitions() {
+    // A new GSI's key attributes must be declared in the request's own
+    // AttributeDefinitions, not merely in the table's stored definitions.
+    // Keying a GSI on the table's `PK` while the request declares only the
+    // GSI's other key attribute must be rejected. Confirmed against real
+    // DynamoDB (eu-west-2).
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+
+    let err = db.update_table(req).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Some index key attributes are not defined in AttributeDefinitions"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_update_table_create_gsi_on_redeclared_table_attribute_succeeds() {
+    // Counterpart to the rejection test: a GSI keyed on the table's own PK is
+    // accepted when the request re-declares PK in its AttributeDefinitions, so
+    // the fix must not over-reject this legitimate case. Confirmed against real
+    // DynamoDB (eu-west-2).
+    let db = make_db();
+    create_simple_table(&db, "TestTable");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "TestTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+
+    let resp = db.update_table(req).unwrap();
+    let gsis = resp.table_description.global_secondary_indexes.unwrap();
+    assert_eq!(gsis.len(), 1);
+    assert_eq!(gsis[0].index_name, "GSI1");
+}
+
+#[test]
 fn test_update_table_create_gsi_backfills_existing_items() {
     let db = make_db();
     create_simple_table(&db, "TestTable");

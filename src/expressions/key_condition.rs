@@ -38,6 +38,13 @@ pub enum SortKeyCondition {
 /// Supports optional parentheses around individual conditions and around
 /// the entire expression, matching DynamoDB behavior.
 pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCondition, String> {
+    // Prefix the size error like every other KeyConditionExpression error; real
+    // DynamoDB checks size before parsing and returns "Invalid
+    // KeyConditionExpression: Expression size has exceeded the maximum allowed
+    // size", even for an otherwise malformed key condition. Confirmed against
+    // real DynamoDB (eu-west-2).
+    super::check_expression_size(expr)
+        .map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
     let tokens = tokenize(expr).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
     // Reject redundant parens before stripping outer ones (strip_outer_parens
     // would otherwise silently accept `((pk = :pk))`).

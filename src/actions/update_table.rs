@@ -315,7 +315,14 @@ pub async fn execute<S: StorageBackend>(
                     projection: create.projection.clone(),
                     provisioned_throughput: None,
                 };
-                validation::validate_gsi(&gsi_def, &attr_defs)?;
+                // A new index's key attributes must all appear in the request's
+                // own AttributeDefinitions, not the merged stored set: DynamoDB
+                // requires the request to (re)declare them even when the table
+                // already defines the attribute.
+                validation::validate_gsi(
+                    &gsi_def,
+                    request.attribute_definitions.as_deref().unwrap_or(&[]),
+                )?;
             }
             if let Some(ref delete) = update.delete {
                 if !current_gsis

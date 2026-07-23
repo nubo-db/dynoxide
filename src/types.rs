@@ -271,10 +271,13 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 // AWS requires the NULL member to be exactly `true`; `{"NULL": false}`
                 // and non-boolean values (e.g. `{"NULL": "no"}`) are both rejected.
                 // dynoxide previously normalised `false` to `true` (#62/#74); real
-                // DynamoDB (eu-west-2) rejects it, so we match that here.
+                // DynamoDB (eu-west-2) rejects it, so we match that here. The
+                // VALIDATION_REQUEST marker puts the rejection in the
+                // request-validation class that PutItem and UpdateItem envelope
+                // (see `crate::serde_errors`); other operations report it bare.
                 if val.as_bool() != Some(true) {
                     return Err(de::Error::custom(
-                        "VALIDATION:One or more parameter values were invalid: \
+                        "VALIDATION_REQUEST:One or more parameter values were invalid: \
                          Null attribute value types must have the value of true",
                     ));
                 }
@@ -356,8 +359,8 @@ impl<'de> Deserialize<'de> for AttributeValue {
 ///
 /// Returns DynamoDB-matching error messages for invalid numbers.
 /// Error messages are returned WITHOUT the VALIDATION: prefix since they
-/// bypass the normal validation flow — the server routes them based on
-/// message content (see `server::serde_errors::deserialize`).
+/// bypass the normal validation flow; the server routes them based on
+/// message content (see `crate::serde_errors::deserialize`).
 fn validate_number_in_deser(n: &str) -> Result<(), String> {
     // validate_dynamo_number is the single source of truth for number format
     // and precision/range; the deser path only reshapes the error message.

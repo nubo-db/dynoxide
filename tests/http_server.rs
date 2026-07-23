@@ -384,3 +384,188 @@ async fn test_query_via_http() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["Count"], 3);
 }
+
+// ---------------------------------------------------------------------------
+// {"NULL": false} enveloping on the HTTP surface
+// ---------------------------------------------------------------------------
+
+/// The enveloped rejection PutItem and UpdateItem return for {"NULL": false}
+/// in any position (item body, Key, ExpressionAttributeValues), captured
+/// against real DynamoDB (eu-west-2).
+const NULL_FALSE_ENVELOPED: &str = "1 validation error detected: \
+     One or more parameter values were invalid: \
+     Null attribute value types must have the value of true";
+
+/// The bare rejection every other operation returns for {"NULL": false}.
+const NULL_FALSE_BARE: &str = "One or more parameter values were invalid: \
+     Null attribute value types must have the value of true";
+
+/// Create a hash-only table for the validation tests below.
+async fn create_items_table(url: &str) {
+    let resp = dynamo_request(
+        url,
+        "CreateTable",
+        json!({
+            "TableName": "Items",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+}
+
+/// Assert a 400 ValidationException with an exact message, and that no
+/// internal marker or serde position suffix leaked into the body.
+async fn assert_validation_error(resp: reqwest::Response, expected_message: &str) {
+    assert_eq!(resp.status(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains("VALIDATION") && !text.contains(" at line "),
+        "internal marker or serde position leaked: {text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("ValidationException"),
+        "unexpected __type: {}",
+        body["__type"]
+    );
+    assert_eq!(body["message"].as_str().unwrap(), expected_message);
+}
+
+#[tokio::test]
+async fn test_put_item_null_false_in_item_enveloped() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "PutItem",
+        json!({
+            "TableName": "Items",
+            "Item": {"pk": {"S": "k1"}, "flag": {"NULL": false}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, NULL_FALSE_ENVELOPED).await;
+}
+
+#[tokio::test]
+async fn test_put_item_null_false_in_eav_enveloped() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "PutItem",
+        json!({
+            "TableName": "Items",
+            "Item": {"pk": {"S": "k1"}},
+            "ConditionExpression": "flag = :n",
+            "ExpressionAttributeValues": {":n": {"NULL": false}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, NULL_FALSE_ENVELOPED).await;
+}
+
+#[tokio::test]
+async fn test_update_item_null_false_in_eav_enveloped() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "UpdateItem",
+        json!({
+            "TableName": "Items",
+            "Key": {"pk": {"S": "k1"}},
+            "UpdateExpression": "SET flag = :n",
+            "ExpressionAttributeValues": {":n": {"NULL": false}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, NULL_FALSE_ENVELOPED).await;
+}
+
+#[tokio::test]
+async fn test_update_item_null_false_in_key_enveloped() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "UpdateItem",
+        json!({
+            "TableName": "Items",
+            "Key": {"pk": {"NULL": false}},
+            "UpdateExpression": "SET flag = :n",
+            "ExpressionAttributeValues": {":n": {"S": "v"}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, NULL_FALSE_ENVELOPED).await;
+}
+
+#[tokio::test]
+async fn test_get_item_null_false_in_key_bare() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "GetItem",
+        json!({
+            "TableName": "Items",
+            "Key": {"pk": {"NULL": false}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, NULL_FALSE_BARE).await;
+}
+
+#[tokio::test]
+async fn test_put_item_empty_attribute_value_bare() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "PutItem",
+        json!({
+            "TableName": "Items",
+            "Item": {"pk": {"S": "k1"}, "data": {}}
+        }),
+    )
+    .await;
+    assert_validation_error(
+        resp,
+        "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_put_item_multi_datatype_attribute_value_bare() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "PutItem",
+        json!({
+            "TableName": "Items",
+            "Item": {"pk": {"S": "k1"}, "data": {"S": "v", "N": "1"}}
+        }),
+    )
+    .await;
+    assert_validation_error(
+        resp,
+        "Supplied AttributeValue has more than one datatypes set, \
+         must contain exactly one of the supported datatypes",
+    )
+    .await;
+}

@@ -1131,3 +1131,76 @@ fn test_query_key_condition_expression_over_size_limit_rejected() {
         "unexpected error: {err}"
     );
 }
+
+// =============================================================================
+// {"NULL": false} in ExclusiveStartKey and ScanFilter
+// =============================================================================
+
+#[test]
+fn test_scan_esk_null_false_starting_key_invalid() {
+    // {"NULL": false} in ExclusiveStartKey keeps its starting-key message,
+    // with no internal marker or serde position suffix leaking through.
+    let db = setup_db();
+    create_hash_only_table(&db, "Items");
+
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Items",
+        "ExclusiveStartKey": {"pk": {"NULL": false}}
+    }))
+    .unwrap();
+
+    let err = db.scan(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "The provided starting key is invalid: \
+         One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_query_esk_null_false_starting_key_invalid() {
+    let db = setup_db();
+    create_hash_only_table(&db, "Items");
+
+    let req: QueryRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Items",
+        "KeyConditionExpression": "pk = :pk",
+        "ExpressionAttributeValues": {":pk": {"S": "a"}},
+        "ExclusiveStartKey": {"pk": {"NULL": false}}
+    }))
+    .unwrap();
+
+    let err = db.query(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "The provided starting key is invalid: \
+         One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_scan_filter_null_false_no_marker_leak() {
+    // A {"NULL": false} inside a ScanFilter AttributeValueList fails to
+    // deserialise; the raw filter validation lets it fall through and the
+    // unparseable filter is dropped, so the scan succeeds. What matters here
+    // is that the internal marker on the serde message never surfaces.
+    let db = setup_db();
+    create_hash_only_table(&db, "Items");
+
+    put(&db, "Items", serde_json::json!({"pk": {"S": "k1"}}));
+
+    let req: ScanRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Items",
+        "ScanFilter": {
+            "flag": {"ComparisonOperator": "EQ", "AttributeValueList": [{"NULL": false}]}
+        }
+    }))
+    .unwrap();
+
+    match db.scan(req) {
+        Ok(resp) => assert_eq!(resp.count, 1),
+        Err(err) => panic!("scan unexpectedly failed: {err}"),
+    }
+}

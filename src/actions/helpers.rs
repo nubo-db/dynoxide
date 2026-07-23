@@ -920,19 +920,8 @@ pub fn parse_expression_attribute_values_raw(
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Extract the core error message (strip serde position suffix)
-                let clean = if let Some(idx) = msg.rfind(" at line ") {
-                    let suffix = &msg[idx..];
-                    if suffix.contains("column") {
-                        &msg[..idx]
-                    } else {
-                        &msg
-                    }
-                } else {
-                    &msg
-                };
-                // Strip VALIDATION: prefix if present
-                let inner = clean.strip_prefix("VALIDATION:").unwrap_or(clean);
+                // Strip the serde position suffix and any internal marker
+                let inner = crate::serde_errors::clean_serde_message(&msg);
 
                 if inner.contains("empty AttributeValue")
                     || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
@@ -959,10 +948,10 @@ pub fn parse_expression_attribute_values_raw(
                     )));
                 } else if inner.contains("Null attribute value types must have the value of true") {
                     // A rejected {"NULL": false} fails to deserialise here with a
-                    // VALIDATION-prefixed message. Real DynamoDB rejects it with the
+                    // marker-prefixed message. Real DynamoDB rejects it with the
                     // bare validation message, without the per-key "contains invalid
                     // value" wrapper it uses for empty or malformed values, so surface
-                    // the inner message directly rather than leaking a
+                    // the cleaned inner message directly rather than leaking a
                     // SerializationException with the raw prefix. Confirmed against
                     // real DynamoDB (eu-west-2).
                     return Err(DynoxideError::ValidationException(inner.to_string()));
@@ -1836,18 +1825,8 @@ pub fn parse_exclusive_start_key(
         Ok(map) => map,
         Err(e) => {
             let msg = e.to_string();
-            // Strip serde position suffix
-            let clean = if let Some(idx) = msg.rfind(" at line ") {
-                let suffix = &msg[idx..];
-                if suffix.contains("column") {
-                    &msg[..idx]
-                } else {
-                    &msg
-                }
-            } else {
-                &msg
-            };
-            let inner = clean.strip_prefix("VALIDATION:").unwrap_or(clean);
+            // Strip the serde position suffix and any internal marker
+            let inner = crate::serde_errors::clean_serde_message(&msg);
 
             if inner.contains("empty AttributeValue")
                 || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
@@ -2252,18 +2231,8 @@ pub fn validate_filter_conditions_raw(
                     match serde_json::from_value::<AttributeValue>(av_val.clone()) {
                         Err(e) => {
                             let msg = e.to_string();
-                            // Strip serde position suffix
-                            let clean = if let Some(idx) = msg.rfind(" at line ") {
-                                let suffix = &msg[idx..];
-                                if suffix.contains("column") {
-                                    &msg[..idx]
-                                } else {
-                                    &msg
-                                }
-                            } else {
-                                &msg
-                            };
-                            let inner = clean.strip_prefix("VALIDATION:").unwrap_or(clean);
+                            // Strip the serde position suffix and any internal marker
+                            let inner = crate::serde_errors::clean_serde_message(&msg);
 
                             if inner.contains("empty AttributeValue")
                                 || (inner.contains("Supplied AttributeValue")

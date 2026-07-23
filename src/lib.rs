@@ -53,6 +53,10 @@ pub mod mcp;
 pub(crate) mod net;
 pub mod partiql;
 pub mod schema;
+// Surface-neutral mapping of serde failures to DynamoDB errors; the HTTP
+// server consumes the request wrappers and the shared message cleaning is
+// used wherever raw serde messages are decoded by hand.
+pub(crate) mod serde_errors;
 #[cfg(feature = "http-server")]
 pub mod server;
 #[cfg(feature = "mcp-server")]

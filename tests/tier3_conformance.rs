@@ -511,6 +511,8 @@ fn projection_expression_tokenizer_error_includes_near_window() {
 fn update_expression_missing_eav_carries_invalid_update_expression_prefix() {
     // R7: UpdateItem with `SET attr1 = :v` and no ExpressionAttributeValues should
     // carry the `Invalid UpdateExpression:` prefix on the missing-EAV message.
+    // UpdateItem wraps this family in the request-validation envelope at its
+    // operation boundary (eu-west-2), so the prefix sits inside the envelope.
     use dynoxide::actions::create_table::CreateTableRequest;
     use dynoxide::actions::update_item::UpdateItemRequest;
     let db = make_db();
@@ -531,8 +533,11 @@ fn update_expression_missing_eav_carries_invalid_update_expression_prefix() {
     .unwrap();
     let err = db.update_item(req).unwrap_err().to_string();
     assert!(
-        err.starts_with("Invalid UpdateExpression: An expression attribute value used in expression is not defined"),
-        "Expected Invalid UpdateExpression: prefix on missing-EAV error, got: {err}"
+        err.starts_with(
+            "1 validation error detected: Invalid UpdateExpression: \
+             An expression attribute value used in expression is not defined"
+        ),
+        "Expected enveloped Invalid UpdateExpression: prefix on missing-EAV error, got: {err}"
     );
 }
 

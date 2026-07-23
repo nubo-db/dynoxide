@@ -5,16 +5,35 @@
 //! converted to String". The helpers here translate the former into the
 //! latter, choosing between ValidationException and SerializationException
 //! the way DynamoDB does.
+//!
+//! Custom `Deserialize` impls signal the DynamoDB error class with a marker
+//! prefix on the serde message:
+//!
+//! - `VALIDATION:` maps to a bare `ValidationException`.
+//! - `VALIDATION_REQUEST:` maps to the request-validation class that PutItem
+//!   and UpdateItem wrap in the `1 validation error detected: ` envelope; it
+//!   becomes the wire-invisible `DynoxideError::EnvelopedValidation`, which
+//!   the server dispatch envelopes on those two operations and untags on
+//!   every other one.
+//!
+//! Neither marker may ever reach the wire. Callers that decode raw serde
+//! messages by hand go through [`clean_serde_message`], which strips both
+//! markers along with serde_json's position suffix.
 
-pub(super) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::Result<T> {
+#[cfg(feature = "http-server")]
+pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::Result<T> {
     serde_json::from_str(body).map_err(|e| {
         let msg = e.to_string();
-        // Custom validation errors from our Deserialize impls use a "VALIDATION:" prefix
-        // to signal that these should be ValidationException, not SerializationException.
-        if let Some(stripped) = msg.strip_prefix("VALIDATION:") {
-            // serde_json appends " at line N column N" to custom errors — strip it
+        // Marker prefixes from our Deserialize impls select the DynamoDB
+        // error class (see the module doc); serde_json appends
+        // " at line N column N" to custom errors, so strip that too.
+        if let Some(stripped) = msg.strip_prefix("VALIDATION_REQUEST:") {
             let clean = strip_serde_position(stripped);
-            return crate::DynoxideError::ValidationException(clean.to_string());
+            return crate::DynoxideError::EnvelopedValidation(clean);
+        }
+        if let Some(stripped) = msg.strip_prefix("VALIDATION:") {
+            let clean = strip_serde_position(stripped);
+            return crate::DynoxideError::ValidationException(clean);
         }
         // DynamoDB returns ValidationException for missing required fields,
         // null values, and unrecognised enum variants. Only true JSON type
@@ -30,7 +49,7 @@ pub(super) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
                 "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes".to_string(),
             )
         } else if msg.contains("Supplied AttributeValue") {
-            // Multi-datatype or empty AV error — strip position info and return as-is
+            // Multi-datatype or empty AV error: strip position info and return as-is
             let clean = strip_serde_position(&msg);
             crate::DynoxideError::ValidationException(clean)
         } else {
@@ -40,21 +59,41 @@ pub(super) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 }
 
 /// Strip serde_json's " at line N column N" suffix from error messages.
+#[cfg(feature = "http-server")]
 fn strip_serde_position(msg: &str) -> String {
+    strip_position(msg).to_string()
+}
+
+/// Slice-based position strip shared by [`strip_serde_position`] and
+/// [`clean_serde_message`].
+fn strip_position(msg: &str) -> &str {
     if let Some(idx) = msg.rfind(" at line ") {
         // Verify the suffix looks like " at line N column N"
-        let suffix = &msg[idx..];
-        if suffix.contains("column") {
-            return msg[..idx].to_string();
+        if msg[idx..].contains("column") {
+            return &msg[..idx];
         }
     }
-    msg.to_string()
+    msg
+}
+
+/// Strip serde_json's position suffix and either marker prefix from a raw
+/// serde error message.
+///
+/// Hand-rolled decoders that pattern-match serde messages route through this
+/// so no marker class can ever leak into a wire message.
+pub(crate) fn clean_serde_message(msg: &str) -> &str {
+    let clean = strip_position(msg);
+    clean
+        .strip_prefix("VALIDATION_REQUEST:")
+        .or_else(|| clean.strip_prefix("VALIDATION:"))
+        .unwrap_or(clean)
 }
 
 /// Map serde deserialisation error messages to DynamoDB-style SerializationException messages.
 ///
 /// DynamoDB returns specific messages like "NUMBER_VALUE cannot be converted to String"
 /// whereas serde returns "invalid type: integer `23`, expected a string at line 1 column 42".
+#[cfg(feature = "http-server")]
 fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
     // "invalid type: <type>, expected <target>"
     if let Some(rest) = msg.strip_prefix("invalid type: ") {
@@ -99,6 +138,7 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
 }
 
 /// Map a serde type mismatch to DynamoDB's SerializationException message.
+#[cfg(feature = "http-server")]
 fn map_type_mismatch(source: &str, target: &str) -> String {
     // Determine target type category
     let target_is_string = target == "a string";
@@ -212,6 +252,7 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
 
 /// Infer the DynamoDB type conversion error from a serde error message.
 /// Uses the column position to inspect the actual JSON value in the body.
+#[cfg(feature = "http-server")]
 fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> String {
     // Try to extract column number from "at line N column N"
     if let Some(col_str) = msg.rsplit("column ").next() {
@@ -235,6 +276,7 @@ fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> Stri
 }
 
 /// Map Rust struct names to DynamoDB Java class names for SerializationException messages.
+#[cfg(feature = "http-server")]
 fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
     match struct_name {
         "ProvisionedThroughput" | "ProvisionedThroughputRaw" => {
@@ -270,6 +312,83 @@ fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn serialize<T: serde::Serialize>(val: &T) -> crate::Result<String> {
+#[cfg(feature = "http-server")]
+pub(crate) fn serialize<T: serde::Serialize>(val: &T) -> crate::Result<String> {
     serde_json::to_string(val).map_err(|e| crate::DynoxideError::InternalServerError(e.to_string()))
+}
+
+#[cfg(all(test, feature = "http-server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_marker_maps_to_enveloped_validation() {
+        // A VALIDATION_REQUEST-marked serde error becomes the wire-invisible
+        // tag, with the marker and position suffix both stripped.
+        let err = serde_json::from_str::<crate::types::AttributeValue>(r#"{"NULL": false}"#)
+            .map_err(|e| e.to_string())
+            .unwrap_err();
+        assert!(
+            err.starts_with("VALIDATION_REQUEST:"),
+            "marker missing: {err}"
+        );
+
+        let decoded: crate::Result<crate::types::AttributeValue> =
+            deserialize(r#"{"NULL": false}"#);
+        match decoded.unwrap_err() {
+            crate::DynoxideError::EnvelopedValidation(msg) => {
+                assert_eq!(
+                    msg,
+                    "One or more parameter values were invalid: \
+                     Null attribute value types must have the value of true"
+                );
+            }
+            other => panic!("expected EnvelopedValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bare_marker_maps_to_validation_exception() {
+        // A VALIDATION-marked serde error stays a bare ValidationException.
+        let decoded: crate::Result<crate::types::AttributeValue> =
+            deserialize(r#"{"S": "a", "N": "1"}"#);
+        match decoded.unwrap_err() {
+            crate::DynoxideError::ValidationException(msg) => {
+                assert_eq!(
+                    msg,
+                    "Supplied AttributeValue has more than one datatypes set, \
+                     must contain exactly one of the supported datatypes"
+                );
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_clean_serde_message_strips_both_markers_and_position() {
+        assert_eq!(
+            clean_serde_message("VALIDATION_REQUEST:msg at line 1 column 42"),
+            "msg"
+        );
+        assert_eq!(
+            clean_serde_message("VALIDATION:msg at line 1 column 42"),
+            "msg"
+        );
+        assert_eq!(clean_serde_message("VALIDATION:msg"), "msg");
+        assert_eq!(
+            clean_serde_message("plain msg at line 3 column 7"),
+            "plain msg"
+        );
+        // A trailing " at line " without "column" is not a serde position
+        // suffix and stays untouched.
+        assert_eq!(clean_serde_message("look at line 9"), "look at line 9");
+        assert_eq!(clean_serde_message("plain msg"), "plain msg");
+    }
+
+    #[test]
+    fn test_strip_serde_position_unchanged() {
+        assert_eq!(strip_serde_position("msg at line 1 column 2"), "msg");
+        assert_eq!(strip_serde_position("msg"), "msg");
+        assert_eq!(strip_serde_position("look at line 9"), "look at line 9");
+    }
 }

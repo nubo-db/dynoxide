@@ -148,6 +148,19 @@ pub fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
     }
 }
 
+/// Convert the wire-invisible `EnvelopedValidation` tag back to a plain,
+/// unenveloped `ValidationException`. Every other error passes through
+/// unchanged.
+///
+/// Operations other than PutItem and UpdateItem report the request-validation
+/// family bare, and the tag must never reach the wire.
+pub fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::EnvelopedValidation(msg) => DynoxideError::ValidationException(msg),
+        other => other,
+    }
+}
+
 /// A validation failure from a shared validator, classified so PutItem and
 /// UpdateItem can tell which families DynamoDB wraps in the
 /// `1 validation error detected: ` envelope.
@@ -919,6 +932,31 @@ mod tests {
 
         let not_found =
             envelope_request_validation(DynoxideError::ResourceNotFoundException("msg".into()));
+        assert!(matches!(
+            &not_found,
+            DynoxideError::ResourceNotFoundException(m) if m == "msg"
+        ));
+    }
+
+    #[test]
+    fn test_strip_request_validation_tag_untags_without_envelope() {
+        let err = strip_request_validation_tag(DynoxideError::EnvelopedValidation("msg".into()));
+        assert!(matches!(
+            &err,
+            DynoxideError::ValidationException(m) if m == "msg"
+        ));
+    }
+
+    #[test]
+    fn test_strip_request_validation_tag_passes_other_errors_through() {
+        let plain = strip_request_validation_tag(DynoxideError::ValidationException("msg".into()));
+        assert!(matches!(
+            &plain,
+            DynoxideError::ValidationException(m) if m == "msg"
+        ));
+
+        let not_found =
+            strip_request_validation_tag(DynoxideError::ResourceNotFoundException("msg".into()));
         assert!(matches!(
             &not_found,
             DynoxideError::ResourceNotFoundException(m) if m == "msg"

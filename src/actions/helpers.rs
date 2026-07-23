@@ -907,6 +907,15 @@ pub fn parse_expression_attribute_values_raw(
                         "ExpressionAttributeValues contains invalid value: \
                          {inner} for key {key}"
                     )));
+                } else if inner.contains("Null attribute value types must have the value of true") {
+                    // A rejected {"NULL": false} fails to deserialise here with a
+                    // VALIDATION-prefixed message. Real DynamoDB rejects it with the
+                    // bare validation message, without the per-key "contains invalid
+                    // value" wrapper it uses for empty or malformed values, so surface
+                    // the inner message directly rather than leaking a
+                    // SerializationException with the raw prefix. Confirmed against
+                    // real DynamoDB (eu-west-2).
+                    return Err(DynoxideError::ValidationException(inner.to_string()));
                 } else {
                     return Err(DynoxideError::SerializationException(msg));
                 }

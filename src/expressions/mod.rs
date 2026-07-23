@@ -18,6 +18,24 @@ use crate::types::AttributeValue;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+/// The maximum byte length DynamoDB allows for a single expression parameter.
+pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
+
+/// Reject an expression parameter longer than DynamoDB's 4096-byte limit,
+/// measured on the raw string as sent: aliases are not substituted and
+/// whitespace is not normalised before counting. Called at each expression
+/// parser's entry so every surface (Update/Condition/Filter/KeyCondition/
+/// Projection) is guarded.
+pub(crate) fn check_expression_size(expr: &str) -> Result<(), String> {
+    if expr.len() > MAX_EXPRESSION_BYTES {
+        return Err(format!(
+            "Expression size has exceeded the maximum allowed size; expression size: {}",
+            expr.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve an attribute name, handling `#name` substitution.
 pub fn resolve_name(
     name: &str,

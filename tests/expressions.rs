@@ -1913,3 +1913,120 @@ fn test_set_rejects_deep_missing_intermediate() {
         err
     );
 }
+
+// ---------------------------------------------------------------------------
+// Expression size limit (4096 bytes) - rejected on each expression surface.
+// Confirmed against real DynamoDB (eu-west-2).
+// ---------------------------------------------------------------------------
+
+// Each expression surface prefixes the size error with `Invalid <Type>Expression:`,
+// matching real DynamoDB (eu-west-2).
+const UPDATE_OVERSIZE_MSG: &str =
+    "Invalid UpdateExpression: Expression size has exceeded the maximum allowed size";
+const CONDITION_OVERSIZE_MSG: &str =
+    "Invalid ConditionExpression: Expression size has exceeded the maximum allowed size";
+const PROJECTION_OVERSIZE_MSG: &str =
+    "Invalid ProjectionExpression: Expression size has exceeded the maximum allowed size";
+
+#[test]
+fn test_update_expression_over_size_limit_rejected() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+
+    // 4097-byte UpdateExpression: one byte past the 4096 limit.
+    let expr = format!("SET {} = :v", "a".repeat(4088));
+    assert_eq!(expr.len(), 4097);
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some(expr),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains(UPDATE_OVERSIZE_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_condition_expression_over_size_limit_rejected() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    // 4097-byte ConditionExpression.
+    let expr = format!("{} = :v", "a".repeat(4092));
+    assert_eq!(expr.len(), 4097);
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some(expr),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains(CONDITION_OVERSIZE_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_projection_expression_over_size_limit_rejected() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+
+    // 4097-byte ProjectionExpression (a single oversized attribute path).
+    let expr = "a".repeat(4097);
+
+    let err = db
+        .get_item(GetItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            consistent_read: None,
+            projection_expression: Some(expr),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains(PROJECTION_OVERSIZE_MSG),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_expression_at_size_limit_not_rejected_for_size() {
+    // A 4096-byte expression is within the limit: it may fail to parse for
+    // other reasons, but never with the size-limit message.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+
+    let expr = "a".repeat(4096);
+
+    let result = db.get_item(GetItemRequest {
+        table_name: "Tbl".to_string(),
+        key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+        consistent_read: None,
+        projection_expression: Some(expr),
+        ..Default::default()
+    });
+
+    // A 4096-byte projection of a single (absent) attribute is within the limit
+    // and parses cleanly, so the call succeeds and never trips the size guard.
+    assert!(
+        result.is_ok(),
+        "4096-byte expression should be within the limit, got: {:?}",
+        result.err()
+    );
+}

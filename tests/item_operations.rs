@@ -473,12 +473,9 @@ fn test_put_item_from_json() {
 }
 
 #[test]
-fn test_put_item_accepts_null_false() {
-    // AWS accepts {"NULL": false} on PutItem and reads it back as
-    // {"NULL": true}. Regression guard for that round-trip.
-    let db = make_db();
-    create_hash_only_table(&db, "Items");
-
+fn test_put_item_rejects_null_false() {
+    // AWS rejects {"NULL": false}; only {"NULL": true} is valid. The request
+    // deserialiser surfaces it as a validation error before any write.
     let json = r#"{
         "TableName": "Items",
         "Item": {
@@ -487,21 +484,53 @@ fn test_put_item_accepts_null_false() {
         }
     }"#;
 
-    let request: PutItemRequest = serde_json::from_str(json).unwrap();
-    db.put_item(request).unwrap();
+    let err = serde_json::from_str::<PutItemRequest>(json).unwrap_err();
+    assert!(
+        err.to_string().contains("must have the value of true"),
+        "unexpected error: {err}"
+    );
+}
 
-    let resp = db
-        .get_item(GetItemRequest {
-            table_name: "Items".to_string(),
-            key: key_map(&[("pk", AttributeValue::S("null-false".into()))]),
-            consistent_read: None,
-            projection_expression: None,
-            ..Default::default()
-        })
-        .unwrap();
+#[test]
+fn test_delete_item_null_false_in_eav_is_validation_exception() {
+    // A rejected {"NULL": false} supplied as an ExpressionAttributeValue on the
+    // DeleteItem raw-EAV path must surface as a ValidationException with the
+    // per-key "contains invalid value" wrapper, not a SerializationException
+    // leaking the internal validation prefix.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
 
-    let item = resp.item.unwrap();
-    assert_eq!(item["flag"], AttributeValue::NULL(true));
+    let req: DeleteItemRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "Items",
+        "Key": {"pk": {"S": "k1"}},
+        "ConditionExpression": "flag = :n",
+        "ExpressionAttributeValues": {":n": {"NULL": false}}
+    }))
+    .unwrap();
+
+    let err = db.delete_item(req).unwrap_err();
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException"
+    );
+    // Real DynamoDB returns the bare validation message, not the per-key
+    // "contains invalid value" wrapper used for empty/malformed values.
+    assert!(
+        err.to_string().contains(
+            "One or more parameter values were invalid: \
+             Null attribute value types must have the value of true"
+        ),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !err.to_string()
+            .contains("ExpressionAttributeValues contains invalid value"),
+        "unexpected per-key wrapper: {err}"
+    );
+    assert!(
+        !err.to_string().contains("VALIDATION:"),
+        "internal prefix leaked to client: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

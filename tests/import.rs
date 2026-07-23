@@ -611,6 +611,205 @@ fields = ["email"]
     }
 
     #[test]
+    fn test_scaffold_billing_mode_and_table_class_from_describe_table() {
+        // DescribeTable wraps billing mode and table class in summary objects
+        // and reports zeroed ProvisionedThroughput blocks for on-demand tables.
+        // The schema path must unwrap the summaries and drop the throughput
+        // blocks, or the table comes back PROVISIONED / STANDARD.
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "Table": {
+                "TableName": "OnDemand",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "gsi1pk", "AttributeType": "S"}
+                ],
+                "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"},
+                "TableClassSummary": {"TableClass": "STANDARD_INFREQUENT_ACCESS"},
+                "ProvisionedThroughput": {
+                    "NumberOfDecreasesToday": 0,
+                    "ReadCapacityUnits": 0,
+                    "WriteCapacityUnits": 0
+                },
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": "gsi1",
+                    "KeySchema": [{"AttributeName": "gsi1pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "NumberOfDecreasesToday": 0,
+                        "ReadCapacityUnits": 0,
+                        "WriteCapacityUnits": 0
+                    }
+                }]
+            }
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let info = db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "OnDemand".to_string(),
+            })
+            .unwrap();
+        let billing = info
+            .table
+            .billing_mode_summary
+            .expect("BillingModeSummary should survive the schema round trip");
+        assert_eq!(billing.billing_mode, "PAY_PER_REQUEST");
+        let class = info
+            .table
+            .table_class_summary
+            .expect("TableClassSummary should survive the schema round trip");
+        assert_eq!(class.table_class, "STANDARD_INFREQUENT_ACCESS");
+    }
+
+    #[test]
+    fn test_scaffold_keeps_provisioned_throughput_for_provisioned_tables() {
+        // The strip only applies to on-demand tables. A provisioned table's
+        // describe output carries real capacity values, and they must survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "Table": {
+                "TableName": "Provisioned",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "gsi1pk", "AttributeType": "S"}
+                ],
+                "BillingModeSummary": {"BillingMode": "PROVISIONED"},
+                "ProvisionedThroughput": {
+                    "NumberOfDecreasesToday": 0,
+                    "ReadCapacityUnits": 7,
+                    "WriteCapacityUnits": 3
+                },
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": "gsi1",
+                    "KeySchema": [{"AttributeName": "gsi1pk", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "NumberOfDecreasesToday": 0,
+                        "ReadCapacityUnits": 5,
+                        "WriteCapacityUnits": 2
+                    }
+                }]
+            }
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let info = db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "Provisioned".to_string(),
+            })
+            .unwrap();
+        let pt = info
+            .table
+            .provisioned_throughput
+            .expect("provisioned throughput should survive the schema round trip");
+        assert_eq!(pt.read_capacity_units, 7);
+        assert_eq!(pt.write_capacity_units, 3);
+    }
+
+    #[test]
+    fn test_scaffold_rejects_inconsistent_create_table_shaped_schema() {
+        // A schema already in CreateTable shape passes through untouched, so
+        // a top-level PAY_PER_REQUEST paired with ProvisionedThroughput still
+        // fails validation, exactly as it would on the CreateTable API.
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "TableName": "Inconsistent",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "ProvisionedThroughput": {
+                "ReadCapacityUnits": 5,
+                "WriteCapacityUnits": 5
+            }
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let err = import::scaffold_from_schema(&db, &schema_file).unwrap_err();
+        assert!(
+            err.to_string().contains("PAY_PER_REQUEST"),
+            "expected the CreateTable validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scaffold_round_trips_own_describe_output() {
+        // A table's own DescribeTable output, used as a schema file, must
+        // recreate the table without degrading billing mode or table class.
+        let source_db = dynoxide::Database::memory().unwrap();
+        source_db
+            .create_table(dynoxide::actions::create_table::CreateTableRequest {
+                table_name: "RoundTrip".to_string(),
+                key_schema: vec![dynoxide::types::KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: dynoxide::types::KeyType::HASH,
+                }],
+                attribute_definitions: vec![dynoxide::types::AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: dynoxide::types::ScalarAttributeType::S,
+                }],
+                billing_mode: Some("PAY_PER_REQUEST".to_string()),
+                table_class: Some("STANDARD_INFREQUENT_ACCESS".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let described = source_db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "RoundTrip".to_string(),
+            })
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "Table": serde_json::to_value(&described.table).unwrap()
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let info = db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "RoundTrip".to_string(),
+            })
+            .unwrap();
+        let billing = info
+            .table
+            .billing_mode_summary
+            .expect("billing mode should survive a describe-scaffold round trip");
+        assert_eq!(billing.billing_mode, "PAY_PER_REQUEST");
+        let class = info
+            .table
+            .table_class_summary
+            .expect("table class should survive a describe-scaffold round trip");
+        assert_eq!(class.table_class, "STANDARD_INFREQUENT_ACCESS");
+    }
+
+    #[test]
     fn test_scaffold_missing_file_errors() {
         let db = dynoxide::Database::memory().unwrap();
         let result = import::scaffold_from_schema(

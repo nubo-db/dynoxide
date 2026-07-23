@@ -450,12 +450,60 @@ fn find_table_json(schema_json: &serde_json::Value, table_name: &str) -> Option<
     for item in items {
         let table = item.get("Table").unwrap_or(item);
         if table.get("TableName").and_then(|v| v.as_str()) == Some(table_name) {
-            // Convert from DescribeTable format to CreateTableRequest format
-            // The field names are the same (PascalCase) — just strip the "Table" wrapper
-            return Some(table.clone());
+            // Convert from DescribeTable format to CreateTableRequest format:
+            // strip the "Table" wrapper, then translate the fields whose shape
+            // differs between the two.
+            let mut table = table.clone();
+            unwrap_describe_table_shapes(&mut table);
+            return Some(table);
         }
     }
     None
+}
+
+/// Translate DescribeTable-only shapes into their CreateTableRequest
+/// equivalents. DescribeTable wraps billing mode and table class in summary
+/// objects (`BillingModeSummary`, `TableClassSummary`), which CreateTable
+/// never reads, so both would otherwise fall back to their defaults. It also
+/// reports zeroed `ProvisionedThroughput` blocks on an on-demand table and
+/// its GSIs, which CreateTable rejects, so those are dropped too. The drop
+/// is gated on the billing mode having come from the summary: a schema
+/// already in CreateTable shape passes through untouched, so an inconsistent
+/// one still fails validation exactly as it would on the CreateTable API.
+fn unwrap_describe_table_shapes(table: &mut serde_json::Value) {
+    let Some(obj) = table.as_object_mut() else {
+        return;
+    };
+
+    let mut billing_mode_hoisted = false;
+    for (summary_key, field_key) in [
+        ("BillingModeSummary", "BillingMode"),
+        ("TableClassSummary", "TableClass"),
+    ] {
+        if !obj.contains_key(field_key) {
+            if let Some(value) = obj.get(summary_key).and_then(|s| s.get(field_key)) {
+                let value = value.clone();
+                obj.insert(field_key.to_string(), value);
+                billing_mode_hoisted |= field_key == "BillingMode";
+            }
+        }
+    }
+
+    if billing_mode_hoisted
+        && obj.get("BillingMode").and_then(|v| v.as_str()) == Some("PAY_PER_REQUEST")
+    {
+        obj.remove("ProvisionedThroughput");
+        if let Some(gsis) = obj
+            .get_mut("GlobalSecondaryIndexes")
+            .and_then(|v| v.as_array_mut())
+        {
+            for gsi in gsis {
+                if let Some(gsi) = gsi.as_object_mut() {
+                    gsi.remove("ProvisionedThroughput");
+                }
+            }
+        }
+    }
 }
 
 /// Extract key attribute names from a CreateTableRequest.

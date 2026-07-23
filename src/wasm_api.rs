@@ -88,30 +88,31 @@ fn unsupported_envelope(op: &str) -> String {
 /// Generic over the backend so the contract is the same on native rusqlite and
 /// the wasm bridge. `Ok` carries the response JSON; `Err` carries a stable error
 /// envelope (`DynoxideError::to_json` for API errors,
-/// [`unsupported_envelope`] for unknown/unsupported ops). Deserialisation of a
-/// malformed `request_json` is itself an API error (`SerializationException`),
-/// never a panic.
+/// [`unsupported_envelope`] for unknown/unsupported ops). Request
+/// deserialisation goes through the shared decoder, so a malformed or invalid
+/// `request_json` classifies exactly as it does over HTTP, never a panic.
 pub async fn dispatch<S: StorageBackend>(
     backend: &S,
     op: &str,
     request_json: &str,
 ) -> std::result::Result<String, String> {
-    // Each arm: deserialise the request (a parse failure is a
-    // SerializationException), run the shared handler (an API error becomes its
-    // own envelope), then serialise the response.
+    // Each arm: deserialise the request through the shared decoder (so a parse
+    // failure classifies exactly as it does over HTTP), run the shared handler,
+    // then serialise the response.
     macro_rules! run {
         ($module:ident) => {{
-            let request = serde_json::from_str(request_json)
-                .map_err(|e| DynoxideError::SerializationException(e.to_string()).to_json())?;
-            let response = actions::$module::execute(backend, request)
-                .await
-                .map_err(|e| e.to_json())?;
-            serde_json::to_string(&response)
-                .map_err(|e| DynoxideError::InternalServerError(e.to_string()).to_json())
+            match crate::serde_errors::deserialize(request_json) {
+                Ok(request) => match actions::$module::execute(backend, request).await {
+                    Ok(response) => serde_json::to_string(&response)
+                        .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
         }};
     }
 
-    match op {
+    let result: crate::Result<String> = match op {
         "CreateTable" => run!(create_table),
         "DeleteTable" => run!(delete_table),
         "DescribeTable" => run!(describe_table),
@@ -126,8 +127,14 @@ pub async fn dispatch<S: StorageBackend>(
         "BatchGetItem" => run!(batch_get_item),
         "BatchWriteItem" => run!(batch_write_item),
         "TransactGetItems" => run!(transact_get_items),
-        other => Err(unsupported_envelope(other)),
-    }
+        other => return Err(unsupported_envelope(other)),
+    };
+
+    // Same seam as the HTTP dispatch: resolve the wire-invisible
+    // EnvelopedValidation tag for the operation before serialising.
+    result
+        .map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
+        .map_err(|e| e.to_json())
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +463,115 @@ mod tests {
         assert_eq!(CONTRACT_VERSION, 1);
         assert!(SUPPORTED_OPS.contains(&"Query"));
         assert!(SUPPORTED_OPS.contains(&"Scan"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Request-validation classification parity with the HTTP surface
+    // -----------------------------------------------------------------------
+
+    /// The enveloped rejection PutItem and UpdateItem return for
+    /// {"NULL": false}, shared verbatim with tests/http_server.rs.
+    const NULL_FALSE_ENVELOPED: &str = "1 validation error detected: \
+     One or more parameter values were invalid: \
+     Null attribute value types must have the value of true";
+
+    /// The bare rejection every other operation returns for {"NULL": false},
+    /// shared verbatim with tests/http_server.rs.
+    const NULL_FALSE_BARE: &str = "One or more parameter values were invalid: \
+     Null attribute value types must have the value of true";
+
+    /// Assert a ValidationException payload with an exact message, and that no
+    /// internal marker or serde position suffix leaked into it.
+    fn assert_validation_payload(err: &str, expected_message: &str) {
+        assert!(
+            !err.contains("VALIDATION") && !err.contains(" at line "),
+            "internal marker or serde position leaked: {err}"
+        );
+        let v: serde_json::Value = serde_json::from_str(err).unwrap();
+        assert!(
+            v["__type"]
+                .as_str()
+                .unwrap()
+                .ends_with("ValidationException"),
+            "unexpected __type: {}",
+            v["__type"]
+        );
+        assert_eq!(v["message"].as_str().unwrap(), expected_message);
+    }
+
+    #[test]
+    fn put_item_null_false_in_item_is_enveloped_validation() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let put = r#"{"TableName":"Music","Item":{"artist":{"S":"a"},"song":{"S":"s1"},"flag":{"NULL":false}}}"#;
+        let err = run(&backend, "PutItem", put).unwrap_err();
+        assert_validation_payload(&err, NULL_FALSE_ENVELOPED);
+    }
+
+    #[test]
+    fn get_item_null_false_in_key_is_bare_validation() {
+        // The marker-tagged serde failure classifies as a ValidationException
+        // (not a SerializationException), reported bare outside
+        // PutItem/UpdateItem, exactly as it does over HTTP.
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let get = r#"{"TableName":"Music","Key":{"artist":{"NULL":false},"song":{"S":"s1"}}}"#;
+        let err = run(&backend, "GetItem", get).unwrap_err();
+        assert_validation_payload(&err, NULL_FALSE_BARE);
+    }
+
+    #[test]
+    fn missing_field_classifies_as_validation_like_http() {
+        // BatchGetItem without RequestItems is a plain serde "missing field"
+        // failure. The shared decoder classifies it as a ValidationException,
+        // matching the HTTP surface (previously a SerializationException on
+        // this surface).
+        let backend = Storage::memory().unwrap();
+        let err = run(&backend, "BatchGetItem", "{}").unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["__type"], "com.amazon.coral.validate#ValidationException");
+    }
+
+    #[test]
+    fn error_payloads_never_leak_markers_or_positions() {
+        // Sweep the request-validation family across the dispatch: no error
+        // payload may carry the internal VALIDATION markers or serde's
+        // position suffix.
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let cases: &[(&str, &str)] = &[
+            (
+                "PutItem",
+                r#"{"TableName":"Music","Item":{"artist":{"S":"a"},"song":{"S":"s"},"flag":{"NULL":false}}}"#,
+            ),
+            (
+                "UpdateItem",
+                r#"{"TableName":"Music","Key":{"artist":{"NULL":false},"song":{"S":"s"}},"UpdateExpression":"SET x = :v","ExpressionAttributeValues":{":v":{"S":"v"}}}"#,
+            ),
+            (
+                "GetItem",
+                r#"{"TableName":"Music","Key":{"artist":{"NULL":false},"song":{"S":"s"}}}"#,
+            ),
+            (
+                "DeleteItem",
+                r#"{"TableName":"Music","Key":{"artist":{"NULL":false},"song":{"S":"s"}}}"#,
+            ),
+            (
+                "Query",
+                r#"{"TableName":"Music","KeyConditionExpression":"artist = :a","ExpressionAttributeValues":{":a":{"NULL":false}}}"#,
+            ),
+            ("DeleteTable", "{}"),
+        ];
+        for (op, body) in cases {
+            let err = run(&backend, op, body).unwrap_err();
+            assert!(
+                !err.contains("VALIDATION") && !err.contains(" at line "),
+                "{op}: internal marker or serde position leaked: {err}"
+            );
+        }
     }
 
     #[test]

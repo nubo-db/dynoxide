@@ -551,28 +551,46 @@ pub struct BulkPutItemsParams {
 // Helper: convert serde_json::Value → HashMap<String, AttributeValue>
 // ---------------------------------------------------------------------------
 
-fn parse_dynamo_map(
+/// Decode a DynamoDB JSON map, classifying failures as `DynoxideError`s.
+///
+/// Marker-tagged serde failures classify through the shared decoder in
+/// `serde_errors`, so the internal markers never reach a tool error; any
+/// other failure keeps the field-specific message.
+fn decode_dynamo_map(
     val: serde_json::Value,
     field_name: &str,
-) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
+) -> Result<HashMap<String, AttributeValue>, crate::errors::DynoxideError> {
     serde_json::from_value(val).map_err(|e| {
-        CallToolResult::error(vec![Content::text(
-            serde_json::json!({
-                "error_type": "ValidationException",
-                "message": format!("Invalid DynamoDB JSON in '{field_name}': {e}"),
-                "retryable": false,
-            })
-            .to_string(),
-        )])
+        let msg = e.to_string();
+        crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
+            crate::errors::DynoxideError::ValidationException(format!(
+                "Invalid DynamoDB JSON in '{field_name}': {msg}"
+            ))
+        })
     })
 }
 
+/// Parse a DynamoDB JSON map, resolving the wire-invisible request-validation
+/// tag with the given function: the put_item and update_item tools pass
+/// `envelope_request_validation`, matching their envelope on the HTTP
+/// surface; every other tool passes `strip_request_validation_tag`, reporting
+/// the family bare.
+fn parse_dynamo_map(
+    val: serde_json::Value,
+    field_name: &str,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
+) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
+    decode_dynamo_map(val, field_name).map_err(|e| to_tool_error(resolve(e)))
+}
+
+/// Optional-map variant of [`parse_dynamo_map`].
 fn parse_optional_dynamo_map(
     val: Option<serde_json::Value>,
     field_name: &str,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
     match val {
-        Some(v) => parse_dynamo_map(v, field_name).map(Some),
+        Some(v) => parse_dynamo_map(v, field_name, resolve).map(Some),
         None => Ok(None),
     }
 }
@@ -596,15 +614,28 @@ fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
 
 /// Parse a required JSON value into a typed result, returning a tool validation
 /// error (not an McpError) on failure so the agent conversation continues.
+///
+/// Marker-tagged serde failures classify through the shared decoder in
+/// `serde_errors` and report the request-validation family bare, exactly as
+/// [`decode_dynamo_map`] does; genuinely malformed input keeps the
+/// field-specific message, with the echoed serde text cleaned so neither
+/// marker nor position suffix can leak.
 fn parse_json_param<T: serde::de::DeserializeOwned>(
     val: serde_json::Value,
     param_name: &str,
 ) -> Result<T, CallToolResult> {
     serde_json::from_value(val).map_err(|e| {
-        tool_validation_error(
-            &format!("Invalid{}", capitalize_first(param_name)),
-            &format!("Invalid {param_name}: {e}"),
-        )
+        let msg = e.to_string();
+        match crate::serde_errors::classify_marked_serde_error(&msg) {
+            Some(err) => to_tool_error(crate::validation::strip_request_validation_tag(err)),
+            None => tool_validation_error(
+                &format!("Invalid{}", capitalize_first(param_name)),
+                &format!(
+                    "Invalid {param_name}: {}",
+                    crate::serde_errors::clean_serde_message(&msg)
+                ),
+            ),
+        }
     })
 }
 
@@ -882,13 +913,18 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("put_item") {
             return Ok(err);
         }
-        let item = match parse_dynamo_map(params.item, "item") {
+        let item = match parse_dynamo_map(
+            params.item,
+            "item",
+            crate::validation::envelope_request_validation,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::envelope_request_validation,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -916,7 +952,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetItemParams>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match parse_dynamo_map(params.key, "key") {
+        let key = match parse_dynamo_map(
+            params.key,
+            "key",
+            crate::validation::strip_request_validation_tag,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
@@ -945,13 +985,18 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("update_item") {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(params.key, "key") {
+        let key = match parse_dynamo_map(
+            params.key,
+            "key",
+            crate::validation::envelope_request_validation,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::envelope_request_validation,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -985,15 +1030,19 @@ impl McpServer {
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let exclusive_start_key =
-            match parse_optional_dynamo_map(params.exclusive_start_key, "exclusive_start_key") {
-                Ok(v) => v,
-                Err(err) => return Ok(err),
-            };
+        let exclusive_start_key = match parse_optional_dynamo_map(
+            params.exclusive_start_key,
+            "exclusive_start_key",
+            crate::validation::strip_request_validation_tag,
+        ) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
 
         let request = crate::actions::query::QueryRequest {
             table_name: params.table_name,
@@ -1026,15 +1075,19 @@ impl McpServer {
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let exclusive_start_key =
-            match parse_optional_dynamo_map(params.exclusive_start_key, "exclusive_start_key") {
-                Ok(v) => v,
-                Err(err) => return Ok(err),
-            };
+        let exclusive_start_key = match parse_optional_dynamo_map(
+            params.exclusive_start_key,
+            "exclusive_start_key",
+            crate::validation::strip_request_validation_tag,
+        ) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
 
         let request = crate::actions::scan::ScanRequest {
             table_name: params.table_name,
@@ -1070,13 +1123,18 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("delete_item") {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(params.key, "key") {
+        let key = match parse_dynamo_map(
+            params.key,
+            "key",
+            crate::validation::strip_request_validation_tag,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1113,7 +1171,7 @@ impl McpServer {
         // We accept both PascalCase and snake_case keys for agent ergonomics.
         let request_items = match parse_batch_write_request_items(params.request_items) {
             Ok(v) => v,
-            Err(e) => return Ok(tool_validation_error("InvalidRequestItems", &e)),
+            Err(e) => return Ok(e),
         };
 
         let request = crate::actions::batch_write_item::BatchWriteItemRequest {
@@ -1135,7 +1193,7 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let request_items = match parse_batch_get_request_items(params.request_items) {
             Ok(v) => v,
-            Err(e) => return Ok(tool_validation_error("InvalidRequestItems", &e)),
+            Err(e) => return Ok(e),
         };
 
         let request = crate::actions::batch_get_item::BatchGetItemRequest {
@@ -1171,13 +1229,32 @@ impl McpServer {
                 ));
             }
         }
-        let parameters: Option<Vec<AttributeValue>> =
-            match params.parameters {
-                Some(val) => Some(serde_json::from_value(val).map_err(|e| {
-                    McpError::invalid_params(format!("Invalid parameters: {e}"), None)
-                })?),
-                None => None,
-            };
+        let parameters: Option<Vec<AttributeValue>> = match params.parameters {
+            Some(val) => match serde_json::from_value(val) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    // Marker-tagged serde failures classify through the shared
+                    // decoder, reporting the request-validation family bare;
+                    // malformed input keeps the field-specific message, with
+                    // the echoed serde text cleaned so neither marker nor
+                    // position suffix can leak.
+                    let msg = e.to_string();
+                    if let Some(err) = crate::serde_errors::classify_marked_serde_error(&msg) {
+                        return Ok(to_tool_error(
+                            crate::validation::strip_request_validation_tag(err),
+                        ));
+                    }
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Invalid parameters: {}",
+                            crate::serde_errors::clean_serde_message(&msg)
+                        ),
+                        None,
+                    ));
+                }
+            },
+            None => None,
+        };
 
         let request = crate::actions::execute_statement::ExecuteStatementRequest {
             statement: params.statement,
@@ -1744,7 +1821,11 @@ impl McpServer {
 
         let mut parsed_items = Vec::with_capacity(params.items.len());
         for (i, item_val) in params.items.into_iter().enumerate() {
-            match parse_dynamo_map(item_val, &format!("items[{i}]")) {
+            match parse_dynamo_map(
+                item_val,
+                &format!("items[{i}]"),
+                crate::validation::strip_request_validation_tag,
+            ) {
                 Ok(item) => parsed_items.push(item),
                 Err(err) => return Ok(err),
             }
@@ -1819,20 +1900,41 @@ impl ServerHandler for McpServer {
 // Batch operation parsing helpers
 // ---------------------------------------------------------------------------
 
+/// Tool error for malformed batch request_items, mirroring the wording the
+/// batch decoders below have always produced.
+fn invalid_request_items_error(message: &str) -> CallToolResult {
+    tool_validation_error("InvalidRequestItems", message)
+}
+
+/// Classify a serde failure inside the hand-rolled batch decoders: a
+/// marker-tagged failure classifies through the shared decoder in
+/// `serde_errors`, reporting the request-validation family bare; anything else
+/// keeps the site's message, with the echoed serde text cleaned so neither
+/// marker nor position suffix can leak.
+fn batch_decode_error(context: &str, msg: &str) -> CallToolResult {
+    match crate::serde_errors::classify_marked_serde_error(msg) {
+        Some(err) => to_tool_error(crate::validation::strip_request_validation_tag(err)),
+        None => invalid_request_items_error(&format!(
+            "{context}: {}",
+            crate::serde_errors::clean_serde_message(msg)
+        )),
+    }
+}
+
 /// Parse batch_write_item request_items from JSON Value.
 /// Accepts both PascalCase and snake_case keys.
 fn parse_batch_write_request_items(
     val: serde_json::Value,
-) -> Result<HashMap<String, Vec<crate::actions::batch_write_item::WriteRequest>>, String> {
+) -> Result<HashMap<String, Vec<crate::actions::batch_write_item::WriteRequest>>, CallToolResult> {
     let map = val
         .as_object()
-        .ok_or_else(|| "request_items must be an object".to_string())?;
+        .ok_or_else(|| invalid_request_items_error("request_items must be an object"))?;
 
     let mut result = HashMap::new();
     for (table_name, requests) in map {
-        let arr = requests
-            .as_array()
-            .ok_or_else(|| format!("request_items['{table_name}'] must be an array"))?;
+        let arr = requests.as_array().ok_or_else(|| {
+            invalid_request_items_error(&format!("request_items['{table_name}'] must be an array"))
+        })?;
 
         let mut write_requests = Vec::new();
         for req in arr {
@@ -1846,10 +1948,11 @@ fn parse_batch_write_request_items(
                     let item_val = p
                         .get("Item")
                         .or_else(|| p.get("item"))
-                        .ok_or_else(|| "PutRequest missing Item".to_string())?;
+                        .ok_or_else(|| invalid_request_items_error("PutRequest missing Item"))?;
                     let item: HashMap<String, AttributeValue> =
-                        serde_json::from_value(item_val.clone())
-                            .map_err(|e| format!("Invalid item in PutRequest: {e}"))?;
+                        serde_json::from_value(item_val.clone()).map_err(|e| {
+                            batch_decode_error("Invalid item in PutRequest", &e.to_string())
+                        })?;
                     Some(crate::actions::batch_write_item::PutRequest { item })
                 }
                 None => None,
@@ -1860,10 +1963,11 @@ fn parse_batch_write_request_items(
                     let key_val = d
                         .get("Key")
                         .or_else(|| d.get("key"))
-                        .ok_or_else(|| "DeleteRequest missing Key".to_string())?;
+                        .ok_or_else(|| invalid_request_items_error("DeleteRequest missing Key"))?;
                     let key: HashMap<String, AttributeValue> =
-                        serde_json::from_value(key_val.clone())
-                            .map_err(|e| format!("Invalid key in DeleteRequest: {e}"))?;
+                        serde_json::from_value(key_val.clone()).map_err(|e| {
+                            batch_decode_error("Invalid key in DeleteRequest", &e.to_string())
+                        })?;
                     Some(crate::actions::batch_write_item::DeleteRequest { key })
                 }
                 None => None,
@@ -1883,21 +1987,24 @@ fn parse_batch_write_request_items(
 /// Accepts both PascalCase and snake_case keys.
 fn parse_batch_get_request_items(
     val: serde_json::Value,
-) -> Result<HashMap<String, crate::actions::batch_get_item::KeysAndAttributes>, String> {
+) -> Result<HashMap<String, crate::actions::batch_get_item::KeysAndAttributes>, CallToolResult> {
     let map = val
         .as_object()
-        .ok_or_else(|| "request_items must be an object".to_string())?;
+        .ok_or_else(|| invalid_request_items_error("request_items must be an object"))?;
 
     let mut result = HashMap::new();
     for (table_name, attrs) in map {
         let keys_val = attrs
             .get("Keys")
             .or_else(|| attrs.get("keys"))
-            .ok_or_else(|| format!("request_items['{table_name}'] missing Keys"))?;
+            .ok_or_else(|| {
+                invalid_request_items_error(&format!("request_items['{table_name}'] missing Keys"))
+            })?;
 
-        let keys: Vec<HashMap<String, AttributeValue>> =
-            serde_json::from_value(keys_val.clone())
-                .map_err(|e| format!("Invalid keys for '{table_name}': {e}"))?;
+        let keys: Vec<HashMap<String, AttributeValue>> = serde_json::from_value(keys_val.clone())
+            .map_err(|e| {
+            batch_decode_error(&format!("Invalid keys for '{table_name}'"), &e.to_string())
+        })?;
 
         let projection_expression = attrs
             .get("ProjectionExpression")

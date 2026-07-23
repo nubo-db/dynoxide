@@ -12,9 +12,9 @@ fn short_error_type(err: &DynoxideError) -> &'static str {
     match err {
         DynoxideError::ResourceNotFoundException(_) => "ResourceNotFoundException",
         DynoxideError::ResourceInUseException(_) => "ResourceInUseException",
-        DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyValueValidation(_) => {
-            "ValidationException"
-        }
+        DynoxideError::ValidationException(_)
+        | DynoxideError::KeyEmptyValueValidation(_)
+        | DynoxideError::EnvelopedValidation(_) => "ValidationException",
         DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
         DynoxideError::TransactionCanceledException(..) => "TransactionCanceledException",
         DynoxideError::ItemCollectionSizeLimitExceededException(_) => {
@@ -75,6 +75,19 @@ mod tests {
         );
         assert_eq!(
             short_error_type(&DynoxideError::KeyEmptyValueValidation(String::new())),
+            "ValidationException",
+        );
+    }
+
+    #[test]
+    fn enveloped_validation_maps_to_validation_exception() {
+        // The MCP surface must treat EnvelopedValidation exactly like ValidationException.
+        assert_eq!(
+            short_error_type(&DynoxideError::EnvelopedValidation(String::new())),
+            short_error_type(&DynoxideError::ValidationException(String::new())),
+        );
+        assert_eq!(
+            short_error_type(&DynoxideError::EnvelopedValidation(String::new())),
             "ValidationException",
         );
     }

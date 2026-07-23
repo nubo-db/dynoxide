@@ -1368,6 +1368,32 @@ fn test_transact_put_non_scalar_table_key_is_cancellation_reason() {
 }
 
 #[test]
+fn test_transact_put_duplicate_ss_stays_bare_cancellation_reason() {
+    // Only PutItem envelopes the duplicate-set families; a transactional Put
+    // keeps the bare message as a ValidationError cancellation reason.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let req: serde_json::Value = json!({
+        "TransactItems": [
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "k1"}, "tags": {"SS": ["a", "a"]}}}}
+        ]
+    });
+    let err = db
+        .transact_write_items(serde_json::from_value(req).unwrap())
+        .unwrap_err();
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref().unwrap_or_default(),
+                "One or more parameter values were invalid: Input collection [a, a] contains duplicates."
+            );
+        }
+        other => panic!("duplicate SS must stay a bare cancellation reason, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_transact_empty_string_key_short_circuit_no_partial_write() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Table1");

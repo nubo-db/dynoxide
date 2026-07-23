@@ -51,14 +51,17 @@ fn test_accept_empty_string() {
 
 #[test]
 fn test_reject_empty_ss() {
+    // PutItem wraps the empty-set rejection in the request-validation envelope
+    // (eu-west-2). The double space after "set" is real.
     let db = make_db();
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S("key1".to_string()));
     item.insert("tags".to_string(), AttributeValue::SS(vec![]));
     let err = put_item(&db, item).unwrap_err();
-    assert!(
-        err.contains("string set") && err.contains("may not be empty"),
-        "unexpected error: {err}"
+    assert_eq!(
+        err,
+        "1 validation error detected: One or more parameter values were invalid: \
+         An string set  may not be empty"
     );
 }
 
@@ -69,9 +72,10 @@ fn test_reject_empty_ns() {
     item.insert("pk".to_string(), AttributeValue::S("key1".to_string()));
     item.insert("nums".to_string(), AttributeValue::NS(vec![]));
     let err = put_item(&db, item).unwrap_err();
-    assert!(
-        err.contains("number set") && err.contains("may not be empty"),
-        "unexpected error: {err}"
+    assert_eq!(
+        err,
+        "1 validation error detected: One or more parameter values were invalid: \
+         An number set  may not be empty"
     );
 }
 
@@ -82,9 +86,10 @@ fn test_reject_empty_bs() {
     item.insert("pk".to_string(), AttributeValue::S("key1".to_string()));
     item.insert("bins".to_string(), AttributeValue::BS(vec![]));
     let err = put_item(&db, item).unwrap_err();
-    assert!(
-        err.contains("Binary sets") && err.contains("not be empty"),
-        "unexpected error: {err}"
+    assert_eq!(
+        err,
+        "1 validation error detected: One or more parameter values were invalid: \
+         Binary sets should not be empty"
     );
 }
 
@@ -110,9 +115,10 @@ fn test_reject_empty_set_nested_in_list() {
         AttributeValue::L(vec![AttributeValue::SS(vec![])]),
     );
     let err = put_item(&db, item).unwrap_err();
-    assert!(
-        err.contains("string set") && err.contains("may not be empty"),
-        "unexpected error: {err}"
+    assert_eq!(
+        err,
+        "1 validation error detected: One or more parameter values were invalid: \
+         An string set  may not be empty"
     );
 }
 
@@ -185,4 +191,31 @@ fn test_batch_write_accept_empty_string() {
     let batch_req: dynoxide::actions::batch_write_item::BatchWriteItemRequest =
         serde_json::from_value(req).unwrap();
     db.batch_write_item(batch_req).unwrap();
+}
+
+#[test]
+fn test_batch_write_empty_set_stays_bare() {
+    // Only PutItem envelopes the empty-set families; BatchWriteItem keeps the
+    // bare message.
+    let db = make_db();
+
+    let req: serde_json::Value = serde_json::json!({
+        "RequestItems": {
+            "Tbl": [{
+                "PutRequest": {
+                    "Item": {
+                        "pk": {"S": "key1"},
+                        "tags": {"SS": []}
+                    }
+                }
+            }]
+        }
+    });
+    let batch_req: dynoxide::actions::batch_write_item::BatchWriteItemRequest =
+        serde_json::from_value(req).unwrap();
+    let err = db.batch_write_item(batch_req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: An string set  may not be empty"
+    );
 }

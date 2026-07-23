@@ -4,6 +4,7 @@ use crate::storage_backend::StorageBackend;
 use crate::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
+use crate::validation::ClassifiedValidationError;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -632,9 +633,16 @@ pub struct ExpressionParamContext<'a> {
 ///
 /// Returns the parsed `ExpressionAttributeValues` if raw JSON was provided
 /// and successfully parsed, so the caller can store it on the request.
+///
+/// The error is classified: the families DynamoDB wraps in the
+/// request-validation envelope on PutItem and UpdateItem (mixing expression
+/// and non-expression parameters, ExpressionAttributeValues without an
+/// expression, and empty or duplicate sets inside ExpressionAttributeValues)
+/// are marked as enveloped. Callers other than those two operations propagate
+/// with `?`, which converts back to the plain error unchanged.
 pub fn validate_expression_params(
     ctx: &ExpressionParamContext<'_>,
-) -> Result<Option<HashMap<String, AttributeValue>>> {
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, ClassifiedValidationError> {
     let has_expressions = !ctx.expression_params.is_empty();
     let has_non_expressions = !ctx.non_expression_params.is_empty();
     let has_names = ctx.expression_attribute_names.is_some();
@@ -646,7 +654,7 @@ pub fn validate_expression_params(
     if has_expressions && has_non_expressions {
         let non_expr = ctx.non_expression_params.join(", ");
         let expr = ctx.expression_params.join(", ");
-        return Err(DynoxideError::ValidationException(format!(
+        return Err(ClassifiedValidationError::enveloped(format!(
             "Can not use both expression and non-expression parameters in the same request: \
              Non-expression parameters: {{{non_expr}}} Expression parameters: {{{expr}}}"
         )));
@@ -654,8 +662,8 @@ pub fn validate_expression_params(
 
     // ExpressionAttributeNames without any expression
     if has_names && !has_expressions {
-        return Err(DynoxideError::ValidationException(
-            "ExpressionAttributeNames can only be specified when using expressions".to_string(),
+        return Err(ClassifiedValidationError::bare(
+            "ExpressionAttributeNames can only be specified when using expressions",
         ));
     }
 
@@ -671,7 +679,7 @@ pub fn validate_expression_params(
         } else {
             format!(": {}", null_parts.join(" and "))
         };
-        return Err(DynoxideError::ValidationException(format!(
+        return Err(ClassifiedValidationError::enveloped(format!(
             "ExpressionAttributeValues can only be specified when using expressions{suffix}"
         )));
     }
@@ -679,14 +687,14 @@ pub fn validate_expression_params(
     // Empty ExpressionAttributeNames
     if let Some(names) = ctx.expression_attribute_names {
         if names.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "ExpressionAttributeNames must not be empty".to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "ExpressionAttributeNames must not be empty",
             ));
         }
         // Validate key format (must start with #)
         for key in names.keys() {
             if !key.starts_with('#') {
-                return Err(DynoxideError::ValidationException(format!(
+                return Err(ClassifiedValidationError::bare(format!(
                     "ExpressionAttributeNames contains invalid key: Syntax error; key: \"{key}\""
                 )));
             }
@@ -697,14 +705,14 @@ pub fn validate_expression_params(
     if let Some(raw_val) = ctx.expression_attribute_values_raw {
         if let Some(obj) = raw_val.as_object() {
             if obj.is_empty() {
-                return Err(DynoxideError::ValidationException(
-                    "ExpressionAttributeValues must not be empty".to_string(),
+                return Err(ClassifiedValidationError::bare(
+                    "ExpressionAttributeValues must not be empty",
                 ));
             }
             // Validate key format (must start with :)
             for key in obj.keys() {
                 if !key.starts_with(':') {
-                    return Err(DynoxideError::ValidationException(format!(
+                    return Err(ClassifiedValidationError::bare(format!(
                         "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
                     )));
                 }
@@ -720,13 +728,13 @@ pub fn validate_expression_params(
     } else if let Some(values) = ctx.expression_attribute_values {
         // Pre-parsed EAV (e.g. from MCP/library usage)
         if values.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "ExpressionAttributeValues must not be empty".to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "ExpressionAttributeValues must not be empty",
             ));
         }
         for key in values.keys() {
             if !key.starts_with(':') {
-                return Err(DynoxideError::ValidationException(format!(
+                return Err(ClassifiedValidationError::bare(format!(
                     "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
                 )));
             }
@@ -740,35 +748,42 @@ pub fn validate_expression_params(
 }
 
 /// Validate a single ExpressionAttributeValues entry.
-fn validate_expression_attribute_value(key: &str, value: &AttributeValue) -> Result<()> {
+fn validate_expression_attribute_value(
+    key: &str,
+    value: &AttributeValue,
+) -> std::result::Result<(), ClassifiedValidationError> {
     // Over-deep expression values are rejected up front, before evaluation, with the
     // bare nesting message real DynamoDB uses (no "contains invalid value" wrapper).
     crate::validation::validate_nesting_depth(value)?;
     // Check for empty/unsupported datatypes
     match value {
+        // Unreachable from PutItem and UpdateItem, whose execute paths reject
+        // NULL(false) first with the captured message (no per-key wrapper),
+        // tagged for the envelope; this arm serves the other operations'
+        // pre-parsed in-process EAV paths.
         AttributeValue::NULL(b) if !b => {
-            return Err(DynoxideError::ValidationException(format!(
+            return Err(ClassifiedValidationError::bare(format!(
                 "ExpressionAttributeValues contains invalid value: \
                  One or more parameter values were invalid: \
                  Null attribute value types must have the value of true for key {key}"
             )));
         }
         AttributeValue::SS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(format!(
+            return Err(ClassifiedValidationError::enveloped(format!(
                 "ExpressionAttributeValues contains invalid value: \
                  One or more parameter values were invalid: \
                  An string set  may not be empty for key {key}"
             )));
         }
         AttributeValue::NS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(format!(
+            return Err(ClassifiedValidationError::enveloped(format!(
                 "ExpressionAttributeValues contains invalid value: \
                  One or more parameter values were invalid: \
                  An number set  may not be empty for key {key}"
             )));
         }
         AttributeValue::BS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(format!(
+            return Err(ClassifiedValidationError::enveloped(format!(
                 "ExpressionAttributeValues contains invalid value: \
                  One or more parameter values were invalid: \
                  Binary sets should not be empty for key {key}"
@@ -779,7 +794,7 @@ fn validate_expression_attribute_value(key: &str, value: &AttributeValue) -> Res
             for s in set {
                 if !seen.insert(s.clone()) {
                     let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(DynoxideError::ValidationException(format!(
+                    return Err(ClassifiedValidationError::enveloped(format!(
                         "ExpressionAttributeValues contains invalid value: \
                          One or more parameter values were invalid: \
                          Input collection [{}] contains duplicates. for key {key}",
@@ -797,7 +812,7 @@ fn validate_expression_attribute_value(key: &str, value: &AttributeValue) -> Res
                         .iter()
                         .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
                         .collect();
-                    return Err(DynoxideError::ValidationException(format!(
+                    return Err(ClassifiedValidationError::enveloped(format!(
                         "ExpressionAttributeValues contains invalid value: \
                          One or more parameter values were invalid: \
                          Input collection [{}]of type BS contains duplicates. for key {key}",
@@ -834,7 +849,7 @@ fn validate_expression_attribute_value(key: &str, value: &AttributeValue) -> Res
             for n in set {
                 let normalized = crate::types::normalize_dynamo_number(n);
                 if !seen.insert(normalized) {
-                    return Err(DynoxideError::ValidationException(format!(
+                    return Err(ClassifiedValidationError::enveloped(format!(
                         "ExpressionAttributeValues contains invalid value: \
                          Input collection contains duplicates for key {key}"
                     )));
@@ -844,6 +859,47 @@ fn validate_expression_attribute_value(key: &str, value: &AttributeValue) -> Res
         _ => {}
     }
     Ok(())
+}
+
+/// Reject `{NULL: false}` anywhere in an attribute-value map, recursing
+/// through lists and maps.
+///
+/// Matches the request-deserialisation rejection so the in-process API agrees
+/// with HTTP; confirmed against real DynamoDB (eu-west-2). Only PutItem and
+/// UpdateItem call this, for the captured positions (item body, Key,
+/// ExpressionAttributeValues and AttributeUpdates); batch, transact and import
+/// behaviour is unchanged. The error carries the wire-invisible envelope tag,
+/// unwrapped at the operation boundary.
+pub fn validate_no_null_false(values: &HashMap<String, AttributeValue>) -> Result<()> {
+    for value in values.values() {
+        validate_no_null_false_value(value)?;
+    }
+    Ok(())
+}
+
+/// Single-value form of [`validate_no_null_false`], for callers holding a bare
+/// `AttributeValue` rather than a map (the legacy AttributeUpdates entries).
+pub(crate) fn validate_no_null_false_value(value: &AttributeValue) -> Result<()> {
+    match value {
+        AttributeValue::NULL(b) if !b => Err(DynoxideError::EnvelopedValidation(
+            "One or more parameter values were invalid: \
+             Null attribute value types must have the value of true"
+                .to_string(),
+        )),
+        AttributeValue::L(list) => {
+            for v in list {
+                validate_no_null_false_value(v)?;
+            }
+            Ok(())
+        }
+        AttributeValue::M(map) => {
+            for v in map.values() {
+                validate_no_null_false_value(v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Parse raw EAV JSON into a `HashMap<String, AttributeValue>` with key-specific
@@ -870,19 +926,8 @@ pub fn parse_expression_attribute_values_raw(
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Extract the core error message (strip serde position suffix)
-                let clean = if let Some(idx) = msg.rfind(" at line ") {
-                    let suffix = &msg[idx..];
-                    if suffix.contains("column") {
-                        &msg[..idx]
-                    } else {
-                        &msg
-                    }
-                } else {
-                    &msg
-                };
-                // Strip VALIDATION: prefix if present
-                let inner = clean.strip_prefix("VALIDATION:").unwrap_or(clean);
+                // Strip the serde position suffix and any internal marker
+                let inner = crate::serde_errors::clean_serde_message(&msg);
 
                 if inner.contains("empty AttributeValue")
                     || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
@@ -909,10 +954,10 @@ pub fn parse_expression_attribute_values_raw(
                     )));
                 } else if inner.contains("Null attribute value types must have the value of true") {
                     // A rejected {"NULL": false} fails to deserialise here with a
-                    // VALIDATION-prefixed message. Real DynamoDB rejects it with the
+                    // marker-prefixed message. Real DynamoDB rejects it with the
                     // bare validation message, without the per-key "contains invalid
                     // value" wrapper it uses for empty or malformed values, so surface
-                    // the inner message directly rather than leaking a
+                    // the cleaned inner message directly rather than leaking a
                     // SerializationException with the raw prefix. Confirmed against
                     // real DynamoDB (eu-west-2).
                     return Err(DynoxideError::ValidationException(inner.to_string()));
@@ -1786,18 +1831,8 @@ pub fn parse_exclusive_start_key(
         Ok(map) => map,
         Err(e) => {
             let msg = e.to_string();
-            // Strip serde position suffix
-            let clean = if let Some(idx) = msg.rfind(" at line ") {
-                let suffix = &msg[idx..];
-                if suffix.contains("column") {
-                    &msg[..idx]
-                } else {
-                    &msg
-                }
-            } else {
-                &msg
-            };
-            let inner = clean.strip_prefix("VALIDATION:").unwrap_or(clean);
+            // Strip the serde position suffix and any internal marker
+            let inner = crate::serde_errors::clean_serde_message(&msg);
 
             if inner.contains("empty AttributeValue")
                 || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
@@ -2202,18 +2237,8 @@ pub fn validate_filter_conditions_raw(
                     match serde_json::from_value::<AttributeValue>(av_val.clone()) {
                         Err(e) => {
                             let msg = e.to_string();
-                            // Strip serde position suffix
-                            let clean = if let Some(idx) = msg.rfind(" at line ") {
-                                let suffix = &msg[idx..];
-                                if suffix.contains("column") {
-                                    &msg[..idx]
-                                } else {
-                                    &msg
-                                }
-                            } else {
-                                &msg
-                            };
-                            let inner = clean.strip_prefix("VALIDATION:").unwrap_or(clean);
+                            // Strip the serde position suffix and any internal marker
+                            let inner = crate::serde_errors::clean_serde_message(&msg);
 
                             if inner.contains("empty AttributeValue")
                                 || (inner.contains("Supplied AttributeValue")

@@ -123,12 +123,135 @@ pub fn format_validation_errors(errors: &[String]) -> Option<String> {
     if errors.is_empty() {
         return None;
     }
-    let prefix = format!(
-        "{} validation error{} detected: ",
+    if let [single] = errors {
+        return Some(envelope_message(single));
+    }
+    Some(format!(
+        "{} validation errors detected: {}",
         errors.len(),
-        if errors.len() == 1 { "" } else { "s" }
-    );
-    Some(format!("{}{}", prefix, errors.join("; ")))
+        errors.join("; ")
+    ))
+}
+
+/// The single-error form of the request-validation envelope. This and
+/// `format_validation_errors` are the only producers of the prefix wording.
+pub(crate) fn envelope_message(msg: &str) -> String {
+    format!("1 validation error detected: {msg}")
+}
+
+/// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
+/// envelope, converting it to a plain `ValidationException`. Every other error
+/// passes through unchanged.
+///
+/// PutItem and UpdateItem apply this at their operation boundary.
+pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::EnvelopedValidation(msg) => {
+            DynoxideError::ValidationException(envelope_message(&msg))
+        }
+        other => other,
+    }
+}
+
+/// Convert the wire-invisible `EnvelopedValidation` tag back to a plain,
+/// unenveloped `ValidationException`. Every other error passes through
+/// unchanged.
+///
+/// Operations other than PutItem and UpdateItem report the request-validation
+/// family bare, and the tag must never reach the wire.
+///
+/// Compiled only for the surfaces that resolve the tag: the HTTP server, the
+/// MCP tools, the wasm engine API, and the unit tests.
+#[cfg(any(
+    feature = "http-server",
+    feature = "mcp-server",
+    feature = "wasm-sqlite",
+    test
+))]
+pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::EnvelopedValidation(msg) => DynoxideError::ValidationException(msg),
+        other => other,
+    }
+}
+
+/// Resolve the wire-invisible `EnvelopedValidation` tag for a named operation:
+/// PutItem and UpdateItem wrap the request-validation family in the
+/// `1 validation error detected: ` envelope, every other operation reports it
+/// bare. Either way the tag never reaches the wire. Enveloping is idempotent
+/// for untagged errors, so applying this to an already-enveloped action error
+/// is safe.
+///
+/// Owner of the operation split for the HTTP and wasm dispatch seams, which
+/// both route through here. The same PutItem/UpdateItem membership is encoded
+/// at the action boundaries (`put_item::execute` / `update_item::execute`
+/// apply the envelope for the in-process API) and in the MCP tools' choice of
+/// resolver, so a future enveloped operation must update all three places.
+///
+/// Compiled only for the dispatch seams that consume it: the HTTP server, the
+/// wasm engine API, and the unit tests.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
+    match operation {
+        "PutItem" | "UpdateItem" => envelope_request_validation(err),
+        _ => strip_request_validation_tag(err),
+    }
+}
+
+/// A validation failure from a shared validator, classified so PutItem and
+/// UpdateItem can tell which families DynamoDB wraps in the
+/// `1 validation error detected: ` envelope.
+///
+/// Every other caller converts it straight back to the original error via the
+/// `From` impl, so plain `?` propagation keeps their behaviour byte-identical.
+#[derive(Debug)]
+pub(crate) enum ClassifiedValidationError {
+    /// A family DynamoDB reports bare, or an error adopted from an
+    /// unclassified helper.
+    Bare(DynoxideError),
+    /// A family DynamoDB wraps in the request-validation envelope on PutItem
+    /// and UpdateItem.
+    Enveloped(String),
+}
+
+impl ClassifiedValidationError {
+    /// A family DynamoDB reports bare.
+    pub(crate) fn bare(message: impl Into<String>) -> Self {
+        Self::Bare(DynoxideError::ValidationException(message.into()))
+    }
+
+    /// A family DynamoDB wraps in the request-validation envelope on PutItem
+    /// and UpdateItem.
+    pub(crate) fn enveloped(message: impl Into<String>) -> Self {
+        Self::Enveloped(message.into())
+    }
+
+    /// Convert for a PutItem/UpdateItem call site: enveloped families become
+    /// the wire-invisible `EnvelopedValidation` tag (unwrapped at the
+    /// operation boundary), everything else passes through unchanged.
+    pub(crate) fn into_tagged(self) -> DynoxideError {
+        match self {
+            Self::Enveloped(msg) => DynoxideError::EnvelopedValidation(msg),
+            Self::Bare(err) => err,
+        }
+    }
+}
+
+impl From<ClassifiedValidationError> for DynoxideError {
+    fn from(e: ClassifiedValidationError) -> Self {
+        match e {
+            ClassifiedValidationError::Enveloped(msg) => DynoxideError::ValidationException(msg),
+            ClassifiedValidationError::Bare(err) => err,
+        }
+    }
+}
+
+impl From<DynoxideError> for ClassifiedValidationError {
+    /// Errors adopted from unclassified helpers stay bare; only call sites
+    /// that know a family is enveloped construct the enveloped form.
+    fn from(error: DynoxideError) -> Self {
+        Self::Bare(error)
+    }
 }
 
 /// Validate key schema: exactly one HASH key, optionally one RANGE key.
@@ -337,38 +460,47 @@ const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limi
 ///
 /// **Important:** This must only be called on items being persisted, NOT on
 /// `ExpressionAttributeValues` (which may legitimately contain empty strings for comparisons).
-pub fn validate_item_attribute_values(item: &Item) -> Result<()> {
+pub fn validate_item_attribute_values(item: &Item) -> crate::Result<()> {
+    validate_item_attribute_values_classified(item).map_err(Into::into)
+}
+
+/// Classified form of [`validate_item_attribute_values`]: the set families
+/// (empty and duplicate SS/NS/BS) are marked as enveloped so PutItem and
+/// UpdateItem can wrap them in the request-validation envelope; number and
+/// nesting errors stay bare. Every other caller uses the public wrapper,
+/// which converts back to the plain error unchanged.
+pub(crate) fn validate_item_attribute_values_classified(
+    item: &Item,
+) -> std::result::Result<(), ClassifiedValidationError> {
     for value in item.values() {
         validate_attribute_value(value, 0)?;
     }
     Ok(())
 }
 
-fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> {
+fn validate_attribute_value(
+    value: &AttributeValue,
+    depth: usize,
+) -> std::result::Result<(), ClassifiedValidationError> {
     if depth >= MAX_NESTING_DEPTH {
-        return Err(DynoxideError::ValidationException(
-            NESTING_LIMIT_MESSAGE.to_string(),
-        ));
+        return Err(ClassifiedValidationError::bare(NESTING_LIMIT_MESSAGE));
     }
     match value {
-        AttributeValue::SS(set) if set.is_empty() => Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: An string set  may not be empty"
-                .to_string(),
+        AttributeValue::SS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
+            "One or more parameter values were invalid: An string set  may not be empty",
         )),
-        AttributeValue::NS(set) if set.is_empty() => Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: An number set  may not be empty"
-                .to_string(),
+        AttributeValue::NS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
+            "One or more parameter values were invalid: An number set  may not be empty",
         )),
-        AttributeValue::BS(set) if set.is_empty() => Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: Binary sets should not be empty"
-                .to_string(),
+        AttributeValue::BS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
+            "One or more parameter values were invalid: Binary sets should not be empty",
         )),
         AttributeValue::SS(set) if !set.is_empty() => {
             let mut seen = std::collections::HashSet::new();
             for s in set {
                 if !seen.insert(s.clone()) {
                     let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(DynoxideError::ValidationException(format!(
+                    return Err(ClassifiedValidationError::enveloped(format!(
                         "One or more parameter values were invalid: Input collection [{}] contains duplicates.",
                         display.join(", ")
                     )));
@@ -385,7 +517,7 @@ fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> 
                         .iter()
                         .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
                         .collect();
-                    return Err(DynoxideError::ValidationException(format!(
+                    return Err(ClassifiedValidationError::enveloped(format!(
                         "One or more parameter values were invalid: Input collection [{}]of type BS contains duplicates.",
                         display.join(", ")
                     )));
@@ -402,8 +534,8 @@ fn validate_attribute_value(value: &AttributeValue, depth: usize) -> Result<()> 
             for n in set {
                 let normalized = crate::types::normalize_dynamo_number(n);
                 if !seen.insert(normalized) {
-                    return Err(DynoxideError::ValidationException(
-                        "Input collection contains duplicates".to_string(),
+                    return Err(ClassifiedValidationError::enveloped(
+                        "Input collection contains duplicates",
                     ));
                 }
             }
@@ -805,5 +937,66 @@ mod tests {
 
         let schema = vec![hash_key("pk")];
         assert_eq!(sort_key_name(&schema), None);
+    }
+
+    #[test]
+    fn test_envelope_request_validation_wraps_tagged_error() {
+        let msg = "Value '' at 'expressionAttributeNames' failed to satisfy constraint: \
+                   Map value must satisfy constraint";
+        let err = envelope_request_validation(DynoxideError::EnvelopedValidation(msg.to_string()));
+        match err {
+            DynoxideError::ValidationException(m) => {
+                assert_eq!(m, format!("1 validation error detected: {msg}"));
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_envelope_request_validation_passes_other_errors_through() {
+        let plain = envelope_request_validation(DynoxideError::ValidationException("msg".into()));
+        assert!(matches!(
+            &plain,
+            DynoxideError::ValidationException(m) if m == "msg"
+        ));
+
+        let key_empty =
+            envelope_request_validation(DynoxideError::KeyEmptyValueValidation("msg".into()));
+        assert!(matches!(
+            &key_empty,
+            DynoxideError::KeyEmptyValueValidation(m) if m == "msg"
+        ));
+
+        let not_found =
+            envelope_request_validation(DynoxideError::ResourceNotFoundException("msg".into()));
+        assert!(matches!(
+            &not_found,
+            DynoxideError::ResourceNotFoundException(m) if m == "msg"
+        ));
+    }
+
+    #[test]
+    fn test_strip_request_validation_tag_untags_without_envelope() {
+        let err = strip_request_validation_tag(DynoxideError::EnvelopedValidation("msg".into()));
+        assert!(matches!(
+            &err,
+            DynoxideError::ValidationException(m) if m == "msg"
+        ));
+    }
+
+    #[test]
+    fn test_strip_request_validation_tag_passes_other_errors_through() {
+        let plain = strip_request_validation_tag(DynoxideError::ValidationException("msg".into()));
+        assert!(matches!(
+            &plain,
+            DynoxideError::ValidationException(m) if m == "msg"
+        ));
+
+        let not_found =
+            strip_request_validation_tag(DynoxideError::ResourceNotFoundException("msg".into()));
+        assert!(matches!(
+            &not_found,
+            DynoxideError::ResourceNotFoundException(m) if m == "msg"
+        ));
     }
 }

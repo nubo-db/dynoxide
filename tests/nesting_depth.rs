@@ -90,6 +90,20 @@ fn stored_item_rejects_32_levels() {
     );
 }
 
+#[test]
+fn stored_item_nesting_message_stays_bare() {
+    // The nesting-depth rejection on PutItem is not a captured enveloped family
+    // and keeps the bare message, byte for byte.
+    let db = make_db();
+    create_table(&db);
+    let err = put_with_data(&db, "bad", deep_map(32)).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Nesting Levels have exceeded supported limits: \
+         Attributes in the item have nested levels beyond supported limit"
+    );
+}
+
 // --- ExpressionAttributeValue (UpdateItem ConditionExpression) ---
 
 #[test]

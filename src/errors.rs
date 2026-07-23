@@ -46,6 +46,13 @@ pub enum DynoxideError {
     #[error("{0}")]
     KeyEmptyValueValidation(String),
 
+    /// A request-validation error that PutItem and UpdateItem wrap in the
+    /// `1 validation error detected: ` envelope at their operation boundary.
+    /// Serialises identically to `ValidationException` on every surface; the
+    /// distinct variant only tags where the envelope applies.
+    #[error("{0}")]
+    EnvelopedValidation(String),
+
     /// Conditional check (ConditionExpression) failed on write.
     /// Optionally carries the existing item when `ReturnValuesOnConditionCheckFailure` is `ALL_OLD`.
     #[error("{0}")]
@@ -145,7 +152,9 @@ impl DynoxideError {
             DynoxideError::ResourceInUseException(_) => {
                 "com.amazonaws.dynamodb.v20120810#ResourceInUseException"
             }
-            DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyValueValidation(_) => {
+            DynoxideError::ValidationException(_)
+            | DynoxideError::KeyEmptyValueValidation(_)
+            | DynoxideError::EnvelopedValidation(_) => {
                 "com.amazon.coral.validate#ValidationException"
             }
             DynoxideError::ConditionalCheckFailedException(..) => {
@@ -196,6 +205,7 @@ impl DynoxideError {
             DynoxideError::ResourceInUseException(_) => "ResourceInUse",
             DynoxideError::ValidationException(_)
             | DynoxideError::KeyEmptyValueValidation(_)
+            | DynoxideError::EnvelopedValidation(_)
             | DynoxideError::ConversionError(_) => "ValidationError",
             DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailed",
             DynoxideError::TransactionCanceledException(..) => "TransactionConflict",
@@ -365,6 +375,21 @@ mod tests {
             assert_eq!(empty.to_json(), plain.to_json());
             assert_eq!(empty.to_string(), plain.to_string());
         }
+    }
+
+    #[test]
+    fn test_enveloped_validation_is_wire_identical_to_validation_exception() {
+        // The variant must be indistinguishable from ValidationException on every wire
+        // surface; only the operation boundary treats it specially.
+        let msg = "One or more parameter values were invalid: \
+                   Type mismatch for key pk expected: S actual: N";
+        let enveloped = DynoxideError::EnvelopedValidation(msg.to_string());
+        let plain = DynoxideError::ValidationException(msg.to_string());
+        assert_eq!(enveloped.status_code(), plain.status_code());
+        assert_eq!(enveloped.error_type(), plain.error_type());
+        assert_eq!(enveloped.short_error_code(), plain.short_error_code());
+        assert_eq!(enveloped.to_json(), plain.to_json());
+        assert_eq!(enveloped.to_string(), plain.to_string());
     }
 
     #[test]

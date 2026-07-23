@@ -1240,7 +1240,13 @@ fn test_update_cannot_modify_key() {
         })
         .unwrap_err();
 
-    assert!(err.to_string().contains("part of the key"));
+    // Cannot-update-key is captured bare (eu-west-2): no request-validation
+    // envelope.
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: Cannot update attribute pk. \
+         This attribute is part of the key"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1816,6 +1822,11 @@ fn test_set_rejects_missing_intermediate_path() {
         "expected invalid path error, got: {}",
         err
     );
+    // Document-path-invalid is an apply-time error, captured bare (eu-west-2).
+    assert!(
+        !err.to_string().contains("validation error detected"),
+        "apply-time error must stay bare, got: {err}"
+    );
 }
 
 #[test]
@@ -1948,9 +1959,11 @@ fn test_update_expression_over_size_limit_rejected() {
         })
         .unwrap_err();
 
-    assert!(
-        err.to_string().contains(UPDATE_OVERSIZE_MSG),
-        "unexpected error: {err}"
+    // UpdateItem wraps UpdateExpression parse-time errors in the
+    // request-validation envelope (eu-west-2).
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {UPDATE_OVERSIZE_MSG}; expression size: 4097")
     );
 }
 
@@ -1973,9 +1986,11 @@ fn test_condition_expression_over_size_limit_rejected() {
         })
         .unwrap_err();
 
-    assert!(
-        err.to_string().contains(CONDITION_OVERSIZE_MSG),
-        "unexpected error: {err}"
+    // PutItem wraps ConditionExpression parse-time errors in the
+    // request-validation envelope (eu-west-2).
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG}; expression size: 4097")
     );
 }
 
@@ -2028,5 +2043,356 @@ fn test_expression_at_size_limit_not_rejected_for_size() {
         result.is_ok(),
         "4096-byte expression should be within the limit, got: {:?}",
         result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PutItem request-validation envelope.
+// PutItem wraps its action-time request-validation families in the
+// `1 validation error detected: ` envelope; families the capture shows bare
+// stay bare. Confirmed against real DynamoDB (eu-west-2).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_put_condition_syntax_error_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("pk = !!".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+    );
+}
+
+#[test]
+fn test_put_condition_redundant_parentheses_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("((pk = :v))".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: \
+         The expression has redundant parentheses;"
+    );
+}
+
+#[test]
+fn test_put_condition_contains_distinct_operand_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("contains(pk, pk)".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: \
+         The first operand must be distinct from the remaining operands for this operator or \
+         function; operator: contains, first operand: [pk]"
+    );
+}
+
+#[test]
+fn test_put_eav_without_expression_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: ExpressionAttributeValues can only be specified when \
+         using expressions: ConditionExpression is null"
+    );
+}
+
+#[test]
+fn test_put_mixing_expected_and_condition_expression_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("attribute_not_exists(pk)".into()),
+            expected: Some(serde_json::json!({"pk": {"Exists": false}})),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Can not use both expression and non-expression \
+         parameters in the same request: Non-expression parameters: {Expected} \
+         Expression parameters: {ConditionExpression}"
+    );
+}
+
+#[test]
+fn test_put_ean_without_expression_stays_bare() {
+    // ExpressionAttributeNames misuse is not a captured enveloped family and
+    // keeps the bare message.
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Tbl".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            expression_attribute_names: Some(
+                [("#a".to_string(), "a".to_string())].into_iter().collect(),
+            ),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "ExpressionAttributeNames can only be specified when using expressions"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// UpdateItem request-validation envelope.
+// UpdateItem wraps its action-time request-validation families in the
+// `1 validation error detected: ` envelope; families the capture shows bare
+// stay bare. Confirmed against real DynamoDB (eu-west-2).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_update_expression_syntax_error_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid UpdateExpression: \
+         Syntax error; Expected attribute name, got end of expression"
+    );
+}
+
+#[test]
+fn test_update_condition_syntax_error_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("pk = !!".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+    );
+}
+
+#[test]
+fn test_update_eav_null_false_enveloped() {
+    // {NULL: false} in ExpressionAttributeValues is rejected with the bare
+    // inner message inside the envelope, not the per-key "contains invalid
+    // value" wrapper (eu-west-2).
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET flag = :n".into()),
+            expression_attribute_values: Some(make_item(&[(":n", AttributeValue::NULL(false))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_update_key_null_false_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::NULL(false))]),
+            update_expression: Some("SET val = :v".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_update_eav_empty_set_enveloped() {
+    // Empty sets in ExpressionAttributeValues carry the per-key wrapper inside
+    // the envelope, matching PutItem's EAV behaviour.
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET tags = :v".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::SS(vec![]))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: ExpressionAttributeValues contains invalid value: \
+         One or more parameter values were invalid: An string set  may not be empty for key :v"
+    );
+}
+
+#[test]
+fn test_update_eav_without_expression_enveloped() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: ExpressionAttributeValues can only be specified when \
+         using expressions: UpdateExpression is null and ConditionExpression is null"
+    );
+}
+
+#[test]
+fn test_update_key_empty_set_stays_bare() {
+    // Empty sets in the Key map are not a captured enveloped family and keep
+    // the bare message.
+    let db = make_db();
+    create_table(&db, "Tbl");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::SS(vec![]))]),
+            update_expression: Some("SET val = :v".into()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: An string set  may not be empty"
+    );
+}
+
+#[test]
+fn test_update_refers_to_nonexistent_attribute_stays_bare() {
+    // Apply-time expression errors are captured bare.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET a = b".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "The provided expression refers to an attribute that does not exist in the item"
+    );
+}
+
+#[test]
+fn test_update_oversized_item_stays_bare() {
+    // Item-size-exceeded on the post-update item is captured bare.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET bigval = :v".into()),
+            expression_attribute_values: Some(make_item(&[(
+                ":v",
+                AttributeValue::S("x".repeat(400 * 1024)),
+            )])),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "Item size to update has exceeded the maximum allowed size"
     );
 }

@@ -203,10 +203,36 @@ fn wrap_invalid_update_expression(err: String) -> String {
 
 pub async fn execute<S: StorageBackend>(
     storage: &S,
+    request: UpdateItemRequest,
+) -> Result<UpdateItemResponse> {
+    // Apply the request-validation envelope exactly once at the operation
+    // boundary, so every early return inside is covered and the tagged
+    // variant never escapes.
+    execute_inner(storage, request)
+        .await
+        .map_err(crate::validation::envelope_request_validation)
+}
+
+async fn execute_inner<S: StorageBackend>(
+    storage: &S,
     mut request: UpdateItemRequest,
 ) -> Result<UpdateItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
+
+    // Reject {NULL: false} up front. The HTTP path rejects it during request
+    // deserialisation; this keeps the in-process API in agreement (eu-west-2).
+    helpers::validate_no_null_false(&request.key)?;
+    if let Some(ref values) = request.expression_attribute_values {
+        helpers::validate_no_null_false(values)?;
+    }
+    if let Some(ref updates) = request.attribute_updates {
+        for update in updates.values() {
+            if let Some(ref value) = update.value {
+                helpers::validate_no_null_false_value(value)?;
+            }
+        }
+    }
 
     // Validate expression/non-expression parameter conflicts BEFORE Expected conversion
     {
@@ -233,7 +259,9 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
         };
-        helpers::validate_expression_params(&ctx)?;
+        // Enveloped families are tagged for the request-validation envelope.
+        helpers::validate_expression_params(&ctx)
+            .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
     }
 
     // Validate key attribute values (unsupported datatypes, invalid numbers)
@@ -324,9 +352,12 @@ pub async fn execute<S: StorageBackend>(
     // Pre-validate UpdateExpression syntax BEFORE table lookup.
     // DynamoDB validates expression syntax, reserved keywords, undefined attribute
     // names/values, overlapping paths, etc. before checking table existence.
+    // Parse-time errors here are families DynamoDB wraps in the
+    // request-validation envelope, so they are tagged; the unused-attribute
+    // check propagates bare, matching PutItem.
     if let Some(ref ue) = request.update_expression {
         let parsed =
-            crate::expressions::update::parse(ue).map_err(DynoxideError::ValidationException)?;
+            crate::expressions::update::parse(ue).map_err(DynoxideError::EnvelopedValidation)?;
 
         // Track all attribute name/value references statically (without evaluating)
         let tracker = crate::expressions::TrackedExpressionAttributes::new(
@@ -334,13 +365,13 @@ pub async fn execute<S: StorageBackend>(
             &request.expression_attribute_values,
         );
         crate::expressions::update::track_references(&parsed, &tracker)
-            .map_err(|e| DynoxideError::ValidationException(wrap_invalid_update_expression(e)))?;
+            .map_err(|e| DynoxideError::EnvelopedValidation(wrap_invalid_update_expression(e)))?;
 
         // Also walk the ConditionExpression to track its attribute usage
         if let Some(ref ce) = request.condition_expression {
             if let Ok(cond_parsed) = crate::expressions::condition::parse(ce) {
                 crate::expressions::condition::track_references(&cond_parsed, &tracker)
-                    .map_err(DynoxideError::ValidationException)?;
+                    .map_err(DynoxideError::EnvelopedValidation)?;
             }
         }
 
@@ -348,23 +379,24 @@ pub async fn execute<S: StorageBackend>(
         tracker.check_unused()?;
     }
 
-    // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.) before table lookup
+    // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.)
+    // before table lookup. Parse-time, so tagged like the block above.
     if let Some(ref ce) = request.condition_expression {
         let parsed = crate::expressions::condition::parse(ce).map_err(|e| {
-            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+            DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
         })?;
         crate::expressions::condition::validate_static(
             &parsed,
             &request.expression_attribute_values,
         )
-        .map_err(DynoxideError::ValidationException)?;
+        .map_err(DynoxideError::EnvelopedValidation)?;
         crate::expressions::condition::validate_operand_semantics(
             &parsed,
             &request.expression_attribute_names,
             &request.expression_attribute_values,
         )
         .map_err(|e| {
-            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+            DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
         })?;
     }
 
@@ -400,15 +432,19 @@ pub async fn execute<S: StorageBackend>(
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
-    // Validate ReturnValues parameter
+    // Validate ReturnValues parameter. The constraint text is tagged without
+    // the envelope prefix; the operation boundary applies it, so the prefix
+    // has a single producer. The enum list mirrors first_invalid_return_enum's
+    // ordering so the in-process message matches the request deserialiser.
     if let Some(ref rv) = request.return_values {
         let rv_upper = rv.to_uppercase();
         if !["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"]
             .contains(&rv_upper.as_str())
         {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{rv}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [ALL_NEW, ALL_OLD, NONE, UPDATED_NEW, UPDATED_OLD]"
+            return Err(DynoxideError::EnvelopedValidation(format!(
+                "Value '{rv}' at 'returnValues' failed to satisfy constraint: \
+                 Member must satisfy enum value set: \
+                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
             )));
         }
     }
@@ -549,7 +585,11 @@ pub async fn execute<S: StorageBackend>(
         // block (Tracker 1). Not repeated here — runtime evaluation may skip branches
         // (e.g., if_not_exists short-circuits) which would cause false positives.
 
-        // Validate attribute values after update expression applied
+        // Validate attribute values after update expression applied. This
+        // checks the post-update item, not the request, so its errors stay
+        // bare: plain `?` converts through the untagged From impl. Do not
+        // route it through into_tagged even though the messages match the
+        // tagged request-time families byte for byte.
         crate::validation::validate_item_attribute_values(&item)?;
         crate::validation::normalize_item_sets(&mut item);
 

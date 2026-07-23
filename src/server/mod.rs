@@ -3,11 +3,10 @@
 //! Only compiled with the `http-server` feature flag.
 
 mod auth;
-mod serde_errors;
 mod serialization_checks;
 
+use crate::serde_errors::{deserialize, serialize};
 use auth::validate_auth;
-use serde_errors::{deserialize, serialize};
 use serialization_checks::pre_check_serialization_types;
 
 use crate::Database;
@@ -320,6 +319,16 @@ fn unknown_operation_response(content_type: &str) -> Response {
 }
 
 fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
+    let result = dispatch_operation(db, operation, body);
+
+    // DynamoDB wraps the request-validation family in the
+    // "1 validation error detected: " envelope on PutItem and UpdateItem and
+    // reports it bare everywhere else. The wire-invisible EnvelopedValidation
+    // tag must never escape dispatch.
+    result.map_err(|e| crate::validation::resolve_request_validation_tag(operation, e))
+}
+
+fn dispatch_operation(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
     // Pre-check JSON field types for operations that use serde_json::Value internally.
     // These checks must run before serde deserialisation because serde_json::Value accepts
     // any JSON type, so type mismatches on list/struct fields would silently pass through.

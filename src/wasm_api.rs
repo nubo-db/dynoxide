@@ -130,15 +130,11 @@ pub async fn dispatch<S: StorageBackend>(
         other => return Err(unsupported_envelope(other)),
     };
 
-    // Same seam as the HTTP dispatch: PutItem and UpdateItem wrap the
-    // request-validation family in the "1 validation error detected: "
-    // envelope and every other operation reports it bare. Either way the
-    // wire-invisible EnvelopedValidation tag never escapes.
-    let result = match op {
-        "PutItem" | "UpdateItem" => result.map_err(crate::validation::envelope_request_validation),
-        _ => result.map_err(crate::validation::strip_request_validation_tag),
-    };
-    result.map_err(|e| e.to_json())
+    // Same seam as the HTTP dispatch: resolve the wire-invisible
+    // EnvelopedValidation tag for the operation before serialising.
+    result
+        .map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
+        .map_err(|e| e.to_json())
 }
 
 // ---------------------------------------------------------------------------

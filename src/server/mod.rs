@@ -323,14 +323,9 @@ fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String>
 
     // DynamoDB wraps the request-validation family in the
     // "1 validation error detected: " envelope on PutItem and UpdateItem and
-    // reports it bare everywhere else. Either way the wire-invisible
-    // EnvelopedValidation tag must never escape dispatch: enveloping is
-    // idempotent for untagged errors, and untagging leaves everything else
-    // unchanged.
-    match operation {
-        "PutItem" | "UpdateItem" => result.map_err(crate::validation::envelope_request_validation),
-        _ => result.map_err(crate::validation::strip_request_validation_tag),
-    }
+    // reports it bare everywhere else. The wire-invisible EnvelopedValidation
+    // tag must never escape dispatch.
+    result.map_err(|e| crate::validation::resolve_request_validation_tag(operation, e))
 }
 
 fn dispatch_operation(db: &Database, operation: &str, body: &str) -> crate::Result<String> {

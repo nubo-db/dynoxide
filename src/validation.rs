@@ -161,6 +161,22 @@ pub fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError {
     }
 }
 
+/// Resolve the wire-invisible `EnvelopedValidation` tag for a named operation:
+/// PutItem and UpdateItem wrap the request-validation family in the
+/// `1 validation error detected: ` envelope, every other operation reports it
+/// bare. Either way the tag never reaches the wire. Enveloping is idempotent
+/// for untagged errors, so applying this to an already-enveloped action error
+/// is safe.
+///
+/// Single owner of the operation split; the HTTP and wasm dispatch seams both
+/// route through here.
+pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
+    match operation {
+        "PutItem" | "UpdateItem" => envelope_request_validation(err),
+        _ => strip_request_validation_tag(err),
+    }
+}
+
 /// A validation failure from a shared validator, classified so PutItem and
 /// UpdateItem can tell which families DynamoDB wraps in the
 /// `1 validation error detected: ` envelope.

@@ -123,6 +123,11 @@ pub struct CreateTableParams {
     pub provisioned_throughput: Option<serde_json::Value>,
 
     #[schemars(
+        description = "Optional on-demand throughput ceilings {max_read_request_units, max_write_request_units}. Stored and reported back by describe_table; not enforced."
+    )]
+    pub on_demand_throughput: Option<serde_json::Value>,
+
+    #[schemars(
         description = "Optional table class: STANDARD or STANDARD_INFREQUENT_ACCESS. Accepted for compatibility."
     )]
     pub table_class: Option<String>,
@@ -427,6 +432,11 @@ pub struct UpdateTableParams {
 
     #[schemars(description = "Change table class: STANDARD or STANDARD_INFREQUENT_ACCESS")]
     pub table_class: Option<String>,
+
+    #[schemars(
+        description = "New on-demand throughput ceilings {max_read_request_units, max_write_request_units}. Stored and reported back by describe_table; not enforced."
+    )]
+    pub on_demand_throughput: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -784,7 +794,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "[WRITE] Create a new DynamoDB table with specified key schema and optional GSIs and LSIs. Supports BillingMode, ProvisionedThroughput, SSESpecification, TableClass, Tags, and DeletionProtectionEnabled. The table is available immediately after creation."
+        description = "[WRITE] Create a new DynamoDB table with specified key schema and optional GSIs and LSIs. Supports BillingMode, ProvisionedThroughput, OnDemandThroughput, SSESpecification, TableClass, Tags, and DeletionProtectionEnabled. The table is available immediately after creation."
     )]
     fn create_table(
         &self,
@@ -876,6 +886,19 @@ impl McpServer {
                 ));
             }
         };
+        let on_demand_throughput = match params
+            .on_demand_throughput
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidOnDemandThroughput",
+                    &format!("Invalid on_demand_throughput: {e}"),
+                ));
+            }
+        };
 
         let request = crate::actions::create_table::CreateTableRequest {
             table_name: params.table_name,
@@ -887,10 +910,10 @@ impl McpServer {
             sse_specification,
             billing_mode: params.billing_mode,
             provisioned_throughput,
+            on_demand_throughput,
             table_class: params.table_class,
             tags,
             deletion_protection_enabled: params.deletion_protection_enabled,
-            ..Default::default()
         };
         match self.db.create_table(request) {
             Ok(resp) => json_result(&resp),
@@ -1456,7 +1479,7 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "[WRITE] Update a table: add/remove GSIs, change stream settings, switch BillingMode or ProvisionedThroughput, change TableClass, or toggle DeletionProtectionEnabled."
+        description = "[WRITE] Update a table: add/remove GSIs, change stream settings, switch BillingMode, ProvisionedThroughput or OnDemandThroughput, change TableClass, or toggle DeletionProtectionEnabled."
     )]
     fn update_table(
         &self,
@@ -1526,6 +1549,20 @@ impl McpServer {
             }
         };
 
+        let on_demand_throughput = match params
+            .on_demand_throughput
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidOnDemandThroughput",
+                    &format!("Invalid on_demand_throughput: {e}"),
+                ));
+            }
+        };
+
         let request = crate::actions::update_table::UpdateTableRequest {
             table_name: params.table_name,
             attribute_definitions,
@@ -1535,7 +1572,7 @@ impl McpServer {
             billing_mode: params.billing_mode,
             provisioned_throughput,
             table_class: params.table_class,
-            on_demand_throughput: None,
+            on_demand_throughput,
         };
         match self.db.update_table(request) {
             Ok(resp) => json_result(&resp),

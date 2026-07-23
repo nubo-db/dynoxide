@@ -463,6 +463,75 @@ fn test_update_table_table_class() {
 }
 
 #[test]
+fn test_on_demand_throughput_create_and_update() {
+    // Ceilings set at creation survive to describe_table, and an update
+    // replaces them. Snake_case keys on create, PascalCase on update, so
+    // both spellings are pinned.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Ceilings",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "on_demand_throughput": {"max_read_request_units": 20, "max_write_request_units": 15}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "create failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "Ceilings", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["OnDemandThroughput"]["MaxReadRequestUnits"],
+        20
+    );
+    assert_eq!(
+        content["Table"]["OnDemandThroughput"]["MaxWriteRequestUnits"],
+        15
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "update_table",
+        json!({
+            "table_name": "Ceilings",
+            "on_demand_throughput": {"MaxReadRequestUnits": 40, "MaxWriteRequestUnits": 30}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "update failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "describe_table",
+        json!({"table_name": "Ceilings", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["OnDemandThroughput"]["MaxReadRequestUnits"],
+        40
+    );
+    assert_eq!(
+        content["Table"]["OnDemandThroughput"]["MaxWriteRequestUnits"],
+        30
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
 fn test_update_table_throughput_interaction_rules() {
     // The shared action's billing/throughput consistency rules, reached
     // through the MCP wiring: PT on an on-demand table is rejected, a switch

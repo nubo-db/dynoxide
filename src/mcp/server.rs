@@ -1511,18 +1511,13 @@ impl McpServer {
         // silently read the capacity units as zero.
         let provisioned_throughput = match params
             .provisioned_throughput
-            .map(serde_json::from_value::<crate::types::ProvisionedThroughput>)
+            .map(|v| {
+                serde_json::from_value::<crate::types::ProvisionedThroughput>(v)
+                    .and_then(|pt| serde_json::to_value(&pt))
+            })
             .transpose()
         {
-            Ok(v) => match v.map(|pt| serde_json::to_value(&pt)).transpose() {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(tool_validation_error(
-                        "InvalidProvisionedThroughput",
-                        &format!("Invalid provisioned_throughput: {e}"),
-                    ));
-                }
-            },
+            Ok(v) => v,
             Err(e) => {
                 return Ok(tool_validation_error(
                     "InvalidProvisionedThroughput",

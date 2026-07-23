@@ -131,6 +131,23 @@ pub fn format_validation_errors(errors: &[String]) -> Option<String> {
     Some(format!("{}{}", prefix, errors.join("; ")))
 }
 
+/// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
+/// envelope, converting it to a plain `ValidationException`. Every other error
+/// passes through unchanged.
+///
+/// PutItem and UpdateItem apply this at their operation boundary; the envelope
+/// wording comes from `format_validation_errors` so it has a single producer.
+pub fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::EnvelopedValidation(msg) => {
+            let enveloped = format_validation_errors(std::slice::from_ref(&msg))
+                .expect("a one-element slice always formats to Some");
+            DynoxideError::ValidationException(enveloped)
+        }
+        other => other,
+    }
+}
+
 /// Validate key schema: exactly one HASH key, optionally one RANGE key.
 ///
 /// DynamoDB validates positionally: the first element must be HASH and, if a
@@ -805,5 +822,41 @@ mod tests {
 
         let schema = vec![hash_key("pk")];
         assert_eq!(sort_key_name(&schema), None);
+    }
+
+    #[test]
+    fn test_envelope_request_validation_wraps_tagged_error() {
+        let msg = "Value '' at 'expressionAttributeNames' failed to satisfy constraint: \
+                   Map value must satisfy constraint";
+        let err = envelope_request_validation(DynoxideError::EnvelopedValidation(msg.to_string()));
+        match err {
+            DynoxideError::ValidationException(m) => {
+                assert_eq!(m, format!("1 validation error detected: {msg}"));
+            }
+            other => panic!("expected ValidationException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_envelope_request_validation_passes_other_errors_through() {
+        let plain = envelope_request_validation(DynoxideError::ValidationException("msg".into()));
+        assert!(matches!(
+            &plain,
+            DynoxideError::ValidationException(m) if m == "msg"
+        ));
+
+        let key_empty =
+            envelope_request_validation(DynoxideError::KeyEmptyValueValidation("msg".into()));
+        assert!(matches!(
+            &key_empty,
+            DynoxideError::KeyEmptyValueValidation(m) if m == "msg"
+        ));
+
+        let not_found =
+            envelope_request_validation(DynoxideError::ResourceNotFoundException("msg".into()));
+        assert!(matches!(
+            &not_found,
+            DynoxideError::ResourceNotFoundException(m) if m == "msg"
+        ));
     }
 }

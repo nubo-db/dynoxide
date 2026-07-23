@@ -276,10 +276,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 // request-validation class that PutItem and UpdateItem envelope
                 // (see `crate::serde_errors`); other operations report it bare.
                 if val.as_bool() != Some(true) {
-                    return Err(de::Error::custom(
-                        "VALIDATION_REQUEST:One or more parameter values were invalid: \
+                    return Err(de::Error::custom(format!(
+                        "{}One or more parameter values were invalid: \
                          Null attribute value types must have the value of true",
-                    ));
+                        crate::serde_errors::REQUEST_VALIDATION_MARKER
+                    )));
                 }
                 Ok(AttributeValue::NULL(true))
             }

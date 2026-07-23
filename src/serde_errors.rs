@@ -44,8 +44,7 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
             )
         } else if msg.contains("Supplied AttributeValue") {
             // Multi-datatype or empty AV error: strip position info and return as-is
-            let clean = strip_serde_position(&msg);
-            crate::DynoxideError::ValidationException(clean)
+            crate::DynoxideError::ValidationException(strip_position(&msg).to_string())
         } else {
             crate::DynoxideError::SerializationException(map_serde_to_dynamodb_message(&msg, body))
         }
@@ -62,26 +61,30 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 /// marker-to-variant mapping, shared by [`deserialize`] and callers that
 /// decode via `serde_json::from_value` (the MCP surface).
 pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
-    if let Some(stripped) = msg.strip_prefix("VALIDATION_REQUEST:") {
+    if let Some(stripped) = msg.strip_prefix(REQUEST_VALIDATION_MARKER) {
         return Some(crate::DynoxideError::EnvelopedValidation(
-            strip_serde_position(stripped),
+            strip_position(stripped).to_string(),
         ));
     }
-    if let Some(stripped) = msg.strip_prefix("VALIDATION:") {
+    if let Some(stripped) = msg.strip_prefix(VALIDATION_MARKER) {
         return Some(crate::DynoxideError::ValidationException(
-            strip_serde_position(stripped),
+            strip_position(stripped).to_string(),
         ));
     }
     None
 }
 
-/// Strip serde_json's " at line N column N" suffix from error messages.
-fn strip_serde_position(msg: &str) -> String {
-    strip_position(msg).to_string()
-}
+/// Marker prefix for validation rejections raised inside serde
+/// deserialisation, mapped to a bare `ValidationException`.
+pub(crate) const VALIDATION_MARKER: &str = "VALIDATION:";
 
-/// Slice-based position strip shared by [`strip_serde_position`] and
-/// [`clean_serde_message`].
+/// Marker prefix for the request-validation class raised inside serde
+/// deserialisation, mapped to the wire-invisible `EnvelopedValidation` tag
+/// that PutItem and UpdateItem envelope. Must be checked before
+/// [`VALIDATION_MARKER`], whose spelling it extends.
+pub(crate) const REQUEST_VALIDATION_MARKER: &str = "VALIDATION_REQUEST:";
+
+/// Strip serde_json's " at line N column N" suffix from error messages.
 fn strip_position(msg: &str) -> &str {
     if let Some(idx) = msg.rfind(" at line ") {
         // Verify the suffix looks like " at line N column N"
@@ -100,8 +103,8 @@ fn strip_position(msg: &str) -> &str {
 pub(crate) fn clean_serde_message(msg: &str) -> &str {
     let clean = strip_position(msg);
     clean
-        .strip_prefix("VALIDATION_REQUEST:")
-        .or_else(|| clean.strip_prefix("VALIDATION:"))
+        .strip_prefix(REQUEST_VALIDATION_MARKER)
+        .or_else(|| clean.strip_prefix(VALIDATION_MARKER))
         .unwrap_or(clean)
 }
 
@@ -398,9 +401,9 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_serde_position_unchanged() {
-        assert_eq!(strip_serde_position("msg at line 1 column 2"), "msg");
-        assert_eq!(strip_serde_position("msg"), "msg");
-        assert_eq!(strip_serde_position("look at line 9"), "look at line 9");
+    fn test_strip_position_unchanged() {
+        assert_eq!(strip_position("msg at line 1 column 2"), "msg");
+        assert_eq!(strip_position("msg"), "msg");
+        assert_eq!(strip_position("look at line 9"), "look at line 9");
     }
 }

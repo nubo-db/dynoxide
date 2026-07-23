@@ -123,26 +123,31 @@ pub fn format_validation_errors(errors: &[String]) -> Option<String> {
     if errors.is_empty() {
         return None;
     }
-    let prefix = format!(
-        "{} validation error{} detected: ",
+    if let [single] = errors {
+        return Some(envelope_message(single));
+    }
+    Some(format!(
+        "{} validation errors detected: {}",
         errors.len(),
-        if errors.len() == 1 { "" } else { "s" }
-    );
-    Some(format!("{}{}", prefix, errors.join("; ")))
+        errors.join("; ")
+    ))
+}
+
+/// The single-error form of the request-validation envelope. This and
+/// `format_validation_errors` are the only producers of the prefix wording.
+pub(crate) fn envelope_message(msg: &str) -> String {
+    format!("1 validation error detected: {msg}")
 }
 
 /// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
 /// envelope, converting it to a plain `ValidationException`. Every other error
 /// passes through unchanged.
 ///
-/// PutItem and UpdateItem apply this at their operation boundary; the envelope
-/// wording comes from `format_validation_errors` so it has a single producer.
-pub fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
+/// PutItem and UpdateItem apply this at their operation boundary.
+pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
     match err {
         DynoxideError::EnvelopedValidation(msg) => {
-            let enveloped = format_validation_errors(std::slice::from_ref(&msg))
-                .expect("a one-element slice always formats to Some");
-            DynoxideError::ValidationException(enveloped)
+            DynoxideError::ValidationException(envelope_message(&msg))
         }
         other => other,
     }
@@ -154,9 +159,19 @@ pub fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
 ///
 /// Operations other than PutItem and UpdateItem report the request-validation
 /// family bare, and the tag must never reach the wire.
-pub fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError {
+pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError {
     match err {
         DynoxideError::EnvelopedValidation(msg) => DynoxideError::ValidationException(msg),
+        other => other,
+    }
+}
+
+/// Promote a plain `ValidationException` to the wire-invisible
+/// `EnvelopedValidation` tag. Inverse of `strip_request_validation_tag`, for
+/// call sites that tag an error raised by a shared helper.
+pub(crate) fn tag_request_validation(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::ValidationException(msg) => DynoxideError::EnvelopedValidation(msg),
         other => other,
     }
 }
@@ -184,45 +199,44 @@ pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError
 /// Every other caller converts it straight back to the original error via the
 /// `From` impl, so plain `?` propagation keeps their behaviour byte-identical.
 #[derive(Debug)]
-pub struct ClassifiedValidationError {
-    error: DynoxideError,
-    enveloped: bool,
+pub(crate) enum ClassifiedValidationError {
+    /// A family DynamoDB reports bare, or an error adopted from an
+    /// unclassified helper.
+    Bare(DynoxideError),
+    /// A family DynamoDB wraps in the request-validation envelope on PutItem
+    /// and UpdateItem.
+    Enveloped(String),
 }
 
 impl ClassifiedValidationError {
     /// A family DynamoDB reports bare.
-    pub fn bare(message: impl Into<String>) -> Self {
-        Self {
-            error: DynoxideError::ValidationException(message.into()),
-            enveloped: false,
-        }
+    pub(crate) fn bare(message: impl Into<String>) -> Self {
+        Self::Bare(DynoxideError::ValidationException(message.into()))
     }
 
     /// A family DynamoDB wraps in the request-validation envelope on PutItem
     /// and UpdateItem.
-    pub fn enveloped(message: impl Into<String>) -> Self {
-        Self {
-            error: DynoxideError::ValidationException(message.into()),
-            enveloped: true,
-        }
+    pub(crate) fn enveloped(message: impl Into<String>) -> Self {
+        Self::Enveloped(message.into())
     }
 
     /// Convert for a PutItem/UpdateItem call site: enveloped families become
     /// the wire-invisible `EnvelopedValidation` tag (unwrapped at the
     /// operation boundary), everything else passes through unchanged.
-    pub fn into_tagged(self) -> DynoxideError {
-        match (self.enveloped, self.error) {
-            (true, DynoxideError::ValidationException(msg)) => {
-                DynoxideError::EnvelopedValidation(msg)
-            }
-            (_, other) => other,
+    pub(crate) fn into_tagged(self) -> DynoxideError {
+        match self {
+            Self::Enveloped(msg) => DynoxideError::EnvelopedValidation(msg),
+            Self::Bare(err) => err,
         }
     }
 }
 
 impl From<ClassifiedValidationError> for DynoxideError {
     fn from(e: ClassifiedValidationError) -> Self {
-        e.error
+        match e {
+            ClassifiedValidationError::Enveloped(msg) => DynoxideError::ValidationException(msg),
+            ClassifiedValidationError::Bare(err) => err,
+        }
     }
 }
 
@@ -230,10 +244,7 @@ impl From<DynoxideError> for ClassifiedValidationError {
     /// Errors adopted from unclassified helpers stay bare; only call sites
     /// that know a family is enveloped construct the enveloped form.
     fn from(error: DynoxideError) -> Self {
-        Self {
-            error,
-            enveloped: false,
-        }
+        Self::Bare(error)
     }
 }
 
@@ -443,12 +454,16 @@ const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limi
 ///
 /// **Important:** This must only be called on items being persisted, NOT on
 /// `ExpressionAttributeValues` (which may legitimately contain empty strings for comparisons).
-/// The error is classified: the set families (empty and duplicate SS/NS/BS)
-/// are marked as enveloped so PutItem and UpdateItem can wrap them in the
-/// request-validation envelope; number and nesting errors stay bare. Callers
-/// other than those two operations propagate with `?`, which converts back to
-/// the plain error unchanged.
-pub fn validate_item_attribute_values(
+pub fn validate_item_attribute_values(item: &Item) -> crate::Result<()> {
+    validate_item_attribute_values_classified(item).map_err(Into::into)
+}
+
+/// Classified form of [`validate_item_attribute_values`]: the set families
+/// (empty and duplicate SS/NS/BS) are marked as enveloped so PutItem and
+/// UpdateItem can wrap them in the request-validation envelope; number and
+/// nesting errors stay bare. Every other caller uses the public wrapper,
+/// which converts back to the plain error unchanged.
+pub(crate) fn validate_item_attribute_values_classified(
     item: &Item,
 ) -> std::result::Result<(), ClassifiedValidationError> {
     for value in item.values() {

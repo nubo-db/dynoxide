@@ -570,44 +570,27 @@ fn decode_dynamo_map(
     })
 }
 
-/// Parse a DynamoDB JSON map for every tool except put_item and update_item:
-/// the request-validation family reports bare, matching the HTTP surface.
+/// Parse a DynamoDB JSON map, resolving the wire-invisible request-validation
+/// tag with the given function: the put_item and update_item tools pass
+/// `envelope_request_validation`, matching their envelope on the HTTP
+/// surface; every other tool passes `strip_request_validation_tag`, reporting
+/// the family bare.
 fn parse_dynamo_map(
     val: serde_json::Value,
     field_name: &str,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
-    decode_dynamo_map(val, field_name)
-        .map_err(|e| to_tool_error(crate::validation::strip_request_validation_tag(e)))
+    decode_dynamo_map(val, field_name).map_err(|e| to_tool_error(resolve(e)))
 }
 
-/// Parse a DynamoDB JSON map for the put_item and update_item tools, which
-/// wrap the request-validation family in the "1 validation error detected: "
-/// envelope, matching PutItem and UpdateItem on the HTTP surface.
-fn parse_dynamo_map_enveloped(
-    val: serde_json::Value,
-    field_name: &str,
-) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
-    decode_dynamo_map(val, field_name)
-        .map_err(|e| to_tool_error(crate::validation::envelope_request_validation(e)))
-}
-
+/// Optional-map variant of [`parse_dynamo_map`].
 fn parse_optional_dynamo_map(
     val: Option<serde_json::Value>,
     field_name: &str,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
     match val {
-        Some(v) => parse_dynamo_map(v, field_name).map(Some),
-        None => Ok(None),
-    }
-}
-
-/// Optional-map variant of [`parse_dynamo_map_enveloped`].
-fn parse_optional_dynamo_map_enveloped(
-    val: Option<serde_json::Value>,
-    field_name: &str,
-) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
-    match val {
-        Some(v) => parse_dynamo_map_enveloped(v, field_name).map(Some),
+        Some(v) => parse_dynamo_map(v, field_name, resolve).map(Some),
         None => Ok(None),
     }
 }
@@ -917,13 +900,18 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("put_item") {
             return Ok(err);
         }
-        let item = match parse_dynamo_map_enveloped(params.item, "item") {
+        let item = match parse_dynamo_map(
+            params.item,
+            "item",
+            crate::validation::envelope_request_validation,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let expression_attribute_values = match parse_optional_dynamo_map_enveloped(
+        let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::envelope_request_validation,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -951,7 +939,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetItemParams>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match parse_dynamo_map(params.key, "key") {
+        let key = match parse_dynamo_map(
+            params.key,
+            "key",
+            crate::validation::strip_request_validation_tag,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
@@ -980,13 +972,18 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("update_item") {
             return Ok(err);
         }
-        let key = match parse_dynamo_map_enveloped(params.key, "key") {
+        let key = match parse_dynamo_map(
+            params.key,
+            "key",
+            crate::validation::envelope_request_validation,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let expression_attribute_values = match parse_optional_dynamo_map_enveloped(
+        let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::envelope_request_validation,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1020,15 +1017,19 @@ impl McpServer {
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let exclusive_start_key =
-            match parse_optional_dynamo_map(params.exclusive_start_key, "exclusive_start_key") {
-                Ok(v) => v,
-                Err(err) => return Ok(err),
-            };
+        let exclusive_start_key = match parse_optional_dynamo_map(
+            params.exclusive_start_key,
+            "exclusive_start_key",
+            crate::validation::strip_request_validation_tag,
+        ) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
 
         let request = crate::actions::query::QueryRequest {
             table_name: params.table_name,
@@ -1061,15 +1062,19 @@ impl McpServer {
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let exclusive_start_key =
-            match parse_optional_dynamo_map(params.exclusive_start_key, "exclusive_start_key") {
-                Ok(v) => v,
-                Err(err) => return Ok(err),
-            };
+        let exclusive_start_key = match parse_optional_dynamo_map(
+            params.exclusive_start_key,
+            "exclusive_start_key",
+            crate::validation::strip_request_validation_tag,
+        ) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
 
         let request = crate::actions::scan::ScanRequest {
             table_name: params.table_name,
@@ -1105,13 +1110,18 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("delete_item") {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(params.key, "key") {
+        let key = match parse_dynamo_map(
+            params.key,
+            "key",
+            crate::validation::strip_request_validation_tag,
+        ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1779,7 +1789,11 @@ impl McpServer {
 
         let mut parsed_items = Vec::with_capacity(params.items.len());
         for (i, item_val) in params.items.into_iter().enumerate() {
-            match parse_dynamo_map(item_val, &format!("items[{i}]")) {
+            match parse_dynamo_map(
+                item_val,
+                &format!("items[{i}]"),
+                crate::validation::strip_request_validation_tag,
+            ) {
                 Ok(item) => parsed_items.push(item),
                 Err(err) => return Ok(err),
             }

@@ -368,10 +368,9 @@ async fn execute_inner<S: StorageBackend>(
         }
 
         // Check for unused expression attribute names/values
-        tracker.check_unused().map_err(|e| match e {
-            DynoxideError::ValidationException(msg) => DynoxideError::EnvelopedValidation(msg),
-            other => other,
-        })?;
+        tracker
+            .check_unused()
+            .map_err(crate::validation::tag_request_validation)?;
     }
 
     // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.)

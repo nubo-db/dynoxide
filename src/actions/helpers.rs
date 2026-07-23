@@ -757,6 +757,9 @@ fn validate_expression_attribute_value(
     crate::validation::validate_nesting_depth(value)?;
     // Check for empty/unsupported datatypes
     match value {
+        // Unreachable from PutItem and UpdateItem, whose execute paths reject
+        // NULL(false) first with the bare enveloped message; this arm serves
+        // the other operations' pre-parsed in-process EAV paths.
         AttributeValue::NULL(b) if !b => {
             return Err(ClassifiedValidationError::bare(format!(
                 "ExpressionAttributeValues contains invalid value: \

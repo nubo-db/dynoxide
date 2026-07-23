@@ -159,6 +159,15 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
 ///
 /// Operations other than PutItem and UpdateItem report the request-validation
 /// family bare, and the tag must never reach the wire.
+///
+/// Compiled only for the surfaces that resolve the tag: the HTTP server, the
+/// MCP tools, the wasm engine API, and the unit tests.
+#[cfg(any(
+    feature = "http-server",
+    feature = "mcp-server",
+    feature = "wasm-sqlite",
+    test
+))]
 pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError {
     match err {
         DynoxideError::EnvelopedValidation(msg) => DynoxideError::ValidationException(msg),
@@ -178,6 +187,10 @@ pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError 
 /// at the action boundaries (`put_item::execute` / `update_item::execute`
 /// apply the envelope for the in-process API) and in the MCP tools' choice of
 /// resolver, so a future enveloped operation must update all three places.
+///
+/// Compiled only for the dispatch seams that consume it: the HTTP server, the
+/// wasm engine API, and the unit tests.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
     match operation {
         "PutItem" | "UpdateItem" => envelope_request_validation(err),

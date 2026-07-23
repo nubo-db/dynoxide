@@ -20,6 +20,10 @@
 //! messages by hand go through [`clean_serde_message`], which strips both
 //! markers along with serde_json's position suffix.
 
+// The request-body decoding path is consumed by the HTTP server and the wasm
+// engine API only, so it and its private helpers below compile just for those
+// builds (and under `cargo test`, which exercises them directly).
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::Result<T> {
     serde_json::from_str(body).map_err(|e| {
         let msg = e.to_string();
@@ -60,6 +64,12 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 /// `None` for the caller to classify. This is the single owner of the
 /// marker-to-variant mapping, shared by [`deserialize`] and callers that
 /// decode via `serde_json::from_value` (the MCP surface).
+#[cfg(any(
+    feature = "http-server",
+    feature = "mcp-server",
+    feature = "wasm-sqlite",
+    test
+))]
 pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
     if let Some(stripped) = msg.strip_prefix(REQUEST_VALIDATION_MARKER) {
         return Some(crate::DynoxideError::EnvelopedValidation(
@@ -112,6 +122,7 @@ pub(crate) fn clean_serde_message(msg: &str) -> &str {
 ///
 /// DynamoDB returns specific messages like "NUMBER_VALUE cannot be converted to String"
 /// whereas serde returns "invalid type: integer `23`, expected a string at line 1 column 42".
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
     // "invalid type: <type>, expected <target>"
     if let Some(rest) = msg.strip_prefix("invalid type: ") {
@@ -156,6 +167,7 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
 }
 
 /// Map a serde type mismatch to DynamoDB's SerializationException message.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn map_type_mismatch(source: &str, target: &str) -> String {
     // Determine target type category
     let target_is_string = target == "a string";
@@ -269,6 +281,7 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
 
 /// Infer the DynamoDB type conversion error from a serde error message.
 /// Uses the column position to inspect the actual JSON value in the body.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> String {
     // Try to extract column number from "at line N column N"
     if let Some(col_str) = msg.rsplit("column ").next() {
@@ -292,6 +305,7 @@ fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> Stri
 }
 
 /// Map Rust struct names to DynamoDB Java class names for SerializationException messages.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
     match struct_name {
         "ProvisionedThroughput" | "ProvisionedThroughputRaw" => {

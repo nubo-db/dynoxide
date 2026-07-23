@@ -414,6 +414,19 @@ pub struct UpdateTableParams {
 
     #[schemars(description = "Enable or disable deletion protection on the table")]
     pub deletion_protection_enabled: Option<bool>,
+
+    #[schemars(
+        description = "Switch billing mode: PROVISIONED or PAY_PER_REQUEST. Switching to PROVISIONED requires provisioned_throughput."
+    )]
+    pub billing_mode: Option<String>,
+
+    #[schemars(
+        description = "New provisioned throughput {read_capacity_units, write_capacity_units}. Not allowed while the table is PAY_PER_REQUEST unless billing_mode switches to PROVISIONED."
+    )]
+    pub provisioned_throughput: Option<serde_json::Value>,
+
+    #[schemars(description = "Change table class: STANDARD or STANDARD_INFREQUENT_ACCESS")]
+    pub table_class: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1443,7 +1456,7 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "[WRITE] Update a table: add/remove GSIs, change stream settings, or toggle DeletionProtectionEnabled."
+        description = "[WRITE] Update a table: add/remove GSIs, change stream settings, switch BillingMode or ProvisionedThroughput, change TableClass, or toggle DeletionProtectionEnabled."
     )]
     fn update_table(
         &self,
@@ -1492,15 +1505,36 @@ impl McpServer {
             }
         };
 
+        // The update action reads ProvisionedThroughput from raw JSON with
+        // PascalCase keys, so normalise through the typed struct, which
+        // accepts either case. Passing snake_case straight through would
+        // silently read the capacity units as zero.
+        let provisioned_throughput = match params
+            .provisioned_throughput
+            .map(|v| {
+                serde_json::from_value::<crate::types::ProvisionedThroughput>(v)
+                    .and_then(|pt| serde_json::to_value(&pt))
+            })
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidProvisionedThroughput",
+                    &format!("Invalid provisioned_throughput: {e}"),
+                ));
+            }
+        };
+
         let request = crate::actions::update_table::UpdateTableRequest {
             table_name: params.table_name,
             attribute_definitions,
             global_secondary_index_updates,
             stream_specification,
             deletion_protection_enabled: params.deletion_protection_enabled,
-            billing_mode: None,
-            provisioned_throughput: None,
-            table_class: None,
+            billing_mode: params.billing_mode,
+            provisioned_throughput,
+            table_class: params.table_class,
             on_demand_throughput: None,
         };
         match self.db.update_table(request) {

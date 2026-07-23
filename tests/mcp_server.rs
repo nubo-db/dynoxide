@@ -349,6 +349,370 @@ fn test_create_table_provisioned_with_throughput() {
 }
 
 #[test]
+fn test_update_table_billing_mode_round_trip() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Flip",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+
+    // Flip to on-demand.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({"table_name": "Flip", "billing_mode": "PAY_PER_REQUEST"}),
+    );
+    assert!(
+        !is_tool_error(&resp),
+        "flip to PAY_PER_REQUEST failed: {resp}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "Flip", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["BillingModeSummary"]["BillingMode"],
+        "PAY_PER_REQUEST"
+    );
+
+    // Flip back to provisioned with snake_case throughput keys; the values
+    // must land, not silently read as zero.
+    let resp = call_tool(
+        &mut child,
+        4,
+        "update_table",
+        json!({
+            "table_name": "Flip",
+            "billing_mode": "PROVISIONED",
+            "provisioned_throughput": {"read_capacity_units": 5, "write_capacity_units": 4}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "flip to PROVISIONED failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        5,
+        "describe_table",
+        json!({"table_name": "Flip", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"],
+        5
+    );
+    assert_eq!(
+        content["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"],
+        4
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_table_table_class() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Classy",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({"table_name": "Classy", "table_class": "STANDARD_INFREQUENT_ACCESS"}),
+    );
+    assert!(!is_tool_error(&resp), "table class update failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "Classy", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["TableClassSummary"]["TableClass"],
+        "STANDARD_INFREQUENT_ACCESS"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_table_throughput_interaction_rules() {
+    // The shared action's billing/throughput consistency rules, reached
+    // through the MCP wiring: PT on an on-demand table is rejected, a switch
+    // to PROVISIONED needs PT, PascalCase PT keys land, and a same-values
+    // update is rejected.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Rules",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({"table_name": "Rules", "billing_mode": "PAY_PER_REQUEST"}),
+    );
+    assert!(
+        !is_tool_error(&resp),
+        "flip to PAY_PER_REQUEST failed: {resp}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "update_table",
+        json!({
+            "table_name": "Rules",
+            "provisioned_throughput": {"read_capacity_units": 5, "write_capacity_units": 5}
+        }),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+         WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST",
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "update_table",
+        json!({"table_name": "Rules", "billing_mode": "PROVISIONED"}),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "One or more parameter values were invalid: \
+         ProvisionedThroughput must be specified when BillingMode is PROVISIONED",
+    );
+
+    // PascalCase throughput keys are accepted too, and the values land.
+    let resp = call_tool(
+        &mut child,
+        5,
+        "update_table",
+        json!({
+            "table_name": "Rules",
+            "billing_mode": "PROVISIONED",
+            "provisioned_throughput": {"ReadCapacityUnits": 6, "WriteCapacityUnits": 2}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "flip to PROVISIONED failed: {resp}");
+    let resp = call_tool(
+        &mut child,
+        6,
+        "describe_table",
+        json!({"table_name": "Rules", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"],
+        6
+    );
+    assert_eq!(
+        content["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"],
+        2
+    );
+
+    let resp = call_tool(
+        &mut child,
+        7,
+        "update_table",
+        json!({
+            "table_name": "Rules",
+            "provisioned_throughput": {"read_capacity_units": 6, "write_capacity_units": 2}
+        }),
+    );
+    assert!(
+        is_tool_error(&resp),
+        "same-values update should fail: {resp}"
+    );
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("The provisioned throughput for the table will not change"),
+        "unexpected message: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_table_malformed_provisioned_throughput_rejected() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Malformed",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({"table_name": "Malformed", "provisioned_throughput": 5}),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "InvalidProvisionedThroughput");
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid provisioned_throughput"),
+        "unexpected message: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_table_partial_provisioned_throughput_rejected() {
+    // A partial throughput object normalises the missing member to an
+    // explicit null, and the shared action rejects it as a null member.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Partial",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "Partial",
+            "provisioned_throughput": {"read_capacity_units": 9}
+        }),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "1 validation error detected: Value null at \
+         'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: \
+         Member must not be null",
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_table_invalid_table_class_rejected() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "BadClass",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({"table_name": "BadClass", "table_class": "EXPRESS"}),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "1 validation error detected: Value 'EXPRESS' at 'tableClass' failed to satisfy \
+         constraint: Member must satisfy enum value set: \
+         [STANDARD, STANDARD_INFREQUENT_ACCESS]",
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_table_invalid_billing_mode_rejected() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "BadFlip",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({"table_name": "BadFlip", "billing_mode": "ON_DEMAND"}),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "1 validation error detected: Value 'ON_DEMAND' at 'billingMode' \
+         failed to satisfy constraint: Member must satisfy enum value set: \
+         [PROVISIONED, PAY_PER_REQUEST]",
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
 fn test_create_table_provisioned_without_throughput_rejected() {
     // Explicit PROVISIONED requires throughput, exactly as on real DynamoDB.
     let mut child = spawn_mcp();

@@ -166,6 +166,13 @@ async fn execute_inner<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
+    // Reject {NULL: false} up front. The HTTP path rejects it during request
+    // deserialisation; this keeps the in-process API in agreement (eu-west-2).
+    helpers::validate_no_null_false(&request.item)?;
+    if let Some(ref values) = request.expression_attribute_values {
+        helpers::validate_no_null_false(values)?;
+    }
+
     // Validate attribute values (empty strings, empty sets, number precision)
     // DynamoDB validates item values before expression parameter checks for PutItem.
     // The set families are tagged for the request-validation envelope.

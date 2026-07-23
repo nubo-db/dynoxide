@@ -293,6 +293,112 @@ fn test_put_item_return_values_all_new_enveloped() {
 }
 
 #[test]
+fn test_put_item_body_null_false_enveloped() {
+    // The in-process API constructs AttributeValue directly, bypassing the
+    // request deserialiser that rejects {"NULL": false} on the HTTP path; the
+    // action-level check gives the same enveloped rejection (eu-west-2).
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[
+                ("pk", AttributeValue::S("k1".into())),
+                ("flag", AttributeValue::NULL(false)),
+            ]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_put_item_nested_null_false_enveloped() {
+    // The rejection recurses through lists and maps, like the deserialiser.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let nested = AttributeValue::M(
+        [("flag".to_string(), AttributeValue::NULL(false))]
+            .into_iter()
+            .collect(),
+    );
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[
+                ("pk", AttributeValue::S("k1".into())),
+                ("data", AttributeValue::L(vec![nested])),
+            ]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_put_item_eav_null_false_enveloped() {
+    // {NULL: false} in ExpressionAttributeValues gets the bare inner message
+    // inside the envelope, not the per-key "contains invalid value" wrapper.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "Items".to_string(),
+            item: make_item(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some("flag = :n".into()),
+            expression_attribute_values: Some(make_item(&[(":n", AttributeValue::NULL(false))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+}
+
+#[test]
+fn test_update_item_return_values_invalid_enveloped_exactly_once() {
+    // The in-process backstop for an invalid ReturnValues enum produces the
+    // same enveloped message as the request deserialiser, with exactly one
+    // envelope.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let err = db
+        .update_item(dynoxide::actions::update_item::UpdateItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            return_values: Some("BOGUS".into()),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy \
+         constraint: Member must satisfy enum value set: \
+         [ALL_NEW, ALL_OLD, NONE, UPDATED_NEW, UPDATED_OLD]"
+    );
+    assert_eq!(
+        err.matches("validation error detected").count(),
+        1,
+        "expected exactly one envelope, got: {err}"
+    );
+}
+
+#[test]
 fn test_put_item_key_type_mismatch_stays_bare() {
     // Type mismatch for a key attribute is captured bare (eu-west-2); it must
     // not gain the request-validation envelope.

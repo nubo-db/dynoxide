@@ -857,6 +857,45 @@ fn validate_expression_attribute_value(
     Ok(())
 }
 
+/// Reject `{NULL: false}` anywhere in an attribute-value map, recursing
+/// through lists and maps.
+///
+/// Matches the request-deserialisation rejection so the in-process API agrees
+/// with HTTP; confirmed against real DynamoDB (eu-west-2). Only PutItem and
+/// UpdateItem call this, for the captured positions (item body, Key and
+/// ExpressionAttributeValues); batch, transact and import behaviour is
+/// unchanged. The error carries the wire-invisible envelope tag, unwrapped at
+/// the operation boundary.
+pub fn validate_no_null_false(values: &HashMap<String, AttributeValue>) -> Result<()> {
+    for value in values.values() {
+        validate_no_null_false_value(value)?;
+    }
+    Ok(())
+}
+
+fn validate_no_null_false_value(value: &AttributeValue) -> Result<()> {
+    match value {
+        AttributeValue::NULL(b) if !b => Err(DynoxideError::EnvelopedValidation(
+            "One or more parameter values were invalid: \
+             Null attribute value types must have the value of true"
+                .to_string(),
+        )),
+        AttributeValue::L(list) => {
+            for v in list {
+                validate_no_null_false_value(v)?;
+            }
+            Ok(())
+        }
+        AttributeValue::M(map) => {
+            for v in map.values() {
+                validate_no_null_false_value(v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Parse raw EAV JSON into a `HashMap<String, AttributeValue>` with key-specific
 /// error messages.
 ///

@@ -118,6 +118,11 @@ pub struct CreateTableParams {
     pub billing_mode: Option<String>,
 
     #[schemars(
+        description = "Optional provisioned throughput {read_capacity_units, write_capacity_units}. Required when billing_mode is explicitly PROVISIONED; must be omitted for PAY_PER_REQUEST."
+    )]
+    pub provisioned_throughput: Option<serde_json::Value>,
+
+    #[schemars(
         description = "Optional table class: STANDARD or STANDARD_INFREQUENT_ACCESS. Accepted for compatibility."
     )]
     pub table_class: Option<String>,
@@ -766,7 +771,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "[WRITE] Create a new DynamoDB table with specified key schema and optional GSIs and LSIs. Supports SSESpecification, TableClass, Tags, and DeletionProtectionEnabled. The table is available immediately after creation."
+        description = "[WRITE] Create a new DynamoDB table with specified key schema and optional GSIs and LSIs. Supports BillingMode, ProvisionedThroughput, SSESpecification, TableClass, Tags, and DeletionProtectionEnabled. The table is available immediately after creation."
     )]
     fn create_table(
         &self,
@@ -845,6 +850,19 @@ impl McpServer {
                 ));
             }
         };
+        let provisioned_throughput = match params
+            .provisioned_throughput
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidProvisionedThroughput",
+                    &format!("Invalid provisioned_throughput: {e}"),
+                ));
+            }
+        };
 
         let request = crate::actions::create_table::CreateTableRequest {
             table_name: params.table_name,
@@ -855,6 +873,7 @@ impl McpServer {
             stream_specification,
             sse_specification,
             billing_mode: params.billing_mode,
+            provisioned_throughput,
             table_class: params.table_class,
             tags,
             deletion_protection_enabled: params.deletion_protection_enabled,

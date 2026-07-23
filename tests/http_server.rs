@@ -569,3 +569,53 @@ async fn test_put_item_multi_datatype_attribute_value_bare() {
     )
     .await;
 }
+
+/// The enveloped rejection UpdateItem returns for a duplicate string set in
+/// ExpressionAttributeValues.
+const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
+     ExpressionAttributeValues contains invalid value: \
+     One or more parameter values were invalid: \
+     Input collection [a, b, a] contains duplicates. for key :t";
+
+/// The bare rejection UpdateItem returns for a SET on a key attribute,
+/// captured against real DynamoDB (eu-west-2).
+const CANNOT_UPDATE_KEY_BARE: &str = "One or more parameter values were invalid: \
+     Cannot update attribute pk. This attribute is part of the key";
+
+#[tokio::test]
+async fn test_update_item_duplicate_set_in_eav_enveloped() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "UpdateItem",
+        json!({
+            "TableName": "Items",
+            "Key": {"pk": {"S": "k1"}},
+            "UpdateExpression": "SET tags = :t",
+            "ExpressionAttributeValues": {":t": {"SS": ["a", "b", "a"]}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, DUPLICATE_SET_IN_EAV_ENVELOPED).await;
+}
+
+#[tokio::test]
+async fn test_update_item_cannot_update_key_bare() {
+    let (url, _handle) = start_test_server().await;
+    create_items_table(&url).await;
+
+    let resp = dynamo_request(
+        &url,
+        "UpdateItem",
+        json!({
+            "TableName": "Items",
+            "Key": {"pk": {"S": "k1"}},
+            "UpdateExpression": "SET pk = :v",
+            "ExpressionAttributeValues": {":v": {"S": "k2"}}
+        }),
+    )
+    .await;
+    assert_validation_error(resp, CANNOT_UPDATE_KEY_BARE).await;
+}

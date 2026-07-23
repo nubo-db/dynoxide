@@ -584,6 +584,124 @@ fn test_update_item() {
     let _ = child.wait();
 }
 
+// ---------------------------------------------------------------------------
+// Request-validation parity with the HTTP surface
+// ---------------------------------------------------------------------------
+
+/// The enveloped rejection PutItem and UpdateItem return for {"NULL": false},
+/// shared verbatim with tests/http_server.rs.
+const NULL_FALSE_ENVELOPED: &str = "1 validation error detected: \
+     One or more parameter values were invalid: \
+     Null attribute value types must have the value of true";
+
+/// The enveloped rejection UpdateItem returns for a duplicate string set in
+/// ExpressionAttributeValues, shared verbatim with tests/http_server.rs.
+const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
+     ExpressionAttributeValues contains invalid value: \
+     One or more parameter values were invalid: \
+     Input collection [a, b, a] contains duplicates. for key :t";
+
+/// The bare rejection UpdateItem returns for a SET on a key attribute, shared
+/// verbatim with tests/http_server.rs.
+const CANNOT_UPDATE_KEY_BARE: &str = "One or more parameter values were invalid: \
+     Cannot update attribute pk. This attribute is part of the key";
+
+/// Create a hash-only table for the validation-parity tests below.
+fn create_parity_table(child: &mut std::process::Child) {
+    let resp = call_tool(
+        child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Parity",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    assert!(!is_tool_error(&resp));
+}
+
+/// Assert a ValidationException tool error with an exact message, and that no
+/// internal marker or serde position suffix leaked into the payload.
+fn assert_validation_tool_error(resp: &Value, expected_message: &str) {
+    assert!(is_tool_error(resp), "expected a tool error: {resp}");
+    let raw = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !raw.contains("VALIDATION") && !raw.contains(" at line "),
+        "internal marker or serde position leaked: {raw}"
+    );
+    let content = tool_content(resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    assert_eq!(content["message"], expected_message);
+}
+
+#[test]
+fn test_put_item_null_false_enveloped() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Parity",
+            "item": {"pk": {"S": "k1"}, "flag": {"NULL": false}}
+        }),
+    );
+    assert_validation_tool_error(&resp, NULL_FALSE_ENVELOPED);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_item_duplicate_set_in_eav_enveloped() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_item",
+        json!({
+            "table_name": "Parity",
+            "key": {"pk": {"S": "k1"}},
+            "update_expression": "SET tags = :t",
+            "expression_attribute_values": {":t": {"SS": ["a", "b", "a"]}}
+        }),
+    );
+    assert_validation_tool_error(&resp, DUPLICATE_SET_IN_EAV_ENVELOPED);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_update_item_cannot_update_key_bare() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_item",
+        json!({
+            "table_name": "Parity",
+            "key": {"pk": {"S": "k1"}},
+            "update_expression": "SET pk = :v",
+            "expression_attribute_values": {":v": {"S": "k2"}}
+        }),
+    );
+    assert_validation_tool_error(&resp, CANNOT_UPDATE_KEY_BARE);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn test_delete_table_with_auto_snapshot() {
     let mut child = spawn_mcp();

@@ -20,20 +20,14 @@
 //! messages by hand go through [`clean_serde_message`], which strips both
 //! markers along with serde_json's position suffix.
 
-#[cfg(feature = "http-server")]
 pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::Result<T> {
     serde_json::from_str(body).map_err(|e| {
         let msg = e.to_string();
         // Marker prefixes from our Deserialize impls select the DynamoDB
         // error class (see the module doc); serde_json appends
         // " at line N column N" to custom errors, so strip that too.
-        if let Some(stripped) = msg.strip_prefix("VALIDATION_REQUEST:") {
-            let clean = strip_serde_position(stripped);
-            return crate::DynoxideError::EnvelopedValidation(clean);
-        }
-        if let Some(stripped) = msg.strip_prefix("VALIDATION:") {
-            let clean = strip_serde_position(stripped);
-            return crate::DynoxideError::ValidationException(clean);
+        if let Some(classified) = classify_marked_serde_error(&msg) {
+            return classified;
         }
         // DynamoDB returns ValidationException for missing required fields,
         // null values, and unrecognised enum variants. Only true JSON type
@@ -58,8 +52,30 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
     })
 }
 
+/// Classify a raw serde error message by its marker prefix, stripping the
+/// marker and serde_json's position suffix.
+///
+/// `VALIDATION_REQUEST:` becomes the wire-invisible
+/// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag and
+/// `VALIDATION:` a bare `ValidationException`; an unmarked message returns
+/// `None` for the caller to classify. This is the single owner of the
+/// marker-to-variant mapping, shared by [`deserialize`] and callers that
+/// decode via `serde_json::from_value` (the MCP surface).
+pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
+    if let Some(stripped) = msg.strip_prefix("VALIDATION_REQUEST:") {
+        return Some(crate::DynoxideError::EnvelopedValidation(
+            strip_serde_position(stripped),
+        ));
+    }
+    if let Some(stripped) = msg.strip_prefix("VALIDATION:") {
+        return Some(crate::DynoxideError::ValidationException(
+            strip_serde_position(stripped),
+        ));
+    }
+    None
+}
+
 /// Strip serde_json's " at line N column N" suffix from error messages.
-#[cfg(feature = "http-server")]
 fn strip_serde_position(msg: &str) -> String {
     strip_position(msg).to_string()
 }
@@ -93,7 +109,6 @@ pub(crate) fn clean_serde_message(msg: &str) -> &str {
 ///
 /// DynamoDB returns specific messages like "NUMBER_VALUE cannot be converted to String"
 /// whereas serde returns "invalid type: integer `23`, expected a string at line 1 column 42".
-#[cfg(feature = "http-server")]
 fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
     // "invalid type: <type>, expected <target>"
     if let Some(rest) = msg.strip_prefix("invalid type: ") {
@@ -138,7 +153,6 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
 }
 
 /// Map a serde type mismatch to DynamoDB's SerializationException message.
-#[cfg(feature = "http-server")]
 fn map_type_mismatch(source: &str, target: &str) -> String {
     // Determine target type category
     let target_is_string = target == "a string";
@@ -252,7 +266,6 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
 
 /// Infer the DynamoDB type conversion error from a serde error message.
 /// Uses the column position to inspect the actual JSON value in the body.
-#[cfg(feature = "http-server")]
 fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> String {
     // Try to extract column number from "at line N column N"
     if let Some(col_str) = msg.rsplit("column ").next() {
@@ -276,7 +289,6 @@ fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> Stri
 }
 
 /// Map Rust struct names to DynamoDB Java class names for SerializationException messages.
-#[cfg(feature = "http-server")]
 fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
     match struct_name {
         "ProvisionedThroughput" | "ProvisionedThroughputRaw" => {
@@ -317,7 +329,7 @@ pub(crate) fn serialize<T: serde::Serialize>(val: &T) -> crate::Result<String> {
     serde_json::to_string(val).map_err(|e| crate::DynoxideError::InternalServerError(e.to_string()))
 }
 
-#[cfg(all(test, feature = "http-server"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

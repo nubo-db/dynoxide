@@ -551,20 +551,44 @@ pub struct BulkPutItemsParams {
 // Helper: convert serde_json::Value → HashMap<String, AttributeValue>
 // ---------------------------------------------------------------------------
 
+/// Decode a DynamoDB JSON map, classifying failures as `DynoxideError`s.
+///
+/// Marker-tagged serde failures classify through the shared decoder in
+/// `serde_errors`, so the internal markers never reach a tool error; any
+/// other failure keeps the field-specific message.
+fn decode_dynamo_map(
+    val: serde_json::Value,
+    field_name: &str,
+) -> Result<HashMap<String, AttributeValue>, crate::errors::DynoxideError> {
+    serde_json::from_value(val).map_err(|e| {
+        let msg = e.to_string();
+        crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
+            crate::errors::DynoxideError::ValidationException(format!(
+                "Invalid DynamoDB JSON in '{field_name}': {msg}"
+            ))
+        })
+    })
+}
+
+/// Parse a DynamoDB JSON map for every tool except put_item and update_item:
+/// the request-validation family reports bare, matching the HTTP surface.
 fn parse_dynamo_map(
     val: serde_json::Value,
     field_name: &str,
 ) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
-    serde_json::from_value(val).map_err(|e| {
-        CallToolResult::error(vec![Content::text(
-            serde_json::json!({
-                "error_type": "ValidationException",
-                "message": format!("Invalid DynamoDB JSON in '{field_name}': {e}"),
-                "retryable": false,
-            })
-            .to_string(),
-        )])
-    })
+    decode_dynamo_map(val, field_name)
+        .map_err(|e| to_tool_error(crate::validation::strip_request_validation_tag(e)))
+}
+
+/// Parse a DynamoDB JSON map for the put_item and update_item tools, which
+/// wrap the request-validation family in the "1 validation error detected: "
+/// envelope, matching PutItem and UpdateItem on the HTTP surface.
+fn parse_dynamo_map_enveloped(
+    val: serde_json::Value,
+    field_name: &str,
+) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
+    decode_dynamo_map(val, field_name)
+        .map_err(|e| to_tool_error(crate::validation::envelope_request_validation(e)))
 }
 
 fn parse_optional_dynamo_map(
@@ -573,6 +597,17 @@ fn parse_optional_dynamo_map(
 ) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
     match val {
         Some(v) => parse_dynamo_map(v, field_name).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Optional-map variant of [`parse_dynamo_map_enveloped`].
+fn parse_optional_dynamo_map_enveloped(
+    val: Option<serde_json::Value>,
+    field_name: &str,
+) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
+    match val {
+        Some(v) => parse_dynamo_map_enveloped(v, field_name).map(Some),
         None => Ok(None),
     }
 }
@@ -882,11 +917,11 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("put_item") {
             return Ok(err);
         }
-        let item = match parse_dynamo_map(params.item, "item") {
+        let item = match parse_dynamo_map_enveloped(params.item, "item") {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let expression_attribute_values = match parse_optional_dynamo_map(
+        let expression_attribute_values = match parse_optional_dynamo_map_enveloped(
             params.expression_attribute_values,
             "expression_attribute_values",
         ) {
@@ -945,11 +980,11 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("update_item") {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(params.key, "key") {
+        let key = match parse_dynamo_map_enveloped(params.key, "key") {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let expression_attribute_values = match parse_optional_dynamo_map(
+        let expression_attribute_values = match parse_optional_dynamo_map_enveloped(
             params.expression_attribute_values,
             "expression_attribute_values",
         ) {

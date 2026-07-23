@@ -866,10 +866,10 @@ fn validate_expression_attribute_value(
 ///
 /// Matches the request-deserialisation rejection so the in-process API agrees
 /// with HTTP; confirmed against real DynamoDB (eu-west-2). Only PutItem and
-/// UpdateItem call this, for the captured positions (item body, Key and
-/// ExpressionAttributeValues); batch, transact and import behaviour is
-/// unchanged. The error carries the wire-invisible envelope tag, unwrapped at
-/// the operation boundary.
+/// UpdateItem call this, for the captured positions (item body, Key,
+/// ExpressionAttributeValues and AttributeUpdates); batch, transact and import
+/// behaviour is unchanged. The error carries the wire-invisible envelope tag,
+/// unwrapped at the operation boundary.
 pub fn validate_no_null_false(values: &HashMap<String, AttributeValue>) -> Result<()> {
     for value in values.values() {
         validate_no_null_false_value(value)?;
@@ -877,7 +877,9 @@ pub fn validate_no_null_false(values: &HashMap<String, AttributeValue>) -> Resul
     Ok(())
 }
 
-fn validate_no_null_false_value(value: &AttributeValue) -> Result<()> {
+/// Single-value form of [`validate_no_null_false`], for callers holding a bare
+/// `AttributeValue` rather than a map (the legacy AttributeUpdates entries).
+pub(crate) fn validate_no_null_false_value(value: &AttributeValue) -> Result<()> {
     match value {
         AttributeValue::NULL(b) if !b => Err(DynoxideError::EnvelopedValidation(
             "One or more parameter values were invalid: \

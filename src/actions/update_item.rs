@@ -226,6 +226,13 @@ async fn execute_inner<S: StorageBackend>(
     if let Some(ref values) = request.expression_attribute_values {
         helpers::validate_no_null_false(values)?;
     }
+    if let Some(ref updates) = request.attribute_updates {
+        for update in updates.values() {
+            if let Some(ref value) = update.value {
+                helpers::validate_no_null_false_value(value)?;
+            }
+        }
+    }
 
     // Validate expression/non-expression parameter conflicts BEFORE Expected conversion
     {
@@ -345,8 +352,9 @@ async fn execute_inner<S: StorageBackend>(
     // Pre-validate UpdateExpression syntax BEFORE table lookup.
     // DynamoDB validates expression syntax, reserved keywords, undefined attribute
     // names/values, overlapping paths, etc. before checking table existence.
-    // Every parse-time error in this block is a family DynamoDB wraps in the
-    // request-validation envelope, so the whole block is tagged.
+    // Parse-time errors here are families DynamoDB wraps in the
+    // request-validation envelope, so they are tagged; the unused-attribute
+    // check propagates bare, matching PutItem.
     if let Some(ref ue) = request.update_expression {
         let parsed =
             crate::expressions::update::parse(ue).map_err(DynoxideError::EnvelopedValidation)?;
@@ -368,9 +376,7 @@ async fn execute_inner<S: StorageBackend>(
         }
 
         // Check for unused expression attribute names/values
-        tracker
-            .check_unused()
-            .map_err(crate::validation::tag_request_validation)?;
+        tracker.check_unused()?;
     }
 
     // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.)

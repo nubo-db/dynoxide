@@ -594,6 +594,11 @@ const NULL_FALSE_ENVELOPED: &str = "1 validation error detected: \
      One or more parameter values were invalid: \
      Null attribute value types must have the value of true";
 
+/// The bare rejection every other operation returns for {"NULL": false},
+/// shared verbatim with tests/http_server.rs.
+const NULL_FALSE_BARE: &str = "One or more parameter values were invalid: \
+     Null attribute value types must have the value of true";
+
 /// The enveloped rejection UpdateItem returns for a duplicate string set in
 /// ExpressionAttributeValues, shared verbatim with tests/http_server.rs.
 const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
@@ -651,6 +656,73 @@ fn test_put_item_null_false_enveloped() {
         }),
     );
     assert_validation_tool_error(&resp, NULL_FALSE_ENVELOPED);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_get_item_null_false_in_key_bare() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({
+            "table_name": "Parity",
+            "key": {"pk": {"NULL": false}}
+        }),
+    );
+    assert_validation_tool_error(&resp, NULL_FALSE_BARE);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_batch_write_item_null_false_bare() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "batch_write_item",
+        json!({
+            "request_items": {
+                "Parity": [
+                    {"PutRequest": {"Item": {"pk": {"S": "k1"}, "flag": {"NULL": false}}}}
+                ]
+            }
+        }),
+    );
+    assert_validation_tool_error(&resp, NULL_FALSE_BARE);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_transact_write_items_null_false_bare() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "transact_write_items",
+        json!({
+            "transact_items": [
+                {"Put": {"TableName": "Parity", "Item": {"pk": {"S": "k1"}, "flag": {"NULL": false}}}}
+            ]
+        }),
+    );
+    assert_validation_tool_error(&resp, NULL_FALSE_BARE);
 
     drop(child.stdin.take());
     let _ = child.wait();

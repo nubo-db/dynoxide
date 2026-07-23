@@ -8,6 +8,7 @@ use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::get_item::GetItemRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::query::QueryRequest;
+use dynoxide::actions::update_item::UpdateItemRequest;
 use dynoxide::types::*;
 use std::collections::HashMap;
 
@@ -113,6 +114,67 @@ fn test_put_item_with_unused_value_rejected() {
         "Expected unused values error, got: {msg}"
     );
     assert!(msg.contains(":unused"), "Expected :unused in error: {msg}");
+}
+
+#[test]
+fn test_put_item_unused_name_message_is_bare() {
+    // The unused-attribute rejection carries no
+    // "1 validation error detected: " envelope on PutItem.
+    let db = make_db();
+    create_table(&db, "TestTable");
+
+    let err = db
+        .put_item(PutItemRequest {
+            table_name: "TestTable".to_string(),
+            item: HashMap::from([
+                ("pk".to_string(), AttributeValue::S("k1".to_string())),
+                ("sk".to_string(), AttributeValue::S("s1".to_string())),
+            ]),
+            condition_expression: Some("attribute_not_exists(pk)".to_string()),
+            expression_attribute_names: Some(HashMap::from([(
+                "#unused".to_string(),
+                "something".to_string(),
+            )])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
+    );
+}
+
+#[test]
+fn test_update_item_unused_name_message_is_bare() {
+    // The unused-attribute rejection carries no
+    // "1 validation error detected: " envelope on UpdateItem either,
+    // matching PutItem.
+    let db = make_db();
+    create_table(&db, "TestTable");
+
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "TestTable".to_string(),
+            key: HashMap::from([
+                ("pk".to_string(), AttributeValue::S("k1".to_string())),
+                ("sk".to_string(), AttributeValue::S("s1".to_string())),
+            ]),
+            update_expression: Some("SET flag = :v".to_string()),
+            expression_attribute_values: Some(HashMap::from([(
+                ":v".to_string(),
+                AttributeValue::S("on".to_string()),
+            )])),
+            expression_attribute_names: Some(HashMap::from([(
+                "#unused".to_string(),
+                "something".to_string(),
+            )])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
+    );
 }
 
 #[test]

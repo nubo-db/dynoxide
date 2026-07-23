@@ -742,6 +742,57 @@ fn test_delete_item_null_false_in_eav_is_validation_exception() {
     );
 }
 
+#[test]
+fn test_update_item_attribute_updates_null_false_enveloped() {
+    // The in-process API constructs AttributeValueUpdate directly, bypassing
+    // the request deserialiser that rejects {"NULL": false} on the HTTP path;
+    // the action-level check gives the same enveloped rejection as the Key and
+    // ExpressionAttributeValues positions, and the item is left untouched.
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+    db.put_item(PutItemRequest {
+        table_name: "Items".to_string(),
+        item: make_item(&[
+            ("pk", AttributeValue::S("k1".into())),
+            ("name", AttributeValue::S("before".into())),
+        ]),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let err = db
+        .update_item(dynoxide::actions::update_item::UpdateItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            attribute_updates: Some(HashMap::from([(
+                "flag".to_string(),
+                dynoxide::actions::update_item::AttributeValueUpdate {
+                    action: "PUT".to_string(),
+                    value: Some(AttributeValue::NULL(false)),
+                },
+            )])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
+
+    let item = db
+        .get_item(GetItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            ..Default::default()
+        })
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(item["name"], AttributeValue::S("before".into()));
+    assert!(!item.contains_key("flag"), "item was modified: {item:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Empty-string key value on the single-action key paths
 // ---------------------------------------------------------------------------

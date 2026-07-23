@@ -166,16 +166,6 @@ pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError 
     }
 }
 
-/// Promote a plain `ValidationException` to the wire-invisible
-/// `EnvelopedValidation` tag. Inverse of `strip_request_validation_tag`, for
-/// call sites that tag an error raised by a shared helper.
-pub(crate) fn tag_request_validation(err: DynoxideError) -> DynoxideError {
-    match err {
-        DynoxideError::ValidationException(msg) => DynoxideError::EnvelopedValidation(msg),
-        other => other,
-    }
-}
-
 /// Resolve the wire-invisible `EnvelopedValidation` tag for a named operation:
 /// PutItem and UpdateItem wrap the request-validation family in the
 /// `1 validation error detected: ` envelope, every other operation reports it

@@ -89,7 +89,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 `native-sqlite` and `encryption` are **mutually exclusive** - they select different SQLite backends. To use encryption:
 
 ```toml
-dynoxide-rs = { version = "0.10", default-features = false, features = ["encryption"] }
+dynoxide-rs = { version = "0.12", default-features = false, features = ["encryption"] }
 ```
 
 **Workspace note:** Cargo unifies features across a workspace. If any crate depends on `dynoxide-rs` with default features (getting `native-sqlite`) and another uses `encryption`, both activate and the build fails. Use `default-features = false` on all `dynoxide-rs` dependencies in the workspace.

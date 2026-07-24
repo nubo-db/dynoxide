@@ -66,6 +66,108 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "TransactGetItems",
 ];
 
+// ---------------------------------------------------------------------------
+// HTTP envelope
+//
+// The wasm engine is fronted by a transport shim (a headless browser driven by
+// `js/wasm-http-bridge.mjs`) so the conformance suite can reach it like any
+// other target. Everything the native server decides *before* an operation is
+// resolved lives here rather than in that shim, so there is exactly one
+// implementation of the wire envelope and the shim stays a dumb pipe. The
+// sequence below mirrors `src/server/mod.rs::handle_request` step for step; if
+// that changes, this changes with it.
+// ---------------------------------------------------------------------------
+
+/// The `X-Amz-Target` prefixes the native server accepts. Kept in step with
+/// `server::TARGET_PREFIX` / `server::STREAMS_TARGET_PREFIX`.
+const TARGET_PREFIX: &str = "DynamoDB_20120810.";
+const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
+
+/// `SerializationException` with no message, for a body that is not JSON.
+/// Byte-identical to `server::serialization_exception_bare`.
+const SERIALIZATION_EXCEPTION_BARE: &str =
+    r#"{"__type":"com.amazon.coral.service#SerializationException"}"#;
+
+/// `UnknownOperationException` with no message, for a missing or unrecognised
+/// target. Byte-identical to `server::unknown_operation_response`.
+const UNKNOWN_OPERATION_BARE: &str =
+    r#"{"__type":"com.amazon.coral.service#UnknownOperationException"}"#;
+
+/// One HTTP response: the status the transport must write, and the body.
+pub struct HttpOutcome {
+    pub status: u16,
+    pub body: String,
+}
+
+impl HttpOutcome {
+    fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+        }
+    }
+}
+
+/// Resolve one DynamoDB HTTP request against `backend`, returning the status
+/// and body the transport should write verbatim.
+///
+/// `target` is the raw `X-Amz-Target` header value, or `None` when absent.
+/// The ordering matters and matches the native server: body-is-JSON first, then
+/// target resolution, then the operation itself. DynamoDB reports a missing
+/// target even when the body is also empty, which is why the empty-body check
+/// sits after target resolution rather than with the JSON check.
+///
+/// **Divergence from the native server:** auth material is not validated.
+/// `server::auth::validate_auth` mirrors DynamoDB's presence/completeness
+/// checks on SigV4 headers (never signature verification, which dynoxide has
+/// never done). The suite drives every target through the AWS SDK, which always
+/// emits well-formed auth, and carries no auth-malformation tests, so
+/// replicating it here would be untested code. Add it if that stops being true.
+pub async fn dispatch_http<S: StorageBackend>(
+    backend: &S,
+    target: Option<&str>,
+    body: &str,
+) -> HttpOutcome {
+    // Non-JSON body → bare SerializationException, before the target is read.
+    if !body.is_empty() && serde_json::from_str::<serde_json::Value>(body).is_err() {
+        return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    let Some(target) = target else {
+        return HttpOutcome::new(400, UNKNOWN_OPERATION_BARE);
+    };
+
+    let operation = target
+        .strip_prefix(TARGET_PREFIX)
+        .or_else(|| target.strip_prefix(STREAMS_TARGET_PREFIX));
+
+    let Some(operation) = operation.filter(|op| crate::dynamo_ops::is_known_operation(op)) else {
+        return HttpOutcome::new(400, UNKNOWN_OPERATION_BARE);
+    };
+
+    // A valid target with an empty body is a serialisation failure, not a
+    // validation error: DynamoDB requires a JSON body on every operation.
+    if body.is_empty() {
+        return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    // A known DynamoDB operation the preview does not implement. 501 is what
+    // makes this land as a skip rather than a failure: the conformance suite's
+    // `isUnsupportedFault` accepts the status outright, so the classification
+    // does not depend on the message surviving the SDK's error parsing.
+    if !SUPPORTED_OPS.contains(&operation) {
+        return HttpOutcome::new(501, unsupported_envelope(operation));
+    }
+
+    // `route` keeps the error typed, so the status comes straight from
+    // `DynoxideError::status_code` rather than being re-derived from the
+    // serialised envelope. Same source of truth as the native server.
+    match route(backend, operation, body).await {
+        Ok(json) => HttpOutcome::new(200, json),
+        Err(e) => HttpOutcome::new(e.status_code(), e.to_json()),
+    }
+}
+
 /// Build the `UnsupportedOperation` JSON envelope for an op the engine does not
 /// serve (either preview-unsupported or genuinely unknown).
 fn unsupported_envelope(op: &str) -> String {
@@ -96,6 +198,23 @@ pub async fn dispatch<S: StorageBackend>(
     op: &str,
     request_json: &str,
 ) -> std::result::Result<String, String> {
+    if !SUPPORTED_OPS.contains(&op) {
+        return Err(unsupported_envelope(op));
+    }
+    route(backend, op, request_json)
+        .await
+        .map_err(|e| e.to_json())
+}
+
+/// Route one supported operation to its handler, keeping the error typed so a
+/// caller that needs an HTTP status (see [`dispatch_http`]) can read it before
+/// the envelope is serialised. Callers check [`SUPPORTED_OPS`] first; an
+/// unlisted op reaching here is a bug, not a user error.
+async fn route<S: StorageBackend>(
+    backend: &S,
+    op: &str,
+    request_json: &str,
+) -> crate::Result<String> {
     // Each arm: deserialise the request through the shared decoder (so a parse
     // failure classifies exactly as it does over HTTP), run the shared handler,
     // then serialise the response.
@@ -127,14 +246,14 @@ pub async fn dispatch<S: StorageBackend>(
         "BatchGetItem" => run!(batch_get_item),
         "BatchWriteItem" => run!(batch_write_item),
         "TransactGetItems" => run!(transact_get_items),
-        other => return Err(unsupported_envelope(other)),
+        other => Err(DynoxideError::InternalServerError(format!(
+            "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
+        ))),
     };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
     // EnvelopedValidation tag for the operation before serialising.
-    result
-        .map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
-        .map_err(|e| e.to_json())
+    result.map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +333,30 @@ mod engine {
         };
         let backend = db.backend().await;
         dispatch(&*backend, &op, &request_json).await
+    }
+
+    /// Resolve one DynamoDB HTTP request end to end, returning
+    /// `{"status": <u16>, "body": "<json>"}` for the transport to write
+    /// verbatim.
+    ///
+    /// `target` is the raw `X-Amz-Target` header, or `null` when the request
+    /// carried none. Unlike [`execute`], a protocol-level rejection is not a
+    /// promise rejection: an unknown target or a bad body is a status and an
+    /// envelope, exactly as it is on the wire. Only calling before `open`
+    /// rejects, because that is a caller bug rather than a request outcome.
+    #[wasm_bindgen(js_name = dispatchHttp)]
+    pub async fn dispatch_http_js(target: Option<String>, body: String) -> Result<String, String> {
+        let db = ENGINE.with(|cell| cell.borrow().clone());
+        let Some(db) = db else {
+            return Err(not_opened_envelope());
+        };
+        let backend = db.backend().await;
+        let outcome = super::dispatch_http(&*backend, target.as_deref(), &body).await;
+        Ok(serde_json::json!({
+            "status": outcome.status,
+            "body": outcome.body,
+        })
+        .to_string())
     }
 
     /// The supported-operation list, as a JSON array of op names. The client's
@@ -611,5 +754,182 @@ mod tests {
         assert_eq!(qv["Count"], 2);
 
         assert!(SUPPORTED_OPS.contains(&"UpdateTable"));
+    }
+
+    // --- HTTP envelope -----------------------------------------------------
+    //
+    // These pin the wire behaviour the conformance suite sees through the
+    // bridge. The suite's `isUnsupportedFault` (src/infra.ts) classifies an op
+    // as unimplemented on any of: name `UnknownOperationException`, a message
+    // matching /unknown operation|not implemented|unsupported operation|is not
+    // supported/i, or HTTP 501. Anything else counts as a conformance failure,
+    // so the preview's unimplemented surface landing as skips depends on these.
+
+    /// The suite's classifier, transcribed. Kept here so a change to the
+    /// envelope that would break skip-classification fails locally rather than
+    /// surfacing as a mysterious drop in the published row.
+    fn is_unsupported_fault(status: u16, body: &str) -> bool {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        let type_tail = v["__type"]
+            .as_str()
+            .unwrap_or("")
+            .rsplit('#')
+            .next()
+            .unwrap_or("")
+            .to_owned();
+        let message = v["message"].as_str().unwrap_or("").to_lowercase();
+        status == 501
+            || type_tail == "UnknownOperationException"
+            || [
+                "unknown operation",
+                "not implemented",
+                "unsupported operation",
+                "is not supported",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle))
+    }
+
+    fn http(backend: &Storage, target: Option<&str>, body: &str) -> HttpOutcome {
+        pollster::block_on(dispatch_http(backend, target, body))
+    }
+
+    #[test]
+    fn http_roundtrips_a_supported_operation() {
+        let backend = Storage::memory().unwrap();
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.CreateTable"),
+            CREATE_MUSIC,
+        );
+        assert_eq!(out.status, 200);
+
+        let out = http(&backend, Some("DynamoDB_20120810.ListTables"), "{}");
+        assert_eq!(out.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(v["TableNames"][0], "Music");
+    }
+
+    #[test]
+    fn http_rejects_a_non_json_body_as_bare_serialization_exception() {
+        let backend = Storage::memory().unwrap();
+        let out = http(&backend, Some("DynamoDB_20120810.ListTables"), "not json");
+        assert_eq!(out.status, 400);
+        assert_eq!(out.body, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    #[test]
+    fn http_reports_a_missing_target_before_an_empty_body() {
+        // DynamoDB resolves the target first, so no-target-and-no-body is an
+        // UnknownOperationException, not a SerializationException.
+        let backend = Storage::memory().unwrap();
+        let out = http(&backend, None, "");
+        assert_eq!(out.status, 400);
+        assert_eq!(out.body, UNKNOWN_OPERATION_BARE);
+    }
+
+    #[test]
+    fn http_rejects_an_empty_body_on_a_valid_target() {
+        let backend = Storage::memory().unwrap();
+        let out = http(&backend, Some("DynamoDB_20120810.ListTables"), "");
+        assert_eq!(out.status, 400);
+        assert_eq!(out.body, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    #[test]
+    fn http_rejects_an_unrecognised_target_prefix() {
+        let backend = Storage::memory().unwrap();
+        let out = http(&backend, Some("Wrong_20120810.ListTables"), "{}");
+        assert_eq!(out.status, 400);
+        assert_eq!(out.body, UNKNOWN_OPERATION_BARE);
+    }
+
+    #[test]
+    fn http_accepts_the_streams_target_prefix() {
+        // The streams ops are not in SUPPORTED_OPS, so this resolves the target
+        // and then reports the op unsupported rather than rejecting the prefix.
+        let backend = Storage::memory().unwrap();
+        let out = http(&backend, Some("DynamoDBStreams_20120810.ListStreams"), "{}");
+        assert_eq!(out.status, 501);
+        assert!(is_unsupported_fault(out.status, &out.body));
+    }
+
+    #[test]
+    fn http_classifies_an_unknown_operation_as_a_skip() {
+        let backend = Storage::memory().unwrap();
+        let out = http(&backend, Some("DynamoDB_20120810.NoSuchOp"), "{}");
+        assert_eq!(out.status, 400);
+        assert!(is_unsupported_fault(out.status, &out.body));
+    }
+
+    /// Every real DynamoDB operation the preview does not implement must reach
+    /// the suite as a skip. This is the case the plan calls load-bearing: if
+    /// these land in the failed column the published row misrepresents the
+    /// preview.
+    #[test]
+    fn http_classifies_every_unimplemented_operation_as_a_skip() {
+        let backend = Storage::memory().unwrap();
+        // The unimplemented surface the plan enumerates, plus the streams ops.
+        for op in [
+            "UpdateTimeToLive",
+            "DescribeTimeToLive",
+            "TransactWriteItems",
+            "TagResource",
+            "UntagResource",
+            "ListTagsOfResource",
+            "DescribeLimits",
+            "ExecuteStatement",
+            "ListStreams",
+        ] {
+            let target = format!("DynamoDB_20120810.{op}");
+            let out = http(&backend, Some(&target), "{}");
+            assert!(
+                is_unsupported_fault(out.status, &out.body),
+                "{op} would be scored as a conformance failure: {} {}",
+                out.status,
+                out.body
+            );
+        }
+    }
+
+    #[test]
+    fn http_surfaces_an_api_error_with_its_own_status_and_envelope() {
+        // A real validation error must stay a 400 with its DynamoDB envelope,
+        // and must not be mistaken for an unimplemented operation.
+        let backend = Storage::memory().unwrap();
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.DescribeTable"),
+            r#"{"TableName":"Absent"}"#,
+        );
+        assert_eq!(out.status, 400);
+        let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+        assert!(
+            v["__type"]
+                .as_str()
+                .unwrap()
+                .contains("ResourceNotFoundException"),
+            "unexpected envelope: {}",
+            out.body
+        );
+        assert!(!is_unsupported_fault(out.status, &out.body));
+    }
+
+    #[test]
+    fn supported_ops_matches_the_routing_table() {
+        // `dispatch` gates on SUPPORTED_OPS before routing, so a drift between
+        // the two would silently report a routed op as unsupported. Every
+        // listed op must reach its handler. An empty request is enough to
+        // prove that: whether it succeeds (ListTables) or fails validation
+        // (everything else), what it must never be is UnsupportedOperation.
+        let backend = Storage::memory().unwrap();
+        for op in SUPPORTED_OPS {
+            if let Err(err) = run(&backend, op, "{}") {
+                assert!(
+                    !err.contains(UNSUPPORTED_TYPE),
+                    "{op} is in SUPPORTED_OPS but did not route: {err}"
+                );
+            }
+        }
     }
 }

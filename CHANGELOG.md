@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The MCP `describe_table` default view now includes `billing_mode`, `table_class` and the capacity settings for the mode the table is in (`provisioned_throughput` or `on_demand_throughput`), where it previously showed none of the table configuration fields and only the `raw: true` view carried them.
 - The MCP `create_table` and `update_table` tools now accept `on_demand_throughput`, so the on-demand ceilings that HTTP and wasm could already set and round-trip are reachable over MCP too ([#157](https://github.com/nubo-db/dynoxide/issues/157)).
 - The MCP `update_table` tool now accepts `billing_mode`, `provisioned_throughput` and `table_class`, so a table can be switched between PROVISIONED and PAY_PER_REQUEST or moved to STANDARD_INFREQUENT_ACCESS over MCP, as it already could over HTTP and wasm. The handler previously hardcoded all three to none, so the engine saw an empty update ([#156](https://github.com/nubo-db/dynoxide/issues/156)).
 - The MCP `create_table` tool now accepts `billing_mode` and `provisioned_throughput`; it previously had neither, so every table created over MCP was PROVISIONED with default throughput. An invalid billing mode is now rejected with DynamoDB's enum validation message on every surface, not just over HTTP ([#154](https://github.com/nubo-db/dynoxide/issues/154)).

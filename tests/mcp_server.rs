@@ -344,6 +344,18 @@ fn test_create_table_provisioned_with_throughput() {
         3
     );
 
+    // The default agent-friendly view surfaces the capacity settings too.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "Provisioned"}),
+    );
+    let flat = tool_content(&resp);
+    assert_eq!(flat["billing_mode"], "PROVISIONED");
+    assert_eq!(flat["provisioned_throughput"]["read_capacity_units"], 7);
+    assert_eq!(flat["provisioned_throughput"]["write_capacity_units"], 3);
+
     drop(child.stdin.take());
     let _ = child.wait();
 }
@@ -525,6 +537,89 @@ fn test_on_demand_throughput_create_and_update() {
     assert_eq!(
         content["Table"]["OnDemandThroughput"]["MaxWriteRequestUnits"],
         30
+    );
+
+    // The default agent-friendly view surfaces the config fields too.
+    let resp = call_tool(
+        &mut child,
+        5,
+        "describe_table",
+        json!({"table_name": "Ceilings"}),
+    );
+    let content = tool_content(&resp);
+    assert_eq!(content["billing_mode"], "PAY_PER_REQUEST");
+    assert_eq!(content["table_class"], "STANDARD");
+    assert_eq!(
+        content["on_demand_throughput"]["max_read_request_units"],
+        40
+    );
+    assert_eq!(
+        content["on_demand_throughput"]["max_write_request_units"],
+        30
+    );
+    assert!(
+        content.get("provisioned_throughput").is_none(),
+        "zeroed provisioned throughput should not appear for an on-demand table: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn test_malformed_on_demand_throughput_rejected() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    // create_table branch
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "BadCeilings",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "on_demand_throughput": 5
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "InvalidOnDemandThroughput");
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid on_demand_throughput"),
+        "unexpected message: {content}"
+    );
+
+    // update_table branch, against a table that does exist
+    call_tool(
+        &mut child,
+        2,
+        "create_table",
+        json!({
+            "table_name": "GoodCeilings",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        3,
+        "update_table",
+        json!({"table_name": "GoodCeilings", "on_demand_throughput": "high"}),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "InvalidOnDemandThroughput");
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid on_demand_throughput"),
+        "unexpected message: {content}"
     );
 
     drop(child.stdin.take());

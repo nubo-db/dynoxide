@@ -94,9 +94,11 @@ client cannot tell it from the native build.
 
 ```bash
 npm run build:wasm
-npx playwright install chromium   # once
 npm run wasm:serve                # port 8003, --port to change it
 ```
+
+It installs its own browser on first run, so the only prerequisite is a built
+bundle. A caller needs the endpoint and nothing else.
 
 ```bash
 aws dynamodb list-tables --endpoint-url http://localhost:8003

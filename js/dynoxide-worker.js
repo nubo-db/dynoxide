@@ -96,7 +96,13 @@ self.onmessage = async (event) => {
         // resolves with `{ status, body }` for the transport to write verbatim.
         // A protocol rejection is a status here, not a thrown envelope: only
         // calling before open rejects.
-        result = await engine.dispatchHttp(payload?.target ?? undefined, payload?.body ?? "");
+        result = await engine.dispatchHttp(
+          payload?.target ?? undefined,
+          payload?.body ?? "",
+          payload?.authorization ?? undefined,
+          payload?.query ?? undefined,
+          payload?.hasDateHeader === true,
+        );
         break;
       case "capabilities":
         result = engine.capabilities();

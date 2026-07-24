@@ -243,14 +243,23 @@ export class EngineClient {
    *
    * @param {string|null} target The raw `X-Amz-Target` header, or null if absent.
    * @param {string} body The raw request body.
+   * @param {object} [auth] Auth material, validated (never signature-verified)
+   *   the same way the native server validates it.
+   * @param {string|null} [auth.authorization] The raw `Authorization` header.
+   * @param {string} [auth.query] The raw query string, without a leading `?`.
+   * @param {boolean} [auth.hasDateHeader] Whether an `X-Amz-Date` or `Date`
+   *   header was present.
    * @returns {Promise<{status: number, body: string}>} Status and body to write
    *   verbatim. Rejects only if called before the engine is open.
    */
-  async dispatchHttp(target, body) {
+  async dispatchHttp(target, body, auth = {}) {
     await this.#ready;
     const raw = await this.#post("dispatchHttp", {
       target: target ?? null,
       body: body ?? "",
+      authorization: auth.authorization ?? null,
+      query: auth.query ?? "",
+      hasDateHeader: auth.hasDateHeader === true,
     });
     return JSON.parse(raw);
   }

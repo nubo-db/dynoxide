@@ -117,16 +117,14 @@ impl HttpOutcome {
 /// target even when the body is also empty, which is why the empty-body check
 /// sits after target resolution rather than with the JSON check.
 ///
-/// **Divergence from the native server:** auth material is not validated.
-/// `server::auth::validate_auth` mirrors DynamoDB's presence/completeness
-/// checks on SigV4 headers (never signature verification, which dynoxide has
-/// never done). The suite drives every target through the AWS SDK, which always
-/// emits well-formed auth, and carries no auth-malformation tests, so
-/// replicating it here would be untested code. Add it if that stops being true.
+/// Auth material is validated through [`crate::auth_material`], the same code
+/// the native server's adapter calls, so the two surfaces cannot diverge.
+/// Signatures are never verified on either.
 pub async fn dispatch_http<S: StorageBackend>(
     backend: &S,
     target: Option<&str>,
     body: &str,
+    auth: crate::auth_material::AuthMaterial<'_>,
 ) -> HttpOutcome {
     // Non-JSON body → bare SerializationException, before the target is read.
     if !body.is_empty() && serde_json::from_str::<serde_json::Value>(body).is_err() {
@@ -144,6 +142,12 @@ pub async fn dispatch_http<S: StorageBackend>(
     let Some(operation) = operation.filter(|op| crate::dynamo_ops::is_known_operation(op)) else {
         return HttpOutcome::new(400, UNKNOWN_OPERATION_BARE);
     };
+
+    // DynamoDB checks auth after resolving the target, so this sits here rather
+    // than at the top.
+    if let Some(envelope) = crate::auth_material::validate(auth) {
+        return HttpOutcome::new(400, envelope);
+    }
 
     // A valid target with an empty body is a serialisation failure, not a
     // validation error: DynamoDB requires a JSON body on every operation.
@@ -345,13 +349,24 @@ mod engine {
     /// envelope, exactly as it is on the wire. Only calling before `open`
     /// rejects, because that is a caller bug rather than a request outcome.
     #[wasm_bindgen(js_name = dispatchHttp)]
-    pub async fn dispatch_http_js(target: Option<String>, body: String) -> Result<String, String> {
+    pub async fn dispatch_http_js(
+        target: Option<String>,
+        body: String,
+        authorization: Option<String>,
+        query: Option<String>,
+        has_date_header: bool,
+    ) -> Result<String, String> {
         let db = ENGINE.with(|cell| cell.borrow().clone());
         let Some(db) = db else {
             return Err(not_opened_envelope());
         };
         let backend = db.backend().await;
-        let outcome = super::dispatch_http(&*backend, target.as_deref(), &body).await;
+        let auth = crate::auth_material::AuthMaterial {
+            authorization: authorization.as_deref(),
+            query: query.as_deref().unwrap_or(""),
+            has_date_header,
+        };
+        let outcome = super::dispatch_http(&*backend, target.as_deref(), &body, auth).await;
         Ok(serde_json::json!({
             "status": outcome.status,
             "body": outcome.body,
@@ -790,8 +805,20 @@ mod tests {
             .any(|needle| message.contains(needle))
     }
 
+    /// A well-formed SigV4 header, as the AWS SDK always sends. Auth is
+    /// validated but never verified, so the signature value is arbitrary.
+    const SIGNED: &str = "AWS4-HMAC-SHA256 Credential=fake/20260724/eu-west-2/dynamodb/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc";
+
+    fn signed_auth() -> crate::auth_material::AuthMaterial<'static> {
+        crate::auth_material::AuthMaterial {
+            authorization: Some(SIGNED),
+            query: "",
+            has_date_header: true,
+        }
+    }
+
     fn http(backend: &Storage, target: Option<&str>, body: &str) -> HttpOutcome {
-        pollster::block_on(dispatch_http(backend, target, body))
+        pollster::block_on(dispatch_http(backend, target, body, signed_auth()))
     }
 
     #[test]
@@ -890,6 +917,41 @@ mod tests {
                 out.body
             );
         }
+    }
+
+    #[test]
+    fn http_validates_auth_material_the_same_way_the_native_server_does() {
+        // Both surfaces delegate to auth_material::validate, so this is a wiring
+        // check rather than a re-test of the rules: an unsigned request must be
+        // rejected here exactly as it is over the native server.
+        let backend = Storage::memory().unwrap();
+        let unsigned = crate::auth_material::AuthMaterial::default();
+        let out = pollster::block_on(dispatch_http(
+            &backend,
+            Some("DynamoDB_20120810.ListTables"),
+            "{}",
+            unsigned,
+        ));
+        assert_eq!(out.status, 400);
+        assert!(
+            out.body.contains("MissingAuthenticationTokenException"),
+            "{}",
+            out.body
+        );
+    }
+
+    #[test]
+    fn http_checks_the_target_before_auth() {
+        // DynamoDB resolves the operation first, so an unsigned request to an
+        // unknown target reports the unknown operation, not the missing token.
+        let backend = Storage::memory().unwrap();
+        let out = pollster::block_on(dispatch_http(
+            &backend,
+            Some("DynamoDB_20120810.NoSuchOp"),
+            "{}",
+            crate::auth_material::AuthMaterial::default(),
+        ));
+        assert_eq!(out.body, UNKNOWN_OPERATION_BARE);
     }
 
     #[test]

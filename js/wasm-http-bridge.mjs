@@ -10,14 +10,20 @@
  * target-specific code path.
  *
  * The engine owns the wire envelope (see `dispatch_http` in src/wasm_api.rs).
- * This file resolves nothing about the protocol: it reads the request, hands
- * the raw target and body to the engine, and writes back whatever status and
- * body come out. Anything protocol-shaped that appears here is a bug, because
- * it would be a second implementation that can drift from the native server.
+ * This file resolves nothing about the protocol: it reads the request, lifts out
+ * the target, body and auth material, and writes back whatever status and body
+ * come out. Anything protocol-shaped that appears here is a bug, because it
+ * would be a second implementation that can drift from the native server.
  *
  * Not a production server. It exists to put the shipping wasm artefact under
- * test over a real socket; there is no auth, no TLS, and no concurrency beyond
- * what one browser page provides.
+ * test over a real socket. Auth material is validated exactly as the native
+ * server validates it and signatures are verified on neither, so this is no
+ * more of a gate than `dynoxide serve` is; there is no TLS, and no concurrency
+ * beyond what one browser page provides.
+ *
+ * Self-contained by design: it installs its own browser on first run, so a
+ * caller needs the endpoint and nothing else. The only prerequisite is a built
+ * bundle.
  *
  * Usage:
  *   npm run build:wasm            # dist/ must exist first
@@ -88,7 +94,7 @@ const PAGE = `<!doctype html>
   });
   globalThis.__bridge = {
     ready: client.ready().then((d) => d),
-    dispatch: (target, body) => client.dispatchHttp(target, body),
+    dispatch: (target, body, auth) => client.dispatchHttp(target, body, auth),
   };
 </script></body></html>`;
 
@@ -164,11 +170,42 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
+/**
+ * Launch Chromium, installing it first if this machine has not got it.
+ *
+ * The server is meant to be self-contained: whoever runs it should need an
+ * endpoint and nothing else, with the browser being this server's problem
+ * rather than theirs. Without this a first run dies on Playwright's "Executable
+ * doesn't exist" and pushes a browser-install step onto every caller, including
+ * CI.
+ */
+async function launchBrowser(chromium, headless) {
+  try {
+    return await chromium.launch({ headless });
+  } catch (e) {
+    if (!/Executable doesn't exist|playwright install/i.test(e?.message ?? "")) {
+      throw e;
+    }
+    console.log("chromium is missing, installing it (first run only)");
+    const install = spawn("npx", ["playwright", "install", "chromium"], {
+      cwd: repoRoot,
+      stdio: "inherit",
+    });
+    const [code] = await once(install, "exit");
+    if (code !== 0) {
+      throw new Error(
+        `could not install chromium (exit ${code}). Install it by hand: npx playwright install chromium`,
+      );
+    }
+    return chromium.launch({ headless });
+  }
+}
+
 /** Launch the browser, boot the engine, and serve until shut down. */
 async function serve(args, cleanups) {
   const { chromium } = await import("@playwright/test");
 
-  const browser = await chromium.launch({ headless: !args.headed });
+  const browser = await launchBrowser(chromium, !args.headed);
   cleanups.push(() => browser.close());
   const page = await browser.newPage();
   page.on("pageerror", (e) => console.error(`[page] ${e.message}`));
@@ -193,12 +230,21 @@ async function serve(args, cleanups) {
       for await (const chunk of req) chunks.push(chunk);
       const body = Buffer.concat(chunks).toString("utf8");
       const target = req.headers["x-amz-target"] ?? null;
+      // Auth is validated (never signature-verified) in the engine, by the same
+      // code the native server uses, so lift the material out and pass it on
+      // rather than deciding anything about it here.
+      const auth = {
+        authorization: req.headers["authorization"] ?? null,
+        query: (req.url ?? "").split("?")[1] ?? "",
+        hasDateHeader:
+          req.headers["x-amz-date"] != null || req.headers["date"] != null,
+      };
 
       // Everything protocol-shaped happens in the engine. This is the whole of
       // the bridge's decision-making.
       const { status, body: responseBody } = await page.evaluate(
-        ([t, b]) => globalThis.__bridge.dispatch(t, b),
-        [target, body],
+        ([t, b, a]) => globalThis.__bridge.dispatch(t, b, a),
+        [target, body, auth],
       );
 
       res.writeHead(status, {

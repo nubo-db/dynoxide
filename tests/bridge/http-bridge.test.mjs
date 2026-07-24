@@ -24,15 +24,22 @@ const PORT = 8103;
 const ASSET_PORT = 8104;
 const BASE = `http://127.0.0.1:${PORT}/`;
 
+// A well-formed SigV4 header, as the AWS SDK always sends. Auth material is
+// validated but never signature-verified, so the values are arbitrary.
+const SIGNED =
+  "AWS4-HMAC-SHA256 Credential=fake/20260724/eu-west-2/dynamodb/aws4_request, " +
+  "SignedHeaders=host;x-amz-date, Signature=abc";
+
 let bridge;
 
 /** POST one DynamoDB request, returning the status and parsed body. */
-async function call(target, body = "{}") {
+async function call(target, body = "{}", { signed = true } = {}) {
   const res = await fetch(BASE, {
     method: "POST",
     headers: {
       "content-type": "application/x-amz-json-1.0",
       ...(target === null ? {} : { "x-amz-target": target }),
+      ...(signed ? { authorization: SIGNED, "x-amz-date": "20260724T000000Z" } : {}),
     },
     body,
   });
@@ -162,4 +169,20 @@ test("the engine starts empty, so shared-table setup cannot collide", async () =
     ["Bridge"],
     "only this run's table should be present",
   );
+});
+
+test("an unsigned request is rejected, as it is on the native server", async () => {
+  // Both HTTP surfaces validate auth material through the same code and verify
+  // signatures on neither, so the wasm endpoint must not be more permissive
+  // than `dynoxide serve`.
+  const out = await call("DynamoDB_20120810.ListTables", "{}", { signed: false });
+  assert.equal(out.status, 400);
+  assert.match(out.body.__type, /MissingAuthenticationTokenException/);
+});
+
+test("the target is resolved before auth, matching DynamoDB", async () => {
+  const out = await call("DynamoDB_20120810.NoSuchOp", "{}", { signed: false });
+  assert.deepEqual(out.body, {
+    __type: "com.amazon.coral.service#UnknownOperationException",
+  });
 });

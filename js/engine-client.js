@@ -231,6 +231,30 @@ export class EngineClient {
     return JSON.parse(raw);
   }
 
+  /**
+   * Resolve one whole DynamoDB HTTP request inside the engine, for a transport
+   * fronting it on a real port.
+   *
+   * Unlike {@link execute}, which takes an already-resolved operation, this
+   * takes the request as it arrived and lets the engine own the wire envelope:
+   * target resolution, body parsing, and the unimplemented-operation response
+   * all happen there rather than in the transport. That keeps one
+   * implementation of the protocol instead of one per transport.
+   *
+   * @param {string|null} target The raw `X-Amz-Target` header, or null if absent.
+   * @param {string} body The raw request body.
+   * @returns {Promise<{status: number, body: string}>} Status and body to write
+   *   verbatim. Rejects only if called before the engine is open.
+   */
+  async dispatchHttp(target, body) {
+    await this.#ready;
+    const raw = await this.#post("dispatchHttp", {
+      target: target ?? null,
+      body: body ?? "",
+    });
+    return JSON.parse(raw);
+  }
+
   /** Tear down the Worker and reject any in-flight calls. */
   terminate() {
     this.#die(new EngineError("engine has been terminated"));

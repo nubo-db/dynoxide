@@ -150,7 +150,7 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 
 | Capability | Notes |
 |---|---|
-| MCP server (33 tools, stdio + HTTP) | Exposes all DynamoDB operations as tools for coding agents |
+| MCP server (34 tools, stdio + HTTP) | Exposes all DynamoDB operations as tools for coding agents |
 | Embedded mode (direct Rust API) | `Database::memory()` - no HTTP, no serialisation overhead |
 | Snapshots + auto-snapshot before destructive ops | Point-in-time save/restore for safe experimentation |
 | OneTable data model integration | `--data-model` loads entity schemas for agent context |

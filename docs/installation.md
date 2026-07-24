@@ -52,11 +52,25 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "0.10", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "0.12", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "0.10", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "0.12", default-features = false, features = ["encryption"] }
 ```
+
+## Upgrading to 0.12.x
+
+Source-breaking for library consumers only. The DynamoDB wire API and the
+CLI, server and MCP surfaces are unchanged, so anyone running the binary can
+upgrade without reading further.
+
+**Depending on the `dynoxide-rs` crate?** Two public types gained fields and
+became `#[non_exhaustive]`:
+
+- **`partiql::parser::Statement`** - the `Update` and `Delete` variants carry a
+  `returning` field. Code that constructs or exhaustively matches them needs `..`.
+- **`actions::batch_execute_statement::BatchStatementResponse`** - gained a
+  `table_name` field, same treatment.
 
 ## Upgrading from 0.9.x
 
@@ -75,7 +89,7 @@ dynoxide-rs = { version = "0.10", default-features = false, features = ["native-
 ## GitHub Actions
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v0.10.0
+- uses: nubo-db/dynoxide/action@v0.12.0
   with:
     snapshot-url: https://example.com/test-data.db.zst  # optional
     port: 8000

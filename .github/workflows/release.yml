@@ -593,16 +593,58 @@ jobs:
 
   # -------------------------------------------------------------------
   # Notify dynoxide.dev so the marketing site rebuilds and the banner /
-  # changelog pick up the new version. The site reads CHANGELOG.md from
-  # this repo at build time, so it only needs a kick.
+  # changelog pick up the new version.
+  #
+  # The site resolves the shipped version from npm's `latest` dist-tag, so
+  # it has to be dispatched *after* the package is live, not merely after
+  # publish-npm returns: that job only dispatches npm.yml and exits, leaving
+  # the actual publish to finish asynchronously. Without the wait below the
+  # site would rebuild against the previous version and nothing would
+  # re-trigger it. Same poll as publish-mcp-registry, for the same reason.
   # -------------------------------------------------------------------
   notify-site:
     name: Trigger dynoxide.dev rebuild
     needs: [validate, publish-crate, publish-homebrew, publish-npm]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Covers the 20-minute poll below plus the dispatch itself.
+    timeout-minutes: 25
 
     steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      # Waits on the dist-tag, not on the version existing. The site resolves
+      # its version from `dist-tags.latest`, and a version can be published
+      # while the tag still points at the previous one, so polling for existence
+      # would let the dispatch fire early - the thing this step exists to
+      # prevent. The budget is deliberately longer than npm.yml's own 15-minute
+      # publish job, since the clock here starts before that job is even queued.
+      - name: Wait for the npm dist-tag to move
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          DEADLINE=$(( $(date +%s) + 1200 ))
+          ATTEMPT=0
+          while :; do
+            ATTEMPT=$(( ATTEMPT + 1 ))
+            # Keep stderr, so a genuine failure (auth, DNS, a 500) is
+            # distinguishable from "not published yet" rather than both looking
+            # like a timeout twenty minutes later.
+            LATEST=$(npm view dynoxide dist-tags.latest 2>/tmp/npm-view-err) || true
+            if [ "$LATEST" = "$VERSION" ]; then
+              echo "npm dist-tags.latest is now $VERSION after $ATTEMPT attempt(s)"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::npm dist-tags.latest is '${LATEST:-unreadable}' after 20 minutes, expected $VERSION"
+              if [ -s /tmp/npm-view-err ]; then echo "Last npm error:"; cat /tmp/npm-view-err; fi
+              exit 1
+            fi
+            echo "Attempt $ATTEMPT: dist-tags.latest is '${LATEST:-unreadable}', waiting for $VERSION"
+            sleep 10
+          done
+
       - name: Dispatch dynoxide.dev deploy
         env:
           GH_TOKEN: ${{ secrets.DYNOXIDE_SITE_DISPATCH_TOKEN }}

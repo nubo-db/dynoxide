@@ -1418,11 +1418,27 @@ fn test_update_table_single_field_table_class() {
     assert_eq!(summary.table_class, "STANDARD_INFREQUENT_ACCESS");
 }
 
+/// Create a PAY_PER_REQUEST table, optionally with initial ceilings.
+fn create_on_demand_table(db: &Database, name: &str, odt: Option<(i64, i64)>) {
+    create_simple_table(db, name);
+    let mut req_json = json!({
+        "TableName": name,
+        "BillingMode": "PAY_PER_REQUEST",
+    });
+    if let Some((r, w)) = odt {
+        req_json["OnDemandThroughput"] =
+            json!({"MaxReadRequestUnits": r, "MaxWriteRequestUnits": w});
+    }
+    let req: UpdateTableRequest = serde_json::from_value(req_json).unwrap();
+    db.update_table(req).unwrap();
+}
+
 #[test]
 fn test_update_table_single_field_on_demand_throughput() {
-    // Issue #45: a lone OnDemandThroughput change must be accepted and persisted.
+    // Issue #45: a lone OnDemandThroughput change must be accepted and
+    // persisted, on a table whose billing mode allows one.
     let db = make_db();
-    create_simple_table(&db, "OdtTable");
+    create_on_demand_table(&db, "OdtTable", None);
 
     let req: UpdateTableRequest = serde_json::from_value(json!({
         "TableName": "OdtTable",
@@ -1436,6 +1452,229 @@ fn test_update_table_single_field_on_demand_throughput() {
         .expect("OnDemandThroughput should be present after update");
     assert_eq!(odt.max_read_request_units, Some(20));
     assert_eq!(odt.max_write_request_units, Some(15));
+}
+
+#[test]
+fn test_update_table_rejects_on_demand_throughput_on_provisioned_table() {
+    // Captured against real DynamoDB (eu-west-2, 2026-07-24): a lone
+    // OnDemandThroughput on a provisioned table is rejected, and the update
+    // wording differs from CreateTable's ("the table", no full stop).
+    let db = make_db();
+    create_simple_table(&db, "OdtGate");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtGate",
+        "OnDemandThroughput": {"MaxReadRequestUnits": 10},
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: MaxReadRequestUnits for \
+         OnDemandThroughput cannot be specified when the table BillingMode is PROVISIONED"
+    );
+
+    // Switching to PROVISIONED while supplying ceilings is the same rejection.
+    let db2 = make_db();
+    create_on_demand_table(&db2, "OdtGateSwitch", None);
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtGateSwitch",
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+        "OnDemandThroughput": {"MaxWriteRequestUnits": 10},
+    }))
+    .unwrap();
+    let err = db2.update_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: MaxWriteRequestUnits for \
+         OnDemandThroughput cannot be specified when the table BillingMode is PROVISIONED"
+    );
+}
+
+#[test]
+fn test_update_table_billing_switch_with_on_demand_throughput_allowed() {
+    // Captured: switching to PAY_PER_REQUEST and setting ceilings in one
+    // request succeeds and applies them.
+    let db = make_db();
+    create_simple_table(&db, "SwitchSet");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "SwitchSet",
+        "BillingMode": "PAY_PER_REQUEST",
+        "OnDemandThroughput": {"MaxReadRequestUnits": 10},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc = describe(&db, "SwitchSet");
+    assert_eq!(
+        desc.billing_mode_summary.unwrap().billing_mode,
+        "PAY_PER_REQUEST"
+    );
+    let odt = desc.on_demand_throughput.unwrap();
+    assert_eq!(odt.max_read_request_units, Some(10));
+    assert_eq!(odt.max_write_request_units, None);
+}
+
+#[test]
+fn test_update_table_partial_on_demand_throughput_merges() {
+    // Captured: a partial object merges member-wise over the stored ceilings.
+    let db = make_db();
+    create_on_demand_table(&db, "OdtMerge", Some((20, 15)));
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtMerge",
+        "OnDemandThroughput": {"MaxReadRequestUnits": 40},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let odt = describe(&db, "OdtMerge").on_demand_throughput.unwrap();
+    assert_eq!(odt.max_read_request_units, Some(40));
+    assert_eq!(odt.max_write_request_units, Some(15));
+}
+
+#[test]
+fn test_update_table_minus_one_removes_ceiling() {
+    // Captured: -1 removes the member. The UpdateTable response echoes the
+    // -1, and DescribeTable afterwards omits the member.
+    let db = make_db();
+    create_on_demand_table(&db, "OdtRemove", Some((20, 15)));
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtRemove",
+        "OnDemandThroughput": {"MaxReadRequestUnits": -1},
+    }))
+    .unwrap();
+    let resp = db.update_table(req).unwrap();
+    let echoed = resp.table_description.on_demand_throughput.unwrap();
+    assert_eq!(echoed.max_read_request_units, Some(-1));
+    assert_eq!(echoed.max_write_request_units, Some(15));
+
+    let odt = describe(&db, "OdtRemove").on_demand_throughput.unwrap();
+    assert_eq!(odt.max_read_request_units, None);
+    assert_eq!(odt.max_write_request_units, Some(15));
+
+    // Removing the last remaining ceiling leaves no OnDemandThroughput at all.
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtRemove",
+        "OnDemandThroughput": {"MaxWriteRequestUnits": -1},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+    assert!(describe(&db, "OdtRemove").on_demand_throughput.is_none());
+}
+
+#[test]
+fn test_update_table_on_demand_throughput_out_of_range() {
+    // Captured: 0 and anything below -1 are outside the valid range.
+    let db = make_db();
+    create_on_demand_table(&db, "OdtRange", Some((20, 15)));
+
+    for bad in [0i64, -2] {
+        let req: UpdateTableRequest = serde_json::from_value(json!({
+            "TableName": "OdtRange",
+            "OnDemandThroughput": {"MaxReadRequestUnits": bad},
+        }))
+        .unwrap();
+        let err = db.update_table(req).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Requested MaxReadRequestUnits \
+             for OnDemandThroughput for table is outside of valid range",
+            "value {bad} should be out of range"
+        );
+    }
+}
+
+#[test]
+fn test_update_table_empty_on_demand_throughput_is_no_change() {
+    // Real DynamoDB returns InternalFailure for an empty OnDemandThroughput
+    // object (captured eu-west-2, 2026-07-24); dynoxide deliberately treats
+    // it as absent instead, so a lone {} hits the no-change rejection and
+    // slips past no gate.
+    let db = make_db();
+    create_simple_table(&db, "OdtEmpty");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtEmpty",
+        "OnDemandThroughput": {},
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert!(
+        err.to_string().starts_with("At least one of"),
+        "expected the no-change rejection, got: {err}"
+    );
+    assert!(describe(&db, "OdtEmpty").on_demand_throughput.is_none());
+}
+
+#[test]
+fn test_update_table_gate_beats_bounds() {
+    // Captured: a PROVISIONED table with an out-of-range member gets the
+    // billing-mode gate error, not the range error.
+    let db = make_db();
+    create_simple_table(&db, "OdtOrder");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtOrder",
+        "OnDemandThroughput": {"MaxReadRequestUnits": 0},
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: MaxReadRequestUnits for \
+         OnDemandThroughput cannot be specified when the table BillingMode is PROVISIONED"
+    );
+}
+
+#[test]
+fn test_update_table_minus_one_on_absent_member() {
+    // Captured: removing a ceiling that was never set succeeds, the response
+    // echoes the -1, and the stored state is unchanged.
+    let db = make_db();
+    create_on_demand_table(&db, "OdtAbsent", None);
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtAbsent",
+        "OnDemandThroughput": {"MaxWriteRequestUnits": 15},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtAbsent",
+        "OnDemandThroughput": {"MaxReadRequestUnits": -1},
+    }))
+    .unwrap();
+    let resp = db.update_table(req).unwrap();
+    let echoed = resp.table_description.on_demand_throughput.unwrap();
+    assert_eq!(echoed.max_read_request_units, Some(-1));
+    assert_eq!(echoed.max_write_request_units, Some(15));
+
+    let odt = describe(&db, "OdtAbsent").on_demand_throughput.unwrap();
+    assert_eq!(odt.max_read_request_units, None);
+    assert_eq!(odt.max_write_request_units, Some(15));
+}
+
+#[test]
+fn test_update_table_switch_to_provisioned_clears_on_demand_throughput() {
+    // Captured: switching billing mode to PROVISIONED clears stored ceilings.
+    let db = make_db();
+    create_on_demand_table(&db, "OdtClear", Some((20, 15)));
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtClear",
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc = describe(&db, "OdtClear");
+    assert!(desc.billing_mode_summary.is_none());
+    assert!(desc.on_demand_throughput.is_none());
 }
 
 #[test]

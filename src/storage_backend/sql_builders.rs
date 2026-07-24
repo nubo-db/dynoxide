@@ -270,6 +270,14 @@ pub fn clear_provisioned_throughput(table_name: &str) -> (String, Vec<SqlParam<'
     )
 }
 
+/// Clear a table's on-demand throughput ceilings.
+pub fn clear_on_demand_throughput(table_name: &str) -> (String, Vec<SqlParam<'_>>) {
+    (
+        "UPDATE _tables SET on_demand_throughput = NULL WHERE table_name = ?1".to_string(),
+        vec![SqlParam::text(table_name)],
+    )
+}
+
 /// Set a table's billing mode.
 pub fn update_billing_mode<'a>(
     table_name: &'a str,

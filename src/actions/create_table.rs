@@ -90,8 +90,17 @@ pub struct CreateTableResponse {
 
 pub async fn execute<S: StorageBackend>(
     storage: &S,
-    request: CreateTableRequest,
+    mut request: CreateTableRequest,
 ) -> Result<CreateTableResponse> {
+    // An OnDemandThroughput object with no members is equivalent to omitting
+    // it: real DynamoDB accepts it at creation and stores nothing (eu-west-2
+    // capture, 2026-07-24), so normalise before any gate looks at it.
+    if request.on_demand_throughput.as_ref().is_some_and(|odt| {
+        odt.max_read_request_units.is_none() && odt.max_write_request_units.is_none()
+    }) {
+        request.on_demand_throughput = None;
+    }
+
     // Structural validation (runs for both programmatic and JSON paths)
     validate_typed_request(&request)?;
 
@@ -112,6 +121,36 @@ pub async fn execute<S: StorageBackend>(
                  constraint: Member must satisfy enum value set: \
                  [STANDARD, STANDARD_INFREQUENT_ACCESS]"
             )));
+        }
+    }
+
+    // OnDemandThroughput is only valid alongside PAY_PER_REQUEST billing, and
+    // its members must be at least 1 at creation (-1 is an UpdateTable-only
+    // removal marker). Both messages captured from real DynamoDB (eu-west-2,
+    // 2026-07-24); the gate names the first present member, read checked
+    // first, and the create wording drops "the" and carries a full stop.
+    if let Some(ref odt) = request.on_demand_throughput {
+        let members = [
+            ("MaxReadRequestUnits", odt.max_read_request_units),
+            ("MaxWriteRequestUnits", odt.max_write_request_units),
+        ];
+        if let Some((member, _)) = members.iter().find(|(_, v)| v.is_some()) {
+            let billing_mode_str = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
+            if billing_mode_str == "PROVISIONED" {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: {member} for \
+                     OnDemandThroughput cannot be specified when table BillingMode \
+                     is PROVISIONED."
+                )));
+            }
+        }
+        for (member, value) in members {
+            if value.is_some_and(|v| v < 1) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Requested {member} for \
+                     OnDemandThroughput for table is outside of valid range"
+                )));
+            }
         }
     }
 

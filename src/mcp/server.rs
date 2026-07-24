@@ -123,6 +123,11 @@ pub struct CreateTableParams {
     pub provisioned_throughput: Option<serde_json::Value>,
 
     #[schemars(
+        description = "Optional on-demand throughput ceilings {max_read_request_units, max_write_request_units}. Stored and reported back by describe_table; not enforced."
+    )]
+    pub on_demand_throughput: Option<serde_json::Value>,
+
+    #[schemars(
         description = "Optional table class: STANDARD or STANDARD_INFREQUENT_ACCESS. Accepted for compatibility."
     )]
     pub table_class: Option<String>,
@@ -427,6 +432,11 @@ pub struct UpdateTableParams {
 
     #[schemars(description = "Change table class: STANDARD or STANDARD_INFREQUENT_ACCESS")]
     pub table_class: Option<String>,
+
+    #[schemars(
+        description = "New on-demand throughput ceilings {max_read_request_units, max_write_request_units}. Stored and reported back by describe_table; not enforced."
+    )]
+    pub on_demand_throughput: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -662,6 +672,24 @@ fn parse_json_param<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Parse an optional JSON tool parameter into a typed value, mapping a
+/// deserialisation failure to a tool validation error with the caller's
+/// error code. The optional counterpart to `parse_json_param`, which owns
+/// the required-parameter path and derives its error code mechanically.
+fn parse_optional_json_param<T: serde::de::DeserializeOwned>(
+    value: Option<serde_json::Value>,
+    error_type: &str,
+    param_name: &str,
+) -> Result<Option<T>, CallToolResult> {
+    value
+        .map(|v| {
+            serde_json::from_value(v).map_err(|e| {
+                tool_validation_error(error_type, &format!("Invalid {param_name}: {e}"))
+            })
+        })
+        .transpose()
+}
+
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -784,7 +812,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "[WRITE] Create a new DynamoDB table with specified key schema and optional GSIs and LSIs. Supports BillingMode, ProvisionedThroughput, SSESpecification, TableClass, Tags, and DeletionProtectionEnabled. The table is available immediately after creation."
+        description = "[WRITE] Create a new DynamoDB table with specified key schema and optional GSIs and LSIs. Supports BillingMode, ProvisionedThroughput, OnDemandThroughput, SSESpecification, TableClass, Tags, and DeletionProtectionEnabled. The table is available immediately after creation."
     )]
     fn create_table(
         &self,
@@ -876,6 +904,14 @@ impl McpServer {
                 ));
             }
         };
+        let on_demand_throughput = match parse_optional_json_param(
+            params.on_demand_throughput,
+            "InvalidOnDemandThroughput",
+            "on_demand_throughput",
+        ) {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
 
         let request = crate::actions::create_table::CreateTableRequest {
             table_name: params.table_name,
@@ -887,10 +923,10 @@ impl McpServer {
             sse_specification,
             billing_mode: params.billing_mode,
             provisioned_throughput,
+            on_demand_throughput,
             table_class: params.table_class,
             tags,
             deletion_protection_enabled: params.deletion_protection_enabled,
-            ..Default::default()
         };
         match self.db.create_table(request) {
             Ok(resp) => json_result(&resp),
@@ -1456,7 +1492,7 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     #[tool(
-        description = "[WRITE] Update a table: add/remove GSIs, change stream settings, switch BillingMode or ProvisionedThroughput, change TableClass, or toggle DeletionProtectionEnabled."
+        description = "[WRITE] Update a table: add/remove GSIs, change stream settings, switch BillingMode, ProvisionedThroughput or OnDemandThroughput, change TableClass, or toggle DeletionProtectionEnabled."
     )]
     fn update_table(
         &self,
@@ -1526,6 +1562,15 @@ impl McpServer {
             }
         };
 
+        let on_demand_throughput = match parse_optional_json_param(
+            params.on_demand_throughput,
+            "InvalidOnDemandThroughput",
+            "on_demand_throughput",
+        ) {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
+
         let request = crate::actions::update_table::UpdateTableRequest {
             table_name: params.table_name,
             attribute_definitions,
@@ -1535,7 +1580,7 @@ impl McpServer {
             billing_mode: params.billing_mode,
             provisioned_throughput,
             table_class: params.table_class,
-            on_demand_throughput: None,
+            on_demand_throughput,
         };
         match self.db.update_table(request) {
             Ok(resp) => json_result(&resp),
@@ -2149,7 +2194,18 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
 
     let stream_enabled = desc.latest_stream_arn.is_some();
 
-    serde_json::json!({
+    let billing_mode = desc
+        .billing_mode_summary
+        .as_ref()
+        .map(|s| s.billing_mode.as_str())
+        .unwrap_or("PROVISIONED");
+    let table_class = desc
+        .table_class_summary
+        .as_ref()
+        .map(|s| s.table_class.as_str())
+        .unwrap_or("STANDARD");
+
+    let mut flat = serde_json::json!({
         "table_name": desc.table_name,
         "status": desc.table_status,
         "partition_key": pk,
@@ -2158,7 +2214,28 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
         "size_bytes": desc.table_size_bytes.unwrap_or(0),
         "gsis": gsis,
         "stream_enabled": stream_enabled,
-    })
+        "billing_mode": billing_mode,
+        "table_class": table_class,
+    });
+
+    // Capacity settings only appear in the mode they belong to: zeroed
+    // provisioned throughput on an on-demand table is noise, not signal.
+    if billing_mode == "PROVISIONED" {
+        if let Some(ref pt) = desc.provisioned_throughput {
+            flat["provisioned_throughput"] = serde_json::json!({
+                "read_capacity_units": pt.read_capacity_units,
+                "write_capacity_units": pt.write_capacity_units,
+            });
+        }
+    }
+    if let Some(ref odt) = desc.on_demand_throughput {
+        flat["on_demand_throughput"] = serde_json::json!({
+            "max_read_request_units": odt.max_read_request_units,
+            "max_write_request_units": odt.max_write_request_units,
+        });
+    }
+
+    flat
 }
 
 /// Enrich a flattened table description with TTL info from storage metadata.

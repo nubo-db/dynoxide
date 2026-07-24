@@ -1112,12 +1112,14 @@ pub struct ProvisionedThroughput {
 pub struct OnDemandThroughput {
     #[serde(
         rename = "MaxReadRequestUnits",
+        alias = "max_read_request_units",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub max_read_request_units: Option<i64>,
     #[serde(
         rename = "MaxWriteRequestUnits",
+        alias = "max_write_request_units",
         default,
         skip_serializing_if = "Option::is_none"
     )]

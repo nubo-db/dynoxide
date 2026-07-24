@@ -90,6 +90,20 @@ self.onmessage = async (event) => {
         // SerializationException for a request that was never malformed.
         result = await engine.execute(payload.op, JSON.stringify(payload.request ?? {}));
         break;
+      case "dispatchHttp":
+        // The whole-request path, used by the HTTP bridge. The engine owns the
+        // wire envelope, so this hands over the raw X-Amz-Target and body and
+        // resolves with `{ status, body }` for the transport to write verbatim.
+        // A protocol rejection is a status here, not a thrown envelope: only
+        // calling before open rejects.
+        result = await engine.dispatchHttp(
+          payload?.target ?? undefined,
+          payload?.body ?? "",
+          payload?.authorization ?? undefined,
+          payload?.query ?? undefined,
+          payload?.hasDateHeader === true,
+        );
+        break;
       case "capabilities":
         result = engine.capabilities();
         break;

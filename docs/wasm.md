@@ -58,10 +58,11 @@ out:  { id, ok: true,  result }      // result is a JSON string
       { id, ok: false, error }       // error is a JSON string
 ```
 
-Three ops carry the engine:
+Four ops carry the engine:
 
 - `open` - `payload: { name, ephemeral? }` opens (or reopens) the OPFS-backed database and resolves with the contract descriptor, `{ contractVersion, capabilities, persistenceMode }`. `ephemeral: true` forces an in-memory session. Call it once before any operation.
 - `execute` - `payload: { op, request }` runs one DynamoDB operation, where `op` is the operation name (`PutItem`, `Query`, `Scan`, ...) and `request` is a plain DynamoDB-JSON object. It resolves with the response JSON and rejects with an error envelope (the same `__type`/`message` shape the native HTTP server speaks). Ask `capabilities` for the supported set rather than guessing; anything outside it comes back as an `UnsupportedOperation` envelope.
+- `dispatchHttp` - `payload: { target, body }` resolves one whole DynamoDB HTTP request, where `target` is the raw `X-Amz-Target` header (or `null`) and `body` is the raw request body. It resolves with `{ status, body }` for a transport to write verbatim. Where `execute` takes an already-resolved operation, this hands the engine the request as it arrived, so target resolution, body parsing, and the unimplemented-operation response all happen in the engine. A protocol rejection comes back as a status rather than a rejected promise; only calling it before `open` rejects.
 - `capabilities` and `contractVersion` - the supported op list and the engine's contract version, for a client that wants them without opening a database.
 
 `contractVersion` stamps the envelope shape, not the engine version. Adding an op is additive and leaves it alone; changing the request, response, or error envelope bumps it. Stamp your messages with the version you built against and the Worker rejects a mismatch loudly, so a stale embed fails with a clear error instead of mis-parsing a newer engine. The shipped version sits in `manifest.json` and is what `open` echoes back.
@@ -75,6 +76,52 @@ python3 -m http.server 8081
 ```
 
 It opens the engine, creates a table, writes a few rows, then runs a query and a filtered scan against the OPFS-backed database so you can see `ScannedCount` come back higher than `Count`. Because it drives the shipping bundle rather than a parallel build, a green harness means the shipping artefact works. (The older smoke ops live behind `npm run build:wasm:harness`, which adds them on top of the same Worker.)
+
+## Serving it over HTTP, for testing only
+
+**This is test infrastructure, not a way to run dynoxide.** It exists so the
+[Parity Suite](https://paritysuite.org) can reach the browser build over a
+socket. If you want a DynamoDB endpoint to develop against, use the native
+build - it is faster, persists, implements far more, and is what the `dynoxide`
+binary, npm package and container image all give you. This server is
+deliberately not distributed in any of them.
+
+Knowing that, the engine has no wire protocol of its own, so nothing that speaks
+DynamoDB over a socket can reach it directly. `npm run wasm:serve` puts an
+endpoint in front: it drives the shipping `dist/` bundle in a headless Chromium
+it manages itself and serves DynamoDB JSON-1.0 on a local port, so an AWS SDK
+client cannot tell it from the native build.
+
+```bash
+npm run build:wasm
+npm run wasm:serve                # port 8003, --port to change it
+```
+
+It installs its own browser on first run, so the only prerequisite is a built
+bundle. A caller needs the endpoint and nothing else.
+
+```bash
+aws dynamodb list-tables --endpoint-url http://localhost:8003
+```
+
+It carries one browser page's worth of concurrency and no TLS.
+
+Two things about it are load-bearing rather than incidental:
+
+- **The engine owns the wire envelope.** `dispatchHttp` decides what a malformed
+  body, a missing target, or an unimplemented operation returns, and the bridge
+  writes back whatever it gets. There is one implementation of the protocol, not
+  one per transport, so the HTTP surface cannot drift from the native server's.
+- **Each start is a clean database.** The session opens `ephemeral`, so a run
+  never inherits state. Test suites that create fixtures up front and never
+  reset would otherwise collide with the previous run's tables. It also means
+  this path does not exercise OPFS; the browser specs under `tests/browser`
+  cover persistence, and this covers the DynamoDB surface.
+
+An operation the preview does not implement returns HTTP 501 with an
+`UnsupportedOperation` envelope, so a conformance runner can tell "out of scope"
+from "implemented and wrong" without guessing. `tests/bridge` drives the whole
+path over a socket; run it with `npm run test:bridge`.
 
 ## The engine package
 

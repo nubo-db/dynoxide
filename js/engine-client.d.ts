@@ -16,6 +16,12 @@ export interface BootDescriptor {
   persistenceMode: PersistenceMode;
 }
 
+/** The status and body a transport writes verbatim for one HTTP request. */
+export interface HttpOutcome {
+  status: number;
+  body: string;
+}
+
 export interface EngineClientOptions {
   /** Explicit URL of the bundled Worker. Overrides assetBase. */
   workerUrl?: string | URL;
@@ -65,6 +71,13 @@ export class EngineClient {
    * you know it, e.g. `execute<ScanOutput>("Scan", request)`.
    */
   execute<T = unknown>(op: string, request?: unknown): Promise<T>;
+  /**
+   * Resolve one whole DynamoDB HTTP request inside the engine, for a transport
+   * fronting it on a real port. The engine owns the wire envelope, so target
+   * resolution, body parsing and the unimplemented-operation response all
+   * happen there. Rejects only if called before the engine is open.
+   */
+  dispatchHttp(target: string | null, body: string): Promise<HttpOutcome>;
   /** Tear down the Worker and reject any in-flight calls. */
   terminate(): void;
 }

@@ -211,7 +211,7 @@ test("the public surface declared in engine-client.d.ts exists at runtime", () =
   // exports it describes. It pins export names and kinds, not TypeScript types -
   // a deeper check would need a tsc toolchain we deliberately don't depend on.
   assert.equal(typeof CONTRACT_VERSION, "number");
-  for (const method of ["ready", "execute", "supports", "terminate"]) {
+  for (const method of ["ready", "execute", "dispatchHttp", "supports", "terminate"]) {
     assert.equal(typeof EngineClient.prototype[method], "function", `EngineClient.${method}`);
   }
   assert.ok(
@@ -222,4 +222,49 @@ test("the public surface declared in engine-client.d.ts exists at runtime", () =
   assert.ok(err instanceof Error);
   assert.equal(err.type, "X");
   assert.equal(typeof err.envelope, "string");
+});
+
+test("dispatchHttp returns the status and body for the transport to write", async () => {
+  const client = new EngineClient({ createWorker: () => makeStubWorker() });
+
+  const created = await client.dispatchHttp(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify(TABLE),
+  );
+  assert.equal(created.status, 200);
+
+  const listed = await client.dispatchHttp("DynamoDB_20120810.ListTables", "{}");
+  assert.equal(listed.status, 200);
+  assert.deepEqual(JSON.parse(listed.body), { TableNames: ["Widgets"] });
+
+  client.terminate();
+});
+
+test("dispatchHttp reports a protocol rejection as a status, not a thrown error", async () => {
+  // The transport writes whatever comes back. A rejection here would force it
+  // to reimplement the mapping from error to status, which is the split this
+  // path exists to avoid.
+  const client = new EngineClient({ createWorker: () => makeStubWorker() });
+
+  const noTarget = await client.dispatchHttp(null, "{}");
+  assert.equal(noTarget.status, 400);
+  assert.match(JSON.parse(noTarget.body).__type, /UnknownOperationException$/);
+
+  const badBody = await client.dispatchHttp("DynamoDB_20120810.ListTables", "not json");
+  assert.equal(badBody.status, 400);
+  assert.match(JSON.parse(badBody.body).__type, /SerializationException$/);
+
+  client.terminate();
+});
+
+test("dispatchHttp returns 501 for an operation the engine does not implement", async () => {
+  // 501 is what makes the conformance suite score the preview's unimplemented
+  // surface as skipped rather than failed.
+  const client = new EngineClient({ createWorker: () => makeStubWorker() });
+
+  const out = await client.dispatchHttp("DynamoDB_20120810.UpdateTimeToLive", "{}");
+  assert.equal(out.status, 501);
+  assert.match(JSON.parse(out.body).message, /is not supported/i);
+
+  client.terminate();
 });

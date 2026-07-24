@@ -41,6 +41,7 @@ compile_error!(
 );
 
 pub mod actions;
+pub mod auth_material;
 pub mod errors;
 pub mod expressions;
 #[cfg(feature = "import")]

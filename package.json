@@ -8,6 +8,7 @@
     "build:wasm": "./scripts/build-wasm.sh",
     "build:wasm:dev": "./scripts/build-wasm.sh --dev",
     "build:wasm:harness": "./scripts/build-wasm.sh --dev --harness",
+    "wasm:serve": "node js/wasm-http-bridge.mjs",
     "test": "node --test js/*.test.js",
     "test:browser": "playwright test"
   },

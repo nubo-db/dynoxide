@@ -567,6 +567,109 @@ fn test_on_demand_throughput_create_and_update() {
 }
 
 #[test]
+fn test_on_demand_throughput_semantics_over_mcp() {
+    // Wire-level pin of the engine semantics captured from real DynamoDB
+    // (eu-west-2, 2026-07-24): the billing gate on both tools with each
+    // operation's exact wording, member-wise merge, and -1 removal with the
+    // response echoing the -1 while describe shows the post-removal state.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    // Create-side gate, on the default (PROVISIONED) billing mode.
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Gated",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "on_demand_throughput": {"max_read_request_units": 10}
+        }),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "One or more parameter values were invalid: MaxReadRequestUnits for \
+         OnDemandThroughput cannot be specified when table BillingMode is PROVISIONED.",
+    );
+
+    // Update-side gate, with its own wording.
+    call_tool(
+        &mut child,
+        2,
+        "create_table",
+        json!({
+            "table_name": "Gated",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        3,
+        "update_table",
+        json!({"table_name": "Gated", "on_demand_throughput": {"max_write_request_units": 10}}),
+    );
+    assert_validation_tool_error(
+        &resp,
+        "One or more parameter values were invalid: MaxWriteRequestUnits for \
+         OnDemandThroughput cannot be specified when the table BillingMode is PROVISIONED",
+    );
+
+    // Merge and -1 removal on an on-demand table.
+    call_tool(
+        &mut child,
+        4,
+        "update_table",
+        json!({
+            "table_name": "Gated",
+            "billing_mode": "PAY_PER_REQUEST",
+            "on_demand_throughput": {"max_read_request_units": 20, "max_write_request_units": 15}
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        5,
+        "update_table",
+        json!({"table_name": "Gated", "on_demand_throughput": {"max_read_request_units": 40}}),
+    );
+    assert!(!is_tool_error(&resp), "merge update failed: {resp}");
+
+    let resp = call_tool(
+        &mut child,
+        6,
+        "update_table",
+        json!({"table_name": "Gated", "on_demand_throughput": {"max_read_request_units": -1}}),
+    );
+    assert!(!is_tool_error(&resp), "-1 removal failed: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["TableDescription"]["OnDemandThroughput"]["MaxReadRequestUnits"],
+        -1
+    );
+    assert_eq!(
+        content["TableDescription"]["OnDemandThroughput"]["MaxWriteRequestUnits"],
+        15
+    );
+
+    let resp = call_tool(
+        &mut child,
+        7,
+        "describe_table",
+        json!({"table_name": "Gated", "raw": true}),
+    );
+    let content = tool_content(&resp);
+    assert!(content["Table"]["OnDemandThroughput"]["MaxReadRequestUnits"].is_null());
+    assert_eq!(
+        content["Table"]["OnDemandThroughput"]["MaxWriteRequestUnits"],
+        15
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
 fn test_malformed_on_demand_throughput_rejected() {
     let mut child = spawn_mcp();
     init_mcp(&mut child);

@@ -90,8 +90,17 @@ pub struct CreateTableResponse {
 
 pub async fn execute<S: StorageBackend>(
     storage: &S,
-    request: CreateTableRequest,
+    mut request: CreateTableRequest,
 ) -> Result<CreateTableResponse> {
+    // An OnDemandThroughput object with no members is equivalent to omitting
+    // it: real DynamoDB accepts it at creation and stores nothing (eu-west-2
+    // capture, 2026-07-24), so normalise before any gate looks at it.
+    if request.on_demand_throughput.as_ref().is_some_and(|odt| {
+        odt.max_read_request_units.is_none() && odt.max_write_request_units.is_none()
+    }) {
+        request.on_demand_throughput = None;
+    }
+
     // Structural validation (runs for both programmatic and JSON paths)
     validate_typed_request(&request)?;
 

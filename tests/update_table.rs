@@ -1589,6 +1589,76 @@ fn test_update_table_on_demand_throughput_out_of_range() {
 }
 
 #[test]
+fn test_update_table_empty_on_demand_throughput_is_no_change() {
+    // Real DynamoDB returns InternalFailure for an empty OnDemandThroughput
+    // object (captured eu-west-2, 2026-07-24); dynoxide deliberately treats
+    // it as absent instead, so a lone {} hits the no-change rejection and
+    // slips past no gate.
+    let db = make_db();
+    create_simple_table(&db, "OdtEmpty");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtEmpty",
+        "OnDemandThroughput": {},
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert!(
+        err.to_string().starts_with("At least one of"),
+        "expected the no-change rejection, got: {err}"
+    );
+    assert!(describe(&db, "OdtEmpty").on_demand_throughput.is_none());
+}
+
+#[test]
+fn test_update_table_gate_beats_bounds() {
+    // Captured: a PROVISIONED table with an out-of-range member gets the
+    // billing-mode gate error, not the range error.
+    let db = make_db();
+    create_simple_table(&db, "OdtOrder");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtOrder",
+        "OnDemandThroughput": {"MaxReadRequestUnits": 0},
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: MaxReadRequestUnits for \
+         OnDemandThroughput cannot be specified when the table BillingMode is PROVISIONED"
+    );
+}
+
+#[test]
+fn test_update_table_minus_one_on_absent_member() {
+    // Captured: removing a ceiling that was never set succeeds, the response
+    // echoes the -1, and the stored state is unchanged.
+    let db = make_db();
+    create_on_demand_table(&db, "OdtAbsent", None);
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtAbsent",
+        "OnDemandThroughput": {"MaxWriteRequestUnits": 15},
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "OdtAbsent",
+        "OnDemandThroughput": {"MaxReadRequestUnits": -1},
+    }))
+    .unwrap();
+    let resp = db.update_table(req).unwrap();
+    let echoed = resp.table_description.on_demand_throughput.unwrap();
+    assert_eq!(echoed.max_read_request_units, Some(-1));
+    assert_eq!(echoed.max_write_request_units, Some(15));
+
+    let odt = describe(&db, "OdtAbsent").on_demand_throughput.unwrap();
+    assert_eq!(odt.max_read_request_units, None);
+    assert_eq!(odt.max_write_request_units, Some(15));
+}
+
+#[test]
 fn test_update_table_switch_to_provisioned_clears_on_demand_throughput() {
     // Captured: switching billing mode to PROVISIONED clears stored ceilings.
     let db = make_db();

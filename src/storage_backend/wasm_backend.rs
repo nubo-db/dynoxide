@@ -507,6 +507,11 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(&sql, params).await
     }
 
+    async fn clear_on_demand_throughput(&self, table_name: &str) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::clear_on_demand_throughput(table_name);
+        self.exec(&sql, params).await
+    }
+
     async fn get_tags(&self, _table_name: &str) -> Result<Vec<Tag>, BackendError> {
         Err(unsupported("get_tags"))
     }

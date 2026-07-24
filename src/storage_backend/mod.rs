@@ -209,6 +209,11 @@ pub trait StorageBackend {
         table_class: &str,
     ) -> Result<(), BackendError>;
 
+    /// Store the serialised on-demand throughput ceilings. Implementations
+    /// must store the payload opaquely: the `clear_on_demand_throughput`
+    /// default passes a JSON `null` through this method, which every reader
+    /// treats as absent, so parsing or rejecting the payload here would break
+    /// that default.
     async fn update_on_demand_throughput(
         &self,
         table_name: &str,
@@ -217,8 +222,8 @@ pub trait StorageBackend {
 
     /// Remove any stored on-demand throughput ceilings. The default stores a
     /// JSON `null`, which every reader treats as absent, so existing backend
-    /// implementations keep working without changes; implementations may
-    /// override to clear the underlying value properly.
+    /// implementations keep working without changes; the in-tree backends
+    /// override this to clear the underlying value properly.
     async fn clear_on_demand_throughput(&self, table_name: &str) -> Result<(), BackendError> {
         self.update_on_demand_throughput(table_name, "null").await
     }

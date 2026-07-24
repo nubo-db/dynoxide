@@ -340,6 +340,37 @@ fn test_create_table_rejects_out_of_range_on_demand_throughput() {
 }
 
 #[test]
+fn test_create_table_empty_on_demand_throughput_treated_as_absent() {
+    // Captured (eu-west-2, 2026-07-24): an OnDemandThroughput object with no
+    // members is accepted and nothing is stored, on any billing mode.
+    let db = make_db();
+
+    let mut req = basic_request("OdtEmptyCreate");
+    req.billing_mode = Some("PAY_PER_REQUEST".to_string());
+    req.on_demand_throughput = Some(OnDemandThroughput {
+        max_read_request_units: None,
+        max_write_request_units: None,
+    });
+    let resp = db.create_table(req).unwrap();
+    assert!(resp.table_description.on_demand_throughput.is_none());
+
+    let desc = db
+        .describe_table(DescribeTableRequest {
+            table_name: "OdtEmptyCreate".to_string(),
+        })
+        .unwrap();
+    assert!(desc.table.on_demand_throughput.is_none());
+
+    // The empty object slips past no gate on a provisioned table either.
+    let mut req = basic_request("OdtEmptyProvisioned");
+    req.on_demand_throughput = Some(OnDemandThroughput {
+        max_read_request_units: None,
+        max_write_request_units: None,
+    });
+    db.create_table(req).unwrap();
+}
+
+#[test]
 fn test_describe_table_omits_on_demand_throughput_when_unset() {
     // Issue #44: a table created without OnDemandThroughput must not synthesise one.
     let db = make_db();

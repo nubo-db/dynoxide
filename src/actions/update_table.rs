@@ -156,9 +156,20 @@ pub struct UpdateTableResponse {
 
 pub async fn execute<S: StorageBackend>(
     storage: &S,
-    request: UpdateTableRequest,
+    mut request: UpdateTableRequest,
 ) -> Result<UpdateTableResponse> {
     // Table name validation is handled in the Deserialize impl
+
+    // An OnDemandThroughput object with no members carries no change, so
+    // treat it as absent: it neither satisfies the at-least-one-change
+    // guard nor produces an echo. Real DynamoDB returns InternalFailure for
+    // this input (captured eu-west-2, 2026-07-24); a deterministic
+    // validation error is a deliberate divergence from emulating a 500.
+    if request.on_demand_throughput.as_ref().is_some_and(|odt| {
+        odt.max_read_request_units.is_none() && odt.max_write_request_units.is_none()
+    }) {
+        request.on_demand_throughput = None;
+    }
 
     // Phase 1: Validate request parameters BEFORE table existence check
     // (DynamoDB validates these first and returns ValidationException,
@@ -200,8 +211,9 @@ pub async fn execute<S: StorageBackend>(
     // either the request switches to it, or the table already is and the
     // request does not switch away. The gate reads the committed billing mode
     // and names the first present member, read checked first; the update
-    // wording carries "the" and no full stop, unlike CreateTable's. Captured
-    // from real DynamoDB (eu-west-2, 2026-07-24).
+    // wording carries "the" and no full stop, unlike CreateTable's. The gate
+    // fires before the bounds check when both are violated. All captured from
+    // real DynamoDB (eu-west-2, 2026-07-24).
     if let Some(ref odt) = request.on_demand_throughput {
         let target_is_provisioned = match request.billing_mode.as_deref() {
             Some("PAY_PER_REQUEST") => false,
@@ -218,6 +230,16 @@ pub async fn execute<S: StorageBackend>(
                     "One or more parameter values were invalid: {member} for \
                      OnDemandThroughput cannot be specified when the table BillingMode \
                      is PROVISIONED"
+                )));
+            }
+        }
+        // Bounds: members must be at least 1, or exactly -1, which removes
+        // the ceiling. Message identical to CreateTable's.
+        for (member, value) in members {
+            if value.is_some_and(|v| v == 0 || v < -1) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Requested {member} for \
+                     OnDemandThroughput for table is outside of valid range"
                 )));
             }
         }
@@ -762,23 +784,6 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
                  constraint: Member must satisfy enum value set: \
                  [STANDARD, STANDARD_INFREQUENT_ACCESS]"
             )));
-        }
-    }
-
-    // OnDemandThroughput bounds: members must be at least 1, or exactly -1,
-    // which removes the ceiling. Message captured from real DynamoDB
-    // (eu-west-2, 2026-07-24), identical wording to CreateTable's.
-    if let Some(ref odt) = request.on_demand_throughput {
-        for (member, value) in [
-            ("MaxReadRequestUnits", odt.max_read_request_units),
-            ("MaxWriteRequestUnits", odt.max_write_request_units),
-        ] {
-            if value.is_some_and(|v| v == 0 || v < -1) {
-                return Err(DynoxideError::ValidationException(format!(
-                    "One or more parameter values were invalid: Requested {member} for \
-                     OnDemandThroughput for table is outside of valid range"
-                )));
-            }
         }
     }
 

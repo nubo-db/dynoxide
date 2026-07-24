@@ -115,6 +115,36 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // OnDemandThroughput is only valid alongside PAY_PER_REQUEST billing, and
+    // its members must be at least 1 at creation (-1 is an UpdateTable-only
+    // removal marker). Both messages captured from real DynamoDB (eu-west-2,
+    // 2026-07-24); the gate names the first present member, read checked
+    // first, and the create wording drops "the" and carries a full stop.
+    if let Some(ref odt) = request.on_demand_throughput {
+        let members = [
+            ("MaxReadRequestUnits", odt.max_read_request_units),
+            ("MaxWriteRequestUnits", odt.max_write_request_units),
+        ];
+        if let Some((member, _)) = members.iter().find(|(_, v)| v.is_some()) {
+            let billing_mode_str = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
+            if billing_mode_str == "PROVISIONED" {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: {member} for \
+                     OnDemandThroughput cannot be specified when table BillingMode \
+                     is PROVISIONED."
+                )));
+            }
+        }
+        for (member, value) in members {
+            if value.is_some_and(|v| v < 1) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Requested {member} for \
+                     OnDemandThroughput for table is outside of valid range"
+                )));
+            }
+        }
+    }
+
     if storage.table_exists(&request.table_name).await? {
         return Err(DynoxideError::ResourceInUseException(format!(
             "Table already exists: {}",

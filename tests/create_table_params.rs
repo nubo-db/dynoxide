@@ -277,6 +277,69 @@ fn test_create_table_on_demand_throughput_round_trips() {
 }
 
 #[test]
+fn test_create_table_rejects_on_demand_throughput_when_provisioned() {
+    // Captured against real DynamoDB (eu-west-2, 2026-07-24): CreateTable
+    // rejects OnDemandThroughput when the billing mode is PROVISIONED,
+    // including the default. The message names the first present member,
+    // read checked first.
+    let db = make_db();
+
+    // Default billing mode (PROVISIONED), read member present.
+    let mut req = basic_request("OdtGateDefault");
+    req.on_demand_throughput = Some(OnDemandThroughput {
+        max_read_request_units: Some(10),
+        max_write_request_units: Some(10),
+    });
+    let err = db.create_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: MaxReadRequestUnits for \
+         OnDemandThroughput cannot be specified when table BillingMode is PROVISIONED."
+    );
+
+    // Explicit PROVISIONED, write member only: the message names the write member.
+    let mut req = basic_request("OdtGateWrite");
+    req.billing_mode = Some("PROVISIONED".to_string());
+    req.provisioned_throughput = Some(ProvisionedThroughput {
+        read_capacity_units: Some(5),
+        write_capacity_units: Some(5),
+    });
+    req.on_demand_throughput = Some(OnDemandThroughput {
+        max_read_request_units: None,
+        max_write_request_units: Some(10),
+    });
+    let err = db.create_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: MaxWriteRequestUnits for \
+         OnDemandThroughput cannot be specified when table BillingMode is PROVISIONED."
+    );
+}
+
+#[test]
+fn test_create_table_rejects_out_of_range_on_demand_throughput() {
+    // Captured: members must be >= 1 at creation; -1 is only meaningful as a
+    // removal on UpdateTable and is rejected here with the same message as 0.
+    let db = make_db();
+
+    for bad in [0i64, -1] {
+        let mut req = basic_request("OdtRange");
+        req.billing_mode = Some("PAY_PER_REQUEST".to_string());
+        req.on_demand_throughput = Some(OnDemandThroughput {
+            max_read_request_units: Some(bad),
+            max_write_request_units: None,
+        });
+        let err = db.create_table(req).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Requested MaxReadRequestUnits \
+             for OnDemandThroughput for table is outside of valid range",
+            "value {bad} should be out of range"
+        );
+    }
+}
+
+#[test]
 fn test_describe_table_omits_on_demand_throughput_when_unset() {
     // Issue #44: a table created without OnDemandThroughput must not synthesise one.
     let db = make_db();

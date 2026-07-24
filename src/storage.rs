@@ -705,6 +705,15 @@ impl Storage {
         Ok(())
     }
 
+    /// Clear on-demand throughput ceilings for a table (sets to SQL NULL).
+    pub fn clear_on_demand_throughput(&self, table_name: &str) -> Result<()> {
+        let (sql, params) = sql_builders::clear_on_demand_throughput(table_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
     /// Update billing mode for a table.
     pub fn update_billing_mode(&self, table_name: &str, billing_mode: &str) -> Result<()> {
         let (sql, params) = sql_builders::update_billing_mode(table_name, billing_mode);

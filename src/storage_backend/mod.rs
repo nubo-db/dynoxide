@@ -215,6 +215,14 @@ pub trait StorageBackend {
         on_demand_throughput: &str,
     ) -> Result<(), BackendError>;
 
+    /// Remove any stored on-demand throughput ceilings. The default stores a
+    /// JSON `null`, which every reader treats as absent, so existing backend
+    /// implementations keep working without changes; implementations may
+    /// override to clear the underlying value properly.
+    async fn clear_on_demand_throughput(&self, table_name: &str) -> Result<(), BackendError> {
+        self.update_on_demand_throughput(table_name, "null").await
+    }
+
     async fn get_tags(&self, table_name: &str) -> Result<Vec<Tag>, BackendError>;
 
     async fn set_tags(&self, table_name: &str, new_tags: &[Tag]) -> Result<(), BackendError>;

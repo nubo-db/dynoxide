@@ -196,6 +196,33 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // OnDemandThroughput is only valid when the table ends up PAY_PER_REQUEST:
+    // either the request switches to it, or the table already is and the
+    // request does not switch away. The gate reads the committed billing mode
+    // and names the first present member, read checked first; the update
+    // wording carries "the" and no full stop, unlike CreateTable's. Captured
+    // from real DynamoDB (eu-west-2, 2026-07-24).
+    if let Some(ref odt) = request.on_demand_throughput {
+        let target_is_provisioned = match request.billing_mode.as_deref() {
+            Some("PAY_PER_REQUEST") => false,
+            Some(_) => true,
+            None => current_billing_mode == "PROVISIONED",
+        };
+        let members = [
+            ("MaxReadRequestUnits", odt.max_read_request_units),
+            ("MaxWriteRequestUnits", odt.max_write_request_units),
+        ];
+        if target_is_provisioned {
+            if let Some((member, _)) = members.iter().find(|(_, v)| v.is_some()) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: {member} for \
+                     OnDemandThroughput cannot be specified when the table BillingMode \
+                     is PROVISIONED"
+                )));
+            }
+        }
+    }
+
     // Same read/write values check
     if let Some(ref pt) = request.provisioned_throughput {
         if let Some(obj) = pt.as_object() {
@@ -386,6 +413,32 @@ pub async fn execute<S: StorageBackend>(
     let is_increase = new_rcu > cur_rcu || new_wcu > cur_wcu;
     let is_decrease = new_rcu < cur_rcu || new_wcu < cur_wcu;
 
+    // OnDemandThroughput merges member-wise over the stored ceilings, with -1
+    // removing a member (captured from real DynamoDB, eu-west-2 2026-07-24).
+    // The response echoes the merge with any -1 kept verbatim; the stored
+    // state has it stripped, and an empty result clears the column.
+    let odt_change = request.on_demand_throughput.as_ref().map(|req_odt| {
+        let stored: crate::types::OnDemandThroughput = meta
+            .on_demand_throughput
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        let echo = crate::types::OnDemandThroughput {
+            max_read_request_units: req_odt
+                .max_read_request_units
+                .or(stored.max_read_request_units),
+            max_write_request_units: req_odt
+                .max_write_request_units
+                .or(stored.max_write_request_units),
+        };
+        let strip = |v: Option<i64>| v.filter(|&v| v != -1);
+        let effective = crate::types::OnDemandThroughput {
+            max_read_request_units: strip(echo.max_read_request_units),
+            max_write_request_units: strip(echo.max_write_request_units),
+        };
+        (echo, effective)
+    });
+
     // All validation passed; perform mutations inside a single transaction.
     helpers::with_write_transaction(storage, async {
         if let Some(ref updates) = request.global_secondary_index_updates {
@@ -482,12 +535,20 @@ pub async fn execute<S: StorageBackend>(
         }
 
         // Handle on-demand throughput changes
-        if let Some(ref on_demand) = request.on_demand_throughput {
-            let json = serde_json::to_string(on_demand)
-                .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-            storage
-                .update_on_demand_throughput(&request.table_name, &json)
-                .await?;
+        if let Some((_, ref effective)) = odt_change {
+            if effective.max_read_request_units.is_none()
+                && effective.max_write_request_units.is_none()
+            {
+                storage
+                    .clear_on_demand_throughput(&request.table_name)
+                    .await?;
+            } else {
+                let json = serde_json::to_string(effective)
+                    .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+                storage
+                    .update_on_demand_throughput(&request.table_name, &json)
+                    .await?;
+            }
         }
 
         // Handle billing mode changes
@@ -499,6 +560,12 @@ pub async fn execute<S: StorageBackend>(
                 // Clear provisioned throughput to avoid stale data
                 storage
                     .clear_provisioned_throughput(&request.table_name)
+                    .await?;
+            } else if billing_mode == "PROVISIONED" {
+                // Switching away from on-demand clears the stored ceilings,
+                // matching real DynamoDB (eu-west-2 capture, 2026-07-24).
+                storage
+                    .clear_on_demand_throughput(&request.table_name)
                     .await?;
             }
         }
@@ -526,6 +593,12 @@ pub async fn execute<S: StorageBackend>(
     // Build response from updated metadata
     let updated_meta = helpers::require_table(storage, &request.table_name).await?;
     let mut desc = build_table_description(&updated_meta, Some(0), Some(0));
+
+    // The UpdateTable response echoes the merged ceilings with any -1 kept
+    // verbatim; only DescribeTable afterwards shows the post-removal state.
+    if let Some((echo, _)) = odt_change {
+        desc.on_demand_throughput = Some(echo);
+    }
 
     // DynamoDB returns UPDATING status during throughput changes
     if is_pt_update {
@@ -689,6 +762,23 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
                  constraint: Member must satisfy enum value set: \
                  [STANDARD, STANDARD_INFREQUENT_ACCESS]"
             )));
+        }
+    }
+
+    // OnDemandThroughput bounds: members must be at least 1, or exactly -1,
+    // which removes the ceiling. Message captured from real DynamoDB
+    // (eu-west-2, 2026-07-24), identical wording to CreateTable's.
+    if let Some(ref odt) = request.on_demand_throughput {
+        for (member, value) in [
+            ("MaxReadRequestUnits", odt.max_read_request_units),
+            ("MaxWriteRequestUnits", odt.max_write_request_units),
+        ] {
+            if value.is_some_and(|v| v == 0 || v < -1) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Requested {member} for \
+                     OnDemandThroughput for table is outside of valid range"
+                )));
+            }
         }
     }
 

@@ -110,6 +110,10 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn clear_on_demand_throughput(&self, table_name: &str) -> Result<(), BackendError> {
+        Storage::clear_on_demand_throughput(self, table_name).map_err(dyno_to_backend)
+    }
+
     async fn get_tags(&self, table_name: &str) -> Result<Vec<Tag>, BackendError> {
         Storage::get_tags(self, table_name).map_err(dyno_to_backend)
     }

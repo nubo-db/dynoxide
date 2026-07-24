@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-24
+
 ### Changed
 
 - **Breaking (Rust API):** the public `partiql::parser::Statement` enum gained a `returning` field on its `Update` and `Delete` variants, and both variants are now `#[non_exhaustive]`; the public `actions::batch_execute_statement::BatchStatementResponse` struct gained a `table_name` field and is now `#[non_exhaustive]` too. Library consumers that construct or exhaustively match these types must add `..`. This is a source-breaking change for the crate's public API, so the next release is a minor bump (0.12.0). The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
@@ -427,7 +429,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...v0.12.0
 [0.11.4]: https://github.com/nubo-db/dynoxide/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/nubo-db/dynoxide/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/nubo-db/dynoxide/compare/v0.11.1...v0.11.2

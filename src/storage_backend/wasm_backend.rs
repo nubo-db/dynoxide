@@ -18,8 +18,9 @@
 //!
 //! # Preview status
 //!
-//! This backend is not verified by the conformance suite. It covers the CRUD,
-//! query, scan, and GSI/LSI surface. Capabilities it does not provide - streams
+//! This backend covers the CRUD, query, scan, GSI/LSI, and PartiQL surface, and
+//! is verified against the conformance suite for those. Capabilities it does
+//! not provide - streams
 //! (delivery mechanism still to be designed), TTL (which needs a background
 //! expiry sweep the browser does not drive), the cross-item `TransactWriteItems`
 //! action, tag and table-setting updates, stats, and bulk import - return the

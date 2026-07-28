@@ -849,3 +849,148 @@ test("an overwrite and a delete keep GSI and LSI in step with the fan-out batche
   expect(result.g2AfterDelete).toBe(0); // delete-path fan-out cleared the GSI
   expect(result.lsiAfterDelete).toBe(0); // and the LSI
 });
+
+test("PartiQL round-trips against OPFS and survives a worker restart", async ({ page }) => {
+  const result = await page.evaluate(async (table) => {
+    const name = `partiql-${crypto.randomUUID()}`;
+    const first = globalThis.dynoxide.makeClient({ name });
+    await first.ready();
+    await first.execute("CreateTable", table);
+
+    const statement = async (Statement, Parameters) =>
+      first.execute("ExecuteStatement", Parameters ? { Statement, Parameters } : { Statement });
+
+    await statement(
+      `INSERT INTO "Music" VALUE {'artist': ?, 'song': ?, 'plays': 1}`,
+      [{ S: "a" }, { S: "s1" }],
+    );
+    await statement(`UPDATE "Music" SET plays = 4 WHERE artist = 'a' AND song = 's1'`);
+    const selected = await statement(`SELECT * FROM "Music" WHERE artist = 'a' AND song = 's1'`);
+
+    const capabilities = first.capabilities;
+    first.terminate();
+
+    // A second worker on the same OPFS database must see the committed rows.
+    const second = globalThis.dynoxide.makeClient({ name });
+    await second.ready();
+    const afterRestart = await second.execute(
+      "ExecuteStatement",
+      { Statement: `SELECT * FROM "Music" WHERE artist = 'a' AND song = 's1'` },
+    );
+    await second.execute("ExecuteStatement", {
+      Statement: `DELETE FROM "Music" WHERE artist = 'a' AND song = 's1'`,
+    });
+    const afterDelete = await second.execute("ExecuteStatement", {
+      Statement: `SELECT * FROM "Music" WHERE artist = 'a' AND song = 's1'`,
+    });
+    second.terminate();
+
+    return {
+      plays: selected.Items[0].plays.N,
+      playsAfterRestart: afterRestart.Items[0].plays.N,
+      remaining: afterDelete.Items.length,
+      capabilities,
+    };
+  }, MUSIC);
+
+  expect(result.plays).toBe("4");
+  expect(result.playsAfterRestart).toBe("4"); // the OPFS commit survived the restart
+  expect(result.remaining).toBe(0);
+  // Positive feature detection: a client hides what the engine does not list.
+  expect(result.capabilities).toEqual(
+    expect.arrayContaining(["ExecuteStatement", "BatchExecuteStatement", "ExecuteTransaction"]),
+  );
+});
+
+test("a cancelled PartiQL transaction unwinds every statement it had applied", async ({ page }) => {
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `txn-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    await client.execute("ExecuteStatement", {
+      Statement: `INSERT INTO "Music" VALUE {'artist': 'a', 'song': 'taken'}`,
+    });
+
+    // The second statement collides, so the first must not survive. Proves the
+    // bridge's ROLLBACK genuinely unwinds a write already made against OPFS.
+    let cancelled = null;
+    try {
+      await client.execute("ExecuteTransaction", {
+        TransactStatements: [
+          { Statement: `INSERT INTO "Music" VALUE {'artist': 'a', 'song': 'fresh'}` },
+          { Statement: `INSERT INTO "Music" VALUE {'artist': 'a', 'song': 'taken'}` },
+        ],
+      });
+    } catch (e) {
+      cancelled = { type: e.type, reasons: JSON.parse(e.envelope).CancellationReasons };
+    }
+
+    const survivors = await client.execute("ExecuteStatement", {
+      Statement: `SELECT * FROM "Music" WHERE artist = 'a' AND song = 'fresh'`,
+    });
+    client.terminate();
+    return { cancelled, survivors: survivors.Items.length };
+  }, MUSIC);
+
+  expect(result.cancelled).not.toBeNull();
+  expect(result.cancelled.type).toMatch(/TransactionCanceledException$/);
+  // Per-statement reasons keep their positions: the collision is the second.
+  expect(result.cancelled.reasons.map((r) => r.Code)).toEqual(["None", "DuplicateItem"]);
+  expect(result.survivors).toBe(0);
+});
+
+test("a repeated ClientRequestToken does not apply the transaction twice", async ({ page }) => {
+  // Guard-scope dependent by design: the engine holds the backend lock for a
+  // whole dispatch, so the second call queues and replays the first result. If
+  // that scope is ever narrowed this test moves, because the second call would
+  // instead meet a live claim in the idempotency cache.
+  const result = await page.evaluate(async (table) => {
+    const client = globalThis.dynoxide.makeClient({ name: `token-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", table);
+
+    // A statement that cannot succeed twice, so a double-apply is observable
+    // as a cancellation rather than needing a counter the page cannot see.
+    const request = {
+      TransactStatements: [
+        { Statement: `INSERT INTO "Music" VALUE {'artist': 'a', 'song': 'once'}` },
+      ],
+      ClientRequestToken: "same-token",
+    };
+
+    // Fire both without awaiting the first, so they overlap in the worker.
+    const settled = await Promise.allSettled([
+      client.execute("ExecuteTransaction", request),
+      client.execute("ExecuteTransaction", request),
+    ]);
+
+    // Control: the same statements under a different token must collide, which
+    // is what shows the token is the reason the pair above did not.
+    let control = null;
+    try {
+      await client.execute("ExecuteTransaction", {
+        ...request,
+        ClientRequestToken: "other-token",
+      });
+    } catch (e) {
+      control = e.type;
+    }
+
+    const rows = await client.execute("ExecuteStatement", {
+      Statement: `SELECT * FROM "Music" WHERE artist = 'a' AND song = 'once'`,
+    });
+    client.terminate();
+    return {
+      statuses: settled.map((s) => s.status),
+      values: settled.map((s) => s.value),
+      control,
+      rows: rows.Items.length,
+    };
+  }, MUSIC);
+
+  expect(result.statuses).toEqual(["fulfilled", "fulfilled"]);
+  // The replay is the first call's response, not an empty stand-in.
+  expect(result.values[1]).toEqual(result.values[0]);
+  expect(result.control).toMatch(/TransactionCanceledException$/);
+  expect(result.rows).toBe(1);
+});

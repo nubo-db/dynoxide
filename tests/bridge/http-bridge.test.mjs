@@ -129,6 +129,54 @@ test("an unimplemented operation is a 501 the suite scores as a skip", async () 
   );
 });
 
+test("PartiQL round-trips a statement and its result through the transport", async () => {
+  // Its own table, so this runs standalone rather than only after the test
+  // that happens to create "Bridge".
+  const created = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      TableName: "BridgePartiql",
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    }),
+  );
+  assert.equal(created.status, 200);
+
+  // The Rust tests cover the statement grammar; this covers the statement and
+  // its parameters surviving HTTP, the browser and the Worker intact.
+  const inserted = await call(
+    "DynamoDB_20120810.ExecuteStatement",
+    JSON.stringify({
+      Statement: `INSERT INTO "BridgePartiql" VALUE {'pk': ?, 'note': ?}`,
+      Parameters: [{ S: "partiql" }, { S: "through the bridge" }],
+    }),
+  );
+  assert.equal(inserted.status, 200);
+
+  const selected = await call(
+    "DynamoDB_20120810.ExecuteStatement",
+    JSON.stringify({
+      Statement: `SELECT * FROM "BridgePartiql" WHERE pk = ?`,
+      Parameters: [{ S: "partiql" }],
+    }),
+  );
+  assert.equal(selected.status, 200);
+  assert.deepEqual(selected.body.Items, [
+    { pk: { S: "partiql" }, note: { S: "through the bridge" } },
+  ]);
+});
+
+test("a malformed PartiQL statement is a ValidationException, not a skip", async () => {
+  const out = await call(
+    "DynamoDB_20120810.ExecuteStatement",
+    JSON.stringify({ Statement: "NOT A STATEMENT" }),
+  );
+  assert.equal(out.status, 400);
+  assert.match(out.body.__type, /ValidationException$/);
+  assert.match(out.body.message, /^Statement wasn't well formed, can't be processed: /);
+});
+
 test("a malformed body is a bare SerializationException", async () => {
   const out = await call("DynamoDB_20120810.ListTables", "not json");
   assert.equal(out.status, 400);
@@ -165,9 +213,9 @@ test("the engine starts empty, so shared-table setup cannot collide", async () =
   const out = await call("DynamoDB_20120810.ListTables");
   assert.equal(out.status, 200);
   assert.deepEqual(
-    out.body.TableNames,
-    ["Bridge"],
-    "only this run's table should be present",
+    [...out.body.TableNames].sort(),
+    ["Bridge", "BridgePartiql"],
+    "only this run's tables should be present",
   );
 });
 

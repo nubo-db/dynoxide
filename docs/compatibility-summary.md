@@ -113,7 +113,7 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
 - **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping
 - **Projections:** Nested dot-notation paths, `COUNT(*)`
-- **Pagination:** `LIMIT`, `NextToken`
+- **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
 - **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics

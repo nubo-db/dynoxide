@@ -43,8 +43,20 @@ pub async fn execute<S: StorageBackend>(
     })?;
 
     let params = request.parameters.unwrap_or_default();
-    let (items, size) =
-        partiql::executor::execute_measured(storage, &stmt, &params, request.limit).await?;
+    let page = partiql::executor::execute_page(
+        storage,
+        &stmt,
+        &params,
+        request.limit,
+        request.next_token.as_deref(),
+    )
+    .await?;
+    let partiql::executor::StatementPage {
+        items,
+        size,
+        next_token,
+        ..
+    } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
     // unlike some emulators that omit it. A SELECT is charged read units (an
@@ -65,7 +77,7 @@ pub async fn execute<S: StorageBackend>(
 
     Ok(ExecuteStatementResponse {
         items,
-        next_token: None,
+        next_token,
         consumed_capacity,
     })
 }

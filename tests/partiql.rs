@@ -2703,3 +2703,496 @@ fn test_partiql_delete_without_pk_rejected() {
         "got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SELECT pagination
+// ---------------------------------------------------------------------------
+
+/// Walk a SELECT the way a client does, returning every page's row count and
+/// the primary keys seen, so a test can check for gaps and duplicates.
+fn paginate(db: &Database, statement: &str, limit: usize) -> (Vec<usize>, Vec<String>) {
+    let mut pages = Vec::new();
+    let mut keys = Vec::new();
+    let mut next_token = None;
+
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: statement.to_string(),
+                limit: Some(limit),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap();
+        let items = response.items.unwrap_or_default();
+        pages.push(items.len());
+        for item in &items {
+            if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                keys.push(pk.clone());
+            }
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(pages.len() < 20, "pagination did not terminate");
+    }
+    (pages, keys)
+}
+
+#[test]
+fn test_select_pagination_walks_every_row_once() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..7 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let (pages, mut keys) = paginate(&db, "SELECT * FROM \"Paged\"", 3);
+
+    assert_eq!(
+        pages,
+        vec![3, 3, 1],
+        "pages should fill before the remainder"
+    );
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), 7, "every row exactly once, no gaps or repeats");
+}
+
+#[test]
+fn test_select_without_limit_returns_everything_and_no_token() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..5 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let response = exec(&db, "SELECT * FROM \"Paged\"");
+    assert_eq!(response.items.unwrap().len(), 5);
+    assert!(response.next_token.is_none());
+}
+
+#[test]
+fn test_select_limit_equal_to_the_row_count_still_offers_one_more_page() {
+    // Limit bounds rows read, so a read that stops on the limit owes a token
+    // even when it happened to consume the table. The page after it is empty
+    // and ends the walk, which is what DynamoDB does and what Query does here.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..3 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let first = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(3),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(first.items.unwrap().len(), 3);
+    let token = first
+        .next_token
+        .expect("a read that stopped on the limit owes a token");
+
+    let second = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(3),
+            next_token: Some(token),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(second.items.unwrap().is_empty());
+    assert!(second.next_token.is_none(), "and the walk ends there");
+}
+
+#[test]
+fn test_select_limit_counts_rows_read_not_rows_matched() {
+    // DynamoDB's Limit bounds items evaluated, so a filtered SELECT can return
+    // fewer than Limit - or nothing at all - and still hand back a token.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..6 {
+        let name = if i == 5 { "keep" } else { "drop" };
+        put_test_item(&db, "Paged", &format!("k{i}"), name);
+    }
+
+    let first = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name = 'keep'".to_string(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        first.items.unwrap().len() < 2,
+        "two rows read, at most one of them matches"
+    );
+    assert!(
+        first.next_token.is_some(),
+        "the read stopped on the limit, so more rows remain"
+    );
+}
+
+#[test]
+fn test_select_pagination_applies_the_where_clause_to_every_page() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..6 {
+        let name = if i % 2 == 0 { "keep" } else { "drop" };
+        put_test_item(&db, "Paged", &format!("k{i}"), name);
+    }
+
+    let (_, mut keys) = paginate(&db, "SELECT * FROM \"Paged\" WHERE name = 'keep'", 2);
+    // Page sizes vary, because Limit bounds rows read rather than rows matched.
+    // What must hold is that the walk yields every match exactly once.
+    keys.sort();
+    assert_eq!(keys, vec!["k0", "k2", "k4"]);
+}
+
+#[test]
+fn test_select_pagination_survives_a_projection_that_drops_the_key() {
+    // The cursor is taken before projection, so projecting away the key must
+    // not break the continuation.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..4 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let mut seen = 0;
+    let mut next_token = None;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT name FROM \"Paged\"".to_string(),
+                limit: Some(2),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap();
+        let items = response.items.unwrap_or_default();
+        assert!(items.iter().all(|i| i.get("pk").is_none()));
+        seen += items.len();
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(seen <= 4, "pagination did not terminate");
+    }
+    assert_eq!(seen, 4);
+}
+
+#[test]
+fn test_select_rejects_a_malformed_next_token() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(1),
+            next_token: Some("not-a-token".to_string()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_next_token_is_rejected_on_a_write_statement() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "INSERT INTO \"Paged\" VALUE {'pk': 'k1'}".to_string(),
+            next_token: Some("anything".to_string()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(_)),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn test_select_pagination_continues_after_the_cursor_row_is_deleted() {
+    // The token carries the count returned so far as a fallback, so deleting
+    // the row a page stopped on does not strand the walk.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..6 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let first = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let returned = first.items.unwrap();
+    let last_pk = match returned.last().unwrap().get("pk") {
+        Some(AttributeValue::S(pk)) => pk.clone(),
+        other => panic!("expected a string key, got {other:?}"),
+    };
+    exec(
+        &db,
+        &format!("DELETE FROM \"Paged\" WHERE pk = '{last_pk}'"),
+    );
+
+    let second = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(2),
+            next_token: first.next_token,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(second.items.unwrap().len(), 2, "the walk continues");
+}
+
+#[test]
+fn test_select_pagination_still_sees_every_original_row_after_a_mid_walk_insert() {
+    // Rows written between pages can land ahead of the cursor and push it
+    // further down the order. The walk must still reach every row that was
+    // there when it started.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..8 {
+        put_test_item(&db, "Paged", &format!("orig{i}"), "n");
+    }
+
+    let mut seen = Vec::new();
+    let mut next_token = None;
+    let mut inserted = false;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT * FROM \"Paged\"".to_string(),
+                limit: Some(2),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap();
+        for item in response.items.unwrap_or_default() {
+            if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                seen.push(pk.clone());
+            }
+        }
+        if !inserted {
+            for i in 0..5 {
+                put_test_item(&db, "Paged", &format!("added{i}"), "n");
+            }
+            inserted = true;
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(seen.len() < 40, "pagination did not terminate");
+    }
+
+    for i in 0..8 {
+        let key = format!("orig{i}");
+        assert_eq!(
+            seen.iter().filter(|k| **k == key).count(),
+            1,
+            "{key} should appear exactly once, saw {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn test_select_pagination_drains_a_table_page_by_page() {
+    // Read a page, delete what it returned, ask for the next. Every row must
+    // come back exactly once and the table must end up empty.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..10 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let mut drained = Vec::new();
+    let mut next_token = None;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT * FROM \"Paged\"".to_string(),
+                limit: Some(3),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap();
+        let items = response.items.unwrap_or_default();
+        for item in &items {
+            if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                drained.push(pk.clone());
+                exec(&db, &format!("DELETE FROM \"Paged\" WHERE pk = '{pk}'"));
+            }
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(drained.len() <= 10, "pagination did not terminate");
+    }
+
+    drained.sort();
+    let expected: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    assert_eq!(drained, expected_sorted, "every row exactly once");
+
+    let left = exec(&db, "SELECT * FROM \"Paged\"").items.unwrap();
+    assert!(
+        left.is_empty(),
+        "the table should be drained, {left:?} left"
+    );
+}
+
+#[test]
+fn test_select_pagination_returns_every_surviving_row_when_the_cursor_is_deleted() {
+    // Asserting the next page is non-empty is not enough: the row after the
+    // deleted cursor is what goes missing.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..6 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let first = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut seen: Vec<String> = first
+        .items
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i.get("pk") {
+            Some(AttributeValue::S(pk)) => Some(pk.clone()),
+            _ => None,
+        })
+        .collect();
+    let cursor_key = seen.last().unwrap().clone();
+    exec(
+        &db,
+        &format!("DELETE FROM \"Paged\" WHERE pk = '{cursor_key}'"),
+    );
+
+    let mut next_token = first.next_token;
+    while let Some(token) = next_token {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT * FROM \"Paged\"".to_string(),
+                limit: Some(2),
+                next_token: Some(token),
+                ..Default::default()
+            })
+            .unwrap();
+        for item in response.items.unwrap_or_default() {
+            if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                seen.push(pk.clone());
+            }
+        }
+        next_token = response.next_token;
+        assert!(seen.len() <= 12, "pagination did not terminate");
+    }
+
+    // The deleted row may or may not appear (it was returned before deletion);
+    // every other row must appear exactly once.
+    seen.sort();
+    for i in 0..6 {
+        let key = format!("k{i}");
+        if key == cursor_key {
+            continue;
+        }
+        assert_eq!(
+            seen.iter().filter(|k| **k == key).count(),
+            1,
+            "{key} should appear exactly once, saw {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn test_select_pagination_walks_a_partition_in_sort_key_order() {
+    // The partition-constrained path reads through query_items, which orders by
+    // sort key. It must ascend, so a continuation resumes after the last key
+    // rather than back at the top.
+    let db = Database::memory().unwrap();
+    let request = CreateTableRequest {
+        table_name: "Sorted".to_string(),
+        key_schema: vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::HASH,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::RANGE,
+            },
+        ],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        ..Default::default()
+    };
+    db.create_table(request).unwrap();
+    for i in 0..5 {
+        exec(
+            &db,
+            &format!("INSERT INTO \"Sorted\" VALUE {{'pk': 'p', 'sk': 's{i}'}}"),
+        );
+    }
+
+    let mut seen = Vec::new();
+    let mut next_token = None;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT * FROM \"Sorted\" WHERE pk = 'p'".to_string(),
+                limit: Some(2),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap();
+        for item in response.items.unwrap_or_default() {
+            if let Some(AttributeValue::S(sk)) = item.get("sk") {
+                seen.push(sk.clone());
+            }
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(
+            seen.len() <= 5,
+            "pagination did not terminate, saw {seen:?}"
+        );
+    }
+
+    assert_eq!(
+        seen,
+        vec!["s0", "s1", "s2", "s3", "s4"],
+        "ascending, once each"
+    );
+}

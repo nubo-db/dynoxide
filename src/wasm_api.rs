@@ -1761,6 +1761,40 @@ mod tests {
     }
 
     #[test]
+    fn execute_statement_pages_a_select_through_next_token() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for song in ["s1", "s2", "s3"] {
+            partiql(
+                &backend,
+                &format!("INSERT INTO \"Music\" VALUE {{'artist': 'a', 'song': '{song}'}}"),
+            )
+            .unwrap();
+        }
+
+        let mut seen = 0;
+        let mut token: Option<String> = None;
+        loop {
+            let mut body = serde_json::json!({
+                "Statement": "SELECT * FROM \"Music\" WHERE artist = 'a'",
+                "Limit": 2,
+            });
+            if let Some(token) = &token {
+                body["NextToken"] = serde_json::json!(token);
+            }
+            let resp = run(&backend, "ExecuteStatement", &body.to_string()).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            seen += v["Items"].as_array().unwrap().len();
+            token = v["NextToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+            assert!(seen <= 3, "pagination did not terminate");
+        }
+        assert_eq!(seen, 3, "every row comes back exactly once");
+    }
+
+    #[test]
     fn a_partiql_rejection_is_not_mistaken_for_an_unimplemented_operation() {
         // Several PartiQL rejections sit one word away from the conformance
         // suite's unsupported-fault needles. If one ever matched, a real

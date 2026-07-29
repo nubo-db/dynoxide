@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn http_classifies_every_unimplemented_operation_as_a_skip() {
         let backend = Storage::memory().unwrap();
-        // The unimplemented surface the plan enumerates, plus the streams ops.
+        // The unimplemented surface listed below, plus the streams ops.
         for op in [
             "UpdateTimeToLive",
             "DescribeTimeToLive",

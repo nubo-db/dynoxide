@@ -2905,6 +2905,42 @@ fn test_select_rejects_a_malformed_next_token() {
 }
 
 #[test]
+fn test_next_token_minted_for_one_table_is_rejected_by_another() {
+    // A token is a position in one table's ordering and means nothing in
+    // another's.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "PagedA");
+    create_test_table(&db, "PagedB");
+    for i in 0..3 {
+        put_test_item(&db, "PagedA", &format!("k{i}"), "n");
+    }
+    put_test_item(&db, "PagedB", "k0", "n");
+
+    let token = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"PagedA\"".to_string(),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+        .next_token
+        .expect("a read that stopped on the limit owes a token");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"PagedB\"".to_string(),
+            limit: Some(1),
+            next_token: Some(token),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
 fn test_next_token_is_rejected_on_a_write_statement() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Paged");
@@ -2924,8 +2960,9 @@ fn test_next_token_is_rejected_on_a_write_statement() {
 
 #[test]
 fn test_select_pagination_continues_after_the_cursor_row_is_deleted() {
-    // The token carries the count returned so far as a fallback, so deleting
-    // the row a page stopped on does not strand the walk.
+    // The token carries the last row's storage keys, and the next page resumes
+    // with an exclusive-start comparison on them, so deleting the row a page
+    // stopped on does not strand the walk.
     let db = Database::memory().unwrap();
     create_test_table(&db, "Paged");
     for i in 0..6 {
@@ -3195,4 +3232,269 @@ fn test_select_pagination_walks_a_partition_in_sort_key_order() {
         vec!["s0", "s1", "s2", "s3", "s4"],
         "ascending, once each"
     );
+}
+
+/// A pk+sk table for sort-key condition tests.
+fn create_ranged_table(db: &Database, table_name: &str) {
+    let request = CreateTableRequest {
+        table_name: table_name.to_string(),
+        key_schema: vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::HASH,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::RANGE,
+            },
+        ],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        ..Default::default()
+    };
+    db.create_table(request).unwrap();
+}
+
+#[test]
+fn test_next_token_is_rejected_when_replayed_with_a_different_where_clause() {
+    // The token is bound to the statement that minted it, so a token from one
+    // WHERE clause cannot silently skip rows in another on the same table.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..4 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "keep");
+    }
+
+    let token = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name = 'keep'".to_string(),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+        .next_token
+        .expect("a read that stopped on the limit owes a token");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name = 'drop'".to_string(),
+            limit: Some(1),
+            next_token: Some(token),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_next_token_is_rejected_when_replayed_with_different_parameters() {
+    // The same statement text with different Parameters walks a different row
+    // set, so the token must not carry across.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..4 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "keep");
+    }
+
+    let token = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name = ?".to_string(),
+            parameters: Some(vec![AttributeValue::S("keep".to_string())]),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+        .next_token
+        .expect("a read that stopped on the limit owes a token");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name = ?".to_string(),
+            parameters: Some(vec![AttributeValue::S("drop".to_string())]),
+            limit: Some(1),
+            next_token: Some(token),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_execute_statement_rejects_limit_zero() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(0),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_limit_zero_cannot_silently_end_a_paginated_walk() {
+    // A zero limit used to read nothing and mint no token, so a walk that hit
+    // one ended early while looking complete. It must error instead.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..4 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+
+    let first = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let token = first.next_token.expect("more rows remain");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\"".to_string(),
+            limit: Some(0),
+            next_token: Some(token),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(_)),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_select_limit_paces_within_the_sort_key_range_not_the_partition() {
+    // Sort-key conditions are pushed into the read, so Limit counts rows
+    // evaluated within the key-condition range, as DynamoDB's does. Were the
+    // range filtered after the read, this first page would burn its two reads
+    // on s0 and s1 and return nothing.
+    let db = Database::memory().unwrap();
+    create_ranged_table(&db, "Ranged");
+    for i in 0..10 {
+        exec(
+            &db,
+            &format!("INSERT INTO \"Ranged\" VALUE {{'pk': 'p', 'sk': 's{i}'}}"),
+        );
+    }
+
+    let first = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Ranged\" WHERE pk = 'p' AND sk >= 's3' AND sk <= 's7'"
+                .to_string(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    let sks: Vec<String> = first
+        .items
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i.get("sk") {
+            Some(AttributeValue::S(sk)) => Some(sk.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sks,
+        vec!["s3", "s4"],
+        "two rows read, both within the range"
+    );
+    assert!(first.next_token.is_some(), "the range holds more rows");
+}
+
+#[test]
+fn test_select_pagination_with_a_sort_key_range_visits_every_match_once() {
+    let db = Database::memory().unwrap();
+    create_ranged_table(&db, "Ranged");
+    for i in 0..10 {
+        exec(
+            &db,
+            &format!("INSERT INTO \"Ranged\" VALUE {{'pk': 'p', 'sk': 's{i}'}}"),
+        );
+    }
+
+    let mut seen = Vec::new();
+    let mut next_token = None;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT * FROM \"Ranged\" WHERE pk = 'p' AND sk BETWEEN 's3' AND 's7'"
+                    .to_string(),
+                limit: Some(2),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap();
+        for item in response.items.unwrap_or_default() {
+            if let Some(AttributeValue::S(sk)) = item.get("sk") {
+                seen.push(sk.clone());
+            }
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(
+            seen.len() <= 5,
+            "pagination did not terminate, saw {seen:?}"
+        );
+    }
+
+    assert_eq!(
+        seen,
+        vec!["s3", "s4", "s5", "s6", "s7"],
+        "in order, once each"
+    );
+}
+
+#[test]
+fn test_select_with_an_untranslatable_sort_key_condition_still_filters_correctly() {
+    // sk IN (...) has no key-condition form, so nothing is pushed down and the
+    // read falls back to the whole partition; the WHERE still filters
+    // post-read, so the result is unchanged.
+    let db = Database::memory().unwrap();
+    create_ranged_table(&db, "Ranged");
+    for i in 0..6 {
+        exec(
+            &db,
+            &format!("INSERT INTO \"Ranged\" VALUE {{'pk': 'p', 'sk': 's{i}'}}"),
+        );
+    }
+
+    let response = exec(
+        &db,
+        "SELECT * FROM \"Ranged\" WHERE pk = 'p' AND sk IN ('s1', 's4')",
+    );
+    let sks: Vec<String> = response
+        .items
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i.get("sk") {
+            Some(AttributeValue::S(sk)) => Some(sk.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sks, vec!["s1", "s4"]);
 }

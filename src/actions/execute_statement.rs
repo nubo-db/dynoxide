@@ -36,6 +36,18 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
+    // Limit is checked before the statement is parsed, mirroring the Query
+    // surface's constraint and wording. A zero limit would otherwise read
+    // nothing and mint no token, silently ending a paginated walk.
+    if request.limit == Some(0) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(
+                "Value at 'Limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+            ),
+        ));
+    }
+
     let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
         DynoxideError::ValidationException(format!(
             "Statement wasn't well formed, can't be processed: {e}"

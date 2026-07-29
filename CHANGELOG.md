@@ -13,8 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Rust API:** `wasm_api::dispatch` and `wasm_api::dispatch_http` take a `DispatchContext`, which borrows the idempotency caches a `ClientRequestToken` needs. Both are behind the `wasm-sqlite` feature, so a native library consumer is unaffected, and the `#[wasm_bindgen]` surface the npm package calls (`open`, `execute`, `dispatchHttp`, `capabilities`, `contract_version`) is unchanged. Callers of `dispatch` build a context from the new public `TokenCaches`. This is separate from `CONTRACT_VERSION`, which does not move.
+- **Breaking (Rust API):** `wasm_api::dispatch` and `wasm_api::dispatch_http` take a `DispatchContext`, which borrows the idempotency caches a `ClientRequestToken` needs. Both are behind the `wasm-sqlite` feature, so a native library consumer is unaffected, and the `#[wasm_bindgen]` surface the npm package calls (`open`, `execute`, `dispatchHttp`, `capabilities`, `contract_version`) is unchanged. Callers of `dispatch` build a context from the new public `TokenCaches`. This is separate from `CONTRACT_VERSION`, which does not move.
 - The wasm build's documentation no longer says it is unverified by the conformance suite, because it now is verified. The preview label stays, and now rests on what remains unimplemented - `TransactWriteItems`, streams, tags and TTL - rather than on an absence of test data.
+
+### Fixed
+
+- PartiQL `SELECT` on `ExecuteStatement` now paginates: `NextToken` is honoured and returned, and `Limit` bounds the rows evaluated rather than the rows matched, matching DynamoDB and the existing Query and Scan semantics. A filtered `SELECT` with a `Limit` can therefore return fewer rows than before for the identical request, and a page can come back short or empty while still carrying a `NextToken`, so callers should follow the token rather than treat a short page as the end of the result. A `SELECT` bound to a partition key now reads in ascending sort-key order, and its sort-key conditions are pushed into the read, so `Limit` paces against rows in the key-condition range rather than the whole partition; a condition a key condition cannot express falls back to the partition-wide read and filters as before. A `NextToken` is now rejected with a `ValidationException` when replayed against a different statement or different `Parameters`, not just a different table, where it previously resumed the walk and silently skipped rows. `Limit: 0` is rejected with the validation message the Query surface uses; it previously read nothing and returned no token, making a paginated walk look complete.
 
 ## [0.12.0] - 2026-07-24
 

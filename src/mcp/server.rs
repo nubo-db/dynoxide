@@ -371,7 +371,9 @@ pub struct ExecutePartiqlParams {
     #[schemars(description = "Positional parameters for the statement, in DynamoDB JSON format")]
     pub parameters: Option<serde_json::Value>,
 
-    #[schemars(description = "Maximum number of items to return for SELECT statements")]
+    #[schemars(
+        description = "Maximum number of items to evaluate for SELECT statements (not necessarily the number returned); a filtered page can come back short or empty and still carry a NextToken"
+    )]
     pub limit: Option<usize>,
 
     #[schemars(

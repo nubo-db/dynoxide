@@ -2935,7 +2935,7 @@ fn test_next_token_minted_for_one_table_is_rejected_by_another() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "NextToken does not match request"),
         "unexpected error: {err:?}"
     );
 }
@@ -3292,7 +3292,41 @@ fn test_next_token_is_rejected_when_replayed_with_a_different_where_clause() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "NextToken does not match request"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn test_next_token_is_rejected_on_a_count_projection() {
+    // COUNT(*) never mints a token (it reports the whole matching set), so a
+    // supplied one cannot match the request. Rejected with the mismatch
+    // message rather than silently discarded.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..4 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "keep");
+    }
+
+    let token = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name = 'keep'".to_string(),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+        .next_token
+        .expect("a read that stopped on the limit owes a token");
+
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT COUNT(*) FROM \"Paged\" WHERE name = 'keep'".to_string(),
+            next_token: Some(token),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "NextToken does not match request"),
         "unexpected error: {err:?}"
     );
 }
@@ -3328,7 +3362,7 @@ fn test_next_token_is_rejected_when_replayed_with_different_parameters() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "Invalid NextToken"),
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "NextToken does not match request"),
         "unexpected error: {err:?}"
     );
 }
@@ -3346,7 +3380,7 @@ fn test_execute_statement_rejects_limit_zero() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"),
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"),
         "unexpected error: {err:?}"
     );
 }

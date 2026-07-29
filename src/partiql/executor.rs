@@ -213,8 +213,15 @@ async fn execute_select<S: StorageBackend>(
         .transpose()?;
 
     // COUNT(*) reports the whole matching set, so it neither pages nor takes a
-    // limit, the same as it did before pagination existed.
+    // limit, the same as it did before pagination existed. It also never mints
+    // a token, so a supplied one cannot match this request and is rejected the
+    // way any other mismatched token is. COUNT(*) is a dynoxide extension
+    // (real DynamoDB rejects the projection outright), so this contract is
+    // dynoxide's own.
     if projections.len() == 1 && projections[0] == "COUNT(*)" {
+        if cursor.is_some() {
+            return Err(token_mismatch());
+        }
         let window = evaluate_window(
             storage,
             table_name,
@@ -399,11 +406,21 @@ fn encode_next_token(table_name: &str, fingerprint: u64, pk: &str, sk: &str) -> 
     base64::engine::general_purpose::STANDARD.encode(payload)
 }
 
+/// The rejection for a well-formed token that belongs to a different request.
+/// DynamoDB separates the two failure shapes: a token that cannot be read at
+/// all is "Invalid NextToken", while one minted by a different table,
+/// statement or parameters is "NextToken does not match request" (both
+/// captured eu-west-2, 2026-07-29).
+fn token_mismatch() -> DynoxideError {
+    DynoxideError::ValidationException("NextToken does not match request".to_string())
+}
+
 /// Decode a token, rejecting one minted against a different table or a
 /// different statement. A token is a position in one row walk; replayed into
 /// another table, another WHERE clause or other parameters it would silently
 /// skip rows, so a fingerprint mismatch is rejected the same way as a
-/// cross-table replay.
+/// cross-table replay, with DynamoDB's mismatch message rather than the
+/// malformed-token one.
 fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<Cursor> {
     use base64::Engine;
     let invalid = || DynoxideError::ValidationException("Invalid NextToken".to_string());
@@ -412,7 +429,7 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
         .map_err(|_| invalid())?;
     let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| invalid())?;
     if value["t"].as_str() != Some(table_name) || value["f"].as_u64() != Some(fingerprint) {
-        return Err(invalid());
+        return Err(token_mismatch());
     }
     Ok(Cursor {
         pk: value["pk"].as_str().ok_or_else(invalid)?.to_string(),

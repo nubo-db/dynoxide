@@ -113,7 +113,7 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
 - **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping
 - **Projections:** Nested dot-notation paths, `COUNT(*)`
-- **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with a `ValidationException`
+- **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2)
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
 - **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics

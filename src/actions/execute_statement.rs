@@ -36,13 +36,15 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
-    // Limit is checked before the statement is parsed, mirroring the Query
-    // surface's constraint and wording. A zero limit would otherwise read
-    // nothing and mint no token, silently ending a paginated walk.
+    // Limit is checked before the statement is parsed. A zero limit would
+    // otherwise read nothing and mint no token, silently ending a paginated
+    // walk. The wording follows Scan's shape (value kept, lowercase 'limit'),
+    // not Query's, matching what ExecuteStatement itself returns (captured
+    // eu-west-2, 2026-07-29).
     if request.limit == Some(0) {
         return Err(DynoxideError::ValidationException(
             crate::validation::envelope_message(
-                "Value at 'Limit' failed to satisfy constraint: \
+                "Value '0' at 'limit' failed to satisfy constraint: \
                  Member must have value greater than or equal to 1",
             ),
         ));

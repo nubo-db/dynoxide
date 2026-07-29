@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- PartiQL now works in the browser. The wasm engine serves `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`, where it previously answered all three with a 501. Behaviour matches the native build statement for statement, including the `RETURNING` projections, the per-statement error codes `BatchExecuteStatement` reports, and `ClientRequestToken` idempotency on `ExecuteTransaction`. The engine's advertised capability list grows from 14 operations to 17; `CONTRACT_VERSION` is unchanged at 1, since adding an operation is additive, so a pinned client keeps working. This closes the whole PartiQL block of the conformance suite's wasm row: 865 passed, 0 failed, 133 skipped, up from 785 passed and 213 skipped. The engine bundle grows by about 143 KB raw and 53 KB gzipped, which is the parser and executor now being reachable from the wasm entry points.
+- PartiQL now works in the browser. The wasm engine serves `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`, where it previously answered all three with a 501. Behaviour matches the native build statement for statement, including the `RETURNING` projections, the per-statement error codes `BatchExecuteStatement` reports, and `ClientRequestToken` idempotency on `ExecuteTransaction`. The engine's advertised capability list grows from 14 operations to 17; `CONTRACT_VERSION` is unchanged at 1, since adding an operation is additive, so a pinned client keeps working. The engine bundle grows by about 143 KB raw and 53 KB gzipped, which is the parser and executor now being reachable from the wasm entry points.
 
 ### Changed
 
 - **Breaking (Rust API):** `wasm_api::dispatch` and `wasm_api::dispatch_http` take a `DispatchContext`, which borrows the idempotency caches a `ClientRequestToken` needs. Both are behind the `wasm-sqlite` feature, so a native library consumer is unaffected, and the `#[wasm_bindgen]` surface the npm package calls (`open`, `execute`, `dispatchHttp`, `capabilities`, `contract_version`) is unchanged. Callers of `dispatch` build a context from the new public `TokenCaches`. This is separate from `CONTRACT_VERSION`, which does not move.
-- The wasm build's documentation no longer says it is unverified by the conformance suite, because it now is verified. The preview label stays, and now rests on what remains unimplemented - `TransactWriteItems`, streams, tags and TTL - rather than on an absence of test data.
+- The wasm build's documentation no longer describes it as unverified. The preview label stays, and now rests on what remains unimplemented - `TransactWriteItems`, streams, tags and TTL - rather than on an absence of test data.
 
 ### Fixed
 

@@ -129,6 +129,66 @@ test("an unimplemented operation is a 501 the suite scores as a skip", async () 
   );
 });
 
+test("a stream-enabled CreateTable is refused before the table exists", async () => {
+  // The refusal must come before anything is created. A refusal after the
+  // create would half-apply: the SDK retries the error, the retry finds the
+  // table, and the caller sees ResourceInUseException where the real answer
+  // is a capability gap - exactly how the conformance suite's streams probe
+  // used to land in the failed column.
+  const spec = {
+    TableName: "Streamed",
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+    BillingMode: "PAY_PER_REQUEST",
+  };
+  const refused = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      ...spec,
+      StreamSpecification: { StreamEnabled: true, StreamViewType: "NEW_AND_OLD_IMAGES" },
+    }),
+  );
+  assert.equal(refused.status, 501);
+  assert.equal(refused.body.__type, "com.dynoxide.wasm#UnsupportedOperation");
+  assert.match(
+    refused.body.message,
+    /unknown operation|not implemented|unsupported operation|is not supported/i,
+    "message must match the conformance suite's isUnsupportedFault regex",
+  );
+
+  // A retry of the refused request gets the same answer, and the same name
+  // without the stream succeeds: nothing was created by the refusal.
+  const retried = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      ...spec,
+      StreamSpecification: { StreamEnabled: true, StreamViewType: "NEW_AND_OLD_IMAGES" },
+    }),
+  );
+  assert.equal(retried.status, 501);
+  const plain = await call("DynamoDB_20120810.CreateTable", JSON.stringify(spec));
+  assert.equal(plain.status, 200);
+  await call("DynamoDB_20120810.DeleteTable", JSON.stringify({ TableName: spec.TableName }));
+});
+
+test("a tagged CreateTable is refused whole, not created untagged", async () => {
+  const spec = {
+    TableName: "Tagged",
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+    BillingMode: "PAY_PER_REQUEST",
+  };
+  const refused = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({ ...spec, Tags: [{ Key: "team", Value: "data" }] }),
+  );
+  assert.equal(refused.status, 501);
+  assert.equal(refused.body.__type, "com.dynoxide.wasm#UnsupportedOperation");
+  const plain = await call("DynamoDB_20120810.CreateTable", JSON.stringify(spec));
+  assert.equal(plain.status, 200);
+  await call("DynamoDB_20120810.DeleteTable", JSON.stringify({ TableName: spec.TableName }));
+});
+
 test("PartiQL round-trips a statement and its result through the transport", async () => {
   // Its own table, so this runs standalone rather than only after the test
   // that happens to create "Bridge".

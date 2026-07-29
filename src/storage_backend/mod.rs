@@ -169,6 +169,26 @@ pub trait StorageBackend {
     /// its injected [`Clock`]; the wasm SQLite backend supplies its own.
     fn clock(&self) -> &dyn Clock;
 
+    /// Whether this backend can record and serve DynamoDB Streams.
+    ///
+    /// A backend that answers `false` still gets its stream methods called
+    /// nowhere on the happy path: the actions consult this before mutating, so
+    /// a request that needs streams is refused before anything is created,
+    /// rather than half-applied and then failed. Defaults to `true`; the wasm
+    /// backend answers `false` until a delivery mechanism exists.
+    fn supports_streams(&self) -> bool {
+        true
+    }
+
+    /// Whether this backend stores resource tags. Same contract as
+    /// [`supports_streams`](Self::supports_streams): consulted before a
+    /// mutation that would need `set_tags`, so a tagged `CreateTable` on a
+    /// backend without tags is refused whole rather than creating the table
+    /// and then failing.
+    fn supports_tags(&self) -> bool {
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Table metadata
     // -----------------------------------------------------------------------

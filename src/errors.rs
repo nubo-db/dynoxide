@@ -98,6 +98,15 @@ pub enum DynoxideError {
     #[error("{0}")]
     InternalServerError(String),
 
+    /// A capability the active storage backend does not implement (for example
+    /// streams or tags on the wasm backend). Serialises with the same
+    /// `UnsupportedOperation` type and 501 status as an op the engine does not
+    /// serve at all, so a client - and the conformance suite - reads both the
+    /// same way: a scope gap, not a server fault. The 501 also keeps AWS SDK
+    /// retry policies from re-sending a request that can never succeed.
+    #[error("'{0}' is not supported by this build of the engine")]
+    UnsupportedCapability(String),
+
     /// Type conversion error (e.g. wrong AttributeValue variant).
     #[error("Conversion error: {0}")]
     ConversionError(#[from] crate::types::ConversionError),
@@ -135,6 +144,9 @@ impl From<crate::storage_backend::BackendError> for DynoxideError {
         use crate::storage_backend::BackendError;
         match err {
             BackendError::Validation(msg) => DynoxideError::ValidationException(msg),
+            BackendError::Unsupported { capability } => {
+                DynoxideError::UnsupportedCapability(capability.to_string())
+            }
             #[cfg(feature = "wasm-sqlite")]
             BackendError::OpfsUnavailable(msg) => DynoxideError::OpfsUnavailable(msg),
             other => DynoxideError::InternalServerError(other.to_string()),
@@ -188,6 +200,9 @@ impl DynoxideError {
             DynoxideError::InternalServerError(_) => {
                 "com.amazonaws.dynamodb.v20120810#InternalServerError"
             }
+            // The same sentinel the op-level 501 envelope carries, so a client
+            // detects "the engine cannot do this" with one type either way.
+            DynoxideError::UnsupportedCapability(_) => "com.dynoxide.wasm#UnsupportedOperation",
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
             DynoxideError::SqliteError(_) => "com.amazonaws.dynamodb.v20120810#InternalServerError",
             #[cfg(feature = "wasm-sqlite")]
@@ -221,6 +236,7 @@ impl DynoxideError {
             DynoxideError::SerializationException(_) => "SerializationError",
             DynoxideError::LimitExceededException(_) => "RequestLimitExceeded",
             DynoxideError::InternalServerError(_) => "InternalServerError",
+            DynoxideError::UnsupportedCapability(_) => "UnsupportedOperation",
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
             DynoxideError::SqliteError(_) => "InternalServerError",
             #[cfg(feature = "wasm-sqlite")]
@@ -234,6 +250,10 @@ impl DynoxideError {
             DynoxideError::InternalServerError(_) => 500,
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
             DynoxideError::SqliteError(_) => 500,
+            // 501 for the same reason the op-level envelope uses it: "not
+            // implemented" is a definite answer about scope, and it sits
+            // outside the status codes AWS SDK retry policies re-send.
+            DynoxideError::UnsupportedCapability(_) => 501,
             _ => 400,
         }
     }
@@ -430,12 +450,15 @@ mod tests {
             "com.amazon.coral.validate#ValidationException"
         );
 
-        // Unsupported (e.g. TTL on wasm) surfaces as a 500 carrying the
-        // capability tag, the documented AWS-style code for the preview.
+        // Unsupported (e.g. streams or tags on wasm) surfaces as the same
+        // typed 501 the op-level envelope uses, with a message the conformance
+        // suite classifies as a scope gap ("is not supported") rather than a
+        // server fault. A 500 here would be retried by AWS SDKs, and a retry
+        // of a capability refusal can never succeed.
         let u: DynoxideError = BackendError::Unsupported { capability: "ttl" }.into();
-        assert_eq!(u.status_code(), 500);
-        assert!(u.error_type().contains("InternalServerError"));
-        assert!(u.to_string().contains("ttl"));
+        assert_eq!(u.status_code(), 501);
+        assert_eq!(u.error_type(), "com.dynoxide.wasm#UnsupportedOperation");
+        assert!(u.to_string().contains("'ttl' is not supported"));
 
         // Every other storage fault maps to a 500, matching the native
         // `rusqlite::Error -> SqliteError -> InternalServerError` path.

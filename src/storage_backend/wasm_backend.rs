@@ -427,6 +427,18 @@ impl StorageBackend for WasmBridgeBackend {
         self.clock.as_ref()
     }
 
+    // Streams await a delivery design and tags are not stored, so the actions
+    // refuse requests needing either before they mutate anything. The
+    // `unsupported(..)` returns on the methods below then only guard paths no
+    // action should reach.
+    fn supports_streams(&self) -> bool {
+        false
+    }
+
+    fn supports_tags(&self) -> bool {
+        false
+    }
+
     // --- Table metadata --------------------------------------------------
 
     async fn insert_table_metadata(&self, m: &CreateTableMetadata<'_>) -> Result<(), BackendError> {

@@ -34,6 +34,7 @@ fn short_error_type(err: &DynoxideError) -> &'static str {
         DynoxideError::IdempotentParameterMismatchException(_) => {
             "IdempotentParameterMismatchException"
         }
+        DynoxideError::UnsupportedCapability(_) => "UnsupportedOperation",
     }
 }
 

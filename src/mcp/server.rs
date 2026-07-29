@@ -377,7 +377,7 @@ pub struct ExecutePartiqlParams {
     pub limit: Option<usize>,
 
     #[schemars(
-        description = "Continuation token from a previous SELECT response, to fetch the next page. Pass back the NextToken the last call returned; its absence means there are no more pages."
+        description = "Continuation token from a previous SELECT response, to fetch the next page. Pass back the NextToken the last call returned; its absence means there are no more pages. The statement and parameters must stay identical across pages; a token replayed with a different statement or parameters is rejected with a ValidationException."
     )]
     pub next_token: Option<String>,
 }

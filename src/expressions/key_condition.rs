@@ -173,6 +173,34 @@ impl ResolvedSortKeyCondition {
     }
 }
 
+/// Assemble resolved sort key conditions into a SQL fragment over the sk
+/// column, together with the parameter values in placeholder order. The
+/// partition key occupies ?1, so sk placeholders are numbered from ?2.
+/// Returns None for the fragment when there are no conditions.
+pub fn sk_conditions_to_sql(
+    conditions: &[ResolvedSortKeyCondition],
+) -> (Option<String>, Vec<String>) {
+    let mut sql_parts = Vec::new();
+    let mut param_values = Vec::new();
+    for cond in conditions {
+        for (op, val) in cond.to_sql_conditions() {
+            let param_idx = param_values.len() + 2;
+            if op == "LIKE" {
+                sql_parts.push(format!("AND sk LIKE ?{param_idx} ESCAPE '\\'"));
+            } else {
+                sql_parts.push(format!("AND sk {op} ?{param_idx}"));
+            }
+            param_values.push(val);
+        }
+    }
+    let sql = if sql_parts.is_empty() {
+        None
+    } else {
+        Some(sql_parts.join(" "))
+    };
+    (sql, param_values)
+}
+
 fn val_to_key_string(val: &AttributeValue) -> String {
     val.to_key_string().unwrap_or_default()
 }

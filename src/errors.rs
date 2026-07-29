@@ -130,11 +130,15 @@ pub enum DynoxideError {
 /// contract, so they surface as `InternalServerError` (HTTP 500), matching how
 /// a raw `rusqlite::Error` surfaces via `SqliteError`.
 ///
-/// The one exception is `BackendError::Validation`: a backend method such as
-/// `set_tags` enforces a client-facing limit (the 50-tag cap) and raises a
-/// `ValidationException`. That crosses the trait boundary as
-/// `BackendError::Validation` and is restored here to its `ValidationException`
-/// (HTTP 400) so the envelope is unchanged from calling `Storage` directly.
+/// There are two exceptions. The first is `BackendError::Validation`: a
+/// backend method such as `set_tags` enforces a client-facing limit (the
+/// 50-tag cap) and raises a `ValidationException`. That crosses the trait
+/// boundary as `BackendError::Validation` and is restored here to its
+/// `ValidationException` (HTTP 400) so the envelope is unchanged from calling
+/// `Storage` directly. The second is `BackendError::Unsupported`, which maps
+/// to `DynoxideError::UnsupportedCapability` (HTTP 501, the
+/// `com.dynoxide.wasm#UnsupportedOperation` envelope) so a capability gap
+/// reads as scope, not a server fault.
 ///
 /// A one-way `From` is deliberate rather than merging the two types:
 /// `BackendError` is the narrow storage vocabulary, `DynoxideError` the wider
@@ -153,6 +157,13 @@ impl From<crate::storage_backend::BackendError> for DynoxideError {
         }
     }
 }
+
+/// The `__type` carried when the engine cannot do what was asked. Shared by
+/// the wasm op-level `UnsupportedOperation` envelope and
+/// `DynoxideError::UnsupportedCapability`, so a client detects "the engine
+/// cannot do this" with one type either way. Namespaced so it cannot collide
+/// with a real DynamoDB `__type`.
+pub(crate) const UNSUPPORTED_TYPE: &str = "com.dynoxide.wasm#UnsupportedOperation";
 
 impl DynoxideError {
     /// Returns the DynamoDB `__type` string for this error.
@@ -202,7 +213,7 @@ impl DynoxideError {
             }
             // The same sentinel the op-level 501 envelope carries, so a client
             // detects "the engine cannot do this" with one type either way.
-            DynoxideError::UnsupportedCapability(_) => "com.dynoxide.wasm#UnsupportedOperation",
+            DynoxideError::UnsupportedCapability(_) => UNSUPPORTED_TYPE,
             #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
             DynoxideError::SqliteError(_) => "com.amazonaws.dynamodb.v20120810#InternalServerError",
             #[cfg(feature = "wasm-sqlite")]

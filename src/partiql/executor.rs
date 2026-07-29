@@ -3,7 +3,7 @@
 //! Maps parsed PartiQL statements to internal DynamoDB operations.
 
 use crate::errors::{DynoxideError, Result};
-use crate::expressions::key_condition::ResolvedSortKeyCondition;
+use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
     CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
 };
@@ -324,28 +324,11 @@ async fn evaluate_window<S: StorageBackend>(
         }
         .unwrap_or_default();
 
-        // Mirror the Query action's fragment construction: pk is ?1, sort-key
-        // parameters follow, and the SQL builder appends the cursor's
-        // exclusive-start comparison after them, so a pushed-down range and a
-        // continuation compose the same way they do for Query.
-        let mut sk_sql_parts = Vec::new();
-        let mut sk_param_values = Vec::new();
-        for cond in &sk_conditions {
-            for (op, val) in cond.to_sql_conditions() {
-                let param_idx = sk_param_values.len() + 2;
-                if op == "LIKE" {
-                    sk_sql_parts.push(format!("AND sk LIKE ?{param_idx} ESCAPE '\\'"));
-                } else {
-                    sk_sql_parts.push(format!("AND sk {op} ?{param_idx}"));
-                }
-                sk_param_values.push(val);
-            }
-        }
-        let sk_condition_sql = if sk_sql_parts.is_empty() {
-            None
-        } else {
-            Some(sk_sql_parts.join(" "))
-        };
+        // The shared helper numbers placeholders after the pk (?1), and the
+        // SQL builder appends the cursor's exclusive-start comparison after
+        // them, so a pushed-down range and a continuation compose the same
+        // way they do for Query.
+        let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
         let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
         // Ascending, so this path and the scan below agree on row order and a

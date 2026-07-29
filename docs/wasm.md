@@ -8,7 +8,7 @@ It's a preview. The wasm build is scored by the same conformance suite that back
 
 **What works:** create and delete tables, describe and list them, update tables (add or delete a GSI, with existing rows backfilled into the new index, and change provisioned throughput, billing mode, table class, on-demand throughput, and deletion protection), put, get, delete, and update items, query, scan, the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), and PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`, including `RETURNING` and `ClientRequestToken` idempotency), over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, same as native. One caveat on PartiQL writes: they record a stream event when the table has a stream enabled, and the wasm build cannot enable one, so that path is unreachable rather than supported.
 
-**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `TransactWriteItems`, tags, table stats, and bulk import return a preview "not yet implemented" error. Those four blocks are the whole of the conformance skip count.
+**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table. `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats, and bulk import return a preview "not yet implemented" error. Those four blocks are the whole of the conformance skip count.
 
 One fidelity note on what *is* supported: adding a GSI is synchronous. The new index is immediately `ACTIVE` and queryable, where AWS reports it `CREATING` with a background backfill that finishes before it becomes `ACTIVE`. The backfilled data matches; only the lifecycle is simplified.
 
@@ -122,8 +122,12 @@ Two things about it are load-bearing rather than incidental:
 
 An operation the preview does not implement returns HTTP 501 with an
 `UnsupportedOperation` envelope, so a conformance runner can tell "out of scope"
-from "implemented and wrong" without guessing. `tests/bridge` drives the whole
-path over a socket; run it with `npm run test:bridge`.
+from "implemented and wrong" without guessing. An implemented operation can
+return the same envelope for a specific unsupported field (`CreateTable` or
+`UpdateTable` carrying streams or tags), so `capabilities()` answers whether an
+operation is routed at all, not whether every request to it will succeed.
+`tests/bridge` drives the whole path over a socket; run it with
+`npm run test:bridge`.
 
 ## The engine package
 

@@ -33,17 +33,12 @@
 //! mismatch rather than mis-parsing a newer engine.
 
 use crate::actions;
-use crate::errors::DynoxideError;
+use crate::errors::{DynoxideError, UNSUPPORTED_TYPE};
 use crate::storage_backend::StorageBackend;
 
 /// Engine-contract version. Bump only on an envelope-shape change; adding a
 /// supported op is additive and non-breaking.
 pub const CONTRACT_VERSION: u32 = 1;
-
-/// The `__type` carried by the engine's own (non-AWS) envelopes, currently just
-/// the unsupported/unknown-operation case. Namespaced so a client can match it
-/// without colliding with a real DynamoDB `__type`.
-const UNSUPPORTED_TYPE: &str = "com.dynoxide.wasm#UnsupportedOperation";
 
 /// Operations the wasm preview engine answers through [`dispatch`]. This is the
 /// authoritative feature-detection list the client consumes via

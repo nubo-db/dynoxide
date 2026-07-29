@@ -275,27 +275,18 @@ fn test_select_with_limit() {
 }
 
 // ---------------------------------------------------------------------------
-// I17: COUNT(*) support
+// I17: COUNT(*) is rejected (real DynamoDB has no PartiQL aggregates)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_select_count_star() {
+fn test_select_count_star_is_rejected() {
+    // Formerly a dynoxide-only extension returning a Count item; real DynamoDB
+    // rejects the projection with this bare message (captured eu-west-2).
     let db = Database::memory().unwrap();
     create_test_table(&db, "Tbl");
 
-    for i in 0..5 {
-        let mut item = HashMap::new();
-        item.insert("pk".to_string(), AttributeValue::S(format!("k{i}")));
-        put_item(&db, "Tbl", item);
-    }
-
-    let resp = exec(&db, "SELECT COUNT(*) FROM \"Tbl\"");
-    let items = resp.items.unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].get("Count"),
-        Some(&AttributeValue::N("5".to_string()))
-    );
+    let err = exec_err(&db, "SELECT COUNT(*) FROM \"Tbl\"");
+    assert_eq!(err, "Unexpected path component at 1:8:5");
 }
 
 // ---------------------------------------------------------------------------

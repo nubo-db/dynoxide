@@ -364,7 +364,7 @@ pub struct BatchGetItemParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecutePartiqlParams {
     #[schemars(
-        description = "PartiQL statement to execute. Supports SELECT (with COUNT(*), LIMIT, nested path projections, and NextToken paging), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths."
+        description = "PartiQL statement to execute. Supports SELECT (with LIMIT, nested path projections, and NextToken paging), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths."
     )]
     pub statement: String,
 
@@ -1288,7 +1288,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Execute a PartiQL statement. Supports SELECT (with COUNT(*), LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths. Write statements are blocked in read-only mode."
+        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths. Write statements are blocked in read-only mode."
     )]
     fn execute_partiql(
         &self,

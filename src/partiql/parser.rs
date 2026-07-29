@@ -96,6 +96,105 @@ pub fn returning_variant(stmt: &Statement) -> Option<ReturningVariant> {
     }
 }
 
+/// DynamoDB's rejection message for a `COUNT` projection, if the statement
+/// carries one.
+///
+/// Real DynamoDB does not support aggregate functions in PartiQL: a `COUNT`
+/// token in a SELECT's projection list is rejected with a bare
+/// `ValidationException` reading `Unexpected path component at
+/// <line>:<column>:<length>`, where line and column are the 1-based position
+/// of the token and the length is always 5 (the `COUNT` keyword itself,
+/// whatever is inside the parens). The rejection fires before the
+/// table-existence check (captured eu-west-2, 2026-07-29).
+///
+/// Returns `Some(message)` when `statement` is a SELECT and, before its first
+/// unquoted `FROM`, an unquoted word-bounded `count` (any case) is followed by
+/// optional whitespace and `(`. String literals and quoted identifiers are
+/// skipped, so a `'count('` literal or a quoted `"COUNT"` attribute name never
+/// triggers. Returns `None` otherwise.
+pub(crate) fn count_projection_rejection(statement: &str) -> Option<String> {
+    fn advance(c: char, line: &mut usize, col: &mut usize) {
+        if c == '\n' {
+            *line += 1;
+            *col = 1;
+        } else {
+            *col += 1;
+        }
+    }
+
+    let chars: Vec<char> = statement.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut first_word_seen = false;
+
+    while i < len {
+        let c = chars[i];
+
+        // Skip string literals and quoted identifiers wholesale, honouring the
+        // doubled-quote escapes ('' and "") the tokenizer accepts.
+        if c == '\'' || c == '"' {
+            let quote = c;
+            advance(c, &mut line, &mut col);
+            i += 1;
+            while i < len {
+                let ch = chars[i];
+                advance(ch, &mut line, &mut col);
+                i += 1;
+                if ch == quote {
+                    if i < len && chars[i] == quote {
+                        advance(chars[i], &mut line, &mut col);
+                        i += 1; // escaped quote, still inside
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if c.is_ascii_alphabetic() || c == '_' {
+            let word_line = line;
+            let word_col = col;
+            let start = i;
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                advance(chars[i], &mut line, &mut col);
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+
+            if !first_word_seen {
+                first_word_seen = true;
+                if !word.eq_ignore_ascii_case("SELECT") {
+                    return None;
+                }
+                continue;
+            }
+            if word.eq_ignore_ascii_case("FROM") {
+                return None;
+            }
+            if word.eq_ignore_ascii_case("COUNT") {
+                let mut j = i;
+                while j < len && chars[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < len && chars[j] == '(' {
+                    return Some(format!(
+                        "Unexpected path component at {word_line}:{word_col}:5"
+                    ));
+                }
+            }
+            continue;
+        }
+
+        advance(c, &mut line, &mut col);
+        i += 1;
+    }
+
+    None
+}
+
 /// A SET clause in an UPDATE statement.
 #[derive(Debug, Clone)]
 pub struct SetClause {
@@ -229,15 +328,10 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    // Check for COUNT(*)
-    if tok.eq_ignore_ascii_case("COUNT") {
-        t.next_token()?; // consume COUNT
-        expect_char(t, "(")?;
-        expect_char(t, "*")?;
-        expect_char(t, ")")?;
-        return Ok(vec!["COUNT(*)".to_string()]);
-    }
-
+    // COUNT is not special-cased: the actions reject it with DynamoDB's
+    // "Unexpected path component" message before parsing, so for library
+    // callers it parses as an attribute token and the following '(' is a
+    // parse error.
     let mut projections = Vec::new();
     loop {
         let name = t
@@ -1842,14 +1936,63 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_count_star() {
-        let stmt = parse("SELECT COUNT(*) FROM \"T\"").unwrap();
-        match stmt {
-            Statement::Select { projections, .. } => {
-                assert_eq!(projections, vec!["COUNT(*)"]);
-            }
-            _ => panic!("Expected SELECT"),
-        }
+    fn test_parse_count_star_is_a_parse_error() {
+        // The actions reject a COUNT projection before parsing; the parser has
+        // no special case, so the '(' after the attribute token fails here.
+        assert!(parse("SELECT COUNT(*) FROM \"T\"").is_err());
+    }
+
+    #[test]
+    fn test_count_rejection_reports_the_token_position() {
+        assert_eq!(
+            count_projection_rejection("SELECT COUNT(*) FROM \"T\""),
+            Some("Unexpected path component at 1:8:5".to_string())
+        );
+        // The column tracks the token, the length stays 5 regardless of case
+        // or what is inside the parens.
+        assert_eq!(
+            count_projection_rejection("SELECT  count(pk) FROM \"T\""),
+            Some("Unexpected path component at 1:9:5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_count_rejection_tracks_lines() {
+        assert_eq!(
+            count_projection_rejection("SELECT\n COUNT(*) FROM \"T\""),
+            Some("Unexpected path component at 2:2:5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_count_rejection_ignores_quotes_and_word_boundaries() {
+        // A quoted "COUNT" identifier, a 'count(' string literal, and a word
+        // merely containing count are all fine.
+        assert_eq!(
+            count_projection_rejection("SELECT \"COUNT\" FROM \"T\""),
+            None
+        );
+        assert_eq!(
+            count_projection_rejection("SELECT 'count(' FROM \"T\""),
+            None
+        );
+        assert_eq!(
+            count_projection_rejection("SELECT recount(x) FROM \"T\""),
+            None
+        );
+    }
+
+    #[test]
+    fn test_count_rejection_only_applies_before_from_on_a_select() {
+        // Non-SELECT statements and anything after FROM are out of scope.
+        assert_eq!(
+            count_projection_rejection("UPDATE \"T\" SET count = count + 1 WHERE pk = 'k1'"),
+            None
+        );
+        assert_eq!(
+            count_projection_rejection("SELECT pk FROM \"T\" WHERE count(x)"),
+            None
+        );
     }
 
     #[test]

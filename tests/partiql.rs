@@ -3297,36 +3297,144 @@ fn test_next_token_is_rejected_when_replayed_with_a_different_where_clause() {
     );
 }
 
-#[test]
-fn test_next_token_is_rejected_on_a_count_projection() {
-    // COUNT(*) never mints a token (it reports the whole matching set), so a
-    // supplied one cannot match the request. Rejected with the mismatch
-    // message rather than silently discarded.
-    let db = Database::memory().unwrap();
-    create_test_table(&db, "Paged");
-    for i in 0..4 {
-        put_test_item(&db, "Paged", &format!("k{i}"), "keep");
-    }
+// -----------------------------------------------------------------------
+// COUNT projections are rejected (aggregates are not DynamoDB PartiQL)
+// -----------------------------------------------------------------------
 
-    let token = db
-        .execute_statement(ExecuteStatementRequest {
-            statement: "SELECT * FROM \"Paged\" WHERE name = 'keep'".to_string(),
-            limit: Some(1),
-            ..Default::default()
-        })
-        .unwrap()
-        .next_token
-        .expect("a read that stopped on the limit owes a token");
-
+/// Run a statement and return the ValidationException message it fails with.
+fn exec_validation_err(db: &Database, statement: &str) -> String {
     let err = db
         .execute_statement(ExecuteStatementRequest {
-            statement: "SELECT COUNT(*) FROM \"Paged\" WHERE name = 'keep'".to_string(),
-            next_token: Some(token),
+            statement: statement.to_string(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        DynoxideError::ValidationException(m) => m,
+        other => panic!("expected ValidationException, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_count_star_projection_is_rejected_with_the_position_of_the_token() {
+    // Real DynamoDB has no aggregate functions in PartiQL: the projection is
+    // rejected with a bare message naming the token's 1-based position and
+    // its length of 5 (captured eu-west-2).
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    assert_eq!(
+        exec_validation_err(&db, "SELECT COUNT(*) FROM \"Users\""),
+        "Unexpected path component at 1:8:5"
+    );
+}
+
+#[test]
+fn test_count_in_a_second_projection_reports_its_own_column() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    assert_eq!(
+        exec_validation_err(&db, "SELECT pk, COUNT(*) FROM \"Users\""),
+        "Unexpected path component at 1:12:5"
+    );
+}
+
+#[test]
+fn test_lowercase_count_is_rejected_the_same_way() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    assert_eq!(
+        exec_validation_err(&db, "SELECT count(*) FROM \"Users\""),
+        "Unexpected path component at 1:8:5"
+    );
+}
+
+#[test]
+fn test_count_of_an_attribute_is_rejected_with_the_same_length() {
+    // The length in the message is the COUNT token itself, not the whole call.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    assert_eq!(
+        exec_validation_err(&db, "SELECT COUNT(pk) FROM \"Users\""),
+        "Unexpected path component at 1:8:5"
+    );
+}
+
+#[test]
+fn test_count_is_rejected_before_the_table_existence_check() {
+    // Real DynamoDB fires this rejection even when the table does not exist.
+    let db = Database::memory().unwrap();
+    assert_eq!(
+        exec_validation_err(&db, "SELECT COUNT(*) FROM \"NoSuchTable\""),
+        "Unexpected path component at 1:8:5"
+    );
+}
+
+#[test]
+fn test_a_quoted_count_attribute_name_still_projects() {
+    // The rejection is token-based, so a quoted "COUNT" identifier is an
+    // ordinary attribute name and stays usable in a projection.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_item_with_attrs(&db, "Users", "u1", &[("COUNT", "three")]);
+
+    let resp = exec(&db, "SELECT \"COUNT\" FROM \"Users\" WHERE pk = 'u1'");
+    let items = resp.items.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("COUNT"),
+        Some(&AttributeValue::S("three".to_string()))
+    );
+}
+
+#[test]
+fn test_count_is_rejected_per_statement_on_batch_execute() {
+    // BatchExecuteStatement follows the shape captured on ExecuteStatement: the
+    // bare message under the usual per-statement ValidationError code.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    put_test_item(&db, "Users", "u1", "Alice");
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            statements: vec![
+                BatchStatementRequest {
+                    statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
+                    parameters: None,
+                },
+                BatchStatementRequest {
+                    statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
+                    parameters: None,
+                },
+            ],
+        })
+        .unwrap();
+
+    let error = resp.responses[0].error.as_ref().expect("expected an error");
+    assert_eq!(error.code, "ValidationError");
+    assert_eq!(error.message, "Unexpected path component at 1:8:5");
+    // The other statement still executes.
+    assert!(resp.responses[1].error.is_none());
+    assert!(resp.responses[1].item.is_some());
+}
+
+#[test]
+fn test_count_is_rejected_at_the_top_level_on_execute_transaction() {
+    // ExecuteTransaction surfaces the rejection where its parse errors live,
+    // at the top level, but with the bare captured message.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
+                parameters: None,
+            }],
             ..Default::default()
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "NextToken does not match request"),
+        matches!(err, DynoxideError::ValidationException(ref m) if m == "Unexpected path component at 1:8:5"),
         "unexpected error: {err:?}"
     );
 }

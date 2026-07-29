@@ -212,34 +212,6 @@ async fn execute_select<S: StorageBackend>(
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
 
-    // COUNT(*) reports the whole matching set, so it neither pages nor takes a
-    // limit, the same as it did before pagination existed. It also never mints
-    // a token, so a supplied one cannot match this request and is rejected the
-    // way any other mismatched token is. COUNT(*) is a dynoxide extension
-    // (real DynamoDB rejects the projection outright), so this contract is
-    // dynoxide's own.
-    if projections.len() == 1 && projections[0] == "COUNT(*)" {
-        if cursor.is_some() {
-            return Err(token_mismatch());
-        }
-        let window = evaluate_window(
-            storage,
-            table_name,
-            where_clause,
-            parameters,
-            &key_schema,
-            None,
-            None,
-        )
-        .await?;
-        let mut result = HashMap::new();
-        result.insert(
-            "Count".to_string(),
-            AttributeValue::N(window.matched.len().to_string()),
-        );
-        return Ok((Some(vec![result]), None));
-    }
-
     let window = evaluate_window(
         storage,
         table_name,

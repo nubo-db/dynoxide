@@ -65,6 +65,21 @@ pub async fn execute<S: StorageBackend>(
     let mut responses = Vec::with_capacity(request.statements.len());
 
     for stmt_req in &request.statements {
+        // A COUNT projection is rejected before parsing with the bare message
+        // captured on ExecuteStatement, carried here under the same
+        // per-statement ValidationError code a parse failure uses.
+        if let Some(msg) = partiql::parser::count_projection_rejection(&stmt_req.statement) {
+            responses.push(BatchStatementResponse {
+                error: Some(BatchStatementError {
+                    code: "ValidationError".to_string(),
+                    message: msg,
+                }),
+                item: None,
+                table_name: None,
+            });
+            continue;
+        }
+
         let parsed = partiql::parser::parse(&stmt_req.statement);
 
         let response = match parsed {

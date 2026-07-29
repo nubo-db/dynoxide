@@ -50,6 +50,13 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // A COUNT projection is rejected before parsing, with DynamoDB's bare
+    // message rather than the wasn't-well-formed wrapper the parse errors
+    // below carry. ExecuteStatement is the captured surface for this shape.
+    if let Some(msg) = partiql::parser::count_projection_rejection(&request.statement) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
     let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
         DynoxideError::ValidationException(format!(
             "Statement wasn't well formed, can't be processed: {e}"

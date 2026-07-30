@@ -87,7 +87,7 @@ pub use macros::ItemInsert;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use web_time::Instant;
+use web_time::{Duration, Instant};
 
 pub use errors::{DynoxideError, Result};
 pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};
@@ -114,61 +114,134 @@ pub struct ImportResult {
     pub bytes_imported: usize,
 }
 
-/// Cached `TransactWriteItems` response with timestamp and request hash for
-/// idempotency.
-type TransactWriteTokenCache = HashMap<
-    String,
-    (
-        Instant,
-        u64,
-        actions::transact_write_items::TransactWriteItemsResponse,
-    ),
->;
+/// One idempotency slot: when the token was claimed, the request hash it was
+/// claimed with, and the response once the call finishes.
+///
+/// `None` in the response position means a call has claimed the token and is
+/// still running. Only the asynchronous driver writes that state; the
+/// synchronous one holds the cache lock across its call instead, so a slot it
+/// finds is always a finished one.
+type TokenSlot<T> = (Instant, u64, Option<T>);
 
-/// Cached `ExecuteTransaction` response with timestamp and request hash for
-/// idempotency. Separate from [`TransactWriteTokenCache`] because the response
-/// type differs and `ClientRequestToken` idempotency is scoped per API
-/// operation in AWS: a token reused across `TransactWriteItems` and
-/// `ExecuteTransaction` executes once in each, so the two caches are
-/// independent by design.
-type ExecuteTransactionTokenCache = HashMap<
-    String,
-    (
-        Instant,
-        u64,
-        actions::execute_transaction::ExecuteTransactionResponse,
-    ),
->;
+/// Idempotency cache keyed by `ClientRequestToken`.
+type TokenCache<T> = HashMap<String, TokenSlot<T>>;
 
-/// AWS caps `ClientRequestToken` at 36 characters. Shared by the two
-/// transactional idempotency paths ([`run_idempotent`]).
-#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+/// Cached `TransactWriteItems` responses.
+type TransactWriteTokenCache =
+    TokenCache<actions::transact_write_items::TransactWriteItemsResponse>;
+
+/// Cached `ExecuteTransaction` responses. Separate from
+/// [`TransactWriteTokenCache`] because the response type differs and
+/// `ClientRequestToken` idempotency is scoped per API operation in AWS: a token
+/// reused across `TransactWriteItems` and `ExecuteTransaction` executes once in
+/// each, so the two caches are independent by design.
+type ExecuteTransactionTokenCache =
+    TokenCache<actions::execute_transaction::ExecuteTransactionResponse>;
+
+/// The transactional idempotency caches one engine instance owns.
+///
+/// Opaque by design: the slot shape is an implementation detail. Construct one
+/// with [`TokenCaches::new`] and lend it to a dispatch that needs it.
+#[derive(Default)]
+pub struct TokenCaches {
+    // Read by the native transactional path; a backend-neutral build has no
+    // such caller yet, so scope the exemption to exactly that configuration
+    // rather than blanket-allowing it.
+    #[cfg_attr(
+        not(any(feature = "native-sqlite", feature = "_has-encryption")),
+        allow(dead_code)
+    )]
+    transact_write: Mutex<TransactWriteTokenCache>,
+    execute_transaction: Mutex<ExecuteTransactionTokenCache>,
+}
+
+impl TokenCaches {
+    /// An empty set of caches.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(any(feature = "wasm-sqlite", test))]
+    pub(crate) fn execute_transaction(&self) -> &Mutex<ExecuteTransactionTokenCache> {
+        &self.execute_transaction
+    }
+}
+
+/// AWS caps `ClientRequestToken` at 36 characters.
 const MAX_TOKEN_LEN: usize = 36;
 
 /// AWS scopes transactional idempotency to a 10-minute window. Entries older
 /// than this are evicted on the next token-bearing call.
-#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const TOKEN_EXPIRY_SECS: u64 = 600;
+
+/// Reject a token longer than DynamoDB accepts, with its exact message.
+fn validate_token(token: Option<&str>) -> Result<()> {
+    match token {
+        Some(token) if token.len() > MAX_TOKEN_LEN => {
+            Err(DynoxideError::ValidationException(format!(
+                "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Hash the idempotency key material.
+///
+/// The input is the items or statements only, never `ReturnConsumedCapacity`,
+/// so a same-token call differing only in the capacity mode replays rather than
+/// mismatching. Normalised through `serde_json::Value` first so the digest does
+/// not depend on map iteration order.
+fn request_hash<H: serde::Serialize>(input: &H) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let normalised = serde_json::to_value(input)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalised.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn lock_cache<T>(cache: &Mutex<TokenCache<T>>) -> Result<std::sync::MutexGuard<'_, TokenCache<T>>> {
+    cache
+        .lock()
+        .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))
+}
+
+/// Drop entries older than `window`.
+///
+/// The window is a parameter so a test can drive expiry without back-dating an
+/// `Instant`, which is not always possible: `Instant`'s origin is boot, so
+/// subtracting ten minutes fails on a machine that has been up for less.
+fn evict_expired<T>(cache: &mut TokenCache<T>, window: Duration) {
+    cache.retain(|_, (claimed_at, _, _)| claimed_at.elapsed() < window);
+}
+
+/// The expiry window every caller outside the tests uses.
+fn token_window() -> Duration {
+    Duration::from_secs(TOKEN_EXPIRY_SECS)
+}
 
 /// Run a transactional operation with `ClientRequestToken` idempotency, shared
 /// by [`Database::transact_write_items`] and [`Database::execute_transaction`].
 ///
-/// For a token-bearing request the cache lock is held across the whole first
-/// call (check, execute, insert) so two concurrent same-token calls cannot both
-/// execute: the second serialises behind the first and replays. A cache hit
-/// clones the stored response, releases the lock, then rebuilds the reply via
-/// `replay` (which re-derives read capacity). Lock ordering is cache-then-
-/// storage: `execute` takes the storage lock second, and nothing takes storage
-/// first and then a token cache, so there is no reverse path to deadlock
-/// against. Any future code touching both locks must keep this order.
+/// The cache lock is held across the whole first call (check, execute, insert)
+/// so two concurrent same-token calls cannot both execute: the second
+/// serialises behind the first and replays. That hold is the exclusion, which
+/// is why this driver never needs to claim a slot the way the asynchronous one
+/// does. A cache hit clones the stored response, releases the lock, then
+/// rebuilds the reply via `replay` (which re-derives read capacity).
 ///
-/// `hash_input` is the stable idempotency key material - the items or
-/// statements only, never `ReturnConsumedCapacity` - so a same-token call
-/// differing only in the capacity mode replays rather than mismatches. A failed
-/// `execute` is propagated without caching, so a same-token retry re-executes.
+/// Lock ordering is cache-then-storage: `execute` takes the storage lock
+/// second, and nothing takes storage first and then a token cache, so there is
+/// no reverse path to deadlock against. Any future code touching both locks
+/// must keep this order.
+///
+/// A failed `execute` is propagated without caching, so a same-token retry
+/// re-executes.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn run_idempotent<T, H, E, R>(
-    cache: &Mutex<HashMap<String, (Instant, u64, T)>>,
+    cache: &Mutex<TokenCache<T>>,
     token: Option<&str>,
     hash_input: &H,
     execute: E,
@@ -180,44 +253,30 @@ where
     E: FnOnce() -> Result<T>,
     R: FnOnce(&T) -> T,
 {
-    if let Some(token) = token {
-        if token.len() > MAX_TOKEN_LEN {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
-            )));
-        }
-    }
+    validate_token(token)?;
 
     // No idempotency token: execute without touching the cache.
     let Some(token) = token else {
         return execute();
     };
+    let hash = request_hash(hash_input);
 
-    // Hash over the key material only, normalised for stable ordering
-    // regardless of HashMap iteration order.
-    let request_hash = {
-        use std::hash::{Hash, Hasher};
-        let normalised = serde_json::to_value(hash_input)
-            .and_then(|v| serde_json::to_vec(&v))
-            .unwrap_or_default();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        normalised.hash(&mut hasher);
-        hasher.finish()
-    };
-
-    let mut cache = cache
-        .lock()
-        .map_err(|e| DynoxideError::InternalServerError(format!("Lock poisoned: {e}")))?;
-    // Evict expired entries.
-    cache.retain(|_, (ts, _, _)| ts.elapsed().as_secs() < TOKEN_EXPIRY_SECS);
-    if let Some((_, cached_hash, resp)) = cache.get(token) {
-        if *cached_hash != request_hash {
+    let mut cache = lock_cache(cache)?;
+    evict_expired(&mut cache, token_window());
+    let cached = match cache.get(token) {
+        Some((_, cached_hash, _)) if *cached_hash != hash => {
             return Err(DynoxideError::IdempotentParameterMismatchException(
                 "An error occurred (IdempotentParameterMismatchException)".to_string(),
             ));
         }
+        // A claimed-but-unfinished slot is treated as absent: this driver
+        // holds its lock across the call, so it never writes one and never
+        // shares a cache with the driver that does.
+        Some((_, _, slot)) => slot.clone(),
+        None => None,
+    };
+    if let Some(cached) = cached {
         // Clone the cached response, release the lock, then rebuild the reply.
-        let cached = resp.clone();
         drop(cache);
         return Ok(replay(&cached));
     }
@@ -227,9 +286,167 @@ where
     let resp = execute()?;
     cache.insert(
         token.to_string(),
-        (Instant::now(), request_hash, resp.clone()),
+        (Instant::now(), hash, Some(resp.clone())),
     );
     Ok(resp)
+}
+
+/// What a refused caller is told. Unreachable from any shipped surface today,
+/// so it stands for "something upstream stopped serialising callers".
+#[cfg(any(feature = "wasm-sqlite", test))]
+const IN_FLIGHT_MESSAGE: &str = "a call under this ClientRequestToken is still in flight";
+
+/// What a caller found when it tried to claim a token slot.
+#[cfg(any(feature = "wasm-sqlite", test))]
+enum TokenClaim<T> {
+    /// The slot was free and now belongs to this call, which must either
+    /// complete it or clear it. Carries the stamp that identifies the claim,
+    /// so a settle can tell its own slot from one a later call has taken over.
+    Marked(Instant),
+    /// Another call holds the slot and has not finished.
+    InFlight,
+    /// A call under this token used different request material.
+    Mismatch,
+    /// A finished call under this token; replay its response.
+    Hit(T),
+}
+
+/// Look up a token and, when it is free, claim it - under one lock.
+///
+/// The lookup and the claim cannot be separate acquisitions: two callers would
+/// both see a free slot and both proceed, which is the race the claim exists to
+/// prevent.
+#[cfg(any(feature = "wasm-sqlite", test))]
+fn lookup_or_claim<T: Clone>(
+    cache: &Mutex<TokenCache<T>>,
+    token: &str,
+    hash: u64,
+) -> Result<TokenClaim<T>> {
+    lookup_or_claim_within(cache, token, hash, token_window())
+}
+
+/// [`lookup_or_claim`] with an explicit expiry window, so a test can drive
+/// expiry without depending on how long the machine has been running.
+#[cfg(any(feature = "wasm-sqlite", test))]
+fn lookup_or_claim_within<T: Clone>(
+    cache: &Mutex<TokenCache<T>>,
+    token: &str,
+    hash: u64,
+    window: Duration,
+) -> Result<TokenClaim<T>> {
+    let mut cache = lock_cache(cache)?;
+    evict_expired(&mut cache, window);
+    Ok(match cache.get(token) {
+        Some((_, cached_hash, _)) if *cached_hash != hash => TokenClaim::Mismatch,
+        Some((_, _, None)) => TokenClaim::InFlight,
+        Some((_, _, Some(resp))) => TokenClaim::Hit(resp.clone()),
+        None => {
+            let claimed_at = Instant::now();
+            cache.insert(token.to_string(), (claimed_at, hash, None));
+            TokenClaim::Marked(claimed_at)
+        }
+    })
+}
+
+/// Is this slot still the claim `claimed_at` made?
+///
+/// A claim can expire while its call is in flight, and a later call can then
+/// take the token over. The original call must not settle or release a slot
+/// that is no longer its own, or it would overwrite the newcomer's response or
+/// free a claim still being worked on.
+#[cfg(any(feature = "wasm-sqlite", test))]
+fn still_ours<T>(cache: &TokenCache<T>, token: &str, claimed_at: Instant) -> bool {
+    matches!(cache.get(token), Some((at, _, None)) if *at == claimed_at)
+}
+
+/// Settle a claimed slot with the response its call produced.
+#[cfg(any(feature = "wasm-sqlite", test))]
+fn record_complete<T>(
+    cache: &Mutex<TokenCache<T>>,
+    token: &str,
+    claimed_at: Instant,
+    hash: u64,
+    resp: T,
+) -> Result<()> {
+    let mut cache = lock_cache(cache)?;
+    if still_ours(&cache, token, claimed_at) {
+        cache.insert(token.to_string(), (claimed_at, hash, Some(resp)));
+    }
+    Ok(())
+}
+
+/// Release a claimed slot whose call failed, so a retry re-executes rather than
+/// replaying the failure.
+#[cfg(any(feature = "wasm-sqlite", test))]
+fn clear_claim<T>(cache: &Mutex<TokenCache<T>>, token: &str, claimed_at: Instant) -> Result<()> {
+    let mut cache = lock_cache(cache)?;
+    if still_ours(&cache, token, claimed_at) {
+        cache.remove(token);
+    }
+    Ok(())
+}
+
+/// [`run_idempotent`] for a caller that cannot block.
+///
+/// Takes a future rather than a closure, because the wasm engine awaits real
+/// bridge promises. That rules out holding the cache lock across the call, so
+/// exclusion comes from claiming the token slot up front instead: a concurrent
+/// same-token caller finds the claim and is refused rather than starting a
+/// second execution.
+///
+/// A refused caller currently gets an internal error. No shipped surface can
+/// reach it - the engine serialises callers on the backend lock before either
+/// arrives here - so it stands for "something upstream stopped serialising"
+/// until an operation exists that can genuinely produce it.
+#[cfg(any(feature = "wasm-sqlite", test))]
+async fn run_idempotent_async<T, H, F, R>(
+    cache: &Mutex<TokenCache<T>>,
+    token: Option<&str>,
+    hash_input: &H,
+    execute: F,
+    replay: R,
+) -> Result<T>
+where
+    T: Clone,
+    H: serde::Serialize,
+    F: std::future::Future<Output = Result<T>>,
+    R: FnOnce(&T) -> T,
+{
+    validate_token(token)?;
+
+    let Some(token) = token else {
+        return execute.await;
+    };
+    let hash = request_hash(hash_input);
+
+    let claimed_at = match lookup_or_claim(cache, token, hash)? {
+        TokenClaim::Hit(cached) => return Ok(replay(&cached)),
+        TokenClaim::Mismatch => {
+            return Err(DynoxideError::IdempotentParameterMismatchException(
+                "An error occurred (IdempotentParameterMismatchException)".to_string(),
+            ));
+        }
+        TokenClaim::InFlight => {
+            return Err(DynoxideError::InternalServerError(
+                IN_FLIGHT_MESSAGE.to_string(),
+            ));
+        }
+        TokenClaim::Marked(claimed_at) => claimed_at,
+    };
+
+    match execute.await {
+        Ok(resp) => {
+            // The work has committed by this point, so a bookkeeping failure
+            // must not be reported as a failed call. The worst it costs is a
+            // replay: the slot stays claimed until it expires.
+            let _ = record_complete(cache, token, claimed_at, hash, resp.clone());
+            Ok(resp)
+        }
+        Err(e) => {
+            let _ = clear_claim(cache, token, claimed_at);
+            Err(e)
+        }
+    }
 }
 
 /// The native storage backend: the rusqlite-backed [`storage::Storage`].
@@ -261,10 +478,10 @@ pub type WasmDatabase = Database<WasmBridgeBackend>;
 /// Build-visible preview marker for the wasm-sqlite backend.
 ///
 /// `true` when built with `--features wasm-sqlite`, `false` otherwise. The wasm
-/// backend covers CRUD, query, scan, and GSI/LSI, but it is not run against the
-/// dynamodb-conformance suite that covers the native build. Consumers can read
-/// this constant to tell whether the artifact they hold is the conformance-
-/// tested native build or the wasm preview.
+/// backend covers CRUD, query, scan, GSI/LSI, and PartiQL, and passes the
+/// conformance cases for all of them, but it still leaves several operations
+/// unimplemented. Consumers can read this constant to tell whether the artifact
+/// they hold is the fully conformant native build or the wasm preview.
 #[cfg(feature = "wasm-sqlite")]
 pub const WASM_PREVIEW: bool = true;
 /// Build-visible preview marker for the wasm-sqlite backend. See the
@@ -283,8 +500,7 @@ pub const WASM_PREVIEW: bool = false;
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Database<S = RusqliteBackend> {
     inner: Arc<Mutex<S>>,
-    idempotency_tokens: Arc<Mutex<TransactWriteTokenCache>>,
-    execute_transaction_tokens: Arc<Mutex<ExecuteTransactionTokenCache>>,
+    tokens: Arc<TokenCaches>,
 }
 
 /// Serialises backend access on the backend-neutral build. On wasm this is an
@@ -315,8 +531,7 @@ use std::sync::Mutex as BackendMutex;
 #[cfg(not(any(feature = "native-sqlite", feature = "_has-encryption")))]
 pub struct Database<S> {
     inner: Arc<BackendMutex<S>>,
-    idempotency_tokens: Arc<Mutex<TransactWriteTokenCache>>,
-    execute_transaction_tokens: Arc<Mutex<ExecuteTransactionTokenCache>>,
+    tokens: Arc<TokenCaches>,
 }
 
 // Hand-written so cloning never requires `S: Clone`; only the `Arc`s clone.
@@ -324,8 +539,7 @@ impl<S> Clone for Database<S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            idempotency_tokens: Arc::clone(&self.idempotency_tokens),
-            execute_transaction_tokens: Arc::clone(&self.execute_transaction_tokens),
+            tokens: Arc::clone(&self.tokens),
         }
     }
 }
@@ -337,8 +551,7 @@ impl Database<RusqliteBackend> {
         let storage = storage::Storage::new(path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
-            idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
-            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(TokenCaches::new()),
         })
     }
 
@@ -373,8 +586,7 @@ impl Database<RusqliteBackend> {
         let storage = storage::Storage::new_encrypted(path, key)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
-            idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
-            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(TokenCaches::new()),
         })
     }
 
@@ -383,8 +595,7 @@ impl Database<RusqliteBackend> {
         let storage = storage::Storage::memory()?;
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
-            idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
-            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(TokenCaches::new()),
         })
     }
 
@@ -637,7 +848,7 @@ impl Database<RusqliteBackend> {
         request: actions::transact_write_items::TransactWriteItemsRequest,
     ) -> Result<actions::transact_write_items::TransactWriteItemsResponse> {
         run_idempotent(
-            &self.idempotency_tokens,
+            &self.tokens.transact_write,
             request.client_request_token.as_deref(),
             &request.transact_items,
             || {
@@ -755,7 +966,7 @@ impl Database<RusqliteBackend> {
         request: actions::execute_transaction::ExecuteTransactionRequest,
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
         run_idempotent(
-            &self.execute_transaction_tokens,
+            &self.tokens.execute_transaction,
             request.client_request_token.as_deref(),
             &request.transact_statements,
             || {
@@ -925,8 +1136,7 @@ impl Database<WasmBridgeBackend> {
             .map_err(DynoxideError::from)?;
         Ok(Self {
             inner: Arc::new(BackendMutex::new(backend)),
-            idempotency_tokens: Arc::new(Mutex::new(HashMap::new())),
-            execute_transaction_tokens: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(TokenCaches::new()),
         })
     }
 
@@ -956,6 +1166,13 @@ impl Database<WasmBridgeBackend> {
     /// per-handler atomicity of the wrappers below.
     pub(crate) async fn backend(&self) -> async_lock::MutexGuard<'_, WasmBridgeBackend> {
         self.inner.lock().await
+    }
+
+    /// The idempotency caches this instance owns, for a dispatch that has to
+    /// honour `ClientRequestToken`. Outlives any single call, so a replay finds
+    /// the earlier one's result.
+    pub(crate) fn token_caches(&self) -> &TokenCaches {
+        &self.tokens
     }
 
     /// Create a new DynamoDB table.
@@ -1113,5 +1330,349 @@ mod tests {
             got.item.unwrap().get("pk"),
             Some(&AttributeValue::S("a".to_string()))
         );
+    }
+}
+
+/// Cache primitives and the asynchronous driver.
+///
+/// These are private, so they are exercised here rather than from an
+/// integration test. The public-facade behaviour both drivers must preserve
+/// lives in `tests/execute_transaction.rs` and `tests/transactions.rs`.
+#[cfg(test)]
+mod idempotency_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const KEY: &str = "statements";
+    const TOKEN: &str = "tok";
+
+    fn cache() -> Mutex<TokenCache<u32>> {
+        Mutex::new(HashMap::new())
+    }
+
+    fn hash() -> u64 {
+        request_hash(&KEY)
+    }
+
+    fn drive<F>(cache: &Mutex<TokenCache<u32>>, token: Option<&str>, execute: F) -> Result<u32>
+    where
+        F: std::future::Future<Output = Result<u32>>,
+    {
+        pollster::block_on(run_idempotent_async(cache, token, &KEY, execute, |c| *c))
+    }
+
+    #[test]
+    fn a_claim_is_visible_to_the_next_caller_and_settles_into_a_hit() {
+        let cache = cache();
+
+        let TokenClaim::Marked(at) = lookup_or_claim(&cache, TOKEN, hash()).unwrap() else {
+            panic!("the first caller should have claimed the token");
+        };
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+            TokenClaim::InFlight
+        ));
+
+        record_complete(&cache, TOKEN, at, hash(), 7).unwrap();
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+            TokenClaim::Hit(7)
+        ));
+    }
+
+    #[test]
+    fn only_one_caller_can_claim_a_token() {
+        // Split the lookup and the claim into two acquisitions and this goes
+        // red: several racing callers would each find the slot free. Sequential
+        // calls would not catch that, so this has to be threaded.
+        use std::sync::Barrier;
+
+        const N: usize = 16;
+        let cache = cache();
+        let barrier = Barrier::new(N);
+
+        let marked = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        matches!(
+                            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+                            TokenClaim::Marked(_)
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|claimed| *claimed)
+                .count()
+        });
+
+        assert_eq!(marked, 1);
+    }
+
+    #[test]
+    fn a_call_whose_claim_expired_does_not_disturb_the_caller_that_took_over() {
+        // A claim can expire while its call is still running, letting a second
+        // caller take the token. The first must not then settle or release a
+        // slot that is no longer its own.
+        let cache = cache();
+        let TokenClaim::Marked(first) = lookup_or_claim(&cache, TOKEN, hash()).unwrap() else {
+            panic!("the first caller should have claimed the token");
+        };
+        let TokenClaim::Marked(second) =
+            lookup_or_claim_within(&cache, TOKEN, hash(), Duration::ZERO).unwrap()
+        else {
+            panic!("the expired claim should have been re-issued");
+        };
+        assert_ne!(first, second);
+
+        // The first call finishing must not overwrite the second's slot.
+        record_complete(&cache, TOKEN, first, hash(), 1).unwrap();
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+            TokenClaim::InFlight
+        ));
+
+        // Nor must the first call failing release it.
+        clear_claim(&cache, TOKEN, first).unwrap();
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+            TokenClaim::InFlight
+        ));
+
+        // The caller that owns the claim still settles it.
+        record_complete(&cache, TOKEN, second, hash(), 2).unwrap();
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+            TokenClaim::Hit(2)
+        ));
+    }
+
+    #[test]
+    fn a_different_request_under_the_same_token_mismatches_in_both_states() {
+        let other = request_hash(&"different");
+
+        let cache = cache();
+        let TokenClaim::Marked(at) = lookup_or_claim(&cache, TOKEN, hash()).unwrap() else {
+            panic!("expected a free slot to claim");
+        };
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, other).unwrap(),
+            TokenClaim::Mismatch
+        ));
+
+        record_complete(&cache, TOKEN, at, hash(), 7).unwrap();
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, other).unwrap(),
+            TokenClaim::Mismatch
+        ));
+    }
+
+    #[test]
+    fn the_claim_lands_before_the_call_is_polled() {
+        // Swapping the claim and the poll in the driver turns this red.
+        let cache = cache();
+        let claimed_first = Cell::new(false);
+
+        let out = drive(&cache, Some(TOKEN), async {
+            // try_lock, not lock: a driver still holding the guard across the
+            // call would hang here, and a hang reads worse than an assertion.
+            let slots = cache
+                .try_lock()
+                .expect("the cache lock must be released before the call runs");
+            claimed_first.set(matches!(slots.get(TOKEN), Some((_, h, None)) if *h == hash()));
+            Ok(7)
+        });
+
+        assert_eq!(out.unwrap(), 7);
+        assert!(claimed_first.get());
+    }
+
+    #[test]
+    fn a_caller_arriving_under_a_live_claim_does_not_execute() {
+        let cache = cache();
+        let second_ran = Cell::new(false);
+
+        let out = drive(&cache, Some(TOKEN), async {
+            let second = drive(&cache, Some(TOKEN), async {
+                second_ran.set(true);
+                Ok(0)
+            });
+            // Pinned exactly: InternalServerError is also what a poisoned lock
+            // produces, so the variant alone would not tell them apart.
+            assert_eq!(second.unwrap_err().to_string(), IN_FLIGHT_MESSAGE);
+            // The refusal must leave the claim alone; releasing it here would
+            // let a third caller start a second execution.
+            assert!(matches!(
+                lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+                TokenClaim::InFlight
+            ));
+            Ok(1)
+        });
+
+        assert_eq!(out.unwrap(), 1);
+        assert!(!second_ran.get(), "the second call must not run the work");
+        // And the outer call still settles the slot it owns.
+        assert!(matches!(
+            lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
+            TokenClaim::Hit(1)
+        ));
+    }
+
+    #[test]
+    fn the_synchronous_driver_treats_a_live_claim_as_absent() {
+        // The two drivers never share a cache today, so this cannot happen -
+        // the synchronous driver holds its lock across the call and never
+        // writes a claim. Pinned so that if they ever do share one, the
+        // double-apply shows up here rather than in production.
+        let cache = cache();
+        lookup_or_claim(&cache, TOKEN, hash()).unwrap();
+
+        let out = run_idempotent(&cache, Some(TOKEN), &KEY, || Ok(9), |c| *c).unwrap();
+        assert_eq!(
+            out, 9,
+            "a claimed slot is not treated as a replayable result"
+        );
+    }
+
+    #[test]
+    fn a_settled_token_replays_without_re_executing() {
+        let cache = cache();
+        let runs = Cell::new(0);
+
+        for _ in 0..2 {
+            let out = drive(&cache, Some(TOKEN), async {
+                runs.set(runs.get() + 1);
+                Ok(7)
+            });
+            assert_eq!(out.unwrap(), 7);
+        }
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_call_releases_its_claim_so_a_retry_re_executes() {
+        let cache = cache();
+        let runs = Cell::new(0);
+
+        let first = drive(&cache, Some(TOKEN), async {
+            runs.set(runs.get() + 1);
+            Err(DynoxideError::ValidationException("no".into()))
+        });
+        assert!(first.is_err());
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "the claim must be released"
+        );
+
+        let second = drive(&cache, Some(TOKEN), async {
+            runs.set(runs.get() + 1);
+            Ok(7)
+        });
+        assert_eq!(second.unwrap(), 7);
+        assert_eq!(runs.get(), 2);
+    }
+
+    #[test]
+    fn a_claim_left_by_a_dropped_call_expires_rather_than_wedging_the_token() {
+        // A dropped future leaves its claim behind. Expiry is what stops that
+        // wedging the token until the process restarts.
+        let cache = cache();
+        lookup_or_claim(&cache, TOKEN, hash()).unwrap();
+
+        assert!(matches!(
+            lookup_or_claim_within(&cache, TOKEN, hash(), Duration::ZERO).unwrap(),
+            TokenClaim::Marked(_)
+        ));
+    }
+
+    #[test]
+    fn a_settled_token_stops_replaying_once_it_expires() {
+        let cache = cache();
+        let TokenClaim::Marked(at) = lookup_or_claim(&cache, TOKEN, hash()).unwrap() else {
+            panic!("expected a free slot to claim");
+        };
+        record_complete(&cache, TOKEN, at, hash(), 7).unwrap();
+
+        // Inside the window it still replays.
+        assert!(matches!(
+            lookup_or_claim_within(&cache, TOKEN, hash(), token_window()).unwrap(),
+            TokenClaim::Hit(7)
+        ));
+        // Past it, the token is free again.
+        assert!(matches!(
+            lookup_or_claim_within(&cache, TOKEN, hash(), Duration::ZERO).unwrap(),
+            TokenClaim::Marked(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_callers_under_one_token_execute_the_work_once() {
+        // The asynchronous driver exists because it cannot hold a lock across
+        // its call, so this is the property that matters most for it. The
+        // synchronous driver has the same test in tests/execute_transaction.rs.
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const N: usize = 16;
+        let cache = cache();
+        let runs = AtomicUsize::new(0);
+        let barrier = Barrier::new(N);
+
+        let outcomes: Vec<Result<u32>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        drive(&cache, Some(TOKEN), async {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok(7)
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the work must run once");
+        // Every caller either gets the value or is told a call is in flight;
+        // none may run the work a second time.
+        for outcome in outcomes {
+            match outcome {
+                Ok(v) => assert_eq!(v, 7),
+                Err(e) => assert_eq!(e.to_string(), IN_FLIGHT_MESSAGE),
+            }
+        }
+    }
+
+    #[test]
+    fn an_overlong_token_is_rejected_with_dynamodbs_message() {
+        let token = "x".repeat(MAX_TOKEN_LEN + 1);
+        let err = drive(&cache(), Some(&token), async { Ok(7) }).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_tokenless_call_never_touches_the_cache() {
+        let cache = cache();
+        let runs = Cell::new(0);
+
+        for _ in 0..2 {
+            drive(&cache, None, async {
+                runs.set(runs.get() + 1);
+                Ok(7)
+            })
+            .unwrap();
+        }
+        assert_eq!(runs.get(), 2);
+        assert!(cache.lock().unwrap().is_empty());
     }
 }

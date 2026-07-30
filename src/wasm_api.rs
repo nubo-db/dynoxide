@@ -33,17 +33,12 @@
 //! mismatch rather than mis-parsing a newer engine.
 
 use crate::actions;
-use crate::errors::DynoxideError;
+use crate::errors::{DynoxideError, UNSUPPORTED_TYPE};
 use crate::storage_backend::StorageBackend;
 
 /// Engine-contract version. Bump only on an envelope-shape change; adding a
 /// supported op is additive and non-breaking.
 pub const CONTRACT_VERSION: u32 = 1;
-
-/// The `__type` carried by the engine's own (non-AWS) envelopes, currently just
-/// the unsupported/unknown-operation case. Namespaced so a client can match it
-/// without colliding with a real DynamoDB `__type`.
-const UNSUPPORTED_TYPE: &str = "com.dynoxide.wasm#UnsupportedOperation";
 
 /// Operations the wasm preview engine answers through [`dispatch`]. This is the
 /// authoritative feature-detection list the client consumes via
@@ -64,7 +59,27 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "BatchGetItem",
     "BatchWriteItem",
     "TransactGetItems",
+    "ExecuteStatement",
+    "BatchExecuteStatement",
+    "ExecuteTransaction",
 ];
+
+/// The idempotency caches a dispatch needs to honour `ClientRequestToken`.
+///
+/// Borrowed rather than owned, so one engine's caches outlive any single
+/// dispatch. Carries the whole set rather than the one cache in use today, so
+/// adding the remaining transactional operation is a routing change instead of
+/// a signature change.
+pub struct DispatchContext<'a> {
+    tokens: &'a crate::TokenCaches,
+}
+
+impl<'a> DispatchContext<'a> {
+    /// Borrow an engine's caches for the span of one dispatch.
+    pub fn new(tokens: &'a crate::TokenCaches) -> Self {
+        Self { tokens }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP envelope
@@ -122,6 +137,7 @@ impl HttpOutcome {
 /// Signatures are never verified on either.
 pub async fn dispatch_http<S: StorageBackend>(
     backend: &S,
+    ctx: &DispatchContext<'_>,
     target: Option<&str>,
     body: &str,
     auth: crate::auth_material::AuthMaterial<'_>,
@@ -166,7 +182,7 @@ pub async fn dispatch_http<S: StorageBackend>(
     // `route` keeps the error typed, so the status comes straight from
     // `DynoxideError::status_code` rather than being re-derived from the
     // serialised envelope. Same source of truth as the native server.
-    match route(backend, operation, body).await {
+    match route(backend, ctx, operation, body).await {
         Ok(json) => HttpOutcome::new(200, json),
         Err(e) => HttpOutcome::new(e.status_code(), e.to_json()),
     }
@@ -199,13 +215,14 @@ fn unsupported_envelope(op: &str) -> String {
 /// `request_json` classifies exactly as it does over HTTP, never a panic.
 pub async fn dispatch<S: StorageBackend>(
     backend: &S,
+    ctx: &DispatchContext<'_>,
     op: &str,
     request_json: &str,
 ) -> std::result::Result<String, String> {
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
-    route(backend, op, request_json)
+    route(backend, ctx, op, request_json)
         .await
         .map_err(|e| e.to_json())
 }
@@ -216,6 +233,7 @@ pub async fn dispatch<S: StorageBackend>(
 /// unlisted op reaching here is a bug, not a user error.
 async fn route<S: StorageBackend>(
     backend: &S,
+    ctx: &DispatchContext<'_>,
     op: &str,
     request_json: &str,
 ) -> crate::Result<String> {
@@ -250,6 +268,9 @@ async fn route<S: StorageBackend>(
         "BatchGetItem" => run!(batch_get_item),
         "BatchWriteItem" => run!(batch_write_item),
         "TransactGetItems" => run!(transact_get_items),
+        "ExecuteStatement" => run!(execute_statement),
+        "BatchExecuteStatement" => run!(batch_execute_statement),
+        "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
         other => Err(DynoxideError::InternalServerError(format!(
             "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
         ))),
@@ -258,6 +279,42 @@ async fn route<S: StorageBackend>(
     // Same seam as the HTTP dispatch: resolve the wire-invisible
     // EnvelopedValidation tag for the operation before serialising.
     result.map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
+}
+
+/// `ExecuteTransaction`, which cannot use the `run!` macro because it needs the
+/// request twice: once as idempotency key material and once to execute. The
+/// statements are cloned rather than borrowed, because the driver takes an
+/// already-built future and executing it consumes the request.
+///
+/// Hashes the statements only, never `ReturnConsumedCapacity`, so a same-token
+/// call differing only in the capacity mode replays rather than mismatching.
+async fn execute_transaction<S: StorageBackend>(
+    backend: &S,
+    ctx: &DispatchContext<'_>,
+    request_json: &str,
+) -> crate::Result<String> {
+    let request: actions::execute_transaction::ExecuteTransactionRequest =
+        crate::serde_errors::deserialize(request_json)?;
+    let statements = request.transact_statements.clone();
+    let token = request.client_request_token.clone();
+    let capacity_mode = request.return_consumed_capacity.clone();
+
+    let response = crate::run_idempotent_async(
+        ctx.tokens.execute_transaction(),
+        token.as_deref(),
+        &statements,
+        actions::execute_transaction::execute(backend, request),
+        |cached| {
+            actions::execute_transaction::replay_response(
+                &statements,
+                &capacity_mode,
+                cached.responses.clone(),
+            )
+        },
+    )
+    .await?;
+
+    serde_json::to_string(&response).map_err(|e| DynoxideError::InternalServerError(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +329,7 @@ async fn route<S: StorageBackend>(
 
 #[cfg(feature = "wasm-sqlite")]
 mod engine {
-    use super::{CONTRACT_VERSION, SUPPORTED_OPS, dispatch};
+    use super::{CONTRACT_VERSION, DispatchContext, SUPPORTED_OPS, dispatch};
     use crate::WasmDatabase;
     use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
@@ -336,7 +393,13 @@ mod engine {
             return Err(not_opened_envelope());
         };
         let backend = db.backend().await;
-        dispatch(&*backend, &op, &request_json).await
+        dispatch(
+            &*backend,
+            &DispatchContext::new(db.token_caches()),
+            &op,
+            &request_json,
+        )
+        .await
     }
 
     /// Resolve one DynamoDB HTTP request end to end, returning
@@ -366,7 +429,14 @@ mod engine {
             query: query.as_deref().unwrap_or(""),
             has_date_header,
         };
-        let outcome = super::dispatch_http(&*backend, target.as_deref(), &body, auth).await;
+        let outcome = super::dispatch_http(
+            &*backend,
+            &DispatchContext::new(db.token_caches()),
+            target.as_deref(),
+            &body,
+            auth,
+        )
+        .await;
         Ok(serde_json::json!({
             "status": outcome.status,
             "body": outcome.body,
@@ -398,7 +468,19 @@ mod tests {
     /// dispatch is backend-generic, so this exercises the same routing,
     /// deserialisation, and envelope code the wasm engine runs.
     fn run(backend: &Storage, op: &str, json: &str) -> std::result::Result<String, String> {
-        pollster::block_on(dispatch(backend, op, json))
+        let tokens = crate::TokenCaches::new();
+        pollster::block_on(dispatch(backend, &DispatchContext::new(&tokens), op, json))
+    }
+
+    /// As [`run`], but against caller-supplied caches, so a test can drive two
+    /// calls through the same idempotency state.
+    fn run_with(
+        backend: &Storage,
+        tokens: &crate::TokenCaches,
+        op: &str,
+        json: &str,
+    ) -> std::result::Result<String, String> {
+        pollster::block_on(dispatch(backend, &DispatchContext::new(tokens), op, json))
     }
 
     const CREATE_MUSIC: &str = r#"{
@@ -818,7 +900,25 @@ mod tests {
     }
 
     fn http(backend: &Storage, target: Option<&str>, body: &str) -> HttpOutcome {
-        pollster::block_on(dispatch_http(backend, target, body, signed_auth()))
+        let tokens = crate::TokenCaches::new();
+        http_with(backend, &tokens, target, body)
+    }
+
+    /// As [`http`], but against caller-supplied caches, so two requests share
+    /// idempotency state the way they do on one engine instance.
+    fn http_with(
+        backend: &Storage,
+        tokens: &crate::TokenCaches,
+        target: Option<&str>,
+        body: &str,
+    ) -> HttpOutcome {
+        pollster::block_on(dispatch_http(
+            backend,
+            &DispatchContext::new(tokens),
+            target,
+            body,
+            signed_auth(),
+        ))
     }
 
     #[test]
@@ -896,7 +996,7 @@ mod tests {
     #[test]
     fn http_classifies_every_unimplemented_operation_as_a_skip() {
         let backend = Storage::memory().unwrap();
-        // The unimplemented surface the plan enumerates, plus the streams ops.
+        // The unimplemented surface listed below, plus the streams ops.
         for op in [
             "UpdateTimeToLive",
             "DescribeTimeToLive",
@@ -905,7 +1005,6 @@ mod tests {
             "UntagResource",
             "ListTagsOfResource",
             "DescribeLimits",
-            "ExecuteStatement",
             "ListStreams",
         ] {
             let target = format!("DynamoDB_20120810.{op}");
@@ -926,8 +1025,10 @@ mod tests {
         // rejected here exactly as it is over the native server.
         let backend = Storage::memory().unwrap();
         let unsigned = crate::auth_material::AuthMaterial::default();
+        let tokens = crate::TokenCaches::new();
         let out = pollster::block_on(dispatch_http(
             &backend,
+            &DispatchContext::new(&tokens),
             Some("DynamoDB_20120810.ListTables"),
             "{}",
             unsigned,
@@ -945,8 +1046,10 @@ mod tests {
         // DynamoDB resolves the operation first, so an unsigned request to an
         // unknown target reports the unknown operation, not the missing token.
         let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
         let out = pollster::block_on(dispatch_http(
             &backend,
+            &DispatchContext::new(&tokens),
             Some("DynamoDB_20120810.NoSuchOp"),
             "{}",
             crate::auth_material::AuthMaterial::default(),
@@ -975,6 +1078,736 @@ mod tests {
             out.body
         );
         assert!(!is_unsupported_fault(out.status, &out.body));
+    }
+
+    // --- PartiQL ------------------------------------------------------------
+    //
+    // The executor itself is covered by tests/partiql.rs; these pin that the
+    // three statements route through this dispatch and keep their envelopes.
+
+    fn partiql(backend: &Storage, statement: &str) -> std::result::Result<String, String> {
+        let body = serde_json::json!({ "Statement": statement }).to_string();
+        run(backend, "ExecuteStatement", &body)
+    }
+
+    fn items(response: &str) -> Vec<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(response).unwrap()["Items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn error_type(err: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(err).unwrap()["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn message(err: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(err).unwrap()["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn execute_statement_inserts_then_selects() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 3}",
+        )
+        .unwrap();
+
+        let found = partiql(
+            &backend,
+            "SELECT * FROM \"Music\" WHERE artist = 'a' AND song = 's1'",
+        )
+        .unwrap();
+        assert_eq!(items(&found)[0]["plays"]["N"], "3");
+    }
+
+    #[test]
+    fn execute_statement_insert_is_not_an_upsert() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        let stmt = "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}";
+        partiql(&backend, stmt).unwrap();
+
+        let err = partiql(&backend, stmt).unwrap_err();
+        assert!(error_type(&err).contains("DuplicateItemException"), "{err}");
+    }
+
+    #[test]
+    fn execute_statement_update_on_a_missing_key_fails_the_condition() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let err = partiql(
+            &backend,
+            "UPDATE \"Music\" SET plays = 1 WHERE artist = 'nobody' AND song = 's1'",
+        )
+        .unwrap_err();
+        assert!(
+            error_type(&err).contains("ConditionalCheckFailedException"),
+            "{err}"
+        );
+        assert_eq!(message(&err), "The conditional request failed");
+    }
+
+    #[test]
+    fn execute_statement_delete_returning_all_old_hits_and_misses() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'genre': 'rock'}",
+        )
+        .unwrap();
+
+        let hit = partiql(
+            &backend,
+            "DELETE FROM \"Music\" WHERE artist = 'a' AND song = 's1' RETURNING ALL OLD *",
+        )
+        .unwrap();
+        assert_eq!(items(&hit)[0]["genre"]["S"], "rock");
+
+        // A missing target still answers with a present but empty Items array.
+        let miss = partiql(
+            &backend,
+            "DELETE FROM \"Music\" WHERE artist = 'a' AND song = 's1' RETURNING ALL OLD *",
+        )
+        .unwrap();
+        assert!(items(&miss).is_empty());
+        assert!(miss.contains("\"Items\""));
+    }
+
+    #[test]
+    fn execute_statement_rejects_the_returning_variants_delete_does_not_allow() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        for variant in ["MODIFIED OLD *", "ALL NEW *", "MODIFIED NEW *"] {
+            let err = partiql(
+                &backend,
+                &format!(
+                    "DELETE FROM \"Music\" WHERE artist = 'a' AND song = 's1' RETURNING {variant}"
+                ),
+            )
+            .unwrap_err();
+            assert_eq!(
+                message(&err),
+                format!(
+                    "Invalid returning clause: RETURNING {variant}. \
+                     Only RETURNING ALL OLD * is allowed in DELETE statements."
+                )
+            );
+            assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+        }
+    }
+
+    #[test]
+    fn execute_statement_modified_projections_carry_only_what_changed() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', \
+             'profile': {'sub': 'old', 'sib': 'keep'}, 'data': 'gone'}",
+        )
+        .unwrap();
+
+        // A nested SET projects the changed leaf under its parent, not the
+        // whole top-level attribute, and never the key.
+        let nested = partiql(
+            &backend,
+            "UPDATE \"Music\" SET profile.sub = 'new' \
+             WHERE artist = 'a' AND song = 's1' RETURNING MODIFIED NEW *",
+        )
+        .unwrap();
+        let projected = &items(&nested)[0];
+        assert_eq!(projected["profile"]["M"]["sub"]["S"], "new");
+        assert!(projected["profile"]["M"].get("sib").is_none());
+        assert!(projected.get("artist").is_none());
+
+        // A REMOVE has no new value to project, so there is no row at all.
+        let removed = partiql(
+            &backend,
+            "UPDATE \"Music\" REMOVE data WHERE artist = 'a' AND song = 's1' \
+             RETURNING MODIFIED NEW *",
+        )
+        .unwrap();
+        assert!(items(&removed).is_empty());
+    }
+
+    #[test]
+    fn execute_statement_reports_capacity_by_statement_kind() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let insert = run(
+            &backend,
+            "ExecuteStatement",
+            &serde_json::json!({
+                "Statement": "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}",
+                "ReturnConsumedCapacity": "TOTAL",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let write: serde_json::Value = serde_json::from_str(&insert).unwrap();
+        assert_eq!(write["ConsumedCapacity"]["TableName"], "Music");
+        assert!(write["ConsumedCapacity"]["CapacityUnits"].as_f64().unwrap() > 0.0);
+
+        let select = run(
+            &backend,
+            "ExecuteStatement",
+            &serde_json::json!({
+                "Statement": "SELECT * FROM \"Music\" WHERE artist = 'a' AND song = 's1'",
+                "ReturnConsumedCapacity": "TOTAL",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let read: serde_json::Value = serde_json::from_str(&select).unwrap();
+        // An eventually consistent read is half a unit; a write is a whole one.
+        assert_eq!(read["ConsumedCapacity"]["CapacityUnits"], 0.5);
+    }
+
+    #[test]
+    fn execute_statement_surfaces_parse_and_table_errors() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let syntax = partiql(&backend, "NOT A STATEMENT").unwrap_err();
+        assert!(
+            error_type(&syntax).ends_with("ValidationException"),
+            "{syntax}"
+        );
+        assert!(
+            message(&syntax).starts_with("Statement wasn't well formed, can't be processed: "),
+            "{syntax}"
+        );
+
+        let absent = partiql(&backend, "SELECT * FROM \"Absent\" WHERE artist = 'a'").unwrap_err();
+        assert!(
+            error_type(&absent).contains("ResourceNotFoundException"),
+            "{absent}"
+        );
+        // A real API error must not be mistaken for an unimplemented operation.
+        assert!(!is_unsupported_fault(400, &absent));
+    }
+
+    #[test]
+    fn batch_execute_statement_reports_failures_per_statement() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let batch = serde_json::json!({
+            "Statements": [
+                { "Statement": "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}" },
+                { "Statement": "NOT A STATEMENT" },
+            ]
+        })
+        .to_string();
+        let resp = run(&backend, "BatchExecuteStatement", &batch).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+        // The whole batch succeeds; only the member carries the failure, with
+        // the short-form code.
+        assert_eq!(v["Responses"][0]["TableName"], "Music");
+        assert_eq!(v["Responses"][1]["Error"]["Code"], "ValidationError");
+        assert!(v["Responses"][1].get("TableName").is_none());
+    }
+
+    #[test]
+    fn batch_execute_statement_rejects_an_empty_statement_list() {
+        let backend = Storage::memory().unwrap();
+        let err = run(&backend, "BatchExecuteStatement", r#"{"Statements":[]}"#).unwrap_err();
+        assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+    }
+
+    #[test]
+    fn batch_execute_statement_honours_a_member_returning_clause() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 1}",
+        )
+        .unwrap();
+
+        let batch = serde_json::json!({
+            "Statements": [
+                { "Statement": "UPDATE \"Music\" SET plays = 2 \
+                    WHERE artist = 'a' AND song = 's1' RETURNING MODIFIED NEW *" },
+            ]
+        })
+        .to_string();
+        let resp = run(&backend, "BatchExecuteStatement", &batch).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["Responses"][0]["Item"]["plays"]["N"], "2");
+        assert!(v["Responses"][0]["Item"].get("artist").is_none());
+    }
+
+    // --- ExecuteTransaction -------------------------------------------------
+
+    fn transaction(statements: &[&str], token: Option<&str>) -> String {
+        let members: Vec<_> = statements
+            .iter()
+            .map(|s| serde_json::json!({ "Statement": s }))
+            .collect();
+        let mut body = serde_json::json!({ "TransactStatements": members });
+        if let Some(token) = token {
+            body["ClientRequestToken"] = serde_json::json!(token);
+        }
+        body.to_string()
+    }
+
+    fn plays(backend: &Storage, song: &str) -> Option<i64> {
+        let resp = partiql(
+            backend,
+            &format!("SELECT * FROM \"Music\" WHERE artist = 'a' AND song = '{song}'"),
+        )
+        .unwrap();
+        items(&resp)
+            .first()
+            .and_then(|i| i["plays"]["N"].as_str())
+            .and_then(|n| n.parse().ok())
+    }
+
+    #[test]
+    fn execute_transaction_applies_every_statement() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 1}",
+        )
+        .unwrap();
+
+        run(
+            &backend,
+            "ExecuteTransaction",
+            &transaction(
+                &[
+                    "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's2', 'plays': 9}",
+                    "UPDATE \"Music\" SET plays = 2 WHERE artist = 'a' AND song = 's1'",
+                ],
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(plays(&backend, "s1"), Some(2));
+        assert_eq!(plays(&backend, "s2"), Some(9));
+    }
+
+    #[test]
+    fn execute_transaction_rolls_back_every_statement_on_failure() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'taken'}",
+        )
+        .unwrap();
+
+        let err = run(
+            &backend,
+            "ExecuteTransaction",
+            &transaction(
+                &[
+                    "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'fresh', 'plays': 1}",
+                    "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'taken'}",
+                ],
+                None,
+            ),
+        )
+        .unwrap_err();
+
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            v["__type"]
+                .as_str()
+                .unwrap()
+                .contains("TransactionCanceledException"),
+            "{err}"
+        );
+        let reasons = v["CancellationReasons"].as_array().unwrap();
+        assert_eq!(reasons[0]["Code"], "None");
+        assert_eq!(reasons[1]["Code"], "DuplicateItem");
+
+        // The first statement's write must not have survived the rollback.
+        assert_eq!(plays(&backend, "fresh"), None);
+    }
+
+    #[test]
+    fn execute_transaction_rejects_a_returning_member_without_looking_unsupported() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let err = run(
+            &backend,
+            "ExecuteTransaction",
+            &transaction(
+                &["DELETE FROM \"Music\" WHERE artist = 'a' AND song = 's1' RETURNING ALL OLD *"],
+                None,
+            ),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            message(&err),
+            "Validation failed in TransactStatements[0]: \
+             RETURNING clause is not supported in ExecuteTransaction."
+        );
+        assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+
+        // DynamoDB's own wording carries "is not supported", which is also one
+        // of the needles `is_unsupported_fault` matches on, so this genuine
+        // rejection reads as an unimplemented operation to that classifier.
+        // Harmless while every caller asserts the message directly, and pinned
+        // here because it stops being harmless the moment one probes instead.
+        // The message cannot be reworded away: it is what AWS returns.
+        assert!(is_unsupported_fault(400, &err), "{err}");
+    }
+
+    #[test]
+    fn execute_transaction_rejects_an_empty_statement_list() {
+        let backend = Storage::memory().unwrap();
+        let err = run(&backend, "ExecuteTransaction", &transaction(&[], None)).unwrap_err();
+        assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+    }
+
+    #[test]
+    fn execute_transaction_replays_a_repeated_token_without_reapplying() {
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 0}",
+        )
+        .unwrap();
+
+        let bump = transaction(
+            &["UPDATE \"Music\" SET plays = plays + 1 WHERE artist = 'a' AND song = 's1'"],
+            Some("same-token"),
+        );
+        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
+        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
+
+        assert_eq!(plays(&backend, "s1"), Some(1));
+    }
+
+    #[test]
+    fn execute_transaction_reuses_a_token_only_for_the_same_statements() {
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        run_with(
+            &backend,
+            &tokens,
+            "ExecuteTransaction",
+            &transaction(
+                &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}"],
+                Some("same-token"),
+            ),
+        )
+        .unwrap();
+
+        let err = run_with(
+            &backend,
+            &tokens,
+            "ExecuteTransaction",
+            &transaction(
+                &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's2'}"],
+                Some("same-token"),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            error_type(&err).contains("IdempotentParameterMismatchException"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn execute_transaction_replays_when_only_the_capacity_mode_differs() {
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 0}",
+        )
+        .unwrap();
+
+        let statement = "UPDATE \"Music\" SET plays = plays + 1 WHERE artist = 'a' AND song = 's1'";
+        let with_mode = |mode: Option<&str>| {
+            let mut body = serde_json::json!({
+                "TransactStatements": [{ "Statement": statement }],
+                "ClientRequestToken": "same-token",
+            });
+            if let Some(mode) = mode {
+                body["ReturnConsumedCapacity"] = serde_json::json!(mode);
+            }
+            body.to_string()
+        };
+
+        let first = run_with(&backend, &tokens, "ExecuteTransaction", &with_mode(None)).unwrap();
+        let replay = run_with(
+            &backend,
+            &tokens,
+            "ExecuteTransaction",
+            &with_mode(Some("TOTAL")),
+        )
+        .unwrap();
+
+        assert_eq!(plays(&backend, "s1"), Some(1));
+        // Each call honours its own mode: the first asked for nothing and gets
+        // nothing back, the replay asks for TOTAL and gets it.
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert!(first.get("ConsumedCapacity").is_none(), "{first}");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay["ConsumedCapacity"][0]["TableName"], "Music");
+    }
+
+    #[test]
+    fn execute_transaction_replays_the_first_calls_responses() {
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 5}",
+        )
+        .unwrap();
+
+        // A SELECT member fills Responses[i].Item, so the replay has a body to
+        // carry over rather than the empty one a write leaves.
+        let read = transaction(
+            &["SELECT * FROM \"Music\" WHERE artist = 'a' AND song = 's1'"],
+            Some("read-token"),
+        );
+        let first = run_with(&backend, &tokens, "ExecuteTransaction", &read).unwrap();
+        let replay = run_with(&backend, &tokens, "ExecuteTransaction", &read).unwrap();
+
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(first["Responses"][0]["Item"]["plays"]["N"], "5");
+        assert_eq!(first["Responses"], replay["Responses"]);
+    }
+
+    #[test]
+    fn execute_transaction_frees_a_token_whose_transaction_was_cancelled() {
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'taken'}",
+        )
+        .unwrap();
+
+        let cancelled = run_with(
+            &backend,
+            &tokens,
+            "ExecuteTransaction",
+            &transaction(
+                &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'taken'}"],
+                Some("retry-token"),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            error_type(&cancelled).contains("TransactionCanceledException"),
+            "{cancelled}"
+        );
+
+        // A cancelled transaction leaves its token reusable: the retry runs
+        // rather than replaying the failure or reporting a mismatch.
+        run_with(
+            &backend,
+            &tokens,
+            "ExecuteTransaction",
+            &transaction(
+                &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'fresh', 'plays': 1}"],
+                Some("retry-token"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(plays(&backend, "fresh"), Some(1));
+    }
+
+    #[test]
+    fn http_carries_idempotency_across_requests() {
+        // The conformance suite drives dispatch_http, so the caches have to
+        // reach that binding too, not just the execute() one.
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        http_with(
+            &backend,
+            &tokens,
+            Some("DynamoDB_20120810.CreateTable"),
+            CREATE_MUSIC,
+        );
+
+        // A statement that cannot succeed twice, so a second application shows
+        // up as a cancellation rather than needing a counter to spot it.
+        let once = transaction(
+            &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'once'}"],
+            Some("http-token"),
+        );
+        for _ in 0..2 {
+            let out = http_with(
+                &backend,
+                &tokens,
+                Some("DynamoDB_20120810.ExecuteTransaction"),
+                &once,
+            );
+            assert_eq!(out.status, 200, "{}", out.body);
+            assert!(!is_unsupported_fault(out.status, &out.body));
+        }
+    }
+
+    #[test]
+    fn execute_transaction_without_a_token_applies_every_time() {
+        let backend = Storage::memory().unwrap();
+        let tokens = crate::TokenCaches::new();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        partiql(
+            &backend,
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'plays': 0}",
+        )
+        .unwrap();
+
+        let bump = transaction(
+            &["UPDATE \"Music\" SET plays = plays + 1 WHERE artist = 'a' AND song = 's1'"],
+            None,
+        );
+        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
+        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
+
+        assert_eq!(plays(&backend, "s1"), Some(2));
+    }
+
+    #[test]
+    fn execute_transaction_rejects_an_overlong_token() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        let token = "x".repeat(37);
+        let err = run(
+            &backend,
+            "ExecuteTransaction",
+            &transaction(
+                &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}"],
+                Some(&token),
+            ),
+        )
+        .unwrap_err();
+        assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+        assert!(message(&err).contains("clientRequestToken"), "{err}");
+    }
+
+    #[test]
+    fn http_serves_partiql_and_still_refuses_transact_write_items() {
+        let backend = Storage::memory().unwrap();
+        http(
+            &backend,
+            Some("DynamoDB_20120810.CreateTable"),
+            CREATE_MUSIC,
+        );
+
+        for (target, body) in [
+            (
+                "DynamoDB_20120810.ExecuteStatement",
+                serde_json::json!({
+                    "Statement": "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}"
+                })
+                .to_string(),
+            ),
+            (
+                "DynamoDB_20120810.BatchExecuteStatement",
+                serde_json::json!({
+                    "Statements": [{
+                        "Statement": "SELECT * FROM \"Music\" WHERE artist = 'a' AND song = 's1'"
+                    }]
+                })
+                .to_string(),
+            ),
+        ] {
+            let out = http(&backend, Some(target), &body);
+            assert_eq!(out.status, 200, "{target}: {}", out.body);
+            assert!(!is_unsupported_fault(out.status, &out.body));
+        }
+
+        // The rest of the transactional surface is still out of scope, and must
+        // keep reaching the suite as a skip rather than a failure.
+        let refused = http(&backend, Some("DynamoDB_20120810.TransactWriteItems"), "{}");
+        assert_eq!(refused.status, 501);
+        assert!(is_unsupported_fault(refused.status, &refused.body));
+    }
+
+    #[test]
+    fn execute_statement_pages_a_select_through_next_token() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for song in ["s1", "s2", "s3"] {
+            partiql(
+                &backend,
+                &format!("INSERT INTO \"Music\" VALUE {{'artist': 'a', 'song': '{song}'}}"),
+            )
+            .unwrap();
+        }
+
+        let mut seen = 0;
+        let mut token: Option<String> = None;
+        loop {
+            let mut body = serde_json::json!({
+                "Statement": "SELECT * FROM \"Music\" WHERE artist = 'a'",
+                "Limit": 2,
+            });
+            if let Some(token) = &token {
+                body["NextToken"] = serde_json::json!(token);
+            }
+            let resp = run(&backend, "ExecuteStatement", &body.to_string()).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            seen += v["Items"].as_array().unwrap().len();
+            token = v["NextToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+            assert!(seen <= 3, "pagination did not terminate");
+        }
+        assert_eq!(seen, 3, "every row comes back exactly once");
+    }
+
+    #[test]
+    fn a_partiql_rejection_is_not_mistaken_for_an_unimplemented_operation() {
+        // Several PartiQL rejections sit one word away from the conformance
+        // suite's unsupported-fault needles. If one ever matched, a real
+        // failure would be scored as scope instead.
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+
+        for statement in [
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'tags': [?]}",
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'meta': {'k': ?}}",
+            "INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1', 'set': << 1, 'a' >>}",
+        ] {
+            let err = partiql(&backend, statement).unwrap_err();
+            assert!(
+                !is_unsupported_fault(400, &err),
+                "would be scored as unimplemented: {err}"
+            );
+        }
     }
 
     #[test]

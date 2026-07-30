@@ -48,7 +48,8 @@ pub enum BackendError {
     /// A capability the active backend does not implement (for example streams,
     /// TTL, or the cross-item `TransactWriteItems` action on the wasm backend).
     /// Carries a static tag so callers can distinguish which capability was
-    /// refused. Surfaces as an `InternalServerError` through
+    /// refused. Surfaces as `DynoxideError::UnsupportedCapability` (HTTP 501
+    /// with the `UnsupportedOperation` envelope) through
     /// `From<BackendError> for DynoxideError`.
     #[error("backend: operation not supported: {capability}")]
     Unsupported {

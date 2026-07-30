@@ -1,6 +1,6 @@
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
-use crate::storage_backend::StorageBackend;
+use crate::storage_backend::{BackendError, StorageBackend};
 use crate::streams;
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, LocalSecondaryIndex,
@@ -219,6 +219,22 @@ pub async fn execute<S: StorageBackend>(
         .transpose()
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
     let deletion_protection = request.deletion_protection_enabled.unwrap_or(false);
+
+    // Refuse capability gaps before creating anything. A refusal after
+    // `insert_table_metadata` would leave the table half-created: the client
+    // sees an error, retries, and finds ResourceInUseException where the real
+    // answer is that the backend cannot honour the request at all.
+    if let Some(ref spec) = request.stream_specification {
+        if spec.stream_enabled && !storage.supports_streams() {
+            return Err(BackendError::Unsupported {
+                capability: "streams",
+            }
+            .into());
+        }
+    }
+    if request.tags.as_ref().is_some_and(|tags| !tags.is_empty()) && !storage.supports_tags() {
+        return Err(BackendError::Unsupported { capability: "tags" }.into());
+    }
 
     let billing_mode_str = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
     storage

@@ -18,8 +18,9 @@
 //!
 //! # Preview status
 //!
-//! This backend is not verified by the conformance suite. It covers the CRUD,
-//! query, scan, and GSI/LSI surface. Capabilities it does not provide - streams
+//! This backend covers the CRUD, query, scan, GSI/LSI, and PartiQL surface, and
+//! is verified against the conformance suite for those. Capabilities it does
+//! not provide - streams
 //! (delivery mechanism still to be designed), TTL (which needs a background
 //! expiry sweep the browser does not drive), the cross-item `TransactWriteItems`
 //! action, tag and table-setting updates, stats, and bulk import - return the
@@ -424,6 +425,18 @@ fn unsupported(capability: &'static str) -> BackendError {
 impl StorageBackend for WasmBridgeBackend {
     fn clock(&self) -> &dyn Clock {
         self.clock.as_ref()
+    }
+
+    // Streams await a delivery design and tags are not stored, so the actions
+    // refuse requests needing either before they mutate anything. The
+    // `unsupported(..)` returns on the methods below then only guard paths no
+    // action should reach.
+    fn supports_streams(&self) -> bool {
+        false
+    }
+
+    fn supports_tags(&self) -> bool {
+        false
     }
 
     // --- Table metadata --------------------------------------------------

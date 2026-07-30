@@ -531,35 +531,26 @@ pub async fn execute<S: StorageBackend>(
     })?;
 
     // Build sk SQL conditions
-    let mut sk_sql_parts = Vec::new();
-    let mut sk_param_values = Vec::new();
-
-    if let Some(ref sk_cond) = resolved.sk_condition {
-        // Validate sk name matches effective sort key
-        if let Some(ref eff_sk) = effective_sk {
-            if sk_cond.sk_name() != eff_sk {
-                return Err(DynoxideError::ValidationException(format!(
-                    "Query condition missed key schema element: {eff_sk}"
-                )));
-            }
-        } else {
-            return Err(DynoxideError::ValidationException(
-                "Query filter contains a sort key condition but the table has no sort key"
-                    .to_string(),
-            ));
-        }
-
-        let conditions = sk_cond.to_sql_conditions();
-        for (i, (op, val)) in conditions.iter().enumerate() {
-            let param_idx = i + 2; // pk is ?1, sk params start at ?2
-            if op == "LIKE" {
-                sk_sql_parts.push(format!("AND sk LIKE ?{param_idx} ESCAPE '\\'"));
+    let (sk_condition_sql, sk_param_values) = match resolved.sk_condition {
+        Some(ref sk_cond) => {
+            // Validate sk name matches effective sort key
+            if let Some(ref eff_sk) = effective_sk {
+                if sk_cond.sk_name() != eff_sk {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "Query condition missed key schema element: {eff_sk}"
+                    )));
+                }
             } else {
-                sk_sql_parts.push(format!("AND sk {op} ?{param_idx}"));
+                return Err(DynoxideError::ValidationException(
+                    "Query filter contains a sort key condition but the table has no sort key"
+                        .to_string(),
+                ));
             }
-            sk_param_values.push(val.clone());
+
+            expressions::key_condition::sk_conditions_to_sql(std::slice::from_ref(sk_cond))
         }
-    }
+        None => (None, Vec::new()),
+    };
 
     // ---- Validate QueryFilter/FilterExpression don't reference primary key attrs ----
     // Collect effective key attribute names
@@ -717,13 +708,6 @@ pub async fn execute<S: StorageBackend>(
         }
     } else {
         false
-    };
-
-    // Combine sk conditions into a single SQL fragment
-    let sk_condition_sql = if sk_sql_parts.is_empty() {
-        None
-    } else {
-        Some(sk_sql_parts.join(" "))
     };
 
     let fetch_limit = request.limit;

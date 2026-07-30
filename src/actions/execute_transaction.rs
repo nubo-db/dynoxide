@@ -63,6 +63,12 @@ pub async fn execute<S: StorageBackend>(
     // Parse all statements before executing any, to fail fast on syntax errors
     let mut parsed = Vec::with_capacity(statements.len());
     for (index, stmt) in statements.iter().enumerate() {
+        // A COUNT projection is rejected before parsing, at the same top level
+        // as a parse error but with the bare message captured on
+        // ExecuteStatement, not the wasn't-well-formed wrapper.
+        if let Some(msg) = partiql::parser::count_projection_rejection(&stmt.statement) {
+            return Err(DynoxideError::ValidationException(msg));
+        }
         let ast = partiql::parser::parse(&stmt.statement).map_err(|e| {
             DynoxideError::ValidationException(format!(
                 "Statement wasn't well formed, can't be processed: {e}"

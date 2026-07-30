@@ -36,6 +36,27 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
+    // Limit is checked before the statement is parsed. A zero limit would
+    // otherwise read nothing and mint no token, silently ending a paginated
+    // walk. The wording follows Scan's shape (value kept, lowercase 'limit'),
+    // not Query's, matching what ExecuteStatement itself returns (captured
+    // eu-west-2, 2026-07-29).
+    if request.limit == Some(0) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(
+                "Value '0' at 'limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+            ),
+        ));
+    }
+
+    // A COUNT projection is rejected before parsing, with DynamoDB's bare
+    // message rather than the wasn't-well-formed wrapper the parse errors
+    // below carry. ExecuteStatement is the captured surface for this shape.
+    if let Some(msg) = partiql::parser::count_projection_rejection(&request.statement) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
     let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
         DynoxideError::ValidationException(format!(
             "Statement wasn't well formed, can't be processed: {e}"
@@ -43,8 +64,20 @@ pub async fn execute<S: StorageBackend>(
     })?;
 
     let params = request.parameters.unwrap_or_default();
-    let (items, size) =
-        partiql::executor::execute_measured(storage, &stmt, &params, request.limit).await?;
+    let page = partiql::executor::execute_page(
+        storage,
+        &stmt,
+        &params,
+        request.limit,
+        request.next_token.as_deref(),
+    )
+    .await?;
+    let partiql::executor::StatementPage {
+        items,
+        size,
+        next_token,
+        ..
+    } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
     // unlike some emulators that omit it. A SELECT is charged read units (an
@@ -65,7 +98,7 @@ pub async fn execute<S: StorageBackend>(
 
     Ok(ExecuteStatementResponse {
         items,
-        next_token: None,
+        next_token,
         consumed_capacity,
     })
 }

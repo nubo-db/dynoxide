@@ -2,7 +2,7 @@
 
 The [dynoxide](https://github.com/nubo-db/dynoxide) DynamoDB-compatible engine, compiled to WebAssembly and packaged to run in the browser. It carries the engine `.wasm`, the official [@sqlite.org/sqlite-wasm](https://github.com/sqlite/sqlite-wasm) SQLite build, the bundled Web Worker, and an `EngineClient` that drives them, so you can run real DynamoDB operations client-side against a SQLite-backed store persisted to OPFS.
 
-It's a preview. The wasm build is not run against the conformance suite that backs dynoxide's native build, so treat its behaviour as illustrative rather than authoritative.
+It's a preview. The wasm build is scored by the same conformance suite that backs dynoxide's native build and passes every test it implements (865 passed, 0 failed, 133 skipped, measured locally on 28 July 2026; the published row refreshes with the next suite run), but it leaves several operations unimplemented - `TransactWriteItems`, streams, tags and TTL - so it is not yet a like-for-like replacement for the native engine.
 
 ## Install
 
@@ -10,7 +10,7 @@ It's a preview. The wasm build is not run against the conformance suite that bac
 npm install @dynoxide/wasm-engine
 ```
 
-This is a preview build: the version carries `-preview` and the wasm path is not run against the conformance suite. `npm install @dynoxide/wasm-engine` gets the current preview; pin the exact version (`0.11.1-preview`) to lock to one.
+This is a preview build: the version carries `-preview`, and while the wasm path passes every conformance test it implements, several operations are still missing. `npm install @dynoxide/wasm-engine` gets the current preview; pin the exact version (`0.11.1-preview`) to lock to one.
 
 ## Quick start
 

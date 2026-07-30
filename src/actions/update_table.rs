@@ -280,6 +280,17 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Refuse a stream-specification change on a backend without streams before
+    // any mutation below (GSI creates, metadata writes) can land. Ordered after
+    // the AWS-pinned validations above so requests real DynamoDB would reject
+    // keep their pinned errors; only a request AWS would accept reaches this.
+    if request.stream_specification.is_some() && !storage.supports_streams() {
+        return Err(crate::storage_backend::BackendError::Unsupported {
+            capability: "streams",
+        }
+        .into());
+    }
+
     // Parse existing GSI definitions
     let mut current_gsis: Vec<GlobalSecondaryIndex> = meta
         .gsi_definitions

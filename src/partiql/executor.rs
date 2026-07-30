@@ -3,6 +3,7 @@
 //! Maps parsed PartiQL statements to internal DynamoDB operations.
 
 use crate::errors::{DynoxideError, Result};
+use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
     CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
 };
@@ -14,8 +15,9 @@ use std::collections::HashMap;
 ///
 /// Returns `Some(items)` for SELECT (may be empty) and for a DELETE or UPDATE
 /// carrying a `RETURNING` clause (the deleted item or the requested projection);
-/// `None` for a write with no `RETURNING` clause. An optional `limit` restricts
-/// how many items a SELECT returns.
+/// `None` for a write with no `RETURNING` clause. An optional `limit` bounds how
+/// many rows a SELECT evaluates (reads), not how many it returns, matching
+/// DynamoDB's `Limit` and the Query/Scan semantics.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     stmt: &Statement,
@@ -35,26 +37,68 @@ pub async fn execute_measured<S: StorageBackend>(
     parameters: &[AttributeValue],
     limit: Option<usize>,
 ) -> Result<(Option<Vec<Item>>, usize)> {
+    let page = execute_page(storage, stmt, parameters, limit, None).await?;
+    Ok((page.items, page.size))
+}
+
+/// One page of a statement's result.
+///
+/// Only a `SELECT` paginates. Every other statement returns the whole result
+/// and no continuation token.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct StatementPage {
+    /// The rows this page carries, with the same `Some`/`None` meaning as
+    /// [`execute`].
+    pub items: Option<Vec<Item>>,
+    /// Total item bytes touched, for `ConsumedCapacity`.
+    pub size: usize,
+    /// Where to resume, when more rows matched than this page returned.
+    pub next_token: Option<String>,
+}
+
+/// Like [`execute_measured`], but resumable.
+///
+/// `next_token` continues a previous page; the returned token, when present,
+/// continues this one. A statement without a `Limit` returns every matching row
+/// and no token.
+pub async fn execute_page<S: StorageBackend>(
+    storage: &S,
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    limit: Option<usize>,
+    next_token: Option<&str>,
+) -> Result<StatementPage> {
+    if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
+        return Err(DynoxideError::ValidationException(
+            "NextToken is only valid on a SELECT statement".to_string(),
+        ));
+    }
     match stmt {
         Statement::Select {
             table_name,
             projections,
             where_clause,
         } => {
-            let items = execute_select(
+            let (items, token) = execute_select(
                 storage,
                 table_name,
                 projections,
                 where_clause.as_ref(),
                 parameters,
                 limit,
+                next_token,
             )
             .await?;
             let size = items
                 .as_ref()
                 .map(|rows| rows.iter().map(crate::types::item_size).sum())
                 .unwrap_or(0);
-            Ok((items, size))
+            Ok(StatementPage {
+                items,
+                size,
+                next_token: token,
+            })
         }
         Statement::Insert {
             table_name,
@@ -63,7 +107,11 @@ pub async fn execute_measured<S: StorageBackend>(
         } => {
             let size =
                 execute_insert(storage, table_name, item, parameters, *if_not_exists).await?;
-            Ok((None, size))
+            Ok(StatementPage {
+                items: None,
+                size,
+                ..Default::default()
+            })
         }
         Statement::Update {
             table_name,
@@ -93,7 +141,11 @@ pub async fn execute_measured<S: StorageBackend>(
                     vec![item]
                 }
             });
-            Ok((items, size))
+            Ok(StatementPage {
+                items,
+                size,
+                ..Default::default()
+            })
         }
         Statement::Delete {
             table_name,
@@ -122,7 +174,11 @@ pub async fn execute_measured<S: StorageBackend>(
             } else {
                 None
             };
-            Ok((items, size))
+            Ok(StatementPage {
+                items,
+                size,
+                ..Default::default()
+            })
         }
     }
 }
@@ -146,44 +202,46 @@ async fn execute_select<S: StorageBackend>(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     limit: Option<usize>,
-) -> Result<Option<Vec<Item>>> {
+    next_token: Option<&str>,
+) -> Result<(Option<Vec<Item>>, Option<String>)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
-    // Check for COUNT(*) projection
-    if projections.len() == 1 && projections[0] == "COUNT(*)" {
-        let items = collect_matching_items(
-            storage,
-            table_name,
-            where_clause,
-            parameters,
-            &key_schema,
-            None,
-        )
-        .await?;
-        let count = items.len();
-        let mut result = HashMap::new();
-        result.insert("Count".to_string(), AttributeValue::N(count.to_string()));
-        return Ok(Some(vec![result]));
-    }
+    let fingerprint = statement_fingerprint(where_clause, parameters);
+    let cursor = next_token
+        .map(|token| decode_next_token(token, table_name, fingerprint))
+        .transpose()?;
 
-    let items = collect_matching_items(
+    let window = evaluate_window(
         storage,
         table_name,
         where_clause,
         parameters,
         &key_schema,
+        cursor.as_ref(),
         limit,
     )
     .await?;
 
-    // Apply projections
-    let items = if projections.is_empty() {
-        items
-    } else {
-        items
-            .into_iter()
-            .map(|item| {
+    // A continuation is owed whenever the read stopped because it hit the
+    // limit, whether or not anything in the window matched. That is why a page
+    // can come back short, or empty, and still carry a token.
+    let token = match (limit, &window.last_evaluated) {
+        (Some(lim), Some((pk, sk))) if window.evaluated >= lim => {
+            Some(encode_next_token(table_name, fingerprint, pk, sk))
+        }
+        _ => None,
+    };
+
+    // Projections run last, so one that drops the key cannot break the
+    // continuation: the cursor comes from the row as it was read.
+    let items = window
+        .matched
+        .into_iter()
+        .map(|item| {
+            if projections.is_empty() {
+                item
+            } else {
                 let mut projected = HashMap::new();
                 for proj in projections {
                     if let Some(val) = resolve_nested_path(&item, proj) {
@@ -191,61 +249,237 @@ async fn execute_select<S: StorageBackend>(
                     }
                 }
                 projected
-            })
-            .collect()
-    };
+            }
+        })
+        .collect();
 
-    Ok(Some(items))
+    Ok((Some(items), token))
 }
 
-/// Collect items that match the WHERE clause, optionally limited.
-async fn collect_matching_items<S: StorageBackend>(
+/// One read of the table: the rows that matched, plus where the read stopped.
+struct Window {
+    matched: Vec<Item>,
+    /// Keys of the last row read, matching or not. The cursor a continuation
+    /// resumes from, so no row is evaluated twice.
+    last_evaluated: Option<(String, String)>,
+    /// How many rows were read, matching or not.
+    evaluated: usize,
+}
+
+/// Read up to `limit` rows starting after `cursor`, and keep the ones the WHERE
+/// clause accepts.
+///
+/// `limit` bounds rows *read*, not rows returned, which is what DynamoDB means
+/// by `Limit` and what `Query` and `Scan` already do here. Pushing both the
+/// cursor and the bound into the backend keeps a page's cost proportional to
+/// the page rather than to the table.
+async fn evaluate_window<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     key_schema: &crate::actions::helpers::KeySchema,
+    cursor: Option<&Cursor>,
     limit: Option<usize>,
-) -> Result<Vec<Item>> {
-    // Try to use Query if the WHERE clause constrains the partition key
+) -> Result<Window> {
     let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, &key_schema.partition_key));
 
-    let items: Vec<Item> = if let Some(pk_cond) = pk_condition {
+    let rows: Vec<(String, String, String)> = if let Some(pk_cond) = pk_condition {
         let pk_val = resolve_value(&pk_cond.value, parameters)?;
         let pk_str = pk_val
             .to_key_string()
             .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
 
-        let rows = storage
-            .query_items(table_name, &pk_str, &Default::default())
-            .await?;
-
-        let iter = rows
-            .into_iter()
-            .filter_map(|(_, _, json)| serde_json::from_str::<Item>(&json).ok())
-            .filter(|item| matches_where(item, where_clause, parameters));
-
-        if let Some(lim) = limit {
-            iter.take(lim).collect()
-        } else {
-            iter.collect()
+        // Sort-key conditions that a key condition can express are pushed into
+        // the SQL, so `limit` counts rows within the key-condition range rather
+        // than rows in the whole partition, which is how DynamoDB paces a
+        // key-bound read. find_pk_condition only fires on a single-OR-group
+        // WHERE, so the group holding the sort-key conditions is unambiguous.
+        let sk_conditions = match (key_schema.sort_key.as_deref(), where_clause) {
+            (Some(sk_name), Some(wc)) => {
+                translate_sk_conditions(&wc.groups[0], sk_name, parameters)
+            }
+            _ => None,
         }
+        .unwrap_or_default();
+
+        // The shared helper numbers placeholders after the pk (?1), and the
+        // SQL builder appends the cursor's exclusive-start comparison after
+        // them, so a pushed-down range and a continuation compose the same
+        // way they do for Query.
+        let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
+        let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+
+        // Ascending, so this path and the scan below agree on row order and a
+        // continuation resumes the same way on either.
+        let params = crate::storage::QueryParams {
+            sk_condition: sk_condition_sql.as_deref(),
+            sk_params: &sk_params_refs,
+            forward: true,
+            limit,
+            exclusive_start_sk: cursor.map(|c| c.sk.as_str()),
+            ..Default::default()
+        };
+        storage.query_items(table_name, &pk_str, &params).await?
     } else {
-        let rows = storage.scan_items(table_name, &Default::default()).await?;
-
-        let iter = rows
-            .into_iter()
-            .filter_map(|(_, _, json)| serde_json::from_str::<Item>(&json).ok())
-            .filter(|item| matches_where(item, where_clause, parameters));
-
-        if let Some(lim) = limit {
-            iter.take(lim).collect()
-        } else {
-            iter.collect()
-        }
+        let params = crate::storage::ScanParams {
+            limit,
+            exclusive_start_pk: cursor.map(|c| c.pk.as_str()),
+            exclusive_start_sk: cursor.map(|c| c.sk.as_str()),
+            ..Default::default()
+        };
+        storage.scan_items(table_name, &params).await?
     };
 
-    Ok(items)
+    let evaluated = rows.len();
+    let last_evaluated = rows.last().map(|(pk, sk, _)| (pk.clone(), sk.clone()));
+    let matched = rows
+        .into_iter()
+        .filter_map(|(_, _, json)| serde_json::from_str::<Item>(&json).ok())
+        .filter(|item| matches_where(item, where_clause, parameters))
+        .collect();
+
+    Ok(Window {
+        matched,
+        last_evaluated,
+        evaluated,
+    })
+}
+
+/// Where a page stopped: the storage keys of its last row.
+struct Cursor {
+    pk: String,
+    sk: String,
+}
+
+/// A digest of the parts of a SELECT that determine its row walk: the WHERE
+/// clause and the parameters. Projections are left out deliberately, because
+/// they run after the read and do not move the cursor. Tokens are ephemeral
+/// and in-process, so the hash does not need to be stable across builds.
+fn statement_fingerprint(where_clause: Option<&WhereClause>, parameters: &[AttributeValue]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{where_clause:?}").hash(&mut hasher);
+    serde_json::to_string(parameters)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Callers should treat this as opaque, but it is only base64 and anyone can
+/// read it. It carries the last row's keys, which a projection may have been
+/// asked to strip from the items - the same trade `LastEvaluatedKey` makes -
+/// plus a fingerprint binding it to the statement that minted it. Nothing may
+/// be inferred from its shape; it is free to change.
+fn encode_next_token(table_name: &str, fingerprint: u64, pk: &str, sk: &str) -> String {
+    use base64::Engine;
+    let payload =
+        serde_json::json!({ "t": table_name, "f": fingerprint, "pk": pk, "sk": sk }).to_string();
+    base64::engine::general_purpose::STANDARD.encode(payload)
+}
+
+/// The rejection for a well-formed token that belongs to a different request.
+/// DynamoDB separates the two failure shapes: a token that cannot be read at
+/// all is "Invalid NextToken", while one minted by a different table,
+/// statement or parameters is "NextToken does not match request" (both
+/// captured eu-west-2, 2026-07-29).
+fn token_mismatch() -> DynoxideError {
+    DynoxideError::ValidationException("NextToken does not match request".to_string())
+}
+
+/// Decode a token, rejecting one minted against a different table or a
+/// different statement. A token is a position in one row walk; replayed into
+/// another table, another WHERE clause or other parameters it would silently
+/// skip rows, so a fingerprint mismatch is rejected the same way as a
+/// cross-table replay, with DynamoDB's mismatch message rather than the
+/// malformed-token one.
+fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<Cursor> {
+    use base64::Engine;
+    let invalid = || DynoxideError::ValidationException("Invalid NextToken".to_string());
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map_err(|_| invalid())?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| invalid())?;
+    if value["t"].as_str() != Some(table_name) || value["f"].as_u64() != Some(fingerprint) {
+        return Err(token_mismatch());
+    }
+    Ok(Cursor {
+        pk: value["pk"].as_str().ok_or_else(invalid)?.to_string(),
+        sk: value["sk"].as_str().ok_or_else(invalid)?.to_string(),
+    })
+}
+
+/// Translate a single AND-group's sort-key conditions into the resolved form
+/// the Query action feeds its SQL builder, so a pk-bound SELECT reads only the
+/// key-condition range and `limit` paces the way DynamoDB's does.
+///
+/// All or nothing: `None` unless every condition on the sort-key attribute is
+/// one a key condition can express (`=`, `<`, `<=`, `>`, `>=`, BETWEEN,
+/// begins_with) with operands that resolve to key-typed scalars. A partial
+/// translation would narrow the read incorrectly, whereas falling back to the
+/// unfiltered partition read stays correct because `matches_where` still runs
+/// on every row. Conditions on other attributes are ignored here and keep
+/// filtering post-read.
+fn translate_sk_conditions(
+    group: &[WhereCondition],
+    sk_name: &str,
+    parameters: &[AttributeValue],
+) -> Option<Vec<ResolvedSortKeyCondition>> {
+    let mut resolved = Vec::new();
+    for cond in group {
+        match cond {
+            WhereCondition::Comparison(c) if c.path == sk_name => {
+                let value = resolve_value(&c.value, parameters).ok()?;
+                value.to_key_string()?;
+                let sk = sk_name.to_string();
+                resolved.push(match c.op {
+                    CompOp::Eq => ResolvedSortKeyCondition::Eq(sk, value),
+                    CompOp::Lt => ResolvedSortKeyCondition::Lt(sk, value),
+                    CompOp::Le => ResolvedSortKeyCondition::Le(sk, value),
+                    CompOp::Gt => ResolvedSortKeyCondition::Gt(sk, value),
+                    CompOp::Ge => ResolvedSortKeyCondition::Ge(sk, value),
+                    // Not-equal is not a key condition; a range read cannot
+                    // express it.
+                    CompOp::Ne => return None,
+                });
+            }
+            WhereCondition::Between(path, lo, hi) if path == sk_name => {
+                let lo = resolve_value(lo, parameters).ok()?;
+                let hi = resolve_value(hi, parameters).ok()?;
+                lo.to_key_string()?;
+                hi.to_key_string()?;
+                resolved.push(ResolvedSortKeyCondition::Between(
+                    sk_name.to_string(),
+                    lo,
+                    hi,
+                ));
+            }
+            WhereCondition::BeginsWith(path, prefix) if path == sk_name => {
+                let prefix = resolve_value(prefix, parameters).ok()?;
+                prefix.to_key_string()?;
+                resolved.push(ResolvedSortKeyCondition::BeginsWith(
+                    sk_name.to_string(),
+                    prefix,
+                ));
+            }
+            // Any other condition shape on the sort key (IN, contains, negated
+            // begins_with, the existence checks) has no key-condition
+            // equivalent, so nothing at all is pushed down for the sort key.
+            WhereCondition::NotBeginsWith(path, _)
+            | WhereCondition::In(path, _)
+            | WhereCondition::Contains(path, _)
+            | WhereCondition::Exists(path)
+            | WhereCondition::NotExists(path)
+            | WhereCondition::IsMissing(path)
+            | WhereCondition::IsNotMissing(path)
+                if path == sk_name =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(resolved)
 }
 
 /// Find a partition key equality condition, searching across all OR groups.

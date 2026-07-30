@@ -4,11 +4,11 @@ Dynoxide compiles to `wasm32-unknown-unknown` and runs in the browser. The same 
 
 Both backends issue the same SQL. The native and wasm code share one set of query builders, so a query fixed on one is fixed on both.
 
-It's a preview. The wasm build is **not** run against the conformance suite that backs the native build, so its correctness rests on its own tests for now. A build made with `--features wasm-sqlite` exposes `dynoxide::WASM_PREVIEW` (`true`) so you can tell which path you're on.
+It's a preview. The wasm build is scored by the same conformance suite that backs the native build and passes every test it implements - 865 passed, 0 failed, 133 skipped, measured locally on 28 July 2026; the published row refreshes with the next suite run. The skip count is far higher than any other target because several operations are still missing, so read the row as "correct on what it implements" rather than as a like-for-like comparison. A build made with `--features wasm-sqlite` exposes `dynoxide::WASM_PREVIEW` (`true`) so you can tell which path you're on.
 
-**What works:** create and delete tables, describe and list them, update tables (add or delete a GSI, with existing rows backfilled into the new index, and change provisioned throughput, billing mode, table class, on-demand throughput, and deletion protection), put, get, delete, and update items, query, scan, and the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, same as native.
+**What works:** create and delete tables, describe and list them, update tables (add or delete a GSI, with existing rows backfilled into the new index, and change provisioned throughput, billing mode, table class, on-demand throughput, and deletion protection), put, get, delete, and update items, query, scan, the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), and PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`, including `RETURNING` and `ClientRequestToken` idempotency), over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, same as native. One caveat on PartiQL writes: they record a stream event when the table has a stream enabled, and the wasm build cannot enable one, so that path is unreachable rather than supported.
 
-**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `TransactWriteItems`, tags, table stats, and bulk import return a preview "not yet implemented" error.
+**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table. `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats, and bulk import return a preview "not yet implemented" error. Those four blocks are the whole of the conformance skip count.
 
 One fidelity note on what *is* supported: adding a GSI is synchronous. The new index is immediately `ACTIVE` and queryable, where AWS reports it `CREATING` with a background backfill that finishes before it becomes `ACTIVE`. The backfilled data matches; only the lifecycle is simplified.
 
@@ -23,6 +23,8 @@ The database lives in OPFS, reached through the official OPFS SAHPool VFS - a po
 Each database name gets its own OPFS directory and its own pool of file handles, so opening several databases on one page never makes them contend for a shared pool. Opening the *same* database a second time while another tab or client still holds it doesn't quietly fork to a private in-memory copy - that would split reads from writes and lose everything on reload - it fails with a clear "OPFS is busy" error instead. That state is recoverable, not sticky: once the holder releases the database, a later open of the same name succeeds rather than replaying the earlier failure. Closing a database relinquishes its access handles (without destroying the data) so another tab can pick it up.
 
 The wasm path runs in rollback-journal mode, not WAL. The SAHPool VFS doesn't implement WAL's shared-memory interface, so `PRAGMA journal_mode = WAL` is a no-op there and SQLite keeps a rollback journal. That costs no atomicity: the backend funnels every write through a single connection it serialises, so it never needs the concurrent readers WAL buys, and each commit flushes through the synchronous handle. (The native build enables WAL because it has the concurrency to gain from it.)
+
+`ClientRequestToken` idempotency runs the same ten-minute window as the native build: a same-token `ExecuteTransaction` replays inside it and re-executes after. What differs is where the cache lives. It belongs to the database handle, so each `open()` starts an empty one - re-opening the same name in the same Worker included - where the native server keeps one for as long as the process runs.
 
 Integers round-trip at full 64-bit width - a value past 2^53 crosses the bridge as a BigInt rather than losing precision as a JavaScript double. DynamoDB number attributes travel as text inside the item JSON regardless, so this only touches the engine's own integer columns.
 
@@ -39,12 +41,12 @@ npm run build:wasm
 
 | File | Size | What |
 |---|---|---|
-| `dynoxide_bg.wasm` | ~1.0 MB | the engine (release, wasm-opt) |
+| `dynoxide_bg.wasm` | ~1.2 MB | the engine (release, wasm-opt) |
 | `sqlite3.wasm` | ~845 KB | SQLite (the official @sqlite.org/sqlite-wasm build) |
 | `dynoxide-worker.js` | ~225 KB | the bundled Web Worker (engine glue + bridge, fully minified) |
 | `manifest.json` | <1 KB | engine version, contract version, file list |
 
-About 2.1 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 860 KB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
+About 2.3 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 915 KB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
 
 Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running the official synchronous OPFS SAHPool VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
 
@@ -120,8 +122,12 @@ Two things about it are load-bearing rather than incidental:
 
 An operation the preview does not implement returns HTTP 501 with an
 `UnsupportedOperation` envelope, so a conformance runner can tell "out of scope"
-from "implemented and wrong" without guessing. `tests/bridge` drives the whole
-path over a socket; run it with `npm run test:bridge`.
+from "implemented and wrong" without guessing. An implemented operation can
+return the same envelope for a specific unsupported field (`CreateTable` or
+`UpdateTable` carrying streams or tags), so `capabilities()` answers whether an
+operation is routed at all, not whether every request to it will succeed.
+`tests/bridge` drives the whole path over a socket; run it with
+`npm run test:bridge`.
 
 ## The engine package
 

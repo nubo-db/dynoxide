@@ -129,6 +129,114 @@ test("an unimplemented operation is a 501 the suite scores as a skip", async () 
   );
 });
 
+test("a stream-enabled CreateTable is refused before the table exists", async () => {
+  // The refusal must come before anything is created. A refusal after the
+  // create would half-apply: the SDK retries the error, the retry finds the
+  // table, and the caller sees ResourceInUseException where the real answer
+  // is a capability gap - exactly how the conformance suite's streams probe
+  // used to land in the failed column.
+  const spec = {
+    TableName: "Streamed",
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+    BillingMode: "PAY_PER_REQUEST",
+  };
+  const refused = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      ...spec,
+      StreamSpecification: { StreamEnabled: true, StreamViewType: "NEW_AND_OLD_IMAGES" },
+    }),
+  );
+  assert.equal(refused.status, 501);
+  assert.equal(refused.body.__type, "com.dynoxide.wasm#UnsupportedOperation");
+  assert.match(
+    refused.body.message,
+    /unknown operation|not implemented|unsupported operation|is not supported/i,
+    "message must match the conformance suite's isUnsupportedFault regex",
+  );
+
+  // A retry of the refused request gets the same answer, and the same name
+  // without the stream succeeds: nothing was created by the refusal.
+  const retried = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      ...spec,
+      StreamSpecification: { StreamEnabled: true, StreamViewType: "NEW_AND_OLD_IMAGES" },
+    }),
+  );
+  assert.equal(retried.status, 501);
+  const plain = await call("DynamoDB_20120810.CreateTable", JSON.stringify(spec));
+  assert.equal(plain.status, 200);
+  await call("DynamoDB_20120810.DeleteTable", JSON.stringify({ TableName: spec.TableName }));
+});
+
+test("a tagged CreateTable is refused whole, not created untagged", async () => {
+  const spec = {
+    TableName: "Tagged",
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+    BillingMode: "PAY_PER_REQUEST",
+  };
+  const refused = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({ ...spec, Tags: [{ Key: "team", Value: "data" }] }),
+  );
+  assert.equal(refused.status, 501);
+  assert.equal(refused.body.__type, "com.dynoxide.wasm#UnsupportedOperation");
+  const plain = await call("DynamoDB_20120810.CreateTable", JSON.stringify(spec));
+  assert.equal(plain.status, 200);
+  await call("DynamoDB_20120810.DeleteTable", JSON.stringify({ TableName: spec.TableName }));
+});
+
+test("PartiQL round-trips a statement and its result through the transport", async () => {
+  // Its own table, so this runs standalone rather than only after the test
+  // that happens to create "Bridge".
+  const created = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      TableName: "BridgePartiql",
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    }),
+  );
+  assert.equal(created.status, 200);
+
+  // The Rust tests cover the statement grammar; this covers the statement and
+  // its parameters surviving HTTP, the browser and the Worker intact.
+  const inserted = await call(
+    "DynamoDB_20120810.ExecuteStatement",
+    JSON.stringify({
+      Statement: `INSERT INTO "BridgePartiql" VALUE {'pk': ?, 'note': ?}`,
+      Parameters: [{ S: "partiql" }, { S: "through the bridge" }],
+    }),
+  );
+  assert.equal(inserted.status, 200);
+
+  const selected = await call(
+    "DynamoDB_20120810.ExecuteStatement",
+    JSON.stringify({
+      Statement: `SELECT * FROM "BridgePartiql" WHERE pk = ?`,
+      Parameters: [{ S: "partiql" }],
+    }),
+  );
+  assert.equal(selected.status, 200);
+  assert.deepEqual(selected.body.Items, [
+    { pk: { S: "partiql" }, note: { S: "through the bridge" } },
+  ]);
+});
+
+test("a malformed PartiQL statement is a ValidationException, not a skip", async () => {
+  const out = await call(
+    "DynamoDB_20120810.ExecuteStatement",
+    JSON.stringify({ Statement: "NOT A STATEMENT" }),
+  );
+  assert.equal(out.status, 400);
+  assert.match(out.body.__type, /ValidationException$/);
+  assert.match(out.body.message, /^Statement wasn't well formed, can't be processed: /);
+});
+
 test("a malformed body is a bare SerializationException", async () => {
   const out = await call("DynamoDB_20120810.ListTables", "not json");
   assert.equal(out.status, 400);
@@ -165,9 +273,9 @@ test("the engine starts empty, so shared-table setup cannot collide", async () =
   const out = await call("DynamoDB_20120810.ListTables");
   assert.equal(out.status, 200);
   assert.deepEqual(
-    out.body.TableNames,
-    ["Bridge"],
-    "only this run's table should be present",
+    [...out.body.TableNames].sort(),
+    ["Bridge", "BridgePartiql"],
+    "only this run's tables should be present",
   );
 });
 

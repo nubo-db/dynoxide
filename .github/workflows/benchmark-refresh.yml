@@ -167,79 +167,36 @@ jobs:
 
       - name: Build PR body from comparison
         run: |
-          python3 <<'PY' > /tmp/pr_body.md
-          import json, os, subprocess, sys
+          git fetch origin benchmark-data:benchmark-data 2>/dev/null || true
 
-          with open('benchmarks/results/criterion_baseline.json') as f:
-              current = json.load(f)
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## Benchmark refresh"
+            echo
+            echo "Run: [${GITHUB_RUN_ID}](${RUN_URL})"
+            echo
+          } > /tmp/pr_body.md
 
-          baseline = {}
-          try:
-              subprocess.run(
-                  ['git', 'fetch', 'origin', 'benchmark-data:benchmark-data'],
-                  check=True, stderr=subprocess.DEVNULL,
-              )
-              ls = subprocess.run(
-                  ['git', 'ls-tree', '--name-only', 'benchmark-data', 'runs/'],
-                  capture_output=True, text=True, check=True,
-              )
-              dirs = sorted([d for d in ls.stdout.strip().split('\n') if d], reverse=True)
-              if dirs:
-                  show = subprocess.run(
-                      ['git', 'show', f'benchmark-data:{dirs[0]}/criterion_baseline.json'],
-                      capture_output=True, text=True,
-                  )
-                  if show.returncode == 0:
-                      baseline = json.loads(show.stdout)
-          except Exception as e:
-              print(f"baseline fetch failed: {e}", file=sys.stderr)
+          # This runs before the store step below, so the current run is not
+          # yet part of the history it is compared against.
+          set +e
+          python3 benchmarks/scripts/compare_criterion.py \
+            --current-json benchmarks/results/criterion_baseline.json \
+            --output /tmp/comparison.md
+          status=$?
+          set -e
 
-          names = sorted(set(current) | set(baseline))
-          rows = []
-          regressions = []
-          threshold = 1.50  # matches benchmark-regression.yml
-          for name in names:
-              c = current.get(name)
-              b = baseline.get(name)
-              if c is not None and b is not None and b != 0:
-                  ratio = c / b
-                  pct = (ratio - 1) * 100
-                  change = f"{'+' if pct >= 0 else ''}{pct:.1f}%"
-                  if ratio > threshold:
-                      regressions.append(name)
-                      change += " :warning:"
-              elif c is not None:
-                  change = "new"
-              else:
-                  change = "removed"
-              rows.append((name, b, c, change))
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            echo "::warning::criterion comparison failed (exit $status)"
+            echo "_Criterion comparison unavailable; see the run log._" >> /tmp/pr_body.md
+          else
+            cat /tmp/comparison.md >> /tmp/pr_body.md
+          fi
 
-          run_id = os.environ.get('GITHUB_RUN_ID', '')
-          repo = os.environ.get('GITHUB_REPOSITORY', 'nubo-db/dynoxide')
-          run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
-
-          print("## Benchmark refresh")
-          print()
-          print(f"Run: [{run_id}]({run_url})")
-          print()
-          print("### Criterion comparison vs previous run")
-          print()
-          print("| Benchmark | Baseline (ns/iter) | Current (ns/iter) | Change |")
-          print("|-----------|-------------------:|------------------:|--------|")
-          for name, b, c, change in rows:
-              bs = f"{b:,}" if b else "—"
-              cs = f"{c:,}" if c else "—"
-              print(f"| {name} | {bs} | {cs} | {change} |")
-          print()
-          if regressions:
-              print(f"> :warning: {len(regressions)} benchmark(s) exceeded the 50% threshold. Wall-clock runners are noisy; variance up to 3x between runs on shared hardware is common. iai-callgrind provides deterministic regression detection in PR checks.")
-          elif baseline:
-              print("> All benchmarks within 50% of prior baseline.")
-          else:
-              print("> No prior baseline; this run establishes one.")
-          print()
-          print("Before merging, eyeball the numbers and re-run this workflow if any look like noise rather than real change.")
-          PY
+          {
+            echo
+            echo "Before merging, eyeball the numbers and re-run this workflow if any look like noise rather than real change."
+          } >> /tmp/pr_body.md
 
       - name: Store results in benchmark-data branch
         run: |

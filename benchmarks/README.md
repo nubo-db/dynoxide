@@ -106,7 +106,7 @@ Results from a Mac Studio (M-series). These reflect the experience of a develope
 
 ## Results: CI (GitHub Actions)
 
-Results from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:ci_commit_link_benchmarks -->[`bc2a16c`](../../../commit/bc2a16c5c91d2a3649617e54d84d639d2a94e502)<!-- /bench -->. Absolute wall-clock numbers vary between runners; ratios are stable across runs.
+Results from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core AMD EPYC 9V74, 16GB RAM<!-- /bench -->). Commit <!-- bench:ci_commit_link_benchmarks -->[`bc2a16c`](../../../commit/bc2a16c5c91d2a3649617e54d84d639d2a94e502)<!-- /bench -->. Absolute wall-clock numbers vary between runners; ratios are stable across runs.
 
 ### Cold Startup
 
@@ -195,7 +195,7 @@ Docker idle memory is the mean of 3 samples taken 10s apart, 30s after first suc
 
 Local development (Apple Silicon) shows ~17x speedup for embedded CI pipeline; GitHub Actions shows ~7x. This is expected:
 
-- Apple Silicon has significantly faster single-thread performance than the 2-core EPYC VM
+- Apple Silicon has significantly faster single-thread performance than the shared CI runner
 - Dynoxide is CPU-bound (native code, in-process SQLite), so it scales roughly linearly with CPU speed
 - DynamoDB Local is JVM-overhead-bound (class loading, JIT compilation, GC), so it benefits less from faster CPUs on cold start
 - The net effect: faster hardware widens the gap between native code and JVM overhead

@@ -162,6 +162,35 @@ def fmt_criterion_ns(ns):
     return "{:.0f}ms".format(ms)
 
 
+def fmt_runner_hardware(system_info):
+    """Describe the runner a CI run landed on, like '4-core AMD EPYC 9V74, 16GB RAM'.
+
+    GitHub's hosted pool is not uniform: runs have landed on 7763, 9V45 and
+    9V74 hosts, and the vCPU allocation has changed over time too. Templating
+    this from the run's own system_info keeps the prose honest, since the
+    benchmarks README asks the reader to weigh which runner produced the
+    numbers.
+    """
+    model = (system_info.get("cpu_model") or "").strip()
+    if not model:
+        return None
+
+    # cpu_model carries the host part's own core count ("AMD EPYC 9V74 80-Core
+    # Processor"), which reads oddly beside the VM's much smaller vCPU count.
+    model = re.sub(r"\s+\d+-Core Processor$", "", model).strip()
+
+    cores = system_info.get("cpu_cores")
+    desc = "{}-core {}".format(cores, model) if cores else model
+
+    ram = system_info.get("total_ram_gb")
+    if ram:
+        try:
+            desc += ", {:.0f}GB RAM".format(float(ram))
+        except (TypeError, ValueError):
+            pass
+    return desc
+
+
 def fmt_prose_startup_range(mean_ms, stddev_ms):
     """Format a prose startup range like '3\u20134 seconds'."""
     low_s = max(0, (mean_ms - stddev_ms)) / 1000
@@ -252,6 +281,11 @@ def build_value_mapping(run_summary, memory_rows):
     if short_sha:
         values["ci_commit_link_root"] = "[`{}`](../../commit/{})".format(short_sha, sha)
         values["ci_commit_link_benchmarks"] = "[`{}`](../../../commit/{})".format(short_sha, sha)
+
+    # --- Runner hardware ---
+    runner_hardware = fmt_runner_hardware(system_info)
+    if runner_hardware:
+        values["ci_runner_hardware"] = runner_hardware
 
     # --- Startup (main README simplified + benchmarks README detailed) ---
     emb = find_startup(results, "dynoxide_embedded")
@@ -653,7 +687,7 @@ def classify_key(key):
 
     Returns: 'ratio', 'latency', 'memory', or 'skip'.
     """
-    if key.startswith("ci_commit"):
+    if key.startswith("ci_commit") or key == "ci_runner_hardware":
         return "skip"
     if "_ratio" in key or key.endswith("_ratio"):
         return "ratio"

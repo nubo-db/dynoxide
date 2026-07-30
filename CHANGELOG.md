@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-30
+
 ### Added
 
 - PartiQL now works in the browser. The wasm engine serves `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`, where it previously answered all three with a 501. Behaviour matches the native build statement for statement, including the `RETURNING` projections, the per-statement error codes `BatchExecuteStatement` reports, and `ClientRequestToken` idempotency on `ExecuteTransaction`. The engine's advertised capability list grows from 14 operations to 17; `CONTRACT_VERSION` is unchanged at 1, since adding an operation is additive, so a pinned client keeps working. The engine bundle grows by about 143 KB raw and 53 KB gzipped, which is the parser and executor now being reachable from the wasm entry points.
@@ -444,7 +446,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...v0.12.0
 [0.11.4]: https://github.com/nubo-db/dynoxide/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/nubo-db/dynoxide/compare/v0.11.2...v0.11.3

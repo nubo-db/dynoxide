@@ -26,7 +26,7 @@ For Rust projects, there's also an **embedded mode** - direct API calls via `Dat
 
 #### CI (GitHub Actions)
 
-Numbers from `ubuntu-latest` (2-core AMD EPYC 7763, 8GB RAM). Commit <!-- bench:ci_commit_link_root -->[`bc2a16c`](../../commit/bc2a16c5c91d2a3649617e54d84d639d2a94e502)<!-- /bench -->.
+Numbers from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core AMD EPYC 9V74, 16GB RAM<!-- /bench -->). Commit <!-- bench:ci_commit_link_root -->[`bc2a16c`](../../commit/bc2a16c5c91d2a3649617e54d84d639d2a94e502)<!-- /bench -->.
 
 | Metric | Dynoxide (embedded) | Dynoxide (HTTP) | DynamoDB Local | LocalStack (all services) |
 |---|---|---|---|---|

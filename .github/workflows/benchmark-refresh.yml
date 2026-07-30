@@ -148,6 +148,9 @@ jobs:
           "
 
       - name: Run criterion baseline
+        # shell: bash adds -o pipefail, so a bench that dies partway fails here
+        # rather than storing a truncated baseline for every later comparison.
+        shell: bash
         run: |
           cd benchmarks
           cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt

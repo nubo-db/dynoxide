@@ -22,6 +22,10 @@ jobs:
             benchmarks
 
       - name: Run criterion micro-benchmarks
+        # shell: bash adds -o pipefail. Without it the exit status of the pipe
+        # is tee's, so a bench that dies partway leaves a truncated file and
+        # still reports success.
+        shell: bash
         run: cd benchmarks && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
 
       - name: Compare against recent baselines

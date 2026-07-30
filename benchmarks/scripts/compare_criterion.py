@@ -9,8 +9,13 @@ become the baseline for every comparison until the next refresh, which both
 floods PRs with false regressions and hides real ones behind the offset.
 
 Reads either criterion's bencher-format output or an already-parsed
-criterion_baseline.json, writes a markdown comparison table, and exits 2 when
-something exceeds the threshold so the caller can decide whether that blocks.
+criterion_baseline.json and writes a markdown comparison table. Both workflows
+branch on the exit code, so it is a contract:
+
+    0  clean, nothing over the threshold
+    1  could not compare
+    2  usage error (argparse's own)
+    3  threshold exceeded, advisory
 
 Usage:
     python3 benchmarks/scripts/compare_criterion.py \
@@ -63,16 +68,24 @@ def git(*args):
 def load_history(ref, window):
     """Load up to `window` most recent stored runs from `ref`.
 
-    Returns a list of (run_dir, {benchmark: ns}), oldest first. Run
-    directories are named runs/YYYY-MM-DD-<sha>, so a lexical sort is
-    chronological. Directories without a criterion_baseline.json are skipped
-    rather than counted against the window, since early runs predate it.
+    Returns a list of (run_dir, {benchmark: ns}), oldest first, or None when the
+    ref could not be read at all. None and [] are deliberately different: a ref
+    we cannot read means no comparison happened, which must not be reported as a
+    comparison that found nothing wrong.
+
+    Run directories are named runs/YYYY-MM-DD-<sha>. Sorting them lexically
+    orders by date but not within a date, where the trailing short SHA decides;
+    that only matters at the window boundary when two runs share a date.
+
+    Runs without a criterion_baseline.json, or with an empty or unparseable one,
+    are skipped rather than counted against the window. An empty file otherwise
+    consumes a slot and shrinks the sample the median rests on.
     """
     listing = git("ls-tree", "--name-only", ref, "runs/")
     if listing is None:
-        return []
+        return None
 
-    run_dirs = sorted(d for d in listing.split() if d)
+    run_dirs = sorted(d for d in listing.splitlines() if d)
     history = []
     for run_dir in reversed(run_dirs):
         if len(history) >= window:
@@ -81,9 +94,12 @@ def load_history(ref, window):
         if raw is None:
             continue
         try:
-            history.append((run_dir, json.loads(raw)))
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        if not parsed:
+            continue
+        history.append((run_dir, parsed))
     history.reverse()
     return history
 
@@ -101,13 +117,19 @@ def build_baseline(history):
 
 
 def sanitize(text):
-    """Escape markdown table metacharacters in a benchmark name."""
-    return re.sub(r"([|`\[\]<>])", r"\\\1", text)
+    """Escape markdown table metacharacters in a benchmark name.
+
+    The backslash is escaped first (it leads the character class), otherwise a
+    name containing a literal \\| would emerge as \\\\| and the pipe would still
+    read as a real cell delimiter.
+    """
+    return re.sub(r"([\\|`\[\]<>])", r"\\\1", text)
 
 
 def build_report(current, baseline, history, threshold):
     """Render the markdown comparison. Returns (markdown, regressions)."""
     regressions = []
+    missing = []
     rows = []
 
     for name in sorted(set(current) | set(baseline)):
@@ -115,19 +137,26 @@ def build_report(current, baseline, history, threshold):
         stats = baseline.get(name)
 
         if now is not None and stats:
-            median, low, high, _ = stats
+            median, low, high, count = stats
             ratio = now / median if median else None
             if ratio is None:
                 change = "—"
             else:
                 pct = (ratio - 1) * 100
                 change = "{}{:.1f}%".format("+" if pct >= 0 else "", pct)
-                if ratio > threshold:
+                # A single sample is not a median. Flagging against it is the
+                # same one-run comparison this script exists to replace, so a
+                # benchmark new to the window reports its change without the
+                # warning until a second run backs it up.
+                if ratio > threshold and count > 1:
                     regressions.append(name)
                     change += " :warning:"
+            baseline_cell = "{:,}".format(round(median))
+            if count < len(history):
+                baseline_cell += " (n={})".format(count)
             rows.append((
                 name,
-                "{:,}".format(round(median)),
+                baseline_cell,
                 "{:,} - {:,}".format(low, high),
                 "{:,}".format(now),
                 change,
@@ -136,6 +165,7 @@ def build_report(current, baseline, history, threshold):
             rows.append((name, "—", "—", "{:,}".format(now), "new"))
         else:
             median, low, high, _ = stats
+            missing.append(name)
             rows.append((
                 name,
                 "{:,}".format(round(median)),
@@ -179,6 +209,14 @@ def build_report(current, baseline, history, threshold):
                 len(regressions), threshold - 1, window
             )
         )
+    elif missing:
+        lines.append(
+            "> :warning: {} benchmark(s) in the baseline produced no result in "
+            "this run: {}. A partial bench run reports the rest as clean, so "
+            "treat this as a failed comparison rather than a pass.".format(
+                len(missing), ", ".join(sanitize(n) for n in missing)
+            )
+        )
     else:
         lines.append(
             "> All benchmarks within {:.0%} of the {}-run median.".format(
@@ -191,7 +229,7 @@ def build_report(current, baseline, history, threshold):
         lines.append("<details><summary>Runs in the baseline</summary>")
         lines.append("")
         for run_dir, _ in history:
-            lines.append("- `{}`".format(run_dir))
+            lines.append("- `{}`".format(sanitize(run_dir)))
         lines.append("")
         lines.append("</details>")
 
@@ -199,7 +237,8 @@ def build_report(current, baseline, history, threshold):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Compare criterion results against recent stored runs")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--current-output",
                         help="criterion bencher-format output to compare")
@@ -234,6 +273,10 @@ def main():
         return EXIT_ERROR
 
     history = load_history(args.ref, args.window)
+    if history is None:
+        print("could not read run history from '{}'; no comparison was made"
+              .format(args.ref), file=sys.stderr)
+        return EXIT_ERROR
     if not history:
         print("no stored runs found on '{}'".format(args.ref), file=sys.stderr)
 

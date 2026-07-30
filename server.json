@@ -3,7 +3,7 @@
   "name": "io.github.nubo-db/dynoxide",
   "title": "Dynoxide",
   "description": "DynamoDB-compatible database engine in Rust on SQLite, with an MCP server for coding agents.",
-  "version": "0.11.1",
+  "version": "0.0.0-development",
   "websiteUrl": "https://dynoxide.dev",
   "repository": {
     "url": "https://github.com/nubo-db/dynoxide",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "dynoxide",
-      "version": "0.11.1",
+      "version": "0.0.0-development",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -28,7 +28,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/nubo-db/dynoxide:0.11.1",
+      "identifier": "ghcr.io/nubo-db/dynoxide:0.0.0-development",
       "transport": {
         "type": "stdio"
       },

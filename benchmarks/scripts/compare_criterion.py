@@ -73,9 +73,10 @@ def load_history(ref, window):
     we cannot read means no comparison happened, which must not be reported as a
     comparison that found nothing wrong.
 
-    Run directories are named runs/YYYY-MM-DD-<sha>. Sorting them lexically
-    orders by date but not within a date, where the trailing short SHA decides;
-    that only matters at the window boundary when two runs share a date.
+    Run directories are named runs/YYYY-MM-DDTHHMMSSZ-<sha>, so sorting them
+    lexically is chronological. Runs stored before that naming landed are
+    date-only; they sort before same-day timestamped runs, which is the right
+    order since they are older.
 
     Runs without a criterion_baseline.json, or with an empty or unparseable one,
     are skipped rather than counted against the window. An empty file otherwise

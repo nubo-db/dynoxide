@@ -204,8 +204,14 @@ jobs:
       - name: Store results in benchmark-data branch
         run: |
           SHA=$(git rev-parse --short HEAD)
-          DATE=$(date -u +%Y-%m-%d)
-          RUN_DIR="runs/${DATE}-${SHA}"
+          # Second-resolution, not date-only: two dispatches on the same day at
+          # the same commit used to land in one directory, so the later run
+          # replaced the earlier instead of adding a sample. The comparison
+          # averages the last N runs, so a silent overwrite quietly shrinks N.
+          # The T also keeps same-day runs in chronological order under a plain
+          # lexical sort, which a date-only name could not do.
+          STAMP=$(date -u +%Y-%m-%dT%H%M%SZ)
+          RUN_DIR="runs/${STAMP}-${SHA}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -221,7 +227,7 @@ jobs:
             echo "# Benchmark History" > README.md
             echo "" >> README.md
             echo "This branch stores historical benchmark results." >> README.md
-            echo "Each run is stored in \`runs/YYYY-MM-DD-<commit_sha>/\`." >> README.md
+            echo "Each run is stored in \`runs/YYYY-MM-DDTHHMMSSZ-<commit_sha>/\`." >> README.md
             git add README.md
             git commit -m "Initialise benchmark-data branch"
             cd -

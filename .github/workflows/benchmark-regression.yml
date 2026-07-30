@@ -36,14 +36,31 @@ jobs:
           set +e
           python3 benchmarks/scripts/compare_criterion.py \
             --current-output benchmarks/criterion_output.txt \
-            --output comparison.md
+            --output comparison.md 2> compare_stderr.txt
           status=$?
           set -e
+          cat compare_stderr.txt
 
-          # 3 means something exceeded the threshold, which is advisory here.
-          # Anything else non-zero means the comparison could not be made, and
-          # a check that could not run must not read as a check that passed.
+          # Exit 3 means a benchmark came in over the threshold. That is
+          # advisory: the step stays green and the warning is the whole signal,
+          # because wall-clock timings on shared runners move on their own.
+          #
+          # Any other non-zero means no comparison happened at all. That fails
+          # the step, since a check that could not run must not look like one
+          # that passed. It still does not block merge -- this job is not a
+          # required check, and iai-callgrind is the gate that is.
           if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            {
+              echo "## Criterion Benchmark Results"
+              echo
+              echo "> :x: The comparison could not be made (exit ${status}), so this"
+              echo "> run says nothing about performance either way."
+              echo
+              echo '```'
+              cat compare_stderr.txt
+              echo '```'
+            } > comparison.md
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
             echo "::error::criterion comparison failed (exit $status)"
             exit "$status"
           fi
@@ -55,13 +72,23 @@ jobs:
           fi
 
       - name: Post comparison to the PR
+        # always(), so a failed comparison still carries its reason into the PR
+        # rather than leaving a red check with nothing to explain it.
+        if: always()
         uses: actions/github-script@v8
         env:
           REGRESSED: ${{ steps.compare.outputs.regressed }}
         with:
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('comparison.md', 'utf8');
+            let body;
+            try {
+              body = fs.readFileSync('comparison.md', 'utf8');
+            } catch {
+              body = '## Criterion Benchmark Results\n\n'
+                   + '> :x: The benchmark job did not get as far as producing a '
+                   + 'comparison. See the run log.\n';
+            }
 
             // GITHUB_STEP_SUMMARY is always visible in the Actions tab
             await core.summary.addRaw(body).write();
@@ -73,7 +100,7 @@ jobs:
               body
             });
 
-            // Wall-clock regressions are advisory only -- don't block merge
+            // A threshold breach is advisory and never blocks merge
             if (process.env.REGRESSED === 'true') {
               core.warning('Wall-clock regression detected -- see PR comment for details');
             }

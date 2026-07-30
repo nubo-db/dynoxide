@@ -22,107 +22,77 @@ jobs:
             benchmarks
 
       - name: Run criterion micro-benchmarks
+        # shell: bash adds -o pipefail. Without it the exit status of the pipe
+        # is tee's, so a bench that dies partway leaves a truncated file and
+        # still reports success.
+        shell: bash
         run: cd benchmarks && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
 
-      - name: Compare results and post summary
+      - name: Compare against recent baselines
+        id: compare
+        run: |
+          git fetch origin benchmark-data:benchmark-data 2>/dev/null || true
+
+          set +e
+          python3 benchmarks/scripts/compare_criterion.py \
+            --current-output benchmarks/criterion_output.txt \
+            --output comparison.md 2> compare_stderr.txt
+          status=$?
+          set -e
+          cat compare_stderr.txt
+
+          # Exit 3 means a benchmark came in over the threshold. That is
+          # advisory: the step stays green and the warning is the whole signal,
+          # because wall-clock timings on shared runners move on their own.
+          #
+          # Any other non-zero means no comparison happened at all. That fails
+          # the step, since a check that could not run must not look like one
+          # that passed. It still does not block merge -- this job is not a
+          # required check, and iai-callgrind is the gate that is.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+            {
+              echo "## Criterion Benchmark Results"
+              echo
+              echo "> :x: The comparison could not be made (exit ${status}), so this"
+              echo "> run says nothing about performance either way."
+              echo
+              echo '```'
+              cat compare_stderr.txt
+              echo '```'
+            } > comparison.md
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::criterion comparison failed (exit $status)"
+            exit "$status"
+          fi
+
+          if [ "$status" -eq 3 ]; then
+            echo "regressed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post comparison to the PR
+        # always(), so a failed comparison still carries its reason into the PR
+        # rather than leaving a red check with nothing to explain it.
+        if: always()
         uses: actions/github-script@v8
+        env:
+          REGRESSED: ${{ steps.compare.outputs.regressed }}
         with:
           script: |
             const fs = require('fs');
-            const { execSync } = require('child_process');
-
-            // Parse current criterion output (bencher format: "test name ... bench: NNN ns/iter (+/- NNN)")
-            const currentOutput = fs.readFileSync('benchmarks/criterion_output.txt', 'utf8');
-            const currentResults = {};
-            for (const line of currentOutput.split('\n')) {
-              const match = line.match(/^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns\/iter/);
-              if (match) {
-                currentResults[match[1]] = parseInt(match[2].replace(/,/g, ''));
-              }
-            }
-
-            if (Object.keys(currentResults).length === 0) {
-              console.log('No criterion results parsed -- skipping regression check');
-              return;
-            }
-
-            // Try to fetch baseline from benchmark-data branch
-            let baselineResults = {};
-            let hasBaseline = false;
+            let body;
             try {
-              execSync('git fetch origin benchmark-data:benchmark-data 2>/dev/null', { stdio: 'pipe' });
-              const latestDir = execSync(
-                'git ls-tree --name-only benchmark-data runs/ | sort -r | head -1',
-                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-              ).trim();
-
-              if (latestDir) {
-                const baselineFile = execSync(
-                  `git show benchmark-data:${latestDir}/criterion_baseline.json 2>/dev/null || echo "{}"`,
-                  { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-                ).trim();
-                baselineResults = JSON.parse(baselineFile);
-                hasBaseline = Object.keys(baselineResults).length > 0;
-              }
-            } catch (e) {
-              console.log('No benchmark-data branch found -- will post results without comparison');
+              body = fs.readFileSync('comparison.md', 'utf8');
+            } catch {
+              body = '## Criterion Benchmark Results\n\n'
+                   + '> :x: The benchmark job did not get as far as producing a '
+                   + 'comparison. See the run log.\n';
             }
 
-            const sanitize = (s) => s.replace(/[|`\[\]<>]/g, '\\$&');
-
-            // Build comparison for all benchmarks
-            const allNames = [...new Set([...Object.keys(currentResults), ...Object.keys(baselineResults)])].sort();
-            const rows = [];
-            const regressions = [];
-            const threshold = 1.50; // 50% -- wall-clock on shared runners is noisy
-
-            for (const name of allNames) {
-              const current = currentResults[name];
-              const baseline = baselineResults[name];
-              let changeStr = '';
-
-              if (current && baseline) {
-                const ratio = current / baseline;
-                const pct = ((ratio - 1) * 100).toFixed(1);
-                changeStr = ratio >= 1 ? `+${pct}%` : `${pct}%`;
-                if (ratio > threshold) {
-                  regressions.push({ name, baseline, current, change: `+${pct}%` });
-                }
-              } else if (current && !baseline) {
-                changeStr = 'new';
-              } else if (!current && baseline) {
-                changeStr = 'removed';
-              }
-
-              rows.push({
-                name,
-                baseline: baseline ? baseline.toLocaleString() : '—',
-                current: current ? current.toLocaleString() : '—',
-                change: changeStr
-              });
-            }
-
-            // Build markdown body
-            let body = '## Criterion Benchmark Results\n\n';
-            body += '| Benchmark | Baseline (ns/iter) | Current (ns/iter) | Change |\n';
-            body += '|-----------|-------------------|-------------------|--------|\n';
-            for (const r of rows) {
-              const flag = regressions.some(reg => reg.name === r.name) ? ' :warning:' : '';
-              body += `| ${sanitize(r.name)} | ${r.baseline} | ${r.current} | ${sanitize(r.change)}${flag} |\n`;
-            }
-
-            if (regressions.length > 0) {
-              body += `\n> :warning: ${regressions.length} benchmark(s) regressed >50%. Wall-clock benchmarks on shared CI runners can vary up to 3x between runs due to noisy neighbours. iai-callgrind provides deterministic regression detection.\n`;
-            } else if (hasBaseline) {
-              body += '\n> All benchmarks within 50% of baseline.\n';
-            } else {
-              body += '\n> No baseline available for comparison. Baseline is recorded on push to `main`.\n';
-            }
-
-            // Post to GITHUB_STEP_SUMMARY (always visible in Actions tab)
+            // GITHUB_STEP_SUMMARY is always visible in the Actions tab
             await core.summary.addRaw(body).write();
 
-            // Post as PR comment
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -130,9 +100,9 @@ jobs:
               body
             });
 
-            // Wall-clock regressions are advisory only -- don't block merge
-            if (regressions.length > 0) {
-              core.warning(`Wall-clock regression detected in ${regressions.length} benchmark(s) -- see PR comment for details`);
+            // A threshold breach is advisory and never blocks merge
+            if (process.env.REGRESSED === 'true') {
+              core.warning('Wall-clock regression detected -- see PR comment for details');
             }
 
   iai-benchmarks:

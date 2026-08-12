@@ -604,8 +604,11 @@ pub fn delete_lsi_item<'a>(
     )
 }
 
-/// Create a vector index shadow table plus its hash-value index (a
-/// two-statement batch), mirroring the GSI physical-table convention.
+/// Create a vector index shadow table plus its hash-value index, mirroring
+/// the GSI physical-table convention. The batch drops any existing table of
+/// that name first, so an orphaned shadow table left behind by a partial
+/// failure or an older binary's DeleteTable can neither wedge recreation nor
+/// leak stale rows into the fresh index.
 ///
 /// One row per indexed base item, keyed by the base-table primary key:
 /// `hash_value` holds the SearchSchema HASH attribute's value (empty when the
@@ -617,7 +620,8 @@ pub fn create_vector_table(table_name: &str, index_name: &str) -> (String, Vec<S
     let escaped = escape_table_name(&vix);
     let idx = escape_table_name(&format!("{vix}::hash_value"));
     let sql = format!(
-        "CREATE TABLE \"{escaped}\" (
+        "DROP TABLE IF EXISTS \"{escaped}\";
+            CREATE TABLE \"{escaped}\" (
                 table_pk TEXT NOT NULL,
                 table_sk TEXT NOT NULL DEFAULT '',
                 hash_value TEXT NOT NULL DEFAULT '',
@@ -1425,7 +1429,8 @@ mod tests {
         let (sql, params) = create_vector_table("Docs", "vix");
         assert_eq!(
             sql,
-            "CREATE TABLE \"Docs::vector::vix\" (
+            "DROP TABLE IF EXISTS \"Docs::vector::vix\";
+            CREATE TABLE \"Docs::vector::vix\" (
                 table_pk TEXT NOT NULL,
                 table_sk TEXT NOT NULL DEFAULT '',
                 hash_value TEXT NOT NULL DEFAULT '',
@@ -1448,8 +1453,9 @@ mod tests {
 
     #[test]
     fn create_vector_table_ddl_executes_and_drop_is_idempotent() {
-        // The DDL must be executable as the two-statement batch both backends
-        // run, and the drop must tolerate an absent table.
+        // The DDL must be executable as the batch both backends run (the
+        // leading drop is a no-op on a fresh database), and the drop builder
+        // must tolerate an absent table.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let (create_sql, _) = create_vector_table("Docs", "vix");
         conn.execute_batch(&create_sql).unwrap();

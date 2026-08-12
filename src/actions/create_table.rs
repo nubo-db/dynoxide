@@ -1,10 +1,10 @@
-use crate::actions::{TableDescription, VectorIndex, build_table_description};
+use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::{BackendError, StorageBackend};
 use crate::streams;
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, LocalSecondaryIndex,
-    Projection, ProjectionType, ProvisionedThroughput,
+    Projection, ProjectionType, ProvisionedThroughput, VectorIndex,
 };
 use serde::{Deserialize, Serialize};
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -102,17 +102,6 @@ pub async fn execute<S: StorageBackend>(
         odt.max_read_request_units.is_none() && odt.max_write_request_units.is_none()
     }) {
         request.on_demand_throughput = None;
-    }
-
-    // An empty VectorIndexes list carries no definitions; treat it as absent
-    // so nothing is persisted or reflected, pending characterisation of how
-    // the service answers the empty-list shape.
-    if request
-        .vector_indexes
-        .as_ref()
-        .is_some_and(|vixs| vixs.is_empty())
-    {
-        request.vector_indexes = None;
     }
 
     // Structural validation (runs for both programmatic and JSON paths)
@@ -399,11 +388,11 @@ fn ve(msg: String) -> DynoxideError {
 /// 4. Missing ProvisionedThroughput (default PROVISIONED billing)
 /// 5. Key attribute definition checks ("Invalid KeySchema" / detailed missing-attr message)
 /// 6. Key schema structure (duplicate names, wrong types)
-/// 7. Empty LSI/GSI lists
+/// 7. Empty LSI/GSI/VectorIndexes lists
 /// 8. LSI/GSI structural validation (key schema, projections, duplicates, limits)
 /// 9. Vector index validation (billing-mode gate, per-index structure,
 ///    duplicates, count limit, conflicting dimensions)
-/// 10. Cross-index duplicate names
+/// 10. Cross-index duplicate names (LSI/GSI/vector share one namespace)
 /// 11. Attribute definition count mismatch (SearchSchema attributes join the
 ///     used set)
 /// 12. StreamSpecification consistency (a disabled stream must not set a view type)
@@ -500,6 +489,16 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
             ));
         }
     }
+    // An empty VectorIndexes list is rejected, not normalised to absent.
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    if let Some(ref vixs) = request.vector_indexes {
+        if vixs.is_empty() {
+            return Err(ve(
+                "One or more parameter values were invalid: List of VectorIndexes is empty"
+                    .to_string(),
+            ));
+        }
+    }
 
     // LSI structural validation
     if let Some(ref lsis) = request.local_secondary_indexes {
@@ -512,18 +511,17 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
         validate_gsi_list(gsis, &request.attribute_definitions, bm).map_err(ve)?;
     }
 
-    // Vector index validation
+    // Vector index validation (the empty list was rejected above)
     if let Some(ref vixs) = request.vector_indexes {
-        if !vixs.is_empty() {
-            let bm = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
-            validate_vector_index_list(vixs, &request.attribute_definitions, bm)?;
-        }
+        let bm = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
+        validate_vector_index_list(vixs, &request.attribute_definitions, bm)?;
     }
 
     // Cross-index duplicate names (checked before attr def count)
     check_cross_index_duplicates(
         &request.local_secondary_indexes,
         &request.global_secondary_indexes,
+        &request.vector_indexes,
     )
     .map_err(ve)?;
 
@@ -557,8 +555,15 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
 
 /// List-level vector index validation, shared by the JSON and programmatic
 /// paths via `validate_typed_request`. All operation-layer messages here are
-/// captured from real DynamoDB (eu-west-2, 2026-08-11) except the
-/// duplicate-name form, which mirrors the classic secondary-index message.
+/// captured from real DynamoDB (eu-west-2, 2026-08-11); the duplicate-name
+/// form is the classic secondary-index message, captured for vector indexes
+/// too, both same-family and cross-family (eu-west-2 and us-east-1,
+/// 2026-08-12).
+///
+/// Returns the crate `Result` rather than the `Result<(), String>` of the
+/// `validate_lsi_list`/`validate_gsi_list` siblings: `validate_vector_index`
+/// raises typed `DynoxideError`s at source, so there is no string layer to
+/// map through here.
 fn validate_vector_index_list(
     vixs: &[VectorIndex],
     defs: &[AttributeDefinition],
@@ -572,8 +577,8 @@ fn validate_vector_index_list(
         ));
     }
 
-    for vix in vixs {
-        crate::validation::validate_vector_index(vix, defs)?;
+    for (i, vix) in vixs.iter().enumerate() {
+        crate::validation::validate_vector_index(vix, defs, i + 1)?;
     }
 
     // Duplicate index names within the vector list.
@@ -615,23 +620,56 @@ fn validate_vector_index_list(
         }
     }
 
+    // The vector attribute must not itself be declared in AttributeDefinitions:
+    // it is not a key attribute, and declaring it is rejected outright.
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    for vix in vixs {
+        let attr = vix.vector_attribute.attribute_name.as_str();
+        if defs.iter().any(|d| d.attribute_name == attr) {
+            return Err(ve(format!(
+                "One or more parameter values were invalid: Conflicting attribute definition \
+                 for '{attr}'. An attribute cannot be defined in AttributeDefinitions when \
+                 used as a VectorAttribute."
+            )));
+        }
+    }
+
     Ok(())
 }
 
+/// Duplicate index names across the LSI, GSI, and vector index families.
+/// LSIs, GSIs, and vector indexes share one name namespace; the classic
+/// duplicate message covers a vector index colliding with either secondary
+/// index family too (captured from real DynamoDB, eu-west-2 and us-east-1,
+/// 2026-08-12). Duplicates within a single family are reported by that
+/// family's own list validation, which runs first.
 fn check_cross_index_duplicates(
     lsis: &Option<Vec<LocalSecondaryIndex>>,
     gsis: &Option<Vec<GlobalSecondaryIndex>>,
+    vixs: &Option<Vec<VectorIndex>>,
 ) -> std::result::Result<(), String> {
-    if let (Some(lsis), Some(gsis)) = (lsis, gsis) {
-        let mut all_names = std::collections::HashSet::new();
+    let mut all_names = std::collections::HashSet::new();
+    if let Some(lsis) = lsis {
         for lsi in lsis {
             all_names.insert(&lsi.index_name);
         }
+    }
+    if let Some(gsis) = gsis {
         for gsi in gsis {
             if !all_names.insert(&gsi.index_name) {
                 return Err(format!(
                     "One or more parameter values were invalid: Duplicate index name: {}",
                     gsi.index_name
+                ));
+            }
+        }
+    }
+    if let Some(vixs) = vixs {
+        for vix in vixs {
+            if !all_names.insert(&vix.index_name) {
+                return Err(format!(
+                    "One or more parameter values were invalid: Duplicate index name: {}",
+                    vix.index_name
                 ));
             }
         }
@@ -780,7 +818,7 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
     let vector_indexes: Option<Vec<VectorIndex>> = raw
         .vector_indexes
         .as_ref()
-        .map(|v| serde_json::from_value(v.clone()))
+        .map(|v| serde_json::from_value(normalise_vix_dimensions(v)))
         .transpose()
         .map_err(|e| e.to_string())?;
 
@@ -1093,7 +1131,12 @@ fn collect_vix_errors(vix_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
             errors.push(format!(
                 "Value null at 'vectorIndexes.{idx}.member.dimensions' failed to satisfy constraint: Member must not be null"
             ));
-        } else if let Some(d) = dims.and_then(|v| v.as_i64()) {
+        } else if let Some(d) = dims.and_then(truncated_dimensions) {
+            // Fractional values are truncated before validation (captured
+            // from real DynamoDB, eu-west-2 and us-east-1, 2026-08-12), so
+            // the lower bound applies to the truncated value; the upper
+            // bound is enforced later by the typed validator with the bare
+            // operation-layer message.
             if d < 1 {
                 errors.push(format!(
                     "Value '{d}' at 'vectorIndexes.{idx}.member.dimensions' failed to satisfy constraint: Member must have value greater than or equal to 1"
@@ -1113,6 +1156,47 @@ fn collect_vix_errors(vix_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
             }
         }
     }
+}
+
+/// Effective integer value of a raw `Dimensions` number, truncating any
+/// fractional part (captured from real DynamoDB, eu-west-2 and us-east-1,
+/// 2026-08-12: Dimensions 3.5 is accepted and DescribeTable reports 3).
+/// Values beyond the i64 range saturate; they are far above the 4096 ceiling
+/// either way. Returns `None` for non-numeric values.
+fn truncated_dimensions(v: &serde_json::Value) -> Option<i64> {
+    if let Some(d) = v.as_i64() {
+        return Some(d);
+    }
+    if v.as_u64().is_some() {
+        // Only reachable for integers above the i64 range.
+        return Some(i64::MAX);
+    }
+    // `as` saturates at the i64 bounds for out-of-range floats.
+    v.as_f64().map(|f| f.trunc() as i64)
+}
+
+/// Normalise raw `Dimensions` values so the typed `u32` parse cannot fail on
+/// any numeric input. Fractional values are truncated (see
+/// [`truncated_dimensions`]); integers above the u32 range clamp to
+/// `u32::MAX`, which is over the 4096 ceiling, so the typed validator then
+/// rejects them with the captured over-range message rather than letting a
+/// raw serde error surface.
+fn normalise_vix_dimensions(vix_val: &serde_json::Value) -> serde_json::Value {
+    let mut val = vix_val.clone();
+    if let Some(arr) = val.as_array_mut() {
+        for elem in arr {
+            let Some(obj) = elem.as_object_mut() else {
+                continue;
+            };
+            let Some(dims) = obj.get_mut("Dimensions") else {
+                continue;
+            };
+            if let Some(d) = truncated_dimensions(dims) {
+                *dims = serde_json::Value::from(d.clamp(0, i64::from(u32::MAX)) as u32);
+            }
+        }
+    }
+    val
 }
 
 fn collect_idx_name_errors(name: &str, prefix: &str, idx: usize, errors: &mut Vec<String>) {

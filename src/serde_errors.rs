@@ -336,6 +336,11 @@ fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
         "GlobalSecondaryIndexUpdate" | "GlobalSecondaryIndexUpdateRaw" => {
             Some("com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndexUpdate")
         }
+        "VectorIndex" => Some("com.amazonaws.dynamodb.v20120810.VectorIndex"),
+        "VectorAttributeDefinition" => {
+            Some("com.amazonaws.dynamodb.v20120810.VectorAttributeDefinition")
+        }
+        "SearchSchemaElement" => Some("com.amazonaws.dynamodb.v20120810.SearchSchemaElement"),
         "Tag" | "TagRaw" => Some("com.amazonaws.dynamodb.v20120810.Tag"),
         _ => None,
     }

@@ -1098,6 +1098,52 @@ pub struct LocalSecondaryIndex {
     pub projection: Projection,
 }
 
+/// The vector attribute a vector index is built over. A structure with a
+/// single `AttributeName` member on the wire, not a bare string.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorAttributeDefinition {
+    #[serde(rename = "AttributeName", alias = "attribute_name")]
+    pub attribute_name: String,
+}
+
+/// One element of a vector index's search schema: a `HASH` partition
+/// attribute or an `INLINE_FILTER` attribute.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchSchemaElement {
+    #[serde(rename = "AttributeName", alias = "attribute_name")]
+    pub attribute_name: String,
+    #[serde(
+        rename = "SearchSchemaElementType",
+        alias = "search_schema_element_type"
+    )]
+    pub search_schema_element_type: String,
+}
+
+/// Vector index definition as supplied on CreateTable's `VectorIndexes`.
+///
+/// Serialised verbatim into the `_tables.vector_index_definitions` column,
+/// following the `gsi_definitions` convention.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorIndex {
+    #[serde(rename = "IndexName", alias = "index_name")]
+    pub index_name: String,
+    #[serde(rename = "VectorAttribute", alias = "vector_attribute")]
+    pub vector_attribute: VectorAttributeDefinition,
+    #[serde(
+        rename = "SearchSchema",
+        alias = "search_schema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub search_schema: Option<Vec<SearchSchemaElement>>,
+    #[serde(rename = "Projection", alias = "projection")]
+    pub projection: Projection,
+    #[serde(rename = "Dimensions", alias = "dimensions")]
+    pub dimensions: u32,
+    #[serde(rename = "DistanceFunction", alias = "distance_function")]
+    pub distance_function: String,
+}
+
 /// Provisioned throughput settings (stored but not enforced).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvisionedThroughput {

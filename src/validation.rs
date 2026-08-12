@@ -382,26 +382,31 @@ pub fn validate_gsi(
 
 /// Validate a single vector index definition.
 ///
+/// `position` is the index's 1-based position within the `VectorIndexes`
+/// list, threaded into the formulaic request-model constraint messages so a
+/// later entry reports its real position.
+///
 /// `request_definitions` must be the AttributeDefinitions declared in the
 /// current request: SearchSchema attributes must be (re)declared there. The
 /// vector attribute itself must NOT be declared in AttributeDefinitions (it
-/// is not a key attribute; real DynamoDB accepts a vector index whose
-/// attribute appears nowhere in AttributeDefinitions).
+/// is not a key attribute; the list-level validation in CreateTable rejects
+/// a request that declares it there).
 pub fn validate_vector_index(
-    vix: &crate::actions::VectorIndex,
+    vix: &crate::types::VectorIndex,
     request_definitions: &[AttributeDefinition],
+    position: usize,
 ) -> Result<()> {
     // Index name length (request-model constraint; minimum length 3)
     if vix.index_name.len() < 3 {
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'vectorIndexes.1.member.indexName' \
+            "1 validation error detected: Value '{}' at 'vectorIndexes.{position}.member.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",
             vix.index_name
         )));
     }
     if vix.index_name.len() > 255 {
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'vectorIndexes.1.member.indexName' \
+            "1 validation error detected: Value '{}' at 'vectorIndexes.{position}.member.indexName' \
              failed to satisfy constraint: Member must have length less than or equal to 255",
             vix.index_name
         )));
@@ -414,7 +419,7 @@ pub fn validate_vector_index(
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     {
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'vectorIndexes.1.member.indexName' \
+            "1 validation error detected: Value '{}' at 'vectorIndexes.{position}.member.indexName' \
              failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
             vix.index_name
         )));
@@ -426,7 +431,7 @@ pub fn validate_vector_index(
         other => {
             return Err(DynoxideError::ValidationException(format!(
                 "1 validation error detected: Value '{other}' at \
-                 'vectorIndexes.1.member.distanceFunction' failed to satisfy constraint: \
+                 'vectorIndexes.{position}.member.distanceFunction' failed to satisfy constraint: \
                  Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
             )));
         }
@@ -450,13 +455,14 @@ pub fn validate_vector_index(
     // missing-definition message is captured from real DynamoDB (eu-west-2,
     // 2026-08-11).
     if let Some(ref schema) = vix.search_schema {
-        for elem in schema {
+        for (elem_idx, elem) in schema.iter().enumerate() {
+            let elem_position = elem_idx + 1;
             match elem.search_schema_element_type.as_str() {
                 "HASH" | "INLINE_FILTER" => {}
                 other => {
                     return Err(DynoxideError::ValidationException(format!(
                         "1 validation error detected: Value '{other}' at \
-                         'vectorIndexes.1.member.searchSchema.1.member.searchSchemaElementType' \
+                         'vectorIndexes.{position}.member.searchSchema.{elem_position}.member.searchSchemaElementType' \
                          failed to satisfy constraint: Member must satisfy enum value set: \
                          [HASH, INLINE_FILTER]"
                     )));
@@ -469,6 +475,34 @@ pub fn validate_vector_index(
                 return Err(DynoxideError::ValidationException(
                     "One or more parameter values were invalid: One element in SearchSchema \
                      is not defined in attribute definitions"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // At most one HASH element per SearchSchema; the reported value is
+        // the actual HASH count. Captured from real DynamoDB (eu-west-2 and
+        // us-east-1, 2026-08-12).
+        let hash_count = schema
+            .iter()
+            .filter(|e| e.search_schema_element_type == "HASH")
+            .count();
+        if hash_count > 1 {
+            return Err(DynoxideError::ValidationException(format!(
+                "One or more parameter values were invalid: Value '{hash_count}' at \
+                 'SearchSchema' failed to satisfy constraint: Member must have HASH count \
+                 less than or equal to 1"
+            )));
+        }
+
+        // No attribute may appear twice in one SearchSchema. Captured from
+        // real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+        let mut seen = std::collections::HashSet::new();
+        for elem in schema {
+            if !seen.insert(elem.attribute_name.as_str()) {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: SearchSchema contains a \
+                     duplicate AttributeName"
                         .to_string(),
                 ));
             }

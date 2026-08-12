@@ -92,6 +92,9 @@ pub struct TableDescription {
     )]
     pub local_secondary_indexes: Option<Vec<LocalSecondaryIndexDescription>>,
 
+    #[serde(rename = "VectorIndexes", skip_serializing_if = "Option::is_none")]
+    pub vector_indexes: Option<Vec<VectorIndexDescription>>,
+
     #[serde(
         rename = "StreamSpecification",
         skip_serializing_if = "Option::is_none"
@@ -233,6 +236,85 @@ pub struct LocalSecondaryIndexDescription {
     pub index_size_bytes: Option<i64>,
 }
 
+/// The vector attribute a vector index is built over. A structure with a
+/// single `AttributeName` member on the wire, not a bare string.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorAttributeDefinition {
+    #[serde(rename = "AttributeName", alias = "attribute_name")]
+    pub attribute_name: String,
+}
+
+/// One element of a vector index's search schema: a `HASH` partition
+/// attribute or an `INLINE_FILTER` attribute.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchSchemaElement {
+    #[serde(rename = "AttributeName", alias = "attribute_name")]
+    pub attribute_name: String,
+    #[serde(
+        rename = "SearchSchemaElementType",
+        alias = "search_schema_element_type"
+    )]
+    pub search_schema_element_type: String,
+}
+
+/// Vector index definition as supplied on CreateTable's `VectorIndexes`.
+///
+/// Serialised verbatim into the `_tables.vector_index_definitions` column,
+/// following the `gsi_definitions` convention.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorIndex {
+    #[serde(rename = "IndexName", alias = "index_name")]
+    pub index_name: String,
+    #[serde(rename = "VectorAttribute", alias = "vector_attribute")]
+    pub vector_attribute: VectorAttributeDefinition,
+    #[serde(
+        rename = "SearchSchema",
+        alias = "search_schema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub search_schema: Option<Vec<SearchSchemaElement>>,
+    #[serde(rename = "Projection", alias = "projection")]
+    pub projection: Projection,
+    #[serde(rename = "Dimensions", alias = "dimensions")]
+    pub dimensions: u32,
+    #[serde(rename = "DistanceFunction", alias = "distance_function")]
+    pub distance_function: String,
+}
+
+/// Vector index description (returned in TableDescription).
+///
+/// Field set per the AWS response shape: IndexName, SearchSchema (when
+/// declared), Projection, VectorAttribute, Dimensions, DistanceFunction,
+/// IndexStatus, IndexSizeBytes, ItemCount, IndexArn. `Backfilling` is never
+/// present on the CreateTable path, so it stays `None` here and is only
+/// populated by paths that observe a backfill.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorIndexDescription {
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    #[serde(rename = "SearchSchema", skip_serializing_if = "Option::is_none")]
+    pub search_schema: Option<Vec<SearchSchemaElement>>,
+    #[serde(rename = "Projection")]
+    pub projection: Projection,
+    #[serde(rename = "VectorAttribute")]
+    pub vector_attribute: VectorAttributeDefinition,
+    #[serde(rename = "Dimensions")]
+    pub dimensions: u32,
+    #[serde(rename = "DistanceFunction")]
+    pub distance_function: String,
+    #[serde(rename = "IndexStatus")]
+    pub index_status: String,
+    #[serde(rename = "Backfilling", skip_serializing_if = "Option::is_none")]
+    pub backfilling: Option<bool>,
+    #[serde(rename = "IndexSizeBytes", skip_serializing_if = "Option::is_none")]
+    pub index_size_bytes: Option<i64>,
+    #[serde(rename = "ItemCount", skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<i64>,
+    #[serde(rename = "IndexArn")]
+    pub index_arn: String,
+}
+
 /// Deterministic fallback `TableId` for a table that has no persisted id.
 ///
 /// The primary scheme persists a random v4 UUID assigned at create time (see
@@ -322,6 +404,36 @@ pub(crate) fn build_table_description(
                     projection: lsi.projection,
                     item_count: Some(0),
                     index_size_bytes: Some(0),
+                }
+            })
+            .collect()
+    });
+
+    let vector_index_definitions: Option<Vec<VectorIndex>> = meta
+        .vector_index_definitions
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    // Indexes report ACTIVE immediately, mirroring the GSI posture. The
+    // CreateTable response overrides this to CREATING; DescribeTable never
+    // reports the Backfilling field on the CreateTable path (captured from
+    // real DynamoDB, eu-west-2, 2026-08-11).
+    let vector_indexes = vector_index_definitions.map(|vixs| {
+        vixs.into_iter()
+            .map(|vix| {
+                let idx_arn = streams::index_arn(table_name, &vix.index_name);
+                VectorIndexDescription {
+                    index_name: vix.index_name,
+                    search_schema: vix.search_schema,
+                    projection: vix.projection,
+                    vector_attribute: vix.vector_attribute,
+                    dimensions: vix.dimensions,
+                    distance_function: vix.distance_function,
+                    index_status: "ACTIVE".to_string(),
+                    backfilling: None,
+                    index_size_bytes: Some(0),
+                    item_count: Some(0),
+                    index_arn: idx_arn,
                 }
             })
             .collect()
@@ -466,6 +578,7 @@ pub(crate) fn build_table_description(
         },
         global_secondary_indexes,
         local_secondary_indexes,
+        vector_indexes,
         stream_specification,
         latest_stream_arn,
         latest_stream_label,

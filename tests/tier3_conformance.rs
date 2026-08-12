@@ -139,6 +139,82 @@ fn create_table_missing_name_still_returns_required_error() {
     );
 }
 
+// ---- Group B: CreateTable vector index request-model constraints ----
+//
+// The dimensions form is captured verbatim from real DynamoDB (eu-west-2,
+// 2026-08-11); the index-name forms follow the request-model constraint
+// pattern shared with GSIs and LSIs.
+
+fn vector_request(vix: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "TableName": "VecTable",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [vix]
+    })
+}
+
+#[test]
+fn create_table_vector_index_dimensions_zero_uses_enveloped_constraint_format() {
+    let result = serde_json::from_value::<CreateTableRequest>(vector_request(serde_json::json!({
+        "IndexName": "vix",
+        "VectorAttribute": {"AttributeName": "embedding"},
+        "Dimensions": 0,
+        "DistanceFunction": "COSINE",
+        "Projection": {"ProjectionType": "ALL"}
+    })));
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(
+            "1 validation error detected: Value '0' at 'vectorIndexes.1.member.dimensions' \
+             failed to satisfy constraint: Member must have value greater than or equal to 1"
+        ),
+        "Expected enveloped dimensions constraint, got: {err}"
+    );
+}
+
+#[test]
+fn create_table_vector_index_short_name_uses_constraint_format() {
+    let result = serde_json::from_value::<CreateTableRequest>(vector_request(serde_json::json!({
+        "IndexName": "vx",
+        "VectorAttribute": {"AttributeName": "embedding"},
+        "Dimensions": 3,
+        "DistanceFunction": "COSINE",
+        "Projection": {"ProjectionType": "ALL"}
+    })));
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("1 validation error detected"),
+        "Expected single constraint error, got: {err}"
+    );
+    assert!(
+        err.contains(
+            "Value 'vx' at 'vectorIndexes.1.member.indexName' failed to satisfy constraint: \
+             Member must have length greater than or equal to 3"
+        ),
+        "Expected indexName length constraint, got: {err}"
+    );
+}
+
+#[test]
+fn create_table_vector_index_missing_dimensions_reports_null_member() {
+    let result = serde_json::from_value::<CreateTableRequest>(vector_request(serde_json::json!({
+        "IndexName": "vix",
+        "VectorAttribute": {"AttributeName": "embedding"},
+        "DistanceFunction": "COSINE",
+        "Projection": {"ProjectionType": "ALL"}
+    })));
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(
+            "Value null at 'vectorIndexes.1.member.dimensions' failed to satisfy constraint: \
+             Member must not be null"
+        ),
+        "Expected null-member constraint, got: {err}"
+    );
+}
+
 // ---- Group C: Query error messages ----
 
 #[test]

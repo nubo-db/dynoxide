@@ -30,10 +30,12 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
             check_field_is_list(obj, "KeySchema")?;
             check_field_is_list(obj, "LocalSecondaryIndexes")?;
             check_field_is_list(obj, "GlobalSecondaryIndexes")?;
+            check_field_is_list(obj, "VectorIndexes")?;
             check_list_elements_are_structs(obj, "AttributeDefinitions")?;
             check_list_elements_are_structs(obj, "KeySchema")?;
             check_list_elements_are_structs(obj, "LocalSecondaryIndexes")?;
             check_list_elements_are_structs(obj, "GlobalSecondaryIndexes")?;
+            check_list_elements_are_structs(obj, "VectorIndexes")?;
 
             // Check struct fields and their inner scalar types
             check_field_is_struct(obj, "ProvisionedThroughput")?;
@@ -74,6 +76,37 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
                         check_nested_list_structs(inner, "KeySchema")?;
                         check_nested_projection_fields(inner)?;
                         check_nested_pt_fields(inner)?;
+                        if let Some(proj) = inner.get("Projection").and_then(|p| p.as_object()) {
+                            check_field_is_list(proj, "NonKeyAttributes")?;
+                            check_nested_list_strings(proj, "NonKeyAttributes")?;
+                        }
+                    }
+                }
+            }
+
+            // Check nested fields inside VectorIndexes
+            if let Some(serde_json::Value::Array(arr)) = obj.get("VectorIndexes") {
+                for item in arr {
+                    if let Some(inner) = item.as_object() {
+                        check_field_is_struct(inner, "VectorAttribute")?;
+                        check_field_is_struct(inner, "Projection")?;
+                        check_field_is_list(inner, "SearchSchema")?;
+                        check_list_elements_are_structs(inner, "SearchSchema")?;
+                        check_field_is_string(inner, "IndexName")?;
+                        check_field_is_string(inner, "DistanceFunction")?;
+                        check_field_is_int(inner, "Dimensions")?;
+                        check_nested_projection_fields(inner)?;
+                        if let Some(va) = inner.get("VectorAttribute").and_then(|v| v.as_object()) {
+                            check_field_is_string(va, "AttributeName")?;
+                        }
+                        if let Some(serde_json::Value::Array(schema)) = inner.get("SearchSchema") {
+                            for elem in schema {
+                                if let Some(eo) = elem.as_object() {
+                                    check_field_is_string(eo, "AttributeName")?;
+                                    check_field_is_string(eo, "SearchSchemaElementType")?;
+                                }
+                            }
+                        }
                         if let Some(proj) = inner.get("Projection").and_then(|p| p.as_object()) {
                             check_field_is_list(proj, "NonKeyAttributes")?;
                             check_nested_list_strings(proj, "NonKeyAttributes")?;
@@ -454,6 +487,8 @@ fn check_list_elements_are_structs(
         "GlobalSecondaryIndexUpdates" => {
             "com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndexUpdate"
         }
+        "VectorIndexes" => "com.amazonaws.dynamodb.v20120810.VectorIndex",
+        "SearchSchema" => "com.amazonaws.dynamodb.v20120810.SearchSchemaElement",
         "Tags" => "com.amazonaws.dynamodb.v20120810.Tag",
         _ => "Unknown",
     };
@@ -618,6 +653,7 @@ fn check_field_is_struct(
                 Some("com.amazonaws.dynamodb.v20120810.ProvisionedThroughput")
             }
             "Projection" => Some("com.amazonaws.dynamodb.v20120810.Projection"),
+            "VectorAttribute" => Some("com.amazonaws.dynamodb.v20120810.VectorAttributeDefinition"),
             "DeleteRequest" => Some("com.amazonaws.dynamodb.v20120810.DeleteRequest"),
             "PutRequest" => Some("com.amazonaws.dynamodb.v20120810.PutRequest"),
             "Create" => Some("com.amazonaws.dynamodb.v20120810.CreateGlobalSecondaryIndexAction"),

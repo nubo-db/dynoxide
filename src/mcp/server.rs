@@ -926,6 +926,7 @@ impl McpServer {
             attribute_definitions,
             global_secondary_indexes,
             local_secondary_indexes,
+            vector_indexes: None,
             stream_specification,
             sse_specification,
             billing_mode: params.billing_mode,

@@ -11,8 +11,10 @@ use rusqlite::{Connection, params};
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Current schema version. Stored in the `_config` table for future migrations.
+/// The value itself lives in `sql_builders` so the wasm backend records the
+/// same version on open.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const SCHEMA_VERSION: &str = "8";
+const SCHEMA_VERSION: &str = sql_builders::SCHEMA_VERSION;
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -220,6 +222,7 @@ pub struct CreateTableMetadata<'a> {
     pub deletion_protection_enabled: bool,
     pub billing_mode: Option<&'a str>,
     pub on_demand_throughput: Option<&'a str>,
+    pub vector_index_definitions: Option<&'a str>,
 }
 
 /// Parameters for query operations (base table or GSI).
@@ -379,9 +382,10 @@ impl Storage {
             .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
 
         // Set schema version if not present
+        let (version_sql, version_params) = sql_builders::init_schema_version(SCHEMA_VERSION);
         self.conn.execute(
-            "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)",
-            params![SCHEMA_VERSION],
+            &version_sql,
+            rusqlite::params_from_iter(version_params.iter()),
         )?;
 
         // Run schema migrations
@@ -416,6 +420,9 @@ impl Storage {
         }
         if version < 8 {
             self.migrate_v7_to_v8()?;
+        }
+        if version < 9 {
+            self.migrate_v8_to_v9()?;
         }
 
         Ok(())
@@ -599,6 +606,31 @@ impl Storage {
 
         self.conn.execute(
             "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '8')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    /// Migrate from schema v8 to v9: add a `vector_index_definitions TEXT`
+    /// column to `_tables`.
+    ///
+    /// Only the duplicate-column error (a re-run over a half-applied
+    /// migration whose version stamp did not land) is tolerated; any other
+    /// failure propagates rather than stamping a version whose column is
+    /// silently absent.
+    fn migrate_v8_to_v9(&self) -> Result<()> {
+        if let Err(e) = self
+            .conn
+            .execute(sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
+        {
+            if !sql_builders::is_duplicate_column_error(&e.to_string()) {
+                return Err(e.into());
+            }
+        }
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '9')",
             [],
         )?;
 
@@ -1002,6 +1034,21 @@ impl Storage {
     pub fn create_lsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
         let (sql, _) = sql_builders::create_lsi_table(table_name, index_name);
         self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Create a vector index shadow table.
+    pub fn create_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
+        let (sql, _) = sql_builders::create_vector_table(table_name, index_name);
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Drop a vector index shadow table.
+    pub fn drop_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
+        let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1739,6 +1786,9 @@ pub struct TableMetadata {
     /// Stable per-table identifier assigned at create time (#55). `None` only
     /// for rows that predate the v8 migration's backfill.
     pub table_id: Option<String>,
+    /// Vector index definitions as request-shaped JSON, following the
+    /// `gsi_definitions` convention. `None` when the table has none.
+    pub vector_index_definitions: Option<String>,
 }
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
@@ -1764,6 +1814,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
         deletion_protection_enabled: row.get::<_, i32>(16).unwrap_or(0) != 0,
         on_demand_throughput: row.get(17)?,
         table_id: row.get(18)?,
+        vector_index_definitions: row.get(19)?,
     })
 }
 
@@ -1949,6 +2000,90 @@ mod tests {
         let storage2 = Storage::new(&path).unwrap();
         let meta2 = storage2.get_table_metadata("LegacyTable").unwrap().unwrap();
         assert_eq!(meta2.table_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// The v8 -> v9 migration adds the `vector_index_definitions` column, so a
+    /// pre-upgrade database keeps working and its rows read back through
+    /// row_to_metadata with the new column present and NULL.
+    #[test]
+    fn test_migrate_v8_to_v9_adds_vector_index_definitions_column() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build a v8-shape database by hand: _tables with table_id but no
+        // vector_index_definitions, schema_version pinned at 8, one row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE _tables (
+                    table_name TEXT PRIMARY KEY,
+                    key_schema TEXT NOT NULL,
+                    attribute_definitions TEXT NOT NULL,
+                    gsi_definitions TEXT,
+                    lsi_definitions TEXT,
+                    stream_enabled INTEGER DEFAULT 0,
+                    stream_view_type TEXT,
+                    stream_label TEXT,
+                    ttl_attribute TEXT,
+                    ttl_enabled INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                    provisioned_throughput TEXT,
+                    tags TEXT,
+                    sse_specification TEXT,
+                    table_class TEXT,
+                    deletion_protection_enabled INTEGER DEFAULT 0,
+                    on_demand_throughput TEXT,
+                    table_id TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _config (key, value) VALUES ('schema_version', '8')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, created_at, table_id) \
+                 VALUES ('LegacyTable', ?1, ?2, 0, 'fixed-id')",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration chain; v8 -> v9 adds the column.
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The pre-existing row survives and reads back with the new column
+        // present and NULL.
+        let meta = storage.get_table_metadata("LegacyTable").unwrap().unwrap();
+        assert_eq!(meta.table_name, "LegacyTable");
+        assert!(meta.vector_index_definitions.is_none());
+
+        // A bare SELECT of the new column would error if the ALTER had not run.
+        let col: Option<String> = storage
+            .conn()
+            .query_row(
+                "SELECT vector_index_definitions FROM _tables WHERE table_name = 'LegacyTable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(col.is_none());
     }
 
     #[test]

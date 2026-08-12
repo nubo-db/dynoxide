@@ -172,6 +172,22 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn create_vector_table(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn drop_vector_table(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn insert_gsi_item(
         &self,
         _table_name: &str,

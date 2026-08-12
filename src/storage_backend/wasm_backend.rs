@@ -116,6 +116,33 @@ impl WasmBridgeBackend {
         bridge_exec(&handle, sql_builders::INIT_SCHEMA, js_sys::Array::new())
             .await
             .map_err(js_err)?;
+        // A database persisted before schema version 9 lacks the
+        // `vector_index_definitions` column, and `CREATE TABLE IF NOT EXISTS`
+        // cannot add it, so the column is added with an ALTER on open. Only
+        // SQLite's duplicate-column error (the already-upgraded case) is
+        // tolerated; any other failure fails the open, because swallowing a
+        // real OPFS fault would leave the column silently absent and every
+        // later metadata statement failing far from the cause.
+        if let Err(e) = bridge_exec(
+            &handle,
+            sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN,
+            js_sys::Array::new(),
+        )
+        .await
+        {
+            let err = js_err(e);
+            if !sql_builders::is_duplicate_column_error(&err.to_string()) {
+                return Err(err);
+            }
+        }
+        // Record the schema version (if none is recorded yet) so future wasm
+        // schema changes can migrate versioned, as the native backend does,
+        // instead of accreting one unconditional ALTER per column.
+        let (version_sql, version_params) =
+            sql_builders::init_schema_version(sql_builders::SCHEMA_VERSION);
+        bridge_exec(&handle, &version_sql, params_to_js(&version_params))
+            .await
+            .map_err(js_err)?;
         Ok(Self {
             handle,
             persistence_mode,
@@ -373,6 +400,7 @@ fn row_to_metadata(row: &js_sys::Array) -> TableMetadata {
         deletion_protection_enabled: col_i64(row, 16) != 0,
         on_demand_throughput: col_text(row, 17),
         table_id: col_text(row, 18),
+        vector_index_definitions: col_text(row, 19),
     }
 }
 
@@ -606,6 +634,24 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn drop_lsi_table(&self, table_name: &str, index_name: &str) -> Result<(), BackendError> {
         let (sql, params) = sql_builders::drop_lsi_table(table_name, index_name);
+        self.exec(&sql, params).await
+    }
+
+    async fn create_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::create_vector_table(table_name, index_name);
+        self.exec(&sql, params).await
+    }
+
+    async fn drop_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);
         self.exec(&sql, params).await
     }
 

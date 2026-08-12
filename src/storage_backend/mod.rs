@@ -288,6 +288,20 @@ pub trait StorageBackend {
 
     async fn drop_lsi_table(&self, table_name: &str, index_name: &str) -> Result<(), BackendError>;
 
+    /// Create the physical shadow table for a vector index.
+    async fn create_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError>;
+
+    /// Drop the physical shadow table for a vector index, if it exists.
+    async fn drop_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError>;
+
     // -----------------------------------------------------------------------
     // GSI item operations
     // -----------------------------------------------------------------------

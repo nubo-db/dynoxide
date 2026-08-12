@@ -174,6 +174,22 @@ impl StorageBackend for Storage {
         Storage::drop_lsi_table(self, table_name, index_name).map_err(dyno_to_backend)
     }
 
+    async fn create_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        Storage::create_vector_table(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
+    async fn drop_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        Storage::drop_vector_table(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
     async fn insert_gsi_item(
         &self,
         table_name: &str,

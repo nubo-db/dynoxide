@@ -108,6 +108,17 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Drop vector index shadow tables
+    if let Some(ref vix_json) = meta.vector_index_definitions {
+        if let Ok(vixs) = serde_json::from_str::<Vec<crate::actions::VectorIndex>>(vix_json) {
+            for vix in &vixs {
+                storage
+                    .drop_vector_table(&request.table_name, &vix.index_name)
+                    .await?;
+            }
+        }
+    }
+
     // Drop data table
     storage.drop_data_table(&request.table_name).await?;
 

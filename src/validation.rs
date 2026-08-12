@@ -380,6 +380,104 @@ pub fn validate_gsi(
     Ok(())
 }
 
+/// Validate a single vector index definition.
+///
+/// `request_definitions` must be the AttributeDefinitions declared in the
+/// current request: SearchSchema attributes must be (re)declared there. The
+/// vector attribute itself must NOT be declared in AttributeDefinitions (it
+/// is not a key attribute; real DynamoDB accepts a vector index whose
+/// attribute appears nowhere in AttributeDefinitions).
+pub fn validate_vector_index(
+    vix: &crate::actions::VectorIndex,
+    request_definitions: &[AttributeDefinition],
+) -> Result<()> {
+    // Index name length (request-model constraint; minimum length 3)
+    if vix.index_name.len() < 3 {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at 'vectorIndexes.1.member.indexName' \
+             failed to satisfy constraint: Member must have length greater than or equal to 3",
+            vix.index_name
+        )));
+    }
+    if vix.index_name.len() > 255 {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at 'vectorIndexes.1.member.indexName' \
+             failed to satisfy constraint: Member must have length less than or equal to 255",
+            vix.index_name
+        )));
+    }
+
+    // Index name character set (same as table names)
+    if !vix
+        .index_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at 'vectorIndexes.1.member.indexName' \
+             failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+            vix.index_name
+        )));
+    }
+
+    // Distance function enum (request-model constraint form)
+    match vix.distance_function.as_str() {
+        "COSINE" | "DOT_PRODUCT" | "EUCLIDEAN" => {}
+        other => {
+            return Err(DynoxideError::ValidationException(format!(
+                "1 validation error detected: Value '{other}' at \
+                 'vectorIndexes.1.member.distanceFunction' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
+            )));
+        }
+    }
+
+    // Dimensions bounds. The 0 case rejects earlier at the request-model
+    // layer on the JSON path; this bare form covers the upper bound and the
+    // programmatic path. Captured from real DynamoDB (eu-west-2, 2026-08-11).
+    if vix.dimensions < 1 || vix.dimensions > 4096 {
+        return Err(DynoxideError::ValidationException(
+            "One or more parameter values were invalid: Number of dimensions must be between \
+             1 and 4096 inclusive."
+                .to_string(),
+        ));
+    }
+
+    // Projection structure
+    validate_projection(&vix.projection, &vix.index_name)?;
+
+    // SearchSchema element types and AttributeDefinitions membership. The
+    // missing-definition message is captured from real DynamoDB (eu-west-2,
+    // 2026-08-11).
+    if let Some(ref schema) = vix.search_schema {
+        for elem in schema {
+            match elem.search_schema_element_type.as_str() {
+                "HASH" | "INLINE_FILTER" => {}
+                other => {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "1 validation error detected: Value '{other}' at \
+                         'vectorIndexes.1.member.searchSchema.1.member.searchSchemaElementType' \
+                         failed to satisfy constraint: Member must satisfy enum value set: \
+                         [HASH, INLINE_FILTER]"
+                    )));
+                }
+            }
+            if !request_definitions
+                .iter()
+                .any(|d| d.attribute_name == elem.attribute_name)
+            {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: One element in SearchSchema \
+                     is not defined in attribute definitions"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a Projection (for GSI or LSI).
 ///
 /// DynamoDB checks:

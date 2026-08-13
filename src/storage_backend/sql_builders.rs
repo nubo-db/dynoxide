@@ -681,6 +681,24 @@ pub fn vector_insert_params<'a>(
     ]
 }
 
+/// Delete a vector shadow-table row by base-table primary key, mirroring
+/// [`delete_gsi_item`].
+pub fn delete_vector_item<'a>(
+    table_name: &str,
+    index_name: &str,
+    table_pk: &'a str,
+    table_sk: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    (
+        format!(
+            "DELETE FROM \"{}\" WHERE table_pk = ?1 AND table_sk = ?2",
+            escape_table_name(&vix)
+        ),
+        vec![SqlParam::text(table_pk), SqlParam::text(table_sk)],
+    )
+}
+
 /// Drop a vector index shadow table if it exists.
 pub fn drop_vector_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let vix = format!("{table_name}::vector::{index_name}");
@@ -1541,6 +1559,18 @@ mod tests {
                 SqlParam::text("{}"),
                 SqlParam::text("{\"pk\":{\"S\":\"p\"}}"),
             ]
+        );
+    }
+
+    #[test]
+    fn delete_vector_item_is_pinned() {
+        assert_eq!(
+            delete_vector_item("Docs", "vix", "p", "s"),
+            (
+                "DELETE FROM \"Docs::vector::vix\" WHERE table_pk = ?1 AND table_sk = ?2"
+                    .to_string(),
+                vec![SqlParam::text("p"), SqlParam::text("s")],
+            )
         );
     }
 

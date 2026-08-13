@@ -76,9 +76,35 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
     table_sk_attr: Option<&str>,
 ) -> Result<()> {
     let lsi_defs = parse_lsi_defs(meta)?;
+    maintain_lsis_after_write_with_defs(
+        storage,
+        table_name,
+        &lsi_defs,
+        table_pk_str,
+        table_sk_str,
+        item,
+        table_pk_attr,
+        table_sk_attr,
+    )
+    .await
+}
+
+/// Defs-accepting form of [`maintain_lsis_after_write`], for callers that
+/// parse the definitions once per batch (BatchWriteItem).
+#[allow(clippy::too_many_arguments)]
+pub async fn maintain_lsis_after_write_with_defs<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    lsi_defs: &[LsiDef],
+    table_pk_str: &str,
+    table_sk_str: &str,
+    item: &Item,
+    table_pk_attr: &str,
+    table_sk_attr: Option<&str>,
+) -> Result<()> {
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
-    for lsi in &lsi_defs {
+    for lsi in lsi_defs {
         // First, remove any existing LSI entry for this base table key
         ops.push(IndexWriteOp::DeleteLsi {
             table_name: table_name.to_string(),
@@ -119,9 +145,22 @@ pub async fn maintain_lsis_after_delete<S: StorageBackend>(
     table_sk_str: &str,
 ) -> Result<()> {
     let lsi_defs = parse_lsi_defs(meta)?;
+    maintain_lsis_after_delete_with_defs(storage, table_name, &lsi_defs, table_pk_str, table_sk_str)
+        .await
+}
+
+/// Defs-accepting form of [`maintain_lsis_after_delete`], for callers that
+/// parse the definitions once per batch (BatchWriteItem).
+pub async fn maintain_lsis_after_delete_with_defs<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    lsi_defs: &[LsiDef],
+    table_pk_str: &str,
+    table_sk_str: &str,
+) -> Result<()> {
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
-    for lsi in &lsi_defs {
+    for lsi in lsi_defs {
         ops.push(IndexWriteOp::DeleteLsi {
             table_name: table_name.to_string(),
             index_name: lsi.index_name.clone(),

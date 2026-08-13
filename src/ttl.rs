@@ -2,7 +2,7 @@
 //!
 //! Provides background expiry of items with expired TTL attributes.
 
-use crate::actions::{gsi, lsi};
+use crate::actions::{gsi, lsi, vector_index};
 use crate::errors::Result;
 use crate::storage_backend::StorageBackend;
 use crate::streams;
@@ -64,6 +64,14 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                             .await?;
                         lsi::maintain_lsis_after_delete(storage, &meta.table_name, meta, pk, sk)
                             .await?;
+                        vector_index::maintain_vector_indexes_after_delete(
+                            storage,
+                            &meta.table_name,
+                            meta,
+                            pk,
+                            sk,
+                        )
+                        .await?;
                         // Generate stream REMOVE record with TTL service identity
                         if meta.stream_enabled {
                             record_ttl_stream_event(storage, meta, &item).await?;

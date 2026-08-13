@@ -650,6 +650,20 @@ async fn execute_inner<S: StorageBackend>(
         )
         .await?;
 
+        // Maintain vector index shadow tables (inside the transaction). A
+        // REMOVE of the vector attribute derives no row, so this de-indexes
+        // the item; restoring the attribute re-indexes it.
+        super::vector_index::maintain_vector_indexes_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &item,
+            &key_schema,
+        )
+        .await?;
+
         // Record stream event (inside the transaction)
         let old_for_stream = if existing_json.is_some() {
             Some(&old_item)

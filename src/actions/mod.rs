@@ -29,6 +29,7 @@ pub mod untag_resource;
 pub mod update_item;
 pub mod update_table;
 pub mod update_time_to_live;
+pub(crate) mod vector_index;
 
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, LocalSecondaryIndex, Projection,

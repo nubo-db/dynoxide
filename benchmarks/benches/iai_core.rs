@@ -10,6 +10,8 @@
 #[cfg(feature = "iai-callgrind")]
 use dynoxide::Database;
 #[cfg(feature = "iai-callgrind")]
+use dynoxide::actions::create_table::CreateTableRequest;
+#[cfg(feature = "iai-callgrind")]
 use dynoxide::actions::delete_item::DeleteItemRequest;
 #[cfg(feature = "iai-callgrind")]
 use dynoxide::actions::get_item::GetItemRequest;
@@ -56,6 +58,45 @@ fn setup_put_item_large() -> (Database, PutItemRequest) {
     let item = generate_item(0, ItemSize::Large);
     let request = PutItemRequest {
         table_name: BENCH_TABLE.to_string(),
+        item,
+        ..Default::default()
+    };
+    (db, request)
+}
+
+#[cfg(feature = "iai-callgrind")]
+fn setup_put_item_vector() -> (Database, PutItemRequest) {
+    let db = Database::memory().unwrap();
+    // A small deterministic vector-indexed fixture: one on-demand table with a
+    // single 8-dimension index, so the measurement covers the put plus its
+    // shadow-row fan-out.
+    let create: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "VectorBench",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{
+            "IndexName": "vix",
+            "VectorAttribute": {"AttributeName": "embedding"},
+            "Dimensions": 8,
+            "DistanceFunction": "COSINE",
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    }))
+    .unwrap();
+    db.create_table(create).unwrap();
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("vec#000000".to_string()));
+    item.insert(
+        "embedding".to_string(),
+        AttributeValue::L(
+            (0..8)
+                .map(|i| AttributeValue::N(format!("0.{i}")))
+                .collect(),
+        ),
+    );
+    let request = PutItemRequest {
+        table_name: "VectorBench".to_string(),
         item,
         ..Default::default()
     };
@@ -157,6 +198,13 @@ fn bench_put_item((db, request): (Database, PutItemRequest)) {
 
 #[cfg(feature = "iai-callgrind")]
 #[library_benchmark]
+#[bench::vector_indexed(setup_put_item_vector())]
+fn bench_put_item_vector((db, request): (Database, PutItemRequest)) {
+    black_box(db.put_item(request).unwrap());
+}
+
+#[cfg(feature = "iai-callgrind")]
+#[library_benchmark]
 #[bench::by_key(setup_get_item())]
 fn bench_get_item((db, request): (Database, GetItemRequest)) {
     black_box(db.get_item(request).unwrap());
@@ -201,7 +249,8 @@ library_benchmark_group!(
         bench_query,
         bench_scan,
         bench_update_item,
-        bench_delete_item
+        bench_delete_item,
+        bench_put_item_vector
 );
 
 #[cfg(feature = "iai-callgrind")]

@@ -55,9 +55,11 @@ async fn execute_inner<S: StorageBackend>(
         });
     }
 
-    // 3. Parse GSI and LSI definitions once (outside the loop)
+    // 3. Parse GSI, LSI, and vector index definitions once (outside the loop)
     let gsi_defs = gsi::parse_gsi_defs(&meta)?;
     let lsi_defs = lsi::parse_lsi_defs(&meta)?;
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let attr_defs = super::vector_index::parse_attr_defs(&meta)?;
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -74,6 +76,26 @@ async fn execute_inner<S: StorageBackend>(
     const FLUSH_BATCH: usize = 1000;
     let mut total_bytes: usize = 0;
 
+    // A fresh import skips the delete half of the index fan-out, so an
+    // intra-batch duplicate key would strand the earlier occurrence's index
+    // rows as ghosts (the base row is simply overwritten). Dedupe by key,
+    // keeping the last occurrence: only the item that finally owns a key gets
+    // an index fan-out. Items whose keys do not extract pass through here and
+    // fail the per-item validation below instead.
+    let last_occurrence: std::collections::HashMap<(String, String), usize> = if skip_gsi_deletes {
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                helpers::extract_key_strings(item, &key_schema)
+                    .ok()
+                    .map(|key| (key, idx))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // The whole import is one transaction: any failure rolls everything back.
     helpers::with_write_transaction(storage, async {
         // Pre-fetch the next stream sequence number once (fix: O(n) → O(1))
@@ -85,9 +107,13 @@ async fn execute_inner<S: StorageBackend>(
 
         let mut base_rows: Vec<BaseItemRow> = Vec::with_capacity(item_count.min(FLUSH_BATCH));
 
-        for mut item in items {
-            // 5. Validate required keys and extract pk/sk
-            helpers::validate_item_keys(&item, &key_schema, &meta)?;
+        for (idx, mut item) in items.into_iter().enumerate() {
+            // 5. Validate required keys and extract pk/sk. The import variant
+            // keeps the classic key checks but skips the vector write
+            // validation: like the UpdateTable backfill, an import
+            // sparse-skips exactly the vector shapes a live write rejects,
+            // importing the base item with no shadow row.
+            helpers::validate_item_keys_for_import(&item, &key_schema, &meta)?;
             crate::validation::validate_item_attribute_values(&item)?;
 
             // Deduplicate sets (in-place, no clone needed)
@@ -109,10 +135,17 @@ async fn execute_inner<S: StorageBackend>(
                 .map(crate::storage::compute_hash_prefix)
                 .unwrap_or_default();
 
+            // On the fresh-import path, only the last occurrence of a key
+            // fans out to the indexes (see `last_occurrence` above); with
+            // deletes enabled every occurrence fans out and the deletes keep
+            // the index rows consistent.
+            let index_fan_out =
+                !skip_gsi_deletes || last_occurrence.get(&(pk.clone(), sk.clone())) == Some(&idx);
+
             // 8. Maintain GSI tables (sparse: skip items missing the GSI pk or sk)
-            for gsi_def in &gsi_defs {
+            for gsi_def in gsi_defs.iter().filter(|_| index_fan_out) {
                 // Delete any existing GSI entry for this base table key
-                // (skipped on fresh import — no stale entries to clean up)
+                // (skipped on fresh import: no stale entries to clean up)
                 if !skip_gsi_deletes {
                     storage
                         .delete_gsi_item(table_name, &gsi_def.index_name, &pk, &sk)
@@ -155,7 +188,7 @@ async fn execute_inner<S: StorageBackend>(
             }
 
             // 8b. Maintain LSI tables (sparse: skip items without a scalar LSI sk)
-            for lsi_def in &lsi_defs {
+            for lsi_def in lsi_defs.iter().filter(|_| index_fan_out) {
                 // Delete any existing LSI entry for this base table key
                 if !skip_gsi_deletes {
                     storage
@@ -195,6 +228,26 @@ async fn execute_inner<S: StorageBackend>(
                         )
                         .await?;
                 }
+            }
+
+            // 8c. Maintain vector index shadow tables through the shared
+            // fan-out so this block cannot drift from the live-write
+            // derivation. The row derivation sparse-skips every shape a live
+            // write would reject (the backfill asymmetry), so an invalid
+            // vector value imports its base item with no shadow row.
+            if index_fan_out {
+                super::vector_index::maintain_vector_indexes_after_write_with_defs(
+                    storage,
+                    table_name,
+                    &vector_defs,
+                    &attr_defs,
+                    &pk,
+                    &sk,
+                    &item,
+                    &key_schema,
+                    skip_gsi_deletes,
+                )
+                .await?;
             }
 
             // 9. Optional stream recording

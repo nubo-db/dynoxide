@@ -191,15 +191,16 @@ pub async fn execute<S: StorageBackend>(
     // Collect unique (table, pk_str, pk_attr, pk_value) for deferred metrics computation
     let mut affected_partitions: Vec<(String, String, String, AttributeValue)> = Vec::new();
 
-    // OPTIMISATION: maintain_gsis_after_write/maintain_lsis_after_write each
-    // deserialise GSI/LSI definitions from JSON on every call. For batch writes
-    // of 25 items against one table, that's 50 redundant deserialise calls.
-    // A future improvement would hoist parse_gsi_defs/parse_lsi_defs to this
-    // level and pass pre-parsed defs into the maintenance functions.
-
     for (table_name, write_requests) in &mut request.request_items {
         let meta = helpers::require_table_for_item_op(storage, table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
+        // Parse the index definitions once per table: the maintain helpers'
+        // meta-accepting forms deserialise the JSON on every call, which for
+        // a 25-item batch against one table would repeat the work per item.
+        let gsi_defs = super::gsi::parse_gsi_defs(&meta)?;
+        let lsi_defs = super::lsi::parse_lsi_defs(&meta)?;
+        let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+        let attr_defs = super::vector_index::parse_attr_defs(&meta)?;
 
         for wr in write_requests {
             if let Some(ref mut put_req) = wr.put_request {
@@ -237,10 +238,10 @@ pub async fn execute<S: StorageBackend>(
                     let old_json = storage
                         .put_item_with_hash(table_name, &pk, &sk, &item_json, size, &hash_prefix)
                         .await?;
-                    let gsi_units = super::gsi::maintain_gsis_after_write(
+                    let gsi_units = super::gsi::maintain_gsis_after_write_with_defs(
                         storage,
                         table_name,
-                        &meta,
+                        &gsi_defs,
                         &pk,
                         &sk,
                         &put_req.item,
@@ -248,15 +249,27 @@ pub async fn execute<S: StorageBackend>(
                         key_schema.sort_key.as_deref(),
                     )
                     .await?;
-                    super::lsi::maintain_lsis_after_write(
+                    super::lsi::maintain_lsis_after_write_with_defs(
                         storage,
                         table_name,
-                        &meta,
+                        &lsi_defs,
                         &pk,
                         &sk,
                         &put_req.item,
                         &key_schema.partition_key,
                         key_schema.sort_key.as_deref(),
+                    )
+                    .await?;
+                    super::vector_index::maintain_vector_indexes_after_write_with_defs(
+                        storage,
+                        table_name,
+                        &vector_defs,
+                        &attr_defs,
+                        &pk,
+                        &sk,
+                        &put_req.item,
+                        &key_schema,
+                        false,
                     )
                     .await?;
                     let old_item: Option<Item> =
@@ -301,12 +314,22 @@ pub async fn execute<S: StorageBackend>(
                     let old_json = storage.delete_item(table_name, &pk, &sk).await?;
                     let old_item: Option<Item> =
                         old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-                    let gsi_units = super::gsi::maintain_gsis_after_delete(
-                        storage, table_name, &meta, &pk, &sk,
+                    let gsi_units = super::gsi::maintain_gsis_after_delete_with_defs(
+                        storage, table_name, &gsi_defs, &pk, &sk,
                     )
                     .await?;
-                    super::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk, &sk)
-                        .await?;
+                    super::lsi::maintain_lsis_after_delete_with_defs(
+                        storage, table_name, &lsi_defs, &pk, &sk,
+                    )
+                    .await?;
+                    super::vector_index::maintain_vector_indexes_after_delete_with_defs(
+                        storage,
+                        table_name,
+                        &vector_defs,
+                        &pk,
+                        &sk,
+                    )
+                    .await?;
                     if old_item.is_some() {
                         crate::streams::record_stream_event(
                             storage,

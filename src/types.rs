@@ -1144,35 +1144,87 @@ pub struct VectorIndex {
     pub distance_function: String,
 }
 
-/// The f32 values of a vector attribute value, or `None` when the value is
-/// not a valid vector for an index with `dimensions` elements: not a List,
-/// wrong element count, an element that is not a Number, or an element that
-/// is not finite after conversion to f32 (out-of-f32-range values overflow to
-/// infinity and are treated as invalid; real DynamoDB rejects them at write
-/// time, captured eu-west-2 and us-east-1, 2026-08-12).
+/// Why an attribute value is not a valid vector for an index with a given
+/// dimension count. Carries the element-level detail the write-path
+/// validation errors interpolate; the checks run in the order the variants
+/// are listed, so a value can only report one failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorValueError {
+    /// The value is not a List at all.
+    NotAList,
+    /// The list's element count differs from the index's dimensions.
+    WrongDimensions {
+        /// The number of elements actually present.
+        actual: usize,
+    },
+    /// An element is not a Number.
+    ElementNotANumber {
+        /// Zero-based element position.
+        position: usize,
+        /// The element's DynamoDB type descriptor.
+        actual: &'static str,
+    },
+    /// An element does not fit the finite f32 range (out-of-range values
+    /// overflow to infinity on conversion; real DynamoDB rejects them at
+    /// write time, captured eu-west-2 and us-east-1, 2026-08-12).
+    ElementOutOfRange {
+        /// Zero-based element position.
+        position: usize,
+        /// The raw number string as written.
+        value: String,
+    },
+}
+
+/// The f32 values of a vector attribute value, or the element-level reason it
+/// is not a valid vector for an index with `dimensions` elements.
 ///
 /// Vector indexes hold f32 copies while the base table keeps full precision
 /// (captured from real DynamoDB, eu-west-2, 2026-08-11), so conversion
-/// happens here, where the index copy is derived.
-pub fn vector_f32_values(value: &AttributeValue, dimensions: u32) -> Option<Vec<f32>> {
+/// happens here, where the index copy is derived. The live write path turns
+/// each error variant into its captured `IndexName:`-suffixed message; the
+/// backfill path discards the detail via [`vector_f32_values`] and
+/// sparse-skips, so the two paths agree on validity by construction.
+pub fn check_vector_f32_values(
+    value: &AttributeValue,
+    dimensions: u32,
+) -> std::result::Result<Vec<f32>, VectorValueError> {
     let AttributeValue::L(elems) = value else {
-        return None;
+        return Err(VectorValueError::NotAList);
     };
     if elems.len() != dimensions as usize {
-        return None;
+        return Err(VectorValueError::WrongDimensions {
+            actual: elems.len(),
+        });
     }
     let mut out = Vec::with_capacity(elems.len());
-    for elem in elems {
+    for (position, elem) in elems.iter().enumerate() {
         let AttributeValue::N(n) = elem else {
-            return None;
+            return Err(VectorValueError::ElementNotANumber {
+                position,
+                actual: elem.type_name(),
+            });
         };
-        let v: f32 = n.parse().ok()?;
-        if !v.is_finite() {
-            return None;
+        // A well-formed DynamoDB number always parses (overflow yields
+        // infinity, not an error); anything non-finite is out of f32 range.
+        match n.parse::<f32>() {
+            Ok(v) if v.is_finite() => out.push(v),
+            _ => {
+                return Err(VectorValueError::ElementOutOfRange {
+                    position,
+                    value: n.clone(),
+                });
+            }
         }
-        out.push(v);
     }
-    Some(out)
+    Ok(out)
+}
+
+/// The f32 values of a vector attribute value, or `None` when the value is
+/// not a valid vector for an index with `dimensions` elements. The validity
+/// rule is exactly [`check_vector_f32_values`]'s, with the element-level
+/// detail discarded; the backfill path uses this form to sparse-skip.
+pub fn vector_f32_values(value: &AttributeValue, dimensions: u32) -> Option<Vec<f32>> {
+    check_vector_f32_values(value, dimensions).ok()
 }
 
 /// Serialise an f32 for a vector index's number copy: shortest-decimal via

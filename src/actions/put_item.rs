@@ -431,6 +431,18 @@ async fn execute_inner<S: StorageBackend>(
         )
         .await?;
 
+        // Maintain vector index shadow tables (inside the transaction)
+        super::vector_index::maintain_vector_indexes_after_write(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+            &request.item,
+            &key_schema,
+        )
+        .await?;
+
         // Record stream event (inside the transaction)
         let old_item_for_stream: Option<Item> =
             old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());

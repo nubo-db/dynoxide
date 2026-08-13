@@ -143,7 +143,8 @@ pub fn validate_item_keys(
     schema: &KeySchema,
     meta: &TableMetadata,
 ) -> Result<()> {
-    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)?;
+    validate_vector_write_attributes_after_keys(item, meta)
 }
 
 /// Like [`validate_item_keys`], but a wrong-type or non-scalar table key yields
@@ -156,7 +157,34 @@ pub fn validate_item_keys_for_batch(
     schema: &KeySchema,
     meta: &TableMetadata,
 ) -> Result<()> {
-    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::SchemaMismatch)
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::SchemaMismatch)?;
+    validate_vector_write_attributes_after_keys(item, meta)
+}
+
+/// Like [`validate_item_keys`], but skips the vector index write validation.
+/// ImportItems uses this: an import is backfill-shaped, so a vector index
+/// value a live write would reject is sparse-skipped by the row derivation
+/// (base item imported, no shadow row) rather than failing the import. The
+/// classic table-key and GSI/LSI index-key checks are exactly those of
+/// [`validate_item_keys`].
+pub fn validate_item_keys_for_import(
+    item: &HashMap<String, AttributeValue>,
+    schema: &KeySchema,
+    meta: &TableMetadata,
+) -> Result<()> {
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)
+}
+
+/// Reject any present-but-invalid vector index attribute (the vector value,
+/// or a SearchSchema HASH or INLINE_FILTER value). Runs after the classic
+/// index-key checks; where real AWS orders the vector family relative to the
+/// classic one is uncaptured, so it follows the family it borrows its shape
+/// from.
+fn validate_vector_write_attributes_after_keys(
+    item: &HashMap<String, AttributeValue>,
+    meta: &TableMetadata,
+) -> Result<()> {
+    super::vector_index::validate_vector_write_attributes(item, meta)
 }
 
 fn validate_item_keys_inner(
@@ -214,7 +242,10 @@ fn validate_item_keys_inner(
     }
 
     // Reject any present-but-invalid GSI/LSI key attribute. Runs after the
-    // table-key checks so a bad table key is reported first.
+    // table-key checks so a bad table key is reported first. The vector
+    // family's write validation is layered on by the public wrappers above,
+    // so the import path can keep these classic checks while letting its row
+    // derivation sparse-skip invalid vector shapes.
     validate_index_key_attributes(item, meta)?;
 
     Ok(())
@@ -420,7 +451,11 @@ pub fn validate_updated_index_keys(
     after: &HashMap<String, AttributeValue>,
     meta: &TableMetadata,
 ) -> Result<()> {
-    run_index_key_validation(after, meta, Some(before))
+    run_index_key_validation(after, meta, Some(before))?;
+    // The vector family gets the same changed-values-only treatment, so an
+    // unrelated update never re-rejects a pre-existing invalid vector value
+    // (for example an item the index backfill sparse-skipped).
+    super::vector_index::validate_updated_vector_attributes(before, after, meta)
 }
 
 /// Validate that a Key map has exactly the key attributes (for GetItem/DeleteItem/UpdateItem).

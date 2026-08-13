@@ -406,6 +406,17 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
     )
     .await?;
 
+    super::vector_index::maintain_vector_indexes_after_write(
+        storage,
+        &put.table_name,
+        &meta,
+        &pk,
+        &sk,
+        &item,
+        &key_schema,
+    )
+    .await?;
+
     // Record stream event
     let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -530,6 +541,17 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
     )
     .await?;
 
+    super::vector_index::maintain_vector_indexes_after_write(
+        storage,
+        &update.table_name,
+        &meta,
+        &pk,
+        &sk,
+        &item,
+        &key_schema,
+    )
+    .await?;
+
     // Record stream event
     let old_item: Option<Item> = old_for_stream.and_then(|j| serde_json::from_str(&j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -585,6 +607,14 @@ async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete)
     let _ = super::gsi::maintain_gsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk)
         .await?;
     super::lsi::maintain_lsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk).await?;
+    super::vector_index::maintain_vector_indexes_after_delete(
+        storage,
+        &delete.table_name,
+        &meta,
+        &pk,
+        &sk,
+    )
+    .await?;
 
     // Record stream event
     let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());

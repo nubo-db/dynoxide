@@ -589,6 +589,18 @@ async fn execute_insert<S: StorageBackend>(
     )
     .await?;
 
+    // Vector index maintenance
+    crate::actions::vector_index::maintain_vector_indexes_after_write(
+        storage,
+        table_name,
+        &meta,
+        &pk,
+        &sk,
+        &item,
+        &key_schema,
+    )
+    .await?;
+
     // Stream record
     let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -743,6 +755,18 @@ async fn execute_update<S: StorageBackend>(
         &item,
         &key_schema.partition_key,
         table_sk_attr,
+    )
+    .await?;
+
+    // Vector index maintenance
+    crate::actions::vector_index::maintain_vector_indexes_after_write(
+        storage,
+        table_name,
+        &meta,
+        &pk_str,
+        &sk_str,
+        &item,
+        &key_schema,
     )
     .await?;
 
@@ -970,6 +994,12 @@ async fn execute_delete<S: StorageBackend>(
     // LSI maintenance
     crate::actions::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk_str, &sk_str)
         .await?;
+
+    // Vector index maintenance
+    crate::actions::vector_index::maintain_vector_indexes_after_delete(
+        storage, table_name, &meta, &pk_str, &sk_str,
+    )
+    .await?;
 
     // Stream record
     let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());

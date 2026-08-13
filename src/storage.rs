@@ -1082,6 +1082,23 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete a vector shadow-table row by base table primary key, mirroring
+    /// [`Self::delete_gsi_item`].
+    pub fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
+    ) -> Result<()> {
+        let (sql, params) =
+            sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk);
+        self.conn
+            .prepare_cached(&sql)?
+            .execute(rusqlite::params_from_iter(params.iter()))?;
+        Ok(())
+    }
+
     /// Drop a vector index shadow table.
     pub fn drop_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
         let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);

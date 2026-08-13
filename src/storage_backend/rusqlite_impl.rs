@@ -208,6 +208,17 @@ impl StorageBackend for Storage {
         Storage::insert_vector_items(self, table_name, index_name, rows).map_err(dyno_to_backend)
     }
 
+    async fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
+    ) -> Result<(), BackendError> {
+        Storage::delete_vector_item(self, table_name, index_name, table_pk, table_sk)
+            .map_err(dyno_to_backend)
+    }
+
     async fn insert_gsi_item(
         &self,
         table_name: &str,

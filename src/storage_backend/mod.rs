@@ -158,6 +158,24 @@ pub enum IndexWriteOp {
         base_sk: String,
         item_json: String,
     },
+    /// Remove this base key's row from a vector index shadow table.
+    DeleteVector {
+        table_name: String,
+        index_name: String,
+        table_pk: String,
+        table_sk: String,
+    },
+    /// Insert (or replace) this item's derived row into a vector index shadow
+    /// table. Carries the whole [`VectorItemRow`] rather than flattened fields
+    /// because the row struct already mirrors the shadow table's column order.
+    /// Boxed so the six-string row does not widen the whole enum: every op in
+    /// a fan-out pays for the largest variant, and the size should stay
+    /// pinned by `InsertGsi` (see the size test below).
+    InsertVector {
+        table_name: String,
+        index_name: String,
+        row: Box<VectorItemRow>,
+    },
 }
 
 /// Backend-neutral storage interface.
@@ -336,12 +354,25 @@ pub trait StorageBackend {
     ///
     /// Batch-shaped so a backend can amortise per-row round-trips, mirroring
     /// [`insert_gsi_items`](Self::insert_gsi_items). Used by the vector index
-    /// backfill path.
+    /// backfill path, and by the default [`apply_index_writes`]
+    /// (Self::apply_index_writes) with a one-row slice for live-write
+    /// maintenance.
     async fn insert_vector_items(
         &self,
         table_name: &str,
         index_name: &str,
         rows: &[VectorItemRow],
+    ) -> Result<(), BackendError>;
+
+    /// Delete a vector shadow-table row by base-table primary key. Used by the
+    /// live-write maintenance fan-out, mirroring
+    /// [`delete_gsi_item`](Self::delete_gsi_item).
+    async fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
     ) -> Result<(), BackendError>;
 
     // -----------------------------------------------------------------------
@@ -497,6 +528,30 @@ pub trait StorageBackend {
                 } => {
                     self.insert_lsi_item(
                         table_name, index_name, pk, sk, base_pk, base_sk, item_json,
+                    )
+                    .await?;
+                }
+                IndexWriteOp::DeleteVector {
+                    table_name,
+                    index_name,
+                    table_pk,
+                    table_sk,
+                } => {
+                    self.delete_vector_item(table_name, index_name, table_pk, table_sk)
+                        .await?;
+                }
+                IndexWriteOp::InsertVector {
+                    table_name,
+                    index_name,
+                    row,
+                } => {
+                    // The batch-shaped insert with a one-row slice: no separate
+                    // per-item method exists because the row struct already
+                    // carries the full column set.
+                    self.insert_vector_items(
+                        table_name,
+                        index_name,
+                        std::slice::from_ref(row.as_ref()),
                     )
                     .await?;
                 }
@@ -693,4 +748,25 @@ pub trait StorageBackend {
         table_name: &str,
         limit: usize,
     ) -> Result<Vec<(String, String, i64)>, BackendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IndexWriteOp;
+
+    /// `InsertVector` carries its row boxed so the vector family does not
+    /// widen the whole enum: every op in a fan-out list pays for the largest
+    /// variant, and before the vector variants arrived that was `InsertGsi`
+    /// at seven `String`s plus the discriminant word. Pin the enum to that
+    /// size so a future field on the vector row cannot regrow it unnoticed.
+    #[test]
+    fn index_write_op_stays_at_the_insert_gsi_driven_size() {
+        let insert_gsi_driven = 7 * std::mem::size_of::<String>() + std::mem::size_of::<usize>();
+        assert!(
+            std::mem::size_of::<IndexWriteOp>() <= insert_gsi_driven,
+            "IndexWriteOp grew past the InsertGsi-driven size: {} > {}",
+            std::mem::size_of::<IndexWriteOp>(),
+            insert_gsi_driven
+        );
+    }
 }

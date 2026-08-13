@@ -150,10 +150,36 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
     table_sk_attr: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
+    maintain_gsis_after_write_with_defs(
+        storage,
+        table_name,
+        &gsi_defs,
+        table_pk_str,
+        table_sk_str,
+        item,
+        table_pk_attr,
+        table_sk_attr,
+    )
+    .await
+}
+
+/// Defs-accepting form of [`maintain_gsis_after_write`], for callers that
+/// parse the definitions once per batch (BatchWriteItem).
+#[allow(clippy::too_many_arguments)]
+pub async fn maintain_gsis_after_write_with_defs<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    gsi_defs: &[GsiDef],
+    table_pk_str: &str,
+    table_sk_str: &str,
+    item: &Item,
+    table_pk_attr: &str,
+    table_sk_attr: Option<&str>,
+) -> Result<HashMap<String, f64>> {
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
-    for gsi in &gsi_defs {
+    for gsi in gsi_defs {
         // First, remove any existing GSI entry for this base table key
         ops.push(IndexWriteOp::DeleteGsi {
             table_name: table_name.to_string(),
@@ -204,10 +230,23 @@ pub async fn maintain_gsis_after_delete<S: StorageBackend>(
     table_sk_str: &str,
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
+    maintain_gsis_after_delete_with_defs(storage, table_name, &gsi_defs, table_pk_str, table_sk_str)
+        .await
+}
+
+/// Defs-accepting form of [`maintain_gsis_after_delete`], for callers that
+/// parse the definitions once per batch (BatchWriteItem).
+pub async fn maintain_gsis_after_delete_with_defs<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    gsi_defs: &[GsiDef],
+    table_pk_str: &str,
+    table_sk_str: &str,
+) -> Result<HashMap<String, f64>> {
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
-    for gsi in &gsi_defs {
+    for gsi in gsi_defs {
         ops.push(IndexWriteOp::DeleteGsi {
             table_name: table_name.to_string(),
             index_name: gsi.index_name.clone(),

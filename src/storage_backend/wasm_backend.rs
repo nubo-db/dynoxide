@@ -295,6 +295,27 @@ fn index_write_op_sql(op: &IndexWriteOp) -> (String, Vec<SqlParam<'_>>) {
             sql_builders::lsi_insert_sql(table_name, index_name),
             sql_builders::lsi_insert_params(pk, sk, base_pk, base_sk, item_json),
         ),
+        IndexWriteOp::DeleteVector {
+            table_name,
+            index_name,
+            table_pk,
+            table_sk,
+        } => sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk),
+        IndexWriteOp::InsertVector {
+            table_name,
+            index_name,
+            row,
+        } => (
+            sql_builders::vector_insert_sql(table_name, index_name),
+            sql_builders::vector_insert_params(
+                &row.table_pk,
+                &row.table_sk,
+                &row.hash_value,
+                &row.vector_json,
+                &row.filter_json,
+                &row.item_json,
+            ),
+        ),
     }
 }
 
@@ -693,6 +714,18 @@ impl StorageBackend for WasmBridgeBackend {
             })
             .collect();
         self.exec_batch(&sql, param_rows).await
+    }
+
+    async fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
+    ) -> Result<(), BackendError> {
+        let (sql, params) =
+            sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk);
+        self.exec(&sql, params).await
     }
 
     // --- GSI items -------------------------------------------------------

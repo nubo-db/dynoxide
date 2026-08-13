@@ -332,6 +332,16 @@ pub async fn execute<S: StorageBackend>(
         super::lsi::maintain_lsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)
             .await?;
 
+        // Maintain vector index shadow tables (inside the transaction)
+        super::vector_index::maintain_vector_indexes_after_delete(
+            storage,
+            &request.table_name,
+            &meta,
+            &pk,
+            &sk,
+        )
+        .await?;
+
         // Parse the old item once, here, for the stream record and the response.
         let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
 

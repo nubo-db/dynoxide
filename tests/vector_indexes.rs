@@ -1812,3 +1812,1307 @@ fn table_without_vector_indexes_reports_none() {
     let body = serde_json::to_string(&desc).unwrap();
     assert!(!body.contains("VectorIndexes"));
 }
+
+// ---------------------------------------------------------------------------
+// Write-path index maintenance: live writes keep the shadow tables correct
+// (f32 copies, silent de-indexing, captured write validation)
+// ---------------------------------------------------------------------------
+
+/// A table named `table` with one 3-dim COSINE index named `vix` over
+/// `embedding`, no SearchSchema.
+async fn create_vector_table(storage: &Storage, table: &str) {
+    let req: CreateTableRequest =
+        serde_json::from_value(base_request(table, json!([vix_json("vix")]))).unwrap();
+    dynoxide::actions::create_table::execute(storage, req)
+        .await
+        .unwrap();
+}
+
+/// As [`create_vector_table`], but with a SearchSchema declaring `tenant` as
+/// the HASH attribute (declared `S` in AttributeDefinitions).
+async fn create_hash_schema_vector_table(storage: &Storage, table: &str) {
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": table,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "tenant", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{
+            "IndexName": "vix",
+            "VectorAttribute": {"AttributeName": "embedding"},
+            "SearchSchema": [
+                {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+            ],
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    }))
+    .unwrap();
+    dynoxide::actions::create_table::execute(storage, req)
+        .await
+        .unwrap();
+}
+
+/// Attempt a PutItem, returning the result instead of unwrapping.
+async fn try_put_raw_item(
+    storage: &Storage,
+    table: &str,
+    item: serde_json::Value,
+) -> dynoxide::Result<()> {
+    let req = serde_json::from_value(json!({
+        "TableName": table,
+        "Item": item,
+    }))
+    .unwrap();
+    dynoxide::actions::put_item::execute(storage, req)
+        .await
+        .map(|_| ())
+}
+
+/// The single shadow row's (hash_value, vector_json, item_json).
+fn shadow_row(storage: &Storage, shadow_table: &str) -> (String, String, String) {
+    storage
+        .conn()
+        .query_row(
+            &format!("SELECT hash_value, vector_json, item_json FROM \"{shadow_table}\""),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_item_stores_f32_copy_and_base_keeps_full_precision() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecLive").await;
+
+    // 16777217 is the first integer f32 cannot represent: the index copy
+    // truncates to 16777216 while the base table keeps what was written
+    // (captured from real DynamoDB, eu-west-2, 2026-08-11). "1" reads back
+    // as "1.0" through the index copy.
+    put_raw_item(
+        &storage,
+        "VecLive",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "16777217"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    assert_eq!(shadow_row_count(&storage, "VecLive::vector::vix"), 1);
+    let (hash_value, vector_json, item_json) = shadow_row(&storage, "VecLive::vector::vix");
+    assert_eq!(hash_value, "");
+    assert_eq!(vector_json, "[16777216.0,1.0,0.0]");
+    let item: serde_json::Value = serde_json::from_str(&item_json).unwrap();
+    assert_eq!(
+        item["embedding"],
+        json!({"L": [{"N": "16777216.0"}, {"N": "1.0"}, {"N": "0.0"}]})
+    );
+
+    let base_json: String = storage
+        .conn()
+        .query_row("SELECT item_json FROM \"VecLive\"", [], |r| r.get(0))
+        .unwrap();
+    let base: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+    assert_eq!(
+        base["embedding"],
+        json!({"L": [{"N": "16777217"}, {"N": "1"}, {"N": "0"}]})
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_item_overwrite_replaces_the_shadow_row() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecOver").await;
+
+    put_raw_item(
+        &storage,
+        "VecOver",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecOver",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    assert_eq!(shadow_row_count(&storage, "VecOver::vector::vix"), 1);
+    let (_, vector_json, _) = shadow_row(&storage, "VecOver::vector::vix");
+    assert_eq!(vector_json, "[0.0,1.0,0.0]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_item_removes_the_shadow_row() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecDel").await;
+
+    put_raw_item(
+        &storage,
+        "VecDel",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    assert_eq!(shadow_row_count(&storage, "VecDel::vector::vix"), 1);
+
+    let req = serde_json::from_value(json!({
+        "TableName": "VecDel",
+        "Key": {"pk": {"S": "a"}}
+    }))
+    .unwrap();
+    dynoxide::actions::delete_item::execute(&storage, req)
+        .await
+        .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecDel::vector::vix"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecDel"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_item_remove_deindexes_and_restore_reindexes() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecUpd").await;
+
+    put_raw_item(
+        &storage,
+        "VecUpd",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    assert_eq!(shadow_row_count(&storage, "VecUpd::vector::vix"), 1);
+
+    // REMOVE de-indexes the item; the base item survives without the
+    // attribute (captured from real DynamoDB, eu-west-2, 2026-08-11).
+    let remove = serde_json::from_value(json!({
+        "TableName": "VecUpd",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "REMOVE embedding"
+    }))
+    .unwrap();
+    dynoxide::actions::update_item::execute(&storage, remove)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecUpd::vector::vix"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecUpd"), 1);
+
+    // Restoring the attribute re-indexes the item.
+    let restore = serde_json::from_value(json!({
+        "TableName": "VecUpd",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET embedding = :v",
+        "ExpressionAttributeValues": {
+            ":v": {"L": [{"N": "0"}, {"N": "0"}, {"N": "1"}]}
+        }
+    }))
+    .unwrap();
+    dynoxide::actions::update_item::execute(&storage, restore)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecUpd::vector::vix"), 1);
+    let (_, vector_json, _) = shadow_row(&storage, "VecUpd::vector::vix");
+    assert_eq!(vector_json, "[0.0,0.0,1.0]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn items_missing_hash_or_vector_attribute_write_without_rows() {
+    let storage = Storage::memory().unwrap();
+    create_hash_schema_vector_table(&storage, "VecSparse").await;
+
+    // Valid vector but no HASH attribute: writes fine, no row (captured from
+    // real DynamoDB, eu-west-2, 2026-08-11: accepted, unreachable through the
+    // HASH-schema index).
+    put_raw_item(
+        &storage,
+        "VecSparse",
+        json!({
+            "pk": {"S": "no-hash"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    // HASH present but no vector attribute: writes fine, no row.
+    put_raw_item(
+        &storage,
+        "VecSparse",
+        json!({
+            "pk": {"S": "no-vector"},
+            "tenant": {"S": "acme"}
+        }),
+    )
+    .await;
+    assert_eq!(shadow_row_count(&storage, "VecSparse::vector::vix"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecSparse"), 2);
+
+    // Both present: indexed, with the HASH value in its key-string encoding.
+    put_raw_item(
+        &storage,
+        "VecSparse",
+        json!({
+            "pk": {"S": "both"},
+            "tenant": {"S": "acme"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    assert_eq!(shadow_row_count(&storage, "VecSparse::vector::vix"), 1);
+    let (hash_value, _, _) = shadow_row(&storage, "VecSparse::vector::vix");
+    assert_eq!(hash_value, "S:acme");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ttl_sweep_deindexes_expired_items() {
+    use dynoxide::actions::update_time_to_live::{
+        TimeToLiveSpecification, UpdateTimeToLiveRequest,
+    };
+
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecTtl").await;
+    dynoxide::actions::update_time_to_live::execute(
+        &storage,
+        UpdateTimeToLiveRequest {
+            table_name: "VecTtl".to_string(),
+            time_to_live_specification: TimeToLiveSpecification {
+                attribute_name: "expires".to_string(),
+                enabled: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    // One long-expired item, one that never expires.
+    put_raw_item(
+        &storage,
+        "VecTtl",
+        json!({
+            "pk": {"S": "expired"},
+            "expires": {"N": "1000"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecTtl",
+        json!({
+            "pk": {"S": "alive"},
+            "expires": {"N": "99999999999"},
+            "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    assert_eq!(shadow_row_count(&storage, "VecTtl::vector::vix"), 2);
+
+    let deleted = dynoxide::ttl::sweep_expired_items(&storage).await.unwrap();
+    assert_eq!(deleted, 1);
+    assert_eq!(shadow_row_count(&storage, "VecTtl"), 1);
+    assert_eq!(shadow_row_count(&storage, "VecTtl::vector::vix"), 1);
+    let (_, vector_json, _) = shadow_row(&storage, "VecTtl::vector::vix");
+    assert_eq!(vector_json, "[0.0,1.0,0.0]");
+}
+
+// ---------------------------------------------------------------------------
+// Captured write-validation errors: each rejection is wholesale, leaving the
+// base table and the shadow table unchanged
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_wrong_dimension_count_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecDims").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecDims",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // Captured from real DynamoDB (eu-west-2, 2026-08-11): full stop after
+    // `invalid`, no stop before `IndexName`.
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid size for parameter embedding, \
+         Expected: 3, Actual: 2 IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecDims"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecDims::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_wrong_element_type_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecElem").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecElem",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"S": "x"}, {"N": "3"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // Captured from real DynamoDB (eu-west-2, 2026-08-11): the element
+    // position is zero-based, and a full stop precedes `IndexName`.
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid type for parameter embedding[1], \
+         Expected: 32-bit floating point number, Actual: S. IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecElem"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecElem::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_non_list_vector_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecList").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecList",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"S": "not-a-list"}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // Captured from real DynamoDB (eu-west-2, 2026-08-11): no stop before
+    // `IndexName` on this form.
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid type for parameter embedding, \
+         Expected: 32-bit floating point number list IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecList"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecList::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_out_of_range_element_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecRange").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecRange",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1E+39"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12):
+    // parameter path and raw value interpolated, scientific-notation bounds
+    // exactly as shown.
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid value for parameter embedding[0], \
+         Value: 1E+39 is outside valid range [-3.4028235E38, 3.4028235E38]. IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecRange"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecRange::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_empty_string_hash_value_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_hash_schema_vector_table(&storage, "VecEmptyHash").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecEmptyHash",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"S": ""},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // The classic secondary-index empty-string message with the
+    // IndexName/IndexKey suffixes (captured eu-west-2, 2026-08-11).
+    assert_eq!(
+        err,
+        "One or more parameter values are not valid. A value specified for a secondary \
+         index key is not supported. The AttributeValue for a key attribute cannot \
+         contain an empty string value. IndexName: vix, IndexKey: tenant"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecEmptyHash"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecEmptyHash::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_type_mismatched_hash_value_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_hash_schema_vector_table(&storage, "VecHashType").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecHashType",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"N": "7"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12):
+    // full stop after `invalid`, matching the write-path family.
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Attribute 'tenant' type mismatch. \
+         Expected: S, Actual: N. IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecHashType"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecHashType::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_item_setting_invalid_vector_rejected_and_state_unchanged() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecUpdBad").await;
+
+    put_raw_item(
+        &storage,
+        "VecUpdBad",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    let update = serde_json::from_value(json!({
+        "TableName": "VecUpdBad",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET embedding = :v",
+        "ExpressionAttributeValues": {
+            ":v": {"L": [{"N": "1"}, {"N": "2"}]}
+        }
+    }))
+    .unwrap();
+    let err = dynoxide::actions::update_item::execute(&storage, update)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid size for parameter embedding, \
+         Expected: 3, Actual: 2 IndexName: vix"
+    );
+
+    // The base item and the shadow row both keep their pre-update state.
+    let base_json: String = storage
+        .conn()
+        .query_row("SELECT item_json FROM \"VecUpdBad\"", [], |r| r.get(0))
+        .unwrap();
+    let base: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+    assert_eq!(
+        base["embedding"],
+        json!({"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]})
+    );
+    let (_, vector_json, _) = shadow_row(&storage, "VecUpdBad::vector::vix");
+    assert_eq!(vector_json, "[1.0,0.0,0.0]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backfill_skipped_item_rejected_when_re_put_while_index_exists() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecAsym").await;
+
+    // Written before any index exists: accepted.
+    put_raw_item(
+        &storage,
+        "VecAsym",
+        json!({
+            "pk": {"S": "short"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+        }),
+    )
+    .await;
+
+    // Backfill sparse-skips the wrong-dimension item (captured from real
+    // DynamoDB, eu-west-2 and us-east-1, 2026-08-12).
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecAsym",
+            "VectorIndexUpdates": [{"Create": vix_json("vix")}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecAsym::vector::vix"), 0);
+
+    // The captured asymmetry: the same item backfill skipped is rejected if
+    // re-put while the index exists.
+    let err = try_put_raw_item(
+        &storage,
+        "VecAsym",
+        json!({
+            "pk": {"S": "short"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid size for parameter embedding, \
+         Expected: 3, Actual: 2 IndexName: vix"
+    );
+
+    // The pre-existing item survives the rejection untouched.
+    assert_eq!(shadow_row_count(&storage, "VecAsym"), 1);
+    assert_eq!(shadow_row_count(&storage, "VecAsym::vector::vix"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// BatchWriteItem, TransactWriteItems, and multi-index behaviour
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_write_item_maintains_vector_indexes_like_put_item() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecBatch").await;
+
+    let put_batch = serde_json::from_value(json!({
+        "RequestItems": {
+            "VecBatch": [
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "a"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }}},
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "b"},
+                    "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+                }}}
+            ]
+        }
+    }))
+    .unwrap();
+    dynoxide::actions::batch_write_item::execute(&storage, put_batch)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecBatch::vector::vix"), 2);
+
+    let delete_batch = serde_json::from_value(json!({
+        "RequestItems": {
+            "VecBatch": [
+                {"DeleteRequest": {"Key": {"pk": {"S": "a"}}}}
+            ]
+        }
+    }))
+    .unwrap();
+    dynoxide::actions::batch_write_item::execute(&storage, delete_batch)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecBatch::vector::vix"), 1);
+    let (_, vector_json, _) = shadow_row(&storage, "VecBatch::vector::vix");
+    assert_eq!(vector_json, "[0.0,1.0,0.0]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_write_with_invalid_vector_rejects_before_any_write() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecBatchBad").await;
+
+    let batch = serde_json::from_value(json!({
+        "RequestItems": {
+            "VecBatchBad": [
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "valid"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }}},
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "invalid"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+                }}}
+            ]
+        }
+    }))
+    .unwrap();
+    let err = dynoxide::actions::batch_write_item::execute(&storage, batch)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid size for parameter embedding, \
+         Expected: 3, Actual: 2 IndexName: vix"
+    );
+    // Validation runs before any write, so the valid sibling landed nowhere.
+    assert_eq!(shadow_row_count(&storage, "VecBatchBad"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecBatchBad::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transact_write_items_maintains_vector_indexes_like_put_item() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecTx").await;
+
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [
+            {"Put": {
+                "TableName": "VecTx",
+                "Item": {
+                    "pk": {"S": "a"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }
+            }},
+            {"Put": {
+                "TableName": "VecTx",
+                "Item": {
+                    "pk": {"S": "b"},
+                    "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+                }
+            }}
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecTx::vector::vix"), 2);
+
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [
+            {"Delete": {
+                "TableName": "VecTx",
+                "Key": {"pk": {"S": "a"}}
+            }}
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecTx::vector::vix"), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transact_rollback_leaves_no_shadow_row() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecTxRb").await;
+
+    // The first put is valid; the second fails its condition (nothing exists
+    // at that key), cancelling the transaction. The first put's shadow row
+    // must roll back with its base write.
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [
+            {"Put": {
+                "TableName": "VecTxRb",
+                "Item": {
+                    "pk": {"S": "a"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }
+            }},
+            {"Put": {
+                "TableName": "VecTxRb",
+                "Item": {"pk": {"S": "b"}},
+                "ConditionExpression": "attribute_exists(pk)"
+            }}
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap_err();
+    assert_eq!(shadow_row_count(&storage, "VecTxRb"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecTxRb::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_valid_for_one_index_and_invalid_for_another_rejects_wholesale() {
+    let storage = Storage::memory().unwrap();
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecMulti",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [
+            {
+                "IndexName": "vixa",
+                "VectorAttribute": {"AttributeName": "veca"},
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            },
+            {
+                "IndexName": "vixb",
+                "VectorAttribute": {"AttributeName": "vecb"},
+                "Dimensions": 2,
+                "DistanceFunction": "EUCLIDEAN",
+                "Projection": {"ProjectionType": "ALL"}
+            }
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::create_table::execute(&storage, req)
+        .await
+        .unwrap();
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecMulti",
+        json!({
+            "pk": {"S": "a"},
+            "veca": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]},
+            "vecb": {"L": [{"N": "1"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid size for parameter vecb, \
+         Expected: 2, Actual: 1 IndexName: vixb"
+    );
+    // The rejection is wholesale: nothing lands in the base table or in
+    // either shadow table, including the index the write was valid for.
+    assert_eq!(shadow_row_count(&storage, "VecMulti"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecMulti::vector::vixa"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecMulti::vector::vixb"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// PartiQL write paths
+// ---------------------------------------------------------------------------
+
+/// Run a PartiQL statement against the storage, returning the result.
+async fn exec_partiql(
+    storage: &Storage,
+    statement: &str,
+    parameters: Vec<dynoxide::types::AttributeValue>,
+) -> dynoxide::Result<dynoxide::actions::execute_statement::ExecuteStatementResponse> {
+    dynoxide::actions::execute_statement::execute(
+        storage,
+        dynoxide::actions::execute_statement::ExecuteStatementRequest {
+            statement: statement.to_string(),
+            parameters: if parameters.is_empty() {
+                None
+            } else {
+                Some(parameters)
+            },
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// A three-element vector as a parameter value.
+fn vector_param(a: &str, b: &str, c: &str) -> dynoxide::types::AttributeValue {
+    serde_json::from_value(json!({"L": [{"N": a}, {"N": b}, {"N": c}]})).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partiql_insert_indexes_a_valid_vector() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecPqIns").await;
+
+    exec_partiql(
+        &storage,
+        "INSERT INTO \"VecPqIns\" VALUE {'pk': 'a', 'embedding': ?}",
+        vec![vector_param("1", "0", "0")],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecPqIns::vector::vix"), 1);
+    let (_, vector_json, _) = shadow_row(&storage, "VecPqIns::vector::vix");
+    assert_eq!(vector_json, "[1.0,0.0,0.0]");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partiql_update_refreshes_the_shadow_row() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecPqUpd").await;
+
+    put_raw_item(
+        &storage,
+        "VecPqUpd",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    // A vector change through PartiQL UPDATE replaces the shadow row's copy.
+    exec_partiql(
+        &storage,
+        "UPDATE \"VecPqUpd\" SET embedding = ? WHERE pk = 'a'",
+        vec![vector_param("0", "1", "0")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecPqUpd::vector::vix"), 1);
+    let (_, vector_json, _) = shadow_row(&storage, "VecPqUpd::vector::vix");
+    assert_eq!(vector_json, "[0.0,1.0,0.0]");
+
+    // A non-vector change refreshes the ALL-projection item copy too.
+    exec_partiql(
+        &storage,
+        "UPDATE \"VecPqUpd\" SET note = 'touched' WHERE pk = 'a'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecPqUpd::vector::vix"), 1);
+    let (_, vector_json, item_json) = shadow_row(&storage, "VecPqUpd::vector::vix");
+    assert_eq!(vector_json, "[0.0,1.0,0.0]");
+    let item: serde_json::Value = serde_json::from_str(&item_json).unwrap();
+    assert_eq!(item["note"], json!({"S": "touched"}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partiql_delete_removes_the_shadow_row() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecPqDel").await;
+
+    put_raw_item(
+        &storage,
+        "VecPqDel",
+        json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    assert_eq!(shadow_row_count(&storage, "VecPqDel::vector::vix"), 1);
+
+    exec_partiql(&storage, "DELETE FROM \"VecPqDel\" WHERE pk = 'a'", vec![])
+        .await
+        .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecPqDel::vector::vix"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecPqDel"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partiql_insert_with_invalid_vector_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecPqBad").await;
+
+    let wrong_dims: dynoxide::types::AttributeValue =
+        serde_json::from_value(json!({"L": [{"N": "1"}, {"N": "2"}]})).unwrap();
+    let err = exec_partiql(
+        &storage,
+        "INSERT INTO \"VecPqBad\" VALUE {'pk': 'a', 'embedding': ?}",
+        vec![wrong_dims],
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Invalid size for parameter embedding, \
+         Expected: 3, Actual: 2 IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecPqBad"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecPqBad::vector::vix"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Changed-value gating, imports, and further captured validations
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn unrelated_update_leaves_backfill_skipped_item_unindexed() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecGate").await;
+
+    // Written before any index exists, then sparse-skipped by the backfill.
+    put_raw_item(
+        &storage,
+        "VecGate",
+        json!({
+            "pk": {"S": "short"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+        }),
+    )
+    .await;
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecGate",
+            "VectorIndexUpdates": [{"Create": vix_json("vix")}]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecGate::vector::vix"), 0);
+
+    // An update that never touches the vector attribute must not re-reject
+    // the pre-existing invalid value, and the item stays unindexed.
+    let update = serde_json::from_value(json!({
+        "TableName": "VecGate",
+        "Key": {"pk": {"S": "short"}},
+        "UpdateExpression": "SET note = :n",
+        "ExpressionAttributeValues": {":n": {"S": "touched"}}
+    }))
+    .unwrap();
+    dynoxide::actions::update_item::execute(&storage, update)
+        .await
+        .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecGate::vector::vix"), 0);
+    let base_json: String = storage
+        .conn()
+        .query_row("SELECT item_json FROM \"VecGate\"", [], |r| r.get(0))
+        .unwrap();
+    let base: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+    assert_eq!(base["note"], json!({"S": "touched"}));
+    assert_eq!(base["embedding"], json!({"L": [{"N": "1"}, {"N": "2"}]}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn import_sparse_skips_invalid_vector_values() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecImp").await;
+
+    // Imports are backfill-shaped: the wrong-dimension item lands in the base
+    // table with no shadow row, instead of failing the whole import the way a
+    // live write rejects.
+    let items: Vec<dynoxide::types::Item> = vec![
+        serde_json::from_value(json!({
+            "pk": {"S": "good"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }))
+        .unwrap(),
+        serde_json::from_value(json!({
+            "pk": {"S": "short"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+        }))
+        .unwrap(),
+    ];
+    let res = dynoxide::actions::import_items::execute(
+        &storage,
+        "VecImp",
+        items,
+        &dynoxide::ImportOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.items_imported, 2);
+
+    assert_eq!(shadow_row_count(&storage, "VecImp"), 2);
+    assert_eq!(shadow_row_count(&storage, "VecImp::vector::vix"), 1);
+    let table_pk: String = storage
+        .conn()
+        .query_row("SELECT table_pk FROM \"VecImp::vector::vix\"", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(table_pk, "S:good");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_import_with_intra_batch_duplicate_leaves_no_ghost_row() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecImpDup").await;
+
+    // The fresh-import fast path skips index deletes, so without dedupe the
+    // first occurrence's shadow row would survive the second occurrence's
+    // overwrite of the base row. The last occurrence wins wholesale.
+    let items: Vec<dynoxide::types::Item> = vec![
+        serde_json::from_value(json!({
+            "pk": {"S": "a"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }))
+        .unwrap(),
+        serde_json::from_value(json!({"pk": {"S": "a"}})).unwrap(),
+    ];
+    dynoxide::actions::import_items::execute_skip_gsi_deletes(
+        &storage,
+        "VecImpDup",
+        items,
+        &dynoxide::ImportOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecImpDup"), 1);
+    assert_eq!(shadow_row_count(&storage, "VecImpDup::vector::vix"), 0);
+    let base_json: String = storage
+        .conn()
+        .query_row("SELECT item_json FROM \"VecImpDup\"", [], |r| r.get(0))
+        .unwrap();
+    let base: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+    assert!(
+        base.get("embedding").is_none(),
+        "the last occurrence (without the vector) must own the base row, got: {base}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_setting_empty_string_hash_value_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_hash_schema_vector_table(&storage, "VecUpdEmptyHash").await;
+
+    put_raw_item(
+        &storage,
+        "VecUpdEmptyHash",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"S": "acme"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    let update = serde_json::from_value(json!({
+        "TableName": "VecUpdEmptyHash",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET tenant = :t",
+        "ExpressionAttributeValues": {":t": {"S": ""}}
+    }))
+    .unwrap();
+    let err = dynoxide::actions::update_item::execute(&storage, update)
+        .await
+        .unwrap_err()
+        .to_string();
+    // The update-expression form drops the IndexName/IndexKey suffix
+    // (captured eu-west-2 and us-east-1, 2026-08-13, byte-identical).
+    assert_eq!(
+        err,
+        "One or more parameter values are not valid. The update expression attempted to \
+         update a secondary index key to a value that is not supported. The AttributeValue \
+         for a key attribute cannot contain an empty string value."
+    );
+
+    // The shadow row keeps its pre-update state.
+    assert_eq!(
+        shadow_row_count(&storage, "VecUpdEmptyHash::vector::vix"),
+        1
+    );
+    let (hash_value, _, _) = shadow_row(&storage, "VecUpdEmptyHash::vector::vix");
+    assert_eq!(hash_value, "S:acme");
+}
+
+/// As [`create_hash_schema_vector_table`], but with `tenant` declared `B` in
+/// AttributeDefinitions.
+async fn create_binary_hash_schema_vector_table(storage: &Storage, table: &str) {
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": table,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "tenant", "AttributeType": "B"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{
+            "IndexName": "vix",
+            "VectorAttribute": {"AttributeName": "embedding"},
+            "SearchSchema": [
+                {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+            ],
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    }))
+    .unwrap();
+    dynoxide::actions::create_table::execute(storage, req)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_empty_binary_hash_value_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_binary_hash_schema_vector_table(&storage, "VecEmptyBin").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecEmptyBin",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"B": ""},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // The binary analogue of the empty-string rejection, suffixes included
+    // (captured eu-west-2 and us-east-1, 2026-08-13, byte-identical).
+    assert_eq!(
+        err,
+        "One or more parameter values are not valid. A value specified for a secondary \
+         index key is not supported. The AttributeValue for a key attribute cannot \
+         contain an empty binary value. IndexName: vix, IndexKey: tenant"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecEmptyBin"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecEmptyBin::vector::vix"), 0);
+}
+
+/// A table whose SearchSchema carries a HASH element (`tenant`, declared `S`)
+/// and an INLINE_FILTER element (`category`, declared `S`).
+async fn create_filter_schema_vector_table(storage: &Storage, table: &str) {
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": table,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "tenant", "AttributeType": "S"},
+            {"AttributeName": "category", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{
+            "IndexName": "vix",
+            "VectorAttribute": {"AttributeName": "embedding"},
+            "SearchSchema": [
+                {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"},
+                {"AttributeName": "category", "SearchSchemaElementType": "INLINE_FILTER"}
+            ],
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    }))
+    .unwrap();
+    dynoxide::actions::create_table::execute(storage, req)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_type_mismatched_inline_filter_value_rejected_with_captured_string() {
+    let storage = Storage::memory().unwrap();
+    create_filter_schema_vector_table(&storage, "VecFilterType").await;
+
+    let err = try_put_raw_item(
+        &storage,
+        "VecFilterType",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"S": "acme"},
+            "category": {"N": "5"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    // INLINE_FILTER elements are type-checked at write, in the same format as
+    // the HASH mismatch (captured eu-west-2 and us-east-1, 2026-08-13).
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid. Attribute 'category' type mismatch. \
+         Expected: S, Actual: N. IndexName: vix"
+    );
+    assert_eq!(shadow_row_count(&storage, "VecFilterType"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecFilterType::vector::vix"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_backfill_skips_empty_binary_and_mismatched_filter_values() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecFillSkips").await;
+
+    put_raw_item(
+        &storage,
+        "VecFillSkips",
+        json!({
+            "pk": {"S": "scoped"},
+            "tenant": {"B": "AQ=="},
+            "category": {"S": "x"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    // An empty-binary HASH value and a type-mismatched INLINE_FILTER value
+    // are both rejected by a live write once the index exists (captured
+    // eu-west-2 and us-east-1, 2026-08-13), so backfill skips both rows.
+    put_raw_item(
+        &storage,
+        "VecFillSkips",
+        json!({
+            "pk": {"S": "empty-bin"},
+            "tenant": {"B": ""},
+            "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecFillSkips",
+        json!({
+            "pk": {"S": "bad-filter"},
+            "tenant": {"B": "AQ=="},
+            "category": {"N": "5"},
+            "embedding": {"L": [{"N": "0"}, {"N": "0"}, {"N": "1"}]}
+        }),
+    )
+    .await;
+
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecFillSkips",
+            "AttributeDefinitions": [
+                {"AttributeName": "tenant", "AttributeType": "B"},
+                {"AttributeName": "category", "AttributeType": "S"}
+            ],
+            "VectorIndexUpdates": [{"Create": {
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "SearchSchema": [
+                    {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"},
+                    {"AttributeName": "category", "SearchSchemaElementType": "INLINE_FILTER"}
+                ],
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecFillSkips::vector::vix"), 1);
+    let table_pk: String = storage
+        .conn()
+        .query_row(
+            "SELECT table_pk FROM \"VecFillSkips::vector::vix\"",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_pk, "S:scoped");
+}

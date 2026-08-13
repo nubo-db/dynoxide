@@ -207,6 +207,16 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn delete_vector_item(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _table_pk: &str,
+        _table_sk: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn insert_gsi_item(
         &self,
         _table_name: &str,

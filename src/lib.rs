@@ -876,13 +876,12 @@ impl Database<RusqliteBackend> {
             },
             |cached| {
                 // The replay recomputes a transactional read cost against the
-                // item sizes (4KB read granularity, diverging from the first
-                // call's 1KB-granular write above 1KB) and carries over the
-                // cached item collection metrics.
+                // image sizes the first call recorded (4KB read granularity,
+                // diverging from that call's 1KB-granular write above 1KB) and
+                // carries over its item collection metrics.
                 actions::transact_write_items::replay_response(
-                    &request.transact_items,
+                    cached,
                     &request.return_consumed_capacity,
-                    cached.item_collection_metrics.clone(),
                 )
             },
         )

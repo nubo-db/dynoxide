@@ -100,6 +100,18 @@ the ones worth knowing.
 | **LSI projection ALL / KEYS_ONLY / INCLUDE** | Supported |
 | **LSI Query routing** | Supported |
 | **LSI Scan routing** | Supported |
+| **Per-LSI ConsumedCapacity (INDEXES mode)** | Supported |
+
+Index write capacity is charged against the change to what an index stores, as
+DynamoDB does, rather than against the item the write leaves behind. A write that
+leaves an index's stored view untouched reports no arm for that index at all,
+moving an index key costs two writes, and removing one costs a single delete.
+Sizing is on the projected index entry, so an attribute the index does not
+project costs it nothing.
+
+`TransactWriteItems` and PartiQL writes are the exception: both report table-level
+capacity only, with no per-index breakdown under `INDEXES`. Real DynamoDB reports
+one.
 
 ---
 

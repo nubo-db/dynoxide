@@ -26,7 +26,7 @@ jobs:
         # is tee's, so a bench that dies partway leaves a truncated file and
         # still reports success.
         shell: bash
-        run: cd benchmarks && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
+        run: cd benchmarks && rm -rf target/criterion && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
 
       - name: Compare against recent baselines
         id: compare

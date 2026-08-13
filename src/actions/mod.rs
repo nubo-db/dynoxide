@@ -15,6 +15,7 @@ pub mod get_shard_iterator;
 pub(crate) mod gsi;
 pub(crate) mod helpers;
 pub mod import_items;
+pub(crate) mod index_capacity;
 pub mod list_streams;
 pub mod list_tables;
 pub mod list_tags_of_resource;

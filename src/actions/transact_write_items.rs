@@ -382,32 +382,27 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
         .put_item_with_hash(&put.table_name, &pk, &sk, &item_json, size, &hash_prefix)
         .await?;
 
-    let _ = super::gsi::maintain_gsis_after_write(
-        storage,
-        &put.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )
-    .await?;
+    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
 
-    super::lsi::maintain_lsis_after_write(
-        storage,
-        &put.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )
-    .await?;
+    let target = super::gsi::IndexWrite {
+        table_name: &put.table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    // Transactional capacity is computed per table from the item sizes, so the
+    // per-index units are discarded here.
+    let _ =
+        super::gsi::maintain_gsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
+            .await?;
+
+    let _ =
+        super::lsi::maintain_lsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
+            .await?;
 
     // Record stream event
-    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
     Ok(())
@@ -506,32 +501,27 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
         .put_item_with_hash(&update.table_name, &pk, &sk, &item_json, size, &hash_prefix)
         .await?;
 
-    let _ = super::gsi::maintain_gsis_after_write(
-        storage,
-        &update.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )
-    .await?;
+    let old_item: Option<Item> = old_for_stream.and_then(|j| serde_json::from_str(&j).ok());
 
-    super::lsi::maintain_lsis_after_write(
-        storage,
-        &update.table_name,
-        &meta,
-        &pk,
-        &sk,
-        &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
-    )
-    .await?;
+    let target = super::gsi::IndexWrite {
+        table_name: &update.table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    // Transactional capacity is computed per table from the item sizes, so the
+    // per-index units are discarded here.
+    let _ =
+        super::gsi::maintain_gsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
+            .await?;
+
+    let _ =
+        super::lsi::maintain_lsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
+            .await?;
 
     // Record stream event
-    let old_item: Option<Item> = old_for_stream.and_then(|j| serde_json::from_str(&j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
     Ok(())
@@ -582,12 +572,24 @@ async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete)
     tracker.check_unused()?;
 
     let old_json = storage.delete_item(&delete.table_name, &pk, &sk).await?;
-    let _ = super::gsi::maintain_gsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk)
-        .await?;
-    super::lsi::maintain_lsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk).await?;
+    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
+
+    let target = super::gsi::IndexWrite {
+        table_name: &delete.table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    // Transactional capacity is computed per table from the item sizes, so the
+    // per-index units are discarded here.
+    let _ =
+        super::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref()).await?;
+    let _ =
+        super::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref()).await?;
 
     // Record stream event
-    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
     if old_item.is_some() {
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }

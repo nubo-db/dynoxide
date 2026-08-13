@@ -484,6 +484,7 @@ async fn execute_inner<S: StorageBackend>(
             size,
         },
         gsi_units,
+        lsi_units,
     ) = helpers::with_write_transaction(storage, async {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -624,39 +625,32 @@ async fn execute_inner<S: StorageBackend>(
             )
             .await?;
 
+        // `old_item` is cloned after the key attributes are injected for the
+        // upsert case, so on a create-through-update it is a `{pk, sk}` image
+        // rather than an absent one. The index delta has to see genuine absence,
+        // so gate on whether a row was actually read back.
+        let prior_image = existing_json.is_some().then_some(&old_item);
+
+        let target = super::gsi::IndexWrite {
+            table_name: &request.table_name,
+            pk: &pk,
+            sk: &sk,
+            pk_attr: &key_schema.partition_key,
+            sk_attr: key_schema.sort_key.as_deref(),
+        };
+
         // Maintain GSI tables (inside the transaction)
-        let gsi_units = super::gsi::maintain_gsis_after_write(
-            storage,
-            &request.table_name,
-            &meta,
-            &pk,
-            &sk,
-            &item,
-            &key_schema.partition_key,
-            key_schema.sort_key.as_deref(),
-        )
-        .await?;
+        let gsi_units =
+            super::gsi::maintain_gsis_after_write(storage, &meta, &target, prior_image, &item)
+                .await?;
 
         // Maintain LSI tables (inside the transaction)
-        super::lsi::maintain_lsis_after_write(
-            storage,
-            &request.table_name,
-            &meta,
-            &pk,
-            &sk,
-            &item,
-            &key_schema.partition_key,
-            key_schema.sort_key.as_deref(),
-        )
-        .await?;
+        let lsi_units =
+            super::lsi::maintain_lsis_after_write(storage, &meta, &target, prior_image, &item)
+                .await?;
 
         // Record stream event (inside the transaction)
-        let old_for_stream = if existing_json.is_some() {
-            Some(&old_item)
-        } else {
-            None
-        };
-        crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item)).await?;
+        crate::streams::record_stream_event(storage, &meta, prior_image, Some(&item)).await?;
 
         Ok((
             UpdateWorkResult {
@@ -666,6 +660,7 @@ async fn execute_inner<S: StorageBackend>(
                 size,
             },
             gsi_units,
+            lsi_units,
         ))
     })
     .await?;
@@ -735,10 +730,11 @@ async fn execute_inner<S: StorageBackend>(
     )
     .await?;
 
-    let consumed_capacity = types::consumed_capacity_with_indexes(
+    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
         types::write_capacity_units(size),
         &gsi_units,
+        &lsi_units,
         &request.return_consumed_capacity,
     );
 

@@ -562,35 +562,37 @@ async fn execute_insert<S: StorageBackend>(
         .put_item_with_hash(table_name, &pk, &sk, &item_json, item_size, &hash_prefix)
         .await?;
 
-    // GSI maintenance
-    let table_sk_attr = key_schema.sort_key.as_deref();
+    let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+
+    let target = crate::actions::gsi::IndexWrite {
+        table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    // PartiQL reports capacity from the item size alone, so the per-index units
+    // are discarded here.
     let _ = crate::actions::gsi::maintain_gsis_after_write(
         storage,
-        table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema.partition_key,
-        table_sk_attr,
     )
     .await?;
 
-    // LSI maintenance
-    crate::actions::lsi::maintain_lsis_after_write(
+    let _ = crate::actions::lsi::maintain_lsis_after_write(
         storage,
-        table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema.partition_key,
-        table_sk_attr,
     )
     .await?;
 
     // Stream record
-    let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
     Ok(item_size)
@@ -719,39 +721,27 @@ async fn execute_update<S: StorageBackend>(
         )
         .await?;
 
-    // GSI maintenance
-    let table_sk_attr = key_schema.sort_key.as_deref();
-    let _ = crate::actions::gsi::maintain_gsis_after_write(
-        storage,
-        table_name,
-        &meta,
-        &pk_str,
-        &sk_str,
-        &item,
-        &key_schema.partition_key,
-        table_sk_attr,
-    )
-    .await?;
+    // `old_item` carries injected key attributes on a create-through-update, so
+    // genuine absence is decided by whether a row was read back.
+    let old_ref = existing_json.is_some().then_some(&old_item);
 
-    // LSI maintenance
-    crate::actions::lsi::maintain_lsis_after_write(
-        storage,
+    let target = crate::actions::gsi::IndexWrite {
         table_name,
-        &meta,
-        &pk_str,
-        &sk_str,
-        &item,
-        &key_schema.partition_key,
-        table_sk_attr,
-    )
-    .await?;
+        pk: &pk_str,
+        sk: &sk_str,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    // PartiQL reports capacity from the item size alone, so the per-index units
+    // are discarded here.
+    let _ = crate::actions::gsi::maintain_gsis_after_write(storage, &meta, &target, old_ref, &item)
+        .await?;
+
+    let _ = crate::actions::lsi::maintain_lsis_after_write(storage, &meta, &target, old_ref, &item)
+        .await?;
 
     // Stream record
-    let old_ref = if existing_json.is_some() {
-        Some(&old_item)
-    } else {
-        None
-    };
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
 
     // Build the RETURNING projection from the item's before/after states. The
@@ -960,19 +950,27 @@ async fn execute_delete<S: StorageBackend>(
     }
 
     let old_json = storage.delete_item(table_name, &pk_str, &sk_str).await?;
+    let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
 
-    // GSI maintenance
-    let _ = crate::actions::gsi::maintain_gsis_after_delete(
-        storage, table_name, &meta, &pk_str, &sk_str,
-    )
-    .await?;
+    let target = crate::actions::gsi::IndexWrite {
+        table_name,
+        pk: &pk_str,
+        sk: &sk_str,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
 
-    // LSI maintenance
-    crate::actions::lsi::maintain_lsis_after_delete(storage, table_name, &meta, &pk_str, &sk_str)
-        .await?;
+    // PartiQL reports capacity from the item size alone, so the per-index units
+    // are discarded here.
+    let _ =
+        crate::actions::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref())
+            .await?;
+
+    let _ =
+        crate::actions::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref())
+            .await?;
 
     // Stream record
-    let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
     if old_item.is_some() {
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }

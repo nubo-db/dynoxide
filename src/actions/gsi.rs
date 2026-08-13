@@ -8,6 +8,20 @@ use crate::storage_backend::{IndexWriteOp, StorageBackend};
 use crate::types::{GlobalSecondaryIndex, Item, KeyType, ProjectionType};
 use std::collections::HashMap;
 
+/// Where a write lands in the base table, and how the table's own keys are
+/// named. Shared by the GSI and LSI fan-out, which both need the key strings to
+/// address index rows and the key attribute names to rebuild the projected entry
+/// on either side of the write.
+pub struct IndexWrite<'a> {
+    pub table_name: &'a str,
+    /// The base table partition key, as the string index rows are addressed by.
+    pub pk: &'a str,
+    /// The base table sort key, empty for a table without one.
+    pub sk: &'a str,
+    pub pk_attr: &'a str,
+    pub sk_attr: Option<&'a str>,
+}
+
 /// Parsed index definition for convenient access. Used for both GSI and LSI,
 /// since the projected-item logic is identical.
 pub struct IndexDef {
@@ -137,17 +151,17 @@ pub fn build_index_item(
 
 /// Update all GSI tables after an item write (put/update).
 /// Handles both insert and update cases.
-/// Returns a map of GSI name to write capacity units consumed.
-#[allow(clippy::too_many_arguments)]
+///
+/// Returns a map of GSI name to write capacity units consumed. An index whose
+/// stored view the write leaves untouched is absent from the map rather than
+/// present and zeroed, so the response omits its arm entirely. `old_item` is the
+/// item as it stood before the write, or `None` when there was no item.
 pub async fn maintain_gsis_after_write<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     meta: &TableMetadata,
-    table_pk_str: &str,
-    table_sk_str: &str,
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
     item: &Item,
-    table_pk_attr: &str,
-    table_sk_attr: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
@@ -156,33 +170,39 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
     for gsi in &gsi_defs {
         // First, remove any existing GSI entry for this base table key
         ops.push(IndexWriteOp::DeleteGsi {
-            table_name: table_name.to_string(),
+            table_name: target.table_name.to_string(),
             index_name: gsi.index_name.clone(),
-            table_pk: table_pk_str.to_string(),
-            table_sk: table_sk_str.to_string(),
+            table_pk: target.pk.to_string(),
+            table_sk: target.sk.to_string(),
         });
 
         // Insert only when the item belongs in this index (sparse).
         if let Some((gsi_pk, gsi_sk)) = gsi.index_key_strings(item) {
-            let projected = build_index_item(item, gsi, table_pk_attr, table_sk_attr);
-            let projected_size = crate::types::item_size(&projected);
+            let projected = build_index_item(item, gsi, target.pk_attr, target.sk_attr);
             let item_json = serde_json::to_string(&projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
             ops.push(IndexWriteOp::InsertGsi {
-                table_name: table_name.to_string(),
+                table_name: target.table_name.to_string(),
                 index_name: gsi.index_name.clone(),
                 gsi_pk,
                 gsi_sk,
-                table_pk: table_pk_str.to_string(),
-                table_sk: table_sk_str.to_string(),
+                table_pk: target.pk.to_string(),
+                table_sk: target.sk.to_string(),
                 item_json,
             });
+        }
 
-            gsi_units.insert(
-                gsi.index_name.clone(),
-                crate::types::write_capacity_units(projected_size),
-            );
+        // Capacity is the change to what the index stores, so it is charged even
+        // when the item leaves the index and no insert is queued above.
+        if let Some(units) = super::index_capacity::index_write_units(
+            old_item,
+            Some(item),
+            gsi,
+            target.pk_attr,
+            target.sk_attr,
+        ) {
+            gsi_units.insert(gsi.index_name.clone(), units);
         }
     }
 
@@ -195,13 +215,15 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 }
 
 /// Remove an item from all GSI tables after a delete.
-/// Returns a map of GSI name to write capacity units consumed.
+///
+/// Returns a map of GSI name to write capacity units consumed. Only an index the
+/// deleted item was actually a member of is charged, sized on the entry it held.
+/// `old_item` is the deleted item, or `None` when the delete removed nothing.
 pub async fn maintain_gsis_after_delete<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     meta: &TableMetadata,
-    table_pk_str: &str,
-    table_sk_str: &str,
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
@@ -209,13 +231,21 @@ pub async fn maintain_gsis_after_delete<S: StorageBackend>(
 
     for gsi in &gsi_defs {
         ops.push(IndexWriteOp::DeleteGsi {
-            table_name: table_name.to_string(),
+            table_name: target.table_name.to_string(),
             index_name: gsi.index_name.clone(),
-            table_pk: table_pk_str.to_string(),
-            table_sk: table_sk_str.to_string(),
+            table_pk: target.pk.to_string(),
+            table_sk: target.sk.to_string(),
         });
-        // Delete operations consume 1 WCU minimum per GSI affected
-        gsi_units.insert(gsi.index_name.clone(), 1.0);
+
+        if let Some(units) = super::index_capacity::index_write_units(
+            old_item,
+            None,
+            gsi,
+            target.pk_attr,
+            target.sk_attr,
+        ) {
+            gsi_units.insert(gsi.index_name.clone(), units);
+        }
     }
 
     storage.apply_index_writes(&ops).await?;

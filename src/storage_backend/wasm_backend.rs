@@ -39,6 +39,7 @@ use crate::storage::{
 use crate::storage_backend::sql_builders::{self, SqlParam};
 use crate::storage_backend::{
     BackendError, BaseItemRow, Clock, GsiItemRow, IndexWriteOp, StorageBackend, SystemClock,
+    VectorItemRow,
 };
 use crate::types::Tag;
 
@@ -505,6 +506,16 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(&sql, params).await
     }
 
+    async fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let (sql, params) =
+            sql_builders::update_vector_index_definitions(table_name, vector_index_definitions);
+        self.exec(&sql, params).await
+    }
+
     async fn update_provisioned_throughput(
         &self,
         table_name: &str,
@@ -653,6 +664,35 @@ impl StorageBackend for WasmBridgeBackend {
     ) -> Result<(), BackendError> {
         let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);
         self.exec(&sql, params).await
+    }
+
+    async fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[VectorItemRow],
+    ) -> Result<(), BackendError> {
+        // Mirrors insert_gsi_items: build the SQL once, assemble every row's
+        // parameters, and make a single bridge crossing. Atomicity comes from
+        // the caller's open transaction.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sql = sql_builders::vector_insert_sql(table_name, index_name);
+        let param_rows = rows
+            .iter()
+            .map(|row| {
+                sql_builders::vector_insert_params(
+                    &row.table_pk,
+                    &row.table_sk,
+                    &row.hash_value,
+                    &row.vector_json,
+                    &row.filter_json,
+                    &row.item_json,
+                )
+            })
+            .collect();
+        self.exec_batch(&sql, param_rows).await
     }
 
     // --- GSI items -------------------------------------------------------

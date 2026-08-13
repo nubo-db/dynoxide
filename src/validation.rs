@@ -382,9 +382,12 @@ pub fn validate_gsi(
 
 /// Validate a single vector index definition.
 ///
-/// `position` is the index's 1-based position within the `VectorIndexes`
-/// list, threaded into the formulaic request-model constraint messages so a
-/// later entry reports its real position.
+/// `member_path` is the request-model path of the index's member, threaded
+/// into the formulaic constraint messages: CreateTable passes
+/// `vectorIndexes.N.member` with the entry's real 1-based position, and
+/// UpdateTable passes `vectorIndexUpdates.1.member.create` (a call carries at
+/// most one create action). The UpdateTable path shape is captured from real
+/// DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
 ///
 /// `request_definitions` must be the AttributeDefinitions declared in the
 /// current request: SearchSchema attributes must be (re)declared there. The
@@ -394,19 +397,19 @@ pub fn validate_gsi(
 pub fn validate_vector_index(
     vix: &crate::types::VectorIndex,
     request_definitions: &[AttributeDefinition],
-    position: usize,
+    member_path: &str,
 ) -> Result<()> {
     // Index name length (request-model constraint; minimum length 3)
     if vix.index_name.len() < 3 {
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'vectorIndexes.{position}.member.indexName' \
+            "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",
             vix.index_name
         )));
     }
     if vix.index_name.len() > 255 {
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'vectorIndexes.{position}.member.indexName' \
+            "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must have length less than or equal to 255",
             vix.index_name
         )));
@@ -419,7 +422,7 @@ pub fn validate_vector_index(
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     {
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'vectorIndexes.{position}.member.indexName' \
+            "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
             vix.index_name
         )));
@@ -431,7 +434,7 @@ pub fn validate_vector_index(
         other => {
             return Err(DynoxideError::ValidationException(format!(
                 "1 validation error detected: Value '{other}' at \
-                 'vectorIndexes.{position}.member.distanceFunction' failed to satisfy constraint: \
+                 '{member_path}.distanceFunction' failed to satisfy constraint: \
                  Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
             )));
         }
@@ -462,7 +465,7 @@ pub fn validate_vector_index(
                 other => {
                     return Err(DynoxideError::ValidationException(format!(
                         "1 validation error detected: Value '{other}' at \
-                         'vectorIndexes.{position}.member.searchSchema.{elem_position}.member.searchSchemaElementType' \
+                         '{member_path}.searchSchema.{elem_position}.member.searchSchemaElementType' \
                          failed to satisfy constraint: Member must satisfy enum value set: \
                          [HASH, INLINE_FILTER]"
                     )));

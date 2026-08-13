@@ -1144,6 +1144,45 @@ pub struct VectorIndex {
     pub distance_function: String,
 }
 
+/// The f32 values of a vector attribute value, or `None` when the value is
+/// not a valid vector for an index with `dimensions` elements: not a List,
+/// wrong element count, an element that is not a Number, or an element that
+/// is not finite after conversion to f32 (out-of-f32-range values overflow to
+/// infinity and are treated as invalid; real DynamoDB rejects them at write
+/// time, captured eu-west-2 and us-east-1, 2026-08-12).
+///
+/// Vector indexes hold f32 copies while the base table keeps full precision
+/// (captured from real DynamoDB, eu-west-2, 2026-08-11), so conversion
+/// happens here, where the index copy is derived.
+pub fn vector_f32_values(value: &AttributeValue, dimensions: u32) -> Option<Vec<f32>> {
+    let AttributeValue::L(elems) = value else {
+        return None;
+    };
+    if elems.len() != dimensions as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity(elems.len());
+    for elem in elems {
+        let AttributeValue::N(n) = elem else {
+            return None;
+        };
+        let v: f32 = n.parse().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        out.push(v);
+    }
+    Some(out)
+}
+
+/// Serialise an f32 for a vector index's number copy: shortest-decimal via
+/// serde_json's f32 formatter, which always keeps a fractional part ("1"
+/// stores as "1.0", matching how the index copy reads back from real
+/// DynamoDB; captured eu-west-2, 2026-08-11).
+pub fn f32_number_string(v: f32) -> String {
+    serde_json::to_string(&v).unwrap_or_else(|_| "0.0".to_string())
+}
+
 /// Provisioned throughput settings (stored but not enforced).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvisionedThroughput {

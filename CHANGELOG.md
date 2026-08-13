@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (Rust API):** the `StorageBackend` trait gained four required methods for vector index support: `create_vector_table` and `drop_vector_table` manage a vector index's physical shadow table, `update_vector_index_definitions` writes a table's stored vector index definitions, and `insert_vector_items` bulk-inserts backfill rows (taking the new public `VectorItemRow` struct). Backend implementations outside the crate must add all four; the bundled rusqlite and wasm backends already have them. The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
+
 ## [0.13.0] - 2026-07-30
 
 ### Added

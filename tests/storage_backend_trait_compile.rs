@@ -11,7 +11,9 @@ use dynoxide::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
     TableStats,
 };
-use dynoxide::storage_backend::{BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend};
+use dynoxide::storage_backend::{
+    BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, VectorItemRow,
+};
 use dynoxide::types::Tag;
 
 /// A type that satisfies [`StorageBackend`] with `unimplemented!()` bodies.
@@ -64,6 +66,14 @@ impl StorageBackend for TestBackend {
         _table_name: &str,
         _attribute_definitions: &str,
         _gsi_definitions: Option<&str>,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn update_vector_index_definitions(
+        &self,
+        _table_name: &str,
+        _vector_index_definitions: Option<&str>,
     ) -> Result<(), BackendError> {
         unimplemented!()
     }
@@ -184,6 +194,15 @@ impl StorageBackend for TestBackend {
         &self,
         _table_name: &str,
         _index_name: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn insert_vector_items(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _rows: &[VectorItemRow],
     ) -> Result<(), BackendError> {
         unimplemented!()
     }

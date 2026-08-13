@@ -4,7 +4,9 @@ use crate::actions::{gsi, helpers};
 use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
 use crate::streams;
-use crate::types::{AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, Projection};
+use crate::types::{
+    AttributeDefinition, GlobalSecondaryIndex, Item, KeySchemaElement, Projection, VectorIndex,
+};
 use crate::validation;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +21,12 @@ struct UpdateTableRequestRaw {
 
     #[serde(rename = "GlobalSecondaryIndexUpdates", default)]
     global_secondary_index_updates: Option<Vec<GlobalSecondaryIndexUpdate>>,
+
+    // Raw JSON so the create action's Dimensions can be normalised (fractional
+    // values truncate, over-range values clamp) before the typed parse, the
+    // same as the CreateTable path.
+    #[serde(rename = "VectorIndexUpdates", default)]
+    vector_index_updates: Option<serde_json::Value>,
 
     #[serde(rename = "StreamSpecification", default)]
     stream_specification: Option<StreamSpecification>,
@@ -44,6 +52,7 @@ pub struct UpdateTableRequest {
     pub table_name: String,
     pub attribute_definitions: Option<Vec<AttributeDefinition>>,
     pub global_secondary_index_updates: Option<Vec<GlobalSecondaryIndexUpdate>>,
+    pub vector_index_updates: Option<Vec<VectorIndexUpdate>>,
     pub stream_specification: Option<StreamSpecification>,
     pub deletion_protection_enabled: Option<bool>,
     pub provisioned_throughput: Option<serde_json::Value>,
@@ -95,10 +104,47 @@ impl<'de> serde::Deserialize<'de> for UpdateTableRequest {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
 
+        // Request-model constraint errors for the raw vector create actions,
+        // enveloped like CreateTable's collectors rather than surfacing raw
+        // serde errors. Real DynamoDB reports one envelope across index
+        // families, GSI entries before vector entries (captured eu-west-2 and
+        // us-east-1, 2026-08-12), so the GSI Update-action errors join in
+        // front here. The top-level ProvisionedThroughput family stays in the
+        // operation-layer envelope in validate_update_request, so a request
+        // invalid there and here gets this envelope alone; whether real
+        // DynamoDB folds that family in too is uncaptured.
+        if let Some(ref vix_val) = raw.vector_index_updates {
+            let mut vix_errors = Vec::new();
+            collect_vix_update_errors(vix_val, &mut vix_errors);
+            if !vix_errors.is_empty() {
+                let mut errors = Vec::new();
+                if let Some(ref gsi_updates) = raw.global_secondary_index_updates {
+                    collect_gsi_update_errors(gsi_updates, &mut errors);
+                }
+                errors.append(&mut vix_errors);
+                errors.truncate(10);
+                let msg = format!(
+                    "{} validation error{} detected: {}",
+                    errors.len(),
+                    if errors.len() == 1 { "" } else { "s" },
+                    errors.join("; ")
+                );
+                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+            }
+        }
+
+        let vector_index_updates = raw
+            .vector_index_updates
+            .as_ref()
+            .map(parse_vector_index_updates)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+
         Ok(UpdateTableRequest {
             table_name,
             attribute_definitions: raw.attribute_definitions,
             global_secondary_index_updates: raw.global_secondary_index_updates,
+            vector_index_updates,
             stream_specification: raw.stream_specification,
             deletion_protection_enabled: raw.deletion_protection_enabled,
             provisioned_throughput: raw.provisioned_throughput,
@@ -148,6 +194,77 @@ pub struct DeleteGsiAction {
     pub index_name: String,
 }
 
+/// One `VectorIndexUpdates` entry, modelled on [`GlobalSecondaryIndexUpdate`].
+/// Only Create and Delete actions exist: a vector index's configuration is
+/// immutable, so there is no Update action (captured from real DynamoDB,
+/// eu-west-2, 2026-08-11).
+#[derive(Debug, Default)]
+pub struct VectorIndexUpdate {
+    /// The create action carries a full vector index definition, the same
+    /// shape as a CreateTable `VectorIndexes` entry.
+    pub create: Option<VectorIndex>,
+    pub delete: Option<DeleteVectorIndexAction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteVectorIndexAction {
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+}
+
+/// Request-model constraint errors for `VectorIndexUpdates` create actions,
+/// mirroring CreateTable's `collect_vix_errors` with this operation's field
+/// paths: `vectorIndexUpdates.N.member.create.<field>` (captured from real
+/// DynamoDB, eu-west-2 and us-east-1, 2026-08-12).
+fn collect_vix_update_errors(val: &serde_json::Value, errors: &mut Vec<String>) {
+    let Some(arr) = val.as_array() else {
+        return;
+    };
+    for (i, elem) in arr.iter().enumerate().take(10) {
+        let Some(obj) = elem.as_object() else {
+            continue;
+        };
+        if let Some(create) = obj.get("Create").and_then(|v| v.as_object()) {
+            crate::actions::create_table::collect_vix_obj_errors(
+                create,
+                &format!("vectorIndexUpdates.{}.member.create", i + 1),
+                errors,
+            );
+        }
+    }
+}
+
+/// Parse the raw `VectorIndexUpdates` JSON into typed updates, normalising
+/// each create action's `Dimensions` the way the CreateTable path does so a
+/// fractional or over-range value cannot fail the typed `u32` parse.
+fn parse_vector_index_updates(
+    val: &serde_json::Value,
+) -> std::result::Result<Vec<VectorIndexUpdate>, String> {
+    let arr = val
+        .as_array()
+        .ok_or_else(|| "Unexpected field type".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        let obj = elem
+            .as_object()
+            .ok_or_else(|| "Unexpected value type in payload".to_string())?;
+        let mut update = VectorIndexUpdate::default();
+        if let Some(create) = obj.get("Create").filter(|v| !v.is_null()) {
+            let mut create = create.clone();
+            if let Some(create_obj) = create.as_object_mut() {
+                crate::actions::create_table::normalise_vix_dimensions_obj(create_obj);
+            }
+            update.create = Some(serde_json::from_value(create).map_err(|e| e.to_string())?);
+        }
+        if let Some(delete) = obj.get("Delete").filter(|v| !v.is_null()) {
+            update.delete =
+                Some(serde_json::from_value(delete.clone()).map_err(|e| e.to_string())?);
+        }
+        out.push(update);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct UpdateTableResponse {
     #[serde(rename = "TableDescription")]
@@ -181,6 +298,16 @@ pub async fn execute<S: StorageBackend>(
 
     let current_billing_mode = meta.billing_mode.as_deref().unwrap_or("PROVISIONED");
 
+    // Parse existing vector index definitions early: the billing-mode gate
+    // below and the update validation both need them.
+    let mut current_vixs: Vec<VectorIndex> = meta
+        .vector_index_definitions
+        .as_ref()
+        .map(|json| serde_json::from_str(json))
+        .transpose()
+        .map_err(|e| DynoxideError::InternalServerError(format!("Bad vector index JSON: {e}")))?
+        .unwrap_or_default();
+
     // Phase 3: Post-table-existence validations
 
     // PAY_PER_REQUEST table + ProvisionedThroughput update is not allowed
@@ -203,6 +330,19 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(
             "One or more parameter values were invalid: \
              ProvisionedThroughput must be specified when BillingMode is PROVISIONED"
+                .to_string(),
+        ));
+    }
+
+    // A vector-indexed table cannot leave PAY_PER_REQUEST. The switch has
+    // its own string, distinct from the create-time gate's, and reads the
+    // stored definitions, so deleting the last index and flipping in the
+    // same call is still rejected. Captured from real DynamoDB (eu-west-2
+    // and us-east-1, 2026-08-12).
+    if request.billing_mode.as_deref() == Some("PROVISIONED") && !current_vixs.is_empty() {
+        return Err(DynoxideError::ValidationException(
+            "One or more parameter values were invalid: Tables with vector indexes must \
+             be in PAY_PER_REQUEST mode"
                 .to_string(),
         ));
     }
@@ -300,6 +440,10 @@ pub async fn execute<S: StorageBackend>(
         .map_err(|e| DynoxideError::InternalServerError(format!("Bad GSI JSON: {e}")))?
         .unwrap_or_default();
 
+    // Parse existing LSI definitions: the cross-family duplicate checks below
+    // and the AttributeDefinitions reconciliation both need them.
+    let lsi_defs = crate::actions::lsi::parse_lsi_defs(&meta)?;
+
     // GSI Update with high capacity on non-existent index
     if let Some(ref updates) = request.global_secondary_index_updates {
         for update in updates {
@@ -369,6 +513,62 @@ pub async fn execute<S: StorageBackend>(
                         create.index_name
                     )));
                 }
+                // A GSI create colliding with a vector index name uses the
+                // vector create path's wording, not the GSI same-family
+                // string above. Captured from real DynamoDB (eu-west-2 and
+                // us-east-1, 2026-08-12).
+                if current_vixs
+                    .iter()
+                    .any(|v| v.index_name == create.index_name)
+                {
+                    return Err(DynoxideError::ValidationException(
+                        "Attempting to create an index which already exists".to_string(),
+                    ));
+                }
+                // A GSI cannot key on a live vector attribute: the vector
+                // index already defines it as a list of the index's
+                // dimensions, so the proposed scalar key definition is a
+                // redefinition. The message interpolates the attribute name,
+                // the live index's dimensions, the request-declared scalar
+                // type, and the proposed key type. Captured from real
+                // DynamoDB (eu-west-2 and us-east-1, 2026-08-12). An element
+                // whose attribute the request does not declare falls through
+                // to validate_gsi's missing-declaration error below.
+                for elem in &create.key_schema {
+                    let Some(vix) = current_vixs
+                        .iter()
+                        .find(|v| v.vector_attribute.attribute_name == elem.attribute_name)
+                    else {
+                        continue;
+                    };
+                    let Some(def) = request
+                        .attribute_definitions
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .find(|d| d.attribute_name == elem.attribute_name)
+                    else {
+                        continue;
+                    };
+                    let type_letter = match def.attribute_type {
+                        crate::types::ScalarAttributeType::S => "S",
+                        crate::types::ScalarAttributeType::N => "N",
+                        crate::types::ScalarAttributeType::B => "B",
+                    };
+                    let key_type = match elem.key_type {
+                        crate::types::KeyType::HASH => "HASH",
+                        crate::types::KeyType::RANGE => "RANGE",
+                    };
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: Attributes cannot be \
+                         redefined. Please check that your attribute has the same type as \
+                         previously defined. Existing schema: \
+                         VectorIndexSchema:[VectorAttribute: key{{{attr}:L:{dims}}}] \
+                         New schema: Schema:[SchemaElement: key{{{attr}:{type_letter}:{key_type}}}]",
+                        attr = elem.attribute_name,
+                        dims = vix.dimensions,
+                    )));
+                }
                 let gsi_def = GlobalSecondaryIndex {
                     index_name: create.index_name.clone(),
                     key_schema: create.key_schema.clone(),
@@ -392,6 +592,126 @@ pub async fn execute<S: StorageBackend>(
                     return Err(DynoxideError::ResourceNotFoundException(format!(
                         "Requested resource not found: Table: {} not found",
                         delete.index_name
+                    )));
+                }
+            }
+        }
+    }
+
+    // Validate all vector index updates before making any changes.
+    if let Some(ref updates) = request.vector_index_updates {
+        // Only one vector index action per call; the rejection is the GSI
+        // online-index machinery's own error. Captured from real DynamoDB
+        // (eu-west-2, 2026-08-11). Whether a call mixing GSI and vector
+        // actions trips a combined limit is uncaptured; each family keeps
+        // its own count here.
+        if updates.len() > 1 {
+            return Err(DynoxideError::LimitExceededException(
+                "Subscriber limit exceeded: Only 1 online index can be created or \
+                 deleted simultaneously per table"
+                    .to_string(),
+            ));
+        }
+        for update in updates {
+            if let Some(ref create) = update.create {
+                // Vector indexes only exist on PAY_PER_REQUEST tables; the
+                // UpdateTable path carries the same string as CreateTable's
+                // gate. Captured from real DynamoDB (eu-west-2 and us-east-1,
+                // 2026-08-12).
+                let target_billing_mode = request
+                    .billing_mode
+                    .as_deref()
+                    .unwrap_or(current_billing_mode);
+                if target_billing_mode != "PAY_PER_REQUEST" {
+                    return Err(DynoxideError::ValidationException(
+                        "One or more parameter values were invalid: Vector indexes are \
+                         only supported for PAY_PER_REQUEST tables"
+                            .to_string(),
+                    ));
+                }
+
+                // The vector create path has its own duplicate wording, with
+                // no index name in it: not the GSI duplicate string and not
+                // CreateTable's classic cross-index one. The check spans all
+                // index families: a name held by a live GSI or LSI collides
+                // too, with the same wording. Captured from real DynamoDB
+                // (eu-west-2 and us-east-1, 2026-08-12).
+                if current_vixs
+                    .iter()
+                    .any(|v| v.index_name == create.index_name)
+                    || current_gsis
+                        .iter()
+                        .any(|g| g.index_name == create.index_name)
+                    || lsi_defs.iter().any(|l| l.index_name == create.index_name)
+                {
+                    return Err(DynoxideError::ValidationException(
+                        "Attempting to create an index which already exists".to_string(),
+                    ));
+                }
+
+                // A new index's SearchSchema attributes must all appear in the
+                // request's own AttributeDefinitions, mirroring the GSI rule.
+                // Always entry 1 in the rendered path: a call carries at most
+                // one create action.
+                validation::validate_vector_index(
+                    create,
+                    request.attribute_definitions.as_deref().unwrap_or(&[]),
+                    "vectorIndexUpdates.1.member.create",
+                )?;
+
+                // Count limit (five per table), same string as CreateTable's.
+                // Captured from real DynamoDB (eu-west-2, 2026-08-11). A
+                // delete cannot share the call to free a slot: one entry per
+                // call, one action per entry, so the stored count is the
+                // effective one.
+                if current_vixs.len() >= 5 {
+                    return Err(DynoxideError::ValidationException(
+                        "One or more parameter values were invalid: VectorIndex count \
+                         exceeds the per-table limit of 5"
+                            .to_string(),
+                    ));
+                }
+
+                // Indexes on one vector attribute must agree on dimensions.
+                // The string is captured on the CreateTable path (eu-west-2,
+                // 2026-08-11); the invariant is structural, so the same check
+                // applies here.
+                if current_vixs.iter().any(|v| {
+                    v.vector_attribute.attribute_name == create.vector_attribute.attribute_name
+                        && v.dimensions != create.dimensions
+                }) {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: Conflicting attribute \
+                         definition for '{}'. All VectorIndexes on the same vector attribute \
+                         must use the same dimensions.",
+                        create.vector_attribute.attribute_name
+                    )));
+                }
+
+                // The vector attribute must not be declared in
+                // AttributeDefinitions, checked against the merged set since
+                // the stored definitions count on UpdateTable. The string is
+                // captured on the CreateTable path only (eu-west-2 and
+                // us-east-1, 2026-08-12); the same rule is applied here.
+                let attr = create.vector_attribute.attribute_name.as_str();
+                if attr_defs.iter().any(|d| d.attribute_name == attr) {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: Conflicting attribute \
+                         definition for '{attr}'. An attribute cannot be defined in \
+                         AttributeDefinitions when used as a VectorAttribute."
+                    )));
+                }
+            }
+            if let Some(ref delete) = update.delete {
+                if !current_vixs
+                    .iter()
+                    .any(|v| v.index_name == delete.index_name)
+                {
+                    // Bare index name, no quoting. Captured from real DynamoDB
+                    // (eu-west-2 and us-east-1, 2026-08-12).
+                    return Err(DynoxideError::ResourceNotFoundException(format!(
+                        "Requested resource not found: Index {} for table {}",
+                        delete.index_name, request.table_name
                     )));
                 }
             }
@@ -503,11 +823,51 @@ pub async fn execute<S: StorageBackend>(
             }
         }
 
+        if let Some(ref updates) = request.vector_index_updates {
+            for update in updates {
+                if let Some(ref create) = update.create {
+                    storage
+                        .create_vector_table(&request.table_name, &create.index_name)
+                        .await?;
+
+                    // Backfill runs synchronously inside this transaction and
+                    // covers the items that exist as of this call; index
+                    // maintenance on later writes arrives separately. The
+                    // response still reports the index CREATING per the
+                    // captured lifecycle walk.
+                    backfill_vector_index(
+                        storage,
+                        &request.table_name,
+                        &key_schema,
+                        create,
+                        &attr_defs,
+                    )
+                    .await?;
+
+                    current_vixs.push(create.clone());
+                }
+
+                if let Some(ref delete) = update.delete {
+                    storage
+                        .drop_vector_table(&request.table_name, &delete.index_name)
+                        .await?;
+                    current_vixs.retain(|v| v.index_name != delete.index_name);
+                }
+            }
+        }
+
         // Reconcile AttributeDefinitions to exactly the attributes still
         // referenced by the table key schema and surviving index key schemas.
+        // Surviving vector indexes' SearchSchema attributes count as used, so
+        // a GSI delete cannot prune an attribute a live vector schema needs.
         // See reconcile_attribute_definitions for the AWS-verified rules.
-        let lsi_defs = crate::actions::lsi::parse_lsi_defs(&meta)?;
-        reconcile_attribute_definitions(&mut attr_defs, &key_schema, &current_gsis, &lsi_defs);
+        reconcile_attribute_definitions(
+            &mut attr_defs,
+            &key_schema,
+            &current_gsis,
+            &lsi_defs,
+            &current_vixs,
+        );
 
         // Update metadata
         let attr_defs_json = serde_json::to_string(&attr_defs)
@@ -524,6 +884,27 @@ pub async fn execute<S: StorageBackend>(
         storage
             .update_table_metadata(&request.table_name, &attr_defs_json, gsi_json.as_deref())
             .await?;
+
+        // Persist vector index definitions only when this request changed
+        // them, following the gsi_definitions convention (NULL when none
+        // remain).
+        if request
+            .vector_index_updates
+            .as_ref()
+            .is_some_and(|u| !u.is_empty())
+        {
+            let vix_json = if current_vixs.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&current_vixs)
+                        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?,
+                )
+            };
+            storage
+                .update_vector_index_definitions(&request.table_name, vix_json.as_deref())
+                .await?;
+        }
 
         // Update provisioned throughput if requested
         if is_pt_update {
@@ -633,6 +1014,30 @@ pub async fn execute<S: StorageBackend>(
         desc.on_demand_throughput = Some(echo);
     }
 
+    // A vector index create reports the table UPDATING and the new index
+    // CREATING in the UpdateTable response; DescribeTable then reports ACTIVE
+    // immediately with Backfilling never present, since backfill ran
+    // synchronously above. The instant-ACTIVE posture mirrors the GSI one and
+    // is the documented divergence from the captured lifecycle walk
+    // (eu-west-2, 2026-08-11), whose response shapes are matched here.
+    if let Some(ref updates) = request.vector_index_updates {
+        let created: std::collections::HashSet<&str> = updates
+            .iter()
+            .filter_map(|u| u.create.as_ref())
+            .map(|c| c.index_name.as_str())
+            .collect();
+        if !created.is_empty() {
+            desc.table_status = "UPDATING".to_string();
+            if let Some(ref mut vixs) = desc.vector_indexes {
+                for vix in vixs {
+                    if created.contains(vix.index_name.as_str()) {
+                        vix.index_status = "CREATING".to_string();
+                    }
+                }
+            }
+        }
+    }
+
     // DynamoDB returns UPDATING status during throughput changes
     if is_pt_update {
         desc.table_status = "UPDATING".to_string();
@@ -661,11 +1066,18 @@ pub async fn execute<S: StorageBackend>(
 /// lockstep: an attribute orphaned by a GSI delete is pruned, and an entry used
 /// by no key schema is dropped rather than stored (neither is an error).
 /// Verified against AWS in eu-west-2.
+///
+/// Surviving vector indexes' SearchSchema attributes join the used set: they
+/// are declared in AttributeDefinitions like key attributes, so a GSI delete
+/// must not prune an attribute a live vector schema still references. The
+/// vector attribute itself never appears in AttributeDefinitions and needs no
+/// entry here.
 fn reconcile_attribute_definitions(
     attr_defs: &mut Vec<AttributeDefinition>,
     key_schema: &helpers::KeySchema,
     gsis: &[GlobalSecondaryIndex],
     lsi_defs: &[crate::actions::lsi::LsiDef],
+    vixs: &[VectorIndex],
 ) {
     let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
     used.insert(key_schema.partition_key.as_str());
@@ -683,7 +1095,57 @@ fn reconcile_attribute_definitions(
             used.insert(sk.as_str());
         }
     }
+    for vix in vixs {
+        if let Some(ref schema) = vix.search_schema {
+            for elem in schema {
+                used.insert(elem.attribute_name.as_str());
+            }
+        }
+    }
     attr_defs.retain(|d| used.contains(d.attribute_name.as_str()));
+}
+
+/// Request-model constraint errors for `GlobalSecondaryIndexUpdates` Update
+/// actions, shared between the operation-layer validation and the raw parse
+/// path's cross-family envelope.
+fn collect_gsi_update_errors(updates: &[GlobalSecondaryIndexUpdate], errors: &mut Vec<String>) {
+    for (i, update) in updates.iter().enumerate() {
+        if let Some(ref upd) = update.update {
+            // Validate Update.IndexName
+            if upd.index_name.len() < 3 {
+                errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", upd.index_name, i + 1));
+            }
+            if !upd.index_name.is_empty()
+                && !upd
+                    .index_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", upd.index_name, i + 1));
+            }
+            // Validate Update.ProvisionedThroughput
+            if let Some(ref pt) = upd.provisioned_throughput {
+                let wcu = pt.write_capacity_units;
+                let rcu = pt.read_capacity_units;
+                if wcu.is_none() {
+                    errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(w) = wcu {
+                    if w < 1 {
+                        errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w, i + 1));
+                    }
+                }
+                if rcu.is_none() {
+                    errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(r) = rcu {
+                    if r < 1 {
+                        errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r, i + 1));
+                    }
+                }
+            } else {
+                errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput' failed to satisfy constraint: Member must not be null", i + 1));
+            }
+        }
+    }
 }
 
 /// Validate UpdateTable request parameters before checking table existence.
@@ -718,43 +1180,7 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
 
     // Validate GlobalSecondaryIndexUpdates fields
     if let Some(ref updates) = request.global_secondary_index_updates {
-        for (i, update) in updates.iter().enumerate() {
-            if let Some(ref upd) = update.update {
-                // Validate Update.IndexName
-                if upd.index_name.len() < 3 {
-                    errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", upd.index_name, i + 1));
-                }
-                if !upd.index_name.is_empty()
-                    && !upd
-                        .index_name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-                {
-                    errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", upd.index_name, i + 1));
-                }
-                // Validate Update.ProvisionedThroughput
-                if let Some(ref pt) = upd.provisioned_throughput {
-                    let wcu = pt.write_capacity_units;
-                    let rcu = pt.read_capacity_units;
-                    if wcu.is_none() {
-                        errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(w) = wcu {
-                        if w < 1 {
-                            errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w, i + 1));
-                        }
-                    }
-                    if rcu.is_none() {
-                        errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(r) = rcu {
-                        if r < 1 {
-                            errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r, i + 1));
-                        }
-                    }
-                } else {
-                    errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput' failed to satisfy constraint: Member must not be null", i + 1));
-                }
-            }
-        }
+        collect_gsi_update_errors(updates, &mut errors);
     }
 
     // Cap at 10 errors
@@ -852,7 +1278,11 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
         .global_secondary_index_updates
         .as_ref()
         .is_none_or(|updates| updates.is_empty());
-    if no_gsi_change && no_config_change {
+    let no_vector_change = request
+        .vector_index_updates
+        .as_ref()
+        .is_none_or(|updates| updates.is_empty());
+    if no_gsi_change && no_config_change && no_vector_change {
         return Err(DynoxideError::ValidationException(
             "At least one of ProvisionedThroughput, BillingMode, UpdateStreamEnabled, GlobalSecondaryIndexUpdates or SSESpecification or ReplicaUpdates is required".to_string(),
         ));
@@ -886,6 +1316,32 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
                         name
                     )));
                 }
+            }
+        }
+    }
+
+    // Validate vector index update structural constraints. An entry carrying
+    // neither action mirrors the GSI structural message (with the two actions
+    // the vector family has); this shape is not captured.
+    if let Some(ref updates) = request.vector_index_updates {
+        for update in updates {
+            if update.create.is_none() && update.delete.is_none() {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: One of \
+                     VectorIndexUpdate.Create, VectorIndexUpdate.Delete must not be null"
+                        .to_string(),
+                ));
+            }
+            // A single entry cannot carry both actions: a per-object
+            // structural rule with its own string, distinct from the
+            // one-action-per-call LimitExceededException. Captured from real
+            // DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+            if update.create.is_some() && update.delete.is_some() {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: Only one vector index \
+                     action is allowed per VectorIndexUpdate object"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -1001,4 +1457,232 @@ async fn backfill_gsi<S: StorageBackend>(
     }
 
     Ok(())
+}
+
+/// Backfill existing items into a newly created vector index, processing in
+/// batches like [`backfill_gsi`].
+///
+/// Items holding values a live write would reject are skipped silently: the
+/// index goes active without them, while re-putting the same item once the
+/// index exists is rejected. That asymmetry is real DynamoDB's behaviour,
+/// captured in eu-west-2 and us-east-1 on 2026-08-12.
+async fn backfill_vector_index<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    key_schema: &helpers::KeySchema,
+    vix: &VectorIndex,
+    attr_defs: &[AttributeDefinition],
+) -> Result<()> {
+    const BATCH_SIZE: usize = 1000;
+    let mut last_pk: Option<String> = None;
+    let mut last_sk: Option<String> = None;
+
+    loop {
+        let items = storage
+            .scan_items(
+                table_name,
+                &crate::storage::ScanParams {
+                    limit: Some(BATCH_SIZE),
+                    exclusive_start_pk: last_pk.as_deref(),
+                    exclusive_start_sk: last_sk.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        let mut rows: Vec<crate::storage_backend::VectorItemRow> = Vec::new();
+        for (pk, sk, item_json) in &items {
+            let item: Item = serde_json::from_str(item_json)
+                .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
+
+            if let Some(row) = vector_index_row(&item, vix, key_schema, attr_defs, pk, sk)? {
+                rows.push(row);
+            }
+        }
+
+        storage
+            .insert_vector_items(table_name, &vix.index_name, &rows)
+            .await?;
+
+        let last = &items[items.len() - 1];
+        last_pk = Some(last.0.clone());
+        last_sk = Some(last.1.clone());
+
+        if items.len() < BATCH_SIZE {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Derive the shadow-table row for one base item, or `None` when the item
+/// does not belong in the index (sparse): an invalid vector value (missing
+/// attribute, wrong type, wrong element count, non-numeric or out-of-f32-range
+/// element) produces no row, and so does a SearchSchema HASH attribute that is
+/// missing, non-scalar, of a type other than the declared AttributeDefinitions
+/// type, or an empty string. The skip set matches exactly what a live write
+/// rejects: the type mismatch was captured as write-rejected in eu-west-2 and
+/// us-east-1 on 2026-08-12, the empty string in eu-west-2 on 2026-08-11.
+fn vector_index_row(
+    item: &Item,
+    vix: &VectorIndex,
+    key_schema: &helpers::KeySchema,
+    attr_defs: &[AttributeDefinition],
+    table_pk: &str,
+    table_sk: &str,
+) -> Result<Option<crate::storage_backend::VectorItemRow>> {
+    let Some(value) = item.get(&vix.vector_attribute.attribute_name) else {
+        return Ok(None);
+    };
+    let Some(values) = crate::types::vector_f32_values(value, vix.dimensions) else {
+        return Ok(None);
+    };
+
+    // A HASH-schema index scopes every search to one partition value, so an
+    // item without the HASH attribute (or with a non-scalar there) is
+    // unreachable and gets no row: the sparse-index pattern.
+    let hash_attr = vix
+        .search_schema
+        .as_ref()
+        .and_then(|schema| {
+            schema
+                .iter()
+                .find(|e| e.search_schema_element_type == "HASH")
+        })
+        .map(|e| e.attribute_name.as_str());
+    let hash_value = match hash_attr {
+        Some(attr) => {
+            let Some(hash_val) = item.get(attr) else {
+                return Ok(None);
+            };
+            // A value whose type differs from the declared AttributeDefinitions
+            // type, or an empty-string value, is rejected by a live write once
+            // the index exists, so backfill skips the same shapes.
+            if let Some(def) = attr_defs.iter().find(|d| d.attribute_name == attr) {
+                use crate::types::{AttributeValue, ScalarAttributeType};
+                let type_matches = match def.attribute_type {
+                    ScalarAttributeType::S => matches!(hash_val, AttributeValue::S(_)),
+                    ScalarAttributeType::N => matches!(hash_val, AttributeValue::N(_)),
+                    ScalarAttributeType::B => matches!(hash_val, AttributeValue::B(_)),
+                };
+                if !type_matches {
+                    return Ok(None);
+                }
+            }
+            if matches!(hash_val, crate::types::AttributeValue::S(s) if s.is_empty()) {
+                return Ok(None);
+            }
+            match hash_val.to_key_string() {
+                Some(s) => s,
+                None => return Ok(None),
+            }
+        }
+        None => String::new(),
+    };
+
+    // INLINE_FILTER attribute values present on the item, as a wire-shaped
+    // JSON object. Absent filter attributes stay absent; the item is still
+    // indexed.
+    let mut filter_map = serde_json::Map::new();
+    if let Some(ref schema) = vix.search_schema {
+        for elem in schema {
+            if elem.search_schema_element_type == "INLINE_FILTER" {
+                if let Some(v) = item.get(&elem.attribute_name) {
+                    filter_map.insert(
+                        elem.attribute_name.clone(),
+                        serde_json::to_value(v)
+                            .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?,
+                    );
+                }
+            }
+        }
+    }
+    let filter_json = serde_json::to_string(&serde_json::Value::Object(filter_map))
+        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+
+    // The index copy holds the f32-truncated vector; the base item keeps full
+    // precision (captured from real DynamoDB, eu-west-2, 2026-08-11).
+    let f32_value = crate::types::AttributeValue::L(
+        values
+            .iter()
+            .map(|v| crate::types::AttributeValue::N(crate::types::f32_number_string(*v)))
+            .collect(),
+    );
+    let projected = build_vector_index_item(item, vix, key_schema, &f32_value);
+    let item_json = serde_json::to_string(&projected)
+        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+    let vector_json = serde_json::to_string(&values)
+        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+
+    Ok(Some(crate::storage_backend::VectorItemRow {
+        table_pk: table_pk.to_string(),
+        table_sk: table_sk.to_string(),
+        hash_value,
+        vector_json,
+        filter_json,
+        item_json,
+    }))
+}
+
+/// Build the projected item copy for a vector index row. The vector attribute
+/// appears only where the projection carries it (ALL, or INCLUDE naming it),
+/// always as the f32 copy; SearchSchema attributes play the role GSI index
+/// keys do in KEYS_ONLY and INCLUDE projections.
+fn build_vector_index_item(
+    item: &Item,
+    vix: &VectorIndex,
+    key_schema: &helpers::KeySchema,
+    f32_value: &crate::types::AttributeValue,
+) -> Item {
+    use crate::types::ProjectionType;
+
+    let vector_attr = vix.vector_attribute.attribute_name.as_str();
+    let projection_type = vix.projection.projection_type.clone().unwrap_or_default();
+
+    match projection_type {
+        ProjectionType::ALL => {
+            let mut projected = item.clone();
+            projected.insert(vector_attr.to_string(), f32_value.clone());
+            projected
+        }
+        ProjectionType::KEYS_ONLY | ProjectionType::INCLUDE => {
+            let mut projected = Item::new();
+            // Table keys
+            if let Some(v) = item.get(&key_schema.partition_key) {
+                projected.insert(key_schema.partition_key.clone(), v.clone());
+            }
+            if let Some(ref sk) = key_schema.sort_key {
+                if let Some(v) = item.get(sk) {
+                    projected.insert(sk.clone(), v.clone());
+                }
+            }
+            // SearchSchema attributes
+            if let Some(ref schema) = vix.search_schema {
+                for elem in schema {
+                    if let Some(v) = item.get(&elem.attribute_name) {
+                        projected.insert(elem.attribute_name.clone(), v.clone());
+                    }
+                }
+            }
+            // Non-key attributes (INCLUDE only), the vector attribute as its
+            // f32 copy when named
+            if projection_type == ProjectionType::INCLUDE {
+                if let Some(ref attrs) = vix.projection.non_key_attributes {
+                    for attr in attrs {
+                        if attr == vector_attr {
+                            projected.insert(attr.clone(), f32_value.clone());
+                        } else if let Some(v) = item.get(attr) {
+                            projected.insert(attr.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            projected
+        }
+    }
 }

@@ -288,6 +288,22 @@ pub fn update_table_metadata<'a>(
     )
 }
 
+/// Update a table's vector index definitions. The write the add/delete-vector
+/// path of `UpdateTable` issues; `vector_index_definitions` is `None` (SQL
+/// `NULL`) when no vector indexes remain.
+pub fn update_vector_index_definitions<'a>(
+    table_name: &'a str,
+    vector_index_definitions: Option<&'a str>,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET vector_index_definitions = ?1 WHERE table_name = ?2".to_string(),
+        vec![
+            SqlParam::opt_text(vector_index_definitions),
+            SqlParam::text(table_name),
+        ],
+    )
+}
+
 /// Set a table's provisioned-throughput JSON.
 pub fn update_provisioned_throughput<'a>(
     table_name: &'a str,
@@ -633,6 +649,36 @@ pub fn create_vector_table(table_name: &str, index_name: &str) -> (String, Vec<S
             CREATE INDEX IF NOT EXISTS \"{idx}\" ON \"{escaped}\" (hash_value);"
     );
     (sql, Vec::new())
+}
+
+/// Insert-or-replace statement for a vector shadow-table row, shared by
+/// single and bulk insert.
+pub fn vector_insert_sql(table_name: &str, index_name: &str) -> String {
+    let vix = format!("{table_name}::vector::{index_name}");
+    format!(
+        "INSERT OR REPLACE INTO \"{}\" (table_pk, table_sk, hash_value, vector_json, filter_json, item_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        escape_table_name(&vix)
+    )
+}
+
+/// Bound parameters for one vector shadow-table row, matching
+/// [`vector_insert_sql`].
+pub fn vector_insert_params<'a>(
+    table_pk: &'a str,
+    table_sk: &'a str,
+    hash_value: &'a str,
+    vector_json: &'a str,
+    filter_json: &'a str,
+    item_json: &'a str,
+) -> Vec<SqlParam<'a>> {
+    vec![
+        SqlParam::text(table_pk),
+        SqlParam::text(table_sk),
+        SqlParam::text(hash_value),
+        SqlParam::text(vector_json),
+        SqlParam::text(filter_json),
+        SqlParam::text(item_json),
+    ]
 }
 
 /// Drop a vector index shadow table if it exists.
@@ -1469,6 +1515,53 @@ mod tests {
         conn.execute_batch(&drop_sql).unwrap();
         // Dropping again is a no-op, matching the GSI/LSI drop builders.
         conn.execute_batch(&drop_sql).unwrap();
+    }
+
+    #[test]
+    fn vector_insert_builders_are_pinned() {
+        assert_eq!(
+            vector_insert_sql("Docs", "vix"),
+            "INSERT OR REPLACE INTO \"Docs::vector::vix\" (table_pk, table_sk, hash_value, \
+             vector_json, filter_json, item_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        );
+        assert_eq!(
+            vector_insert_params(
+                "p",
+                "s",
+                "S:t1",
+                "[1.0,0.0,0.0]",
+                "{}",
+                "{\"pk\":{\"S\":\"p\"}}"
+            ),
+            vec![
+                SqlParam::text("p"),
+                SqlParam::text("s"),
+                SqlParam::text("S:t1"),
+                SqlParam::text("[1.0,0.0,0.0]"),
+                SqlParam::text("{}"),
+                SqlParam::text("{\"pk\":{\"S\":\"p\"}}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_vector_index_definitions_is_pinned() {
+        assert_eq!(
+            update_vector_index_definitions("T", Some("[{}]")),
+            (
+                "UPDATE _tables SET vector_index_definitions = ?1 WHERE table_name = ?2"
+                    .to_string(),
+                vec![SqlParam::text("[{}]"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_vector_index_definitions("T", None),
+            (
+                "UPDATE _tables SET vector_index_definitions = ?1 WHERE table_name = ?2"
+                    .to_string(),
+                vec![SqlParam::Null, SqlParam::text("T")],
+            )
+        );
     }
 
     #[test]

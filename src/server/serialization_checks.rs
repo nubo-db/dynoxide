@@ -143,6 +143,51 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
                     }
                 }
             }
+            // Check inside VectorIndexUpdates; the Create action carries the
+            // same shape as a CreateTable VectorIndexes entry.
+            check_field_is_list(obj, "VectorIndexUpdates")?;
+            check_list_elements_are_structs(obj, "VectorIndexUpdates")?;
+            if let Some(serde_json::Value::Array(arr)) = obj.get("VectorIndexUpdates") {
+                for item in arr {
+                    if let Some(inner) = item.as_object() {
+                        check_field_is_struct(inner, "Create")?;
+                        check_field_is_struct(inner, "Delete")?;
+                        if let Some(create) = inner.get("Create").and_then(|v| v.as_object()) {
+                            check_field_is_struct(create, "VectorAttribute")?;
+                            check_field_is_struct(create, "Projection")?;
+                            check_field_is_list(create, "SearchSchema")?;
+                            check_list_elements_are_structs(create, "SearchSchema")?;
+                            check_field_is_string(create, "IndexName")?;
+                            check_field_is_string(create, "DistanceFunction")?;
+                            check_field_is_int(create, "Dimensions")?;
+                            check_nested_projection_fields(create)?;
+                            if let Some(va) =
+                                create.get("VectorAttribute").and_then(|v| v.as_object())
+                            {
+                                check_field_is_string(va, "AttributeName")?;
+                            }
+                            if let Some(serde_json::Value::Array(schema)) =
+                                create.get("SearchSchema")
+                            {
+                                for elem in schema {
+                                    if let Some(eo) = elem.as_object() {
+                                        check_field_is_string(eo, "AttributeName")?;
+                                        check_field_is_string(eo, "SearchSchemaElementType")?;
+                                    }
+                                }
+                            }
+                            if let Some(proj) = create.get("Projection").and_then(|p| p.as_object())
+                            {
+                                check_field_is_list(proj, "NonKeyAttributes")?;
+                                check_nested_list_strings(proj, "NonKeyAttributes")?;
+                            }
+                        }
+                        if let Some(delete) = inner.get("Delete").and_then(|v| v.as_object()) {
+                            check_field_is_string(delete, "IndexName")?;
+                        }
+                    }
+                }
+            }
         }
         "PutItem" | "DeleteItem" | "UpdateItem" => {
             check_field_is_map(
@@ -488,6 +533,7 @@ fn check_list_elements_are_structs(
             "com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndexUpdate"
         }
         "VectorIndexes" => "com.amazonaws.dynamodb.v20120810.VectorIndex",
+        "VectorIndexUpdates" => "com.amazonaws.dynamodb.v20120810.VectorIndexUpdate",
         "SearchSchema" => "com.amazonaws.dynamodb.v20120810.SearchSchemaElement",
         "Tags" => "com.amazonaws.dynamodb.v20120810.Tag",
         _ => "Unknown",

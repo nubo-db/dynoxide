@@ -578,7 +578,11 @@ fn validate_vector_index_list(
     }
 
     for (i, vix) in vixs.iter().enumerate() {
-        crate::validation::validate_vector_index(vix, defs, i + 1)?;
+        crate::validation::validate_vector_index(
+            vix,
+            defs,
+            &format!("vectorIndexes.{}.member", i + 1),
+        )?;
     }
 
     // Duplicate index names within the vector list.
@@ -984,7 +988,11 @@ fn collect_lsi_errors(lsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
                     {
                         errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.projection' failed to satisfy constraint: Member must not be null", i + 1));
                     } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
-                        collect_proj_errors(p, &format!("localSecondaryIndexes.{}", i + 1), errors);
+                        collect_proj_errors(
+                            p,
+                            &format!("localSecondaryIndexes.{}.member", i + 1),
+                            errors,
+                        );
                     }
                 }
             }
@@ -1014,7 +1022,7 @@ fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
                     } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
                         collect_proj_errors(
                             p,
-                            &format!("globalSecondaryIndexes.{}", i + 1),
+                            &format!("globalSecondaryIndexes.{}.member", i + 1),
                             errors,
                         );
                     }
@@ -1065,95 +1073,104 @@ fn collect_vix_errors(vix_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
             Some(obj) => obj,
             None => continue,
         };
-        let idx = i + 1;
-        if !obj.contains_key("IndexName") || obj.get("IndexName") == Some(&serde_json::Value::Null)
+        collect_vix_obj_errors(obj, &format!("vectorIndexes.{}.member", i + 1), errors);
+    }
+}
+
+/// Request-model constraint errors for one raw vector index object, shared
+/// with the `UpdateTable` create-action collector: `path` is the object's
+/// member path (`vectorIndexes.N.member` here,
+/// `vectorIndexUpdates.N.member.create` there, the latter captured from real
+/// DynamoDB, eu-west-2 and us-east-1, 2026-08-12).
+pub(crate) fn collect_vix_obj_errors(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if !obj.contains_key("IndexName") || obj.get("IndexName") == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.indexName' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
+        collect_idx_name_errors_at(name, path, errors);
+    }
+    if !obj.contains_key("VectorAttribute")
+        || obj.get("VectorAttribute") == Some(&serde_json::Value::Null)
+    {
+        errors.push(format!(
+            "Value null at '{path}.vectorAttribute' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(va) = obj.get("VectorAttribute").and_then(|v| v.as_object()) {
+        if !va.contains_key("AttributeName")
+            || va.get("AttributeName") == Some(&serde_json::Value::Null)
         {
             errors.push(format!(
-                "Value null at 'vectorIndexes.{idx}.member.indexName' failed to satisfy constraint: Member must not be null"
+                "Value null at '{path}.vectorAttribute.attributeName' failed to satisfy constraint: Member must not be null"
             ));
-        } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
-            collect_idx_name_errors(name, "vectorIndexes", idx, errors);
         }
-        if !obj.contains_key("VectorAttribute")
-            || obj.get("VectorAttribute") == Some(&serde_json::Value::Null)
-        {
-            errors.push(format!(
-                "Value null at 'vectorIndexes.{idx}.member.vectorAttribute' failed to satisfy constraint: Member must not be null"
-            ));
-        } else if let Some(va) = obj.get("VectorAttribute").and_then(|v| v.as_object()) {
-            if !va.contains_key("AttributeName")
-                || va.get("AttributeName") == Some(&serde_json::Value::Null)
+    }
+    if let Some(schema) = obj.get("SearchSchema").and_then(|v| v.as_array()) {
+        for (j, se) in schema.iter().enumerate().take(10) {
+            let seo = match se.as_object() {
+                Some(seo) => seo,
+                None => continue,
+            };
+            let sidx = j + 1;
+            if !seo.contains_key("AttributeName")
+                || seo.get("AttributeName") == Some(&serde_json::Value::Null)
             {
                 errors.push(format!(
-                    "Value null at 'vectorIndexes.{idx}.member.vectorAttribute.attributeName' failed to satisfy constraint: Member must not be null"
+                    "Value null at '{path}.searchSchema.{sidx}.member.attributeName' failed to satisfy constraint: Member must not be null"
                 ));
             }
-        }
-        if let Some(schema) = obj.get("SearchSchema").and_then(|v| v.as_array()) {
-            for (j, se) in schema.iter().enumerate().take(10) {
-                let seo = match se.as_object() {
-                    Some(seo) => seo,
-                    None => continue,
-                };
-                let sidx = j + 1;
-                if !seo.contains_key("AttributeName")
-                    || seo.get("AttributeName") == Some(&serde_json::Value::Null)
-                {
+            let et = seo.get("SearchSchemaElementType");
+            if et.is_none() || et == Some(&serde_json::Value::Null) {
+                errors.push(format!(
+                    "Value null at '{path}.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must not be null"
+                ));
+            } else if let Some(s) = et.and_then(|v| v.as_str()) {
+                if s != "HASH" && s != "INLINE_FILTER" {
                     errors.push(format!(
-                        "Value null at 'vectorIndexes.{idx}.member.searchSchema.{sidx}.member.attributeName' failed to satisfy constraint: Member must not be null"
+                        "Value '{s}' at '{path}.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, INLINE_FILTER]"
                     ));
                 }
-                let et = seo.get("SearchSchemaElementType");
-                if et.is_none() || et == Some(&serde_json::Value::Null) {
-                    errors.push(format!(
-                        "Value null at 'vectorIndexes.{idx}.member.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must not be null"
-                    ));
-                } else if let Some(s) = et.and_then(|v| v.as_str()) {
-                    if s != "HASH" && s != "INLINE_FILTER" {
-                        errors.push(format!(
-                            "Value '{s}' at 'vectorIndexes.{idx}.member.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, INLINE_FILTER]"
-                        ));
-                    }
-                }
             }
         }
-        if !obj.contains_key("Projection")
-            || obj.get("Projection") == Some(&serde_json::Value::Null)
-        {
+    }
+    if !obj.contains_key("Projection") || obj.get("Projection") == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.projection' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
+        collect_proj_errors(p, path, errors);
+    }
+    let dims = obj.get("Dimensions");
+    if dims.is_none() || dims == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.dimensions' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(d) = dims.and_then(truncated_dimensions) {
+        // Fractional values are truncated before validation (captured
+        // from real DynamoDB, eu-west-2 and us-east-1, 2026-08-12), so
+        // the lower bound applies to the truncated value; the upper
+        // bound is enforced later by the typed validator with the bare
+        // operation-layer message.
+        if d < 1 {
             errors.push(format!(
-                "Value null at 'vectorIndexes.{idx}.member.projection' failed to satisfy constraint: Member must not be null"
+                "Value '{d}' at '{path}.dimensions' failed to satisfy constraint: Member must have value greater than or equal to 1"
             ));
-        } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
-            collect_proj_errors(p, &format!("vectorIndexes.{idx}"), errors);
         }
-        let dims = obj.get("Dimensions");
-        if dims.is_none() || dims == Some(&serde_json::Value::Null) {
+    }
+    let df = obj.get("DistanceFunction");
+    if df.is_none() || df == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.distanceFunction' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(s) = df.and_then(|v| v.as_str()) {
+        if s != "COSINE" && s != "DOT_PRODUCT" && s != "EUCLIDEAN" {
             errors.push(format!(
-                "Value null at 'vectorIndexes.{idx}.member.dimensions' failed to satisfy constraint: Member must not be null"
+                "Value '{s}' at '{path}.distanceFunction' failed to satisfy constraint: Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
             ));
-        } else if let Some(d) = dims.and_then(truncated_dimensions) {
-            // Fractional values are truncated before validation (captured
-            // from real DynamoDB, eu-west-2 and us-east-1, 2026-08-12), so
-            // the lower bound applies to the truncated value; the upper
-            // bound is enforced later by the typed validator with the bare
-            // operation-layer message.
-            if d < 1 {
-                errors.push(format!(
-                    "Value '{d}' at 'vectorIndexes.{idx}.member.dimensions' failed to satisfy constraint: Member must have value greater than or equal to 1"
-                ));
-            }
-        }
-        let df = obj.get("DistanceFunction");
-        if df.is_none() || df == Some(&serde_json::Value::Null) {
-            errors.push(format!(
-                "Value null at 'vectorIndexes.{idx}.member.distanceFunction' failed to satisfy constraint: Member must not be null"
-            ));
-        } else if let Some(s) = df.and_then(|v| v.as_str()) {
-            if s != "COSINE" && s != "DOT_PRODUCT" && s != "EUCLIDEAN" {
-                errors.push(format!(
-                    "Value '{s}' at 'vectorIndexes.{idx}.member.distanceFunction' failed to satisfy constraint: Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
-                ));
-            }
         }
     }
 }
@@ -1185,35 +1202,50 @@ fn normalise_vix_dimensions(vix_val: &serde_json::Value) -> serde_json::Value {
     let mut val = vix_val.clone();
     if let Some(arr) = val.as_array_mut() {
         for elem in arr {
-            let Some(obj) = elem.as_object_mut() else {
-                continue;
-            };
-            let Some(dims) = obj.get_mut("Dimensions") else {
-                continue;
-            };
-            if let Some(d) = truncated_dimensions(dims) {
-                *dims = serde_json::Value::from(d.clamp(0, i64::from(u32::MAX)) as u32);
+            if let Some(obj) = elem.as_object_mut() {
+                normalise_vix_dimensions_obj(obj);
             }
         }
     }
     val
 }
 
+/// Normalise one raw vector index object's `Dimensions` value in place, shared
+/// with the `UpdateTable` create-action path so both parse routes apply the
+/// same truncation and clamping before the typed `u32` parse.
+pub(crate) fn normalise_vix_dimensions_obj(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(dims) = obj.get_mut("Dimensions") else {
+        return;
+    };
+    if let Some(d) = truncated_dimensions(dims) {
+        *dims = serde_json::Value::from(d.clamp(0, i64::from(u32::MAX)) as u32);
+    }
+}
+
 fn collect_idx_name_errors(name: &str, prefix: &str, idx: usize, errors: &mut Vec<String>) {
+    collect_idx_name_errors_at(name, &format!("{prefix}.{idx}.member"), errors);
+}
+
+/// As [`collect_idx_name_errors`], but taking the full member path directly,
+/// for callers whose path does not follow the `<list>.<idx>.member` shape.
+fn collect_idx_name_errors_at(name: &str, path: &str, errors: &mut Vec<String>) {
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     {
-        errors.push(format!("Value '{}' at '{}.{}.member.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", name, prefix, idx));
+        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", name, path));
     }
     if name.len() < 3 {
-        errors.push(format!("Value '{}' at '{}.{}.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", name, prefix, idx));
+        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", name, path));
     }
     if name.len() > 255 {
-        errors.push(format!("Value '{}' at '{}.{}.member.indexName' failed to satisfy constraint: Member must have length less than or equal to 255", name, prefix, idx));
+        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must have length less than or equal to 255", name, path));
     }
 }
 
+/// `prefix` is the owning index object's full member path (for example
+/// `globalSecondaryIndexes.1.member`), so callers with a deeper shape can
+/// pass their own.
 fn collect_proj_errors(
     proj: &serde_json::Map<String, serde_json::Value>,
     prefix: &str,
@@ -1222,14 +1254,14 @@ fn collect_proj_errors(
     if let Some(pt) = proj.get("ProjectionType") {
         if let Some(s) = pt.as_str() {
             if s != "ALL" && s != "KEYS_ONLY" && s != "INCLUDE" {
-                errors.push(format!("Value '{}' at '{}.member.projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", s, prefix));
+                errors.push(format!("Value '{}' at '{}.projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", s, prefix));
             }
         }
     }
     if let Some(nka) = proj.get("NonKeyAttributes") {
         if let Some(arr) = nka.as_array() {
             if arr.is_empty() {
-                errors.push(format!("Value '[]' at '{}.member.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
+                errors.push(format!("Value '[]' at '{}.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
             }
         }
     }

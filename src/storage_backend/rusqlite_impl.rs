@@ -72,6 +72,15 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<(), BackendError> {
+        Storage::update_vector_index_definitions(self, table_name, vector_index_definitions)
+            .map_err(dyno_to_backend)
+    }
+
     async fn update_provisioned_throughput(
         &self,
         table_name: &str,
@@ -188,6 +197,15 @@ impl StorageBackend for Storage {
         index_name: &str,
     ) -> Result<(), BackendError> {
         Storage::drop_vector_table(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
+    async fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[crate::storage_backend::VectorItemRow],
+    ) -> Result<(), BackendError> {
+        Storage::insert_vector_items(self, table_name, index_name, rows).map_err(dyno_to_backend)
     }
 
     async fn insert_gsi_item(

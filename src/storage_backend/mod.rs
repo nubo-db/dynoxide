@@ -93,6 +93,27 @@ pub struct GsiItemRow {
     pub item_json: String,
 }
 
+/// One vector shadow-table row for a bulk insert via
+/// [`StorageBackend::insert_vector_items`].
+///
+/// The fields mirror the shadow table's column order.
+#[derive(Debug, Clone)]
+pub struct VectorItemRow {
+    /// Base-table partition key string.
+    pub table_pk: String,
+    /// Base-table sort key string.
+    pub table_sk: String,
+    /// SearchSchema HASH attribute key string (empty when the schema declares
+    /// no HASH element).
+    pub hash_value: String,
+    /// The f32-truncated vector as a JSON array.
+    pub vector_json: String,
+    /// INLINE_FILTER attribute values as a JSON object.
+    pub filter_json: String,
+    /// Projected item JSON.
+    pub item_json: String,
+}
+
 /// One index-table write operation, backend-neutral.
 ///
 /// The per-write and per-delete GSI/LSI fan-out builds an ordered list of these
@@ -209,6 +230,15 @@ pub trait StorageBackend {
         gsi_definitions: Option<&str>,
     ) -> Result<(), BackendError>;
 
+    /// Update a table's vector index definitions. The write the
+    /// add/delete-vector path of `UpdateTable` issues; `None` clears the
+    /// column when no vector indexes remain.
+    async fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<(), BackendError>;
+
     async fn update_provisioned_throughput(
         &self,
         table_name: &str,
@@ -300,6 +330,18 @@ pub trait StorageBackend {
         &self,
         table_name: &str,
         index_name: &str,
+    ) -> Result<(), BackendError>;
+
+    /// Bulk-insert many rows into one vector shadow table.
+    ///
+    /// Batch-shaped so a backend can amortise per-row round-trips, mirroring
+    /// [`insert_gsi_items`](Self::insert_gsi_items). Used by the vector index
+    /// backfill path.
+    async fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[VectorItemRow],
     ) -> Result<(), BackendError>;
 
     // -----------------------------------------------------------------------

@@ -1,5 +1,6 @@
 //! Vector index control-plane tests: CreateTable acceptance and validation,
-//! DescribeTable reflection, and DeleteTable cleanup.
+//! DescribeTable reflection, DeleteTable cleanup, and the UpdateTable
+//! `VectorIndexUpdates` path with its synchronous backfill.
 //!
 //! Error strings are pinned byte-for-byte to real DynamoDB behaviour captured
 //! in eu-west-2 on 2026-08-11, with a follow-up capture on 2026-08-12 that
@@ -9,6 +10,7 @@ use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::delete_table::DeleteTableRequest;
 use dynoxide::actions::describe_table::DescribeTableRequest;
+use dynoxide::actions::update_table::{UpdateTableRequest, VectorIndexUpdate};
 use dynoxide::storage::Storage;
 use dynoxide::types::{
     AttributeDefinition, KeySchemaElement, KeyType, Projection, ProjectionType,
@@ -50,8 +52,8 @@ fn parse(req: serde_json::Value) -> CreateTableRequest {
 /// The raw serde error carries the internal `VALIDATION:` marker that the
 /// server layer strips before anything reaches the wire; strip it here so
 /// assertions pin the full client-visible message.
-fn request_model_error(
-    result: std::result::Result<CreateTableRequest, serde_json::Error>,
+fn request_model_error<T: std::fmt::Debug>(
+    result: std::result::Result<T, serde_json::Error>,
 ) -> String {
     let err = result.unwrap_err().to_string();
     err.strip_prefix("VALIDATION:")
@@ -835,6 +837,959 @@ async fn create_succeeds_when_orphaned_vector_shadow_table_exists() {
         )
         .unwrap();
     assert_eq!(has_vector_json, 1);
+}
+
+// ---------------------------------------------------------------------------
+// UpdateTable VectorIndexUpdates: create with synchronous backfill, delete,
+// and the captured error strings
+// ---------------------------------------------------------------------------
+
+async fn create_plain_ppr_table(storage: &Storage, table: &str) {
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": table,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .unwrap();
+    dynoxide::actions::create_table::execute(storage, req)
+        .await
+        .unwrap();
+}
+
+async fn put_raw_item(storage: &Storage, table: &str, item: serde_json::Value) {
+    let req = serde_json::from_value(json!({
+        "TableName": table,
+        "Item": item,
+    }))
+    .unwrap();
+    dynoxide::actions::put_item::execute(storage, req)
+        .await
+        .unwrap();
+}
+
+async fn update_table_raw(
+    storage: &Storage,
+    req: serde_json::Value,
+) -> dynoxide::Result<dynoxide::actions::update_table::UpdateTableResponse> {
+    let req: UpdateTableRequest = serde_json::from_value(req).unwrap();
+    dynoxide::actions::update_table::execute(storage, req).await
+}
+
+fn shadow_row_count(storage: &Storage, shadow_table: &str) -> i64 {
+    storage
+        .conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM \"{shadow_table}\""),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecFill").await;
+
+    // One valid vector, plus one of each invalid shape a live write would
+    // reject: wrong dimension count, non-numeric element, wrong type,
+    // out-of-f32-range element, and a missing attribute. Backfill over
+    // pre-existing invalid values skips them silently (captured from real
+    // DynamoDB, eu-west-2 and us-east-1, 2026-08-12).
+    put_raw_item(
+        &storage,
+        "VecFill",
+        json!({
+            "pk": {"S": "valid"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}, {"N": "3"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecFill",
+        json!({
+            "pk": {"S": "wrong-dims"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecFill",
+        json!({
+            "pk": {"S": "non-numeric"},
+            "embedding": {"L": [{"N": "1"}, {"S": "x"}, {"N": "3"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecFill",
+        json!({
+            "pk": {"S": "wrong-type"},
+            "embedding": {"S": "not-a-list"}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecFill",
+        json!({
+            "pk": {"S": "out-of-range"},
+            "embedding": {"L": [{"N": "1E+39"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    put_raw_item(&storage, "VecFill", json!({"pk": {"S": "no-vector"}})).await;
+
+    let resp = update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecFill",
+            "VectorIndexUpdates": [{"Create": vix_json("vix")}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The UpdateTable response reports the table UPDATING and the new index
+    // CREATING (captured lifecycle walk, eu-west-2, 2026-08-11).
+    assert_eq!(resp.table_description.table_status, "UPDATING");
+    let vixs = resp.table_description.vector_indexes.as_ref().unwrap();
+    assert_eq!(vixs.len(), 1);
+    assert_eq!(vixs[0].index_status, "CREATING");
+
+    // Only the valid item was backfilled, with its f32 copy stored.
+    assert_eq!(shadow_row_count(&storage, "VecFill::vector::vix"), 1);
+    let (table_pk, vector_json): (String, String) = storage
+        .conn()
+        .query_row(
+            "SELECT table_pk, vector_json FROM \"VecFill::vector::vix\"",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(table_pk, "S:valid");
+    assert_eq!(vector_json, "[1.0,2.0,3.0]");
+
+    // DescribeTable reports ACTIVE immediately, with Backfilling absent from
+    // the serialised description (dynoxide never reports the field; backfill
+    // is synchronous).
+    let desc = dynoxide::actions::describe_table::execute(
+        &storage,
+        DescribeTableRequest {
+            table_name: "VecFill".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "ACTIVE");
+    let body = serde_json::to_string(&desc).unwrap();
+    assert!(
+        !body.contains("Backfilling"),
+        "Backfilling should be absent from the serialised description, got: {body}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_backfill_skips_hash_values_a_live_write_would_reject() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecHash").await;
+
+    put_raw_item(
+        &storage,
+        "VecHash",
+        json!({
+            "pk": {"S": "scoped"},
+            "tenant": {"S": "acme"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    // Valid vector but no HASH attribute: unreachable through a HASH-schema
+    // index, so it gets no row (the sparse-index pattern).
+    put_raw_item(
+        &storage,
+        "VecHash",
+        json!({
+            "pk": {"S": "unscoped"},
+            "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    // A HASH value whose type differs from the declared AttributeDefinitions
+    // type, and an empty-string HASH value, are both rejected by a live write
+    // once the index exists (captured from real DynamoDB: the type mismatch
+    // in eu-west-2 and us-east-1 on 2026-08-12, the empty string in eu-west-2
+    // on 2026-08-11), so backfill skips both shapes.
+    put_raw_item(
+        &storage,
+        "VecHash",
+        json!({
+            "pk": {"S": "type-clash"},
+            "tenant": {"N": "7"},
+            "embedding": {"L": [{"N": "0"}, {"N": "0"}, {"N": "1"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecHash",
+        json!({
+            "pk": {"S": "empty-hash"},
+            "tenant": {"S": ""},
+            "embedding": {"L": [{"N": "1"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecHash",
+            "AttributeDefinitions": [{"AttributeName": "tenant", "AttributeType": "S"}],
+            "VectorIndexUpdates": [{"Create": {
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "SearchSchema": [
+                    {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+                ],
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(shadow_row_count(&storage, "VecHash::vector::vix"), 1);
+    let hash_value: String = storage
+        .conn()
+        .query_row("SELECT hash_value FROM \"VecHash::vector::vix\"", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(hash_value, "S:acme");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_backfill_keys_only_projection_stores_exact_item() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecProjKeys").await;
+    put_raw_item(
+        &storage,
+        "VecProjKeys",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"S": "t1"},
+            "extra": {"S": "x"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}, {"N": "3"}]}
+        }),
+    )
+    .await;
+
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecProjKeys",
+            "AttributeDefinitions": [{"AttributeName": "tenant", "AttributeType": "S"}],
+            "VectorIndexUpdates": [{"Create": {
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "SearchSchema": [
+                    {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+                ],
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "KEYS_ONLY"}
+            }}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    // KEYS_ONLY projects the table keys plus the SearchSchema attributes and
+    // nothing else: no vector copy, no other non-key attributes.
+    let item_json: String = storage
+        .conn()
+        .query_row(
+            "SELECT item_json FROM \"VecProjKeys::vector::vix\"",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_str(&item_json).unwrap();
+    assert_eq!(item, json!({"pk": {"S": "a"}, "tenant": {"S": "t1"}}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_backfill_include_projection_stores_exact_item() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecProjInc").await;
+    put_raw_item(
+        &storage,
+        "VecProjInc",
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"S": "t1"},
+            "note": {"S": "kept"},
+            "other": {"S": "dropped"},
+            "embedding": {"L": [{"N": "1"}, {"N": "2"}, {"N": "3"}]}
+        }),
+    )
+    .await;
+
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecProjInc",
+            "AttributeDefinitions": [{"AttributeName": "tenant", "AttributeType": "S"}],
+            "VectorIndexUpdates": [{"Create": {
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "SearchSchema": [
+                    {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+                ],
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {
+                    "ProjectionType": "INCLUDE",
+                    "NonKeyAttributes": ["embedding", "note"]
+                }
+            }}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    // INCLUDE projects the table keys, the SearchSchema attributes, and the
+    // named non-key attributes; the vector attribute appears as its f32 copy
+    // and nothing else rides along.
+    let item_json: String = storage
+        .conn()
+        .query_row(
+            "SELECT item_json FROM \"VecProjInc::vector::vix\"",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_str(&item_json).unwrap();
+    assert_eq!(
+        item,
+        json!({
+            "pk": {"S": "a"},
+            "tenant": {"S": "t1"},
+            "note": {"S": "kept"},
+            "embedding": {"L": [{"N": "1.0"}, {"N": "2.0"}, {"N": "3.0"}]}
+        })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_backfill_stores_inline_filter_values_exactly() {
+    let storage = Storage::memory().unwrap();
+    create_plain_ppr_table(&storage, "VecFilter").await;
+    put_raw_item(
+        &storage,
+        "VecFilter",
+        json!({
+            "pk": {"S": "with"},
+            "tenant": {"S": "t"},
+            "category": {"S": "books"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+    put_raw_item(
+        &storage,
+        "VecFilter",
+        json!({
+            "pk": {"S": "without"},
+            "tenant": {"S": "t"},
+            "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecFilter",
+            "AttributeDefinitions": [
+                {"AttributeName": "tenant", "AttributeType": "S"},
+                {"AttributeName": "category", "AttributeType": "S"}
+            ],
+            "VectorIndexUpdates": [{"Create": {
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "SearchSchema": [
+                    {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"},
+                    {"AttributeName": "category", "SearchSchemaElementType": "INLINE_FILTER"}
+                ],
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Both items are indexed: an absent INLINE_FILTER attribute does not make
+    // the item sparse, and it stays absent from the JSON rather than becoming
+    // null.
+    assert_eq!(shadow_row_count(&storage, "VecFilter::vector::vix"), 2);
+    let filter_for = |pk: &str| -> String {
+        storage
+            .conn()
+            .query_row(
+                "SELECT filter_json FROM \"VecFilter::vector::vix\" WHERE table_pk = ?1",
+                [pk],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let with = filter_for("S:with");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&with).unwrap(),
+        json!({"category": {"S": "books"}})
+    );
+    let without = filter_for("S:without");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&without).unwrap(),
+        json!({})
+    );
+    assert!(
+        !without.contains("null"),
+        "an absent filter attribute must be absent, never null, got: {without}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_table_deletes_vector_index_leaving_base_table_and_gsis_untouched() {
+    let storage = Storage::memory().unwrap();
+    let req: CreateTableRequest = serde_json::from_value(full_house_request("VecDrop")).unwrap();
+    dynoxide::actions::create_table::execute(&storage, req)
+        .await
+        .unwrap();
+    put_raw_item(
+        &storage,
+        "VecDrop",
+        json!({
+            "pk": {"S": "a"},
+            "sk": {"S": "1"},
+            "gsi_pk": {"S": "g"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        }),
+    )
+    .await;
+
+    update_table_raw(
+        &storage,
+        json!({
+            "TableName": "VecDrop",
+            "VectorIndexUpdates": [{"Delete": {"IndexName": "vix"}}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The shadow table is gone; the base table and the other index families
+    // are untouched, physically and in metadata.
+    assert!(!physical_table_exists(&storage, "VecDrop::vector::vix"));
+    assert!(physical_table_exists(&storage, "VecDrop"));
+    assert!(physical_table_exists(&storage, "VecDrop::gsi::gsi1"));
+    assert!(physical_table_exists(&storage, "VecDrop::lsi::lsi1"));
+
+    let desc = dynoxide::actions::describe_table::execute(
+        &storage,
+        DescribeTableRequest {
+            table_name: "VecDrop".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(desc.table.vector_indexes.is_none());
+    assert_eq!(
+        desc.table.global_secondary_indexes.as_ref().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        desc.table.local_secondary_indexes.as_ref().unwrap().len(),
+        1
+    );
+
+    let base_rows: i64 = storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM \"VecDrop\"", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(base_rows, 1);
+}
+
+#[test]
+fn two_vector_index_actions_in_one_call_rejected_with_captured_string() {
+    // The GSI online-index machinery's own error. Captured from real
+    // DynamoDB (eu-west-2, 2026-08-11).
+    let db = make_db();
+    db.create_table(parse(base_request("VecTwoActs", json!([vix_json("one")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecTwoActs",
+        "VectorIndexUpdates": [
+            {"Delete": {"IndexName": "one"}},
+            {"Create": vix_json("two")}
+        ]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table"
+    );
+}
+
+#[test]
+fn vector_update_entry_with_both_actions_rejected_with_captured_string() {
+    // One entry carrying Create and Delete breaks a per-object structural
+    // rule with its own string, not the one-action-per-call
+    // LimitExceededException. Captured from real DynamoDB (eu-west-2 and
+    // us-east-1, 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(base_request("VecBothActs", json!([vix_json("one")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecBothActs",
+        "VectorIndexUpdates": [{
+            "Create": vix_json("two"),
+            "Delete": {"IndexName": "one"}
+        }]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Only one vector index action is \
+         allowed per VectorIndexUpdate object"
+    );
+}
+
+#[test]
+fn vector_create_named_after_existing_gsi_or_lsi_rejected_with_captured_string() {
+    // The duplicate check spans index families: a vector create colliding
+    // with a live GSI name carries the vector path's wording, captured from
+    // real DynamoDB (eu-west-2 and us-east-1, 2026-08-12). The LSI direction
+    // follows the shared name namespace captured on the CreateTable path.
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(full_house_request("VecXFam")).unwrap();
+    db.create_table(req).unwrap();
+    for clash in ["gsi1", "lsi1"] {
+        let req: UpdateTableRequest = serde_json::from_value(json!({
+            "TableName": "VecXFam",
+            "VectorIndexUpdates": [{"Create": vix_json(clash)}]
+        }))
+        .unwrap();
+        let err = db.update_table(req).unwrap_err().to_string();
+        assert_eq!(err, "Attempting to create an index which already exists");
+    }
+}
+
+#[test]
+fn gsi_create_named_after_existing_vector_index_rejected_with_captured_string() {
+    // A GSI create colliding with a live vector index name carries the
+    // vector path's wording, not the GSI same-family string. Captured from
+    // real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    let db = make_db();
+    let req: CreateTableRequest = serde_json::from_value(full_house_request("GsiXFam")).unwrap();
+    db.create_table(req).unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "GsiXFam",
+        "AttributeDefinitions": [{"AttributeName": "cat", "AttributeType": "S"}],
+        "GlobalSecondaryIndexUpdates": [{"Create": {
+            "IndexName": "vix",
+            "KeySchema": [{"AttributeName": "cat", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(err, "Attempting to create an index which already exists");
+}
+
+#[test]
+fn gsi_create_keyed_on_live_vector_attribute_rejected_with_captured_string() {
+    // A GSI keyed on a live vector attribute is a redefinition: the message
+    // interpolates the attribute, the live index's dimensions, the declared
+    // scalar type, and the proposed key type. Captured from real DynamoDB
+    // (eu-west-2 and us-east-1, 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(base_request("GsiVecKey", json!([vix_json("vix")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "GsiVecKey",
+        "AttributeDefinitions": [{"AttributeName": "embedding", "AttributeType": "S"}],
+        "GlobalSecondaryIndexUpdates": [{"Create": {
+            "IndexName": "gsi2",
+            "KeySchema": [{"AttributeName": "embedding", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Attributes cannot be redefined. \
+         Please check that your attribute has the same type as previously defined. \
+         Existing schema: VectorIndexSchema:[VectorAttribute: key{embedding:L:3}] \
+         New schema: Schema:[SchemaElement: key{embedding:S:HASH}]"
+    );
+}
+
+#[test]
+fn update_table_missing_dimensions_rejected_at_request_model_layer() {
+    // The UpdateTable path renders 'vectorIndexUpdates.N.member.create'
+    // field paths, enveloped like CreateTable's collectors. Captured from
+    // real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    let mut create = vix_json("vix");
+    create.as_object_mut().unwrap().remove("Dimensions");
+    let err = request_model_error(serde_json::from_value::<UpdateTableRequest>(json!({
+        "TableName": "VecNoDims",
+        "VectorIndexUpdates": [{"Create": create}]
+    })));
+    assert_eq!(
+        err,
+        "1 validation error detected: Value null at \
+         'vectorIndexUpdates.1.member.create.dimensions' failed to satisfy constraint: \
+         Member must not be null"
+    );
+}
+
+#[test]
+fn update_table_request_model_envelope_reports_gsi_entries_before_vector_entries() {
+    // One envelope across index families, GSI entries before vector entries.
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    let mut create = vix_json("vix");
+    create.as_object_mut().unwrap().remove("Dimensions");
+    let err = request_model_error(serde_json::from_value::<UpdateTableRequest>(json!({
+        "TableName": "VecEnvelope",
+        "GlobalSecondaryIndexUpdates": [{"Update": {"IndexName": "gsi1"}}],
+        "VectorIndexUpdates": [{"Create": create}]
+    })));
+    assert_eq!(
+        err,
+        "2 validation errors detected: Value null at \
+         'globalSecondaryIndexUpdates.1.member.update.provisionedThroughput' failed to \
+         satisfy constraint: Member must not be null; Value null at \
+         'vectorIndexUpdates.1.member.create.dimensions' failed to satisfy constraint: \
+         Member must not be null"
+    );
+}
+
+#[test]
+fn update_table_operation_layer_paths_carry_the_create_segment() {
+    // The typed validator renders the UpdateTable path shape too, always as
+    // entry 1 since a call carries at most one create action. A position-2
+    // pin is impossible on this operation: two entries are rejected by the
+    // one-action-per-call limit before any per-entry validation runs.
+    let db = make_db();
+    db.create_table(parse(base_request(
+        "VecPathTyped",
+        json!([vix_json("vix")]),
+    )))
+    .unwrap();
+    let req = UpdateTableRequest {
+        table_name: "VecPathTyped".to_string(),
+        vector_index_updates: Some(vec![VectorIndexUpdate {
+            create: Some(typed_vix("vx")),
+            delete: None,
+        }]),
+        ..Default::default()
+    };
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "1 validation error detected: Value 'vx' at \
+         'vectorIndexUpdates.1.member.create.indexName' failed to satisfy constraint: \
+         Member must have length greater than or equal to 3"
+    );
+}
+
+#[test]
+fn vector_create_with_duplicate_name_rejected_with_captured_string() {
+    // The vector path has its own duplicate wording, with no index name in
+    // it: not the GSI string and not CreateTable's classic cross-index one.
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(base_request("VecDupUpd", json!([vix_json("vix")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecDupUpd",
+        "VectorIndexUpdates": [{"Create": vix_json("vix")}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(err, "Attempting to create an index which already exists");
+}
+
+#[test]
+fn vector_delete_of_missing_index_rejected_with_captured_string() {
+    // Bare index name, no quoting. Captured from real DynamoDB (eu-west-2
+    // and us-east-1, 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(json!({
+        "TableName": "VecDelMiss",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    })))
+    .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecDelMiss",
+        "VectorIndexUpdates": [{"Delete": {"IndexName": "absent"}}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "Requested resource not found: Index absent for table VecDelMiss"
+    );
+}
+
+#[test]
+fn vector_create_on_provisioned_table_rejected_with_captured_string() {
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(json!({
+        "TableName": "VecProvUpd",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    })))
+    .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecProvUpd",
+        "VectorIndexUpdates": [{"Create": vix_json("vix")}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Vector indexes are only supported \
+         for PAY_PER_REQUEST tables"
+    );
+}
+
+#[test]
+fn billing_switch_to_provisioned_rejected_while_vector_indexes_exist() {
+    // The flip gate has its own string, distinct from the create-time
+    // gate's. Captured from real DynamoDB (eu-west-2 and us-east-1,
+    // 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(base_request("VecFlip", json!([vix_json("vix")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecFlip",
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Tables with vector indexes must \
+         be in PAY_PER_REQUEST mode"
+    );
+}
+
+#[test]
+fn billing_switch_combined_with_delete_of_last_vector_index_rejected() {
+    // The gate reads the stored definitions, so deleting the last vector
+    // index and flipping in the same call is still rejected. Captured from
+    // real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    let db = make_db();
+    db.create_table(parse(base_request("VecFlipDel", json!([vix_json("vix")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecFlipDel",
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+        "VectorIndexUpdates": [{"Delete": {"IndexName": "vix"}}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Tables with vector indexes must \
+         be in PAY_PER_REQUEST mode"
+    );
+}
+
+#[test]
+fn fifth_vector_index_via_update_table_accepted_at_the_boundary() {
+    let db = make_db();
+    let vixs: Vec<serde_json::Value> = (0..4).map(|i| vix_json(&format!("vix-{i}"))).collect();
+    db.create_table(parse(base_request("VecFour", json!(vixs))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecFour",
+        "VectorIndexUpdates": [{"Create": vix_json("vix-4")}]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+    let desc = describe(&db, "VecFour");
+    let vixs = desc.table.vector_indexes.as_ref().unwrap();
+    assert_eq!(vixs.len(), 5);
+    assert!(vixs.iter().all(|v| v.index_status == "ACTIVE"));
+}
+
+#[test]
+fn sixth_vector_index_via_update_table_rejected_with_captured_string() {
+    // Same count-limit string as CreateTable's. Captured from real DynamoDB
+    // (eu-west-2, 2026-08-11).
+    let db = make_db();
+    let vixs: Vec<serde_json::Value> = (0..5).map(|i| vix_json(&format!("vix-{i}"))).collect();
+    db.create_table(parse(base_request("VecFiveUpd", json!(vixs))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecFiveUpd",
+        "VectorIndexUpdates": [{"Create": vix_json("vix-5")}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: VectorIndex count exceeds the \
+         per-table limit of 5"
+    );
+}
+
+#[test]
+fn update_table_create_with_conflicting_dimensions_rejected_with_captured_string() {
+    // The string is captured on the CreateTable path (eu-west-2, 2026-08-11);
+    // the invariant is structural, so this call site pins the same bytes
+    // against a live index.
+    let db = make_db();
+    db.create_table(parse(base_request("VecDimUpd", json!([vix_json("vix")]))))
+        .unwrap();
+    let mut second = vix_json("vix2");
+    second["Dimensions"] = json!(4);
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecDimUpd",
+        "VectorIndexUpdates": [{"Create": second}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Conflicting attribute definition for \
+         'embedding'. All VectorIndexes on the same vector attribute must use the same \
+         dimensions."
+    );
+}
+
+#[test]
+fn update_table_create_with_vector_attribute_declared_rejected_with_captured_string() {
+    // The string is captured on the CreateTable path (eu-west-2 and
+    // us-east-1, 2026-08-12); this call site checks the merged definitions,
+    // so a declaration arriving in the update's delta trips it too.
+    let db = make_db();
+    db.create_table(parse(json!({
+        "TableName": "VecAttrUpd",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    })))
+    .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecAttrUpd",
+        "AttributeDefinitions": [{"AttributeName": "embedding", "AttributeType": "B"}],
+        "VectorIndexUpdates": [{"Create": vix_json("vix")}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: Conflicting attribute definition for \
+         'embedding'. An attribute cannot be defined in AttributeDefinitions when used as a \
+         VectorAttribute."
+    );
+}
+
+#[test]
+fn empty_vector_index_update_entry_rejected() {
+    // An entry carrying neither action mirrors the GSI structural message
+    // with the two actions the vector family has; this shape is not captured.
+    let db = make_db();
+    db.create_table(parse(base_request("VecEmptyUpd", json!([vix_json("vix")]))))
+        .unwrap();
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecEmptyUpd",
+        "VectorIndexUpdates": [{}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "One or more parameter values were invalid: One of VectorIndexUpdate.Create, \
+         VectorIndexUpdate.Delete must not be null"
+    );
+}
+
+#[test]
+fn gsi_delete_preserves_attribute_used_by_vector_search_schema() {
+    // Regression guard for AttributeDefinitions reconciliation: deleting a
+    // GSI whose key attribute a surviving vector index's SearchSchema also
+    // uses must not prune that attribute.
+    let db = make_db();
+    db.create_table(parse(json!({
+        "TableName": "VecShared",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "tenant", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "gsi1",
+            "KeySchema": [{"AttributeName": "tenant", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "VectorIndexes": [{
+            "IndexName": "vix",
+            "VectorAttribute": {"AttributeName": "embedding"},
+            "SearchSchema": [
+                {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+            ],
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    })))
+    .unwrap();
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecShared",
+        "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi1"}}]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let desc = describe(&db, "VecShared");
+    assert!(desc.table.global_secondary_indexes.is_none());
+    assert_eq!(desc.table.vector_indexes.as_ref().unwrap().len(), 1);
+    assert!(
+        desc.table
+            .attribute_definitions
+            .iter()
+            .any(|d| d.attribute_name == "tenant"),
+        "the surviving vector index's SearchSchema attribute must survive \
+         reconciliation, got: {:?}",
+        desc.table.attribute_definitions
+    );
 }
 
 // ---------------------------------------------------------------------------

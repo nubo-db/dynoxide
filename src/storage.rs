@@ -714,6 +714,20 @@ impl Storage {
         Ok(())
     }
 
+    /// Update vector index definitions for a table; `None` clears the column.
+    pub fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<()> {
+        let (sql, params) =
+            sql_builders::update_vector_index_definitions(table_name, vector_index_definitions);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
     /// Update provisioned throughput for a table.
     pub fn update_provisioned_throughput(
         &self,
@@ -1041,6 +1055,30 @@ impl Storage {
     pub fn create_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
         let (sql, _) = sql_builders::create_vector_table(table_name, index_name);
         self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Bulk-insert many rows into one vector shadow table using a single
+    /// cached prepared statement, mirroring [`Self::insert_gsi_items`].
+    pub fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[crate::storage_backend::VectorItemRow],
+    ) -> Result<()> {
+        let sql = sql_builders::vector_insert_sql(table_name, index_name);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        for row in rows {
+            let params = sql_builders::vector_insert_params(
+                &row.table_pk,
+                &row.table_sk,
+                &row.hash_value,
+                &row.vector_json,
+                &row.filter_json,
+                &row.item_json,
+            );
+            stmt.execute(rusqlite::params_from_iter(params.iter()))?;
+        }
         Ok(())
     }
 

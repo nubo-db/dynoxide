@@ -1583,6 +1583,9 @@ impl McpServer {
             table_name: params.table_name,
             attribute_definitions,
             global_secondary_index_updates,
+            // Vector index updates through MCP arrive with the wider MCP
+            // vector-parity work, not this tool revision.
+            vector_index_updates: None,
             stream_specification,
             deletion_protection_enabled: params.deletion_protection_enabled,
             billing_mode: params.billing_mode,

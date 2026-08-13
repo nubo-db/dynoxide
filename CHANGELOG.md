@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ConsumedCapacity` under `INDEXES` charges index writes on the change to what an index stores, not on the item the write leaves behind ([#176](https://github.com/nubo-db/dynoxide/issues/176)). Each index used to be charged a unit whenever the finished item belonged to it, which is right for a plain insert and wrong for most else:
+
+  - LSI writes are charged. The `LocalSecondaryIndexes` arm never appeared before, and its units never reached the total.
+  - An identical overwrite is free, and a write outside a GSI's projection no longer charges that GSI.
+  - Moving an index key costs two writes; removing one costs a single delete.
+  - `DeleteItem` charges an index only when the deleted item was in it.
+
+  Units are sized on the projected index entry rather than the base item: an insert or delete costs its own image, an in-place update the larger of the two, and a key move both halves rounded separately. `BatchWriteItem` inherits all of it. Two of the old figures over-reported rather than under-reported, so any downstream correction for the old numbers needs removing. Captured against eu-west-2.
+
+- `PutItem` and `UpdateItem` size the table arm on the larger of the item's before and after images, matching DynamoDB. They used to size it on the finished item, so shrinking a 3KB item to 100B reported one unit against DynamoDB's three. Items under 1KB are unaffected, and `DeleteItem` already sized on the old image.
+
+### Notes
+
+- `TransactWriteItems` and PartiQL writes still report table-level `ConsumedCapacity` only, with no per-index breakdown under `INDEXES`, where real DynamoDB reports one. The index fix above does not reach them, and the gap is now recorded in [docs/compatibility-summary.md](docs/compatibility-summary.md).
+
 ## [0.13.0] - 2026-07-30
 
 ### Added

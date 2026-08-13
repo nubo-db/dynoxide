@@ -22,6 +22,7 @@ pub(crate) mod lsi;
 pub mod put_item;
 pub mod query;
 pub mod scan;
+pub mod search_vectors;
 pub mod tag_resource;
 pub mod transact_get_items;
 pub mod transact_write_items;

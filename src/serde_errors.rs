@@ -138,6 +138,14 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
             .unwrap_or(target_part)
             .trim();
 
+        // The i32-modelled members (SearchVectors' TopK) leak the raw
+        // serde-style rejection, position suffix included: "invalid type:
+        // floating point `3.5`, expected i32 at line 1 column N", captured
+        // from real DynamoDB (eu-west-2 and us-east-1, 2026-08-13).
+        if target == "i32" {
+            return msg.to_string();
+        }
+
         return map_type_mismatch(source_part.trim(), target);
     }
 

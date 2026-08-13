@@ -12,7 +12,7 @@ use dynoxide::storage::{
     TableStats,
 };
 use dynoxide::storage_backend::{
-    BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, VectorItemRow,
+    BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, VectorCandidateRow, VectorItemRow,
 };
 use dynoxide::types::Tag;
 
@@ -214,6 +214,15 @@ impl StorageBackend for TestBackend {
         _table_pk: &str,
         _table_sk: &str,
     ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn query_vector_candidates(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _hash_value: Option<&str>,
+    ) -> Result<Vec<VectorCandidateRow>, BackendError> {
         unimplemented!()
     }
 

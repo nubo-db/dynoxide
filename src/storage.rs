@@ -1099,6 +1099,32 @@ impl Storage {
         Ok(())
     }
 
+    /// Load vector shadow-table candidate rows for a search, optionally
+    /// scoped to one SearchSchema HASH value. Ordered by base-table primary
+    /// key (see the builder) so equal scores tie-break deterministically.
+    pub fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<crate::storage_backend::VectorCandidateRow>> {
+        let (sql, params) =
+            sql_builders::query_vector_candidates(table_name, index_name, hash_value);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(crate::storage_backend::VectorCandidateRow {
+                    table_pk: row.get(0)?,
+                    table_sk: row.get(1)?,
+                    vector_json: row.get(2)?,
+                    filter_json: row.get(3)?,
+                    item_json: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Drop a vector index shadow table.
     pub fn drop_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
         let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);

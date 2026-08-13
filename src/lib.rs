@@ -833,6 +833,14 @@ impl Database<RusqliteBackend> {
         self.with_storage(|s| pollster::block_on(actions::scan::execute(s, request)))
     }
 
+    /// Search a vector index with exact brute-force KNN, ranked best first.
+    pub fn search_vectors(
+        &self,
+        request: actions::search_vectors::SearchVectorsRequest,
+    ) -> Result<actions::search_vectors::SearchVectorsResponse> {
+        self.with_storage(|s| pollster::block_on(actions::search_vectors::execute(s, request)))
+    }
+
     // -------------------------------------------------------------------
     // Transactions
     // -------------------------------------------------------------------

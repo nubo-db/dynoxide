@@ -114,6 +114,25 @@ pub struct VectorItemRow {
     pub item_json: String,
 }
 
+/// One candidate row loaded from a vector shadow table for scoring by
+/// SearchVectors, via [`StorageBackend::query_vector_candidates`].
+///
+/// Carries no `hash_value`: scoping by HASH value happens in the query
+/// itself, so every returned row already matches the scope.
+#[derive(Debug, Clone)]
+pub struct VectorCandidateRow {
+    /// Base-table partition key string.
+    pub table_pk: String,
+    /// Base-table sort key string.
+    pub table_sk: String,
+    /// The stored f32-truncated vector as a JSON array.
+    pub vector_json: String,
+    /// INLINE_FILTER attribute values as a wire-shaped JSON object.
+    pub filter_json: String,
+    /// Projected item JSON.
+    pub item_json: String,
+}
+
 /// One index-table write operation, backend-neutral.
 ///
 /// The per-write and per-delete GSI/LSI fan-out builds an ordered list of these
@@ -374,6 +393,17 @@ pub trait StorageBackend {
         table_pk: &str,
         table_sk: &str,
     ) -> Result<(), BackendError>;
+
+    /// Load the rows SearchVectors scores, optionally scoped to one
+    /// SearchSchema HASH value (key-string encoded, matching the write
+    /// path's `hash_value` column). Rows come back ordered by base-table
+    /// primary key so equal scores tie-break deterministically.
+    async fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<VectorCandidateRow>, BackendError>;
 
     // -----------------------------------------------------------------------
     // GSI item operations

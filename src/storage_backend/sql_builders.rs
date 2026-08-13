@@ -699,6 +699,37 @@ pub fn delete_vector_item<'a>(
     )
 }
 
+/// Load the candidate rows for a SearchVectors call: every row of the shadow
+/// table, or one partition of it when the index's SearchSchema declares a
+/// HASH element (the caller passes the key-string-encoded operand, matching
+/// the encoding the write path stores in `hash_value`). Ordered by base-table
+/// primary key so equal scores downstream tie-break deterministically
+/// regardless of insertion order.
+pub fn query_vector_candidates<'a>(
+    table_name: &str,
+    index_name: &str,
+    hash_value: Option<&'a str>,
+) -> (String, Vec<SqlParam<'a>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    let escaped = escape_table_name(&vix);
+    match hash_value {
+        Some(hv) => (
+            format!(
+                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                 \"{escaped}\" WHERE hash_value = ?1 ORDER BY table_pk ASC, table_sk ASC"
+            ),
+            vec![SqlParam::text(hv)],
+        ),
+        None => (
+            format!(
+                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                 \"{escaped}\" ORDER BY table_pk ASC, table_sk ASC"
+            ),
+            Vec::new(),
+        ),
+    }
+}
+
 /// Drop a vector index shadow table if it exists.
 pub fn drop_vector_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
     let vix = format!("{table_name}::vector::{index_name}");
@@ -1559,6 +1590,53 @@ mod tests {
                 SqlParam::text("{}"),
                 SqlParam::text("{\"pk\":{\"S\":\"p\"}}"),
             ]
+        );
+    }
+
+    #[test]
+    fn query_vector_candidates_is_pinned() {
+        assert_eq!(
+            query_vector_candidates("Docs", "vix", None),
+            (
+                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                 \"Docs::vector::vix\" ORDER BY table_pk ASC, table_sk ASC"
+                    .to_string(),
+                Vec::new(),
+            )
+        );
+        assert_eq!(
+            query_vector_candidates("Docs", "vix", Some("S:t1")),
+            (
+                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                 \"Docs::vector::vix\" WHERE hash_value = ?1 ORDER BY table_pk ASC, \
+                 table_sk ASC"
+                    .to_string(),
+                vec![SqlParam::text("S:t1")],
+            )
+        );
+    }
+
+    #[test]
+    fn scoped_candidate_query_uses_the_hash_value_index() {
+        // The per-partition candidate load must go through the hash_value
+        // index rather than scanning the shadow table, or HASH-scoped
+        // searches degrade to full scans as tables grow.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let (create_sql, _) = create_vector_table("Docs", "vix");
+        conn.execute_batch(&create_sql).unwrap();
+
+        let (sql, _) = query_vector_candidates("Docs", "vix", Some("S:t1"));
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(["S:t1"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX") && d.contains("Docs::vector::vix::hash_value")),
+            "expected an index search on hash_value, got plan: {plan:?}"
         );
     }
 

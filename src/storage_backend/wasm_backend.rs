@@ -39,7 +39,7 @@ use crate::storage::{
 use crate::storage_backend::sql_builders::{self, SqlParam};
 use crate::storage_backend::{
     BackendError, BaseItemRow, Clock, GsiItemRow, IndexWriteOp, StorageBackend, SystemClock,
-    VectorItemRow,
+    VectorCandidateRow, VectorItemRow,
 };
 use crate::types::Tag;
 
@@ -726,6 +726,28 @@ impl StorageBackend for WasmBridgeBackend {
         let (sql, params) =
             sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk);
         self.exec(&sql, params).await
+    }
+
+    async fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<VectorCandidateRow>, BackendError> {
+        let (sql, p) = sql_builders::query_vector_candidates(table_name, index_name, hash_value);
+        let rows = self.query(&sql, p).await?;
+        let mut out = Vec::with_capacity(rows.length() as usize);
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            out.push(VectorCandidateRow {
+                table_pk: col_text(&row, 0).unwrap_or_default(),
+                table_sk: col_text(&row, 1).unwrap_or_default(),
+                vector_json: col_text(&row, 2).unwrap_or_default(),
+                filter_json: col_text(&row, 3).unwrap_or_default(),
+                item_json: col_text(&row, 4).unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     // --- GSI items -------------------------------------------------------

@@ -556,6 +556,13 @@ fn resolve_operand(
 // Comparison logic
 // ---------------------------------------------------------------------------
 
+/// DynamoDB equality between two resolved attribute values. Exposed for the
+/// SearchVectors filter evaluation so its wire-shape comparisons agree with
+/// the condition machinery (numeric `N` equality in particular).
+pub fn values_equal(left: &AttributeValue, right: &AttributeValue) -> bool {
+    compare_values(left, &CompOp::Eq, right)
+}
+
 /// Compare two AttributeValues using a comparison operator.
 fn compare_values(left: &AttributeValue, op: &CompOp, right: &AttributeValue) -> bool {
     match (left, right) {

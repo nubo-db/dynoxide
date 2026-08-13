@@ -219,6 +219,16 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<crate::storage_backend::VectorCandidateRow>, BackendError> {
+        Storage::query_vector_candidates(self, table_name, index_name, hash_value)
+            .map_err(dyno_to_backend)
+    }
+
     async fn insert_gsi_item(
         &self,
         table_name: &str,

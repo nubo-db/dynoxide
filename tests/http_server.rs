@@ -1295,3 +1295,217 @@ async fn test_scan_filter_expression_oversize_bare() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_search_vectors_http_bytes_match_the_in_process_facade() {
+    // One database serves both surfaces so the same request must produce
+    // identical bytes: the server serialises the same response type the
+    // facade returns.
+    let db = Database::memory().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server_db = db.clone();
+    let _handle = tokio::spawn(async move {
+        dynoxide::server::serve_on(listener, server_db).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    dynamo_request(
+        &url,
+        "CreateTable",
+        json!({
+            "TableName": "VecHttp",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "cosine",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }),
+    )
+    .await;
+    for (pk, v) in [("a", ["1", "0", "0"]), ("b", ["0", "1", "0"])] {
+        let resp = dynamo_request(
+            &url,
+            "PutItem",
+            json!({
+                "TableName": "VecHttp",
+                "Item": {
+                    "pk": {"S": pk},
+                    "embedding": {"L": v.map(|n| json!({"N": n})).to_vec()}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    let request_body = json!({
+        "TableName": "VecHttp",
+        "IndexName": "cosine",
+        "SearchVector": [{"N": "1"}, {"N": "0"}, {"N": "0"}],
+        "TopK": 10
+    });
+
+    let http_resp = dynamo_request(&url, "SearchVectors", request_body.clone()).await;
+    assert_eq!(http_resp.status(), 200);
+    let http_body = http_resp.text().await.unwrap();
+
+    let facade_req: dynoxide::actions::search_vectors::SearchVectorsRequest =
+        serde_json::from_value(request_body).unwrap();
+    let facade_resp = db.search_vectors(facade_req).unwrap();
+    let facade_body = serde_json::to_string(&facade_resp).unwrap();
+
+    assert_eq!(http_body, facade_body);
+    // Ranked best-first with the score serialised as a JSON double, and the
+    // vector attribute excluded by default.
+    assert!(
+        http_body
+            .starts_with("{\"SearchResults\":[{\"Item\":{\"pk\":{\"S\":\"a\"}},\"Score\":0.0}")
+    );
+    assert!(!http_body.contains("embedding"));
+}
+
+#[tokio::test]
+async fn test_search_vectors_probe_shape_on_a_nonexistent_table() {
+    let (url, _handle) = start_test_server().await;
+
+    // The conformance suite's data-plane probe sends SearchVectors at a table
+    // that cannot exist and expects a real ResourceNotFoundException, not an
+    // unknown-operation fault.
+    let resp = dynamo_request(
+        &url,
+        "SearchVectors",
+        json!({
+            "TableName": "_conformance_no_such_table_probe",
+            "IndexName": "no-such-index",
+            "SearchVector": [{"N": "1"}, {"N": "0"}, {"N": "0"}],
+            "TopK": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["__type"],
+        "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException"
+    );
+    assert_eq!(body["message"], "Requested resource not found");
+}
+
+#[tokio::test]
+async fn test_search_vectors_top_k_zero_is_enveloped_over_the_wire() {
+    let (url, _handle) = start_test_server().await;
+
+    let resp = dynamo_request(
+        &url,
+        "SearchVectors",
+        json!({
+            "TableName": "AnyTable",
+            "IndexName": "vix",
+            "SearchVector": [{"N": "1"}],
+            "TopK": 0
+        }),
+    )
+    .await;
+    assert_validation_error(
+        resp,
+        "1 validation error detected: Value '0' at 'topK' failed to satisfy constraint: \
+         Member must have value greater than or equal to 1",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_serialization_shapes_over_the_wire() {
+    let (url, _handle) = start_test_server().await;
+
+    // SearchVector must be a bare array of attribute values, not an
+    // L-wrapped attribute value.
+    let resp = dynamo_request(
+        &url,
+        "SearchVectors",
+        json!({
+            "TableName": "AnyTable", "IndexName": "vix",
+            "SearchVector": {"L": [{"N": "1"}]}, "TopK": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("SerializationException"),
+        "unexpected __type: {}",
+        body["__type"]
+    );
+    assert_eq!(
+        body["Message"],
+        "Start of structure or map found where not expected"
+    );
+
+    // TopK as a string is a serialisation-layer type mismatch.
+    let resp = dynamo_request(
+        &url,
+        "SearchVectors",
+        json!({
+            "TableName": "AnyTable", "IndexName": "vix",
+            "SearchVector": [{"N": "1"}], "TopK": "10"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("SerializationException"),
+        "unexpected __type: {}",
+        body["__type"]
+    );
+    assert_eq!(
+        body["Message"],
+        "STRING_VALUE cannot be converted to Integer"
+    );
+}
+
+#[tokio::test]
+async fn test_search_vectors_fractional_top_k_is_a_serialization_exception() {
+    let (url, _handle) = start_test_server().await;
+
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-13):
+    // a fractional TopK leaks the raw serde-style rejection, position suffix
+    // included. The column is request-dependent, so only the shape up to the
+    // column number is pinned here.
+    let resp = dynamo_request(
+        &url,
+        "SearchVectors",
+        json!({
+            "TableName": "AnyTable", "IndexName": "vix",
+            "SearchVector": [{"N": "1"}], "TopK": 3.5
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("SerializationException"),
+        "unexpected __type: {}",
+        body["__type"]
+    );
+    let message = body["Message"].as_str().unwrap();
+    assert!(
+        message.starts_with("invalid type: floating point `3.5`, expected i32 at line 1 column"),
+        "unexpected message: {message}"
+    );
+}

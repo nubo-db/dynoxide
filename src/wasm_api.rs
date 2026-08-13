@@ -665,6 +665,23 @@ mod tests {
     }
 
     #[test]
+    fn search_vectors_is_known_but_unsupported_with_the_501_envelope() {
+        // SearchVectors is in the wide known-operation set but not in
+        // SUPPORTED_OPS, so the dispatch envelope phrases it as unsupported
+        // rather than unknown, and the HTTP surface reports 501 so the
+        // conformance suite scores it as a skip.
+        let backend = Storage::memory().unwrap();
+        let err = run(&backend, "SearchVectors", "{}").unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["__type"], "com.dynoxide.wasm#UnsupportedOperation");
+        assert!(v["message"].as_str().unwrap().contains("not supported"));
+
+        let out = http(&backend, Some("DynamoDB_20120810.SearchVectors"), "{}");
+        assert_eq!(out.status, 501);
+        assert!(is_unsupported_fault(out.status, &out.body));
+    }
+
+    #[test]
     fn conditional_check_failure_surfaces_in_envelope() {
         let backend = Storage::memory().unwrap();
         seed_music(&backend);
@@ -1006,6 +1023,7 @@ mod tests {
             "ListTagsOfResource",
             "DescribeLimits",
             "ListStreams",
+            "SearchVectors",
         ] {
             let target = format!("DynamoDB_20120810.{op}");
             let out = http(&backend, Some(&target), "{}");

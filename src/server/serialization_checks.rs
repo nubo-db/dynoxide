@@ -332,6 +332,16 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
             check_field_is_list(obj, "Tags")?;
             check_list_elements_are_structs(obj, "Tags")?;
         }
+        "SearchVectors" => {
+            // SearchVector is a bare array of AttributeValue structs, not
+            // wrapped in L. TableName, IndexName, ProjectionExpression, and
+            // the expression attribute maps are covered by the common checks
+            // below.
+            check_field_is_list(obj, "SearchVector")?;
+            check_list_elements_are_structs(obj, "SearchVector")?;
+            check_field_is_int(obj, "TopK")?;
+            check_field_is_string(obj, "SearchConditionExpression")?;
+        }
         _ => {}
     }
 
@@ -535,6 +545,7 @@ fn check_list_elements_are_structs(
         "VectorIndexes" => "com.amazonaws.dynamodb.v20120810.VectorIndex",
         "VectorIndexUpdates" => "com.amazonaws.dynamodb.v20120810.VectorIndexUpdate",
         "SearchSchema" => "com.amazonaws.dynamodb.v20120810.SearchSchemaElement",
+        "SearchVector" => "com.amazonaws.dynamodb.v20120810.AttributeValue",
         "Tags" => "com.amazonaws.dynamodb.v20120810.Tag",
         _ => "Unknown",
     };

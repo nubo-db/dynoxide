@@ -28,7 +28,9 @@ pub fn parse_vector_defs(meta: &TableMetadata) -> Result<Vec<VectorIndex>> {
 }
 
 /// The SearchSchema HASH attribute of an index, when the schema declares one.
-fn hash_attr(vix: &VectorIndex) -> Option<&str> {
+/// Shared with the SearchVectors handler, which scopes candidate loads and
+/// the mandatory-condition check on the same attribute the write path keys.
+pub(crate) fn hash_attr(vix: &VectorIndex) -> Option<&str> {
     vix.search_schema.as_ref().and_then(|schema| {
         schema
             .iter()
@@ -44,7 +46,9 @@ pub(crate) fn parse_attr_defs(meta: &TableMetadata) -> Result<Vec<AttributeDefin
     })
 }
 
-fn scalar_type_str(t: &ScalarAttributeType) -> &'static str {
+/// The wire letter of a declared scalar attribute type. Shared with the
+/// SearchVectors handler's type-mismatch rejection.
+pub(crate) fn scalar_type_str(t: &ScalarAttributeType) -> &'static str {
     match t {
         ScalarAttributeType::S => "S",
         ScalarAttributeType::N => "N",

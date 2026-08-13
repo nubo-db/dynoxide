@@ -390,6 +390,11 @@ fn dispatch_operation(db: &Database, operation: &str, body: &str) -> crate::Resu
             let resp = db.scan(req)?;
             serialize(&resp)
         }
+        "SearchVectors" => {
+            let req = deserialize(body)?;
+            let resp = db.search_vectors(req)?;
+            serialize(&resp)
+        }
         "BatchGetItem" => {
             let req = deserialize(body)?;
             let resp = db.batch_get_item(req)?;

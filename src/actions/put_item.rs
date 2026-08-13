@@ -471,7 +471,7 @@ async fn execute_inner<S: StorageBackend>(
 
     let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
-        types::write_capacity_units(size),
+        types::table_write_capacity_units(old_item.as_ref().map(types::item_size), Some(size)),
         &gsi_units,
         &lsi_units,
         &request.return_consumed_capacity,

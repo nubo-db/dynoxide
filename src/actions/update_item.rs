@@ -11,6 +11,10 @@ struct UpdateWorkResult {
     item: HashMap<String, AttributeValue>,
     item_json: String,
     size: usize,
+    /// Size of the item as it genuinely stood beforehand, or `None` when the
+    /// update was an upsert that created it. Distinct from `old_item`, which
+    /// carries injected key attributes in that case.
+    old_size: Option<usize>,
 }
 
 /// Internal deserialization struct for detecting missing fields.
@@ -482,6 +486,7 @@ async fn execute_inner<S: StorageBackend>(
             item,
             item_json,
             size,
+            old_size,
         },
         gsi_units,
         lsi_units,
@@ -630,6 +635,7 @@ async fn execute_inner<S: StorageBackend>(
         // rather than an absent one. The index delta has to see genuine absence,
         // so gate on whether a row was actually read back.
         let prior_image = existing_json.is_some().then_some(&old_item);
+        let old_size = prior_image.map(types::item_size);
 
         let target = super::gsi::IndexWrite {
             table_name: &request.table_name,
@@ -658,6 +664,7 @@ async fn execute_inner<S: StorageBackend>(
                 item,
                 item_json,
                 size,
+                old_size,
             },
             gsi_units,
             lsi_units,
@@ -732,7 +739,7 @@ async fn execute_inner<S: StorageBackend>(
 
     let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
-        types::write_capacity_units(size),
+        types::table_write_capacity_units(old_size, Some(size)),
         &gsi_units,
         &lsi_units,
         &request.return_consumed_capacity,

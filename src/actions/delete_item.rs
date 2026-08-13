@@ -379,10 +379,9 @@ pub async fn execute<S: StorageBackend>(
     .await?;
 
     // Calculate consumed capacity from old item size (write for delete)
-    let old_size = old_item.as_ref().map(types::item_size).unwrap_or(0);
     let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
-        types::write_capacity_units(old_size),
+        types::table_write_capacity_units(old_item.as_ref().map(types::item_size), None),
         &gsi_units,
         &lsi_units,
         &request.return_consumed_capacity,

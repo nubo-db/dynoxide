@@ -609,6 +609,125 @@ fn lsi_sizing_mirrors_the_gsi() {
 }
 
 // ---------------------------------------------------------------------------
+// The base table arm, from the 13 August capture. Not part of #176: below 1KB
+// every one of these reports 1 either way, which is why the report missed it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn table_arm_is_sized_on_the_larger_image() {
+    // Capture S2 and S3: a base item swinging between 3017B and 18B reports
+    // table 3 in both directions. Sizing on the finished item would report 1
+    // for the shrink.
+    let db = sizing_table();
+
+    seed(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({
+            "pk": {"S": "t1"}, "sk": {"S": "1"}, "proj": {"S": pad(3000)}
+        }),
+    );
+    let shrink = put(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({"pk": {"S": "t1"}, "sk": {"S": "1"}, "proj": {"S": "p"}}),
+    );
+    assert_eq!(table_units(&shrink), Some(3.0), "put holds the old image");
+
+    seed(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({"pk": {"S": "t2"}, "sk": {"S": "1"}, "proj": {"S": "p"}}),
+    );
+    let grow = put(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({
+            "pk": {"S": "t2"}, "sk": {"S": "1"}, "proj": {"S": pad(3000)}
+        }),
+    );
+    assert_eq!(table_units(&grow), Some(3.0), "put takes the new image");
+}
+
+#[test]
+fn update_shrinking_an_item_holds_the_old_image_size() {
+    // Capture R3: a base item of 2017B updated down to 117B reports table 2.
+    let db = sizing_table();
+    seed(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({
+            "pk": {"S": "r3"}, "sk": {"S": "1"},
+            "gsiPk": {"S": "g"}, "proj": {"S": pad(2000)}
+        }),
+    );
+    let cc = update(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({"pk": {"S": "r3"}, "sk": {"S": "1"}}),
+        serde_json::json!({
+            "UpdateExpression": "SET proj = :v",
+            "ExpressionAttributeValues": {":v": {"S": pad(100)}}
+        }),
+    );
+    assert_eq!(table_units(&cc), Some(2.0));
+}
+
+#[test]
+fn a_fresh_write_is_sized_on_the_new_item_alone() {
+    let db = sizing_table();
+    let cc = put(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({
+            "pk": {"S": "fresh"}, "sk": {"S": "1"}, "proj": {"S": pad(2000)}
+        }),
+    );
+    assert_eq!(table_units(&cc), Some(2.0));
+
+    // And an upsert through UpdateItem likewise has no prior image to hold.
+    let upsert = update(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({"pk": {"S": "fresh2"}, "sk": {"S": "1"}}),
+        serde_json::json!({
+            "UpdateExpression": "SET proj = :v",
+            "ExpressionAttributeValues": {":v": {"S": "p"}}
+        }),
+    );
+    assert_eq!(table_units(&upsert), Some(1.0));
+}
+
+#[test]
+fn batch_put_sizes_the_table_arm_on_the_larger_image() {
+    let db = sizing_table();
+    seed(
+        &db,
+        SIZING_TABLE,
+        serde_json::json!({
+            "pk": {"S": "b1"}, "sk": {"S": "1"}, "proj": {"S": pad(3000)}
+        }),
+    );
+
+    let req = serde_json::json!({
+        "RequestItems": {
+            SIZING_TABLE: [{"PutRequest": {"Item": {
+                "pk": {"S": "b1"}, "sk": {"S": "1"}, "proj": {"S": "p"}
+            }}}]
+        },
+        "ReturnConsumedCapacity": "INDEXES"
+    });
+    let caps = db
+        .batch_write_item(serde_json::from_value(req).unwrap())
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES mode reports capacity");
+    let cc = caps.iter().find(|c| c.table_name == SIZING_TABLE).unwrap();
+
+    assert_eq!(table_units(cc), Some(3.0));
+}
+
+// ---------------------------------------------------------------------------
 // TOTAL mode, upserts, and BatchWriteItem.
 // ---------------------------------------------------------------------------
 

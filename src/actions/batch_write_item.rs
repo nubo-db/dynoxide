@@ -252,49 +252,61 @@ pub async fn execute<S: StorageBackend>(
                 // item: a mid-fan-out failure rolls this item's write back.
                 // BatchWriteItem items are independent, so this is one
                 // transaction per write request.
-                let (gsi_units, lsi_units) = helpers::with_write_transaction(storage, async {
-                    let old_json = storage
-                        .put_item_with_hash(table_name, &pk, &sk, &item_json, size, &hash_prefix)
+                let (old_size, gsi_units, lsi_units) =
+                    helpers::with_write_transaction(storage, async {
+                        let old_json = storage
+                            .put_item_with_hash(
+                                table_name,
+                                &pk,
+                                &sk,
+                                &item_json,
+                                size,
+                                &hash_prefix,
+                            )
+                            .await?;
+                        let old_item: Option<Item> =
+                            old_json.and_then(|j| serde_json::from_str(&j).ok());
+                        let target = super::gsi::IndexWrite {
+                            table_name,
+                            pk: &pk,
+                            sk: &sk,
+                            pk_attr: &key_schema.partition_key,
+                            sk_attr: key_schema.sort_key.as_deref(),
+                        };
+                        let gsi_units = super::gsi::maintain_gsis_after_write(
+                            storage,
+                            &meta,
+                            &target,
+                            old_item.as_ref(),
+                            &put_req.item,
+                        )
                         .await?;
-                    let old_item: Option<Item> =
-                        old_json.and_then(|j| serde_json::from_str(&j).ok());
-                    let target = super::gsi::IndexWrite {
-                        table_name,
-                        pk: &pk,
-                        sk: &sk,
-                        pk_attr: &key_schema.partition_key,
-                        sk_attr: key_schema.sort_key.as_deref(),
-                    };
-                    let gsi_units = super::gsi::maintain_gsis_after_write(
-                        storage,
-                        &meta,
-                        &target,
-                        old_item.as_ref(),
-                        &put_req.item,
-                    )
+                        let lsi_units = super::lsi::maintain_lsis_after_write(
+                            storage,
+                            &meta,
+                            &target,
+                            old_item.as_ref(),
+                            &put_req.item,
+                        )
+                        .await?;
+                        crate::streams::record_stream_event(
+                            storage,
+                            &meta,
+                            old_item.as_ref(),
+                            Some(&put_req.item),
+                        )
+                        .await?;
+                        Ok((
+                            old_item.as_ref().map(types::item_size),
+                            gsi_units,
+                            lsi_units,
+                        ))
+                    })
                     .await?;
-                    let lsi_units = super::lsi::maintain_lsis_after_write(
-                        storage,
-                        &meta,
-                        &target,
-                        old_item.as_ref(),
-                        &put_req.item,
-                    )
-                    .await?;
-                    crate::streams::record_stream_event(
-                        storage,
-                        &meta,
-                        old_item.as_ref(),
-                        Some(&put_req.item),
-                    )
-                    .await?;
-                    Ok((gsi_units, lsi_units))
-                })
-                .await?;
 
-                // Accumulate WCU based on item size
+                // Accumulate WCU on the larger of the displaced and new images
                 *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
-                    types::write_capacity_units(size);
+                    types::table_write_capacity_units(old_size, Some(size));
 
                 // Accumulate secondary index units per table
                 accumulate_index_units(&mut table_gsi_units, table_name, &gsi_units);
@@ -355,12 +367,11 @@ pub async fn execute<S: StorageBackend>(
                     .await?;
 
                 // Accumulate WCU: based on old item size if it existed, else 1 WCU
-                let delete_wcu = if let Some(ref old) = old_item {
-                    types::write_capacity_units(types::item_size(old))
-                } else {
-                    1.0
-                };
-                *table_wcu.entry(table_name.clone()).or_insert(0.0) += delete_wcu;
+                *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
+                    types::table_write_capacity_units(
+                        old_item.as_ref().map(types::item_size),
+                        None,
+                    );
 
                 // Accumulate secondary index units per table
                 accumulate_index_units(&mut table_gsi_units, table_name, &gsi_units);

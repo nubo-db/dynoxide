@@ -798,6 +798,24 @@ pub fn write_capacity_units(item_size_bytes: usize) -> f64 {
     ((item_size_bytes as f64) / 1024.0).ceil().max(1.0)
 }
 
+/// Write capacity units the base table consumes for a single write.
+///
+/// DynamoDB sizes a write on the larger of the item's before and after images,
+/// so shrinking an item still costs what the old one did. `old_size` is `None`
+/// when nothing was there beforehand, and `new_size` is `None` on a delete,
+/// where only the old image exists.
+pub fn table_write_capacity_units(old_size: Option<usize>, new_size: Option<usize>) -> f64 {
+    let old = old_size.map(write_capacity_units);
+    let new = new_size.map(write_capacity_units);
+    match (old, new) {
+        (Some(old), Some(new)) => old.max(new),
+        (Some(units), None) | (None, Some(units)) => units,
+        // No image either side is not a write DynamoDB would charge for, but a
+        // write is never free, so fall back to the one-unit minimum.
+        (None, None) => write_capacity_units(0),
+    }
+}
+
 /// Calculate read capacity units assuming strongly consistent reads
 /// (1 RCU per 4KB, rounded up). Used when ConsistentRead is true or
 /// when the read type is not specified.

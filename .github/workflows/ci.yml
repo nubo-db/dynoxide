@@ -104,14 +104,32 @@ jobs:
             exit 1
           fi
 
-      # Without --no-default-features this is the native backend plus the CLI
-      # alongside the wasm one, which is how a consumer trips it by accident.
-      - name: wasm-sqlite on top of the defaults must fail
+      # A non-zero exit is not enough on its own: both combinations below
+      # already failed to compile before the guard existed, on unrelated type
+      # errors, so an exit-status-only check would pass with the guard deleted.
+      # Assert on the guard's own message instead. The first case is the
+      # accidental one, where the defaults union in the native backend; the
+      # second reaches the guard through mcp-server implying cli.
+      - name: wasm-sqlite alongside a native feature must fail on the guard
         run: |
-          if cargo check --features wasm-sqlite 2>&1; then
-            echo "ERROR: wasm-sqlite with the default features should cause compile_error!"
-            exit 1
-          fi
+          must_fail_on_guard() {
+            desc="$1"
+            shift
+            if out=$(cargo check --lib "$@" 2>&1); then
+              echo "ERROR: $desc should cause compile_error!"
+              exit 1
+            fi
+            if ! echo "$out" | grep -q "mutually exclusive with the native backends"; then
+              echo "ERROR: $desc failed, but not on the feature guard:"
+              echo "$out"
+              exit 1
+            fi
+            echo "OK: $desc"
+          }
+          must_fail_on_guard "wasm-sqlite on top of the defaults" \
+            --features wasm-sqlite
+          must_fail_on_guard "wasm-sqlite reaching the guard through mcp-server" \
+            --no-default-features --features wasm-sqlite,mcp-server
 
       - name: wasm-sqlite on its own must build
         run: cargo check --no-default-features --features wasm-sqlite

@@ -109,9 +109,13 @@ moving an index key costs two writes, and removing one costs a single delete.
 Sizing is on the projected index entry, so an attribute the index does not
 project costs it nothing.
 
-`TransactWriteItems` and PartiQL writes are the exception: both report table-level
-capacity only, with no per-index breakdown under `INDEXES`. Real DynamoDB reports
-one.
+`TransactWriteItems` and PartiQL writes are the exception, and in two ways. Neither
+reports a per-index breakdown under `INDEXES`, where real DynamoDB reports one. The
+table figure they do report is also still sized on the finished item rather than on
+the larger of the item's before and after images, so a write that shrinks an item
+under-reports on these surfaces while `PutItem` and `UpdateItem` now get it right.
+`TransactWriteItems` sizes an update from the request's key and expression values,
+so it sees neither image. All three are invisible below 1KB.
 
 ---
 

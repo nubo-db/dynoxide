@@ -255,6 +255,77 @@ fn put_item_identical_overwrite() {
     assert_capacity(&cc, 1.0, 1.0, None, None, "lsi1");
 }
 
+#[test]
+fn repeated_puts_of_one_item_report_one_figure() {
+    // Normalising expands scientific notation, so the item written is larger
+    // than the item that arrived. Sizing the new image before normalising and
+    // the old image after it made the same write cost differently depending on
+    // whether a row was already there.
+    let db = report_table();
+    let mut item = serde_json::Map::new();
+    item.insert("pk".to_string(), serde_json::json!({"S": "norm"}));
+    item.insert("sk".to_string(), serde_json::json!({"S": "1"}));
+    for i in 0..20 {
+        item.insert(format!("n{i}"), serde_json::json!({"N": "1E100"}));
+    }
+    let item = serde_json::Value::Object(item);
+
+    let first = put(&db, REPORT_TABLE, item.clone());
+    let second = put(&db, REPORT_TABLE, item.clone());
+    let third = put(&db, REPORT_TABLE, item);
+
+    assert_eq!(
+        first.capacity_units, second.capacity_units,
+        "an insert and an identical overwrite must be sized the same way"
+    );
+    assert_eq!(
+        second.capacity_units, third.capacity_units,
+        "repeating the overwrite must not move the figure again"
+    );
+}
+
+#[test]
+fn put_item_overwrite_reordering_a_set() {
+    // A set is unordered, so listing its members differently is the same stored
+    // view and costs what an identical overwrite costs: total 1, table 1, no
+    // arms. The members are held in a Vec, so comparing them directly would read
+    // the reorder as an edit and charge both indexes.
+    let db = report_table();
+    let seeded = serde_json::json!({
+        "pk": {"S": "set"}, "sk": {"S": "1"},
+        "gsiPk": {"S": "g"}, "lsiSk": {"S": "L1"},
+        "proj": {"SS": ["a", "b", "c"]}
+    });
+    seed(&db, REPORT_TABLE, seeded);
+    let reordered = serde_json::json!({
+        "pk": {"S": "set"}, "sk": {"S": "1"},
+        "gsiPk": {"S": "g"}, "lsiSk": {"S": "L1"},
+        "proj": {"SS": ["c", "a", "b"]}
+    });
+    let cc = put(&db, REPORT_TABLE, reordered);
+    assert_capacity(&cc, 1.0, 1.0, None, None, "lsi1");
+}
+
+#[test]
+fn put_item_overwrite_changing_a_set_member() {
+    // The counterpart: a genuine edit to the set still charges both indexes, so
+    // the order-insensitive comparison has not swallowed real changes.
+    let db = report_table();
+    let seeded = serde_json::json!({
+        "pk": {"S": "set2"}, "sk": {"S": "1"},
+        "gsiPk": {"S": "g"}, "lsiSk": {"S": "L1"},
+        "proj": {"SS": ["a", "b"]}
+    });
+    seed(&db, REPORT_TABLE, seeded);
+    let edited = serde_json::json!({
+        "pk": {"S": "set2"}, "sk": {"S": "1"},
+        "gsiPk": {"S": "g"}, "lsiSk": {"S": "L1"},
+        "proj": {"SS": ["b", "z"]}
+    });
+    let cc = put(&db, REPORT_TABLE, edited);
+    assert_capacity(&cc, 3.0, 1.0, Some(1.0), Some(1.0), "lsi1");
+}
+
 /// The item rows 6 to 10 mutate: in both indexes, with a projected `proj` and a
 /// non-projected `other`.
 fn seed_indexed_item(db: &Database) {

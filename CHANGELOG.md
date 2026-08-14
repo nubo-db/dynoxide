@@ -18,11 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Units are sized on the projected index entry rather than the base item: an insert or delete costs its own image, an in-place update the larger of the two, and a key move both halves rounded separately. `BatchWriteItem` inherits all of it. Two of the old figures over-reported rather than under-reported, so any downstream correction for the old numbers needs removing. Captured against eu-west-2.
 
-- `PutItem` and `UpdateItem` size the table arm on the larger of the item's before and after images, matching DynamoDB. They used to size it on the finished item, so shrinking a 3KB item to 100B reported one unit against DynamoDB's three. Items under 1KB are unaffected, and `DeleteItem` already sized on the old image.
+- `PutItem`, `UpdateItem` and `BatchWriteItem` size the table arm on the larger of the item's before and after images, matching DynamoDB. They used to size it on the finished item, so shrinking a 3KB item to 100B reported one unit against DynamoDB's three. Items under 1KB are unaffected, and `DeleteItem` already sized on the old image.
+
+- `PutItem` sizes the item after normalising it rather than as it arrived. Normalising expands scientific notation, so an item carrying `1E100` grows on the way to storage; the table arm was measuring the request and the stored size was recording it, while the same item read back measured larger. The same write reported one figure as an insert and another as an overwrite, and disagreed with `BatchWriteItem`, which already sized after normalising.
+
+- An overwrite that reorders a set's members is free, as it is on DynamoDB. Sets are unordered, so re-listing the same members leaves an index's stored view alone, but they are held in order internally and the comparison read that as a change, charging every index projecting the set.
 
 ### Notes
 
-- `TransactWriteItems` and PartiQL writes still report table-level `ConsumedCapacity` only, with no per-index breakdown under `INDEXES`, where real DynamoDB reports one. The index fix above does not reach them, and the gap is now recorded in [docs/compatibility-summary.md](docs/compatibility-summary.md).
+- `TransactWriteItems` and PartiQL writes are untouched by all of the above, and the gap is wider than a missing breakdown. They report no per-index arms under `INDEXES`, where real DynamoDB reports them, and the table figure they do report is still sized on the finished item rather than on the larger of the two images. `TransactWriteItems` is further out: it sizes an update from the request's key and expression values, so it never sees either image. Recorded in [docs/compatibility-summary.md](docs/compatibility-summary.md).
 
 ## [0.13.0] - 2026-07-30
 

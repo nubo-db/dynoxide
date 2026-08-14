@@ -24,7 +24,7 @@
 //! same rules as GSIs.
 
 use super::gsi::{IndexDef, build_index_item};
-use crate::types::{Item, write_capacity_units};
+use crate::types::{AttributeValue, Item, write_capacity_units};
 
 /// One index's stored view of an item.
 struct IndexEntry {
@@ -80,7 +80,7 @@ pub fn index_write_units(
             // under-charge either side of a KB boundary.
             Some(write_capacity_units(old.size) + write_capacity_units(new.size))
         }
-        (Some(old), Some(new)) if old.projected == new.projected => None,
+        (Some(old), Some(new)) if unchanged(&old.projected, &new.projected) => None,
         (Some(old), Some(new)) => {
             // Overwritten in place, and charged on the larger of the two images
             // rather than on the one left behind.
@@ -89,10 +89,48 @@ pub fn index_write_units(
     }
 }
 
+/// Whether two projected entries hold the same thing, in DynamoDB's terms.
+///
+/// Sets are unordered, so a re-put listing the same members in a different order
+/// leaves the index's stored view untouched and costs nothing. `SS`, `NS` and
+/// `BS` are backed by `Vec`, so a derived comparison would call that a change
+/// and charge for it. Lists keep their order, because DynamoDB lists are
+/// ordered.
+fn unchanged(old: &Item, new: &Item) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .all(|(name, a)| new.get(name).is_some_and(|b| value_unchanged(a, b)))
+}
+
+fn value_unchanged(a: &AttributeValue, b: &AttributeValue) -> bool {
+    match (a, b) {
+        (AttributeValue::SS(x), AttributeValue::SS(y)) => set_unchanged(x, y),
+        (AttributeValue::NS(x), AttributeValue::NS(y)) => set_unchanged(x, y),
+        (AttributeValue::BS(x), AttributeValue::BS(y)) => set_unchanged(x, y),
+        (AttributeValue::L(x), AttributeValue::L(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_unchanged(p, q))
+        }
+        (AttributeValue::M(x), AttributeValue::M(y)) => unchanged(x, y),
+        _ => a == b,
+    }
+}
+
+fn set_unchanged<T: Ord>(x: &[T], y: &[T]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    let mut x: Vec<&T> = x.iter().collect();
+    let mut y: Vec<&T> = y.iter().collect();
+    x.sort_unstable();
+    y.sort_unstable();
+    x == y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AttributeValue, ProjectionType};
+    use crate::types::ProjectionType;
     use std::collections::HashMap;
 
     /// The capture's GSI: HASH `gsiPk`, no sort key, projecting `INCLUDE [proj]`.
@@ -212,6 +250,68 @@ mod tests {
         // Capture V2: an identical overwrite reports total 1, table 1, no arms.
         let same = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g"), ("proj", "p")]);
         assert_eq!(units(Some(&same), Some(&same), &gsi_include()), None);
+    }
+
+    #[test]
+    fn a_reordered_set_is_not_a_change() {
+        // DynamoDB sets are unordered, so re-putting the same members in another
+        // order leaves the index's stored view alone and costs nothing. The
+        // members are backed by a Vec, so comparing them directly would charge.
+        let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);
+        let mut new = old.clone();
+        old.insert(
+            "proj".to_string(),
+            AttributeValue::SS(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+        );
+        new.insert(
+            "proj".to_string(),
+            AttributeValue::SS(vec!["c".to_string(), "a".to_string(), "b".to_string()]),
+        );
+        assert_eq!(units(Some(&old), Some(&new), &gsi_include()), None);
+    }
+
+    #[test]
+    fn a_changed_set_member_is_still_a_change() {
+        // The order-insensitive comparison must not swallow a real edit.
+        let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);
+        let mut new = old.clone();
+        old.insert(
+            "proj".to_string(),
+            AttributeValue::SS(vec!["a".to_string(), "b".to_string()]),
+        );
+        new.insert(
+            "proj".to_string(),
+            AttributeValue::SS(vec!["b".to_string(), "z".to_string()]),
+        );
+        assert_eq!(units(Some(&old), Some(&new), &gsi_include()), Some(1.0));
+    }
+
+    #[test]
+    fn a_reordered_list_is_a_change() {
+        // Lists are ordered, unlike sets, so reordering one is a real edit.
+        let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);
+        let mut new = old.clone();
+        old.insert("proj".to_string(), AttributeValue::L(vec![s("a"), s("b")]));
+        new.insert("proj".to_string(), AttributeValue::L(vec![s("b"), s("a")]));
+        assert_eq!(units(Some(&old), Some(&new), &gsi_include()), Some(1.0));
+    }
+
+    #[test]
+    fn a_reordered_set_nested_in_a_map_is_not_a_change() {
+        // The comparison has to reach sets inside M and L, not just top level.
+        let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);
+        let mut new = old.clone();
+        let nest = |members: Vec<&str>| {
+            let mut m: HashMap<String, AttributeValue> = HashMap::new();
+            m.insert(
+                "tags".to_string(),
+                AttributeValue::SS(members.into_iter().map(str::to_string).collect()),
+            );
+            AttributeValue::M(m)
+        };
+        old.insert("proj".to_string(), nest(vec!["a", "b"]));
+        new.insert("proj".to_string(), nest(vec!["b", "a"]));
+        assert_eq!(units(Some(&old), Some(&new), &gsi_include()), None);
     }
 
     #[test]

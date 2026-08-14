@@ -306,6 +306,12 @@ async fn execute_inner<S: StorageBackend>(
     // Normalize sets (deduplication)
     crate::validation::normalize_item_sets(&mut request.item);
 
+    // Size again, because normalising can shrink the item. Everything past this
+    // point describes what is actually written: the size stored alongside the
+    // row, and the capacity charged for writing it. The check above deliberately
+    // keeps measuring the request as it arrived.
+    let size = types::item_size(&request.item);
+
     // Extract key values
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&request.item, &key_schema)?;

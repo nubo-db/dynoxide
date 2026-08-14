@@ -26,6 +26,10 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
             None => continue,
         };
 
+        // Parsed once per table: the index fan-out needs the table key attribute
+        // names to rebuild each expired item's projected index entries.
+        let key_schema = crate::actions::helpers::parse_key_schema(meta)?;
+
         // Scan all items in the table
         let mut exclusive_start_pk: Option<String> = None;
         let mut exclusive_start_sk: Option<String> = None;
@@ -60,10 +64,21 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                     // is one transaction per deleted item.
                     crate::actions::helpers::with_write_transaction(storage, async {
                         storage.delete_item(&meta.table_name, pk, sk).await?;
-                        gsi::maintain_gsis_after_delete(storage, &meta.table_name, meta, pk, sk)
-                            .await?;
-                        lsi::maintain_lsis_after_delete(storage, &meta.table_name, meta, pk, sk)
-                            .await?;
+                        let target = gsi::IndexWrite {
+                            table_name: &meta.table_name,
+                            pk,
+                            sk,
+                            pk_attr: &key_schema.partition_key,
+                            sk_attr: key_schema.sort_key.as_deref(),
+                        };
+                        // TTL deletions report no capacity, so the per-index
+                        // units are discarded.
+                        let _ =
+                            gsi::maintain_gsis_after_delete(storage, meta, &target, Some(&item))
+                                .await?;
+                        let _ =
+                            lsi::maintain_lsis_after_delete(storage, meta, &target, Some(&item))
+                                .await?;
                         // Generate stream REMOVE record with TTL service identity
                         if meta.stream_enabled {
                             record_ttl_stream_event(storage, meta, &item).await?;

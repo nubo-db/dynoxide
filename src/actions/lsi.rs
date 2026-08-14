@@ -2,10 +2,12 @@
 //!
 //! Handles keeping LSI tables in sync with base table writes.
 
+use super::gsi::IndexWrite;
 use crate::errors::{DynoxideError, Result};
 use crate::storage::TableMetadata;
 use crate::storage_backend::{IndexWriteOp, StorageBackend};
 use crate::types::{Item, KeyType, LocalSecondaryIndex};
+use std::collections::HashMap;
 
 /// Type alias: LSI definitions reuse the shared IndexDef from gsi.
 pub type LsiDef = super::gsi::IndexDef;
@@ -64,72 +66,96 @@ pub fn parse_lsi_key_schema(
 
 /// Update all LSI tables after an item write (put/update).
 /// Handles both insert and update cases.
-#[allow(clippy::too_many_arguments)]
+///
+/// Returns a map of LSI name to write capacity units consumed, on the same terms
+/// as the GSI fan-out: an index the write leaves untouched is absent from the map
+/// rather than present and zeroed.
 pub async fn maintain_lsis_after_write<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     meta: &TableMetadata,
-    table_pk_str: &str,
-    table_sk_str: &str,
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
     item: &Item,
-    table_pk_attr: &str,
-    table_sk_attr: Option<&str>,
-) -> Result<()> {
+) -> Result<HashMap<String, f64>> {
     let lsi_defs = parse_lsi_defs(meta)?;
+    let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for lsi in &lsi_defs {
         // First, remove any existing LSI entry for this base table key
         ops.push(IndexWriteOp::DeleteLsi {
-            table_name: table_name.to_string(),
+            table_name: target.table_name.to_string(),
             index_name: lsi.index_name.clone(),
-            base_pk: table_pk_str.to_string(),
-            base_sk: table_sk_str.to_string(),
+            base_pk: target.pk.to_string(),
+            base_sk: target.sk.to_string(),
         });
 
         // Insert only when the item belongs in this index (sparse): an LSI shares
         // the table partition key, so membership rests on a present, scalar sort key.
         if let Some((lsi_pk, lsi_sk)) = lsi.index_key_strings(item) {
-            let projected = super::gsi::build_index_item(item, lsi, table_pk_attr, table_sk_attr);
+            let projected = super::gsi::build_index_item(item, lsi, target.pk_attr, target.sk_attr);
             let item_json = serde_json::to_string(&projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
             ops.push(IndexWriteOp::InsertLsi {
-                table_name: table_name.to_string(),
+                table_name: target.table_name.to_string(),
                 index_name: lsi.index_name.clone(),
                 pk: lsi_pk,
                 sk: lsi_sk,
-                base_pk: table_pk_str.to_string(),
-                base_sk: table_sk_str.to_string(),
+                base_pk: target.pk.to_string(),
+                base_sk: target.sk.to_string(),
                 item_json,
             });
+        }
+
+        if let Some(units) = super::index_capacity::index_write_units(
+            old_item,
+            Some(item),
+            lsi,
+            target.pk_attr,
+            target.sk_attr,
+        ) {
+            lsi_units.insert(lsi.index_name.clone(), units);
         }
     }
 
     storage.apply_index_writes(&ops).await?;
-    Ok(())
+    Ok(lsi_units)
 }
 
 /// Remove an item from all LSI tables after a delete.
+///
+/// Returns a map of LSI name to write capacity units consumed, charging only the
+/// indexes the deleted item was a member of.
 pub async fn maintain_lsis_after_delete<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     meta: &TableMetadata,
-    table_pk_str: &str,
-    table_sk_str: &str,
-) -> Result<()> {
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
+) -> Result<HashMap<String, f64>> {
     let lsi_defs = parse_lsi_defs(meta)?;
+    let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for lsi in &lsi_defs {
         ops.push(IndexWriteOp::DeleteLsi {
-            table_name: table_name.to_string(),
+            table_name: target.table_name.to_string(),
             index_name: lsi.index_name.clone(),
-            base_pk: table_pk_str.to_string(),
-            base_sk: table_sk_str.to_string(),
+            base_pk: target.pk.to_string(),
+            base_sk: target.sk.to_string(),
         });
+
+        if let Some(units) = super::index_capacity::index_write_units(
+            old_item,
+            None,
+            lsi,
+            target.pk_attr,
+            target.sk_attr,
+        ) {
+            lsi_units.insert(lsi.index_name.clone(), units);
+        }
     }
 
     storage.apply_index_writes(&ops).await?;
-    Ok(())
+    Ok(lsi_units)
 }

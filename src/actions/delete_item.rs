@@ -288,7 +288,7 @@ pub async fn execute<S: StorageBackend>(
     // transaction so a mid-fan-out failure rolls the whole delete back, leaving
     // no torn index. Unconditional (not just for ConditionExpression) because
     // the atomicity guarantee applies to every single-item write.
-    let (old_item, gsi_units) = helpers::with_write_transaction(storage, async {
+    let (old_item, gsi_units, lsi_units) = helpers::with_write_transaction(storage, async {
         // Evaluate ConditionExpression against existing item
         if let Some(ref cond_expr) = request.condition_expression {
             let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -323,24 +323,34 @@ pub async fn execute<S: StorageBackend>(
         // Delete item (returns old item_json)
         let old_json = storage.delete_item(&request.table_name, &pk, &sk).await?;
 
+        // Parse the old item once, here, for the index capacity delta, the
+        // stream record and the response.
+        let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+
+        let target = super::gsi::IndexWrite {
+            table_name: &request.table_name,
+            pk: &pk,
+            sk: &sk,
+            pk_attr: &key_schema.partition_key,
+            sk_attr: key_schema.sort_key.as_deref(),
+        };
+
         // Maintain GSI tables (inside the transaction)
         let gsi_units =
-            super::gsi::maintain_gsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)
+            super::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref())
                 .await?;
 
         // Maintain LSI tables (inside the transaction)
-        super::lsi::maintain_lsis_after_delete(storage, &request.table_name, &meta, &pk, &sk)
-            .await?;
-
-        // Parse the old item once, here, for the stream record and the response.
-        let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+        let lsi_units =
+            super::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref())
+                .await?;
 
         // Record stream event (inside the transaction)
         if old_item.is_some() {
             crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
         }
 
-        Ok((old_item, gsi_units))
+        Ok((old_item, gsi_units, lsi_units))
     })
     .await?;
 
@@ -369,11 +379,11 @@ pub async fn execute<S: StorageBackend>(
     .await?;
 
     // Calculate consumed capacity from old item size (write for delete)
-    let old_size = old_item.as_ref().map(types::item_size).unwrap_or(0);
-    let consumed_capacity = types::consumed_capacity_with_indexes(
+    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
-        types::write_capacity_units(old_size),
+        types::table_write_capacity_units(old_item.as_ref().map(types::item_size), None),
         &gsi_units,
+        &lsi_units,
         &request.return_consumed_capacity,
     );
 

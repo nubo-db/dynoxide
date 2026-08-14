@@ -208,6 +208,71 @@ pub struct TableCapacity {
     pub lsi_units: HashMap<String, f64>,
 }
 
+/// Shapes one table's entry. The transactional surfaces mirror their units into
+/// a write axis; the single-statement and batch ones report `CapacityUnits`
+/// alone, so the two builders are not interchangeable.
+type CapacityBuilder = fn(
+    &str,
+    f64,
+    &HashMap<String, f64>,
+    &HashMap<String, f64>,
+    &Option<String>,
+) -> Option<crate::types::ConsumedCapacity>;
+
+/// Per-table units for a transactional read: 2 RCU per entry, rounded at 4KB
+/// read granularity before the factor, summed by table.
+///
+/// Serves both an all-read transaction and a same-token replay, which are the
+/// same arithmetic over the same `(table, image size)` pairs. The replay's
+/// sizes come from the first call, because the request cannot supply them for
+/// an action that carries only a key.
+pub fn transactional_read_units(sizes: &[(String, usize)]) -> HashMap<String, f64> {
+    let mut table_units: HashMap<String, f64> = HashMap::new();
+    for (table, size) in sizes {
+        *table_units.entry(table.clone()).or_default() +=
+            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::read_capacity_units(*size);
+    }
+    table_units
+}
+
+/// Turn per-table totals into one `ConsumedCapacity` per table.
+///
+/// Sorted by table name. Aggregation is a `HashMap`, which would otherwise hand
+/// back a different order on every call and leave a caller indexing into a
+/// shuffled array.
+///
+/// Returns `None` when no capacity was asked for, which is distinct from an
+/// empty vec: the response omits the field entirely rather than carrying an
+/// empty list.
+pub fn per_table_capacity(
+    by_table: &HashMap<String, TableCapacity>,
+    mode: &Option<String>,
+    builder: CapacityBuilder,
+) -> Option<Vec<crate::types::ConsumedCapacity>> {
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
+    }
+
+    let mut tables: Vec<&String> = by_table.keys().collect();
+    tables.sort();
+
+    Some(
+        tables
+            .into_iter()
+            .filter_map(|table| {
+                let units = by_table.get(table)?;
+                builder(
+                    table,
+                    units.table_units,
+                    &units.gsi_units,
+                    &units.lsi_units,
+                    mode,
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Fold per-action records into per-table totals.
 ///
 /// `factor` is the transactional multiplier: 2 for `TransactWriteItems` and

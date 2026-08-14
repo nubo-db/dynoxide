@@ -1,5 +1,7 @@
 use crate::actions::helpers;
-use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table};
+use crate::actions::index_capacity::{
+    WriteCapacity, aggregate_by_table, per_table_capacity, transactional_read_units,
+};
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::partiql;
 use crate::storage_backend::StorageBackend;
@@ -149,7 +151,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     let mode = &request.return_consumed_capacity;
     let consumed_capacity = if is_read_set(&parsed) {
         crate::types::build_transactional_capacity(
-            &read_table_units(&charges),
+            &transactional_read_units(&replay_sizes(&charges)),
             mode,
             crate::types::transactional_read_capacity,
         )
@@ -213,47 +215,17 @@ impl StatementCharge {
     }
 }
 
-/// Per-table read units for a read set: 2 RCU per statement at 4KB granularity.
-fn read_table_units(charges: &[StatementCharge]) -> HashMap<String, f64> {
-    let mut table_units: HashMap<String, f64> = HashMap::new();
-    for charge in charges {
-        *table_units
-            .entry(charge.table_name().to_string())
-            .or_default() += crate::types::TRANSACTIONAL_CAPACITY_FACTOR
-            * crate::types::read_capacity_units(charge.size());
-    }
-    table_units
-}
-
 /// Fold the per-statement records into one `ConsumedCapacity` per table.
 fn build_write_capacity(
     charges: &[StatementCharge],
     mode: &Option<String>,
 ) -> Option<Vec<crate::types::ConsumedCapacity>> {
-    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        return None;
-    }
-
     let records: Vec<WriteCapacity> = charges.iter().map(StatementCharge::as_write).collect();
     let by_table = aggregate_by_table(&records, crate::types::TRANSACTIONAL_CAPACITY_FACTOR);
-    // Sorted so a multi-table transaction reports a stable order.
-    let mut tables: Vec<&String> = by_table.keys().collect();
-    tables.sort();
-
-    Some(
-        tables
-            .into_iter()
-            .filter_map(|table| {
-                let units = by_table.get(table)?;
-                crate::types::transactional_write_capacity_with_indexes(
-                    table,
-                    units.table_units,
-                    &units.gsi_units,
-                    &units.lsi_units,
-                    mode,
-                )
-            })
-            .collect(),
+    per_table_capacity(
+        &by_table,
+        mode,
+        crate::types::transactional_write_capacity_with_indexes,
     )
 }
 
@@ -277,19 +249,6 @@ fn is_read_set(parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)]) -> 
         .all(|(stmt, _)| matches!(stmt, partiql::parser::Statement::Select { .. }))
 }
 
-/// Per-table read units for a same-token replay, from the sizes the first call
-/// recorded. A replay is charged as a transactional read at 4KB granularity
-/// against the image each statement touched, which the statement text alone
-/// cannot supply: a `DELETE` names a key, not the item it removed.
-fn replay_table_units(sizes: &[(String, usize)]) -> HashMap<String, f64> {
-    let mut table_units: HashMap<String, f64> = HashMap::new();
-    for (table, size) in sizes {
-        *table_units.entry(table.clone()).or_default() +=
-            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::read_capacity_units(*size);
-    }
-    table_units
-}
-
 /// Build the response for a same-token idempotent replay. The statements are
 /// identical to the first call (the idempotency hash matched), so `Responses`
 /// carry over from the cached first call and capacity is reported as a
@@ -306,7 +265,7 @@ pub(crate) fn replay_response(
         response: ExecuteTransactionResponse {
             responses: cached.response.responses.clone(),
             consumed_capacity: crate::types::build_transactional_capacity(
-                &replay_table_units(&cached.replay_sizes),
+                &transactional_read_units(&cached.replay_sizes),
                 mode,
                 crate::types::transactional_read_capacity,
             ),

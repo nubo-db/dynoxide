@@ -1,5 +1,7 @@
 use crate::actions::helpers;
-use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table};
+use crate::actions::index_capacity::{
+    WriteCapacity, aggregate_by_table, per_table_capacity, transactional_read_units,
+};
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
@@ -222,50 +224,12 @@ fn build_write_capacity(
     capacity: &[WriteCapacity],
     mode: &Option<String>,
 ) -> Option<Vec<crate::types::ConsumedCapacity>> {
-    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        return None;
-    }
-
     let by_table = aggregate_by_table(capacity, crate::types::TRANSACTIONAL_CAPACITY_FACTOR);
-    // Sorted so a multi-table transaction reports its tables in a stable order.
-    // Aggregation is a HashMap, which would otherwise hand back a different
-    // order on every call and leave callers indexing into a shuffled array.
-    let mut tables: Vec<&String> = by_table.keys().collect();
-    tables.sort();
-
-    Some(
-        tables
-            .into_iter()
-            .filter_map(|table| {
-                let units = by_table.get(table)?;
-                crate::types::transactional_write_capacity_with_indexes(
-                    table,
-                    units.table_units,
-                    &units.gsi_units,
-                    &units.lsi_units,
-                    mode,
-                )
-            })
-            .collect(),
+    per_table_capacity(
+        &by_table,
+        mode,
+        crate::types::transactional_write_capacity_with_indexes,
     )
-}
-
-/// Per-table transactional read units for a same-token replay. AWS recomputes
-/// the replay as a transactional read against the image each action was sized
-/// on: 2 RCU per action, rounded at 4KB read granularity before the
-/// transactional factor, summed per table. This differs from the first call's
-/// write magnitude above 1KB, where writes round at 1KB and reads at 4KB.
-///
-/// The sizes come from the first call rather than from the request, because the
-/// request carries no item for a `Delete` or a `ConditionCheck`. Sizing those on
-/// their keys reports 2 against a 9KB item where AWS reports 6.
-fn transact_read_table_units(sizes: &[(String, usize)]) -> HashMap<String, f64> {
-    let mut table_units: HashMap<String, f64> = HashMap::new();
-    for (table, size) in sizes {
-        *table_units.entry(table.clone()).or_default() +=
-            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::read_capacity_units(*size);
-    }
-    table_units
 }
 
 /// Build the response for a same-token idempotent replay. The items are
@@ -280,7 +244,7 @@ pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> Ca
     CachedWrite {
         response: TransactWriteItemsResponse {
             consumed_capacity: crate::types::build_transactional_capacity(
-                &transact_read_table_units(&cached.replay_sizes),
+                &transactional_read_units(&cached.replay_sizes),
                 mode,
                 crate::types::transactional_read_capacity,
             ),

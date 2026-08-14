@@ -1,4 +1,4 @@
-use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table};
+use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table, per_table_capacity};
 use crate::errors::{DynoxideError, Result};
 use crate::partiql;
 use crate::storage_backend::StorageBackend;
@@ -293,34 +293,29 @@ fn build_capacity(
             crate::types::read_capacity_units_with_consistency(*size, false);
     }
 
-    // The surcharge lands on the total without reaching the Table arm, so it is
-    // added after the arms are built rather than folded into them. A table whose
-    // statements all failed gets no entry at all: captured against a two-table
-    // batch where the failing table was omitted entirely and only the
-    // succeeding one was reported.
+    let mut entries = per_table_capacity(
+        &by_table,
+        mode,
+        crate::types::consumed_capacity_with_secondary_indexes,
+    )?;
+
+    // The surcharge is applied here rather than inside the shared fold, because
+    // it is the one rule of the three that differs and it has already been got
+    // wrong once. A failed statement lands on the total without reaching the
+    // Table arm or any index arm, so it cannot be folded into the units the
+    // builder sees. A table whose statements all failed has no entry to attach
+    // it to and gets none: captured against a two-table batch where the failing
+    // table was omitted entirely and only the succeeding one was reported.
     let mut surcharge: HashMap<&str, f64> = HashMap::new();
     for (table, units) in failures {
         *surcharge.entry(table.as_str()).or_default() += units;
     }
+    for entry in &mut entries {
+        entry.capacity_units += surcharge
+            .get(entry.table_name.as_str())
+            .copied()
+            .unwrap_or(0.0);
+    }
 
-    let mut tables: Vec<&String> = by_table.keys().collect();
-    tables.sort();
-
-    Some(
-        tables
-            .into_iter()
-            .filter_map(|table| {
-                let units = by_table.get(table)?;
-                let mut capacity = crate::types::consumed_capacity_with_secondary_indexes(
-                    table,
-                    units.table_units,
-                    &units.gsi_units,
-                    &units.lsi_units,
-                    mode,
-                )?;
-                capacity.capacity_units += surcharge.get(table.as_str()).copied().unwrap_or(0.0);
-                Some(capacity)
-            })
-            .collect(),
-    )
+    Some(entries)
 }

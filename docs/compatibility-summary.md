@@ -115,7 +115,8 @@ table figure they do report is also still sized on the finished item rather than
 the larger of the item's before and after images, so a write that shrinks an item
 under-reports on these surfaces while `PutItem` and `UpdateItem` now get it right.
 `TransactWriteItems` sizes an update from the request's key and expression values,
-so it sees neither image. All three are invisible below 1KB.
+so it sees neither image. The sizing gaps are invisible below 1KB, where everything
+rounds to the same unit; the missing breakdown shows at any size.
 
 ---
 

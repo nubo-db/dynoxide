@@ -306,10 +306,12 @@ async fn execute_inner<S: StorageBackend>(
     // Normalize sets (deduplication)
     crate::validation::normalize_item_sets(&mut request.item);
 
-    // Size again, because normalising can shrink the item. Everything past this
-    // point describes what is actually written: the size stored alongside the
-    // row, and the capacity charged for writing it. The check above deliberately
-    // keeps measuring the request as it arrived.
+    // Size again: normalising rewrites values, and expanding scientific notation
+    // can leave the item larger than the one that arrived. Everything past this
+    // point describes what is actually written, both the size recorded alongside
+    // the row and the capacity charged for writing it. The limit check above
+    // still measures the request as it arrived, which is a separate question
+    // from what the write costs.
     let size = types::item_size(&request.item);
 
     // Extract key values

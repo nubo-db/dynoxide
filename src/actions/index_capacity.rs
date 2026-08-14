@@ -271,6 +271,45 @@ mod tests {
     }
 
     #[test]
+    fn a_reordered_number_set_is_not_a_change() {
+        let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);
+        let mut new = old.clone();
+        old.insert(
+            "proj".to_string(),
+            AttributeValue::NS(vec!["1".to_string(), "2".to_string(), "3".to_string()]),
+        );
+        new.insert(
+            "proj".to_string(),
+            AttributeValue::NS(vec!["3".to_string(), "1".to_string(), "2".to_string()]),
+        );
+        assert_eq!(units(Some(&old), Some(&new), &gsi_include()), None);
+    }
+
+    #[test]
+    fn a_reordered_binary_set_is_not_a_change() {
+        let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);
+        let mut new = old.clone();
+        old.insert(
+            "proj".to_string(),
+            AttributeValue::BS(vec![vec![1, 2], vec![3], vec![4, 5, 6]]),
+        );
+        new.insert(
+            "proj".to_string(),
+            AttributeValue::BS(vec![vec![4, 5, 6], vec![1, 2], vec![3]]),
+        );
+        assert_eq!(units(Some(&old), Some(&new), &gsi_include()), None);
+    }
+
+    #[test]
+    fn renaming_an_attribute_is_a_change() {
+        // Both sides hold the same number of attributes and the same values, so
+        // a comparison that only counted entries would call this unchanged.
+        let old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g"), ("before", "v")]);
+        let new = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g"), ("after", "v")]);
+        assert_eq!(units(Some(&old), Some(&new), &gsi_all()), Some(1.0));
+    }
+
+    #[test]
     fn a_changed_set_member_is_still_a_change() {
         // The order-insensitive comparison must not swallow a real edit.
         let mut old = item(&[("pk", "v1"), ("sk", "1"), ("gsiPk", "g")]);

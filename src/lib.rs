@@ -494,11 +494,12 @@ pub type WasmDatabase = Database<WasmBridgeBackend>;
 
 /// Build-visible preview marker for the wasm-sqlite backend.
 ///
-/// `true` when built with `--features wasm-sqlite`, `false` otherwise. The wasm
-/// backend covers CRUD, query, scan, GSI/LSI, and PartiQL, and passes the
-/// conformance cases for all of them, but it still leaves several operations
-/// unimplemented. Consumers can read this constant to tell whether the artifact
-/// they hold is the fully conformant native build or the wasm preview.
+/// `true` when built with `--no-default-features --features wasm-sqlite`,
+/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI, and
+/// PartiQL, and passes the conformance cases for all of them, but it still
+/// leaves several operations unimplemented. Consumers can read this constant to
+/// tell whether the artifact they hold is the fully conformant native build or
+/// the wasm preview.
 #[cfg(feature = "wasm-sqlite")]
 pub const WASM_PREVIEW: bool = true;
 /// Build-visible preview marker for the wasm-sqlite backend. See the

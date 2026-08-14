@@ -29,6 +29,23 @@ compile_error!(
      Use the `encryption` feature for vendored OpenSSL on non-Apple platforms."
 );
 
+#[cfg(all(
+    feature = "wasm-sqlite",
+    any(
+        feature = "native-sqlite",
+        feature = "_has-encryption",
+        feature = "cli"
+    )
+))]
+compile_error!(
+    "The `wasm-sqlite` backend is mutually exclusive with the native backends and \
+     with the CLI, server and MCP features, which are native-only.\n\
+     If your manifest names none of those, they came from the defaults: Cargo adds \
+     the default features to whatever you list, so `features = [\"wasm-sqlite\"]` \
+     enables the native backend as well. Turn them off:\n  \
+     dynoxide-rs = { version = \"...\", default-features = false, features = [\"wasm-sqlite\"] }"
+);
+
 #[cfg(not(any(
     feature = "native-sqlite",
     feature = "_has-encryption",
@@ -477,11 +494,12 @@ pub type WasmDatabase = Database<WasmBridgeBackend>;
 
 /// Build-visible preview marker for the wasm-sqlite backend.
 ///
-/// `true` when built with `--features wasm-sqlite`, `false` otherwise. The wasm
-/// backend covers CRUD, query, scan, GSI/LSI, and PartiQL, and passes the
-/// conformance cases for all of them, but it still leaves several operations
-/// unimplemented. Consumers can read this constant to tell whether the artifact
-/// they hold is the fully conformant native build or the wasm preview.
+/// `true` when built with `--no-default-features --features wasm-sqlite`,
+/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI, and
+/// PartiQL, and passes the conformance cases for all of them, but it still
+/// leaves several operations unimplemented. Consumers can read this constant to
+/// tell whether the artifact they hold is the fully conformant native build or
+/// the wasm preview.
 #[cfg(feature = "wasm-sqlite")]
 pub const WASM_PREVIEW: bool = true;
 /// Build-visible preview marker for the wasm-sqlite backend. See the

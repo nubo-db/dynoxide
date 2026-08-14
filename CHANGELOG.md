@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Enabling `wasm-sqlite` alongside the default features now fails with a message that says so. Cargo adds the default features to whatever a manifest lists, so `dynoxide-rs = { version = "0.13", features = ["wasm-sqlite"] }` also enabled the native backend and the CLI, and the build stopped on three type errors naming neither the feature nor the conflict. The combination was never valid and still is not; what was missing was the diagnosis. Enable the wasm backend with `default-features = false`.
+
 ## [0.13.0] - 2026-07-30
 
 ### Added

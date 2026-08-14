@@ -78,7 +78,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 | `mcp-server` | Yes | Adds MCP server for coding agents (stdio and Streamable HTTP transports). |
 | `import` | Yes | Adds `dynoxide import` CLI for importing DynamoDB Export data with anonymisation. |
 | `cli` | Indirect | Gates the `dynoxide` binary. Pulled in automatically by `http-server`, `mcp-server`, or `import`, so default builds include it; a library-only or `wasm-sqlite` build omits the binary. |
-| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS), a preview. Pulls neither native SQLite nor the CLI. See the WASM section. |
+| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS), a preview. Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See the WASM section. |
 | `encryption` | No | Bundles SQLCipher + vendored OpenSSL. Adds `Database::new_encrypted()` for encryption at rest. |
 | `encryption-cc` | No | Like `encryption` but uses Apple CommonCrypto instead of bundled OpenSSL. For macOS and iOS builds. |
 | `encrypted-server` | No | Convenience: enables `encryption` + `http-server`. |
@@ -86,7 +86,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 | `encrypted-full` | No | Convenience: enables `encryption` + `http-server` + `mcp-server` + `import`. |
 | `full` | - | Alias for default features (backward compatibility). |
 
-`native-sqlite` and `encryption` are **mutually exclusive** - they select different SQLite backends. To use encryption:
+`native-sqlite`, `encryption` and `wasm-sqlite` are **mutually exclusive** - they select different SQLite backends. `wasm-sqlite` additionally excludes the CLI, server and MCP features, which are native-only. Cargo adds the default features to whatever you list, so naming one of these on its own is not enough: `features = ["wasm-sqlite"]` still enables `native-sqlite` and the CLI from the defaults, and the build stops on a `compile_error!` saying so. Always pair a non-default backend with `default-features = false`. To use encryption:
 
 ```toml
 dynoxide-rs = { version = "0.12", default-features = false, features = ["encryption"] }

@@ -1,4 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use dynoxide::actions::batch_execute_statement::{
+    BatchExecuteStatementRequest, BatchStatementRequest,
+};
 use dynoxide::actions::batch_get_item::{BatchGetItemRequest, KeysAndAttributes};
 use dynoxide::actions::batch_write_item::{BatchWriteItemRequest, PutRequest, WriteRequest};
 use dynoxide::actions::delete_item::DeleteItemRequest;
@@ -373,6 +376,43 @@ fn bench_transact_write_items(c: &mut Criterion) {
 // Criterion configuration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// BatchExecuteStatement (25 PartiQL statements)
+//
+// The PartiQL surfaces had no benchmark of any kind until this one. The batch
+// path is the interesting one: it walks its statement list three times before
+// executing anything, once to classify reads against writes, once to reject
+// duplicate targets, and once to run them, and the middle pass loads table
+// metadata per statement.
+// ---------------------------------------------------------------------------
+
+fn bench_batch_execute_statement(c: &mut Criterion) {
+    c.bench_function("batch_execute_statement_25", |b| {
+        let db = setup_database(PRE_POPULATED_COUNT, ItemSize::Medium);
+        let mut counter = PRE_POPULATED_COUNT;
+        b.iter(|| {
+            counter += 25;
+            let statements: Vec<BatchStatementRequest> = (0..25)
+                .map(|i| {
+                    let mut stmt = BatchStatementRequest::default();
+                    stmt.statement = format!(
+                        "INSERT INTO \"{}\" VALUE {{'pk':'bench-{}','sk':'s'}}",
+                        BENCH_TABLE,
+                        counter + i
+                    );
+                    stmt
+                })
+                .collect();
+
+            db.batch_execute_statement(BatchExecuteStatementRequest {
+                statements,
+                return_consumed_capacity: None,
+            })
+            .unwrap();
+        });
+    });
+}
+
 criterion_group! {
     name = embedded_micro;
     config = Criterion::default()
@@ -388,6 +428,7 @@ criterion_group! {
         bench_delete_item,
         bench_batch_write_item,
         bench_batch_get_item,
+        bench_batch_execute_statement,
         bench_transact_write_items
 }
 

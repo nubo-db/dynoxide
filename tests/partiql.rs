@@ -1933,6 +1933,76 @@ fn test_batch_execute_partial_failure() {
 }
 
 #[test]
+fn test_batch_execute_unparseable_statement_is_per_statement() {
+    // Captured against real DynamoDB: a batch holding an unparseable statement
+    // is not rejected outright. That member reports ValidationError and the
+    // rest run. This is the contract the single up-front parse has to preserve:
+    // collecting into Result<Vec<_>, _> rather than Vec<Result<_, _>> would turn
+    // a per-statement error into a request-level failure.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("THIS IS NOT SQL AT ALL".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'ok1'}".to_string()),
+            ],
+        })
+        .expect("an unparseable member does not sink the request");
+
+    assert_eq!(resp.responses.len(), 2);
+    assert_eq!(
+        resp.responses[0].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError")
+    );
+    assert!(resp.responses[1].error.is_none(), "the rest still run");
+}
+
+#[test]
+fn test_batch_execute_unparseable_does_not_mask_the_top_level_checks() {
+    // Captured: an unparseable member takes no part in the read/write
+    // classification or duplicate detection, but neither does it stop those
+    // checks firing on the members that did parse. Both still reject top-level.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let mixed = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("NOT SQL".to_string()),
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'a'".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'b'}".to_string()),
+            ],
+        })
+        .expect_err("the mixed check still fires");
+    assert!(
+        mixed
+            .to_string()
+            .contains("Read and write requests together"),
+        "unexpected error: {mixed}"
+    );
+
+    let dup = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("NOT SQL".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'same'}".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'same'}".to_string()),
+            ],
+        })
+        .expect_err("the duplicate check still fires");
+    assert!(
+        dup.to_string()
+            .contains("Provided list of item keys contains duplicates"),
+        "unexpected error: {dup}"
+    );
+}
+
+#[test]
 fn test_batch_execute_rejects_duplicate_item_keys() {
     // Captured against real DynamoDB: two statements against one item are
     // rejected before any of them runs, the same way a transaction rejects

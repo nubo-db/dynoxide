@@ -104,6 +104,18 @@ jobs:
             exit 1
           fi
 
+      # Without --no-default-features this is the native backend plus the CLI
+      # alongside the wasm one, which is how a consumer trips it by accident.
+      - name: wasm-sqlite on top of the defaults must fail
+        run: |
+          if cargo check --features wasm-sqlite 2>&1; then
+            echo "ERROR: wasm-sqlite with the default features should cause compile_error!"
+            exit 1
+          fi
+
+      - name: wasm-sqlite on its own must build
+        run: cargo check --no-default-features --features wasm-sqlite
+
   wasm-check:
     name: wasm-sqlite build check
     runs-on: ubuntu-latest

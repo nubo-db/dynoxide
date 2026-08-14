@@ -1010,16 +1010,23 @@ pub fn build_transactional_capacity(
     mode: &Option<String>,
     builder: fn(&str, f64, &Option<String>) -> Option<ConsumedCapacity>,
 ) -> Option<Vec<ConsumedCapacity>> {
-    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        Some(
-            table_units
-                .iter()
-                .filter_map(|(table, &units)| builder(table, units, mode))
-                .collect(),
-        )
-    } else {
-        None
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
     }
+
+    // Sorted by table name, matching the write path. Iterating the map handed
+    // back a different order per process, so a two-table read set or replay
+    // could report its tables either way round while the write half of the same
+    // response family was stable.
+    let mut tables: Vec<&String> = table_units.keys().collect();
+    tables.sort();
+
+    Some(
+        tables
+            .into_iter()
+            .filter_map(|table| builder(table, *table_units.get(table)?, mode))
+            .collect(),
+    )
 }
 
 /// Build a `ConsumedCapacity` for one table in a transactional write, with the

@@ -204,20 +204,36 @@ fn bench_delete_item((db, request): (Database, DeleteItemRequest)) {
 #[cfg(feature = "iai-callgrind")]
 fn setup_batch_execute_statement() -> (Database, BatchExecuteStatementRequest) {
     let db = setup_database(1000, ItemSize::Medium);
-    let statements = (0..25)
-        .map(|i| {
-            let mut stmt = BatchStatementRequest::default();
-            stmt.statement = format!(
-                "INSERT INTO \"{BENCH_TABLE}\" VALUE {{'pk':'bench-{i}','sk':'s'}}"
-            );
-            stmt
-        })
-        .collect();
-    let request = BatchExecuteStatementRequest {
-        statements,
-        ..Default::default()
+    let build = || -> BatchExecuteStatementRequest {
+        let statements = (0..25)
+            .map(|i| {
+                let mut stmt = BatchStatementRequest::default();
+                // `sk` is declared N on the bench table. A string here is
+                // rejected per statement while the batch still returns Ok, so
+                // the benchmark would silently measure the rejection path.
+                stmt.statement =
+                    format!("INSERT INTO \"{BENCH_TABLE}\" VALUE {{'pk':'bench-{i}','sk':{i}}}");
+                stmt
+            })
+            .collect();
+        BatchExecuteStatementRequest {
+            statements,
+            ..Default::default()
+        }
     };
-    (db, request)
+
+    // Setup is excluded from measurement, so prove the workload runs here
+    // rather than trusting an outer Ok that member errors do not disturb.
+    let check = db.batch_execute_statement(build()).unwrap();
+    assert!(
+        check.responses.iter().all(|r| r.error.is_none()),
+        "benchmark workload is failing, so this measures rejection"
+    );
+
+    // A fresh database, so the measured call inserts rather than duplicating
+    // what the check above just wrote.
+    let db = setup_database(1000, ItemSize::Medium);
+    (db, build())
 }
 
 #[cfg(feature = "iai-callgrind")]

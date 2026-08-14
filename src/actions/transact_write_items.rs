@@ -224,6 +224,13 @@ fn build_write_capacity(
     capacity: &[WriteCapacity],
     mode: &Option<String>,
 ) -> Option<Vec<crate::types::ConsumedCapacity>> {
+    // Checked before aggregating, not just inside the shared builder. Most
+    // calls ask for no capacity at all, and aggregation walks every action and
+    // allocates a map per table before the builder could discard it.
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
+    }
+
     let by_table = aggregate_by_table(capacity, crate::types::TRANSACTIONAL_CAPACITY_FACTOR);
     per_table_capacity(
         &by_table,

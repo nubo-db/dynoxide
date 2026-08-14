@@ -706,6 +706,71 @@ fn u2_a_failed_statement_is_charged_on_the_item_already_stored() {
 }
 
 #[test]
+fn r3_a_table_whose_statements_all_failed_is_omitted() {
+    // Capture R3: a batch where one table's only statement fails and another
+    // table's succeeds reports just the succeeding table, with no surcharge
+    // anywhere. So the failure surcharge only ever lands on a table that also
+    // had a success, and a table with nothing to attach it to gets no entry.
+    let db = indexed_table();
+    db.create_table(serde_json::from_value(table_def(OTHER_TABLE)).unwrap())
+        .unwrap();
+    seed(
+        &db,
+        serde_json::json!({"pk": {"S": "x0"}, "sk": {"S": "1"}, "gsiPk": {"S": "g1"}}),
+    );
+
+    let entries = batch(
+        &db,
+        &[
+            // Fails: x0 already exists on TABLE.
+            &format!("INSERT INTO \"{TABLE}\" VALUE {{'pk':'x0','sk':'1','gsiPk':'g1'}}"),
+            &format!("INSERT INTO \"{OTHER_TABLE}\" VALUE {{'pk':'x1','sk':'1','gsiPk':'g1'}}"),
+        ],
+        "INDEXES",
+    )
+    .expect("the succeeding table reports capacity");
+
+    assert_eq!(entries.len(), 1, "the all-failed table is omitted entirely");
+    assert_eq!(entries[0].table_name, OTHER_TABLE);
+    assert_eq!(entries[0].capacity_units, 2.0);
+    assert_eq!(table_arm(&entries[0]), 1.0);
+    assert_eq!(gsi(&entries[0]), Some(1.0));
+}
+
+#[test]
+fn a_count_projection_rejection_keeps_its_place_in_the_response() {
+    // The execution loop pairs each request statement with what was parsed for
+    // it. `test_count_is_rejected_per_statement_on_batch_execute` already covers
+    // a rejection at the head of a batch; this one puts it in the middle, where
+    // a misalignment would be visible as the error landing on a neighbour.
+    //
+    // Nothing can misalign them today, because the pairing advances both sides
+    // together. The guard is against a later change that filters or reorders
+    // what the preparation pass returns, which would go unnoticed with the
+    // rejection first.
+    let db = indexed_table();
+    let req = serde_json::json!({
+        "Statements": [
+            {"Statement": format!("INSERT INTO \"{TABLE}\" VALUE {{'pk':'c1','sk':'1'}}")},
+            {"Statement": format!("SELECT COUNT(*) FROM \"{TABLE}\"")},
+            {"Statement": format!("INSERT INTO \"{TABLE}\" VALUE {{'pk':'c2','sk':'1'}}")}
+        ]
+    });
+    let resp = db
+        .batch_execute_statement(serde_json::from_value(req).unwrap())
+        .expect("a COUNT rejection is per-statement");
+
+    assert_eq!(resp.responses.len(), 3);
+    assert!(resp.responses[0].error.is_none());
+    assert_eq!(
+        resp.responses[1].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError"),
+        "the rejection stays on the statement that caused it"
+    );
+    assert!(resp.responses[2].error.is_none());
+}
+
+#[test]
 fn a_no_op_write_still_names_its_table() {
     // An `IF NOT EXISTS` duplicate writes nothing, and the entry it produces
     // must still carry the table. Building it from a defaulted record leaves

@@ -220,6 +220,13 @@ fn build_write_capacity(
     charges: &[StatementCharge],
     mode: &Option<String>,
 ) -> Option<Vec<crate::types::ConsumedCapacity>> {
+    // Checked before the clone, not just inside the shared builder. Most calls
+    // ask for no capacity, and `as_write` clones every record and its index
+    // maps before the builder could discard the lot.
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
+    }
+
     let records: Vec<WriteCapacity> = charges.iter().map(StatementCharge::as_write).collect();
     let by_table = aggregate_by_table(&records, crate::types::TRANSACTIONAL_CAPACITY_FACTOR);
     per_table_capacity(

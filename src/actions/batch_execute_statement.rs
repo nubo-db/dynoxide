@@ -233,10 +233,10 @@ struct Prepared {
 /// resolution does, so the parsing was the larger half of the overhead by more
 /// than two to one.
 ///
-/// Target resolution shares one key-schema lookup per table. That saves little
-/// on the native backend, where table metadata is already cached in memory, and
-/// more on the wasm backend, which has no such cache and pays a bridge crossing
-/// for every lookup.
+/// Target resolution is not shared and not cheap: it loads the table's metadata
+/// and parses its key schema per statement, and the executor does both again a
+/// moment later. Sharing that is a separate change from this one, and it is
+/// worth more on the wasm backend, which caches no metadata at all.
 async fn prepare<S: StorageBackend>(
     storage: &S,
     statements: &[BatchStatementRequest],

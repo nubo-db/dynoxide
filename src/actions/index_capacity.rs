@@ -211,7 +211,7 @@ pub struct TableCapacity {
 /// Shapes one table's entry. The transactional surfaces mirror their units into
 /// a write axis; the single-statement and batch ones report `CapacityUnits`
 /// alone, so the two builders are not interchangeable.
-type CapacityBuilder = fn(
+pub(crate) type CapacityBuilder = fn(
     &str,
     f64,
     &HashMap<String, f64>,
@@ -226,7 +226,7 @@ type CapacityBuilder = fn(
 /// same arithmetic over the same `(table, image size)` pairs. The replay's
 /// sizes come from the first call, because the request cannot supply them for
 /// an action that carries only a key.
-pub fn transactional_read_units(sizes: &[(String, usize)]) -> HashMap<String, f64> {
+pub(crate) fn transactional_read_units(sizes: &[(String, usize)]) -> HashMap<String, f64> {
     let mut table_units: HashMap<String, f64> = HashMap::new();
     for (table, size) in sizes {
         *table_units.entry(table.clone()).or_default() +=
@@ -244,7 +244,7 @@ pub fn transactional_read_units(sizes: &[(String, usize)]) -> HashMap<String, f6
 /// Returns `None` when no capacity was asked for, which is distinct from an
 /// empty vec: the response omits the field entirely rather than carrying an
 /// empty list.
-pub fn per_table_capacity(
+pub(crate) fn per_table_capacity(
     by_table: &HashMap<String, TableCapacity>,
     mode: &Option<String>,
     builder: CapacityBuilder,

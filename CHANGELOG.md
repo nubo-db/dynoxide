@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BatchExecuteStatement` accepts `ReturnConsumedCapacity` and reports capacity, which it previously had no way to do at all. Per-table entries with index arms, aggregated across the batch. A failed statement is still charged the write it attempted, sized on the larger of the row already stored and the item it carried; a batch in which nothing succeeds reports no capacity, and a table whose statements all failed is omitted entirely. Captured against eu-west-2.
+
+### Changed
+
+- **Breaking (behaviour):** `BatchExecuteStatement` and `ExecuteTransaction` now reject two request shapes they used to accept, matching DynamoDB. A batch or transaction may not mix reads and writes, and may not name the same item twice, reads included. Both are rejected up front with a top-level `ValidationException` before any statement runs; a request that previously succeeded in either shape now fails. An unparseable member is unaffected and still reports against itself while the rest of the batch runs. Captured against eu-west-2.
+
+  The four checks cost about 7% on a 25-statement `BatchExecuteStatement`, measured against `958e340`.
+
+- **Breaking (Rust API):** `actions::batch_execute_statement::BatchStatementRequest` is now `#[non_exhaustive]`. It is still short of DynamoDB's shape, lacking `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`, so it will gain fields again and the attribute is there to stop that breaking anyone twice. Library consumers that construct it must build from `Default` and assign, or deserialise it. `BatchExecuteStatementRequest` is deliberately not marked: with `ReturnConsumedCapacity` on it, that type now matches DynamoDB exactly. This is a source-breaking change for the crate's public API, so the next release is a minor bump. The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
+
 ### Fixed
 
 - `ConsumedCapacity` under `INDEXES` charges index writes on the change to what an index stores, not on the item the write leaves behind ([#176](https://github.com/nubo-db/dynoxide/issues/176)). Each index used to be charged a unit whenever the finished item belonged to it, which is right for a plain insert and wrong for most else:
@@ -26,10 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Enabling `wasm-sqlite` alongside the default features now fails with a message that says so. Cargo adds the default features to whatever a manifest lists, so `dynoxide-rs = { version = "0.13", features = ["wasm-sqlite"] }` also enabled the native backend and the CLI, and the build stopped on three type errors naming neither the feature nor the conflict. The combination was never valid and still is not; what was missing was the diagnosis. Enable the wasm backend with `default-features = false`.
 
+- `TransactWriteItems`, `ExecuteStatement`, `ExecuteTransaction` and `BatchExecuteStatement` report per-index `ConsumedCapacity` under `INDEXES`, where they used to report a `Table` arm and nothing else ([#178](https://github.com/nubo-db/dynoxide/issues/178)). The transactional 2x factor applies to the base table arm alone: an index arm inside a transaction costs what the same write costs outside one. Index units fold into the total, so totals grow on an indexed table under `TOTAL` as well.
+
+- The transactional table arm is sized on the larger of the item's before and after images rather than on the request payload. `Delete` and `ConditionCheck` carry a key and no item, so both used to be sized on the key: deleting a 3KB item reported 2 units against DynamoDB's 6. Invisible below 1KB. A `ConditionCheck` writes nothing and is still charged on the image it read.
+
+- A same-token `TransactWriteItems` or `ExecuteTransaction` replay is charged against the images the first call was sized on, at 4KB read granularity. It used to recompute from the request, which carries no item for a `Delete` or a `ConditionCheck`, so a replayed delete of a 9KB item reported 2 against DynamoDB's 6.
+
 ### Notes
 
-- `TransactWriteItems` and PartiQL writes are untouched by all of the above, and the gap is wider than a missing breakdown. They report no per-index arms under `INDEXES`, where real DynamoDB reports them, and the table figure they do report is still sized on the finished item rather than on the larger of the two images. `TransactWriteItems` is further out: it sizes an update from the request's key and expression values, so it never sees either image. Recorded in [docs/compatibility-summary.md](docs/compatibility-summary.md).
-- Enabling `wasm-sqlite` alongside the default features now fails with a message that says so. Cargo adds the default features to whatever a manifest lists, so `dynoxide-rs = { version = "0.13", features = ["wasm-sqlite"] }` also enabled the native backend and the CLI, and the build stopped on three type errors naming neither the feature nor the conflict. The combination was never valid and still is not; what was missing was the diagnosis. Enable the wasm backend with `default-features = false`.
+- A PartiQL `SELECT` against an index still scans the base table and drops its `WHERE` clause, returning rows the index does not contain and accepting an index name that does not exist ([#179](https://github.com/nubo-db/dynoxide/issues/179)). Unrelated to the capacity work above and unchanged by it.
 
 ## [0.13.0] - 2026-07-30
 

@@ -303,10 +303,11 @@ async fn execute_transaction<S: StorageBackend>(
         ctx.tokens.execute_transaction(),
         token.as_deref(),
         &statements,
-        actions::execute_transaction::execute(backend, request),
+        actions::execute_transaction::execute_cached(backend, request),
         |cached| actions::execute_transaction::replay_response(cached, &capacity_mode),
     )
-    .await?;
+    .await?
+    .response;
 
     serde_json::to_string(&response).map_err(|e| DynoxideError::InternalServerError(e.to_string()))
 }

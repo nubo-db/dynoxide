@@ -143,17 +143,17 @@ type TokenSlot<T> = (Instant, u64, Option<T>);
 /// Idempotency cache keyed by `ClientRequestToken`.
 type TokenCache<T> = HashMap<String, TokenSlot<T>>;
 
-/// Cached `TransactWriteItems` responses.
-type TransactWriteTokenCache =
-    TokenCache<actions::transact_write_items::TransactWriteItemsResponse>;
+/// Cached `TransactWriteItems` responses, alongside the image sizes a replay is
+/// billed against. Those sizes are cache bookkeeping, so they ride here rather
+/// than on the response type a caller sees.
+type TransactWriteTokenCache = TokenCache<actions::transact_write_items::CachedWrite>;
 
 /// Cached `ExecuteTransaction` responses. Separate from
 /// [`TransactWriteTokenCache`] because the response type differs and
 /// `ClientRequestToken` idempotency is scoped per API operation in AWS: a token
 /// reused across `TransactWriteItems` and `ExecuteTransaction` executes once in
 /// each, so the two caches are independent by design.
-type ExecuteTransactionTokenCache =
-    TokenCache<actions::execute_transaction::ExecuteTransactionResponse>;
+type ExecuteTransactionTokenCache = TokenCache<actions::execute_transaction::CachedTransaction>;
 
 /// The transactional idempotency caches one engine instance owns.
 ///
@@ -871,7 +871,10 @@ impl Database<RusqliteBackend> {
             &request.transact_items,
             || {
                 self.with_storage(|s| {
-                    pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
+                    pollster::block_on(actions::transact_write_items::execute_cached(
+                        s,
+                        request.clone(),
+                    ))
                 })
             },
             |cached| {
@@ -885,6 +888,7 @@ impl Database<RusqliteBackend> {
                 )
             },
         )
+        .map(|cached| cached.response)
     }
 
     /// Execute a transactional read (up to 100 gets).
@@ -988,7 +992,10 @@ impl Database<RusqliteBackend> {
             &request.transact_statements,
             || {
                 self.with_storage(|s| {
-                    pollster::block_on(actions::execute_transaction::execute(s, request.clone()))
+                    pollster::block_on(actions::execute_transaction::execute_cached(
+                        s,
+                        request.clone(),
+                    ))
                 })
             },
             |cached| {
@@ -1000,6 +1007,7 @@ impl Database<RusqliteBackend> {
                 )
             },
         )
+        .map(|cached| cached.response)
     }
 
     /// Execute a batch of PartiQL statements.

@@ -36,11 +36,18 @@ pub struct ExecuteTransactionResponse {
     pub responses: Option<Vec<ItemResponse>>,
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<Vec<crate::types::ConsumedCapacity>>,
-    /// Per-statement `(table, image size)` from this call, kept so a same-token
-    /// replay can charge against the images each statement touched rather than
-    /// re-deriving them from the statement text, which cannot see a `DELETE`
-    /// target's size at all. Never serialised.
-    #[serde(skip)]
+}
+
+/// A first-call result together with what a same-token replay needs to bill it.
+///
+/// The replay is charged against the image each statement touched, which the
+/// statement text cannot supply: a `DELETE` names a key, not the row it
+/// removed. Those sizes are internal bookkeeping, so they live here, on the type
+/// the idempotency cache holds, rather than on the response type callers see.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CachedTransaction {
+    pub(crate) response: ExecuteTransactionResponse,
+    /// Per-statement `(table, image size)`.
     pub(crate) replay_sizes: Vec<(String, usize)>,
 }
 
@@ -50,10 +57,21 @@ pub struct ItemResponse {
     pub item: Option<Item>,
 }
 
+/// Run a PartiQL transaction.
+///
+/// Callers driving idempotency want [`execute_cached`], which also hands back
+/// the sizes a replay is billed against.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<ExecuteTransactionResponse> {
+    Ok(execute_cached(storage, request).await?.response)
+}
+
+pub(crate) async fn execute_cached<S: StorageBackend>(
+    storage: &S,
+    request: ExecuteTransactionRequest,
+) -> Result<CachedTransaction> {
     let statements = &request.transact_statements;
 
     // Validate: must have between 1 and 100 statements
@@ -139,9 +157,11 @@ pub async fn execute<S: StorageBackend>(
         build_write_capacity(&charges, mode)
     };
 
-    Ok(ExecuteTransactionResponse {
-        responses: Some(responses),
-        consumed_capacity,
+    Ok(CachedTransaction {
+        response: ExecuteTransactionResponse {
+            responses: Some(responses),
+            consumed_capacity,
+        },
         replay_sizes: replay_sizes(&charges),
     })
 }
@@ -279,16 +299,18 @@ fn replay_table_units(sizes: &[(String, usize)]) -> HashMap<String, f64> {
 /// successfully on the first call, so an unexpected parse error just drops that
 /// statement from the estimate rather than failing the replay.
 pub(crate) fn replay_response(
-    cached: &ExecuteTransactionResponse,
+    cached: &CachedTransaction,
     mode: &Option<String>,
-) -> ExecuteTransactionResponse {
-    ExecuteTransactionResponse {
-        responses: cached.responses.clone(),
-        consumed_capacity: crate::types::build_transactional_capacity(
-            &replay_table_units(&cached.replay_sizes),
-            mode,
-            crate::types::transactional_read_capacity,
-        ),
+) -> CachedTransaction {
+    CachedTransaction {
+        response: ExecuteTransactionResponse {
+            responses: cached.response.responses.clone(),
+            consumed_capacity: crate::types::build_transactional_capacity(
+                &replay_table_units(&cached.replay_sizes),
+                mode,
+                crate::types::transactional_read_capacity,
+            ),
+        },
         replay_sizes: cached.replay_sizes.clone(),
     }
 }

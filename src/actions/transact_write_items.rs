@@ -107,18 +107,36 @@ pub struct TransactWriteItemsResponse {
         skip_serializing_if = "Option::is_none"
     )]
     pub item_collection_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
-    /// Per-action `(table, image size)` from this call, kept so a same-token
-    /// replay can charge against the images the write was sized on rather than
-    /// against the request payload, which carries no item for a `Delete` or a
-    /// `ConditionCheck`. Never serialised, so the wire shape is unaffected.
-    #[serde(skip)]
+}
+
+/// A first-call result together with what a same-token replay needs to bill it.
+///
+/// The replay is charged against the images each action was sized on, which the
+/// request cannot supply: a `Delete` or a `ConditionCheck` carries only a key.
+/// Those sizes are internal bookkeeping, so they live here, on the type the
+/// idempotency cache holds, rather than on the response type callers see.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CachedWrite {
+    pub(crate) response: TransactWriteItemsResponse,
+    /// Per-action `(table, image size)`.
     pub(crate) replay_sizes: Vec<(String, usize)>,
 }
 
+/// Run a transactional write.
+///
+/// Callers driving idempotency want [`execute_cached`], which also hands back
+/// the sizes a replay is billed against.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: TransactWriteItemsRequest,
 ) -> Result<TransactWriteItemsResponse> {
+    Ok(execute_cached(storage, request).await?.response)
+}
+
+pub(crate) async fn execute_cached<S: StorageBackend>(
+    storage: &S,
+    request: TransactWriteItemsRequest,
+) -> Result<CachedWrite> {
     let items = &request.transact_items;
 
     // Validate: at least 1 action
@@ -167,9 +185,11 @@ pub async fn execute<S: StorageBackend>(
         helpers::with_write_transaction(storage, execute_within_transaction(storage, items))
             .await?;
 
-    Ok(TransactWriteItemsResponse {
-        consumed_capacity: build_write_capacity(&capacity, &request.return_consumed_capacity),
-        item_collection_metrics: None,
+    Ok(CachedWrite {
+        response: TransactWriteItemsResponse {
+            consumed_capacity: build_write_capacity(&capacity, &request.return_consumed_capacity),
+            item_collection_metrics: None,
+        },
         replay_sizes: replay_sizes(&capacity),
     })
 }
@@ -254,20 +274,18 @@ fn transact_read_table_units(sizes: &[(String, usize)]) -> HashMap<String, f64> 
 /// recorded rather than re-serving its write numbers, honouring the replay
 /// request's own `ReturnConsumedCapacity` mode (the original call's mode does
 /// not carry over). The read cost is computed at 4KB read granularity, which
-/// diverges from the first-call write magnitude above 1KB. `cached` is the
-/// stored first-call response, which carries both the image sizes and the item
-/// collection metrics.
-pub(crate) fn replay_response(
-    cached: &TransactWriteItemsResponse,
-    mode: &Option<String>,
-) -> TransactWriteItemsResponse {
-    TransactWriteItemsResponse {
-        consumed_capacity: crate::types::build_transactional_capacity(
-            &transact_read_table_units(&cached.replay_sizes),
-            mode,
-            crate::types::transactional_read_capacity,
-        ),
-        item_collection_metrics: cached.item_collection_metrics.clone(),
+/// diverges from the first-call write magnitude above 1KB. `cached` is what the
+/// first call stored: its response, and the image sizes to bill against.
+pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> CachedWrite {
+    CachedWrite {
+        response: TransactWriteItemsResponse {
+            consumed_capacity: crate::types::build_transactional_capacity(
+                &transact_read_table_units(&cached.replay_sizes),
+                mode,
+                crate::types::transactional_read_capacity,
+            ),
+            item_collection_metrics: cached.response.item_collection_metrics.clone(),
+        },
         replay_sizes: cached.replay_sizes.clone(),
     }
 }

@@ -992,12 +992,11 @@ impl Database<RusqliteBackend> {
                 })
             },
             |cached| {
-                // The replay reports transactional read capacity and carries
-                // over the cached first-call responses.
+                // The replay reports transactional read capacity against the
+                // sizes the first call recorded, and carries over its responses.
                 actions::execute_transaction::replay_response(
-                    &request.transact_statements,
+                    cached,
                     &request.return_consumed_capacity,
-                    cached.responses.clone(),
                 )
             },
         )

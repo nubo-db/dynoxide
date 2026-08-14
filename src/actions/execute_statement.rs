@@ -75,25 +75,36 @@ pub async fn execute<S: StorageBackend>(
     let partiql::executor::StatementPage {
         items,
         size,
+        capacity,
         next_token,
-        ..
     } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
     // unlike some emulators that omit it. A SELECT is charged read units (an
-    // eventually consistent read unless ConsistentRead is set); INSERT, UPDATE
-    // and DELETE are charged write units. The unit (single object, not an array)
-    // comes from the shared `types.rs` helpers.
+    // eventually consistent read unless ConsistentRead is set) against the rows
+    // it returned. A write is charged the base table arm plus a per-index arm,
+    // with no transactional factor: a capture against real DynamoDB reports a
+    // PartiQL INSERT of an item in two indexes as total 3, table 1, one unit per
+    // index, exactly as the equivalent `PutItem`.
     let consumed_capacity = partiql::parser::table_name(&stmt).and_then(|table| {
-        let units = if matches!(stmt, partiql::parser::Statement::Select { .. }) {
-            crate::types::read_capacity_units_with_consistency(
+        let Some(capacity) = capacity else {
+            let units = crate::types::read_capacity_units_with_consistency(
                 size,
                 request.consistent_read.unwrap_or(false),
-            )
-        } else {
-            crate::types::write_capacity_units(size)
+            );
+            return crate::types::consumed_capacity(
+                table,
+                units,
+                &request.return_consumed_capacity,
+            );
         };
-        crate::types::consumed_capacity(table, units, &request.return_consumed_capacity)
+        crate::types::consumed_capacity_with_secondary_indexes(
+            table,
+            crate::types::table_write_capacity_units(capacity.old_size, capacity.new_size),
+            &capacity.gsi_units,
+            &capacity.lsi_units,
+            &request.return_consumed_capacity,
+        )
     });
 
     Ok(ExecuteStatementResponse {

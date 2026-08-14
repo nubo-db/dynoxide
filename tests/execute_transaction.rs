@@ -144,6 +144,8 @@ fn test_mixed_select_and_insert() {
     })
     .unwrap();
 
+    // Captured against real DynamoDB: a transaction is all-read or all-write,
+    // and a mixed set is rejected before any statement runs.
     let request = ExecuteTransactionRequest {
         transact_statements: vec![
             ParameterizedStatement {
@@ -159,22 +161,57 @@ fn test_mixed_select_and_insert() {
         return_consumed_capacity: None,
     };
 
-    let resp = db.execute_transaction(request).unwrap();
-    let responses = resp.responses.unwrap();
-    assert_eq!(responses.len(), 2);
-
-    // First response should have the selected item
-    let item = responses[0]
-        .item
-        .as_ref()
-        .expect("SELECT should return an item");
-    assert_eq!(
-        item.get("name"),
-        Some(&AttributeValue::S("Alice".to_string()))
+    let err = db
+        .execute_transaction(request)
+        .expect_err("a mixed read/write transaction is rejected");
+    assert!(
+        err.to_string()
+            .contains("does not support both read and write operations in the same request"),
+        "unexpected error: {err}"
     );
 
-    // Second response (INSERT) should have no item
-    assert!(responses[1].item.is_none());
+    // Nothing ran, so the INSERT left nothing behind.
+    let items = select_all(&db, "Users");
+    assert!(
+        !items.iter().any(|i| match i.get("pk") {
+            Some(AttributeValue::S(s)) => s == "u2",
+            _ => false,
+        }),
+        "a rejected transaction must not write"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Two statements against one item are rejected, matching TransactWriteItems.
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_duplicate_target_rejected() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let request = ExecuteTransactionRequest {
+        transact_statements: vec![
+            ParameterizedStatement {
+                statement: "INSERT INTO \"Users\" VALUE {'pk': 'dup', 'name': 'One'}".to_string(),
+                parameters: None,
+            },
+            ParameterizedStatement {
+                statement: "UPDATE \"Users\" SET name = 'Two' WHERE pk = 'dup'".to_string(),
+                parameters: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let err = db
+        .execute_transaction(request)
+        .expect_err("two statements against one item are rejected");
+    assert!(
+        err.to_string()
+            .contains("Transaction request cannot include multiple operations on one item"),
+        "unexpected error: {err}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -400,7 +437,9 @@ fn test_parameterised_statements() {
     })
     .unwrap();
 
-    // Use parameterised WHERE in a transaction: update u1 and select u2
+    // Parameterised WHERE clauses in a transaction, updating both items. An
+    // all-write set, since a transaction mixing reads and writes is rejected
+    // (see test_mixed_select_and_insert).
     let request = ExecuteTransactionRequest {
         transact_statements: vec![
             ParameterizedStatement {
@@ -408,7 +447,7 @@ fn test_parameterised_statements() {
                 parameters: Some(vec![AttributeValue::S("u1".to_string())]),
             },
             ParameterizedStatement {
-                statement: "SELECT * FROM \"Users\" WHERE pk = ?".to_string(),
+                statement: "UPDATE \"Users\" SET name = 'Bob V2' WHERE pk = ?".to_string(),
                 parameters: Some(vec![AttributeValue::S("u2".to_string())]),
             },
         ],
@@ -419,23 +458,23 @@ fn test_parameterised_statements() {
     let responses = resp.responses.unwrap();
     assert_eq!(responses.len(), 2);
 
-    // First response (UPDATE) has no item
-    assert!(responses[0].item.is_none());
+    // Neither UPDATE carries a RETURNING clause, so neither yields an item.
+    assert!(responses.iter().all(|r| r.item.is_none()));
 
-    // Second response (SELECT) has Bob
-    let bob = responses[1].item.as_ref().unwrap();
-    assert_eq!(bob.get("name"), Some(&AttributeValue::S("Bob".to_string())));
-
-    // Verify the update took effect
+    // Both parameters resolved to the item they named.
     let items = select_all(&db, "Users");
-    let u1 = items.iter().find(|i| match i.get("pk") {
-        Some(AttributeValue::S(s)) => s == "u1",
-        _ => false,
-    });
-    match u1.unwrap().get("name") {
-        Some(AttributeValue::S(s)) => assert_eq!(s, "Alice V2"),
-        other => panic!("Expected updated name, got {:?}", other),
-    }
+    let name_of = |pk: &str| {
+        items
+            .iter()
+            .find(|i| matches!(i.get("pk"), Some(AttributeValue::S(s)) if s == pk))
+            .and_then(|i| i.get("name"))
+            .cloned()
+    };
+    assert_eq!(
+        name_of("u1"),
+        Some(AttributeValue::S("Alice V2".to_string()))
+    );
+    assert_eq!(name_of("u2"), Some(AttributeValue::S("Bob V2".to_string())));
 }
 
 // -----------------------------------------------------------------------

@@ -1680,8 +1680,10 @@ impl McpServer {
             }
         }
 
-        let request =
-            crate::actions::batch_execute_statement::BatchExecuteStatementRequest { statements };
+        let request = crate::actions::batch_execute_statement::BatchExecuteStatementRequest {
+            statements,
+            ..Default::default()
+        };
         match self.db.batch_execute_statement(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),

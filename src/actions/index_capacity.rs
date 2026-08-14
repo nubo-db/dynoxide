@@ -136,6 +136,7 @@ fn set_unchanged<T: Ord>(x: &[T], y: &[T]) -> bool {
 /// index arms come from the maintenance helpers, which have already applied the
 /// delta rules above. Holding the three apart until aggregation is what keeps
 /// the transactional factor off the index arms.
+#[derive(Debug, Clone, Default)]
 pub struct WriteCapacity {
     pub table_name: String,
     /// The item before the write, absent when nothing was there.

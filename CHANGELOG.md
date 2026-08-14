@@ -24,9 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An overwrite that reorders a set's members is free, as it is on DynamoDB. Sets are unordered, so re-listing the same members leaves an index's stored view alone, but they are held in order internally and the comparison read that as a change, charging every index projecting the set.
 
+- Enabling `wasm-sqlite` alongside the default features now fails with a message that says so. Cargo adds the default features to whatever a manifest lists, so `dynoxide-rs = { version = "0.13", features = ["wasm-sqlite"] }` also enabled the native backend and the CLI, and the build stopped on three type errors naming neither the feature nor the conflict. The combination was never valid and still is not; what was missing was the diagnosis. Enable the wasm backend with `default-features = false`.
+
 ### Notes
 
 - `TransactWriteItems` and PartiQL writes are untouched by all of the above, and the gap is wider than a missing breakdown. They report no per-index arms under `INDEXES`, where real DynamoDB reports them, and the table figure they do report is still sized on the finished item rather than on the larger of the two images. `TransactWriteItems` is further out: it sizes an update from the request's key and expression values, so it never sees either image. Recorded in [docs/compatibility-summary.md](docs/compatibility-summary.md).
+- Enabling `wasm-sqlite` alongside the default features now fails with a message that says so. Cargo adds the default features to whatever a manifest lists, so `dynoxide-rs = { version = "0.13", features = ["wasm-sqlite"] }` also enabled the native backend and the CLI, and the build stopped on three type errors naming neither the feature nor the conflict. The combination was never valid and still is not; what was missing was the diagnosis. Enable the wasm backend with `default-features = false`.
 
 ## [0.13.0] - 2026-07-30
 

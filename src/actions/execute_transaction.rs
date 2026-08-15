@@ -97,11 +97,8 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         if let Some(msg) = partiql::parser::count_projection_rejection(&stmt.statement) {
             return Err(DynoxideError::ValidationException(msg));
         }
-        let ast = partiql::parser::parse(&stmt.statement).map_err(|e| {
-            DynoxideError::ValidationException(format!(
-                "Statement wasn't well formed, can't be processed: {e}"
-            ))
-        })?;
+        let ast = partiql::parser::parse(&stmt.statement)
+            .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
         // DynamoDB rejects a RETURNING clause on any member of a transaction with
         // a top-level ValidationException, before applying any write. This is a
         // plain validation failure, not a TransactionCanceledException.

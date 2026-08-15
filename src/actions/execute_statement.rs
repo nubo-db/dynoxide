@@ -59,11 +59,11 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(msg));
     }
 
-    let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
-        DynoxideError::ValidationException(format!(
-            "Statement wasn't well formed, can't be processed: {e}"
-        ))
-    })?;
+    // The parser says which envelope its rejection takes: a malformed statement
+    // gets DynamoDB's "wasn't well formed" wrapper, while a rejection DynamoDB
+    // reports on its own terms is passed through bare.
+    let stmt = partiql::parser::parse(&request.statement)
+        .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
 
     let params = request.parameters.unwrap_or_default();
     let page = partiql::executor::execute_page(

@@ -141,7 +141,7 @@ pub async fn execute<S: StorageBackend>(
                     // `ValidationError` code, the same as an execution error,
                     // matching DynamoDB.
                     code: "ValidationError".to_string(),
-                    message: format!("Statement wasn't well formed, can't be processed: {e}"),
+                    message: e.into_message(),
                 }),
                 item: None,
                 table_name: None,
@@ -222,7 +222,7 @@ pub async fn execute<S: StorageBackend>(
 struct Prepared {
     /// The parse result. An `Err` is a per-statement error, not a request-level
     /// one: AWS reports `ValidationError` against that member and runs the rest.
-    stmt: std::result::Result<partiql::parser::Statement, String>,
+    stmt: std::result::Result<partiql::parser::Statement, partiql::parser::ParseError>,
     /// The item this statement targets, for duplicate detection. `None` when it
     /// does not resolve to one, which covers a partition-spanning `SELECT` and
     /// anything whose key cannot be read off the request.

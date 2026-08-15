@@ -326,6 +326,44 @@ fn a_qualifier_naming_the_table_is_rejected() {
 }
 
 #[test]
+fn the_path_rejections_are_reported_without_the_well_formed_envelope() {
+    // Q14, Q15, Q22, Q25. DynamoDB wraps a malformed statement in "Statement
+    // wasn't well formed, can't be processed: " and reports these four on their
+    // own terms. Which envelope a message takes is observable, so each is
+    // pinned rather than just its text.
+    let db = seeded();
+    for (sql, expected) in [
+        (
+            format!("SELECT * FROM \"{TABLE}\".\"gsi-all\".\"more\""),
+            "A path may contain at most 2 components in the FROM clause",
+        ),
+        (
+            format!("SELECT * FROM \"{TABLE}\".\"\""),
+            "Path component cannot be an empty string",
+        ),
+        (
+            format!("INSERT INTO \"{TABLE}\".\"gsi-all\" VALUE {{'pk':'w','sk':'w'}}"),
+            "FROM clause may only contain a single table name in data manipulation statements",
+        ),
+    ] {
+        let msg = error(&db, &sql);
+        assert!(msg.contains(expected), "for {sql}: got {msg}");
+        assert!(
+            !msg.contains("wasn't well formed"),
+            "for {sql}: wrapped when AWS returns it bare: {msg}"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_statement_still_gets_the_well_formed_envelope() {
+    // The control for the test above: an actual syntax error keeps the wrapper.
+    let db = seeded();
+    let msg = error(&db, "SELECT * FROM");
+    assert!(msg.contains("wasn't well formed"), "got {msg}");
+}
+
+#[test]
 fn a_consistent_read_against_a_gsi_is_rejected() {
     // Q16. PartiQL words this differently from Query, which says "Consistent
     // reads are not supported on global secondary indexes". Both wordings were

@@ -9,6 +9,56 @@
 use crate::types::AttributeValue;
 use std::collections::HashMap;
 
+/// Why a statement did not parse.
+///
+/// DynamoDB wraps a syntax error in `Statement wasn't well formed, can't be
+/// processed: ` and returns some rejections bare, so which envelope a message
+/// takes is part of the observable contract. The parser says which it is rather
+/// than leaving each caller to guess from the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// A malformed statement. The caller wraps this in DynamoDB's envelope.
+    Syntax(String),
+    /// A well-formed statement DynamoDB rejects on its own terms, reported
+    /// without the envelope.
+    Validation(String),
+}
+
+impl ParseError {
+    /// The message DynamoDB returns, envelope included where it uses one.
+    pub fn into_message(self) -> String {
+        match self {
+            ParseError::Syntax(m) => {
+                format!("Statement wasn't well formed, can't be processed: {m}")
+            }
+            ParseError::Validation(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Syntax(m) | ParseError::Validation(m) => f.write_str(m),
+        }
+    }
+}
+
+// Every helper below still returns a bare `String` for a syntax error, so `?`
+// lifts it into the common case and only the handful of sites with their own
+// envelope name a variant.
+impl From<String> for ParseError {
+    fn from(message: String) -> Self {
+        ParseError::Syntax(message)
+    }
+}
+
+impl From<&str> for ParseError {
+    fn from(message: &str) -> Self {
+        ParseError::Syntax(message.to_string())
+    }
+}
+
 /// A parsed PartiQL statement.
 ///
 /// Every variant is `#[non_exhaustive]`: they carry a growing set of clauses (a
@@ -311,7 +361,7 @@ pub enum PartiqlValue {
 }
 
 /// Parse a PartiQL statement string.
-pub fn parse(input: &str) -> Result<Statement, String> {
+pub fn parse(input: &str) -> Result<Statement, ParseError> {
     let mut tokenizer = Tokenizer::new(input)?;
     let first = tokenizer
         .next_token()?
@@ -325,11 +375,11 @@ pub fn parse(input: &str) -> Result<Statement, String> {
         "DELETE" => parse_delete(&mut tokenizer),
         // A statement that does not begin with a DML keyword is not valid
         // PartiQL; DynamoDB reports this as "Expected data manipulation".
-        _ => Err("Expected data manipulation".to_string()),
+        _ => Err("Expected data manipulation".into()),
     }
 }
 
-fn parse_select(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_select(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     // Parse projections
     let projections = parse_projections(t)?;
 
@@ -406,18 +456,18 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
     Ok(projections)
 }
 
-fn parse_insert(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_insert(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "INTO")?;
     let target = parse_table_name(t)?;
     // Unlike UPDATE and DELETE, which parse a qualifier and reject it in
     // execution, DynamoDB rejects one on INSERT here, and reports where the
     // table name sat. Captured eu-west-2 2026-08-15.
     if target.index.is_some() {
-        return Err(format!(
+        return Err(ParseError::Validation(format!(
             "FROM clause may only contain a single table name in data \
              manipulation statements at {}:{}:{}",
             target.span.line, target.span.col, target.span.len
-        ));
+        )));
     }
     let table_name = target.name;
     expect_keyword(t, "VALUE")?;
@@ -446,7 +496,7 @@ fn parse_insert(t: &mut Tokenizer) -> Result<Statement, String> {
     })
 }
 
-fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     let target = parse_table_name(t)?;
 
     // SET and REMOVE are both optional but at least one must be present.
@@ -463,7 +513,7 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
 
                 let eq = t.next_token()?.ok_or("Expected '='")?;
                 if eq != "=" {
-                    return Err(format!("Expected '=' but got '{eq}'"));
+                    return Err(format!("Expected '=' but got '{eq}'").into());
                 }
 
                 let value = parse_set_value(t)?;
@@ -498,7 +548,7 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
     }
 
     if set_clauses.is_empty() && remove_paths.is_empty() {
-        return Err("UPDATE requires at least one SET or REMOVE clause".to_string());
+        return Err("UPDATE requires at least one SET or REMOVE clause".into());
     }
 
     let where_clause = parse_optional_where(t)?;
@@ -573,7 +623,7 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
     }
 }
 
-fn parse_delete(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_delete(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "FROM")?;
     let target = parse_table_name(t)?;
     let where_clause = parse_optional_where(t)?;
@@ -645,12 +695,14 @@ struct TableTarget {
     span: Span,
 }
 
-fn parse_table_name(t: &mut Tokenizer) -> Result<TableTarget, String> {
+fn parse_table_name(t: &mut Tokenizer) -> Result<TableTarget, ParseError> {
     let span = t.span_at(t.pos);
     let raw = t.next_token()?.ok_or("Expected table name")?;
     let name = unquote(&raw);
     if name.is_empty() {
-        return Err("Path component cannot be an empty string".to_string());
+        return Err(ParseError::Validation(
+            "Path component cannot be an empty string".to_string(),
+        ));
     }
 
     let index = match t.peek_token()? {
@@ -659,14 +711,16 @@ fn parse_table_name(t: &mut Tokenizer) -> Result<TableTarget, String> {
             let raw = t.next_token()?.ok_or("Expected index name after '.'")?;
             let index = unquote(&raw);
             if index.is_empty() {
-                return Err("Path component cannot be an empty string".to_string());
+                return Err(ParseError::Validation(
+                    "Path component cannot be an empty string".to_string(),
+                ));
             }
             // A third component is its own rejection rather than a generic
             // parse failure, matching DynamoDB.
             if matches!(t.peek_token()?, Some(ref dot) if dot == ".") {
-                return Err(
-                    "A path may contain at most 2 components in the FROM clause".to_string()
-                );
+                return Err(ParseError::Validation(
+                    "A path may contain at most 2 components in the FROM clause".to_string(),
+                ));
             }
             Some(index)
         }
@@ -1810,7 +1864,7 @@ mod tests {
         ] {
             let err = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {clause}")).unwrap_err();
             assert!(
-                err.contains("Unsupported RETURNING clause"),
+                err.to_string().contains("Unsupported RETURNING clause"),
                 "clause {clause} gave unexpected error: {err}"
             );
         }
@@ -2326,23 +2380,27 @@ mod tests {
         // source characters so a quoted name includes its quotes. Every figure
         // below was read off eu-west-2 on 2026-08-15.
         let err = parse("INSERT INTO \"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        // Bare, not wrapped: AWS reports this one on its own terms.
         assert_eq!(
             err,
-            "FROM clause may only contain a single table name in data \
-             manipulation statements at 1:13:10"
+            ParseError::Validation(
+                "FROM clause may only contain a single table name in data \
+                 manipulation statements at 1:13:10"
+                    .to_string()
+            )
         );
 
         // The column tracks real whitespace rather than being a constant.
         let err = parse("INSERT   INTO   \"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
-        assert!(err.ends_with("at 1:17:10"), "got {err}");
+        assert!(err.to_string().ends_with("at 1:17:10"), "got {err}");
 
         // A newline before the table name moves the line and resets the column.
         let err = parse("INSERT INTO\n\"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
-        assert!(err.ends_with("at 2:1:10"), "got {err}");
+        assert!(err.to_string().ends_with("at 2:1:10"), "got {err}");
 
         // An unquoted name is measured without quotes it never had.
         let err = parse("INSERT INTO abcdefgh.idx VALUE {'pk':'a'}").unwrap_err();
-        assert!(err.ends_with("at 1:13:8"), "got {err}");
+        assert!(err.to_string().ends_with("at 1:13:8"), "got {err}");
     }
 
     #[test]
@@ -2360,18 +2418,20 @@ mod tests {
     #[test]
     fn an_empty_index_component_is_rejected() {
         let err = parse("SELECT * FROM \"T\".\"\"").unwrap_err();
-        assert!(
-            err.contains("empty string"),
-            "expected the empty-component message, got {err}"
+        assert_eq!(
+            err,
+            ParseError::Validation("Path component cannot be an empty string".to_string())
         );
     }
 
     #[test]
     fn a_three_part_name_is_rejected() {
         let err = parse("SELECT * FROM \"T\".\"idx\".\"more\"").unwrap_err();
-        assert!(
-            err.contains("at most 2 components"),
-            "expected the component-count message, got {err}"
+        assert_eq!(
+            err,
+            ParseError::Validation(
+                "A path may contain at most 2 components in the FROM clause".to_string()
+            )
         );
     }
 }

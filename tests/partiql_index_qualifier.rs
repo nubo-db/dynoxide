@@ -541,6 +541,27 @@ fn the_path_rejections_are_reported_without_the_well_formed_envelope() {
 }
 
 #[test]
+fn an_unterminated_quote_is_a_well_formed_envelope_rejection() {
+    // R16, R17, R18. DynamoDB returns the envelope with no detail after it. The
+    // outcome is what is pinned here, the type and the rejection, because that
+    // is the half a caller can depend on. dynoxide names the fault as well,
+    // which is additive: AWS's validation prose differed across two of four
+    // regions in the 2026-06 capture, so the wording was never the contract.
+    let db = seeded();
+    for sql in [
+        "SELECT * FROM \"",
+        "SELECT * FROM \"abc",
+        "SELECT * FROM \"pq_idxq\" WHERE pk = 'oops",
+    ] {
+        let msg = error(&db, sql);
+        assert!(
+            msg.starts_with("Statement wasn't well formed, can't be processed:"),
+            "for {sql}: got {msg}"
+        );
+    }
+}
+
+#[test]
 fn a_malformed_statement_still_gets_the_well_formed_envelope() {
     // The control for the test above: an actual syntax error keeps the wrapper.
     let db = seeded();

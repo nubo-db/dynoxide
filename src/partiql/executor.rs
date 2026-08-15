@@ -86,6 +86,75 @@ pub struct ReadIndex {
 /// `next_token` continues a previous page; the returned token, when present,
 /// continues this one. A statement without a `Limit` returns every matching row
 /// and no token.
+/// The WHERE clause a statement carries, if any. `INSERT` never has one.
+fn statement_where_clause(stmt: &Statement) -> Option<&WhereClause> {
+    match stmt {
+        Statement::Select { where_clause, .. }
+        | Statement::Update { where_clause, .. }
+        | Statement::Delete { where_clause, .. } => where_clause.as_ref(),
+        Statement::Insert { .. } => None,
+    }
+}
+
+/// Reject an ordering comparison whose operand is a type that has no ordering.
+///
+/// DynamoDB orders `S`, `N` and `B` and nothing else, and it rejects the
+/// statement outright rather than declining to match: the check fires before the
+/// table is resolved, so a statement naming a table that does not exist still
+/// reports this. `=` and `<>` are unaffected, being defined for every type.
+/// Captured eu-west-2 2026-08-15.
+fn validate_ordering_operands(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+) -> Result<()> {
+    fn orderable(v: &AttributeValue) -> bool {
+        matches!(
+            v,
+            AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+        )
+    }
+    fn reject(op: &str, v: &AttributeValue) -> DynoxideError {
+        DynoxideError::ValidationException(format!(
+            "Incorrect operand type for operator or function; \
+             operator or function: {op}, operand type: {}",
+            v.type_name()
+        ))
+    }
+
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    for group in &wc.groups {
+        for condition in group {
+            match condition {
+                WhereCondition::Comparison(c) => {
+                    let op = match c.op {
+                        CompOp::Lt => "<",
+                        CompOp::Le => "<=",
+                        CompOp::Gt => ">",
+                        CompOp::Ge => ">=",
+                        CompOp::Eq | CompOp::Ne => continue,
+                    };
+                    let value = resolve_value(&c.value, parameters)?;
+                    if !orderable(&value) {
+                        return Err(reject(op, &value));
+                    }
+                }
+                WhereCondition::Between(_, low, high) => {
+                    for operand in [low, high] {
+                        let value = resolve_value(operand, parameters)?;
+                        if !orderable(&value) {
+                            return Err(reject("BETWEEN", &value));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn execute_page<S: StorageBackend>(
     storage: &S,
     stmt: &Statement,
@@ -99,6 +168,8 @@ pub async fn execute_page<S: StorageBackend>(
             "NextToken is only valid on a SELECT statement".to_string(),
         ));
     }
+    validate_ordering_operands(statement_where_clause(stmt), parameters)?;
+
     // DynamoDB rejects an index qualifier on a write statement before it
     // resolves the table, so a qualified UPDATE against a table that does not
     // exist reports the index problem rather than the missing table. Captured
@@ -642,6 +713,7 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
                 | WhereCondition::Between(p, _, _)
                 | WhereCondition::In(p, _)
                 | WhereCondition::Contains(p, _)
+                | WhereCondition::NotContains(p, _)
                 | WhereCondition::IsMissing(p)
                 | WhereCondition::IsNotMissing(p) => p.as_str(),
             };
@@ -1838,42 +1910,46 @@ fn matches_conditions(
                 }
             }
             WhereCondition::Contains(path, substr_val) => {
-                let item_val = match resolve_nested_path(item, path) {
-                    Some(v) => v,
-                    None => return false,
-                };
-                let substr = match resolve_value(substr_val, parameters) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                match (item_val, &substr) {
-                    (AttributeValue::S(s), AttributeValue::S(sub)) => {
-                        if !s.contains(sub.as_str()) {
-                            return false;
-                        }
-                    }
-                    (AttributeValue::SS(set), AttributeValue::S(val)) => {
-                        if !set.contains(val) {
-                            return false;
-                        }
-                    }
-                    (AttributeValue::NS(set), AttributeValue::N(val)) => {
-                        if !set.contains(val) {
-                            return false;
-                        }
-                    }
-                    (AttributeValue::L(list), target) => {
-                        if !list.contains(target) {
-                            return false;
-                        }
-                    }
-                    _ => return false,
+                if !contains_value(item, path, substr_val, parameters) {
+                    return false;
+                }
+            }
+            WhereCondition::NotContains(path, substr_val) => {
+                if contains_value(item, path, substr_val, parameters) {
+                    return false;
                 }
             }
         }
     }
 
     true
+}
+
+/// Whether `path` holds a value containing `substr_val`: a substring of a
+/// string, a member of a set, or an element of a list.
+///
+/// Shared by `CONTAINS` and `NOT CONTAINS` so the two cannot answer different
+/// questions. A path that does not resolve, or a value that cannot be compared
+/// to the operand, contains nothing.
+fn contains_value(
+    item: &Item,
+    path: &str,
+    substr_val: &PartiqlValue,
+    parameters: &[AttributeValue],
+) -> bool {
+    let Some(item_val) = resolve_nested_path(item, path) else {
+        return false;
+    };
+    let Ok(substr) = resolve_value(substr_val, parameters) else {
+        return false;
+    };
+    match (item_val, &substr) {
+        (AttributeValue::S(s), AttributeValue::S(sub)) => s.contains(sub.as_str()),
+        (AttributeValue::SS(set), AttributeValue::S(val)) => set.contains(val),
+        (AttributeValue::NS(set), AttributeValue::N(val)) => set.contains(val),
+        (AttributeValue::L(list), target) => list.contains(target),
+        _ => false,
+    }
 }
 
 /// Resolve a dotted/indexed path to a nested attribute value.

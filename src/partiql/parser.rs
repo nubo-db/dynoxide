@@ -324,6 +324,9 @@ pub enum WhereCondition {
     Between(String, PartiqlValue, PartiqlValue),
     In(String, Vec<PartiqlValue>),
     Contains(String, PartiqlValue),
+    /// `NOT CONTAINS(path, value)`. Reachable only through a `NOT` in front of
+    /// a `CONTAINS`, which De Morgan may also produce from a negated group.
+    NotContains(String, PartiqlValue),
     IsMissing(String),
     IsNotMissing(String),
 }
@@ -735,27 +738,228 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 /// Parse conditions supporting both AND and OR.
 /// Returns a list of OR-groups, where each group is a list of AND-joined conditions.
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<Vec<Vec<WhereCondition>>, String> {
-    let mut groups: Vec<Vec<WhereCondition>> = Vec::new();
-    let mut current_group: Vec<WhereCondition> = Vec::new();
+    let expr = parse_or_expr(t)?;
+    let expr = push_not_down(expr, false)?;
+    to_dnf(expr)
+}
 
-    loop {
-        let condition = parse_single_condition(t)?;
-        current_group.push(condition);
+/// A WHERE clause as written, before it is flattened.
+///
+/// `WhereClause` holds an OR of ANDs, which is the shape the executor and the
+/// key-condition pushdown both read. Parentheses and `NOT` do not fit that
+/// shape as written, so they are parsed into a tree here and flattened into it
+/// afterwards. Nothing below the parser sees this type.
+enum BoolExpr {
+    Leaf(WhereCondition),
+    And(Vec<BoolExpr>),
+    Or(Vec<BoolExpr>),
+    Not(Box<BoolExpr>),
+}
 
-        match t.peek_token()? {
-            Some(ref s) if s.eq_ignore_ascii_case("AND") => {
-                t.next_token()?; // consume AND — continue in current group
-            }
-            Some(ref s) if s.eq_ignore_ascii_case("OR") => {
-                t.next_token()?; // consume OR — start new group
-                groups.push(current_group);
-                current_group = Vec::new();
-            }
-            _ => break,
+fn parse_or_expr(t: &mut Tokenizer) -> Result<BoolExpr, String> {
+    let mut terms = vec![parse_and_expr(t)?];
+    while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("OR")) {
+        t.next_token()?;
+        terms.push(parse_and_expr(t)?);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        BoolExpr::Or(terms)
+    })
+}
+
+fn parse_and_expr(t: &mut Tokenizer) -> Result<BoolExpr, String> {
+    let mut terms = vec![parse_not_expr(t)?];
+    while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("AND")) {
+        t.next_token()?;
+        terms.push(parse_not_expr(t)?);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        BoolExpr::And(terms)
+    })
+}
+
+fn parse_not_expr(t: &mut Tokenizer) -> Result<BoolExpr, String> {
+    // `NOT EXISTS(x)` and `NOT BEGINS_WITH(x, y)` are single conditions with
+    // their own variants, so they belong to parse_single_condition and are left
+    // to it. A `NOT` in front of anything else is the boolean operator.
+    if matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("NOT")) {
+        let next = t.peek_token_at(1)?.unwrap_or_default();
+        let is_condition_form =
+            next.eq_ignore_ascii_case("EXISTS") || next.eq_ignore_ascii_case("BEGINS_WITH");
+        if !is_condition_form {
+            t.next_token()?;
+            return Ok(BoolExpr::Not(Box::new(parse_not_expr(t)?)));
         }
     }
+    parse_primary(t)
+}
 
-    groups.push(current_group);
+fn parse_primary(t: &mut Tokenizer) -> Result<BoolExpr, String> {
+    if matches!(t.peek_token()?, Some(ref s) if s == "(") {
+        t.next_token()?;
+        let inner = parse_or_expr(t)?;
+        match t.next_token()? {
+            Some(ref s) if s == ")" => Ok(inner),
+            other => Err(format!(
+                "Expected ')' but got '{}'",
+                other.unwrap_or_else(|| "end of statement".to_string())
+            )),
+        }
+    } else {
+        Ok(BoolExpr::Leaf(parse_single_condition(t)?))
+    }
+}
+
+/// Drive `NOT` down to the leaves by De Morgan, so the tree that reaches
+/// `to_dnf` is a plain AND/OR of conditions.
+fn push_not_down(expr: BoolExpr, negated: bool) -> Result<BoolExpr, String> {
+    match expr {
+        BoolExpr::Not(inner) => push_not_down(*inner, !negated),
+        BoolExpr::And(terms) => {
+            let terms = terms
+                .into_iter()
+                .map(|e| push_not_down(e, negated))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(if negated {
+                BoolExpr::Or(terms)
+            } else {
+                BoolExpr::And(terms)
+            })
+        }
+        BoolExpr::Or(terms) => {
+            let terms = terms
+                .into_iter()
+                .map(|e| push_not_down(e, negated))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(if negated {
+                BoolExpr::And(terms)
+            } else {
+                BoolExpr::Or(terms)
+            })
+        }
+        BoolExpr::Leaf(cond) => {
+            if negated {
+                negate_condition(cond)
+            } else {
+                Ok(BoolExpr::Leaf(cond))
+            }
+        }
+    }
+}
+
+/// The negation of a single condition.
+///
+/// Two of these are not single conditions once negated and become subtrees:
+/// `NOT BETWEEN` is a disjunction and `NOT IN` a conjunction. Both are returned
+/// as such and flattened with everything else.
+fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
+    use WhereCondition as W;
+    Ok(match cond {
+        W::Comparison(c) => W::Comparison(Condition {
+            path: c.path,
+            op: match c.op {
+                CompOp::Eq => CompOp::Ne,
+                CompOp::Ne => CompOp::Eq,
+                CompOp::Lt => CompOp::Ge,
+                CompOp::Le => CompOp::Gt,
+                CompOp::Gt => CompOp::Le,
+                CompOp::Ge => CompOp::Lt,
+            },
+            value: c.value,
+        })
+        .into(),
+        W::Exists(p) => W::NotExists(p).into(),
+        W::NotExists(p) => W::Exists(p).into(),
+        W::BeginsWith(p, v) => W::NotBeginsWith(p, v).into(),
+        W::NotBeginsWith(p, v) => W::BeginsWith(p, v).into(),
+        W::IsMissing(p) => W::IsNotMissing(p).into(),
+        W::IsNotMissing(p) => W::IsMissing(p).into(),
+        W::Contains(p, v) => W::NotContains(p, v).into(),
+        W::NotContains(p, v) => W::Contains(p, v).into(),
+        W::Between(p, low, high) => BoolExpr::Or(vec![
+            W::Comparison(Condition {
+                path: p.clone(),
+                op: CompOp::Lt,
+                value: low,
+            })
+            .into(),
+            W::Comparison(Condition {
+                path: p,
+                op: CompOp::Gt,
+                value: high,
+            })
+            .into(),
+        ]),
+        W::In(p, values) => BoolExpr::And(
+            values
+                .into_iter()
+                .map(|v| {
+                    W::Comparison(Condition {
+                        path: p.clone(),
+                        op: CompOp::Ne,
+                        value: v,
+                    })
+                    .into()
+                })
+                .collect(),
+        ),
+    })
+}
+
+impl From<WhereCondition> for BoolExpr {
+    fn from(cond: WhereCondition) -> Self {
+        BoolExpr::Leaf(cond)
+    }
+}
+
+/// How many OR groups a flattened clause may have.
+///
+/// Distributing an AND over ORs multiplies group counts, so a clause built from
+/// nested alternations can expand far beyond what was written. The cap keeps a
+/// pathological statement a rejection rather than an allocation.
+const MAX_OR_GROUPS: usize = 256;
+
+/// Flatten an AND/OR tree into the OR-of-ANDs the rest of the engine reads.
+fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
+    let groups = match expr {
+        BoolExpr::Leaf(cond) => vec![vec![cond]],
+        BoolExpr::Not(_) => {
+            unreachable!("push_not_down removes every Not before to_dnf sees the tree")
+        }
+        BoolExpr::Or(terms) => {
+            let mut out = Vec::new();
+            for term in terms {
+                out.extend(to_dnf(term)?);
+            }
+            out
+        }
+        BoolExpr::And(terms) => {
+            let mut out: Vec<Vec<WhereCondition>> = vec![Vec::new()];
+            for term in terms {
+                let term_groups = to_dnf(term)?;
+                if out.len().saturating_mul(term_groups.len()) > MAX_OR_GROUPS {
+                    return Err("WHERE clause is too complex to evaluate".to_string());
+                }
+                let mut next = Vec::with_capacity(out.len() * term_groups.len());
+                for existing in &out {
+                    for group in &term_groups {
+                        let mut combined = existing.clone();
+                        combined.extend(group.iter().cloned());
+                        next.push(combined);
+                    }
+                }
+                out = next;
+            }
+            out
+        }
+    };
+    if groups.len() > MAX_OR_GROUPS {
+        return Err("WHERE clause is too complex to evaluate".to_string());
+    }
     Ok(groups)
 }
 
@@ -1598,6 +1802,13 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
                 }
             }
             if i >= len {
+                // DynamoDB returns the envelope with nothing after it here.
+                // The detail is deliberately kept anyway: the exception type and
+                // the accept/reject outcome match, and the wording is the half
+                // that drifts. AWS's own validation prose differed across two of
+                // four regions in the 2026-06 capture, so a caller matching it
+                // exactly is already broken; one branching on the type is not.
+                // Extra detail is additive and cannot break either.
                 return Err("Unterminated string literal".to_string());
             }
             s.push('\'');
@@ -1630,6 +1841,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
             // character, and sliced s[1..0], which panics. Rejecting it here
             // fixes the crash at its source and leaves `unquote` total.
             if i >= len {
+                // Detail kept, for the reason given on the string-literal case.
                 return Err("Unterminated quoted identifier".to_string());
             }
             s.push('"');

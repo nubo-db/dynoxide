@@ -264,15 +264,12 @@ fn a_type_mismatch_is_never_equal_and_always_unequal() {
 }
 
 #[test]
-fn ordering_across_mismatched_types_diverges_from_dynamodb() {
-    // Recorded, not endorsed. DynamoDB rejects an ordering comparison between
-    // mismatched types outright: `Incorrect operand type for operator or
-    // function; operator or function: <, operand type: BOOL` (captured
-    // eu-west-2 2026-08-15, case R10). dynoxide answers false and returns no
-    // rows, which predates the shared comparison engine and is unchanged by it.
-    //
-    // Pinned so the divergence is visible rather than assumed correct, and so
-    // whoever closes it sees this test fail rather than a silent behaviour swap.
+fn ordering_between_different_types_matches_nothing() {
+    // Not a rejection. An earlier reading of case R10 took it for one, but the
+    // rule turned out to be about the operand's type rather than a mismatch:
+    // DynamoDB rejects `<` against BOOL, NULL, L, M or a set, and accepts it
+    // against S, N and B whatever the stored attribute is. So this statement is
+    // valid on both sides and simply selects nothing here.
     let db = db_with("name", s("plain"));
     assert!(!matches(&db, "name", "<", n("1")));
 }

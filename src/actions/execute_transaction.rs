@@ -293,7 +293,7 @@ async fn execute_within_transaction<S: StorageBackend>(
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
 
     for (stmt, params) in parsed {
-        match partiql::executor::execute_page(storage, stmt, params, None, None).await {
+        match partiql::executor::execute_page(storage, stmt, params, None, None, false).await {
             Ok(page) => {
                 let table_name = partiql::parser::table_name(stmt).unwrap_or_default();
                 charges.push(match page.capacity {

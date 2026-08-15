@@ -43,7 +43,7 @@ pub async fn execute_measured<S: StorageBackend>(
     parameters: &[AttributeValue],
     limit: Option<usize>,
 ) -> Result<(Option<Vec<Item>>, usize)> {
-    let page = execute_page(storage, stmt, parameters, limit, None).await?;
+    let page = execute_page(storage, stmt, parameters, limit, None, false).await?;
     Ok((page.items, page.size))
 }
 
@@ -65,6 +65,19 @@ pub struct StatementPage {
     pub capacity: Option<WriteCapacity>,
     /// Where to resume, when more rows matched than this page returned.
     pub next_token: Option<String>,
+    /// The index a `SELECT` was served from. `None` for a base table read and
+    /// for every write. Capacity lands on this index's arm rather than on the
+    /// table's, which the caller cannot work out from the statement alone.
+    pub read_index: Option<ReadIndex>,
+}
+
+/// The index a `SELECT` was served from.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ReadIndex {
+    pub name: String,
+    /// LSIs and GSIs land on different arms of `ConsumedCapacity`.
+    pub is_lsi: bool,
 }
 
 /// Like [`execute_measured`], but resumable.
@@ -78,6 +91,7 @@ pub async fn execute_page<S: StorageBackend>(
     parameters: &[AttributeValue],
     limit: Option<usize>,
     next_token: Option<&str>,
+    consistent_read: bool,
 ) -> Result<StatementPage> {
     if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
         return Err(DynoxideError::ValidationException(
@@ -98,29 +112,33 @@ pub async fn execute_page<S: StorageBackend>(
     match stmt {
         Statement::Select {
             table_name,
+            index_name,
             projections,
             where_clause,
             ..
         } => {
-            let (items, token) = execute_select(
+            let outcome = execute_select(
                 storage,
                 table_name,
+                index_name.as_deref(),
                 projections,
                 where_clause.as_ref(),
                 parameters,
                 limit,
                 next_token,
+                consistent_read,
             )
             .await?;
-            let size = items
-                .as_ref()
-                .map(|rows| rows.iter().map(crate::types::item_size).sum())
-                .unwrap_or(0);
+            let size = outcome.items.iter().map(crate::types::item_size).sum();
             Ok(StatementPage {
-                items,
+                items: Some(outcome.items),
                 size,
                 capacity: None,
-                next_token: token,
+                next_token: outcome.next_token,
+                read_index: outcome.index.map(|i| ReadIndex {
+                    name: i.name,
+                    is_lsi: i.is_lsi,
+                }),
             })
         }
         Statement::Insert {
@@ -228,19 +246,50 @@ fn insert_nested_projection(result: &mut Item, path: &str, val: AttributeValue) 
     result.insert(key.to_string(), val);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_select<S: StorageBackend>(
     storage: &S,
     table_name: &str,
+    index_name: Option<&str>,
     projections: &[String],
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     limit: Option<usize>,
     next_token: Option<&str>,
-) -> Result<(Option<Vec<Item>>, Option<String>)> {
+    consistent_read: bool,
+) -> Result<SelectOutcome> {
+    // The table is resolved before the index: a qualified SELECT against a
+    // table that does not exist reports the missing table, not the missing
+    // index. Captured eu-west-2 2026-08-15.
     let meta = require_table(storage, table_name).await?;
-    let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
+    let table_key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
-    let fingerprint = statement_fingerprint(where_clause, parameters);
+    let index = index_name
+        .map(|name| resolve_index(&meta, name))
+        .transpose()?;
+
+    // A strongly consistent read cannot be served from a GSI. PartiQL words
+    // this differently from Query, which says "Consistent reads are not
+    // supported on global secondary indexes"; both wordings were captured on
+    // the same day, so neither is a stale copy of the other.
+    if consistent_read && index.as_ref().is_some_and(|i| !i.is_lsi) {
+        return Err(DynoxideError::ValidationException(
+            "Strongly consistent read is not supported on Global Secondary Indexes".to_string(),
+        ));
+    }
+
+    // The keys the row walk is paced by: the index's when one is named, the
+    // table's otherwise. An LSI's partition key is the table's, so only the
+    // sort key moves in that case.
+    let (read_pk, read_sk) = match index.as_ref() {
+        Some(idx) => (idx.pk_attr.as_str(), idx.sk_attr.as_deref()),
+        None => (
+            table_key_schema.partition_key.as_str(),
+            table_key_schema.sort_key.as_deref(),
+        ),
+    };
+
+    let fingerprint = statement_fingerprint(where_clause, parameters, index_name);
     let cursor = next_token
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
@@ -248,9 +297,12 @@ async fn execute_select<S: StorageBackend>(
     let window = evaluate_window(
         storage,
         table_name,
+        index.as_ref(),
         where_clause,
         parameters,
-        &key_schema,
+        read_pk,
+        read_sk,
+        &table_key_schema,
         cursor.as_ref(),
         limit,
     )
@@ -260,8 +312,8 @@ async fn execute_select<S: StorageBackend>(
     // limit, whether or not anything in the window matched. That is why a page
     // can come back short, or empty, and still carry a token.
     let token = match (limit, &window.last_evaluated) {
-        (Some(lim), Some((pk, sk))) if window.evaluated >= lim => {
-            Some(encode_next_token(table_name, fingerprint, pk, sk))
+        (Some(lim), Some(stop)) if window.evaluated >= lim => {
+            Some(encode_next_token(table_name, fingerprint, stop))
         }
         _ => None,
     };
@@ -286,15 +338,28 @@ async fn execute_select<S: StorageBackend>(
         })
         .collect();
 
-    Ok((Some(items), token))
+    Ok(SelectOutcome {
+        items,
+        next_token: token,
+        index,
+    })
+}
+
+/// What a `SELECT` produced: its rows, where to resume, and the index it was
+/// served from. The index rides along because capacity is attributed to it
+/// rather than to the table, and the caller has no other way to know.
+struct SelectOutcome {
+    items: Vec<Item>,
+    next_token: Option<String>,
+    index: Option<ResolvedIndex>,
 }
 
 /// One read of the table: the rows that matched, plus where the read stopped.
 struct Window {
     matched: Vec<Item>,
-    /// Keys of the last row read, matching or not. The cursor a continuation
+    /// Where the last row read sat, matching or not. The cursor a continuation
     /// resumes from, so no row is evaluated twice.
-    last_evaluated: Option<(String, String)>,
+    last_evaluated: Option<Cursor>,
     /// How many rows were read, matching or not.
     evaluated: usize,
 }
@@ -306,16 +371,20 @@ struct Window {
 /// by `Limit` and what `Query` and `Scan` already do here. Pushing both the
 /// cursor and the bound into the backend keeps a page's cost proportional to
 /// the page rather than to the table.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_window<S: StorageBackend>(
     storage: &S,
     table_name: &str,
+    index: Option<&ResolvedIndex>,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-    key_schema: &crate::actions::helpers::KeySchema,
+    read_pk: &str,
+    read_sk: Option<&str>,
+    table_key_schema: &crate::actions::helpers::KeySchema,
     cursor: Option<&Cursor>,
     limit: Option<usize>,
 ) -> Result<Window> {
-    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, &key_schema.partition_key));
+    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
 
     let rows: Vec<(String, String, String)> = if let Some(pk_cond) = pk_condition {
         let pk_val = resolve_value(&pk_cond.value, parameters)?;
@@ -328,7 +397,7 @@ async fn evaluate_window<S: StorageBackend>(
         // than rows in the whole partition, which is how DynamoDB paces a
         // key-bound read. find_pk_condition only fires on a single-OR-group
         // WHERE, so the group holding the sort-key conditions is unambiguous.
-        let sk_conditions = match (key_schema.sort_key.as_deref(), where_clause) {
+        let sk_conditions = match (read_sk, where_clause) {
             (Some(sk_name), Some(wc)) => {
                 translate_sk_conditions(&wc.groups[0], sk_name, parameters)
             }
@@ -351,21 +420,78 @@ async fn evaluate_window<S: StorageBackend>(
             forward: true,
             limit,
             exclusive_start_sk: cursor.map(|c| c.sk.as_str()),
-            ..Default::default()
+            exclusive_start_base_pk: cursor.and_then(|c| c.base_pk.as_deref()),
+            exclusive_start_base_sk: cursor.and_then(|c| c.base_sk.as_deref()),
         };
-        storage.query_items(table_name, &pk_str, &params).await?
+        match index {
+            Some(idx) if idx.is_lsi => {
+                storage
+                    .query_lsi_items(table_name, &idx.name, &pk_str, &params)
+                    .await?
+            }
+            Some(idx) => {
+                storage
+                    .query_gsi_items(table_name, &idx.name, &pk_str, &params)
+                    .await?
+            }
+            None => storage.query_items(table_name, &pk_str, &params).await?,
+        }
     } else {
         let params = crate::storage::ScanParams {
             limit,
             exclusive_start_pk: cursor.map(|c| c.pk.as_str()),
             exclusive_start_sk: cursor.map(|c| c.sk.as_str()),
+            exclusive_start_base_pk: cursor.and_then(|c| c.base_pk.as_deref()),
+            exclusive_start_base_sk: cursor.and_then(|c| c.base_sk.as_deref()),
             ..Default::default()
         };
-        storage.scan_items(table_name, &params).await?
+        match index {
+            Some(idx) if idx.is_lsi => {
+                storage
+                    .scan_lsi_items(table_name, &idx.name, &params)
+                    .await?
+            }
+            Some(idx) => {
+                storage
+                    .scan_gsi_items(table_name, &idx.name, &params)
+                    .await?
+            }
+            None => storage.scan_items(table_name, &params).await?,
+        }
     };
 
     let evaluated = rows.len();
-    let last_evaluated = rows.last().map(|(pk, sk, _)| (pk.clone(), sk.clone()));
+    // The stop position is read off the last row whether or not it matched.
+    // An index read needs the base table key with it, and the index row holds
+    // it: an index entry always carries the base key, whatever it projects.
+    let last_evaluated = rows.last().map(|(pk, sk, json)| {
+        let (base_pk, base_sk) = if index.is_some() {
+            let item: Option<Item> = serde_json::from_str(json).ok();
+            let base_pk = item
+                .as_ref()
+                .and_then(|i| i.get(&table_key_schema.partition_key))
+                .and_then(|v| v.to_key_string());
+            // A hash-only base table still stores the empty-string default in
+            // the index row's table_sk column, so the cursor keeps its full
+            // width and ties are broken by the base key rather than collapsing.
+            let base_sk = match table_key_schema.sort_key.as_deref() {
+                Some(name) => item
+                    .as_ref()
+                    .and_then(|i| i.get(name))
+                    .and_then(|v| v.to_key_string()),
+                None => Some(String::new()),
+            };
+            (base_pk, base_sk)
+        } else {
+            (None, None)
+        };
+        Cursor {
+            pk: pk.clone(),
+            sk: sk.clone(),
+            base_pk,
+            base_sk,
+        }
+    });
     let matched = rows
         .into_iter()
         .filter_map(|(_, _, json)| serde_json::from_str::<Item>(&json).ok())
@@ -380,19 +506,77 @@ async fn evaluate_window<S: StorageBackend>(
 }
 
 /// Where a page stopped: the storage keys of its last row.
+///
+/// An index read carries the base table key alongside the index key. Without
+/// it the backend's cursor collapses to `(index_pk, index_sk)`, which cannot
+/// advance past rows sharing an index key, and those rows are dropped with no
+/// error. `src/actions/scan.rs` documents the same trap on its own cursor.
 struct Cursor {
     pk: String,
     sk: String,
+    base_pk: Option<String>,
+    base_sk: Option<String>,
+}
+
+/// Which index a qualified `SELECT` resolved to, and the keys to read it by.
+struct ResolvedIndex {
+    name: String,
+    is_lsi: bool,
+    pk_attr: String,
+    sk_attr: Option<String>,
+}
+
+/// Resolve a `"table"."index"` qualifier against the table's metadata.
+///
+/// The rejection deliberately does not name the index. `Query` and `Scan` build
+/// `"... specified index: {name}"` through the helpers in `actions::gsi` and
+/// `actions::lsi`, and AWS appends the name there but not on the PartiQL
+/// surface, so reusing those helpers here would be wrong by exactly the suffix.
+/// Captured eu-west-2 2026-08-15.
+fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Result<ResolvedIndex> {
+    if let Some(lsi) = crate::actions::lsi::parse_lsi_defs(meta)?
+        .into_iter()
+        .find(|l| l.index_name == index_name)
+    {
+        return Ok(ResolvedIndex {
+            name: lsi.index_name,
+            is_lsi: true,
+            pk_attr: lsi.pk_attr,
+            sk_attr: lsi.sk_attr,
+        });
+    }
+    if let Some(gsi) = crate::actions::gsi::parse_gsi_defs(meta)?
+        .into_iter()
+        .find(|g| g.index_name == index_name)
+    {
+        return Ok(ResolvedIndex {
+            name: gsi.index_name,
+            is_lsi: false,
+            pk_attr: gsi.pk_attr,
+            sk_attr: gsi.sk_attr,
+        });
+    }
+    Err(DynoxideError::ValidationException(
+        "The table does not have the specified index".to_string(),
+    ))
 }
 
 /// A digest of the parts of a SELECT that determine its row walk: the WHERE
 /// clause and the parameters. Projections are left out deliberately, because
 /// they run after the read and do not move the cursor. Tokens are ephemeral
 /// and in-process, so the hash does not need to be stable across builds.
-fn statement_fingerprint(where_clause: Option<&WhereClause>, parameters: &[AttributeValue]) -> u64 {
+fn statement_fingerprint(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    index_name: Option<&str>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{where_clause:?}").hash(&mut hasher);
+    // The index is part of the walk, not just of the filter: a token minted
+    // against one index would otherwise resume against another at a position
+    // that means nothing there.
+    index_name.hash(&mut hasher);
     serde_json::to_string(parameters)
         .unwrap_or_default()
         .hash(&mut hasher);
@@ -404,10 +588,17 @@ fn statement_fingerprint(where_clause: Option<&WhereClause>, parameters: &[Attri
 /// asked to strip from the items - the same trade `LastEvaluatedKey` makes -
 /// plus a fingerprint binding it to the statement that minted it. Nothing may
 /// be inferred from its shape; it is free to change.
-fn encode_next_token(table_name: &str, fingerprint: u64, pk: &str, sk: &str) -> String {
+fn encode_next_token(table_name: &str, fingerprint: u64, stop: &Cursor) -> String {
     use base64::Engine;
-    let payload =
-        serde_json::json!({ "t": table_name, "f": fingerprint, "pk": pk, "sk": sk }).to_string();
+    let payload = serde_json::json!({
+        "t": table_name,
+        "f": fingerprint,
+        "pk": stop.pk,
+        "sk": stop.sk,
+        "bpk": stop.base_pk,
+        "bsk": stop.base_sk,
+    })
+    .to_string();
     base64::engine::general_purpose::STANDARD.encode(payload)
 }
 
@@ -439,6 +630,8 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
     Ok(Cursor {
         pk: value["pk"].as_str().ok_or_else(invalid)?.to_string(),
         sk: value["sk"].as_str().ok_or_else(invalid)?.to_string(),
+        base_pk: value["bpk"].as_str().map(str::to_string),
+        base_sk: value["bsk"].as_str().map(str::to_string),
     })
 }
 

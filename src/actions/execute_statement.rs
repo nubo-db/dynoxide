@@ -14,8 +14,10 @@ pub struct ExecuteStatementRequest {
     pub limit: Option<usize>,
     #[serde(rename = "NextToken", default)]
     pub next_token: Option<String>,
-    /// Accepted for API compatibility. Has no behavioural effect — SQLite
-    /// reads are always consistent.
+    /// Does not change which rows come back, because every read against SQLite
+    /// is already strongly consistent. It does change two things: the rate the
+    /// read is charged at, and whether a select qualified by a GSI is rejected
+    /// at all.
     #[serde(rename = "ConsistentRead", default)]
     pub consistent_read: Option<bool>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
@@ -70,6 +72,7 @@ pub async fn execute<S: StorageBackend>(
         &params,
         request.limit,
         request.next_token.as_deref(),
+        request.consistent_read.unwrap_or(false),
     )
     .await?;
     let partiql::executor::StatementPage {
@@ -77,6 +80,7 @@ pub async fn execute<S: StorageBackend>(
         size,
         capacity,
         next_token,
+        read_index,
     } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
@@ -92,11 +96,34 @@ pub async fn execute<S: StorageBackend>(
                 size,
                 request.consistent_read.unwrap_or(false),
             );
-            return crate::types::consumed_capacity(
-                table,
-                units,
-                &request.return_consumed_capacity,
-            );
+            // A read served from an index is charged against that index's arm
+            // with the table arm at zero, the same shape Query and Scan already
+            // report. Captured eu-west-2 2026-08-15: a keyed GSI select is
+            // total 0.5, table 0, gsi 0.5, where dynoxide charged the table.
+            return match read_index {
+                Some(index) if index.is_lsi => {
+                    let lsi_units = std::collections::HashMap::from([(index.name, units)]);
+                    crate::types::consumed_capacity_with_secondary_indexes(
+                        table,
+                        0.0,
+                        &std::collections::HashMap::new(),
+                        &lsi_units,
+                        &request.return_consumed_capacity,
+                    )
+                }
+                Some(index) => {
+                    let gsi_units = std::collections::HashMap::from([(index.name, units)]);
+                    crate::types::consumed_capacity_with_indexes(
+                        table,
+                        0.0,
+                        &gsi_units,
+                        &request.return_consumed_capacity,
+                    )
+                }
+                None => {
+                    crate::types::consumed_capacity(table, units, &request.return_consumed_capacity)
+                }
+            };
         };
         crate::types::consumed_capacity_with_secondary_indexes(
             table,

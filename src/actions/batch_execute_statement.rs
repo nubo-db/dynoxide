@@ -151,7 +151,11 @@ pub async fn execute<S: StorageBackend>(
                 // not on a per-statement error.
                 let table = partiql::parser::table_name(&stmt).map(str::to_string);
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                match partiql::executor::execute_page(storage, &stmt, params, None, None).await {
+                // A member's own ConsistentRead is not deserialised yet, so every
+                // batch read is rated as eventually consistent here.
+                match partiql::executor::execute_page(storage, &stmt, params, None, None, false)
+                    .await
+                {
                     Ok(page) => {
                         match page.capacity {
                             Some(capacity) => records.push(capacity),

@@ -261,10 +261,31 @@ fn a_type_mismatch_is_never_equal_and_always_unequal() {
     let db = db_with("name", s("plain"));
     assert!(!matches(&db, "name", "=", n("1")), "S = N");
     assert!(matches(&db, "name", "<>", n("1")), "S <> N");
-    assert!(
-        !matches(&db, "name", "<", n("1")),
-        "ordering across types is false"
-    );
+}
+
+#[test]
+fn ordering_across_mismatched_types_diverges_from_dynamodb() {
+    // Recorded, not endorsed. DynamoDB rejects an ordering comparison between
+    // mismatched types outright: `Incorrect operand type for operator or
+    // function; operator or function: <, operand type: BOOL` (captured
+    // eu-west-2 2026-08-15, case R10). dynoxide answers false and returns no
+    // rows, which predates the shared comparison engine and is unchanged by it.
+    //
+    // Pinned so the divergence is visible rather than assumed correct, and so
+    // whoever closes it sees this test fail rather than a silent behaviour swap.
+    let db = db_with("name", s("plain"));
+    assert!(!matches(&db, "name", "<", n("1")));
+}
+
+#[test]
+fn binary_orders_by_bytes() {
+    // R8, R9. PartiQL used to answer false for any ordering comparison on
+    // binary, because it never reached a binary arm at all. The shared engine
+    // compares the bytes, which is what DynamoDB does.
+    let db = db_with("bin", b("ccc"));
+    assert!(matches(&db, "bin", "<", b("ddd")), "ccc < ddd");
+    assert!(matches(&db, "bin", ">", b("bbb")), "ccc > bbb");
+    assert!(!matches(&db, "bin", "<", b("bbb")), "ccc is not < bbb");
 }
 
 #[test]

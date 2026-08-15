@@ -926,3 +926,49 @@ fn test_execute_transaction_multi_table_capacity() {
     tables.sort_unstable();
     assert_eq!(tables, vec!["TableA", "TableB"]);
 }
+
+#[test]
+fn an_index_qualified_select_is_rejected_inside_a_transaction() {
+    // R14, captured eu-west-2 2026-08-15. AWS rejects an index read inside a
+    // transaction up front rather than serving it, so there is no arm for it to
+    // be charged to. A plain ValidationException, not a cancellation, like the
+    // RETURNING rejection beside it.
+    let db = dynoxide::Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "tx_idx",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi-all",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let msg = db
+        .execute_transaction(
+            serde_json::from_value(serde_json::json!({
+                "TransactStatements": [
+                    {"Statement": "SELECT * FROM \"tx_idx\".\"gsi-all\" WHERE gsiPk='x'"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .expect_err("an index read inside a transaction is rejected")
+        .to_string();
+    assert!(
+        msg.contains(
+            "Validation failed in TransactStatements[0]: \
+             Reads on indices are not supported within transactions."
+        ),
+        "got {msg}"
+    );
+}

@@ -141,7 +141,7 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
-- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping
+- **Logical:** `AND`, `OR`, `NOT`. Parenthesised grouping is **not** supported and is rejected as a parse error, including a single parenthesised condition; DynamoDB accepts it
 - **Projections:** Nested dot-notation paths
 - **Aggregates:** Not supported, matching DynamoDB: a `COUNT(...)` projection is rejected with DynamoDB's `Unexpected path component` message carrying the token's position (captured against eu-west-2)
 - **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2)
@@ -150,7 +150,7 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics
 - **Index qualifier:** `SELECT * FROM "table"."index"` is served from the named GSI or LSI. The read follows the index, so items the index does not hold are absent and a `KEYS_ONLY` or `INCLUDE` projection returns only what it projects. An unknown index name, a path of more than two components, an empty path component and a strongly consistent read of a GSI are each rejected with DynamoDB's own wording. A GSI rejects a projection naming an attribute it does not carry; either kind rejects a filter on one when the read is keyed on the index partition key, and matches nothing when it is not. `INSERT` rejects a qualifier at parse, `UPDATE` and `DELETE` reject it in execution. Captured against eu-west-2
 
-  Two limits: an LSI serves a projection naming an unprojected attribute from the base table on DynamoDB and returns nothing here, and an index-qualified `SELECT` inside `BatchExecuteStatement` or `ExecuteTransaction` is charged to the table arm rather than the index
+  An index-qualified `SELECT` inside `ExecuteTransaction` is rejected, as it is on DynamoDB. One limit remains: an LSI serves a projection naming an unprojected attribute from the base table on DynamoDB and returns nothing here
 
 Parameter placeholders (`?`) supported in all positions including nested list/map values.
 

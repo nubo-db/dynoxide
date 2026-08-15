@@ -328,6 +328,99 @@ fn an_unkeyed_read_accepts_a_filter_the_index_cannot_satisfy() {
 }
 
 #[test]
+fn an_in_on_the_index_key_counts_as_keyed() {
+    // R12. An IN cannot be pushed down as a single key so the read still scans,
+    // but AWS rejects an unprojected filter alongside it all the same. The
+    // rejection follows the shape of the key condition, not what the read does
+    // with it.
+    let db = seeded();
+    let msg = error(
+        &db,
+        &format!(
+            "SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2 IN ['x2','y2'] AND nonproj='N1'"
+        ),
+    );
+    assert!(
+        msg.contains("does not project one or more filter attributes"),
+        "got {msg}"
+    );
+}
+
+#[test]
+fn an_index_key_reached_through_or_does_not_count_as_keyed() {
+    // R11. AWS accepts an unprojected filter when the index key is reached
+    // through OR, so the rejection must not fire on a multi-group WHERE.
+    //
+    // The captured statement parenthesised its groups; this one cannot, because
+    // dynoxide's PartiQL parser rejects parentheses in a WHERE clause outright.
+    // That gap is not this change's to fix, so the unparenthesised form stands
+    // in, and what is pinned here is the narrower claim: a multi-group WHERE is
+    // not treated as keyed.
+    let db = seeded();
+    let sql = format!(
+        "SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND nonproj='N1' OR gsiPk2='y2'"
+    );
+    let req = serde_json::json!({"Statement": sql});
+    assert!(
+        db.execute_statement(serde_json::from_value(req).unwrap())
+            .is_ok(),
+        "a multi-group WHERE must not trigger the unprojected-filter rejection"
+    );
+}
+
+#[test]
+fn a_non_equality_predicate_on_an_unprojected_attribute_is_rejected_when_keyed() {
+    // R4, R5, R6. The rejection covers every predicate that reads the
+    // attribute, not just equality.
+    let db = seeded();
+    for sql in [
+        format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND nonproj IS MISSING"),
+        format!(
+            "SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND nonproj IS NOT MISSING"
+        ),
+        format!(
+            "SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND BEGINS_WITH(nonproj, 'N')"
+        ),
+    ] {
+        let msg = error(&db, &sql);
+        assert!(
+            msg.contains("does not project one or more filter attributes"),
+            "for {sql}: got {msg}"
+        );
+    }
+}
+
+#[test]
+fn a_non_equality_predicate_on_a_projected_attribute_is_accepted() {
+    // R7. The control: the same predicate shape on an attribute the index does
+    // carry runs and matches nothing.
+    let db = seeded();
+    assert!(
+        keys(
+            &db,
+            &format!(
+                "SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND projattr IS MISSING"
+            )
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn an_empty_table_component_is_rejected_the_same_way_as_an_empty_index() {
+    // R1, R2. The empty-component rejection was captured on the index half
+    // first; AWS applies it to the table half too, ahead of resolving the table.
+    let db = seeded();
+    for sql in ["SELECT * FROM \"\"", "SELECT * FROM \"\".\"gsi-all\""] {
+        let msg = error(&db, sql);
+        assert!(
+            msg.contains("Path component cannot be an empty string"),
+            "for {sql}: got {msg}"
+        );
+    }
+}
+
+#[test]
 fn a_keyed_read_accepts_a_filter_the_index_does_carry() {
     // Q36, Q38. The key condition is present but every filter attribute is
     // projected, so there is nothing to reject.

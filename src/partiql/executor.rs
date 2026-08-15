@@ -311,10 +311,7 @@ async fn execute_select<S: StorageBackend>(
             }
         }
 
-        let keyed = where_clause
-            .and_then(|wc| find_pk_condition(wc, idx.pk_attr()))
-            .is_some();
-        if keyed {
+        if keys_index(where_clause, idx.pk_attr()) {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
                 .filter(|attr| !idx.projects(attr, &table_key_schema))
@@ -836,6 +833,28 @@ fn translate_sk_conditions(
 }
 
 /// Find a partition key equality condition, searching across all OR groups.
+/// Whether the WHERE clause keys this index, which is what decides between a
+/// query and a scan and so whether an unprojected filter attribute is rejected.
+///
+/// Broader than `find_pk_condition` on one axis and identical on the other. An
+/// `IN` on the index partition key counts, even though the read cannot push it
+/// down as a single key and still scans; AWS rejects an unprojected filter
+/// alongside it. An index key reached through OR does not count, and AWS
+/// accepts an unprojected filter there. Captured eu-west-2 2026-08-15.
+fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
+    let Some(wc) = where_clause else {
+        return false;
+    };
+    if wc.groups.len() != 1 {
+        return false;
+    }
+    wc.groups[0].iter().any(|c| match c {
+        WhereCondition::Comparison(cond) => cond.path == pk_name && cond.op == CompOp::Eq,
+        WhereCondition::In(path, _) => path == pk_name,
+        _ => false,
+    })
+}
+
 fn find_pk_condition<'a>(
     wc: &'a WhereClause,
     pk_name: &str,

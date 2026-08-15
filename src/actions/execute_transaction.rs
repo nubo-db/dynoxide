@@ -107,6 +107,16 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
                 "Validation failed in TransactStatements[{index}]: RETURNING clause is not supported in ExecuteTransaction."
             )));
         }
+        // An index-qualified read is rejected outright inside a transaction, so
+        // there is no arm for it to be charged to. Rejected up front like the
+        // RETURNING case, not as a cancellation. Captured eu-west-2 2026-08-15.
+        if matches!(ast, partiql::parser::Statement::Select { .. })
+            && partiql::parser::index_name(&ast).is_some()
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: Reads on indices are not supported within transactions."
+            )));
+        }
         let params = stmt.parameters.clone().unwrap_or_default();
         parsed.push((ast, params));
     }

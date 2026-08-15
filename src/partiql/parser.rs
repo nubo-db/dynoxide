@@ -11,18 +11,22 @@ use std::collections::HashMap;
 
 /// A parsed PartiQL statement.
 ///
-/// The `Update` and `Delete` variants are `#[non_exhaustive]`: they carry a
-/// growing set of clauses (a `RETURNING` variant was added in 0.12.0), so
+/// Every variant is `#[non_exhaustive]`: they carry a growing set of clauses (a
+/// `RETURNING` variant was added in 0.12.0, an index qualifier after that), so
 /// downstream code must match them with `..` and cannot build them by struct
 /// literal. This keeps later clause additions non-breaking, matching the
 /// precedent set by `DynoxideError`.
 #[derive(Debug, Clone)]
 pub enum Statement {
+    #[non_exhaustive]
     Select {
         table_name: String,
+        /// The index named by a `"table"."index"` qualifier, if any.
+        index_name: Option<String>,
         projections: Vec<String>, // empty = SELECT *
         where_clause: Option<WhereClause>,
     },
+    #[non_exhaustive]
     Insert {
         table_name: String,
         item: HashMap<String, PartiqlValue>,
@@ -31,6 +35,10 @@ pub enum Statement {
     #[non_exhaustive]
     Update {
         table_name: String,
+        /// The index named by a `"table"."index"` qualifier, if any. DynamoDB
+        /// parses one here and rejects it in execution, so the parser carries
+        /// it rather than failing, and the executor produces the message.
+        index_name: Option<String>,
         set_clauses: Vec<SetClause>,
         remove_paths: Vec<String>,
         where_clause: Option<WhereClause>,
@@ -41,6 +49,9 @@ pub enum Statement {
     #[non_exhaustive]
     Delete {
         table_name: String,
+        /// The index named by a `"table"."index"` qualifier, if any. Carried
+        /// for the same reason as on `Update`.
+        index_name: Option<String>,
         where_clause: Option<WhereClause>,
         /// The `RETURNING` variant when the statement ends with a `RETURNING`
         /// clause. DynamoDB allows only `ALL OLD *` on `DELETE`; the executor
@@ -84,6 +95,24 @@ pub fn table_name(stmt: &Statement) -> Option<&str> {
         | Statement::Insert { table_name, .. }
         | Statement::Update { table_name, .. }
         | Statement::Delete { table_name, .. } => Some(table_name),
+    }
+}
+
+/// The index a statement's `FROM` clause qualified its table with, as in
+/// `SELECT * FROM "table"."index"`. `None` when the statement names a table
+/// alone.
+///
+/// Carried for every statement kind rather than for `SELECT` alone, because
+/// DynamoDB rejects a qualifier on `UPDATE` and `DELETE` semantically rather
+/// than at parse time, and the executor needs the name to say so.
+pub fn index_name(stmt: &Statement) -> Option<&str> {
+    match stmt {
+        Statement::Select { index_name, .. }
+        | Statement::Update { index_name, .. }
+        | Statement::Delete { index_name, .. } => index_name.as_deref(),
+        // An INSERT never carries one: DynamoDB rejects a qualified name there
+        // at parse time, so the statement does not survive to be executed.
+        Statement::Insert { .. } => None,
     }
 }
 
@@ -307,14 +336,15 @@ fn parse_select(t: &mut Tokenizer) -> Result<Statement, String> {
     // Expect FROM
     expect_keyword(t, "FROM")?;
 
-    // Parse table name
-    let table_name = parse_table_name(t)?;
+    // Parse table name, plus any index the FROM clause qualified it with
+    let target = parse_table_name(t)?;
 
     // Optional WHERE clause
     let where_clause = parse_optional_where(t)?;
 
     Ok(Statement::Select {
-        table_name,
+        table_name: target.name,
+        index_name: target.index,
         projections,
         where_clause,
     })
@@ -378,7 +408,18 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
 
 fn parse_insert(t: &mut Tokenizer) -> Result<Statement, String> {
     expect_keyword(t, "INTO")?;
-    let table_name = parse_table_name(t)?;
+    let target = parse_table_name(t)?;
+    // Unlike UPDATE and DELETE, which parse a qualifier and reject it in
+    // execution, DynamoDB rejects one on INSERT here, and reports where the
+    // table name sat. Captured eu-west-2 2026-08-15.
+    if target.index.is_some() {
+        return Err(format!(
+            "FROM clause may only contain a single table name in data \
+             manipulation statements at {}:{}:{}",
+            target.span.line, target.span.col, target.span.len
+        ));
+    }
+    let table_name = target.name;
     expect_keyword(t, "VALUE")?;
 
     // Parse the item literal as a map of possibly-parameterised values
@@ -406,7 +447,7 @@ fn parse_insert(t: &mut Tokenizer) -> Result<Statement, String> {
 }
 
 fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
-    let table_name = parse_table_name(t)?;
+    let target = parse_table_name(t)?;
 
     // SET and REMOVE are both optional but at least one must be present.
     // Parse SET clauses if the next keyword is SET.
@@ -464,7 +505,8 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
     let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Update {
-        table_name,
+        table_name: target.name,
+        index_name: target.index,
         set_clauses,
         remove_paths,
         where_clause,
@@ -533,12 +575,13 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
 
 fn parse_delete(t: &mut Tokenizer) -> Result<Statement, String> {
     expect_keyword(t, "FROM")?;
-    let table_name = parse_table_name(t)?;
+    let target = parse_table_name(t)?;
     let where_clause = parse_optional_where(t)?;
     let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Delete {
-        table_name,
+        table_name: target.name,
+        index_name: target.index,
         where_clause,
         returning,
     })
@@ -589,9 +632,48 @@ fn parse_optional_returning(t: &mut Tokenizer) -> Result<Option<ReturningVariant
     }
 }
 
-fn parse_table_name(t: &mut Tokenizer) -> Result<String, String> {
-    let name = t.next_token()?.ok_or("Expected table name")?;
-    Ok(unquote(&name))
+/// A `FROM` target: a table, and the index its name was qualified with.
+///
+/// `"table"."index"` is DynamoDB's way of naming an index in PartiQL. The
+/// tokenizer emits `.` as its own token, so the qualifier has to be consumed
+/// here; leaving it in the stream makes the next clause parse against `.` and
+/// the index name, which silently drops that clause.
+struct TableTarget {
+    name: String,
+    index: Option<String>,
+    /// Where the table name sat in the source, for the `INSERT` rejection.
+    span: Span,
+}
+
+fn parse_table_name(t: &mut Tokenizer) -> Result<TableTarget, String> {
+    let span = t.span_at(t.pos);
+    let raw = t.next_token()?.ok_or("Expected table name")?;
+    let name = unquote(&raw);
+    if name.is_empty() {
+        return Err("Path component cannot be an empty string".to_string());
+    }
+
+    let index = match t.peek_token()? {
+        Some(ref dot) if dot == "." => {
+            t.next_token()?; // consume '.'
+            let raw = t.next_token()?.ok_or("Expected index name after '.'")?;
+            let index = unquote(&raw);
+            if index.is_empty() {
+                return Err("Path component cannot be an empty string".to_string());
+            }
+            // A third component is its own rejection rather than a generic
+            // parse failure, matching DynamoDB.
+            if matches!(t.peek_token()?, Some(ref dot) if dot == ".") {
+                return Err(
+                    "A path may contain at most 2 components in the FROM clause".to_string()
+                );
+            }
+            Some(index)
+        }
+        _ => None,
+    };
+
+    Ok(TableTarget { name, index, span })
 }
 
 fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String> {
@@ -1281,17 +1363,31 @@ fn expect_keyword(t: &mut Tokenizer, kw: &str) -> Result<(), String> {
 
 struct Tokenizer {
     tokens: Vec<String>,
+    spans: Vec<Span>,
     pos: usize,
     param_counter: usize,
 }
 
 impl Tokenizer {
     fn new(input: &str) -> Result<Self, String> {
-        let tokens = tokenize(input)?;
+        let (tokens, spans) = tokenize(input)?;
         Ok(Self {
             tokens,
+            spans,
             pos: 0,
             param_counter: 0,
+        })
+    }
+
+    /// The source span of the token at `index`, for the one rejection message
+    /// that reports a position. Out of range yields a zero span rather than
+    /// panicking, so a malformed statement still produces an error rather than
+    /// bringing the process down.
+    fn span_at(&self, index: usize) -> Span {
+        self.spans.get(index).copied().unwrap_or(Span {
+            line: 1,
+            col: 1,
+            len: 0,
         })
     }
 
@@ -1327,11 +1423,59 @@ impl Tokenizer {
     }
 }
 
-/// Tokenise a PartiQL string into tokens.
-fn tokenize(input: &str) -> Result<Vec<String>, String> {
+/// Where a token started in the source, and how long it was as written.
+///
+/// DynamoDB reports a table name's position when it rejects a qualified name on
+/// an `INSERT`, as `line:column:length` counted from 1 with the length measured
+/// in source characters (so a quoted name includes its quotes). Reproducing that
+/// message means the position has to survive tokenisation. Captured eu-west-2
+/// 2026-08-15.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    line: usize,
+    col: usize,
+    len: usize,
+}
+
+fn emit(
+    tokens: &mut Vec<String>,
+    spans: &mut Vec<Span>,
+    tok: String,
+    start: usize,
+    end: usize,
+    pos: &[(usize, usize)],
+) {
+    let (line, col) = pos[start];
+    spans.push(Span {
+        line,
+        col,
+        len: end - start,
+    });
+    tokens.push(tok);
+}
+
+/// Tokenise a PartiQL string into tokens and their source spans.
+fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
     let mut tokens = Vec::new();
+    let mut spans = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
+
+    // Char index to (line, column), both 1-based, computed once so the loop
+    // below does not have to thread a position through every branch.
+    let mut pos = Vec::with_capacity(len + 1);
+    let (mut line, mut col) = (1usize, 1usize);
+    for &c in &chars {
+        pos.push((line, col));
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    pos.push((line, col));
+
     let mut i = 0;
 
     while i < len {
@@ -1341,12 +1485,15 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             continue;
         }
 
+        let start = i;
+
         // Single-char tokens
         match chars[i] {
             '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '*' | '?' | '+' | '-' | '.' => {
                 // Check for multi-char - or +  as start of number? No, treat as separate.
-                tokens.push(chars[i].to_string());
+                let tok = chars[i].to_string();
                 i += 1;
+                emit(&mut tokens, &mut spans, tok, start, i, &pos);
                 continue;
             }
             _ => {}
@@ -1357,8 +1504,8 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             let two = format!("{}{}", chars[i], chars[i + 1]);
             match two.as_str() {
                 "<>" | "<=" | ">=" | "!=" => {
-                    tokens.push(two);
                     i += 2;
+                    emit(&mut tokens, &mut spans, two, start, i, &pos);
                     continue;
                 }
                 _ => {}
@@ -1367,8 +1514,9 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
 
         // Single-char operators
         if matches!(chars[i], '=' | '<' | '>') {
-            tokens.push(chars[i].to_string());
+            let tok = chars[i].to_string();
             i += 1;
+            emit(&mut tokens, &mut spans, tok, start, i, &pos);
             continue;
         }
 
@@ -1394,7 +1542,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 s.push('\'');
                 i += 1;
             }
-            tokens.push(s);
+            emit(&mut tokens, &mut spans, s, start, i, &pos);
             continue;
         }
 
@@ -1420,7 +1568,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 s.push('"');
                 i += 1;
             }
-            tokens.push(s);
+            emit(&mut tokens, &mut spans, s, start, i, &pos);
             continue;
         }
 
@@ -1431,7 +1579,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            tokens.push(s);
+            emit(&mut tokens, &mut spans, s, start, i, &pos);
             continue;
         }
 
@@ -1442,7 +1590,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            tokens.push(s);
+            emit(&mut tokens, &mut spans, s, start, i, &pos);
             continue;
         }
 
@@ -1450,7 +1598,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
         return Err(format!("Unexpected character: '{}'", chars[i]));
     }
 
-    Ok(tokens)
+    Ok((tokens, spans))
 }
 
 #[cfg(test)]
@@ -1465,6 +1613,7 @@ mod tests {
                 table_name,
                 projections,
                 where_clause,
+                ..
             } => {
                 assert_eq!(table_name, "TestTable");
                 assert!(projections.is_empty());
@@ -1559,6 +1708,7 @@ mod tests {
                 table_name,
                 where_clause,
                 returning,
+                ..
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
@@ -1576,6 +1726,7 @@ mod tests {
                 table_name,
                 where_clause,
                 returning,
+                ..
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
@@ -2069,5 +2220,158 @@ mod tests {
             },
             _ => panic!("Expected SELECT with WHERE"),
         }
+    }
+
+    // An index qualifier is `"table"."index"`. The tokenizer emits `.` as its
+    // own token, so a table name parser that takes one token leaves `.` and the
+    // index name in the stream, and whatever clause follows is read against
+    // those instead. Every statement kind goes through `parse_table_name`, so
+    // all four lose their clauses the same way. Captured eu-west-2 2026-08-15.
+
+    #[test]
+    fn select_index_qualifier_keeps_the_where_clause() {
+        let stmt = parse("SELECT * FROM \"T\".\"idx\" WHERE pk = 'p'").unwrap();
+        match stmt {
+            Statement::Select {
+                table_name,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "T");
+                assert!(
+                    where_clause.is_some(),
+                    "the qualifier stranded the WHERE clause"
+                );
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn delete_index_qualifier_keeps_the_where_clause() {
+        let stmt = parse("DELETE FROM \"T\".\"idx\" WHERE pk = 'p'").unwrap();
+        match stmt {
+            Statement::Delete {
+                table_name,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "T");
+                // The parser accepts a DELETE with no WHERE and the executor
+                // rejects it, so a stranded clause surfaces there as "DELETE
+                // requires a WHERE clause" on a statement that plainly has one.
+                assert!(
+                    where_clause.is_some(),
+                    "the qualifier stranded the WHERE clause"
+                );
+            }
+            _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn update_index_qualifier_keeps_its_clauses() {
+        let stmt = parse("UPDATE \"T\".\"idx\" SET a = 'x' WHERE pk = 'p'")
+            .expect("the qualifier stranded the SET clause");
+        match stmt {
+            Statement::Update {
+                table_name,
+                set_clauses,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "T");
+                assert_eq!(set_clauses.len(), 1);
+                assert!(where_clause.is_some());
+            }
+            _ => panic!("Expected UPDATE"),
+        }
+    }
+
+    #[test]
+    fn select_index_qualifier_is_captured() {
+        let stmt = parse("SELECT * FROM \"T\".\"idx\"").unwrap();
+        assert_eq!(index_name(&stmt), Some("idx"));
+        assert_eq!(table_name(&stmt), Some("T"));
+    }
+
+    #[test]
+    fn select_without_a_qualifier_carries_no_index() {
+        let stmt = parse("SELECT * FROM \"T\" WHERE pk = 'p'").unwrap();
+        assert_eq!(index_name(&stmt), None);
+    }
+
+    #[test]
+    fn unquoted_index_qualifier_parses() {
+        let stmt = parse("SELECT * FROM T.idx").unwrap();
+        assert_eq!(table_name(&stmt), Some("T"));
+        assert_eq!(index_name(&stmt), Some("idx"));
+    }
+
+    #[test]
+    fn write_statements_carry_the_qualifier_for_the_executor_to_reject() {
+        // AWS rejects a qualifier on all three, but UPDATE and DELETE parse it
+        // and reject semantically while INSERT fails at parse. Parsing it here
+        // lets the executor carry DynamoDB's own message rather than a parse
+        // error, which is how the RETURNING variants are already handled.
+        let stmt = parse("UPDATE \"T\".\"idx\" SET a = 'x' WHERE pk = 'p'").unwrap();
+        assert_eq!(index_name(&stmt), Some("idx"));
+        let stmt = parse("DELETE FROM \"T\".\"idx\" WHERE pk = 'p'").unwrap();
+        assert_eq!(index_name(&stmt), Some("idx"));
+    }
+
+    #[test]
+    fn insert_rejects_a_qualifier_and_reports_the_table_name_position() {
+        // `line:column:length`, counted from 1, with the length measured in
+        // source characters so a quoted name includes its quotes. Every figure
+        // below was read off eu-west-2 on 2026-08-15.
+        let err = parse("INSERT INTO \"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        assert_eq!(
+            err,
+            "FROM clause may only contain a single table name in data \
+             manipulation statements at 1:13:10"
+        );
+
+        // The column tracks real whitespace rather than being a constant.
+        let err = parse("INSERT   INTO   \"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        assert!(err.ends_with("at 1:17:10"), "got {err}");
+
+        // A newline before the table name moves the line and resets the column.
+        let err = parse("INSERT INTO\n\"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        assert!(err.ends_with("at 2:1:10"), "got {err}");
+
+        // An unquoted name is measured without quotes it never had.
+        let err = parse("INSERT INTO abcdefgh.idx VALUE {'pk':'a'}").unwrap_err();
+        assert!(err.ends_with("at 1:13:8"), "got {err}");
+    }
+
+    #[test]
+    fn insert_without_a_qualifier_is_unaffected() {
+        let stmt = parse("INSERT INTO \"T\" VALUE {'pk':'a'}").unwrap();
+        assert_eq!(table_name(&stmt), Some("T"));
+        assert_eq!(index_name(&stmt), None);
+    }
+
+    #[test]
+    fn a_trailing_dot_with_no_index_name_is_an_error() {
+        assert!(parse("SELECT * FROM \"T\".").is_err());
+    }
+
+    #[test]
+    fn an_empty_index_component_is_rejected() {
+        let err = parse("SELECT * FROM \"T\".\"\"").unwrap_err();
+        assert!(
+            err.contains("empty string"),
+            "expected the empty-component message, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_three_part_name_is_rejected() {
+        let err = parse("SELECT * FROM \"T\".\"idx\".\"more\"").unwrap_err();
+        assert!(
+            err.contains("at most 2 components"),
+            "expected the component-count message, got {err}"
+        );
     }
 }

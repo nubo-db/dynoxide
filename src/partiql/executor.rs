@@ -84,11 +84,23 @@ pub async fn execute_page<S: StorageBackend>(
             "NextToken is only valid on a SELECT statement".to_string(),
         ));
     }
+    // DynamoDB rejects an index qualifier on a write statement before it
+    // resolves the table, so a qualified UPDATE against a table that does not
+    // exist reports the index problem rather than the missing table. Captured
+    // eu-west-2 2026-08-15.
+    if !matches!(stmt, Statement::Select { .. })
+        && crate::partiql::parser::index_name(stmt).is_some()
+    {
+        return Err(DynoxideError::ValidationException(
+            "This operation is not supported on an index".to_string(),
+        ));
+    }
     match stmt {
         Statement::Select {
             table_name,
             projections,
             where_clause,
+            ..
         } => {
             let (items, token) = execute_select(
                 storage,
@@ -133,6 +145,7 @@ pub async fn execute_page<S: StorageBackend>(
             remove_paths,
             where_clause,
             returning,
+            ..
         } => {
             let (projection, capacity) = execute_update(
                 storage,
@@ -167,6 +180,7 @@ pub async fn execute_page<S: StorageBackend>(
             table_name,
             where_clause,
             returning,
+            ..
         } => {
             // DynamoDB permits only RETURNING ALL OLD * on DELETE; the other
             // well-formed variants are rejected with a ValidationException whose

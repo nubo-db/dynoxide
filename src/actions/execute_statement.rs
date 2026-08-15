@@ -81,6 +81,7 @@ pub async fn execute<S: StorageBackend>(
         capacity,
         next_token,
         read_index,
+        base_reads,
     } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
@@ -102,10 +103,17 @@ pub async fn execute<S: StorageBackend>(
             // total 0.5, table 0, gsi 0.5, where dynoxide charged the table.
             return match read_index {
                 Some(index) if index.is_lsi => {
+                    // A reach-back read the base item for each row, and those
+                    // land on the table arm at read granularity apiece, leaving
+                    // the index arm to cover the index read. Captured
+                    // eu-west-2 2026-08-15: three rows served this way reported
+                    // total 2, table 1.5, lsi 0.5.
+                    let table_units = crate::types::read_capacity_units_with_consistency(0, false)
+                        * base_reads as f64;
                     let lsi_units = std::collections::HashMap::from([(index.name, units)]);
                     crate::types::consumed_capacity_with_secondary_indexes(
                         table,
-                        0.0,
+                        table_units,
                         &std::collections::HashMap::new(),
                         &lsi_units,
                         &request.return_consumed_capacity,

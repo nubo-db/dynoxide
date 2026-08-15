@@ -70,6 +70,10 @@ pub struct StatementPage {
     /// for every write. Capacity lands on this index's arm rather than on the
     /// table's, which the caller cannot work out from the statement alone.
     pub read_index: Option<ReadIndex>,
+    /// Base table items an LSI reach-back read to serve attributes the index
+    /// does not project. Charged to the table arm, which is why an index read
+    /// can report a non-zero one.
+    pub base_reads: usize,
 }
 
 /// The index a `SELECT` was served from.
@@ -211,6 +215,7 @@ pub async fn execute_page<S: StorageBackend>(
                     name: i.def.index_name,
                     is_lsi: i.is_lsi,
                 }),
+                base_reads: outcome.base_reads,
             })
         }
         Statement::Insert {
@@ -455,10 +460,47 @@ async fn execute_select<S: StorageBackend>(
         _ => None,
     };
 
+    // An LSI shares its partition with the table, so DynamoDB serves a
+    // projection naming an attribute the index does not carry by reading the
+    // base item. A GSI cannot, and rejects the statement above instead. The
+    // index entry already holds the base key, so the fetch needs nothing the
+    // row does not carry. Captured eu-west-2 2026-08-15 (case Q27).
+    let reach_back = index.as_ref().is_some_and(|idx| {
+        idx.is_lsi
+            && projections
+                .iter()
+                .any(|p| !idx.projects(root_attribute(p), &table_key_schema))
+    });
+
+    let mut base_reads = 0usize;
+    let mut rows = Vec::with_capacity(window.matched.len());
+    for item in window.matched {
+        if reach_back {
+            let pk = item
+                .get(&table_key_schema.partition_key)
+                .and_then(|v| v.to_key_string())
+                .unwrap_or_default();
+            let sk = match table_key_schema.sort_key.as_deref() {
+                Some(name) => item
+                    .get(name)
+                    .and_then(|v| v.to_key_string())
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            if let Some(json) = storage.get_item(table_name, &pk, &sk).await? {
+                if let Ok(full) = serde_json::from_str::<Item>(&json) {
+                    base_reads += 1;
+                    rows.push(full);
+                    continue;
+                }
+            }
+        }
+        rows.push(item);
+    }
+
     // Projections run last, so one that drops the key cannot break the
     // continuation: the cursor comes from the row as it was read.
-    let items = window
-        .matched
+    let items = rows
         .into_iter()
         .map(|item| {
             if projections.is_empty() {
@@ -479,6 +521,7 @@ async fn execute_select<S: StorageBackend>(
         items,
         next_token: token,
         index,
+        base_reads,
     })
 }
 
@@ -489,6 +532,9 @@ struct SelectOutcome {
     items: Vec<Item>,
     next_token: Option<String>,
     index: Option<ResolvedIndex>,
+    /// How many base table items an LSI reach-back read. Each one is charged to
+    /// the table arm, leaving the index arm to cover the index read alone.
+    base_reads: usize,
 }
 
 /// One read of the table: the rows that matched, plus where the read stopped.

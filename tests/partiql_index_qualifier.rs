@@ -480,6 +480,52 @@ fn an_lsi_select_without_a_partition_key_still_reads_the_index() {
     );
 }
 
+#[test]
+fn an_lsi_serves_an_unprojected_projection_from_the_base_table() {
+    // Q27. An LSI shares its partition with the table, so DynamoDB reads the
+    // base item rather than rejecting. dynoxide used to return rows of {}.
+    let db = seeded();
+    assert_eq!(
+        attributes(
+            &db,
+            &format!("SELECT projattr FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p'")
+        ),
+        vec!["projattr"]
+    );
+}
+
+#[test]
+fn an_lsi_reach_back_splits_capacity_between_the_arms() {
+    // Q27: three rows served this way reported total 2, table 1.5, lsi 0.5.
+    // The base fetches land on the table arm at read granularity apiece; the
+    // index arm covers the index read alone.
+    let db = seeded();
+    let cap = capacity(
+        &db,
+        &format!("SELECT projattr FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p'"),
+    );
+    assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(1.5));
+    assert_eq!(
+        cap.local_secondary_indexes
+            .as_ref()
+            .and_then(|m| m.get("lsi-keys"))
+            .map(|d| d.capacity_units),
+        Some(0.5)
+    );
+    assert_eq!(cap.capacity_units, 2.0);
+}
+
+#[test]
+fn a_projection_the_lsi_does_carry_reads_no_base_items() {
+    // The control: without a reach-back the table arm stays at zero.
+    let db = seeded();
+    let cap = capacity(
+        &db,
+        &format!("SELECT pk, lsiSk2 FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p'"),
+    );
+    assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(0.0));
+}
+
 // --- rejections ----------------------------------------------------------
 
 #[test]

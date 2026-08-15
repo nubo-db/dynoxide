@@ -151,6 +151,27 @@ pub async fn execute<S: StorageBackend>(
                 // not on a per-statement error.
                 let table = partiql::parser::table_name(&stmt).map(str::to_string);
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
+                // A batch read must name a single item. A SELECT that does not
+                // resolve to one, or that names an index, is rejected against
+                // itself while the rest of the batch runs. Both shapes carry the
+                // same message, so an index-qualified read is unreachable here
+                // even when it does name the primary key. Captured eu-west-2
+                // 2026-08-15.
+                let unkeyed_read = matches!(stmt, partiql::parser::Statement::Select { .. })
+                    && (prepared.target.is_none() || partiql::parser::index_name(&stmt).is_some());
+                if unkeyed_read {
+                    responses.push(BatchStatementResponse {
+                        error: Some(BatchStatementError {
+                            code: "ValidationError".to_string(),
+                            message: "Select statements within BatchExecuteStatement must \
+                                      specify the primary key in the where clause."
+                                .to_string(),
+                        }),
+                        item: None,
+                        table_name: None,
+                    });
+                    continue;
+                }
                 // A member's own ConsistentRead is not deserialised yet, so every
                 // batch read is rated as eventually consistent here.
                 match partiql::executor::execute_page(storage, &stmt, params, None, None, false)
@@ -187,17 +208,26 @@ pub async fn execute<S: StorageBackend>(
                         // that is the one kind whose attempt can be sized
                         // without reading anything. Everything else falls back
                         // to the one-unit minimum.
-                        if let Some(name) = table {
+                        if let Some(ref name) = table {
                             let units = attempted_units(storage, &stmt, params).await;
-                            failures.push((name, units));
+                            failures.push((name.clone(), units));
                         }
+                        // DynamoDB echoes the table on a member whose statement
+                        // ran and failed, and omits it on one rejected before it
+                        // ran. `ConditionalCheckFailed` and `DuplicateItem` both
+                        // carry it; a `ValidationError` does not, which is what
+                        // an invalid RETURNING variant or a bad expression is.
+                        // Captured eu-west-2 2026-08-15 for the first pair and
+                        // 2026-07 for the second.
+                        let code = e.short_error_code().to_string();
+                        let echoes_table = code != "ValidationError";
                         BatchStatementResponse {
                             error: Some(BatchStatementError {
-                                code: e.short_error_code().to_string(),
+                                code,
                                 message: e.to_string(),
                             }),
                             item: None,
-                            table_name: None,
+                            table_name: if echoes_table { table } else { None },
                         }
                     }
                 }

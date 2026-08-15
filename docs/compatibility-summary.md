@@ -123,9 +123,13 @@ images, which covers a `ConditionCheck` too: it writes nothing and is still
 charged on the image it read. A same-token replay is charged against those same
 images at 4KB read granularity.
 
-One read-side gap remains: a PartiQL `SELECT` served from an index reports its
-units against the base table arm, because the index qualifier is not honoured at
-all ([#179](https://github.com/nubo-db/dynoxide/issues/179)).
+A PartiQL `SELECT` served from an index is charged against that index's arm with
+the table arm at zero, matching `Query` and `Scan`.
+
+One read-side gap remains, and it is not specific to indexes: a PartiQL read with
+no key condition is charged on the rows it returns, where DynamoDB charges a flat
+figure for the scan regardless of how many rows it evaluated. An unqualified base
+table scan diverges by the same margin as an index one.
 
 ---
 
@@ -133,7 +137,7 @@ all ([#179](https://github.com/nubo-db/dynoxide/issues/179)).
 
 Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 
-- **Comparisons:** `=`, `<>`, `<`, `>`, `<=`, `>=`
+- **Comparisons:** `=`, `<>`, `<`, `>`, `<=`, `>=`, on every attribute type. Sets compare without regard to member order, lists in order, maps on their key set; the same comparison serves condition expressions, so the two surfaces cannot drift
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
@@ -144,6 +148,9 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
 - **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics
+- **Index qualifier:** `SELECT * FROM "table"."index"` is served from the named GSI or LSI. The read follows the index, so items the index does not hold are absent and a `KEYS_ONLY` or `INCLUDE` projection returns only what it projects. An unknown index name, a path of more than two components, an empty path component and a strongly consistent read of a GSI are each rejected with DynamoDB's own wording. A GSI rejects a projection naming an attribute it does not carry; either kind rejects a filter on one when the read is keyed on the index partition key, and matches nothing when it is not. `INSERT` rejects a qualifier at parse, `UPDATE` and `DELETE` reject it in execution. Captured against eu-west-2
+
+  Two limits: an LSI serves a projection naming an unprojected attribute from the base table on DynamoDB and returns nothing here, and an index-qualified `SELECT` inside `BatchExecuteStatement` or `ExecuteTransaction` is charged to the table arm rather than the index
 
 Parameter placeholders (`?`) supported in all positions including nested list/map values.
 

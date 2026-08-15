@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The four checks cost about 7% on a 25-statement `BatchExecuteStatement`, measured against `958e340`.
 
+- **Breaking (Rust API):** the PartiQL parser's public types moved with the index-qualifier work. Every `partiql::parser::Statement` variant is now `#[non_exhaustive]`, and `Select`, `Update` and `Delete` carry an `index_name`, so a downstream `match` needs a `..` and construction goes through `Default` or deserialisation. `partiql::parser::parse` returns `ParseError` rather than `String`, because which envelope a rejection takes is part of the observable contract and the caller cannot tell from the text. `partiql::parser::CompOp` is a re-export of the condition engine's operator rather than a second enum of the same shape. `partiql::executor::execute_page` takes the statement's `ConsistentRead`, which now decides both the rate a read is charged at and whether a GSI-qualified select is rejected at all. Source-breaking for the crate's public API, so the next release is a minor bump. The DynamoDB wire API and the CLI, server and MCP surfaces are unaffected.
+
 - **Breaking (Rust API):** `actions::batch_execute_statement::BatchStatementRequest` is now `#[non_exhaustive]`. It is still short of DynamoDB's shape, lacking `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`, so it will gain fields again and the attribute is there to stop that breaking anyone twice. Library consumers that construct it must build from `Default` and assign, or deserialise it. `BatchExecuteStatementRequest` is deliberately not marked: with `ReturnConsumedCapacity` on it, that type now matches DynamoDB exactly. This is a source-breaking change for the crate's public API, so the next release is a minor bump. The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
 
 ### Fixed
@@ -44,9 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A same-token `TransactWriteItems` or `ExecuteTransaction` replay is charged against the images the first call was sized on, at 4KB read granularity. It used to recompute from the request, which carries no item for a `Delete` or a `ConditionCheck`, so a replayed delete of a 9KB item reported 2 against DynamoDB's 6.
 
-### Notes
+- A PartiQL `SELECT` is served from the index its `FROM` clause names ([#179](https://github.com/nubo-db/dynoxide/issues/179)). `SELECT * FROM "table"."index"` used to discard the index and scan the base table, so it returned items the index does not contain and a name matching no index quietly succeeded. The qualifier tokenises as three tokens and the table name parser took one, which left the rest for the next clause to parse against, so the `WHERE` went with it. That single mis-parse cost `UPDATE` its `SET` clause and made `DELETE` report requiring a `WHERE` clause it plainly had.
 
-- A PartiQL `SELECT` against an index still scans the base table and drops its `WHERE` clause, returning rows the index does not contain and accepting an index name that does not exist ([#179](https://github.com/nubo-db/dynoxide/issues/179)). Unrelated to the capacity work above and unchanged by it.
+  The read now follows the index: sparse membership excludes items the index does not hold, and a `KEYS_ONLY` or `INCLUDE` projection returns what it projects and no more. Capacity lands on the index arm with the table arm at zero, matching `Query` and `Scan`. Continuation tokens carry the base table key, so rows sharing an index key are no longer skipped, and a token is bound to the index that minted it.
+
+  Five rejections come with it, each with DynamoDB's own wording: an unknown index name, a `FROM` path of more than two components, an empty path component, a strongly consistent read of a GSI, and a qualifier on a write statement. A GSI rejects a projection naming an attribute it does not carry; either kind rejects a filter on one, but only when the read is keyed on the index partition key, because an unkeyed read is a scan and a scan matches nothing. Captured against eu-west-2.
+
+- A PartiQL predicate on a set, list, map, binary or null attribute compares by value instead of never matching ([#186](https://github.com/nubo-db/dynoxide/issues/186)). PartiQL carried its own comparison covering strings, numbers and booleans, and answered every other type from a catch-all returning false for `=` and true for `<>`. The same code gates `UPDATE` and `DELETE`, so a write conditioned on any of those types could never fire. Sets compare without regard to order, lists in order, maps on their key set. PartiQL now shares the condition-expression engine's comparison rather than carrying a second copy of it. Captured against eu-west-2: the two surfaces agree on every type.
+
+- An unterminated quoted name is rejected instead of panicking the parser. `SELECT * FROM "` sliced a one-character string from index 1, which panics, and the release profile aborts on panic, so a single malformed statement took the process down. Predates the index qualifier, which added a second way to reach it.
 
 ## [0.13.0] - 2026-07-30
 

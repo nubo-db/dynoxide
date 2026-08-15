@@ -56,6 +56,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An unterminated quoted name is rejected instead of panicking the parser. `SELECT * FROM "` sliced a one-character string from index 1, which panics, and the release profile aborts on panic, so a single malformed statement took the process down. Predates the index qualifier, which added a second way to reach it.
 
+- `BatchStatementRequest` carries `ConsistentRead` ([#183](https://github.com/nubo-db/dynoxide/issues/183)) and `ReturnValuesOnConditionCheckFailure` ([#184](https://github.com/nubo-db/dynoxide/issues/184)). Both were absent, so a member setting either was parsed as though it had not.
+
+  `ConsistentRead` is per member and sets the rate that member's read is charged at: a keyed batch `SELECT` costs 0.5 without it and 1 with it, and a batch mixing the two sums both rates. It does not change which rows come back.
+
+  `ReturnValuesOnConditionCheckFailure` is accepted and inert, which is what DynamoDB does with it. A member whose condition fails returns the same response whether it is `ALL_OLD`, `NONE` or absent, and never carries the item; the same option on a `TransactWriteItems` `ConditionCheck` does return it, which is what rules out a bad measurement. The field is deserialised so a client setting it meets a field dynoxide knows rather than one it drops. Captured against eu-west-2.
+
+- A `SELECT` inside `BatchExecuteStatement` must name the table's primary key, and may not name an index. Both shapes were accepted and served; DynamoDB rejects each against that member while the rest of the batch runs, with the same message. An index-qualified batch read is therefore unreachable even when it does name the key.
+
+- A batch member whose statement ran and failed echoes its table, where one rejected before it ran does not. `ConditionalCheckFailed` and `DuplicateItem` carry `TableName` and a `ValidationError` does not, which is what an invalid `RETURNING` variant is.
+
+- Parenthesised grouping and `NOT` work in a `WHERE` clause. Both were documented as supported and neither was: the clause parser was a flat OR of ANDs, so even `WHERE (a='1')` was a parse error, and `NOT` was recognised only inside `NOT EXISTS` and `NOT BEGINS_WITH`. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan. A clause whose flattened form exceeds 256 alternatives is rejected as too complex rather than expanded.
+
+- An ordering comparison rejects an operand whose type has no ordering. DynamoDB orders `S`, `N` and `B`, and rejects `<`, `<=`, `>`, `>=` and `BETWEEN` against anything else before it resolves the table; dynoxide answered no rows. `=` and `<>` are unaffected, being defined for every type. Captured against eu-west-2.
+
+- An index-qualified `SELECT` inside `ExecuteTransaction` is rejected, as it is on DynamoDB, rather than served and charged to the base table arm.
+
+- An LSI serves a projection naming an attribute it does not carry by reading the base item, which is what DynamoDB does and a GSI cannot. dynoxide returned rows of empty objects. The base reads land on the table arm at read granularity apiece, so three rows served this way report total 2, table 1.5, lsi 0.5.
+
 ## [0.13.0] - 2026-07-30
 
 ### Added

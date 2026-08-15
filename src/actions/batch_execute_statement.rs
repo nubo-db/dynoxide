@@ -29,6 +29,21 @@ pub struct BatchStatementRequest {
     pub statement: String,
     #[serde(rename = "Parameters", default)]
     pub parameters: Option<Vec<AttributeValue>>,
+    /// Per member, not per batch. Does not change which rows come back, because
+    /// every read against SQLite is already strongly consistent, but it does
+    /// change the rate the read is charged at: a keyed batch `SELECT` costs 0.5
+    /// without it and 1 with it, and a batch mixing the two sums both rates.
+    /// Captured eu-west-2 2026-08-15.
+    #[serde(rename = "ConsistentRead", default)]
+    pub consistent_read: Option<bool>,
+    /// Accepted and inert, which is what DynamoDB does with it. A batch member
+    /// whose condition fails returns the same response whether this is
+    /// `ALL_OLD`, `NONE`, or absent, and never carries the item: measured
+    /// against a `TransactWriteItems` `ConditionCheck` in the same round, which
+    /// does return it. The field is deserialised so a client setting it meets a
+    /// field dynoxide knows rather than one it drops.
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
+    pub return_values_on_condition_check_failure: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -115,7 +130,8 @@ pub async fn execute<S: StorageBackend>(
 
     let mut responses = Vec::with_capacity(request.statements.len());
     let mut records: Vec<WriteCapacity> = Vec::new();
-    let mut read_units: Vec<(String, usize)> = Vec::new();
+    // Table, bytes read, and whether that member asked for a consistent read.
+    let mut read_units: Vec<(String, usize, bool)> = Vec::new();
     let mut failures: Vec<(String, f64)> = Vec::new();
 
     for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
@@ -172,10 +188,15 @@ pub async fn execute<S: StorageBackend>(
                     });
                     continue;
                 }
-                // A member's own ConsistentRead is not deserialised yet, so every
-                // batch read is rated as eventually consistent here.
-                match partiql::executor::execute_page(storage, &stmt, params, None, None, false)
-                    .await
+                match partiql::executor::execute_page(
+                    storage,
+                    &stmt,
+                    params,
+                    None,
+                    None,
+                    stmt_req.consistent_read.unwrap_or(false),
+                )
+                .await
                 {
                     Ok(page) => {
                         match page.capacity {
@@ -184,7 +205,11 @@ pub async fn execute<S: StorageBackend>(
                             // returned, with no index arm on a base table read.
                             None => {
                                 if let Some(ref name) = table {
-                                    read_units.push((name.clone(), page.size));
+                                    read_units.push((
+                                        name.clone(),
+                                        page.size,
+                                        stmt_req.consistent_read.unwrap_or(false),
+                                    ));
                                 }
                             }
                         }
@@ -350,7 +375,7 @@ async fn attempted_units<S: StorageBackend>(
 /// counts for a unit when another statement in the batch succeeds.
 fn build_capacity(
     records: &[WriteCapacity],
-    read_units: &[(String, usize)],
+    read_units: &[(String, usize, bool)],
     failures: &[(String, f64)],
     mode: &Option<String>,
 ) -> Option<Vec<crate::types::ConsumedCapacity>> {
@@ -362,9 +387,9 @@ fn build_capacity(
     }
 
     let mut by_table = aggregate_by_table(records, 1.0);
-    for (table, size) in read_units {
+    for (table, size, consistent) in read_units {
         by_table.entry(table.clone()).or_default().table_units +=
-            crate::types::read_capacity_units_with_consistency(*size, false);
+            crate::types::read_capacity_units_with_consistency(*size, *consistent);
     }
 
     let mut entries = per_table_capacity(

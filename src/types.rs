@@ -816,6 +816,18 @@ pub fn table_write_capacity_units(old_size: Option<usize>, new_size: Option<usiz
     }
 }
 
+/// Read capacity units one write's images cost when charged as a read.
+///
+/// A same-token transactional replay is billed as a read against the image the
+/// original write was sized on, which is the larger of the before and after
+/// images, but rounded at 4KB rather than 1KB. Captured in eu-west-2: a replayed
+/// put that shrank a 9KB item to nothing reports 6, and so does the replay of
+/// the write that grew it, so neither side alone explains the figure.
+pub fn table_read_capacity_units(old_size: Option<usize>, new_size: Option<usize>) -> f64 {
+    let larger = old_size.unwrap_or(0).max(new_size.unwrap_or(0));
+    read_capacity_units(larger)
+}
+
 /// Calculate read capacity units assuming strongly consistent reads
 /// (1 RCU per 4KB, rounded up). Used when ConsistentRead is true or
 /// when the read type is not specified.
@@ -887,55 +899,71 @@ pub fn consumed_capacity_with_secondary_indexes(
     lsi_units: &HashMap<String, f64>,
     mode: &Option<String>,
 ) -> Option<ConsumedCapacity> {
-    let units_to_map = |units: &HashMap<String, f64>| -> Option<HashMap<String, CapacityDetail>> {
-        if units.is_empty() {
-            None
-        } else {
-            Some(
-                units
-                    .iter()
-                    .map(|(name, &u)| {
-                        (
-                            name.clone(),
-                            CapacityDetail {
-                                capacity_units: u,
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect(),
-            )
+    secondary_index_capacity(
+        table_name,
+        table_units,
+        gsi_units,
+        lsi_units,
+        mode,
+        CapacityAxis::None,
+    )
+}
+
+/// Whether a response mirrors its units into a named axis alongside
+/// `CapacityUnits`.
+///
+/// Single-item and PartiQL responses report `CapacityUnits` alone at every
+/// level. Transactional responses mirror the units into `WriteCapacityUnits`
+/// at every level, including each index arm. Both shapes are captured against
+/// real DynamoDB.
+#[derive(Clone, Copy, PartialEq)]
+enum CapacityAxis {
+    None,
+    Write,
+}
+
+impl CapacityAxis {
+    /// The `WriteCapacityUnits` value for a detail carrying `units`.
+    fn write_units(self, units: f64) -> Option<f64> {
+        match self {
+            Self::None => None,
+            Self::Write => Some(units),
         }
-    };
+    }
+}
+
+/// Shared body for the per-index capacity builders. `table_units` carries the
+/// transactional factor already, when one applies; the index maps never do.
+fn secondary_index_capacity(
+    table_name: &str,
+    table_units: f64,
+    gsi_units: &HashMap<String, f64>,
+    lsi_units: &HashMap<String, f64>,
+    mode: &Option<String>,
+    axis: CapacityAxis,
+) -> Option<ConsumedCapacity> {
+    let total = table_units + gsi_units.values().sum::<f64>() + lsi_units.values().sum::<f64>();
 
     match mode.as_deref().unwrap_or("NONE") {
-        "INDEXES" => {
-            let gsi_total: f64 = gsi_units.values().sum();
-            let lsi_total: f64 = lsi_units.values().sum();
-            Some(ConsumedCapacity {
-                table_name: table_name.to_string(),
-                capacity_units: table_units + gsi_total + lsi_total,
-                table: Some(CapacityDetail {
-                    capacity_units: table_units,
-                    ..Default::default()
-                }),
-                global_secondary_indexes: units_to_map(gsi_units),
-                local_secondary_indexes: units_to_map(lsi_units),
+        "INDEXES" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: total,
+            write_capacity_units: axis.write_units(total),
+            table: Some(CapacityDetail {
+                capacity_units: table_units,
+                write_capacity_units: axis.write_units(table_units),
                 ..Default::default()
-            })
-        }
-        "TOTAL" => {
-            let gsi_total: f64 = gsi_units.values().sum();
-            let lsi_total: f64 = lsi_units.values().sum();
-            Some(ConsumedCapacity {
-                table_name: table_name.to_string(),
-                capacity_units: table_units + gsi_total + lsi_total,
-                table: None,
-                global_secondary_indexes: None,
-                local_secondary_indexes: None,
-                ..Default::default()
-            })
-        }
+            }),
+            global_secondary_indexes: capacity_detail_map(gsi_units, axis),
+            local_secondary_indexes: capacity_detail_map(lsi_units, axis),
+            ..Default::default()
+        }),
+        "TOTAL" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: total,
+            write_capacity_units: axis.write_units(total),
+            ..Default::default()
+        }),
         _ => None,
     }
 }
@@ -982,16 +1010,77 @@ pub fn build_transactional_capacity(
     mode: &Option<String>,
     builder: fn(&str, f64, &Option<String>) -> Option<ConsumedCapacity>,
 ) -> Option<Vec<ConsumedCapacity>> {
-    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        Some(
-            table_units
-                .iter()
-                .filter_map(|(table, &units)| builder(table, units, mode))
-                .collect(),
-        )
-    } else {
-        None
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
     }
+
+    // Sorted by table name, matching the write path. Iterating the map handed
+    // back a different order per process, so a two-table read set or replay
+    // could report its tables either way round while the write half of the same
+    // response family was stable.
+    let mut tables: Vec<&String> = table_units.keys().collect();
+    tables.sort();
+
+    Some(
+        tables
+            .into_iter()
+            .filter_map(|table| builder(table, *table_units.get(table)?, mode))
+            .collect(),
+    )
+}
+
+/// Build a `ConsumedCapacity` for one table in a transactional write, with the
+/// per-index breakdown.
+///
+/// `table_units` already carries the transactional 2x factor; the index maps do
+/// not. DynamoDB applies that factor to the base table arm alone, so an index
+/// arm inside a transaction costs what the same write costs outside one.
+///
+/// `CapacityUnits` and `WriteCapacityUnits` both report the table arm plus the
+/// index arms. The `Table` detail reports the table arm on its own, and every
+/// index arm carries the write axis too, which is where this shape differs from
+/// the single-item one.
+pub fn transactional_write_capacity_with_indexes(
+    table_name: &str,
+    table_units: f64,
+    gsi_units: &HashMap<String, f64>,
+    lsi_units: &HashMap<String, f64>,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    secondary_index_capacity(
+        table_name,
+        table_units,
+        gsi_units,
+        lsi_units,
+        mode,
+        CapacityAxis::Write,
+    )
+}
+
+/// Turn per-index units into the response's detail map, or `None` when nothing
+/// was charged so the arm is absent rather than present and empty.
+fn capacity_detail_map(
+    units: &HashMap<String, f64>,
+    axis: CapacityAxis,
+) -> Option<HashMap<String, CapacityDetail>> {
+    if units.is_empty() {
+        return None;
+    }
+    Some(
+        units
+            .iter()
+            .map(|(name, &u)| {
+                (
+                    name.clone(),
+                    CapacityDetail {
+                        capacity_units: u,
+                        write_capacity_units: axis.write_units(u),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Build a `ConsumedCapacity` for one table in a transactional write

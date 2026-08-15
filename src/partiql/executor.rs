@@ -2,6 +2,7 @@
 //!
 //! Maps parsed PartiQL statements to internal DynamoDB operations.
 
+use crate::actions::index_capacity::WriteCapacity;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
@@ -28,9 +29,14 @@ pub async fn execute<S: StorageBackend>(
 }
 
 /// Like [`execute`], but also returns the total item byte size the statement
-/// touched, for `ConsumedCapacity` accounting. SELECT reports the summed size of
-/// the rows returned; INSERT/UPDATE/DELETE report the affected item's size (0
-/// when the statement was a no-op, e.g. a missing DELETE target).
+/// touched. SELECT reports the summed size of the rows returned;
+/// INSERT/UPDATE/DELETE report the affected item's size (0 when the statement
+/// was a no-op, e.g. a missing DELETE target).
+///
+/// This size alone no longer describes what the statement costs. A write is
+/// charged on the larger of the images either side of it plus a per-index arm,
+/// which [`execute_page`] carries on `StatementPage::capacity`. Prefer that for
+/// capacity; this remains for callers that only want the byte count.
 pub async fn execute_measured<S: StorageBackend>(
     storage: &S,
     stmt: &Statement,
@@ -53,6 +59,10 @@ pub struct StatementPage {
     pub items: Option<Vec<Item>>,
     /// Total item bytes touched, for `ConsumedCapacity`.
     pub size: usize,
+    /// What a write statement contributed to `ConsumedCapacity`: the images
+    /// either side and the per-index units. `None` for a `SELECT`, which is
+    /// charged from `size` at read granularity instead.
+    pub capacity: Option<WriteCapacity>,
     /// Where to resume, when more rows matched than this page returned.
     pub next_token: Option<String>,
 }
@@ -97,6 +107,7 @@ pub async fn execute_page<S: StorageBackend>(
             Ok(StatementPage {
                 items,
                 size,
+                capacity: None,
                 next_token: token,
             })
         }
@@ -105,11 +116,14 @@ pub async fn execute_page<S: StorageBackend>(
             item,
             if_not_exists,
         } => {
-            let size =
+            let capacity =
                 execute_insert(storage, table_name, item, parameters, *if_not_exists).await?;
             Ok(StatementPage {
                 items: None,
-                size,
+                // An insert is measured on the item it wrote, which is 0 when an
+                // `if_not_exists` duplicate made it a no-op.
+                size: capacity.new_size.unwrap_or(0),
+                capacity: Some(capacity),
                 ..Default::default()
             })
         }
@@ -120,7 +134,7 @@ pub async fn execute_page<S: StorageBackend>(
             where_clause,
             returning,
         } => {
-            let (projection, size) = execute_update(
+            let (projection, capacity) = execute_update(
                 storage,
                 table_name,
                 set_clauses,
@@ -143,7 +157,9 @@ pub async fn execute_page<S: StorageBackend>(
             });
             Ok(StatementPage {
                 items,
-                size,
+                // An update is measured on the item it left behind.
+                size: capacity.new_size.unwrap_or(0),
+                capacity: Some(capacity),
                 ..Default::default()
             })
         }
@@ -163,7 +179,7 @@ pub async fn execute_page<S: StorageBackend>(
                     )));
                 }
             }
-            let (old_item, size) =
+            let (old_item, capacity) =
                 execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
             // RETURNING ALL OLD * always surfaces an Items array: the deleted
             // item on a hit, an empty array on a miss (a no-op success). This
@@ -176,7 +192,10 @@ pub async fn execute_page<S: StorageBackend>(
             };
             Ok(StatementPage {
                 items,
-                size,
+                // A delete is measured on the item it removed, which is 0 when
+                // the target was missing.
+                size: capacity.old_size.unwrap_or(0),
+                capacity: Some(capacity),
                 ..Default::default()
             })
         }
@@ -501,15 +520,72 @@ fn find_pk_condition<'a>(
     }
 }
 
-/// Returns the inserted item's size in bytes (0 when an `if_not_exists`
-/// duplicate makes the insert a no-op), for `ConsumedCapacity` accounting.
+/// The `(table, pk, sk)` a statement targets, for duplicate detection across a
+/// batch. `None` when the statement does not resolve to a single item, which
+/// covers a `SELECT` spanning a partition and anything whose key cannot be read
+/// off the statement.
+///
+/// A `SELECT` naming every key attribute does resolve, and AWS rejects a batch
+/// carrying two of them against one item just as it does for writes.
+///
+/// The result is a tuple rather than a joined string. Joining on a delimiter is
+/// not injective once a key value contains it: `pk='a#b', sk='c'` and
+/// `pk='a', sk='b#c'` render alike, and AWS accepts that pair as two distinct
+/// items.
+///
+/// Errors are swallowed deliberately. A statement whose key cannot be resolved,
+/// or whose table cannot be read, is left to fail on its own terms during
+/// execution rather than surfacing here as a duplicate-detection failure.
+pub async fn statement_target<S: StorageBackend>(
+    storage: &S,
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+) -> Option<(String, String, String)> {
+    let table_name = crate::partiql::parser::table_name(stmt)?;
+    let meta = require_table(storage, table_name).await.ok()?;
+    let key_schema = crate::actions::helpers::parse_key_schema(&meta).ok()?;
+
+    let key_of = |source: &dyn Fn(&str) -> Option<AttributeValue>| -> Option<(String, String)> {
+        let pk = source(&key_schema.partition_key)?.to_key_string()?;
+        let sk = match key_schema.sort_key {
+            Some(ref name) => source(name)?.to_key_string()?,
+            None => String::new(),
+        };
+        Some((pk, sk))
+    };
+
+    let from_where = |where_clause: &Option<WhereClause>| -> Option<(String, String)> {
+        let wc = where_clause.as_ref()?;
+        key_of(&|name: &str| {
+            find_comparison_in_groups(&wc.groups, name)
+                .and_then(|cond| resolve_value(&cond.value, parameters).ok())
+        })
+    };
+
+    let (pk, sk) = match stmt {
+        Statement::Insert { item, .. } => key_of(&|name: &str| {
+            item.get(name)
+                .and_then(|v| resolve_value(v, parameters).ok())
+        })?,
+        Statement::Update { where_clause, .. }
+        | Statement::Delete { where_clause, .. }
+        // A SELECT resolves only when its WHERE pins every key attribute; one
+        // spanning a partition yields nothing and takes no part in the check.
+        | Statement::Select { where_clause, .. } => from_where(where_clause)?,
+    };
+
+    Some((table_name.to_string(), pk, sk))
+}
+
+/// Returns what the insert consumed. An `if_not_exists` duplicate makes it a
+/// no-op, which carries no images and no index units.
 async fn execute_insert<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     item_template: &HashMap<String, PartiqlValue>,
     parameters: &[AttributeValue],
     if_not_exists: bool,
-) -> Result<usize> {
+) -> Result<WriteCapacity> {
     // Resolve any parameter placeholders in the item
     let mut item = HashMap::new();
     for (k, v) in item_template {
@@ -542,8 +618,16 @@ async fn execute_insert<S: StorageBackend>(
     let existing = storage.get_item(table_name, &pk, &sk).await?;
     if existing.is_some() {
         if if_not_exists {
-            // Silently succeed — no-op
-            return Ok(0);
+            // Silently succeed, writing nothing and touching no index. The
+            // table still has to be named, or the no-op lands in a bucket
+            // keyed on the empty string and surfaces as a nameless entry.
+            return Ok(WriteCapacity::new(
+                table_name,
+                None,
+                None,
+                HashMap::new(),
+                HashMap::new(),
+            ));
         }
         return Err(DynoxideError::DuplicateItemException(
             "Duplicate primary key exists in table".to_string(),
@@ -572,9 +656,7 @@ async fn execute_insert<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    // PartiQL reports capacity from the item size alone, so the per-index units
-    // are discarded here.
-    let _ = crate::actions::gsi::maintain_gsis_after_write(
+    let gsi_units = crate::actions::gsi::maintain_gsis_after_write(
         storage,
         &meta,
         &target,
@@ -583,7 +665,7 @@ async fn execute_insert<S: StorageBackend>(
     )
     .await?;
 
-    let _ = crate::actions::lsi::maintain_lsis_after_write(
+    let lsi_units = crate::actions::lsi::maintain_lsis_after_write(
         storage,
         &meta,
         &target,
@@ -595,13 +677,20 @@ async fn execute_insert<S: StorageBackend>(
     // Stream record
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
-    Ok(item_size)
+    // An INSERT rejects an existing key above, so there is never an old image
+    // here; `old_item` only ever comes back empty.
+    Ok(WriteCapacity::new(
+        table_name,
+        old_item.as_ref().map(crate::types::item_size),
+        Some(item_size),
+        gsi_units,
+        lsi_units,
+    ))
 }
 
 /// Applies an UPDATE and returns the `RETURNING` projection (or `None` when the
-/// statement carried no `RETURNING` clause) and the updated item's new size in
-/// bytes (0 when the update resolves to an empty item and is skipped), for
-/// `ConsumedCapacity` accounting.
+/// statement carried no `RETURNING` clause) and what the write consumed. An
+/// update that resolves to an empty item is skipped and carries no images.
 async fn execute_update<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -610,7 +699,7 @@ async fn execute_update<S: StorageBackend>(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     returning: Option<ReturningVariant>,
-) -> Result<(Option<Item>, usize)> {
+) -> Result<(Option<Item>, WriteCapacity)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -692,7 +781,10 @@ async fn execute_update<S: StorageBackend>(
 
     // Ensure keys are present
     if item.is_empty() {
-        return Ok((None, 0));
+        return Ok((
+            None,
+            WriteCapacity::new(table_name, None, None, HashMap::new(), HashMap::new()),
+        ));
     }
 
     // Validate attribute values after SET clauses applied
@@ -733,13 +825,13 @@ async fn execute_update<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    // PartiQL reports capacity from the item size alone, so the per-index units
-    // are discarded here.
-    let _ = crate::actions::gsi::maintain_gsis_after_write(storage, &meta, &target, old_ref, &item)
-        .await?;
+    let gsi_units =
+        crate::actions::gsi::maintain_gsis_after_write(storage, &meta, &target, old_ref, &item)
+            .await?;
 
-    let _ = crate::actions::lsi::maintain_lsis_after_write(storage, &meta, &target, old_ref, &item)
-        .await?;
+    let lsi_units =
+        crate::actions::lsi::maintain_lsis_after_write(storage, &meta, &target, old_ref, &item)
+            .await?;
 
     // Stream record
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
@@ -757,7 +849,16 @@ async fn execute_update<S: StorageBackend>(
         project_returning(variant, &old_item, &item, &modified)
     });
 
-    Ok((projection, item_size))
+    Ok((
+        projection,
+        WriteCapacity::new(
+            table_name,
+            old_ref.map(crate::types::item_size),
+            Some(item_size),
+            gsi_units,
+            lsi_units,
+        ),
+    ))
 }
 
 /// Build the `RETURNING` projection for an UPDATE from the item's before/after
@@ -878,7 +979,7 @@ async fn execute_delete<S: StorageBackend>(
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
-) -> Result<(Option<Item>, usize)> {
+) -> Result<(Option<Item>, WriteCapacity)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
 
@@ -960,13 +1061,11 @@ async fn execute_delete<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    // PartiQL reports capacity from the item size alone, so the per-index units
-    // are discarded here.
-    let _ =
+    let gsi_units =
         crate::actions::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref())
             .await?;
 
-    let _ =
+    let lsi_units =
         crate::actions::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref())
             .await?;
 
@@ -975,10 +1074,11 @@ async fn execute_delete<S: StorageBackend>(
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
-    // A delete is charged for the size of the item it removed; a no-op delete
-    // (missing target) reports 0.
-    let deleted_size = old_item.as_ref().map(crate::types::item_size).unwrap_or(0);
-    Ok((old_item, deleted_size))
+    // A delete is charged on the item it removed, so a no-op delete against a
+    // missing target carries no image and falls back to the one-unit minimum.
+    let capacity =
+        WriteCapacity::from_items(table_name, old_item.as_ref(), None, gsi_units, lsi_units);
+    Ok((old_item, capacity))
 }
 
 // ---------------------------------------------------------------------------

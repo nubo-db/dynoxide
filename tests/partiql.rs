@@ -12,6 +12,14 @@ use dynoxide::types::{
 };
 use std::collections::HashMap;
 
+/// `BatchStatementRequest` is `#[non_exhaustive]`, so a test outside the crate
+/// cannot use struct-literal syntax for it. This is the supported shape.
+fn batch_stmt(statement: String) -> BatchStatementRequest {
+    let mut req = BatchStatementRequest::default();
+    req.statement = statement;
+    req
+}
+
 fn create_test_table(db: &Database, table_name: &str) {
     let request = CreateTableRequest {
         table_name: table_name.to_string(),
@@ -1299,10 +1307,10 @@ fn test_batch_delete_returning_all_old_surfaces_item() {
 
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement: "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING ALL OLD *".to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING ALL OLD *".to_string(),
+            )],
         })
         .unwrap();
 
@@ -1337,11 +1345,10 @@ fn test_batch_update_returning_surfaces_projection() {
     // ALL NEW: the full new item, key included.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1' RETURNING ALL NEW *"
-                    .to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1' RETURNING ALL NEW *".to_string(),
+            )],
         })
         .unwrap();
     let item = resp.responses[0]
@@ -1358,12 +1365,11 @@ fn test_batch_update_returning_surfaces_projection() {
     // MODIFIED NEW: only the changed attribute, no key.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement:
-                    "UPDATE \"Users\" SET data = 'newer' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
-                        .to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "UPDATE \"Users\" SET data = 'newer' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                    .to_string(),
+            )],
         })
         .unwrap();
     let item = resp.responses[0]
@@ -1388,11 +1394,10 @@ fn test_batch_update_empty_modified_omits_item() {
     // entirely (the batch analogue of ExecuteStatement's Items: []), matching AWS.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement: "UPDATE \"Users\" REMOVE data WHERE pk = 'b1' RETURNING MODIFIED NEW *"
-                    .to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "UPDATE \"Users\" REMOVE data WHERE pk = 'b1' RETURNING MODIFIED NEW *".to_string(),
+            )],
         })
         .unwrap();
     assert_eq!(resp.responses.len(), 1);
@@ -1416,12 +1421,11 @@ fn test_batch_update_list_index_modified_projects_changed_element() {
 
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement:
-                    "UPDATE \"Users\" SET tags[0] = 'x' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
-                        .to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "UPDATE \"Users\" SET tags[0] = 'x' WHERE pk = 'b1' RETURNING MODIFIED NEW *"
+                    .to_string(),
+            )],
         })
         .unwrap();
     let item = resp.responses[0]
@@ -1446,10 +1450,10 @@ fn test_batch_plain_update_echoes_table_name() {
     // A plain (no-RETURNING) member still echoes TableName, with no Item.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1'".to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "UPDATE \"Users\" SET data = 'new' WHERE pk = 'b1'".to_string(),
+            )],
         })
         .unwrap();
     assert!(resp.responses[0].error.is_none());
@@ -1470,15 +1474,10 @@ fn test_batch_parse_error_uses_short_validation_code() {
     // per-statement execution error does), while a valid sibling still executes.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
             statements: vec![
-                BatchStatementRequest {
-                    statement: "SLECT * FROM \"Users\"".to_string(),
-                    parameters: None,
-                },
-                BatchStatementRequest {
-                    statement: "SELECT * FROM \"Users\" WHERE pk = 'b1'".to_string(),
-                    parameters: None,
-                },
+                batch_stmt("SLECT * FROM \"Users\"".to_string()),
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'b1'".to_string()),
             ],
         })
         .unwrap();
@@ -1530,11 +1529,10 @@ fn test_batch_invalid_delete_returning_variant_is_a_per_statement_error() {
     // per-statement error, not a thrown exception.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
-            statements: vec![BatchStatementRequest {
-                statement: "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING MODIFIED OLD *"
-                    .to_string(),
-                parameters: None,
-            }],
+            return_consumed_capacity: None,
+            statements: vec![batch_stmt(
+                "DELETE FROM \"Users\" WHERE pk = 'b1' RETURNING MODIFIED OLD *".to_string(),
+            )],
         })
         .unwrap();
     assert_eq!(resp.responses.len(), 1);
@@ -1894,17 +1892,10 @@ fn test_batch_execute_mixed_operations() {
 
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
             statements: vec![
-                BatchStatementRequest {
-                    statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}"
-                        .to_string(),
-                    parameters: None,
-                },
-                BatchStatementRequest {
-                    statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}"
-                        .to_string(),
-                    parameters: None,
-                },
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string()),
             ],
         })
         .unwrap();
@@ -1923,25 +1914,162 @@ fn test_batch_execute_partial_failure() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
+    // An all-write batch: a batch mixing reads and writes is rejected up front
+    // (see test_batch_execute_rejects_mixed_read_and_write), so partial failure
+    // is exercised with a second write against a table that does not exist.
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
             statements: vec![
-                BatchStatementRequest {
-                    statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}"
-                        .to_string(),
-                    parameters: None,
-                },
-                BatchStatementRequest {
-                    statement: "SELECT * FROM \"NonExistent\"".to_string(),
-                    parameters: None,
-                },
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string()),
+                batch_stmt("INSERT INTO \"NonExistent\" VALUE {'pk': 'u2'}".to_string()),
             ],
         })
         .unwrap();
 
     assert_eq!(resp.responses.len(), 2);
     assert!(resp.responses[0].error.is_none()); // insert succeeded
-    assert!(resp.responses[1].error.is_some()); // select failed — table not found
+    assert!(resp.responses[1].error.is_some()); // insert failed, table not found
+}
+
+#[test]
+fn test_batch_execute_unparseable_statement_is_per_statement() {
+    // Captured against real DynamoDB: a batch holding an unparseable statement
+    // is not rejected outright. That member reports ValidationError and the
+    // rest run. This is the contract the single up-front parse has to preserve:
+    // collecting into Result<Vec<_>, _> rather than Vec<Result<_, _>> would turn
+    // a per-statement error into a request-level failure.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("THIS IS NOT SQL AT ALL".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'ok1'}".to_string()),
+            ],
+        })
+        .expect("an unparseable member does not sink the request");
+
+    assert_eq!(resp.responses.len(), 2);
+    assert_eq!(
+        resp.responses[0].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError")
+    );
+    assert!(resp.responses[1].error.is_none(), "the rest still run");
+}
+
+#[test]
+fn test_batch_execute_unparseable_does_not_mask_the_top_level_checks() {
+    // Captured: an unparseable member takes no part in the read/write
+    // classification or duplicate detection, but neither does it stop those
+    // checks firing on the members that did parse. Both still reject top-level.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let mixed = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("NOT SQL".to_string()),
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'a'".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'b'}".to_string()),
+            ],
+        })
+        .expect_err("the mixed check still fires");
+    assert!(
+        mixed
+            .to_string()
+            .contains("Read and write requests together"),
+        "unexpected error: {mixed}"
+    );
+
+    let dup = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("NOT SQL".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'same'}".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'same'}".to_string()),
+            ],
+        })
+        .expect_err("the duplicate check still fires");
+    assert!(
+        dup.to_string()
+            .contains("Provided list of item keys contains duplicates"),
+        "unexpected error: {dup}"
+    );
+}
+
+#[test]
+fn test_batch_execute_rejects_duplicate_item_keys() {
+    // Captured against real DynamoDB: two statements against one item are
+    // rejected before any of them runs, the same way a transaction rejects
+    // duplicate targets.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let err = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'dup'}".to_string()),
+                batch_stmt("UPDATE \"Users\" SET name='x' WHERE pk='dup'".to_string()),
+            ],
+        })
+        .expect_err("two statements against one item are rejected");
+
+    assert!(
+        err.to_string()
+            .contains("Provided list of item keys contains duplicates"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_batch_execute_allows_distinct_item_keys() {
+    // The mirror of the case above: distinct keys in one batch are fine.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'one'}".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'two'}".to_string()),
+            ],
+        })
+        .unwrap();
+
+    assert_eq!(resp.responses.len(), 2);
+    assert!(resp.responses.iter().all(|r| r.error.is_none()));
+}
+
+#[test]
+fn test_batch_execute_rejects_mixed_read_and_write() {
+    // Captured against real DynamoDB: a batch carrying both a read and a write
+    // is rejected before any statement runs, as a top-level ValidationException
+    // rather than a per-statement error.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+
+    let err = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string()),
+                batch_stmt("INSERT INTO \"Users\" VALUE {'pk': 'u2'}".to_string()),
+            ],
+        })
+        .expect_err("a mixed batch is rejected");
+
+    assert!(
+        err.to_string()
+            .contains("Read and write requests together in the same batch is not supported"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -1949,13 +2077,13 @@ fn test_batch_execute_exceeds_limit() {
     let db = Database::memory().unwrap();
 
     let stmts: Vec<BatchStatementRequest> = (0..26)
-        .map(|_| BatchStatementRequest {
-            statement: "SELECT * FROM \"T\"".to_string(),
-            parameters: None,
-        })
+        .map(|_| batch_stmt("SELECT * FROM \"T\"".to_string()))
         .collect();
 
-    let result = db.batch_execute_statement(BatchExecuteStatementRequest { statements: stmts });
+    let result = db.batch_execute_statement(BatchExecuteStatementRequest {
+        statements: stmts,
+        return_consumed_capacity: None,
+    });
 
     assert!(result.is_err());
 }
@@ -1964,7 +2092,10 @@ fn test_batch_execute_exceeds_limit() {
 fn test_batch_execute_empty_statements_rejected() {
     let db = Database::memory().unwrap();
 
-    let result = db.batch_execute_statement(BatchExecuteStatementRequest { statements: vec![] });
+    let result = db.batch_execute_statement(BatchExecuteStatementRequest {
+        statements: vec![],
+        return_consumed_capacity: None,
+    });
 
     let err = result.unwrap_err();
     let msg = format!("{err}");
@@ -3396,15 +3527,10 @@ fn test_count_is_rejected_per_statement_on_batch_execute() {
 
     let resp = db
         .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
             statements: vec![
-                BatchStatementRequest {
-                    statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
-                    parameters: None,
-                },
-                BatchStatementRequest {
-                    statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
-                    parameters: None,
-                },
+                batch_stmt("SELECT COUNT(*) FROM \"Users\"".to_string()),
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string()),
             ],
         })
         .unwrap();

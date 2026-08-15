@@ -10,6 +10,10 @@
 #[cfg(feature = "iai-callgrind")]
 use dynoxide::Database;
 #[cfg(feature = "iai-callgrind")]
+use dynoxide::actions::batch_execute_statement::{
+    BatchExecuteStatementRequest, BatchStatementRequest,
+};
+#[cfg(feature = "iai-callgrind")]
 use dynoxide::actions::delete_item::DeleteItemRequest;
 #[cfg(feature = "iai-callgrind")]
 use dynoxide::actions::get_item::GetItemRequest;
@@ -190,6 +194,55 @@ fn bench_delete_item((db, request): (Database, DeleteItemRequest)) {
     black_box(db.delete_item(request).unwrap());
 }
 
+/// A 25-statement PartiQL batch.
+///
+/// The PartiQL surfaces had no instruction-count coverage at all, so a change
+/// to their hot path could not be measured by the gate that blocks a merge.
+/// This one walks its statement list more than once before executing anything,
+/// which is precisely the kind of cost the wall-clock suite is too noisy to
+/// resolve.
+#[cfg(feature = "iai-callgrind")]
+fn setup_batch_execute_statement() -> (Database, BatchExecuteStatementRequest) {
+    let db = setup_database(1000, ItemSize::Medium);
+    let build = || -> BatchExecuteStatementRequest {
+        let statements = (0..25)
+            .map(|i| {
+                let mut stmt = BatchStatementRequest::default();
+                // `sk` is declared N on the bench table. A string here is
+                // rejected per statement while the batch still returns Ok, so
+                // the benchmark would silently measure the rejection path.
+                stmt.statement =
+                    format!("INSERT INTO \"{BENCH_TABLE}\" VALUE {{'pk':'bench-{i}','sk':{i}}}");
+                stmt
+            })
+            .collect();
+        BatchExecuteStatementRequest {
+            statements,
+            ..Default::default()
+        }
+    };
+
+    // Setup is excluded from measurement, so prove the workload runs here
+    // rather than trusting an outer Ok that member errors do not disturb.
+    let check = db.batch_execute_statement(build()).unwrap();
+    assert!(
+        check.responses.iter().all(|r| r.error.is_none()),
+        "benchmark workload is failing, so this measures rejection"
+    );
+
+    // A fresh database, so the measured call inserts rather than duplicating
+    // what the check above just wrote.
+    let db = setup_database(1000, ItemSize::Medium);
+    (db, build())
+}
+
+#[cfg(feature = "iai-callgrind")]
+#[library_benchmark]
+#[bench::batch25(setup_batch_execute_statement())]
+fn bench_batch_execute_statement((db, request): (Database, BatchExecuteStatementRequest)) {
+    black_box(db.batch_execute_statement(request).unwrap());
+}
+
 // ---- Group and harness registration ----
 
 #[cfg(feature = "iai-callgrind")]
@@ -201,7 +254,8 @@ library_benchmark_group!(
         bench_query,
         bench_scan,
         bench_update_item,
-        bench_delete_item
+        bench_delete_item,
+        bench_batch_execute_statement
 );
 
 #[cfg(feature = "iai-callgrind")]

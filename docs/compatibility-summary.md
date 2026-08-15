@@ -109,14 +109,23 @@ moving an index key costs two writes, and removing one costs a single delete.
 Sizing is on the projected index entry, so an attribute the index does not
 project costs it nothing.
 
-`TransactWriteItems` and PartiQL writes are the exception, and in two ways. Neither
-reports a per-index breakdown under `INDEXES`, where real DynamoDB reports one. The
-table figure they do report is also still sized on the finished item rather than on
-the larger of the item's before and after images, so a write that shrinks an item
-under-reports on these surfaces while `PutItem` and `UpdateItem` now get it right.
-`TransactWriteItems` sizes an update from the request's key and expression values,
-so it sees neither image. The sizing gaps are invisible below 1KB, where everything
-rounds to the same unit; the missing breakdown shows at any size.
+Every write surface reports the breakdown: `PutItem`, `UpdateItem`, `DeleteItem`,
+`BatchWriteItem`, `TransactWriteItems`, `ExecuteStatement`, `ExecuteTransaction`
+and `BatchExecuteStatement`.
+
+The transactional 2x factor applies to the base table arm alone. An index arm
+inside a `TransactWriteItems` or `ExecuteTransaction` costs what the same write
+costs outside a transaction, so a GSI key move charges the index the same either
+way while the table arm doubles.
+
+A transactional table arm is sized on the larger of the item's before and after
+images, which covers a `ConditionCheck` too: it writes nothing and is still
+charged on the image it read. A same-token replay is charged against those same
+images at 4KB read granularity.
+
+One read-side gap remains: a PartiQL `SELECT` served from an index reports its
+units against the base table arm, because the index qualifier is not honoured at
+all ([#179](https://github.com/nubo-db/dynoxide/issues/179)).
 
 ---
 
@@ -139,6 +148,12 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 Parameter placeholders (`?`) supported in all positions including nested list/map values.
 
 **`RETURNING`:** honoured on `ExecuteStatement` (`DELETE ALL OLD *`, and `UPDATE` in all four `ALL`/`MODIFIED` × `OLD`/`NEW` variants, with `MODIFIED` excluding the key) and on `BatchExecuteStatement`; rejected inside `ExecuteTransaction` with a `ValidationException`. `DELETE` accepts only `RETURNING ALL OLD *` and rejects the other variants, matching DynamoDB.
+
+**Batch and transaction shape:** `BatchExecuteStatement` and `ExecuteTransaction` reject a request that mixes reads with writes, and one that names the same item twice, reads included. Both raise a top-level `ValidationException` before any statement runs, each with its own message. A member that does not parse is reported against itself and does not stop the rest of a batch. Captured against eu-west-2.
+
+**`ReturnConsumedCapacity`:** accepted on all three PartiQL surfaces. `BatchExecuteStatement` aggregates per table across the batch and charges a failed statement the write it attempted, sized on the row already stored.
+
+`BatchStatementRequest` does not yet carry `ConsistentRead` or `ReturnValuesOnConditionCheckFailure`, so a batch member setting either is parsed as though it had not.
 
 ---
 

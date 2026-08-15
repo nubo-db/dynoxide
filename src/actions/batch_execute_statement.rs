@@ -1,16 +1,29 @@
+use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table, per_table_capacity};
 use crate::errors::{DynoxideError, Result};
 use crate::partiql;
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct BatchExecuteStatementRequest {
     #[serde(rename = "Statements")]
     pub statements: Vec<BatchStatementRequest>,
+    #[serde(rename = "ReturnConsumedCapacity", default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
+/// One member of a batch.
+///
+/// `#[non_exhaustive]` because this type is short of DynamoDB's: it still lacks
+/// `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`, so it will gain
+/// fields again. Construct one from `Default` and assign, or deserialise it.
+/// The enclosing `BatchExecuteStatementRequest` is deliberately not marked: it
+/// carries `Statements` and `ReturnConsumedCapacity`, which is the whole of
+/// DynamoDB's shape, so there is nothing left to add to it.
 #[derive(Debug, Default, Deserialize)]
+#[non_exhaustive]
 pub struct BatchStatementRequest {
     #[serde(rename = "Statement")]
     pub statement: String,
@@ -22,6 +35,11 @@ pub struct BatchStatementRequest {
 pub struct BatchExecuteStatementResponse {
     #[serde(rename = "Responses")]
     pub responses: Vec<BatchStatementResponse>,
+    /// Per-table capacity, aggregated across the statements in the batch. No
+    /// transactional factor applies. Absent when no mode was asked for, and also
+    /// when every statement failed, which is what AWS does.
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    pub consumed_capacity: Option<Vec<crate::types::ConsumedCapacity>>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -62,9 +80,45 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    let mut responses = Vec::with_capacity(request.statements.len());
+    // Parse once, and carry the resolved target alongside. Statements that fail
+    // to parse keep their error for the per-statement path below: a batch
+    // holding one is not rejected outright, it reports `ValidationError` against
+    // that member and runs the rest. Parse failure and an unresolvable target
+    // are different things, which is why they are a `Result` and an `Option`
+    // rather than one fallible value.
+    let prepared = prepare(storage, &request.statements).await;
 
-    for stmt_req in &request.statements {
+    // A batch is all-read or all-write. AWS rejects a mixed one up front,
+    // before any statement runs, rather than per statement. A statement that
+    // did not parse takes no part in the classification, and its presence does
+    // not stop the check firing on the ones that did.
+    let kinds = prepared.iter().filter_map(|p| p.stmt.as_ref().ok());
+    let (reads, writes): (Vec<_>, Vec<_>) =
+        kinds.partition(|stmt| matches!(stmt, partiql::parser::Statement::Select { .. }));
+    if !reads.is_empty() && !writes.is_empty() {
+        return Err(DynoxideError::ValidationException(
+            "Read and write requests together in the same batch is not supported.".to_string(),
+        ));
+    }
+
+    // Two statements against one item are rejected up front, reads included. A
+    // statement whose key cannot be read off the request has no target and is
+    // left to fail on its own terms below.
+    let mut seen_targets = HashSet::new();
+    for target in prepared.iter().filter_map(|p| p.target.as_ref()) {
+        if !seen_targets.insert(target) {
+            return Err(DynoxideError::ValidationException(
+                "Provided list of item keys contains duplicates".to_string(),
+            ));
+        }
+    }
+
+    let mut responses = Vec::with_capacity(request.statements.len());
+    let mut records: Vec<WriteCapacity> = Vec::new();
+    let mut read_units: Vec<(String, usize)> = Vec::new();
+    let mut failures: Vec<(String, f64)> = Vec::new();
+
+    for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
         // A COUNT projection is rejected before parsing with the bare message
         // captured on ExecuteStatement, carried here under the same
         // per-statement ValidationError code a parse failure uses.
@@ -80,9 +134,7 @@ pub async fn execute<S: StorageBackend>(
             continue;
         }
 
-        let parsed = partiql::parser::parse(&stmt_req.statement);
-
-        let response = match parsed {
+        let response = match prepared.stmt {
             Err(e) => BatchStatementResponse {
                 error: Some(BatchStatementError {
                     // A per-statement parse failure carries the short-form
@@ -99,30 +151,51 @@ pub async fn execute<S: StorageBackend>(
                 // not on a per-statement error.
                 let table = partiql::parser::table_name(&stmt).map(str::to_string);
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                match partiql::executor::execute(storage, &stmt, params, None).await {
-                    Ok(Some(items)) => {
+                match partiql::executor::execute_page(storage, &stmt, params, None, None).await {
+                    Ok(page) => {
+                        match page.capacity {
+                            Some(capacity) => records.push(capacity),
+                            // A SELECT is charged read units against the rows it
+                            // returned, with no index arm on a base table read.
+                            None => {
+                                if let Some(ref name) = table {
+                                    read_units.push((name.clone(), page.size));
+                                }
+                            }
+                        }
                         // A SELECT yields its row here; a DELETE/UPDATE carrying a
                         // RETURNING clause yields the returned item. Batch surfaces
                         // a single item per statement, so take the first.
                         BatchStatementResponse {
                             error: None,
-                            item: items.into_iter().next(),
+                            item: page.items.and_then(|items| items.into_iter().next()),
                             table_name: table,
                         }
                     }
-                    Ok(None) => BatchStatementResponse {
-                        error: None,
-                        item: None,
-                        table_name: table,
-                    },
-                    Err(e) => BatchStatementResponse {
-                        error: Some(BatchStatementError {
-                            code: e.short_error_code().to_string(),
-                            message: e.to_string(),
-                        }),
-                        item: None,
-                        table_name: None,
-                    },
+                    Err(e) => {
+                        // A failed statement is charged the write it attempted,
+                        // added to its table's total while appearing in no arm.
+                        // Captured: a failing 3KB insert beside a small success
+                        // reports total 5 against arms summing to 2, and three
+                        // failures of 1, 1 and 3 units report total 7.
+                        //
+                        // Only an INSERT carries its item in the statement, so
+                        // that is the one kind whose attempt can be sized
+                        // without reading anything. Everything else falls back
+                        // to the one-unit minimum.
+                        if let Some(name) = table {
+                            let units = attempted_units(storage, &stmt, params).await;
+                            failures.push((name, units));
+                        }
+                        BatchStatementResponse {
+                            error: Some(BatchStatementError {
+                                code: e.short_error_code().to_string(),
+                                message: e.to_string(),
+                            }),
+                            item: None,
+                            table_name: None,
+                        }
+                    }
                 }
             }
         };
@@ -130,5 +203,159 @@ pub async fn execute<S: StorageBackend>(
         responses.push(response);
     }
 
-    Ok(BatchExecuteStatementResponse { responses })
+    Ok(BatchExecuteStatementResponse {
+        consumed_capacity: build_capacity(
+            &records,
+            &read_units,
+            &failures,
+            &request.return_consumed_capacity,
+        ),
+        responses,
+    })
+}
+
+/// One statement, parsed once and resolved once.
+struct Prepared {
+    /// The parse result. An `Err` is a per-statement error, not a request-level
+    /// one: AWS reports `ValidationError` against that member and runs the rest.
+    stmt: std::result::Result<partiql::parser::Statement, String>,
+    /// The item this statement targets, for duplicate detection. `None` when it
+    /// does not resolve to one, which covers a partition-spanning `SELECT` and
+    /// anything whose key cannot be read off the request.
+    target: Option<(String, String, String)>,
+}
+
+/// Parse every statement and resolve its target, once each.
+///
+/// The statement text was previously parsed three times per call: to classify
+/// reads against writes, to find duplicate targets, and to execute. Measured on
+/// a 25-statement batch, each pass costs about as much as everything the target
+/// resolution does, so the parsing was the larger half of the overhead by more
+/// than two to one.
+///
+/// Target resolution is not shared and not cheap: it loads the table's metadata
+/// and parses its key schema per statement, and the executor does both again a
+/// moment later. Sharing that is a separate change from this one, and it is
+/// worth more on the wasm backend, which caches no metadata at all.
+async fn prepare<S: StorageBackend>(
+    storage: &S,
+    statements: &[BatchStatementRequest],
+) -> Vec<Prepared> {
+    let mut prepared = Vec::with_capacity(statements.len());
+    for stmt_req in statements {
+        let parsed = partiql::parser::parse(&stmt_req.statement);
+        let target = match parsed {
+            Ok(ref stmt) => {
+                let params = stmt_req.parameters.as_deref().unwrap_or_default();
+                partiql::executor::statement_target(storage, stmt, params).await
+            }
+            Err(_) => None,
+        };
+        prepared.push(Prepared {
+            stmt: parsed,
+            target,
+        });
+    }
+    prepared
+}
+
+/// The write units a failed statement is charged.
+///
+/// Sized on the larger of the item already stored at the target and the item
+/// the statement carried, which is the same rule a successful write follows.
+///
+/// The stored side is load-bearing rather than incidental. Captured: a batch of
+/// three failing inserts alongside one success reports 7 against arms summing
+/// to 2. Two of the failures name tiny items and cost 1 each; the third names a
+/// tiny item too, but the row already at that key is 3KB, and it costs 3. Sizing
+/// on the statement alone reports 5.
+async fn attempted_units<S: StorageBackend>(
+    storage: &S,
+    stmt: &partiql::parser::Statement,
+    parameters: &[AttributeValue],
+) -> f64 {
+    let stored_size = match partiql::executor::statement_target(storage, stmt, parameters).await {
+        Some((table, pk, sk)) => storage
+            .get_item(&table, &pk, &sk)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Item>(&json).ok())
+            .map(|item| crate::types::item_size(&item)),
+        None => None,
+    };
+
+    // Only an INSERT carries its item in the statement text.
+    let attempted_size = match stmt {
+        partiql::parser::Statement::Insert { item, .. } => {
+            let mut resolved = Item::new();
+            for (name, value) in item {
+                let av = match value {
+                    partiql::parser::PartiqlValue::Literal(av) => av.clone(),
+                    // An unresolvable parameter is why the statement failed, so
+                    // size on what did resolve.
+                    partiql::parser::PartiqlValue::Parameter(idx) => match parameters.get(*idx) {
+                        Some(av) => av.clone(),
+                        None => continue,
+                    },
+                };
+                resolved.insert(name.clone(), av);
+            }
+            Some(crate::types::item_size(&resolved))
+        }
+        _ => None,
+    };
+
+    crate::types::table_write_capacity_units(stored_size, attempted_size)
+}
+
+/// Fold the batch into one `ConsumedCapacity` per table.
+///
+/// No transactional factor applies. A batch in which nothing succeeded reports
+/// no capacity at all, which is what AWS does even though the same failure
+/// counts for a unit when another statement in the batch succeeds.
+fn build_capacity(
+    records: &[WriteCapacity],
+    read_units: &[(String, usize)],
+    failures: &[(String, f64)],
+    mode: &Option<String>,
+) -> Option<Vec<crate::types::ConsumedCapacity>> {
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
+    }
+    if records.is_empty() && read_units.is_empty() {
+        return None;
+    }
+
+    let mut by_table = aggregate_by_table(records, 1.0);
+    for (table, size) in read_units {
+        by_table.entry(table.clone()).or_default().table_units +=
+            crate::types::read_capacity_units_with_consistency(*size, false);
+    }
+
+    let mut entries = per_table_capacity(
+        &by_table,
+        mode,
+        crate::types::consumed_capacity_with_secondary_indexes,
+    )?;
+
+    // The surcharge is applied here rather than inside the shared fold, because
+    // it is the one rule of the three that differs and it has already been got
+    // wrong once. A failed statement lands on the total without reaching the
+    // Table arm or any index arm, so it cannot be folded into the units the
+    // builder sees. A table whose statements all failed has no entry to attach
+    // it to and gets none: captured against a two-table batch where the failing
+    // table was omitted entirely and only the succeeding one was reported.
+    let mut surcharge: HashMap<&str, f64> = HashMap::new();
+    for (table, units) in failures {
+        *surcharge.entry(table.as_str()).or_default() += units;
+    }
+    for entry in &mut entries {
+        entry.capacity_units += surcharge
+            .get(entry.table_name.as_str())
+            .copied()
+            .unwrap_or(0.0);
+    }
+
+    Some(entries)
 }

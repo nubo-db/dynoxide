@@ -343,15 +343,12 @@ pub struct Condition {
 }
 
 /// Comparison operator.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CompOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
+///
+/// The condition-expression engine's operator, rather than a second enum with
+/// the same shape. The two comparison implementations behind them have already
+/// drifted once; sharing the operator keeps the seam between the surfaces
+/// narrow enough that it cannot happen again by accident.
+pub use crate::expressions::condition::CompOp;
 
 /// A value in a PartiQL expression — either a literal or a parameter placeholder.
 #[derive(Debug, Clone, PartialEq)]

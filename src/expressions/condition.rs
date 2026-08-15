@@ -557,7 +557,13 @@ fn resolve_operand(
 // ---------------------------------------------------------------------------
 
 /// Compare two AttributeValues using a comparison operator.
-fn compare_values(left: &AttributeValue, op: &CompOp, right: &AttributeValue) -> bool {
+///
+/// Shared with the PartiQL executor, which reaches the same predicates by a
+/// different route. The two had separate implementations and drifted: PartiQL's
+/// handled strings, numbers and booleans and answered every other type from a
+/// catch-all. A capture against real DynamoDB found the two surfaces agree on
+/// every type, so there is one set of semantics to implement and this is it.
+pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &AttributeValue) -> bool {
     match (left, right) {
         // String comparisons
         (AttributeValue::S(a), AttributeValue::S(b)) => compare_ord(a, b, op),

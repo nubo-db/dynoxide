@@ -4,6 +4,7 @@
 
 use crate::actions::index_capacity::WriteCapacity;
 use crate::errors::{DynoxideError, Result};
+use crate::expressions::condition::compare_values;
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
     CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
@@ -1941,31 +1942,6 @@ fn split_path_segments(path: &str) -> Option<Vec<PathSegment<'_>>> {
     Some(segments)
 }
 
-/// Compare two AttributeValues using a comparison operator.
-fn compare_values(left: &AttributeValue, op: &CompOp, right: &AttributeValue) -> bool {
-    match (left, right) {
-        (AttributeValue::S(a), AttributeValue::S(b)) => compare_ord(a, op, b),
-        (AttributeValue::N(a), AttributeValue::N(b)) => {
-            use bigdecimal::BigDecimal;
-            use std::str::FromStr;
-            match (BigDecimal::from_str(a), BigDecimal::from_str(b)) {
-                (Ok(da), Ok(db)) => compare_ord(&da, op, &db),
-                _ => false,
-            }
-        }
-        (AttributeValue::BOOL(a), AttributeValue::BOOL(b)) => match op {
-            CompOp::Eq => a == b,
-            CompOp::Ne => a != b,
-            _ => false,
-        },
-        _ => match op {
-            CompOp::Eq => false,
-            CompOp::Ne => true,
-            _ => false,
-        },
-    }
-}
-
 /// Format a BigDecimal number, stripping unnecessary trailing zeros.
 fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
     let normalized = n.normalized();
@@ -1973,16 +1949,5 @@ fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
         normalized.with_scale(0).to_string()
     } else {
         normalized.to_string()
-    }
-}
-
-fn compare_ord<T: PartialOrd>(a: &T, op: &CompOp, b: &T) -> bool {
-    match op {
-        CompOp::Eq => a == b,
-        CompOp::Ne => a != b,
-        CompOp::Lt => a < b,
-        CompOp::Le => a <= b,
-        CompOp::Gt => a > b,
-        CompOp::Ge => a >= b,
     }
 }

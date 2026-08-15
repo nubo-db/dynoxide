@@ -1,0 +1,197 @@
+//! How many times the engine repeats work it has already done.
+//!
+//! Two open performance questions are about counts rather than durations:
+//! whether an index entry is rebuilt when one was already to hand, and whether a
+//! batch resolves the same table's metadata once or twice per statement. Both
+//! are answered exactly here and identically on every machine.
+//!
+//! Run with `cargo test --features bench-counters --test repeated_work_counts`.
+//! Without the feature the counters compile to nothing and every test skips, so
+//! the default `cargo test` is unaffected.
+//!
+//! The metadata figure is the one worth reading carefully. It is counted at the
+//! `StorageBackend` boundary, so it is what a *caller* asks for, not what a
+//! backend does about it. The native backend answers most of them from a
+//! `RefCell` cache and the wasm backend crosses a bridge to a JS worker for
+//! every one of them, caching nothing. The count is the same either way, which
+//! is what makes the wasm cost measurable without a browser.
+
+#![cfg(feature = "bench-counters")]
+
+use dynoxide::Database;
+use dynoxide::bench_counters::{Counts, reset, snapshot};
+
+const TABLE: &str = "counts_tbl";
+
+/// A table with two indexes, which is the shape that shows repeated index work.
+fn two_index_table() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": TABLE,
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi-inc",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["proj"]}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi-all",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    db
+}
+
+fn put(db: &Database, sk: &str, mode: Option<&str>) {
+    let mut req = serde_json::json!({
+        "TableName": TABLE,
+        "Item": {
+            "pk": {"S": "p"}, "sk": {"S": sk},
+            "gsiPk": {"S": "g"}, "lsiSk": {"S": "l"},
+            "proj": {"S": "v"}, "other": {"S": "w"}
+        }
+    });
+    if let Some(mode) = mode {
+        req["ReturnConsumedCapacity"] = serde_json::json!(mode);
+    }
+    db.put_item(serde_json::from_value(req).unwrap()).unwrap();
+}
+
+/// Count what one operation costs, with the setup already done.
+fn measure(f: impl FnOnce()) -> Counts {
+    reset();
+    f();
+    snapshot()
+}
+
+// --- index entries rebuilt on a write -------------------------------------
+
+#[test]
+fn report_index_entry_builds_on_an_overwrite() {
+    let db = two_index_table();
+    put(&db, "s1", None); // seed, so the write measured below has an old image
+
+    let without = measure(|| put(&db, "s1", None));
+    let with_indexes = measure(|| put(&db, "s1", Some("INDEXES")));
+
+    println!(
+        "overwrite, two indexes, capacity not asked for : {} index entries built",
+        without.index_entries_built
+    );
+    println!(
+        "overwrite, two indexes, INDEXES requested      : {} index entries built",
+        with_indexes.index_entries_built
+    );
+
+    // The floor is one projected entry per index: the fan-out has to build the
+    // row it stores. Anything above that is a rebuild of something already to
+    // hand, or a build of an image nothing else wants.
+    assert!(
+        without.index_entries_built >= 2,
+        "two indexes must build at least one entry each"
+    );
+
+    // The claim under test: the figures reported when nobody asked for capacity
+    // should not exceed the figures reported when somebody did.
+    assert!(
+        without.index_entries_built <= with_indexes.index_entries_built,
+        "a write that reports no capacity built {} entries against {} for one that does",
+        without.index_entries_built,
+        with_indexes.index_entries_built
+    );
+}
+
+#[test]
+fn report_index_entry_builds_on_an_insert() {
+    let db = two_index_table();
+    let counts = measure(|| put(&db, "fresh", None));
+    println!(
+        "insert, two indexes, capacity not asked for    : {} index entries built",
+        counts.index_entries_built
+    );
+}
+
+// --- metadata resolved per statement in a batch ---------------------------
+
+fn batch(db: &Database, count: usize) {
+    let statements: Vec<serde_json::Value> = (0..count)
+        .map(|i| {
+            serde_json::json!({
+                "Statement": format!(
+                    "INSERT INTO \"{TABLE}\" VALUE {{'pk':'p','sk':'b{i}','gsiPk':'g','lsiSk':'l'}}"
+                )
+            })
+        })
+        .collect();
+    db.batch_execute_statement(
+        serde_json::from_value(serde_json::json!({"Statements": statements})).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn report_metadata_reads_across_a_batch() {
+    let db = two_index_table();
+
+    let one = measure(|| batch(&db, 1));
+    let twenty_five = measure(|| batch(&db, 25));
+
+    println!(
+        "batch of 1  : {} metadata reads, {} key schema parses",
+        one.metadata_reads, one.key_schema_parses
+    );
+    println!(
+        "batch of 25 : {} metadata reads, {} key schema parses",
+        twenty_five.metadata_reads, twenty_five.key_schema_parses
+    );
+    println!(
+        "per statement: {:.1} metadata reads, {:.1} key schema parses",
+        twenty_five.metadata_reads as f64 / 25.0,
+        twenty_five.key_schema_parses as f64 / 25.0
+    );
+
+    // One table, so one resolution would do for the whole batch. Anything that
+    // scales with the statement count is per-statement work on a per-table fact.
+    assert!(
+        twenty_five.metadata_reads >= one.metadata_reads,
+        "a longer batch cannot read metadata fewer times"
+    );
+}
+
+#[test]
+fn report_metadata_reads_for_a_single_statement() {
+    let db = two_index_table();
+    let counts = measure(|| {
+        db.execute_statement(
+            serde_json::from_value(serde_json::json!({
+                "Statement": format!(
+                    "INSERT INTO \"{TABLE}\" VALUE {{'pk':'p','sk':'one','gsiPk':'g','lsiSk':'l'}}"
+                )
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    });
+    println!(
+        "single ExecuteStatement insert: {} metadata reads, {} key schema parses",
+        counts.metadata_reads, counts.key_schema_parses
+    );
+}

@@ -30,17 +30,21 @@ use crate::types::{
 use std::collections::HashMap;
 
 /// One index's stored view of an item.
-struct IndexEntry {
+pub(crate) struct IndexEntry {
     /// The `(pk, sk)` position of the entry, which decides whether a write moves
     /// it or overwrites it in place.
-    key: (String, String),
-    projected: Item,
+    pub(crate) key: (String, String),
+    pub(crate) projected: Item,
     size: usize,
 }
 
 /// Build the index's stored view of `item`, or `None` when the item is not a
 /// member of this index. Membership is the existing sparse-index rule.
-fn entry_for(
+///
+/// Visible to the fan-out so it can build the new item's entry once and hand it
+/// to [`index_write_units_for`], rather than each building its own copy of the
+/// same projection.
+pub(crate) fn entry_for(
     item: &Item,
     index: &IndexDef,
     table_pk: &str,
@@ -70,8 +74,24 @@ pub fn index_write_units(
     table_pk: &str,
     table_sk: Option<&str>,
 ) -> Option<f64> {
-    let old = old_item.and_then(|item| entry_for(item, index, table_pk, table_sk));
     let new = new_item.and_then(|item| entry_for(item, index, table_pk, table_sk));
+    index_write_units_for(old_item, new, index, table_pk, table_sk)
+}
+
+/// As [`index_write_units`], for a caller that has already built the new item's
+/// entry.
+///
+/// The fan-out builds that entry to store it, and building it a second time to
+/// measure it is the same projection twice. On a table with two indexes an
+/// overwrite went from six projections to four by sharing it.
+pub(crate) fn index_write_units_for(
+    old_item: Option<&Item>,
+    new: Option<IndexEntry>,
+    index: &IndexDef,
+    table_pk: &str,
+    table_sk: Option<&str>,
+) -> Option<f64> {
+    let old = old_item.and_then(|item| entry_for(item, index, table_pk, table_sk));
 
     match (old, new) {
         (None, None) => None,

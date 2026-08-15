@@ -92,9 +92,12 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
 
         // Insert only when the item belongs in this index (sparse): an LSI shares
         // the table partition key, so membership rests on a present, scalar sort key.
-        if let Some((lsi_pk, lsi_sk)) = lsi.index_key_strings(item) {
-            let projected = super::gsi::build_index_item(item, lsi, target.pk_attr, target.sk_attr);
-            let item_json = serde_json::to_string(&projected)
+        // Built once here and handed to the capacity calculation below, which
+        // would otherwise project the same item again.
+        let entry = super::index_capacity::entry_for(item, lsi, target.pk_attr, target.sk_attr);
+        if let Some(ref entry) = entry {
+            let (lsi_pk, lsi_sk) = entry.key.clone();
+            let item_json = serde_json::to_string(&entry.projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
             ops.push(IndexWriteOp::InsertLsi {
@@ -108,9 +111,9 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
             });
         }
 
-        if let Some(units) = super::index_capacity::index_write_units(
+        if let Some(units) = super::index_capacity::index_write_units_for(
             old_item,
-            Some(item),
+            entry,
             lsi,
             target.pk_attr,
             target.sk_attr,

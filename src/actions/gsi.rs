@@ -116,6 +116,7 @@ pub fn build_index_item(
     table_pk: &str,
     table_sk: Option<&str>,
 ) -> Item {
+    crate::bench_counters::record(&crate::bench_counters::INDEX_ENTRIES_BUILT);
     if index.projection_type == ProjectionType::ALL {
         return item.clone();
     }
@@ -152,10 +153,13 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
             table_sk: target.sk.to_string(),
         });
 
-        // Insert only when the item belongs in this index (sparse).
-        if let Some((gsi_pk, gsi_sk)) = gsi.index_key_strings(item) {
-            let projected = build_index_item(item, gsi, target.pk_attr, target.sk_attr);
-            let item_json = serde_json::to_string(&projected)
+        // Insert only when the item belongs in this index (sparse). The entry
+        // is built once here and handed to the capacity calculation below,
+        // which would otherwise project the same item again.
+        let entry = super::index_capacity::entry_for(item, gsi, target.pk_attr, target.sk_attr);
+        if let Some(ref entry) = entry {
+            let (gsi_pk, gsi_sk) = entry.key.clone();
+            let item_json = serde_json::to_string(&entry.projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
             ops.push(IndexWriteOp::InsertGsi {
@@ -171,9 +175,9 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 
         // Capacity is the change to what the index stores, so it is charged even
         // when the item leaves the index and no insert is queued above.
-        if let Some(units) = super::index_capacity::index_write_units(
+        if let Some(units) = super::index_capacity::index_write_units_for(
             old_item,
-            Some(item),
+            entry,
             gsi,
             target.pk_attr,
             target.sk_attr,

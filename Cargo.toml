@@ -26,6 +26,10 @@ default = ["native-sqlite", "http-server", "mcp-server", "import"]
 # keys off `cli` so the binary is skipped in backend-neutral builds such as
 # `--no-default-features --features wasm-sqlite`, which ship the library only.
 cli = ["dep:clap"]
+# Operation counters for the performance questions that are about how many times
+# something happens rather than how long it takes. Off by default; compiles to
+# nothing when absent. See `src/bench_counters.rs`.
+bench-counters = []
 http-server = ["cli", "dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast", "dep:windows-sys"]
 native-sqlite = ["dep:rusqlite", "rusqlite/bundled"]
 _has-encryption = ["dep:zeroize"]

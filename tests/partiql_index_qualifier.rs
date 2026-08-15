@@ -270,6 +270,78 @@ fn a_keys_only_lsi_returns_keys_alone() {
     );
 }
 
+#[test]
+fn a_gsi_rejects_a_projection_it_does_not_carry() {
+    // Q8. Note this is a rejection where the equivalent filter (Q7 above) is
+    // not: the two sides of the projection rule are asymmetric on AWS.
+    let db = seeded();
+    let msg = error(&db, &format!("SELECT nonproj FROM \"{TABLE}\".\"gsi-inc\""));
+    assert!(
+        msg.contains(
+            "One or more parameter values were invalid: \
+             Global secondary index gsi-inc does not project [nonproj]"
+        ),
+        "got {msg}"
+    );
+}
+
+#[test]
+fn a_gsi_accepts_a_projection_it_does_carry() {
+    let db = seeded();
+    assert_eq!(
+        attributes(
+            &db,
+            &format!("SELECT pk, projattr FROM \"{TABLE}\".\"gsi-inc\"")
+        ),
+        vec!["pk", "projattr"]
+    );
+}
+
+#[test]
+fn an_lsi_rejects_a_filter_on_an_attribute_it_does_not_carry() {
+    // Q28. The GSI equivalent matches nothing instead of erroring, which is
+    // why the two branches are written separately rather than shared.
+    let db = seeded();
+    let msg = error(
+        &db,
+        &format!("SELECT * FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p' AND projattr='P1'"),
+    );
+    assert!(
+        msg.contains(
+            "One or more parameter values were invalid: Secondary index lsi-keys \
+             does not project one or more filter attributes: [projattr]"
+        ),
+        "got {msg}"
+    );
+}
+
+#[test]
+fn an_lsi_accepts_a_filter_on_an_attribute_it_does_carry() {
+    // An ALL projection carries everything, so the same filter is fine there.
+    let db = seeded();
+    assert_eq!(
+        keys(
+            &db,
+            &format!("SELECT * FROM \"{TABLE}\".\"lsi-all\" WHERE pk='p' AND nonproj='N1'")
+        ),
+        vec!["p/s1"]
+    );
+}
+
+#[test]
+fn an_index_key_is_always_carried_whatever_the_projection_says() {
+    // A KEYS_ONLY index still carries its own key and the table's, so
+    // filtering and projecting on those is never rejected.
+    let db = seeded();
+    assert_eq!(
+        attributes(
+            &db,
+            &format!("SELECT pk, sk, lsiSk2 FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p'")
+        ),
+        vec!["lsiSk2", "pk", "sk"]
+    );
+}
+
 // --- LSI -----------------------------------------------------------------
 
 #[test]

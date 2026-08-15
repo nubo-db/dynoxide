@@ -278,6 +278,51 @@ async fn execute_select<S: StorageBackend>(
         ));
     }
 
+    // What an index does not carry, a statement may not name. The two sides
+    // are rejected differently and that asymmetry is measured, not assumed:
+    //
+    //   - A GSI rejects a projection naming an attribute it does not carry.
+    //     Filtering on one is not rejected; it simply matches nothing, because
+    //     the attribute is absent from every entry.
+    //   - An LSI rejects a filter on an attribute it does not carry, and
+    //     accepts a projection naming one, which it serves by reading the base
+    //     table. That reach-back is not implemented here, so such a projection
+    //     still comes back empty.
+    //
+    // Captured eu-west-2 2026-08-15. The asymmetry rests on one measured case
+    // on each side, so a probe of the other projection types would be worth
+    // having before either rule is generalised further.
+    if let Some(idx) = index.as_ref() {
+        if idx.is_lsi {
+            let missing: Vec<String> = where_attributes(where_clause)
+                .into_iter()
+                .filter(|attr| !idx.projects(attr, &table_key_schema))
+                .collect();
+            if !missing.is_empty() {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Secondary index {} \
+                     does not project one or more filter attributes: [{}]",
+                    idx.name,
+                    missing.join(", ")
+                )));
+            }
+        } else {
+            let missing: Vec<String> = projections
+                .iter()
+                .map(|p| root_attribute(p).to_string())
+                .filter(|attr| !idx.projects(attr, &table_key_schema))
+                .collect();
+            if !missing.is_empty() {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Global secondary index {} \
+                     does not project [{}]",
+                    idx.name,
+                    missing.join(", ")
+                )));
+            }
+        }
+    }
+
     // The keys the row walk is paced by: the index's when one is named, the
     // table's otherwise. An LSI's partition key is the table's, so only the
     // sort key moves in that case.
@@ -524,6 +569,68 @@ struct ResolvedIndex {
     is_lsi: bool,
     pk_attr: String,
     sk_attr: Option<String>,
+    projection_type: crate::types::ProjectionType,
+    non_key_attributes: Option<Vec<String>>,
+}
+
+impl ResolvedIndex {
+    /// Whether an entry in this index carries `attr`.
+    ///
+    /// Index keys and the base table keys are always present, whatever the
+    /// projection says, because an index entry cannot point back without them.
+    fn projects(&self, attr: &str, table_keys: &crate::actions::helpers::KeySchema) -> bool {
+        if attr == self.pk_attr
+            || self.sk_attr.as_deref() == Some(attr)
+            || attr == table_keys.partition_key
+            || table_keys.sort_key.as_deref() == Some(attr)
+        {
+            return true;
+        }
+        match self.projection_type {
+            crate::types::ProjectionType::ALL => true,
+            crate::types::ProjectionType::KEYS_ONLY => false,
+            crate::types::ProjectionType::INCLUDE => self
+                .non_key_attributes
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|n| n == attr)),
+        }
+    }
+}
+
+/// The attribute a path names, ignoring any document navigation after it.
+/// `address.city` and `tags[0]` are both carried by `address` and `tags`.
+fn root_attribute(path: &str) -> &str {
+    let end = path.find(['.', '[']).unwrap_or(path.len());
+    &path[..end]
+}
+
+/// Every attribute a WHERE clause reads.
+fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
+    let Some(wc) = where_clause else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for group in &wc.groups {
+        for condition in group {
+            let path = match condition {
+                WhereCondition::Comparison(c) => c.path.as_str(),
+                WhereCondition::Exists(p)
+                | WhereCondition::NotExists(p)
+                | WhereCondition::BeginsWith(p, _)
+                | WhereCondition::NotBeginsWith(p, _)
+                | WhereCondition::Between(p, _, _)
+                | WhereCondition::In(p, _)
+                | WhereCondition::Contains(p, _)
+                | WhereCondition::IsMissing(p)
+                | WhereCondition::IsNotMissing(p) => p.as_str(),
+            };
+            let root = root_attribute(path).to_string();
+            if !out.contains(&root) {
+                out.push(root);
+            }
+        }
+    }
+    out
 }
 
 /// Resolve a `"table"."index"` qualifier against the table's metadata.
@@ -543,6 +650,8 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
             is_lsi: true,
             pk_attr: lsi.pk_attr,
             sk_attr: lsi.sk_attr,
+            projection_type: lsi.projection_type,
+            non_key_attributes: lsi.non_key_attributes,
         });
     }
     if let Some(gsi) = crate::actions::gsi::parse_gsi_defs(meta)?
@@ -554,6 +663,8 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
             is_lsi: false,
             pk_attr: gsi.pk_attr,
             sk_attr: gsi.sk_attr,
+            projection_type: gsi.projection_type,
+            non_key_attributes: gsi.non_key_attributes,
         });
     }
     Err(DynoxideError::ValidationException(

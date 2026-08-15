@@ -278,35 +278,23 @@ async fn execute_select<S: StorageBackend>(
         ));
     }
 
-    // What an index does not carry, a statement may not name. The two sides
-    // are rejected differently and that asymmetry is measured, not assumed:
+    // What an index does not carry, a statement may not always name. Two
+    // separate rules, and neither splits the way it first appears to:
     //
-    //   - A GSI rejects a projection naming an attribute it does not carry.
-    //     Filtering on one is not rejected; it simply matches nothing, because
-    //     the attribute is absent from every entry.
-    //   - An LSI rejects a filter on an attribute it does not carry, and
-    //     accepts a projection naming one, which it serves by reading the base
-    //     table. That reach-back is not implemented here, so such a projection
-    //     still comes back empty.
+    //   - A projection naming an unprojected attribute is rejected on a GSI and
+    //     accepted on an LSI, which serves it by reading the base table. That
+    //     reach-back is not implemented here, so such a projection comes back
+    //     empty rather than rejected.
+    //   - A filter on an unprojected attribute is rejected on either kind, but
+    //     only when the read is keyed on the index partition key. An unkeyed
+    //     read is a scan, and a scan simply matches nothing.
     //
-    // Captured eu-west-2 2026-08-15. The asymmetry rests on one measured case
-    // on each side, so a probe of the other projection types would be worth
-    // having before either rule is generalised further.
+    // The filter rule looked like a GSI/LSI split on the first two cases
+    // measured. It is not: an unkeyed LSI filter is accepted and a keyed GSI
+    // filter is rejected, and a two-condition unkeyed filter is accepted, which
+    // rules out the condition count as well. Captured eu-west-2 2026-08-15.
     if let Some(idx) = index.as_ref() {
-        if idx.is_lsi {
-            let missing: Vec<String> = where_attributes(where_clause)
-                .into_iter()
-                .filter(|attr| !idx.projects(attr, &table_key_schema))
-                .collect();
-            if !missing.is_empty() {
-                return Err(DynoxideError::ValidationException(format!(
-                    "One or more parameter values were invalid: Secondary index {} \
-                     does not project one or more filter attributes: [{}]",
-                    idx.name,
-                    missing.join(", ")
-                )));
-            }
-        } else {
+        if !idx.is_lsi {
             let missing: Vec<String> = projections
                 .iter()
                 .map(|p| root_attribute(p).to_string())
@@ -316,6 +304,26 @@ async fn execute_select<S: StorageBackend>(
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values were invalid: Global secondary index {} \
                      does not project [{}]",
+                    idx.name,
+                    missing.join(", ")
+                )));
+            }
+        }
+
+        let keyed = where_clause
+            .and_then(|wc| find_pk_condition(wc, &idx.pk_attr))
+            .is_some();
+        if keyed {
+            let missing: Vec<String> = where_attributes(where_clause)
+                .into_iter()
+                .filter(|attr| !idx.projects(attr, &table_key_schema))
+                .collect();
+            if !missing.is_empty() {
+                // "Secondary index", with no Global or Local in front of it,
+                // on both kinds.
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Secondary index {} \
+                     does not project one or more filter attributes: [{}]",
                     idx.name,
                     missing.join(", ")
                 )));

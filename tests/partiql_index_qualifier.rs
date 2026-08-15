@@ -221,20 +221,6 @@ fn a_filter_on_a_projected_non_key_attribute_applies() {
     );
 }
 
-#[test]
-fn a_gsi_filter_on_an_unprojected_attribute_matches_nothing() {
-    // Q7. The attribute is absent from the index entry, so nothing matches and
-    // the read does not reach back to the base table to find out.
-    let db = seeded();
-    assert!(
-        keys(
-            &db,
-            &format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE nonproj='N1'")
-        )
-        .is_empty()
-    );
-}
-
 // --- projection ----------------------------------------------------------
 
 #[test]
@@ -272,8 +258,9 @@ fn a_keys_only_lsi_returns_keys_alone() {
 
 #[test]
 fn a_gsi_rejects_a_projection_it_does_not_carry() {
-    // Q8. Note this is a rejection where the equivalent filter (Q7 above) is
-    // not: the two sides of the projection rule are asymmetric on AWS.
+    // Q8, Q30. A GSI cannot reach back to the base table, so naming an
+    // attribute it does not carry is rejected. An LSI accepts the same
+    // statement and serves it from the table.
     let db = seeded();
     let msg = error(&db, &format!("SELECT nonproj FROM \"{TABLE}\".\"gsi-inc\""));
     assert!(
@@ -298,31 +285,64 @@ fn a_gsi_accepts_a_projection_it_does_carry() {
 }
 
 #[test]
-fn an_lsi_rejects_a_filter_on_an_attribute_it_does_not_carry() {
-    // Q28. The GSI equivalent matches nothing instead of erroring, which is
-    // why the two branches are written separately rather than shared.
+fn a_keyed_read_rejects_a_filter_on_an_attribute_the_index_does_not_carry() {
+    // Q34, Q28. Both kinds reject it, and the message says "Secondary index"
+    // with neither Global nor Local in front.
     let db = seeded();
-    let msg = error(
-        &db,
-        &format!("SELECT * FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p' AND projattr='P1'"),
-    );
-    assert!(
-        msg.contains(
-            "One or more parameter values were invalid: Secondary index lsi-keys \
-             does not project one or more filter attributes: [projattr]"
+    for (sql, index) in [
+        (
+            format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND nonproj='N1'"),
+            "gsi-inc",
         ),
-        "got {msg}"
-    );
+        (
+            format!("SELECT * FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p' AND projattr='P1'"),
+            "lsi-keys",
+        ),
+    ] {
+        let msg = error(&db, &sql);
+        assert!(
+            msg.contains(&format!(
+                "One or more parameter values were invalid: Secondary index {index} \
+                 does not project one or more filter attributes:"
+            )),
+            "for {sql}: got {msg}"
+        );
+    }
 }
 
 #[test]
-fn an_lsi_accepts_a_filter_on_an_attribute_it_does_carry() {
-    // An ALL projection carries everything, so the same filter is fine there.
+fn an_unkeyed_read_accepts_a_filter_the_index_cannot_satisfy() {
+    // Q7, Q29, Q35, Q37. Without a condition on the index partition key the
+    // read is a scan, and a scan matches nothing rather than failing. These
+    // four are why the rule above is not a GSI-versus-LSI split: Q37 is the LSI
+    // mirror of Q7, and Q35 rules out the condition count as the trigger.
+    let db = seeded();
+    for sql in [
+        format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE nonproj='N1'"),
+        format!("SELECT * FROM \"{TABLE}\".\"gsi-keys\" WHERE projattr='P1'"),
+        format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE nonproj='N1' AND projattr='P1'"),
+        format!("SELECT * FROM \"{TABLE}\".\"lsi-keys\" WHERE projattr='P1'"),
+    ] {
+        assert!(keys(&db, &sql).is_empty(), "{sql} should match nothing");
+    }
+}
+
+#[test]
+fn a_keyed_read_accepts_a_filter_the_index_does_carry() {
+    // Q36, Q38. The key condition is present but every filter attribute is
+    // projected, so there is nothing to reject.
     let db = seeded();
     assert_eq!(
         keys(
             &db,
-            &format!("SELECT * FROM \"{TABLE}\".\"lsi-all\" WHERE pk='p' AND nonproj='N1'")
+            &format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND projattr='P1'")
+        ),
+        vec!["p/s1"]
+    );
+    assert_eq!(
+        keys(
+            &db,
+            &format!("SELECT * FROM \"{TABLE}\".\"lsi-all\" WHERE pk='p' AND lsiSk='l1'")
         ),
         vec!["p/s1"]
     );

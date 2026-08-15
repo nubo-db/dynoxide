@@ -137,7 +137,7 @@ pub async fn execute_page<S: StorageBackend>(
                 capacity: None,
                 next_token: outcome.next_token,
                 read_index: outcome.index.map(|i| ReadIndex {
-                    name: i.name,
+                    name: i.def.index_name,
                     is_lsi: i.is_lsi,
                 }),
             })
@@ -305,14 +305,14 @@ async fn execute_select<S: StorageBackend>(
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values were invalid: Global secondary index {} \
                      does not project [{}]",
-                    idx.name,
+                    idx.name(),
                     missing.join(", ")
                 )));
             }
         }
 
         let keyed = where_clause
-            .and_then(|wc| find_pk_condition(wc, &idx.pk_attr))
+            .and_then(|wc| find_pk_condition(wc, idx.pk_attr()))
             .is_some();
         if keyed {
             let missing: Vec<String> = where_attributes(where_clause)
@@ -325,7 +325,7 @@ async fn execute_select<S: StorageBackend>(
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values were invalid: Secondary index {} \
                      does not project one or more filter attributes: [{}]",
-                    idx.name,
+                    idx.name(),
                     missing.join(", ")
                 )));
             }
@@ -336,7 +336,7 @@ async fn execute_select<S: StorageBackend>(
     // table's otherwise. An LSI's partition key is the table's, so only the
     // sort key moves in that case.
     let (read_pk, read_sk) = match index.as_ref() {
-        Some(idx) => (idx.pk_attr.as_str(), idx.sk_attr.as_deref()),
+        Some(idx) => (idx.pk_attr(), idx.sk_attr()),
         None => (
             table_key_schema.partition_key.as_str(),
             table_key_schema.sort_key.as_deref(),
@@ -347,6 +347,21 @@ async fn execute_select<S: StorageBackend>(
     let cursor = next_token
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
+
+    // An index read's cursor is meaningless without the base table key: the
+    // backend falls back to a two-column comparison that cannot advance past
+    // rows sharing an index key, so the walk ends early and silently. The
+    // fingerprint alone does not catch a token that was truncated rather than
+    // minted for another statement, so the halves are checked separately.
+    if index.is_some()
+        && cursor
+            .as_ref()
+            .is_some_and(|c| c.base_pk.is_none() || c.base_sk.is_none())
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid NextToken".to_string(),
+        ));
+    }
 
     let window = evaluate_window(
         storage,
@@ -480,12 +495,12 @@ async fn evaluate_window<S: StorageBackend>(
         match index {
             Some(idx) if idx.is_lsi => {
                 storage
-                    .query_lsi_items(table_name, &idx.name, &pk_str, &params)
+                    .query_lsi_items(table_name, idx.name(), &pk_str, &params)
                     .await?
             }
             Some(idx) => {
                 storage
-                    .query_gsi_items(table_name, &idx.name, &pk_str, &params)
+                    .query_gsi_items(table_name, idx.name(), &pk_str, &params)
                     .await?
             }
             None => storage.query_items(table_name, &pk_str, &params).await?,
@@ -502,12 +517,12 @@ async fn evaluate_window<S: StorageBackend>(
         match index {
             Some(idx) if idx.is_lsi => {
                 storage
-                    .scan_lsi_items(table_name, &idx.name, &params)
+                    .scan_lsi_items(table_name, idx.name(), &params)
                     .await?
             }
             Some(idx) => {
                 storage
-                    .scan_gsi_items(table_name, &idx.name, &params)
+                    .scan_gsi_items(table_name, idx.name(), &params)
                     .await?
             }
             None => storage.scan_items(table_name, &params).await?,
@@ -574,35 +589,35 @@ struct Cursor {
 
 /// Which index a qualified `SELECT` resolved to, and the keys to read it by.
 struct ResolvedIndex {
-    name: String,
+    /// The index as `actions::gsi` parsed it. Held whole rather than copied
+    /// field by field, so the projection rule stays in one place.
+    def: crate::actions::gsi::IndexDef,
     is_lsi: bool,
-    pk_attr: String,
-    sk_attr: Option<String>,
-    projection_type: crate::types::ProjectionType,
-    non_key_attributes: Option<Vec<String>>,
 }
 
 impl ResolvedIndex {
-    /// Whether an entry in this index carries `attr`.
-    ///
-    /// Index keys and the base table keys are always present, whatever the
-    /// projection says, because an index entry cannot point back without them.
+    fn name(&self) -> &str {
+        &self.def.index_name
+    }
+
+    fn pk_attr(&self) -> &str {
+        &self.def.pk_attr
+    }
+
+    fn sk_attr(&self) -> Option<&str> {
+        self.def.sk_attr.as_deref()
+    }
+}
+
+impl ResolvedIndex {
+    /// Whether an entry in this index carries `attr`, by the same rule
+    /// `build_index_item` projects with.
     fn projects(&self, attr: &str, table_keys: &crate::actions::helpers::KeySchema) -> bool {
-        if attr == self.pk_attr
-            || self.sk_attr.as_deref() == Some(attr)
-            || attr == table_keys.partition_key
-            || table_keys.sort_key.as_deref() == Some(attr)
-        {
-            return true;
-        }
-        match self.projection_type {
-            crate::types::ProjectionType::ALL => true,
-            crate::types::ProjectionType::KEYS_ONLY => false,
-            crate::types::ProjectionType::INCLUDE => self
-                .non_key_attributes
-                .as_ref()
-                .is_some_and(|names| names.iter().any(|n| n == attr)),
-        }
+        self.def.projects(
+            attr,
+            &table_keys.partition_key,
+            table_keys.sort_key.as_deref(),
+        )
     }
 }
 
@@ -655,12 +670,8 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
         .find(|l| l.index_name == index_name)
     {
         return Ok(ResolvedIndex {
-            name: lsi.index_name,
+            def: lsi,
             is_lsi: true,
-            pk_attr: lsi.pk_attr,
-            sk_attr: lsi.sk_attr,
-            projection_type: lsi.projection_type,
-            non_key_attributes: lsi.non_key_attributes,
         });
     }
     if let Some(gsi) = crate::actions::gsi::parse_gsi_defs(meta)?
@@ -668,12 +679,8 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
         .find(|g| g.index_name == index_name)
     {
         return Ok(ResolvedIndex {
-            name: gsi.index_name,
+            def: gsi,
             is_lsi: false,
-            pk_attr: gsi.pk_attr,
-            sk_attr: gsi.sk_attr,
-            projection_type: gsi.projection_type,
-            non_key_attributes: gsi.non_key_attributes,
         });
     }
     Err(DynoxideError::ValidationException(

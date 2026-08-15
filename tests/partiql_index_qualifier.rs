@@ -688,6 +688,44 @@ fn a_token_minted_against_one_index_is_rejected_by_another() {
 }
 
 #[test]
+fn an_index_token_stripped_of_its_base_key_is_rejected() {
+    // The fingerprint is copied verbatim from a legitimate token, so only the
+    // base-key halves are missing. Without an explicit check the read falls
+    // back to a two-column cursor and ends the walk after one row instead of
+    // erroring.
+    use base64::Engine;
+    let db = seeded();
+    let sql = format!("SELECT * FROM \"{TABLE}\".\"gsi-all\"");
+    let first = db
+        .execute_statement(
+            serde_json::from_value(serde_json::json!({"Statement": sql, "Limit": 1})).unwrap(),
+        )
+        .unwrap();
+    let token = first
+        .next_token
+        .expect("a limited read owes a continuation");
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&token)
+        .unwrap();
+    let mut payload: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    payload["bpk"] = serde_json::Value::Null;
+    payload["bsk"] = serde_json::Value::Null;
+    let tampered = base64::engine::general_purpose::STANDARD.encode(payload.to_string().as_bytes());
+
+    let msg = db
+        .execute_statement(
+            serde_json::from_value(serde_json::json!({
+                "Statement": sql, "Limit": 1, "NextToken": tampered
+            }))
+            .unwrap(),
+        )
+        .expect_err("a truncated index token is rejected")
+        .to_string();
+    assert!(msg.contains("Invalid NextToken"), "got {msg}");
+}
+
+#[test]
 fn a_token_minted_against_the_table_is_rejected_by_an_index() {
     let db = seeded();
     let first = db

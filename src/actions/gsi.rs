@@ -36,6 +36,30 @@ pub struct IndexDef {
 pub type GsiDef = IndexDef;
 
 impl IndexDef {
+    /// Whether an entry in this index carries `attr`.
+    ///
+    /// The index keys and the base table keys are always carried, whatever the
+    /// projection says, because an entry cannot point back at its item without
+    /// them. `build_index_item` projects by this rule and the PartiQL read path
+    /// rejects by it, so it lives here rather than in either of them.
+    pub fn projects(&self, attr: &str, table_pk: &str, table_sk: Option<&str>) -> bool {
+        if attr == self.pk_attr
+            || self.sk_attr.as_deref() == Some(attr)
+            || attr == table_pk
+            || table_sk == Some(attr)
+        {
+            return true;
+        }
+        match self.projection_type {
+            ProjectionType::ALL => true,
+            ProjectionType::KEYS_ONLY => false,
+            ProjectionType::INCLUDE => self
+                .non_key_attributes
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|n| n == attr)),
+        }
+    }
+
     /// The `(pk, sk)` key strings for this item's index entry, or `None` if the
     /// item is excluded. Sparse-index behaviour: an item missing the partition
     /// key, or the sort key when one is defined, or holding a non-scalar where a
@@ -92,61 +116,13 @@ pub fn build_index_item(
     table_pk: &str,
     table_sk: Option<&str>,
 ) -> Item {
-    match index.projection_type {
-        ProjectionType::ALL => item.clone(),
-        ProjectionType::KEYS_ONLY => {
-            let mut projected = HashMap::new();
-            // Table keys
-            if let Some(v) = item.get(table_pk) {
-                projected.insert(table_pk.to_string(), v.clone());
-            }
-            if let Some(sk) = table_sk {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.to_string(), v.clone());
-                }
-            }
-            // Index keys
-            if let Some(v) = item.get(&index.pk_attr) {
-                projected.insert(index.pk_attr.clone(), v.clone());
-            }
-            if let Some(ref sk) = index.sk_attr {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.clone(), v.clone());
-                }
-            }
-            projected
-        }
-        ProjectionType::INCLUDE => {
-            let mut projected = HashMap::new();
-            // Table keys
-            if let Some(v) = item.get(table_pk) {
-                projected.insert(table_pk.to_string(), v.clone());
-            }
-            if let Some(sk) = table_sk {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.to_string(), v.clone());
-                }
-            }
-            // Index keys
-            if let Some(v) = item.get(&index.pk_attr) {
-                projected.insert(index.pk_attr.clone(), v.clone());
-            }
-            if let Some(ref sk) = index.sk_attr {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.clone(), v.clone());
-                }
-            }
-            // Non-key attributes
-            if let Some(ref attrs) = index.non_key_attributes {
-                for attr in attrs {
-                    if let Some(v) = item.get(attr) {
-                        projected.insert(attr.clone(), v.clone());
-                    }
-                }
-            }
-            projected
-        }
+    if index.projection_type == ProjectionType::ALL {
+        return item.clone();
     }
+    item.iter()
+        .filter(|(name, _)| index.projects(name, table_pk, table_sk))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// Update all GSI tables after an item write (put/update).

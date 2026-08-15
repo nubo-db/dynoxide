@@ -15,12 +15,14 @@ use std::collections::HashMap;
 /// processed: ` and returns some rejections bare, so which envelope a message
 /// takes is part of the observable contract. The parser says which it is rather
 /// than leaving each caller to guess from the text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// A malformed statement. The caller wraps this in DynamoDB's envelope.
+    #[error("{0}")]
     Syntax(String),
     /// A well-formed statement DynamoDB rejects on its own terms, reported
     /// without the envelope.
+    #[error("{0}")]
     Validation(String),
 }
 
@@ -32,14 +34,6 @@ impl ParseError {
                 format!("Statement wasn't well formed, can't be processed: {m}")
             }
             ParseError::Validation(m) => m,
-        }
-    }
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::Syntax(m) | ParseError::Validation(m) => f.write_str(m),
         }
     }
 }
@@ -462,8 +456,8 @@ fn parse_insert(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     if target.index.is_some() {
         return Err(ParseError::Validation(format!(
             "FROM clause may only contain a single table name in data \
-             manipulation statements at {}:{}:{}",
-            target.span.line, target.span.col, target.span.len
+             manipulation statements at {}",
+            t.position(target.span)
         )));
     }
     let table_name = target.name;
@@ -1393,7 +1387,12 @@ fn parse_item_value_partiql(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
 
 /// Remove surrounding single or double quotes from a string.
 fn unquote(s: &str) -> String {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+    // The length guard is not redundant with the tokenizer's unterminated-quote
+    // rejection: a bare `"` starts and ends with the same character, so without
+    // it this slices s[1..0] and panics rather than returning anything.
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
@@ -1415,6 +1414,9 @@ fn expect_keyword(t: &mut Tokenizer, kw: &str) -> Result<(), String> {
 struct Tokenizer {
     tokens: Vec<String>,
     spans: Vec<Span>,
+    /// The statement as written, kept so a span can be turned into a line and
+    /// column when a rejection needs one.
+    input: String,
     pos: usize,
     param_counter: usize,
 }
@@ -1425,6 +1427,7 @@ impl Tokenizer {
         Ok(Self {
             tokens,
             spans,
+            input: input.to_string(),
             pos: 0,
             param_counter: 0,
         })
@@ -1435,11 +1438,17 @@ impl Tokenizer {
     /// panicking, so a malformed statement still produces an error rather than
     /// bringing the process down.
     fn span_at(&self, index: usize) -> Span {
-        self.spans.get(index).copied().unwrap_or(Span {
-            line: 1,
-            col: 1,
-            len: 0,
-        })
+        self.spans
+            .get(index)
+            .copied()
+            .unwrap_or(Span { start: 0, len: 0 })
+    }
+
+    /// A span as DynamoDB reports it: `line:column:length`, all 1-based, with
+    /// the length in source characters.
+    fn position(&self, span: Span) -> String {
+        let (line, col) = span.line_col(&self.input);
+        format!("{line}:{col}:{}", span.len)
     }
 
     fn next_token(&mut self) -> Result<Option<String>, String> {
@@ -1483,23 +1492,35 @@ impl Tokenizer {
 /// 2026-08-15.
 #[derive(Debug, Clone, Copy)]
 struct Span {
-    line: usize,
-    col: usize,
+    /// Character offset of the token's first character.
+    start: usize,
     len: usize,
 }
 
-fn emit(
-    tokens: &mut Vec<String>,
-    spans: &mut Vec<Span>,
-    tok: String,
-    start: usize,
-    end: usize,
-    pos: &[(usize, usize)],
-) {
-    let (line, col) = pos[start];
+impl Span {
+    /// The 1-based line and column of the token's first character.
+    ///
+    /// Walked from the start of the statement on demand. Only one rejection
+    /// message reports a position, so paying for it per parse would mean
+    /// counting newlines for every statement to serve a case that almost never
+    /// fires.
+    fn line_col(&self, input: &str) -> (usize, usize) {
+        let (mut line, mut col) = (1usize, 1usize);
+        for c in input.chars().take(self.start) {
+            if c == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+}
+
+fn emit(tokens: &mut Vec<String>, spans: &mut Vec<Span>, tok: String, start: usize, end: usize) {
     spans.push(Span {
-        line,
-        col,
+        start,
         len: end - start,
     });
     tokens.push(tok);
@@ -1507,25 +1528,12 @@ fn emit(
 
 /// Tokenise a PartiQL string into tokens and their source spans.
 fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
-    let mut tokens = Vec::new();
-    let mut spans = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
-
-    // Char index to (line, column), both 1-based, computed once so the loop
-    // below does not have to thread a position through every branch.
-    let mut pos = Vec::with_capacity(len + 1);
-    let (mut line, mut col) = (1usize, 1usize);
-    for &c in &chars {
-        pos.push((line, col));
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    pos.push((line, col));
+    let mut tokens = Vec::new();
+    // Roughly one token per four characters on the statements this sees; the
+    // exact figure does not matter, only that it stops reallocating from zero.
+    let mut spans = Vec::with_capacity(len / 4 + 1);
 
     let mut i = 0;
 
@@ -1544,7 +1552,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
                 // Check for multi-char - or +  as start of number? No, treat as separate.
                 let tok = chars[i].to_string();
                 i += 1;
-                emit(&mut tokens, &mut spans, tok, start, i, &pos);
+                emit(&mut tokens, &mut spans, tok, start, i);
                 continue;
             }
             _ => {}
@@ -1556,7 +1564,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
             match two.as_str() {
                 "<>" | "<=" | ">=" | "!=" => {
                     i += 2;
-                    emit(&mut tokens, &mut spans, two, start, i, &pos);
+                    emit(&mut tokens, &mut spans, two, start, i);
                     continue;
                 }
                 _ => {}
@@ -1567,7 +1575,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
         if matches!(chars[i], '=' | '<' | '>') {
             let tok = chars[i].to_string();
             i += 1;
-            emit(&mut tokens, &mut spans, tok, start, i, &pos);
+            emit(&mut tokens, &mut spans, tok, start, i);
             continue;
         }
 
@@ -1589,11 +1597,12 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
                     i += 1;
                 }
             }
-            if i < len {
-                s.push('\'');
-                i += 1;
+            if i >= len {
+                return Err("Unterminated string literal".to_string());
             }
-            emit(&mut tokens, &mut spans, s, start, i, &pos);
+            s.push('\'');
+            i += 1;
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1615,11 +1624,17 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
                     i += 1;
                 }
             }
-            if i < len {
-                s.push('"');
-                i += 1;
+            // An unterminated identifier used to be emitted as a token that
+            // still carried its opening quote. `unquote` then saw a string that
+            // both starts and ends with `"` when the quote was the only
+            // character, and sliced s[1..0], which panics. Rejecting it here
+            // fixes the crash at its source and leaves `unquote` total.
+            if i >= len {
+                return Err("Unterminated quoted identifier".to_string());
             }
-            emit(&mut tokens, &mut spans, s, start, i, &pos);
+            s.push('"');
+            i += 1;
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1630,7 +1645,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            emit(&mut tokens, &mut spans, s, start, i, &pos);
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1641,7 +1656,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            emit(&mut tokens, &mut spans, s, start, i, &pos);
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -2405,6 +2420,35 @@ mod tests {
         let stmt = parse("INSERT INTO \"T\" VALUE {'pk':'a'}").unwrap();
         assert_eq!(table_name(&stmt), Some("T"));
         assert_eq!(index_name(&stmt), None);
+    }
+
+    #[test]
+    fn an_unterminated_quote_is_rejected_rather_than_panicking() {
+        // `unquote` sliced s[1..0] on a lone `"`, which panics, and the release
+        // profile sets panic = "abort", so this aborted the server process. The
+        // bare-table form predates the index qualifier; the qualifier added a
+        // second way in.
+        for stmt in [
+            "SELECT * FROM \"",
+            "SELECT * FROM \"T\".\"",
+            "SELECT * FROM \"unterminated",
+            "SELECT * FROM \"T\" WHERE pk = 'oops",
+        ] {
+            let err = parse(stmt).unwrap_err();
+            assert!(
+                matches!(err, ParseError::Syntax(_)),
+                "{stmt:?} should be a syntax error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquote_is_total() {
+        // Called on every name the parser reads, so it must not panic on any
+        // token the tokenizer can produce.
+        for input in ["", "\"", "'", "\"\"", "''", "\"a\"", "a"] {
+            let _ = unquote(input);
+        }
     }
 
     #[test]

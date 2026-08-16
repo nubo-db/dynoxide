@@ -202,7 +202,7 @@ pub async fn execute<S: StorageBackend>(
                         match page.capacity {
                             Some(capacity) => records.push(capacity),
                             // A SELECT is charged read units against the rows it
-                            // returned, with no index arm on a base table read.
+                            // walked, with no index arm on a base table read.
                             None => {
                                 if let Some(ref name) = table {
                                     read_units.push((

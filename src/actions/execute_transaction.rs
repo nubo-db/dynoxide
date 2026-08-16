@@ -177,7 +177,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
 
 /// What one statement contributed to the transaction's capacity.
 enum StatementCharge {
-    /// A `SELECT`, charged on the rows it returned at read granularity.
+    /// A `SELECT`, charged on the rows it walked at read granularity.
     Read { table_name: String, size: usize },
     /// A write, charged on its images and its per-index units.
     Write(WriteCapacity),

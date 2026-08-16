@@ -87,7 +87,8 @@ pub async fn execute<S: StorageBackend>(
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
     // unlike some emulators that omit it. A SELECT is charged read units (an
     // eventually consistent read unless ConsistentRead is set) against the rows
-    // it returned. A write is charged the base table arm plus a per-index arm,
+    // it walked, which is before its WHERE clause and its projection narrow
+    // them. A write is charged the base table arm plus a per-index arm,
     // with no transactional factor: a capture against real DynamoDB reports a
     // PartiQL INSERT of an item in two indexes as total 3, table 1, one unit per
     // index, exactly as the equivalent `PutItem`.

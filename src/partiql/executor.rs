@@ -205,10 +205,9 @@ pub async fn execute_page<S: StorageBackend>(
                 consistent_read,
             )
             .await?;
-            let size = outcome.items.iter().map(crate::types::item_size).sum();
             Ok(StatementPage {
                 items: Some(outcome.items),
-                size,
+                size: outcome.evaluated_bytes,
                 capacity: None,
                 next_token: outcome.next_token,
                 read_index: outcome.index.map(|i| ReadIndex {
@@ -519,6 +518,7 @@ async fn execute_select<S: StorageBackend>(
 
     Ok(SelectOutcome {
         items,
+        evaluated_bytes: window.evaluated_bytes,
         next_token: token,
         index,
         base_reads,
@@ -530,6 +530,10 @@ async fn execute_select<S: StorageBackend>(
 /// rather than to the table, and the caller has no other way to know.
 struct SelectOutcome {
     items: Vec<Item>,
+    /// What the read walked, which is what it is charged on. Not the weight of
+    /// `items`: a filter and a projection both narrow the rows after the read
+    /// has already paid for them.
+    evaluated_bytes: usize,
     next_token: Option<String>,
     index: Option<ResolvedIndex>,
     /// How many base table items an LSI reach-back read. Each one is charged to
@@ -545,6 +549,9 @@ struct Window {
     last_evaluated: Option<Cursor>,
     /// How many rows were read, matching or not.
     evaluated: usize,
+    /// What those rows weighed as they were read, before the WHERE clause and
+    /// before any projection. This is what the read is charged on.
+    evaluated_bytes: usize,
 }
 
 /// Read up to `limit` rows starting after `cursor`, and keep the ones the WHERE
@@ -675,16 +682,27 @@ async fn evaluate_window<S: StorageBackend>(
             base_sk,
         }
     });
-    let matched = rows
-        .into_iter()
-        .filter_map(|(_, _, json)| serde_json::from_str::<Item>(&json).ok())
-        .filter(|item| matches_where(item, where_clause, parameters))
-        .collect();
+    // Sized as read, before the WHERE clause narrows it. DynamoDB charges a
+    // read on the rows it walked, so a read matching one row costs what a read
+    // matching every row costs, and one matching nothing costs the same again.
+    // Captured eu-west-2 2026-08-15 and 2026-08-16 on ten fixtures.
+    let mut evaluated_bytes = 0usize;
+    let mut matched = Vec::new();
+    for (_, _, json) in rows {
+        let Ok(item) = serde_json::from_str::<Item>(&json) else {
+            continue;
+        };
+        evaluated_bytes += crate::types::item_size(&item);
+        if matches_where(&item, where_clause, parameters) {
+            matched.push(item);
+        }
+    }
 
     Ok(Window {
         matched,
         last_evaluated,
         evaluated,
+        evaluated_bytes,
     })
 }
 

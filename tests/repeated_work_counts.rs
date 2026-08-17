@@ -153,6 +153,14 @@ fn report_index_entry_builds_on_an_insert() {
         "insert, two indexes, capacity not asked for    : {} index entries built",
         counts.index_entries_built
     );
+
+    // One entry per index and nothing more. An insert has no old image, so
+    // there is nothing for sizing to project even when capacity is asked for,
+    // which is what makes this the floor the overwrite test measures against.
+    assert_eq!(
+        counts.index_entries_built, 2,
+        "an insert should build one entry per index"
+    );
 }
 
 // --- metadata resolved per statement in a batch ---------------------------
@@ -231,4 +239,13 @@ fn report_metadata_reads_for_a_single_statement() {
         "single ExecuteStatement insert: {} metadata reads, {} key schema parses",
         counts.metadata_reads, counts.key_schema_parses
     );
+
+    // A single statement has no preparation pass to share a resolution with, so
+    // the executor resolves the table itself. Once is the floor, and pinning it
+    // here is what would catch a caller that starts resolving ahead of it again.
+    assert_eq!(
+        counts.metadata_reads, 1,
+        "one statement should read its table's metadata once"
+    );
+    assert_eq!(counts.key_schema_parses, 1, "and parse its key schema once");
 }

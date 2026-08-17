@@ -116,6 +116,12 @@ fn a_delete_clears_both_indexes_with_no_capacity_asked_for() {
     let db = table();
     put(&db, "s1", "g1", "l1");
 
+    // Assert the rows arrived before deleting them. Without this the test also
+    // passes when the write never populated the indexes at all, which is the
+    // failure a mis-placed gate would produce.
+    assert_eq!(index_rows(&db, "gsi-inc", "gsiPk", "g1").len(), 1);
+    assert_eq!(index_rows(&db, "lsi-all", "pk", "p").len(), 1);
+
     let req = serde_json::json!({
         "TableName": TABLE,
         "Key": {"pk": {"S": "p"}, "sk": {"S": "s1"}}
@@ -131,6 +137,10 @@ fn a_delete_clears_both_indexes_with_no_capacity_asked_for() {
 fn an_item_leaving_an_index_is_removed_from_it_with_no_capacity_asked_for() {
     let db = table();
     put(&db, "s1", "g1", "l1");
+
+    // The item is in the GSI before the write that takes it out. Asserting only
+    // its absence afterwards would pass just as well if it had never been in.
+    assert_eq!(index_rows(&db, "gsi-inc", "gsiPk", "g1").len(), 1);
 
     // Dropping `gsiPk` takes the item out of the sparse GSI while leaving it in
     // the table and the LSI. Nothing is inserted for the GSI on this write, so

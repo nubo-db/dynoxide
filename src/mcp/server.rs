@@ -364,12 +364,18 @@ pub struct BatchGetItemParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecutePartiqlParams {
     #[schemars(
-        description = "PartiQL statement to execute. Supports SELECT (with LIMIT, nested path projections, and NextToken paging), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths."
+        description = "PartiQL statement to execute. Supports SELECT (with LIMIT, nested path projections, and NextToken paging), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping to any depth, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier."
     )]
     pub statement: String,
 
     #[schemars(description = "Positional parameters for the statement, in DynamoDB JSON format")]
     pub parameters: Option<serde_json::Value>,
+
+    #[schemars(
+        description = "Whether to use strongly consistent reads. Does not change which rows come back, but it doubles the rate a SELECT is charged at and it makes a SELECT qualified by a GSI a rejection, because a GSI cannot serve one."
+    )]
+    #[serde(default)]
+    pub consistent_read: Option<bool>,
 
     #[schemars(
         description = "Maximum number of items to evaluate for SELECT statements (not necessarily the number returned); a filtered page can come back short or empty and still carry a NextToken"
@@ -470,7 +476,7 @@ pub struct TransactGetItemsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchExecutePartiqlParams {
     #[schemars(
-        description = "Array of PartiQL statements. Each is {Statement: \"...\", Parameters?: [...]}."
+        description = "Array of PartiQL statements. Each is {Statement: \"...\", Parameters?: [...], ConsistentRead?: true|false, ReturnValuesOnConditionCheckFailure?: \"ALL_OLD\"|\"NONE\"}. ConsistentRead is per member and sets the rate that member's read is charged at rather than which rows come back. ReturnValuesOnConditionCheckFailure is accepted and inert, as it is on DynamoDB. A batch is all-read or all-write, and a SELECT member must name the table's primary key and may not name an index."
     )]
     pub statements: serde_json::Value,
 }
@@ -1288,7 +1294,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, OR, nested paths. Write statements are blocked in read-only mode."
+        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping to any depth, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier. Write statements are blocked in read-only mode."
     )]
     fn execute_partiql(
         &self,
@@ -1342,6 +1348,7 @@ impl McpServer {
             parameters,
             limit: params.limit,
             next_token: params.next_token,
+            consistent_read: params.consistent_read,
             ..Default::default()
         };
         match self.db.execute_statement(request) {

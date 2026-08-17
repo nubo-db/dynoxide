@@ -128,20 +128,19 @@ fn report_index_entry_builds_on_an_overwrite() {
     );
 
     // The floor is one projected entry per index: the fan-out has to build the
-    // row it stores. Anything above that is a rebuild of something already to
-    // hand, or a build of an image nothing else wants.
-    assert!(
-        without.index_entries_built >= 2,
-        "two indexes must build at least one entry each"
+    // row it stores. An overwrite with no capacity asked for now sits on that
+    // floor, so it costs an insert's projections rather than an insert's plus a
+    // pass over the old image that only sizing wanted.
+    assert_eq!(
+        without.index_entries_built, 2,
+        "an overwrite reporting no capacity should build one entry per index"
     );
 
-    // The claim under test: the figures reported when nobody asked for capacity
-    // should not exceed the figures reported when somebody did.
-    assert!(
-        without.index_entries_built <= with_indexes.index_entries_built,
-        "a write that reports no capacity built {} entries against {} for one that does",
-        without.index_entries_built,
-        with_indexes.index_entries_built
+    // Sizing an index needs the old image projected as well, and that is the
+    // whole of the difference. Asking for capacity is what pays for it.
+    assert_eq!(
+        with_indexes.index_entries_built, 4,
+        "sizing two indexes needs the old image projected for each"
     );
 }
 

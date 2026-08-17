@@ -336,14 +336,24 @@ pub async fn execute<S: StorageBackend>(
         };
 
         // Maintain GSI tables (inside the transaction)
-        let gsi_units =
-            super::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref())
-                .await?;
+        let gsi_units = super::gsi::maintain_gsis_after_delete(
+            storage,
+            &meta,
+            &target,
+            old_item.as_ref(),
+            request.return_consumed_capacity.as_deref(),
+        )
+        .await?;
 
         // Maintain LSI tables (inside the transaction)
-        let lsi_units =
-            super::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref())
-                .await?;
+        let lsi_units = super::lsi::maintain_lsis_after_delete(
+            storage,
+            &meta,
+            &target,
+            old_item.as_ref(),
+            request.return_consumed_capacity.as_deref(),
+        )
+        .await?;
 
         // Record stream event (inside the transaction)
         if old_item.is_some() {

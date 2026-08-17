@@ -432,6 +432,7 @@ async fn execute_inner<S: StorageBackend>(
             &target,
             old_item.as_ref(),
             &request.item,
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
@@ -442,6 +443,7 @@ async fn execute_inner<S: StorageBackend>(
             &target,
             old_item.as_ref(),
             &request.item,
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 

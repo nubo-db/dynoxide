@@ -69,14 +69,17 @@ pub fn parse_lsi_key_schema(
 ///
 /// Returns a map of LSI name to write capacity units consumed, on the same terms
 /// as the GSI fan-out: an index the write leaves untouched is absent from the map
-/// rather than present and zeroed.
+/// rather than present and zeroed. `capacity_mode` gates the sizing on the same
+/// terms too, so see [`super::gsi::maintain_gsis_after_write`].
 pub async fn maintain_lsis_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
     old_item: Option<&Item>,
     item: &Item,
+    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let lsi_defs = parse_lsi_defs(meta)?;
     let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -111,13 +114,15 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
             });
         }
 
-        if let Some(units) = super::index_capacity::index_write_units_for(
-            old_item,
-            entry,
-            lsi,
-            target.pk_attr,
-            target.sk_attr,
-        ) {
+        if want_capacity
+            && let Some(units) = super::index_capacity::index_write_units_for(
+                old_item,
+                entry,
+                lsi,
+                target.pk_attr,
+                target.sk_attr,
+            )
+        {
             lsi_units.insert(lsi.index_name.clone(), units);
         }
     }
@@ -129,13 +134,16 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
 /// Remove an item from all LSI tables after a delete.
 ///
 /// Returns a map of LSI name to write capacity units consumed, charging only the
-/// indexes the deleted item was a member of.
+/// indexes the deleted item was a member of. `capacity_mode` gates the sizing as
+/// it does on [`super::gsi::maintain_gsis_after_delete`].
 pub async fn maintain_lsis_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
     old_item: Option<&Item>,
+    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let lsi_defs = parse_lsi_defs(meta)?;
     let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -148,13 +156,15 @@ pub async fn maintain_lsis_after_delete<S: StorageBackend>(
             base_sk: target.sk.to_string(),
         });
 
-        if let Some(units) = super::index_capacity::index_write_units(
-            old_item,
-            None,
-            lsi,
-            target.pk_attr,
-            target.sk_attr,
-        ) {
+        if want_capacity
+            && let Some(units) = super::index_capacity::index_write_units(
+                old_item,
+                None,
+                lsi,
+                target.pk_attr,
+                target.sk_attr,
+            )
+        {
             lsi_units.insert(lsi.index_name.clone(), units);
         }
     }

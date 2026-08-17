@@ -195,6 +195,7 @@ pub async fn execute<S: StorageBackend>(
                     None,
                     None,
                     stmt_req.consistent_read.unwrap_or(false),
+                    request.return_consumed_capacity.as_deref(),
                 )
                 .await
                 {

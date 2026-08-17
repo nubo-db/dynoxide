@@ -147,9 +147,15 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     }
 
     // All statements run inside one SQLite transaction (all-or-nothing).
-    let (responses, charges) =
-        helpers::with_write_transaction(storage, execute_within_transaction(storage, &parsed))
-            .await?;
+    let (responses, charges) = helpers::with_write_transaction(
+        storage,
+        execute_within_transaction(
+            storage,
+            &parsed,
+            request.return_consumed_capacity.as_deref(),
+        ),
+    )
+    .await?;
 
     // Transactional capacity, split by statement kind: an all-SELECT read set
     // reports read capacity, any INSERT/UPDATE/DELETE makes it a write set. Both
@@ -294,13 +300,24 @@ pub(crate) fn replay_response(
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
+    capacity_mode: Option<&str>,
 ) -> Result<(Vec<ItemResponse>, Vec<StatementCharge>)> {
     let mut responses = Vec::with_capacity(parsed.len());
     let mut charges: Vec<StatementCharge> = Vec::with_capacity(parsed.len());
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
 
     for (stmt, params) in parsed {
-        match partiql::executor::execute_page(storage, stmt, params, None, None, false).await {
+        match partiql::executor::execute_page(
+            storage,
+            stmt,
+            params,
+            None,
+            None,
+            false,
+            capacity_mode,
+        )
+        .await
+        {
             Ok(page) => {
                 let table_name = partiql::parser::table_name(stmt).unwrap_or_default();
                 charges.push(match page.capacity {

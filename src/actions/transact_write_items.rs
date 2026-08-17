@@ -183,9 +183,12 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     }
 
     // All actions run inside one SQLite transaction (all-or-nothing).
-    let capacity =
-        helpers::with_write_transaction(storage, execute_within_transaction(storage, items))
-            .await?;
+    let capacity_mode = request.return_consumed_capacity.as_deref();
+    let capacity = helpers::with_write_transaction(
+        storage,
+        execute_within_transaction(storage, items, capacity_mode),
+    )
+    .await?;
 
     Ok(CachedWrite {
         response: TransactWriteItemsResponse {
@@ -268,13 +271,14 @@ pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> Ca
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     items: &[TransactWriteItem],
+    capacity_mode: Option<&str>,
 ) -> Result<Vec<WriteCapacity>> {
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(items.len());
     let mut capacity: Vec<WriteCapacity> = Vec::with_capacity(items.len());
     let mut has_failure = false;
 
     for item in items {
-        let reason = execute_single_action(storage, item).await;
+        let reason = execute_single_action(storage, item, capacity_mode).await;
         match reason {
             Ok(action_capacity) => {
                 capacity.push(action_capacity);
@@ -330,13 +334,14 @@ async fn execute_within_transaction<S: StorageBackend>(
 async fn execute_single_action<S: StorageBackend>(
     storage: &S,
     item: &TransactWriteItem,
+    capacity_mode: Option<&str>,
 ) -> Result<WriteCapacity> {
     if let Some(ref put) = item.put {
-        execute_put(storage, put).await
+        execute_put(storage, put, capacity_mode).await
     } else if let Some(ref update) = item.update {
-        execute_update(storage, update).await
+        execute_update(storage, update, capacity_mode).await
     } else if let Some(ref delete) = item.delete {
-        execute_delete(storage, delete).await
+        execute_delete(storage, delete, capacity_mode).await
     } else if let Some(ref check) = item.condition_check {
         execute_condition_check(storage, check).await
     } else {
@@ -359,7 +364,11 @@ fn validate_eav_nesting(values: &Option<HashMap<String, AttributeValue>>) -> Res
     Ok(())
 }
 
-async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Result<WriteCapacity> {
+async fn execute_put<S: StorageBackend>(
+    storage: &S,
+    put: &TransactPut,
+    capacity_mode: Option<&str>,
+) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&put.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &put.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
@@ -436,13 +445,25 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    let gsi_units =
-        super::gsi::maintain_gsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
-            .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_write(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        &item,
+        capacity_mode,
+    )
+    .await?;
 
-    let lsi_units =
-        super::lsi::maintain_lsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
-            .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_write(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        &item,
+        capacity_mode,
+    )
+    .await?;
 
     // Record stream event
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -459,6 +480,7 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
 async fn execute_update<S: StorageBackend>(
     storage: &S,
     update: &TransactUpdate,
+    capacity_mode: Option<&str>,
 ) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&update.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &update.table_name).await?;
@@ -562,13 +584,25 @@ async fn execute_update<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    let gsi_units =
-        super::gsi::maintain_gsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
-            .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_write(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        &item,
+        capacity_mode,
+    )
+    .await?;
 
-    let lsi_units =
-        super::lsi::maintain_lsis_after_write(storage, &meta, &target, old_item.as_ref(), &item)
-            .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_write(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        &item,
+        capacity_mode,
+    )
+    .await?;
 
     // Record stream event
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -589,6 +623,7 @@ async fn execute_update<S: StorageBackend>(
 async fn execute_delete<S: StorageBackend>(
     storage: &S,
     delete: &TransactDelete,
+    capacity_mode: Option<&str>,
 ) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&delete.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &delete.table_name).await?;
@@ -644,10 +679,22 @@ async fn execute_delete<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    let gsi_units =
-        super::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref()).await?;
-    let lsi_units =
-        super::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref()).await?;
+    let gsi_units = super::gsi::maintain_gsis_after_delete(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
+    )
+    .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_delete(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
+    )
+    .await?;
 
     // Record stream event
     if old_item.is_some() {

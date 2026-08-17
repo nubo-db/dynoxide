@@ -646,14 +646,26 @@ async fn execute_inner<S: StorageBackend>(
         };
 
         // Maintain GSI tables (inside the transaction)
-        let gsi_units =
-            super::gsi::maintain_gsis_after_write(storage, &meta, &target, prior_image, &item)
-                .await?;
+        let gsi_units = super::gsi::maintain_gsis_after_write(
+            storage,
+            &meta,
+            &target,
+            prior_image,
+            &item,
+            request.return_consumed_capacity.as_deref(),
+        )
+        .await?;
 
         // Maintain LSI tables (inside the transaction)
-        let lsi_units =
-            super::lsi::maintain_lsis_after_write(storage, &meta, &target, prior_image, &item)
-                .await?;
+        let lsi_units = super::lsi::maintain_lsis_after_write(
+            storage,
+            &meta,
+            &target,
+            prior_image,
+            &item,
+            request.return_consumed_capacity.as_deref(),
+        )
+        .await?;
 
         // Record stream event (inside the transaction)
         crate::streams::record_stream_event(storage, &meta, prior_image, Some(&item)).await?;

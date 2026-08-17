@@ -44,7 +44,7 @@ pub async fn execute_measured<S: StorageBackend>(
     parameters: &[AttributeValue],
     limit: Option<usize>,
 ) -> Result<(Option<Vec<Item>>, usize)> {
-    let page = execute_page(storage, stmt, parameters, limit, None, false).await?;
+    let page = execute_page(storage, stmt, parameters, limit, None, false, None).await?;
     Ok((page.items, page.size))
 }
 
@@ -166,6 +166,7 @@ pub async fn execute_page<S: StorageBackend>(
     limit: Option<usize>,
     next_token: Option<&str>,
     consistent_read: bool,
+    capacity_mode: Option<&str>,
 ) -> Result<StatementPage> {
     if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
         return Err(DynoxideError::ValidationException(
@@ -222,8 +223,15 @@ pub async fn execute_page<S: StorageBackend>(
             item,
             if_not_exists,
         } => {
-            let capacity =
-                execute_insert(storage, table_name, item, parameters, *if_not_exists).await?;
+            let capacity = execute_insert(
+                storage,
+                table_name,
+                item,
+                parameters,
+                *if_not_exists,
+                capacity_mode,
+            )
+            .await?;
             Ok(StatementPage {
                 items: None,
                 // An insert is measured on the item it wrote, which is 0 when an
@@ -249,6 +257,7 @@ pub async fn execute_page<S: StorageBackend>(
                 where_clause.as_ref(),
                 parameters,
                 *returning,
+                capacity_mode,
             )
             .await?;
             // RETURNING surfaces the requested projection of the updated item;
@@ -287,8 +296,14 @@ pub async fn execute_page<S: StorageBackend>(
                     )));
                 }
             }
-            let (old_item, capacity) =
-                execute_delete(storage, table_name, where_clause.as_ref(), parameters).await?;
+            let (old_item, capacity) = execute_delete(
+                storage,
+                table_name,
+                where_clause.as_ref(),
+                parameters,
+                capacity_mode,
+            )
+            .await?;
             // RETURNING ALL OLD * always surfaces an Items array: the deleted
             // item on a hit, an empty array on a miss (a no-op success). This
             // differs from the classic DeleteItem ReturnValues path, which omits
@@ -1074,6 +1089,7 @@ async fn execute_insert<S: StorageBackend>(
     item_template: &HashMap<String, PartiqlValue>,
     parameters: &[AttributeValue],
     if_not_exists: bool,
+    capacity_mode: Option<&str>,
 ) -> Result<WriteCapacity> {
     // Resolve any parameter placeholders in the item
     let mut item = HashMap::new();
@@ -1151,6 +1167,7 @@ async fn execute_insert<S: StorageBackend>(
         &target,
         old_item.as_ref(),
         &item,
+        capacity_mode,
     )
     .await?;
 
@@ -1160,6 +1177,7 @@ async fn execute_insert<S: StorageBackend>(
         &target,
         old_item.as_ref(),
         &item,
+        capacity_mode,
     )
     .await?;
 
@@ -1180,6 +1198,7 @@ async fn execute_insert<S: StorageBackend>(
 /// Applies an UPDATE and returns the `RETURNING` projection (or `None` when the
 /// statement carried no `RETURNING` clause) and what the write consumed. An
 /// update that resolves to an empty item is skipped and carries no images.
+#[allow(clippy::too_many_arguments)]
 async fn execute_update<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -1188,6 +1207,7 @@ async fn execute_update<S: StorageBackend>(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     returning: Option<ReturningVariant>,
+    capacity_mode: Option<&str>,
 ) -> Result<(Option<Item>, WriteCapacity)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
@@ -1314,13 +1334,25 @@ async fn execute_update<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    let gsi_units =
-        crate::actions::gsi::maintain_gsis_after_write(storage, &meta, &target, old_ref, &item)
-            .await?;
+    let gsi_units = crate::actions::gsi::maintain_gsis_after_write(
+        storage,
+        &meta,
+        &target,
+        old_ref,
+        &item,
+        capacity_mode,
+    )
+    .await?;
 
-    let lsi_units =
-        crate::actions::lsi::maintain_lsis_after_write(storage, &meta, &target, old_ref, &item)
-            .await?;
+    let lsi_units = crate::actions::lsi::maintain_lsis_after_write(
+        storage,
+        &meta,
+        &target,
+        old_ref,
+        &item,
+        capacity_mode,
+    )
+    .await?;
 
     // Stream record
     crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
@@ -1468,6 +1500,7 @@ async fn execute_delete<S: StorageBackend>(
     table_name: &str,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
+    capacity_mode: Option<&str>,
 ) -> Result<(Option<Item>, WriteCapacity)> {
     let meta = require_table(storage, table_name).await?;
     let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
@@ -1550,13 +1583,23 @@ async fn execute_delete<S: StorageBackend>(
         sk_attr: key_schema.sort_key.as_deref(),
     };
 
-    let gsi_units =
-        crate::actions::gsi::maintain_gsis_after_delete(storage, &meta, &target, old_item.as_ref())
-            .await?;
+    let gsi_units = crate::actions::gsi::maintain_gsis_after_delete(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
+    )
+    .await?;
 
-    let lsi_units =
-        crate::actions::lsi::maintain_lsis_after_delete(storage, &meta, &target, old_item.as_ref())
-            .await?;
+    let lsi_units = crate::actions::lsi::maintain_lsis_after_delete(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
+    )
+    .await?;
 
     // Stream record
     if old_item.is_some() {

@@ -73,6 +73,7 @@ pub async fn execute<S: StorageBackend>(
         request.limit,
         request.next_token.as_deref(),
         request.consistent_read.unwrap_or(false),
+        request.return_consumed_capacity.as_deref(),
     )
     .await?;
     let partiql::executor::StatementPage {

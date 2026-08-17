@@ -844,6 +844,17 @@ pub fn read_capacity_units_with_consistency(item_size_bytes: usize, consistent: 
     if consistent { strongly } else { strongly / 2.0 }
 }
 
+/// Whether a `ReturnConsumedCapacity` value asks for a figure at all.
+///
+/// Every `consumed_capacity*` builder below throws its inputs away unless the
+/// mode is `TOTAL` or `INDEXES`, so work done only to feed them is wasted in
+/// every other mode, and `NONE` is the default. Callers that can skip that work
+/// ask here rather than each spelling the comparison out, so the set of modes
+/// that mean "yes" is written down once.
+pub fn capacity_wanted(mode: Option<&str>) -> bool {
+    matches!(mode, Some("TOTAL") | Some("INDEXES"))
+}
+
 /// Build a `ConsumedCapacity` for a simple table operation.
 pub fn consumed_capacity(
     table_name: &str,
@@ -1010,7 +1021,7 @@ pub fn build_transactional_capacity(
     mode: &Option<String>,
     builder: fn(&str, f64, &Option<String>) -> Option<ConsumedCapacity>,
 ) -> Option<Vec<ConsumedCapacity>> {
-    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+    if !capacity_wanted(mode.as_deref()) {
         return None;
     }
 

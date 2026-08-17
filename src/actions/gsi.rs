@@ -133,13 +133,20 @@ pub fn build_index_item(
 /// stored view the write leaves untouched is absent from the map rather than
 /// present and zeroed, so the response omits its arm entirely. `old_item` is the
 /// item as it stood before the write, or `None` when there was no item.
+///
+/// `capacity_mode` is the caller's `ReturnConsumedCapacity`, forwarded rather
+/// than interpreted, so a call site is right by passing a field it already
+/// holds. The map comes back empty when it asks for nothing, and sizing an index
+/// costs a projection of the old image per index that nothing else wants.
 pub async fn maintain_gsis_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
     old_item: Option<&Item>,
     item: &Item,
+    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -175,13 +182,15 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 
         // Capacity is the change to what the index stores, so it is charged even
         // when the item leaves the index and no insert is queued above.
-        if let Some(units) = super::index_capacity::index_write_units_for(
-            old_item,
-            entry,
-            gsi,
-            target.pk_attr,
-            target.sk_attr,
-        ) {
+        if want_capacity
+            && let Some(units) = super::index_capacity::index_write_units_for(
+                old_item,
+                entry,
+                gsi,
+                target.pk_attr,
+                target.sk_attr,
+            )
+        {
             gsi_units.insert(gsi.index_name.clone(), units);
         }
     }
@@ -199,12 +208,18 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 /// Returns a map of GSI name to write capacity units consumed. Only an index the
 /// deleted item was actually a member of is charged, sized on the entry it held.
 /// `old_item` is the deleted item, or `None` when the delete removed nothing.
+///
+/// `capacity_mode` is the caller's `ReturnConsumedCapacity`, as on
+/// [`maintain_gsis_after_write`]. A delete queues its ops from the target key
+/// alone, so sizing is the only thing that projects the deleted item at all.
 pub async fn maintain_gsis_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
     old_item: Option<&Item>,
+    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -217,13 +232,15 @@ pub async fn maintain_gsis_after_delete<S: StorageBackend>(
             table_sk: target.sk.to_string(),
         });
 
-        if let Some(units) = super::index_capacity::index_write_units(
-            old_item,
-            None,
-            gsi,
-            target.pk_attr,
-            target.sk_attr,
-        ) {
+        if want_capacity
+            && let Some(units) = super::index_capacity::index_write_units(
+                old_item,
+                None,
+                gsi,
+                target.pk_attr,
+                target.sk_attr,
+            )
+        {
             gsi_units.insert(gsi.index_name.clone(), units);
         }
     }

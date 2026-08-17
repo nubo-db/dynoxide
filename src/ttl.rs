@@ -71,14 +71,25 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                             pk_attr: &key_schema.partition_key,
                             sk_attr: key_schema.sort_key.as_deref(),
                         };
-                        // TTL deletions report no capacity, so the per-index
-                        // units are discarded.
-                        let _ =
-                            gsi::maintain_gsis_after_delete(storage, meta, &target, Some(&item))
-                                .await?;
-                        let _ =
-                            lsi::maintain_lsis_after_delete(storage, meta, &target, Some(&item))
-                                .await?;
+                        // A TTL deletion has no caller to report capacity to, so
+                        // it asks for none and the fan-out skips sizing the
+                        // indexes rather than sizing them for a discarded map.
+                        let _ = gsi::maintain_gsis_after_delete(
+                            storage,
+                            meta,
+                            &target,
+                            Some(&item),
+                            None,
+                        )
+                        .await?;
+                        let _ = lsi::maintain_lsis_after_delete(
+                            storage,
+                            meta,
+                            &target,
+                            Some(&item),
+                            None,
+                        )
+                        .await?;
                         // Generate stream REMOVE record with TTL service identity
                         if meta.stream_enabled {
                             record_ttl_stream_event(storage, meta, &item).await?;

@@ -195,11 +195,20 @@ fn report_metadata_reads_across_a_batch() {
         twenty_five.key_schema_parses as f64 / 25.0
     );
 
-    // One table, so one resolution would do for the whole batch. Anything that
-    // scales with the statement count is per-statement work on a per-table fact.
-    assert!(
-        twenty_five.metadata_reads >= one.metadata_reads,
-        "a longer batch cannot read metadata fewer times"
+    // One table, so one resolution does for the whole batch. The figure not
+    // moving with the statement count is the whole point: metadata and key
+    // schema are per-table facts, and only the item key is per statement.
+    assert_eq!(
+        one.metadata_reads, 1,
+        "a single-statement batch resolves its table once"
+    );
+    assert_eq!(
+        twenty_five.metadata_reads, 1,
+        "25 statements against one table still resolve it once"
+    );
+    assert_eq!(
+        twenty_five.key_schema_parses, 1,
+        "the parsed key schema is kept alongside the metadata"
     );
 }
 

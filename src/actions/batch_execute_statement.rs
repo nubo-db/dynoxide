@@ -1,6 +1,7 @@
 use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table, per_table_capacity};
 use crate::errors::{DynoxideError, Result};
 use crate::partiql;
+use crate::partiql::executor::ResolvedTable;
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
@@ -101,7 +102,7 @@ pub async fn execute<S: StorageBackend>(
     // that member and runs the rest. Parse failure and an unresolvable target
     // are different things, which is why they are a `Result` and an `Option`
     // rather than one fallible value.
-    let prepared = prepare(storage, &request.statements).await;
+    let (prepared, tables) = prepare(storage, &request.statements).await;
 
     // A batch is all-read or all-write. AWS rejects a mixed one up front,
     // before any statement runs, rather than per statement. A statement that
@@ -196,6 +197,7 @@ pub async fn execute<S: StorageBackend>(
                     None,
                     stmt_req.consistent_read.unwrap_or(false),
                     request.return_consumed_capacity.as_deref(),
+                    table.as_deref().and_then(|t| tables.get(t)),
                 )
                 .await
                 {
@@ -235,7 +237,9 @@ pub async fn execute<S: StorageBackend>(
                         // without reading anything. Everything else falls back
                         // to the one-unit minimum.
                         if let Some(ref name) = table {
-                            let units = attempted_units(storage, &stmt, params).await;
+                            let units =
+                                attempted_units(storage, &stmt, params, prepared.target.as_ref())
+                                    .await;
                             failures.push((name.clone(), units));
                         }
                         // DynamoDB echoes the table on a member whose statement
@@ -293,30 +297,46 @@ struct Prepared {
 /// resolution does, so the parsing was the larger half of the overhead by more
 /// than two to one.
 ///
-/// Target resolution is not shared and not cheap: it loads the table's metadata
-/// and parses its key schema per statement, and the executor does both again a
-/// moment later. Sharing that is a separate change from this one, and it is
-/// worth more on the wasm backend, which caches no metadata at all.
+/// Target resolution loads the table's metadata and parses its key schema, and
+/// both are now kept rather than thrown away once the target is read off them.
+/// The executor takes them as they are instead of resolving the same table a
+/// second time, which halves the metadata loads a batch performs. That is worth
+/// most on the wasm backend, where every load crosses the bridge to a JS worker
+/// and nothing caches the result, but the key schema half is a JSON parse and is
+/// paid on both backends.
 async fn prepare<S: StorageBackend>(
     storage: &S,
     statements: &[BatchStatementRequest],
-) -> Vec<Prepared> {
+) -> (Vec<Prepared>, HashMap<String, ResolvedTable>) {
     let mut prepared = Vec::with_capacity(statements.len());
+    // Keyed by table, not by statement: a batch is usually 25 statements
+    // against one table, and that is one resolution rather than 25.
+    let mut tables: HashMap<String, ResolvedTable> = HashMap::new();
+
     for stmt_req in statements {
         let parsed = partiql::parser::parse(&stmt_req.statement);
-        let target = match parsed {
-            Ok(ref stmt) => {
-                let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                partiql::executor::statement_target(storage, stmt, params).await
+        let mut target = None;
+        if let Ok(ref stmt) = parsed
+            && let Some(name) = partiql::parser::table_name(stmt)
+        {
+            if !tables.contains_key(name)
+                && let Ok(resolved) = ResolvedTable::load(storage, name).await
+            {
+                tables.insert(name.to_string(), resolved);
             }
-            Err(_) => None,
-        };
+            // Absent when the table could not be read, which leaves the
+            // statement to fail on its own terms during execution.
+            if let Some(resolved) = tables.get(name) {
+                let params = stmt_req.parameters.as_deref().unwrap_or_default();
+                target = partiql::executor::statement_target_in(stmt, params, name, resolved);
+            }
+        }
         prepared.push(Prepared {
             stmt: parsed,
             target,
         });
     }
-    prepared
+    (prepared, tables)
 }
 
 /// The write units a failed statement is charged.
@@ -329,14 +349,18 @@ async fn prepare<S: StorageBackend>(
 /// to 2. Two of the failures name tiny items and cost 1 each; the third names a
 /// tiny item too, but the row already at that key is 3KB, and it costs 3. Sizing
 /// on the statement alone reports 5.
+/// `target` is the one the preparation pass already resolved. Sizing used to
+/// resolve it again here, which made a batch of failures cost three metadata
+/// loads per statement rather than two.
 async fn attempted_units<S: StorageBackend>(
     storage: &S,
     stmt: &partiql::parser::Statement,
     parameters: &[AttributeValue],
+    target: Option<&(String, String, String)>,
 ) -> f64 {
-    let stored_size = match partiql::executor::statement_target(storage, stmt, parameters).await {
+    let stored_size = match target {
         Some((table, pk, sk)) => storage
-            .get_item(&table, &pk, &sk)
+            .get_item(table, pk, sk)
             .await
             .ok()
             .flatten()

@@ -74,6 +74,9 @@ pub async fn execute<S: StorageBackend>(
         request.next_token.as_deref(),
         request.consistent_read.unwrap_or(false),
         request.return_consumed_capacity.as_deref(),
+        // A single statement has no preparation pass to share a resolution
+        // with, so the executor resolves the table itself, once.
+        None,
     )
     .await?;
     let partiql::executor::StatementPage {

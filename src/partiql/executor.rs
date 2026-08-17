@@ -44,7 +44,7 @@ pub async fn execute_measured<S: StorageBackend>(
     parameters: &[AttributeValue],
     limit: Option<usize>,
 ) -> Result<(Option<Vec<Item>>, usize)> {
-    let page = execute_page(storage, stmt, parameters, limit, None, false, None).await?;
+    let page = execute_page(storage, stmt, parameters, limit, None, false, None, None).await?;
     Ok((page.items, page.size))
 }
 
@@ -159,6 +159,7 @@ fn validate_ordering_operands(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_page<S: StorageBackend>(
     storage: &S,
     stmt: &Statement,
@@ -167,6 +168,7 @@ pub async fn execute_page<S: StorageBackend>(
     next_token: Option<&str>,
     consistent_read: bool,
     capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
 ) -> Result<StatementPage> {
     if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
         return Err(DynoxideError::ValidationException(
@@ -204,6 +206,7 @@ pub async fn execute_page<S: StorageBackend>(
                 limit,
                 next_token,
                 consistent_read,
+                resolved,
             )
             .await?;
             Ok(StatementPage {
@@ -230,6 +233,7 @@ pub async fn execute_page<S: StorageBackend>(
                 parameters,
                 *if_not_exists,
                 capacity_mode,
+                resolved,
             )
             .await?;
             Ok(StatementPage {
@@ -258,6 +262,7 @@ pub async fn execute_page<S: StorageBackend>(
                 parameters,
                 *returning,
                 capacity_mode,
+                resolved,
             )
             .await?;
             // RETURNING surfaces the requested projection of the updated item;
@@ -302,6 +307,7 @@ pub async fn execute_page<S: StorageBackend>(
                 where_clause.as_ref(),
                 parameters,
                 capacity_mode,
+                resolved,
             )
             .await?;
             // RETURNING ALL OLD * always surfaces an Items array: the deleted
@@ -348,15 +354,27 @@ async fn execute_select<S: StorageBackend>(
     limit: Option<usize>,
     next_token: Option<&str>,
     consistent_read: bool,
+    resolved: Option<&ResolvedTable>,
 ) -> Result<SelectOutcome> {
     // The table is resolved before the index: a qualified SELECT against a
     // table that does not exist reports the missing table, not the missing
     // index. Captured eu-west-2 2026-08-15.
-    let meta = require_table(storage, table_name).await?;
-    let table_key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
+    // Resolved by the caller when a preparation pass already did it, which is
+    // what stops a batch reading the same table's metadata and parsing the same
+    // key schema once per statement on top of once per batch member.
+    let owned;
+    let resolved = match resolved {
+        Some(r) => r,
+        None => {
+            owned = ResolvedTable::load(storage, table_name).await?;
+            &owned
+        }
+    };
+    let meta = &resolved.meta;
+    let table_key_schema = &resolved.key_schema;
 
     let index = index_name
-        .map(|name| resolve_index(&meta, name))
+        .map(|name| resolve_index(meta, name))
         .transpose()?;
 
     // A strongly consistent read cannot be served from a GSI. PartiQL words
@@ -389,7 +407,7 @@ async fn execute_select<S: StorageBackend>(
             let missing: Vec<String> = projections
                 .iter()
                 .map(|p| root_attribute(p).to_string())
-                .filter(|attr| !idx.projects(attr, &table_key_schema))
+                .filter(|attr| !idx.projects(attr, table_key_schema))
                 .collect();
             if !missing.is_empty() {
                 return Err(DynoxideError::ValidationException(format!(
@@ -404,7 +422,7 @@ async fn execute_select<S: StorageBackend>(
         if keys_index(where_clause, idx.pk_attr()) {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
-                .filter(|attr| !idx.projects(attr, &table_key_schema))
+                .filter(|attr| !idx.projects(attr, table_key_schema))
                 .collect();
             if !missing.is_empty() {
                 // "Secondary index", with no Global or Local in front of it,
@@ -458,7 +476,7 @@ async fn execute_select<S: StorageBackend>(
         parameters,
         read_pk,
         read_sk,
-        &table_key_schema,
+        table_key_schema,
         cursor.as_ref(),
         limit,
     )
@@ -483,7 +501,7 @@ async fn execute_select<S: StorageBackend>(
         idx.is_lsi
             && projections
                 .iter()
-                .any(|p| !idx.projects(root_attribute(p), &table_key_schema))
+                .any(|p| !idx.projects(root_attribute(p), table_key_schema))
     });
 
     let mut base_reads = 0usize;
@@ -1045,10 +1063,85 @@ pub async fn statement_target<S: StorageBackend>(
     stmt: &Statement,
     parameters: &[AttributeValue],
 ) -> Option<(String, String, String)> {
-    let table_name = crate::partiql::parser::table_name(stmt)?;
-    let meta = require_table(storage, table_name).await.ok()?;
-    let key_schema = crate::actions::helpers::parse_key_schema(&meta).ok()?;
+    prepare_statement(storage, stmt, parameters).await.target
+}
 
+/// A table's metadata and its parsed key schema, worked out once.
+///
+/// The key schema is the half worth carrying. Metadata is answered from a cache
+/// on the native backend and crosses the bridge on wasm, but the key schema is
+/// parsed out of JSON on every call on both, and nothing keeps the parsed form.
+pub struct ResolvedTable {
+    pub meta: crate::storage::TableMetadata,
+    pub key_schema: crate::actions::helpers::KeySchema,
+}
+
+impl ResolvedTable {
+    pub async fn load<S: StorageBackend>(storage: &S, table_name: &str) -> Result<Self> {
+        let meta = require_table(storage, table_name).await?;
+        let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
+        Ok(Self { meta, key_schema })
+    }
+}
+
+/// The single item a statement names, given its table already resolved.
+///
+/// Both batch surfaces resolve a table once and then ask this of every statement
+/// against it, because the metadata and the key schema are per table while the
+/// key is per statement.
+pub fn statement_target_in(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    table_name: &str,
+    resolved: &ResolvedTable,
+) -> Option<(String, String, String)> {
+    statement_key(stmt, parameters, &resolved.key_schema)
+        .map(|(pk, sk)| (table_name.to_string(), pk, sk))
+}
+
+/// What a preparation pass worked out about one statement, so the executor does
+/// not work it out again.
+///
+/// `resolved` is present whenever the table could be read, including for a
+/// statement that pins no single item, because the executor needs it either way.
+/// A batch that hands this back to [`execute_page`] resolves each statement's
+/// table once rather than twice.
+#[derive(Default)]
+pub struct PreparedStatement {
+    pub resolved: Option<ResolvedTable>,
+    /// `(table, pk, sk)` when the statement names exactly one item.
+    pub target: Option<(String, String, String)>,
+}
+
+/// Resolve a statement's table and, where it names one, its single item.
+///
+/// Errors are swallowed for the same reason [`statement_target`] swallows them:
+/// a statement whose table cannot be read is left to fail on its own terms
+/// during execution.
+pub async fn prepare_statement<S: StorageBackend>(
+    storage: &S,
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+) -> PreparedStatement {
+    let Some(table_name) = crate::partiql::parser::table_name(stmt) else {
+        return PreparedStatement::default();
+    };
+    let Ok(resolved) = ResolvedTable::load(storage, table_name).await else {
+        return PreparedStatement::default();
+    };
+    let target = statement_target_in(stmt, parameters, table_name, &resolved);
+    PreparedStatement {
+        resolved: Some(resolved),
+        target,
+    }
+}
+
+/// The single item a statement names, read off an already-parsed key schema.
+fn statement_key(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    key_schema: &crate::actions::helpers::KeySchema,
+) -> Option<(String, String)> {
     let key_of = |source: &dyn Fn(&str) -> Option<AttributeValue>| -> Option<(String, String)> {
         let pk = source(&key_schema.partition_key)?.to_key_string()?;
         let sk = match key_schema.sort_key {
@@ -1066,19 +1159,17 @@ pub async fn statement_target<S: StorageBackend>(
         })
     };
 
-    let (pk, sk) = match stmt {
+    match stmt {
         Statement::Insert { item, .. } => key_of(&|name: &str| {
             item.get(name)
                 .and_then(|v| resolve_value(v, parameters).ok())
-        })?,
+        }),
         Statement::Update { where_clause, .. }
         | Statement::Delete { where_clause, .. }
         // A SELECT resolves only when its WHERE pins every key attribute; one
         // spanning a partition yields nothing and takes no part in the check.
-        | Statement::Select { where_clause, .. } => from_where(where_clause)?,
-    };
-
-    Some((table_name.to_string(), pk, sk))
+        | Statement::Select { where_clause, .. } => from_where(where_clause),
+    }
 }
 
 /// Returns what the insert consumed. An `if_not_exists` duplicate makes it a
@@ -1090,6 +1181,7 @@ async fn execute_insert<S: StorageBackend>(
     parameters: &[AttributeValue],
     if_not_exists: bool,
     capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
 ) -> Result<WriteCapacity> {
     // Resolve any parameter placeholders in the item
     let mut item = HashMap::new();
@@ -1106,18 +1198,29 @@ async fn execute_insert<S: StorageBackend>(
         item.insert(k.clone(), resolved);
     }
 
-    let meta = require_table(storage, table_name).await?;
-    let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
+    // Resolved by the caller when a preparation pass already did it, which is
+    // what stops a batch reading the same table's metadata and parsing the same
+    // key schema once per statement on top of once per batch member.
+    let owned;
+    let resolved = match resolved {
+        Some(r) => r,
+        None => {
+            owned = ResolvedTable::load(storage, table_name).await?;
+            &owned
+        }
+    };
+    let meta = &resolved.meta;
+    let key_schema = &resolved.key_schema;
 
     // Validate keys present
-    crate::actions::helpers::validate_item_keys(&item, &key_schema, &meta)?;
+    crate::actions::helpers::validate_item_keys(&item, key_schema, meta)?;
     crate::validation::validate_item_attribute_values(&item)?;
 
     // Deduplicate sets
     crate::validation::normalize_item_sets(&mut item);
 
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
-    let (pk, sk) = crate::actions::helpers::extract_key_strings(&item, &key_schema)?;
+    let (pk, sk) = crate::actions::helpers::extract_key_strings(&item, key_schema)?;
 
     // PartiQL INSERT must reject duplicates (unlike PutItem which overwrites)
     let existing = storage.get_item(table_name, &pk, &sk).await?;
@@ -1163,7 +1266,7 @@ async fn execute_insert<S: StorageBackend>(
 
     let gsi_units = crate::actions::gsi::maintain_gsis_after_write(
         storage,
-        &meta,
+        meta,
         &target,
         old_item.as_ref(),
         &item,
@@ -1173,7 +1276,7 @@ async fn execute_insert<S: StorageBackend>(
 
     let lsi_units = crate::actions::lsi::maintain_lsis_after_write(
         storage,
-        &meta,
+        meta,
         &target,
         old_item.as_ref(),
         &item,
@@ -1182,7 +1285,7 @@ async fn execute_insert<S: StorageBackend>(
     .await?;
 
     // Stream record
-    crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
+    crate::streams::record_stream_event(storage, meta, old_item.as_ref(), Some(&item)).await?;
 
     // An INSERT rejects an existing key above, so there is never an old image
     // here; `old_item` only ever comes back empty.
@@ -1208,9 +1311,21 @@ async fn execute_update<S: StorageBackend>(
     parameters: &[AttributeValue],
     returning: Option<ReturningVariant>,
     capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
 ) -> Result<(Option<Item>, WriteCapacity)> {
-    let meta = require_table(storage, table_name).await?;
-    let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
+    // Resolved by the caller when a preparation pass already did it, which is
+    // what stops a batch reading the same table's metadata and parsing the same
+    // key schema once per statement on top of once per batch member.
+    let owned;
+    let resolved = match resolved {
+        Some(r) => r,
+        None => {
+            owned = ResolvedTable::load(storage, table_name).await?;
+            &owned
+        }
+    };
+    let meta = &resolved.meta;
+    let key_schema = &resolved.key_schema;
 
     // WHERE clause is required for UPDATE to identify the item
     let wc = where_clause.ok_or_else(|| {
@@ -1301,7 +1416,7 @@ async fn execute_update<S: StorageBackend>(
     crate::validation::normalize_item_sets(&mut item);
 
     // Reject an index key this update set to an invalid value (see helpers).
-    crate::actions::helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
+    crate::actions::helpers::validate_updated_index_keys(&before_item, &item, meta)?;
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
@@ -1336,7 +1451,7 @@ async fn execute_update<S: StorageBackend>(
 
     let gsi_units = crate::actions::gsi::maintain_gsis_after_write(
         storage,
-        &meta,
+        meta,
         &target,
         old_ref,
         &item,
@@ -1346,7 +1461,7 @@ async fn execute_update<S: StorageBackend>(
 
     let lsi_units = crate::actions::lsi::maintain_lsis_after_write(
         storage,
-        &meta,
+        meta,
         &target,
         old_ref,
         &item,
@@ -1355,7 +1470,7 @@ async fn execute_update<S: StorageBackend>(
     .await?;
 
     // Stream record
-    crate::streams::record_stream_event(storage, &meta, old_ref, Some(&item)).await?;
+    crate::streams::record_stream_event(storage, meta, old_ref, Some(&item)).await?;
 
     // Build the RETURNING projection from the item's before/after states. The
     // MODIFIED variants project each touched path (a nested `a.b` yields just
@@ -1501,9 +1616,21 @@ async fn execute_delete<S: StorageBackend>(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
 ) -> Result<(Option<Item>, WriteCapacity)> {
-    let meta = require_table(storage, table_name).await?;
-    let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
+    // Resolved by the caller when a preparation pass already did it, which is
+    // what stops a batch reading the same table's metadata and parsing the same
+    // key schema once per statement on top of once per batch member.
+    let owned;
+    let resolved = match resolved {
+        Some(r) => r,
+        None => {
+            owned = ResolvedTable::load(storage, table_name).await?;
+            &owned
+        }
+    };
+    let meta = &resolved.meta;
+    let key_schema = &resolved.key_schema;
 
     let wc = where_clause.ok_or_else(|| {
         DynoxideError::ValidationException("DELETE requires a WHERE clause".to_string())
@@ -1585,7 +1712,7 @@ async fn execute_delete<S: StorageBackend>(
 
     let gsi_units = crate::actions::gsi::maintain_gsis_after_delete(
         storage,
-        &meta,
+        meta,
         &target,
         old_item.as_ref(),
         capacity_mode,
@@ -1594,7 +1721,7 @@ async fn execute_delete<S: StorageBackend>(
 
     let lsi_units = crate::actions::lsi::maintain_lsis_after_delete(
         storage,
-        &meta,
+        meta,
         &target,
         old_item.as_ref(),
         capacity_mode,
@@ -1603,7 +1730,7 @@ async fn execute_delete<S: StorageBackend>(
 
     // Stream record
     if old_item.is_some() {
-        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
+        crate::streams::record_stream_event(storage, meta, old_item.as_ref(), None).await?;
     }
 
     // A delete is charged on the item it removed, so a no-op delete against a

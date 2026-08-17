@@ -4,6 +4,7 @@ use crate::actions::index_capacity::{
 };
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::partiql;
+use crate::partiql::executor::ResolvedTable;
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
@@ -134,15 +135,33 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         ));
     }
 
+    // Duplicate detection resolves each statement's table, and the executor
+    // needs the same metadata and key schema a moment later, so they are kept
+    // here rather than resolved twice per statement.
     let mut seen_targets = HashSet::new();
+    // Keyed by table rather than by statement: the metadata and key schema are
+    // per table, and only the key is per statement.
+    let mut tables: HashMap<String, ResolvedTable> = HashMap::new();
     for (stmt, params) in &parsed {
-        if let Some(target) = partiql::executor::statement_target(storage, stmt, params).await {
-            if !seen_targets.insert(target) {
-                return Err(DynoxideError::ValidationException(
-                    "Transaction request cannot include multiple operations on one item"
-                        .to_string(),
-                ));
-            }
+        let Some(name) = partiql::parser::table_name(stmt) else {
+            continue;
+        };
+        if !tables.contains_key(name)
+            && let Ok(resolved) = ResolvedTable::load(storage, name).await
+        {
+            tables.insert(name.to_string(), resolved);
+        }
+        // Absent when the table could not be read, which leaves the statement to
+        // fail on its own terms during execution rather than as a duplicate.
+        let Some(resolved) = tables.get(name) else {
+            continue;
+        };
+        if let Some(target) = partiql::executor::statement_target_in(stmt, params, name, resolved)
+            && !seen_targets.insert(target)
+        {
+            return Err(DynoxideError::ValidationException(
+                "Transaction request cannot include multiple operations on one item".to_string(),
+            ));
         }
     }
 
@@ -152,6 +171,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         execute_within_transaction(
             storage,
             &parsed,
+            &tables,
             request.return_consumed_capacity.as_deref(),
         ),
     )
@@ -300,6 +320,7 @@ pub(crate) fn replay_response(
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
+    tables: &HashMap<String, ResolvedTable>,
     capacity_mode: Option<&str>,
 ) -> Result<(Vec<ItemResponse>, Vec<StatementCharge>)> {
     let mut responses = Vec::with_capacity(parsed.len());
@@ -315,6 +336,7 @@ async fn execute_within_transaction<S: StorageBackend>(
             None,
             false,
             capacity_mode,
+            partiql::parser::table_name(stmt).and_then(|t| tables.get(t)),
         )
         .await
         {

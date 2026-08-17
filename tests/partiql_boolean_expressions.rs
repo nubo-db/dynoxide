@@ -16,6 +16,7 @@ use dynoxide::Database;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
 use dynoxide::types::AttributeValue;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 const TABLE: &str = "pq_bool";
 
@@ -44,11 +45,11 @@ fn seeded() -> Database {
     db
 }
 
-/// The sorted keys a WHERE clause selects.
-fn selects(db: &Database, where_clause: &str) -> String {
+/// The sorted keys a WHERE clause selects from `table`.
+fn selects_in(db: &Database, table: &str, where_clause: &str) -> String {
     let resp = db
         .execute_statement(ExecuteStatementRequest {
-            statement: format!("SELECT pk FROM \"{TABLE}\" WHERE {where_clause}"),
+            statement: format!("SELECT pk FROM \"{table}\" WHERE {where_clause}"),
             ..Default::default()
         })
         .unwrap_or_else(|e| panic!("{where_clause} failed: {e}"));
@@ -63,6 +64,11 @@ fn selects(db: &Database, where_clause: &str) -> String {
         .collect();
     keys.sort();
     keys.join(",")
+}
+
+/// The same, against the table most of these tests share.
+fn selects(db: &Database, where_clause: &str) -> String {
+    selects_in(db, TABLE, where_clause)
 }
 
 #[test]
@@ -255,7 +261,7 @@ fn parse_rejection(db: &Database, statement: String) -> String {
         statement,
         ..Default::default()
     }) {
-        Ok(_) => panic!("a statement nested past the budget must be rejected"),
+        Ok(_) => panic!("a statement past the parser's budget must be rejected"),
         Err(e) => e.to_string(),
     }
 }
@@ -300,6 +306,92 @@ fn a_clause_nested_within_the_budget_still_parses() {
     );
 }
 
+#[test]
+fn the_depth_budget_is_spent_across_both_descents() {
+    // The clause parser and the value parser recurse on the same stack, and each
+    // used to get the whole budget: a WHERE nested to the limit could hold a
+    // value nested to the limit and spend twice as many frames as the bound
+    // allows. The depth now carries from one into the other, so a statement
+    // splitting it between the two is rejected on the total.
+    let db = seeded();
+    let err = parse_rejection(
+        &db,
+        format!(
+            "SELECT * FROM \"{TABLE}\" WHERE {}a={}'x'{}{}",
+            "(".repeat(40),
+            "[".repeat(40),
+            "]".repeat(40),
+            ")".repeat(40)
+        ),
+    );
+    assert!(err.contains("nested too deeply"), "got {err}");
+}
+
+// --- width is bounded too --------------------------------------------------
+//
+// The depth budget bounds how far the descent recurses; it says nothing about
+// how much the flattening then builds. A clause can be shallow and still expand
+// enormously, and the flattener used to build the whole expansion before
+// noticing it was over the cap.
+
+#[test]
+fn a_wide_alternation_is_rejected_without_building_it_first() {
+    // The group cap used to be checked only after the whole alternation had been
+    // flattened, so a clause with tens of thousands of arms allocated every one
+    // of them on its way to a rejection it was always going to get.
+    let db = seeded();
+    let clause = (0..40_000)
+        .map(|i| format!("a='v{i}'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let start = Instant::now();
+    let err = parse_rejection(&db, format!("SELECT * FROM \"{TABLE}\" WHERE {clause}"));
+    assert!(err.contains("too complex"), "got {err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "rejection took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_clause_too_wide_to_flatten_is_rejected_rather_than_grinding() {
+    // A negated `IN` is one group as wide as the list under De Morgan, and each
+    // negated conjunction after it clones that whole group once per alternative.
+    // Capping groups leaves that work unbounded, so a statement of a few tens of
+    // kilobytes used to spend tens of seconds of CPU cloning conditions before
+    // any cap tripped.
+    let db = seeded();
+    let values = (0..4_000)
+        .map(|i| format!("'v{i}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut clause = format!("NOT a IN ({values})");
+    for i in 0..8 {
+        clause.push_str(&format!(" AND NOT (b='p{i}' AND b='q{i}')"));
+    }
+    let start = Instant::now();
+    let err = parse_rejection(&db, format!("SELECT * FROM \"{TABLE}\" WHERE {clause}"));
+    assert!(err.contains("too complex"), "got {err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "rejection took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_clause_within_the_width_budget_still_runs() {
+    // The budget has to leave room for anything anyone would write. A negated
+    // `IN` over a few dozen values is well inside it.
+    let db = seeded();
+    let values = (0..40)
+        .map(|i| format!("'v{i}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(selects(&db, &format!("NOT a IN ({values})")), "1,2,3");
+}
+
 // --- a negated comparison and a missing attribute --------------------------
 
 const GAP_TABLE: &str = "pq_bool_gap";
@@ -334,23 +426,7 @@ fn seeded_with_a_gap() -> Database {
 }
 
 fn selects_with_a_gap(db: &Database, where_clause: &str) -> String {
-    let resp = db
-        .execute_statement(ExecuteStatementRequest {
-            statement: format!("SELECT pk FROM \"{GAP_TABLE}\" WHERE {where_clause}"),
-            ..Default::default()
-        })
-        .unwrap_or_else(|e| panic!("{where_clause} failed: {e}"));
-    let mut keys: Vec<String> = resp
-        .items
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|i| match i.get("pk") {
-            Some(AttributeValue::S(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
-    keys.sort();
-    keys.join(",")
+    selects_in(db, GAP_TABLE, where_clause)
 }
 
 #[test]
@@ -393,6 +469,55 @@ fn a_not_in_an_update_where_is_not_refused_as_an_or() {
     })
     .expect("a NOT in an UPDATE WHERE is not an OR");
     assert_eq!(selects(&db, "b='z'"), "1");
+}
+
+#[test]
+fn an_or_inside_a_not_in_an_update_where_is_accepted_and_touches_one_row() {
+    // The other half of the same point. This clause has an `OR` in it, so a
+    // guard reading the syntax refused it, but De Morgan flattens it to two
+    // groups that both pin `pk='1'`, so it names exactly one item and can run.
+    let db = seeded();
+    db.execute_statement(ExecuteStatementRequest {
+        statement: format!("UPDATE \"{TABLE}\" SET b='z' WHERE pk='1' AND NOT (a='q' OR a='r')"),
+        ..Default::default()
+    })
+    .expect("a clause naming one item is not an OR the guard should refuse");
+    assert_eq!(selects(&db, "b='z'"), "1");
+}
+
+#[test]
+fn a_not_that_names_two_items_in_an_update_where_is_refused() {
+    // The dangerous shape. `NOT (NOT pk='1' AND NOT pk='2')` is `pk='1' OR
+    // pk='2'` with no `OR` written anywhere, so a guard reading the syntax let
+    // it through and the UPDATE then wrote whichever item the first group
+    // happened to name, silently leaving the other one alone.
+    let db = seeded();
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: format!(
+                "UPDATE \"{TABLE}\" SET b='z' WHERE NOT (NOT pk='1' AND NOT pk='2')"
+            ),
+            ..Default::default()
+        })
+        .expect_err("a clause naming two items must not run as one write")
+        .to_string();
+    assert!(err.contains("identifies a single item"), "got {err}");
+    // And nothing was written on the way to the refusal.
+    assert_eq!(selects(&db, "b='z'"), "");
+}
+
+#[test]
+fn a_not_that_names_two_items_in_a_delete_where_is_refused() {
+    let db = seeded();
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: format!("DELETE FROM \"{TABLE}\" WHERE NOT (NOT pk='1' AND NOT pk='2')"),
+            ..Default::default()
+        })
+        .expect_err("a clause naming two items must not run as one delete")
+        .to_string();
+    assert!(err.contains("identifies a single item"), "got {err}");
+    assert_eq!(selects(&db, "pk='1' OR pk='2'"), "1,2");
 }
 
 #[test]

@@ -348,7 +348,7 @@ async fn prepare<S: StorageBackend>(
             // statement to fail on its own terms during execution.
             if let Some(resolved) = tables.get(name) {
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                target = partiql::executor::statement_target_in(stmt, params, name, resolved);
+                target = partiql::executor::statement_target_in(stmt, params, resolved);
             }
         }
         prepared.push(Prepared {

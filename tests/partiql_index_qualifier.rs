@@ -155,12 +155,21 @@ fn attributes(db: &Database, sql: &str) -> Vec<String> {
     names
 }
 
-fn capacity(db: &Database, sql: &str) -> ConsumedCapacity {
-    let req = serde_json::json!({"Statement": sql, "ReturnConsumedCapacity": "INDEXES"});
+/// The capacity a whole request reports, for the cases that need to set more
+/// than the statement.
+fn capacity_in(db: &Database, req: serde_json::Value) -> ConsumedCapacity {
     db.execute_statement(serde_json::from_value(req).unwrap())
         .unwrap()
         .consumed_capacity
         .expect("INDEXES mode reports capacity")
+}
+
+/// The capacity a statement reports under `INDEXES`.
+fn capacity(db: &Database, sql: &str) -> ConsumedCapacity {
+    capacity_in(
+        db,
+        serde_json::json!({"Statement": sql, "ReturnConsumedCapacity": "INDEXES"}),
+    )
 }
 
 fn error(db: &Database, sql: &str) -> String {
@@ -388,6 +397,87 @@ fn a_non_equality_predicate_on_an_unprojected_attribute_is_rejected_when_keyed()
             "for {sql}: got {msg}"
         );
     }
+}
+
+#[test]
+fn a_negated_filter_on_an_unprojected_attribute_is_rejected_when_keyed() {
+    // Captured eu-west-2 2026-08-17. A negation counts as a filter for this
+    // rule: the keyed GSI and the keyed LSI both come back with the same
+    // rejection the positive filter gets, word for word.
+    //
+    // It has to. A negation is true of a row whose attribute is missing, and on
+    // an index that does not carry the attribute every row looks missing, so
+    // serving the read would return exactly the rows the base item contradicts.
+    let db = seeded();
+    for (index, sql) in [
+        (
+            "gsi-keys",
+            format!(
+                "SELECT pk FROM \"{TABLE}\".\"gsi-keys\" WHERE gsiPk2='x2' AND NOT nonproj='N1'"
+            ),
+        ),
+        (
+            "lsi-keys",
+            format!("SELECT pk FROM \"{TABLE}\".\"lsi-keys\" WHERE pk='p' AND NOT nonproj='N1'"),
+        ),
+    ] {
+        let msg = error(&db, &sql);
+        assert!(
+            msg.contains(&format!(
+                "One or more parameter values were invalid: Secondary index {index} \
+                 does not project one or more filter attributes: [nonproj]"
+            )),
+            "for {sql}: got {msg}"
+        );
+    }
+}
+
+#[test]
+fn a_negated_key_equality_is_not_pushed_down_as_a_key() {
+    // `NOT pk = 'p'` is a filter, not a key condition. Nothing may read the
+    // comparison out from under the negation and push it down: a keyed read
+    // would go straight to the one row the statement excludes and return it,
+    // and on an index it would also count as keying the index. Both come back
+    // as scans.
+    let db = seeded();
+
+    // Every fixture row shares `pk='p'`, so a negated key equality on the table
+    // matches nothing, and a key lookup would have returned all four.
+    assert!(
+        keys(&db, &format!("SELECT * FROM \"{TABLE}\" WHERE NOT pk='p'")).is_empty(),
+        "a negated key equality must not become a key lookup"
+    );
+    // `sk` distinguishes them, so this one names the rows that are left.
+    assert_eq!(
+        keys(
+            &db,
+            &format!("SELECT * FROM \"{TABLE}\" WHERE pk='p' AND NOT sk='s1'")
+        ),
+        vec!["p/s2", "p/s3", "p/s4"]
+    );
+
+    // The same against an index. `gsi-all` holds the three rows carrying
+    // `gsiPk`, two of them under `x`, so negating the index key leaves the one
+    // under `y`.
+    assert_eq!(
+        keys(
+            &db,
+            &format!("SELECT * FROM \"{TABLE}\".\"gsi-all\" WHERE NOT gsiPk='x'")
+        ),
+        vec!["p/s2"]
+    );
+}
+
+#[test]
+fn a_negated_filter_on_an_unprojected_attribute_is_served_when_unkeyed() {
+    // Captured eu-west-2 2026-08-17. The keyed/unkeyed distinction survives the
+    // negation: without a condition on the index partition key the read is a
+    // scan, and AWS served it, returning every row the index carries.
+    let db = seeded();
+    let sql = format!("SELECT pk FROM \"{TABLE}\".\"gsi-keys\" WHERE NOT nonproj='N1'");
+    // Three of the four fixture rows carry `gsiPk2`, so three is the whole
+    // index, which is what a filter no row can contradict should return.
+    assert_eq!(keys(&db, &sql).len(), 3, "an unkeyed read is a scan");
 }
 
 #[test]
@@ -975,13 +1065,6 @@ fn big_items() -> Database {
     db
 }
 
-fn capacity_in(db: &Database, req: serde_json::Value) -> ConsumedCapacity {
-    db.execute_statement(serde_json::from_value(req).unwrap())
-        .unwrap()
-        .consumed_capacity
-        .expect("INDEXES mode reports capacity")
-}
-
 #[test]
 fn a_reach_back_over_large_items_is_charged_on_their_bytes() {
     // Three ~9KB rows report table 4.5, not the 1.5 a flat per-row rate gives.
@@ -1032,6 +1115,32 @@ fn a_reach_back_follows_the_requests_consistency() {
 }
 
 #[test]
+fn a_reach_back_is_charged_on_rows_walked_not_rows_kept() {
+    // Captured eu-west-2 2026-08-17. A filter matching none of the three rows
+    // returns nothing and still reports table 4.5, the same as the unfiltered
+    // read of the same rows. The reach-back happens on the way past a row, so
+    // filtering the row out afterwards refunds nothing.
+    let db = big_items();
+    let cap = capacity_in(
+        &db,
+        serde_json::json!({
+            "Statement": format!(
+                "SELECT nonproj FROM \"{BIG_TABLE}\".\"lsi-inc\" WHERE pk='p' AND projattr='absent'"
+            ),
+            "ReturnConsumedCapacity": "INDEXES"
+        }),
+    );
+    assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(4.5));
+    assert_eq!(
+        cap.local_secondary_indexes
+            .as_ref()
+            .and_then(|m| m.get("lsi-inc"))
+            .map(|d| d.capacity_units),
+        Some(0.5)
+    );
+}
+
+#[test]
 fn select_star_against_an_include_index_does_not_reach_back() {
     // The control, and a surprise worth pinning: `SELECT *` names no attribute
     // the index fails to project, so it is served from the index alone and the
@@ -1047,4 +1156,15 @@ fn select_star_against_an_include_index_does_not_reach_back() {
     );
     assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(0.0));
     assert_eq!(cap.capacity_units, 0.5);
+
+    // And the rows say the same thing the capacity does. A zero table arm only
+    // means no reach-back if the attributes it would have fetched are absent,
+    // so the projected set is what comes back and `nonproj` is not in it.
+    assert_eq!(
+        attributes(
+            &db,
+            &format!("SELECT * FROM \"{BIG_TABLE}\".\"lsi-inc\" WHERE pk='p'")
+        ),
+        vec!["lsiSk", "pk", "projattr", "sk"]
+    );
 }

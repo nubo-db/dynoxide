@@ -485,6 +485,18 @@ async fn execute_select<S: StorageBackend>(
         ));
     }
 
+    // An LSI shares its partition with the table, so DynamoDB serves a
+    // projection naming an attribute the index does not carry by reading the
+    // base item. A GSI cannot, and rejects the statement above instead. The
+    // index entry already holds the base key, so the fetch needs nothing the
+    // row does not carry. Captured eu-west-2 2026-08-15 (case Q27).
+    let reach_back = index.as_ref().is_some_and(|idx| {
+        idx.is_lsi
+            && projections
+                .iter()
+                .any(|p| !idx.projects(root_attribute(p), table_key_schema))
+    });
+
     let window = evaluate_window(
         storage,
         table_name,
@@ -496,6 +508,8 @@ async fn execute_select<S: StorageBackend>(
         table_key_schema,
         cursor.as_ref(),
         limit,
+        reach_back,
+        consistent_read,
     )
     .await?;
 
@@ -509,57 +523,12 @@ async fn execute_select<S: StorageBackend>(
         _ => None,
     };
 
-    // An LSI shares its partition with the table, so DynamoDB serves a
-    // projection naming an attribute the index does not carry by reading the
-    // base item. A GSI cannot, and rejects the statement above instead. The
-    // index entry already holds the base key, so the fetch needs nothing the
-    // row does not carry. Captured eu-west-2 2026-08-15 (case Q27).
-    let reach_back = index.as_ref().is_some_and(|idx| {
-        idx.is_lsi
-            && projections
-                .iter()
-                .any(|p| !idx.projects(root_attribute(p), table_key_schema))
-    });
-
-    // Each reach-back is charged on the bytes of the base item it read, at the
-    // request's consistency, and the per-row charges are summed rather than the
-    // bytes. Captured eu-west-2 2026-08-17: three rows reaching back cost 1.5 on
-    // the table arm for ~50 byte and ~3KB base items alike, 4.5 for ~9KB ones,
-    // and 9 for the same 9KB rows under ConsistentRead. Summing the bytes first
-    // would report 3.5 for the 9KB case, which is what the same rows cost read
-    // straight from the table; the reach-back rounds per row instead.
-    let mut base_read_units = 0f64;
-    let mut rows = Vec::with_capacity(window.matched.len());
-    for item in window.matched {
-        if reach_back {
-            let pk = item
-                .get(&table_key_schema.partition_key)
-                .and_then(|v| v.to_key_string())
-                .unwrap_or_default();
-            let sk = match table_key_schema.sort_key.as_deref() {
-                Some(name) => item
-                    .get(name)
-                    .and_then(|v| v.to_key_string())
-                    .unwrap_or_default(),
-                None => String::new(),
-            };
-            if let Some(json) = storage.get_item(table_name, &pk, &sk).await? {
-                if let Ok(full) = serde_json::from_str::<Item>(&json) {
-                    base_read_units += crate::types::read_capacity_units_with_consistency(
-                        crate::types::item_size(&full),
-                        consistent_read,
-                    );
-                    rows.push(full);
-                    continue;
-                }
-            }
-        }
-        rows.push(item);
-    }
+    let base_read_units = window.base_read_units;
 
     // Projections run last, so one that drops the key cannot break the
     // continuation: the cursor comes from the row as it was read.
-    let items = rows
+    let items = window
+        .matched
         .into_iter()
         .map(|item| {
             if projections.is_empty() {
@@ -612,6 +581,9 @@ struct Window {
     /// What those rows weighed as they were read, before the WHERE clause and
     /// before any projection. This is what the read is charged on.
     evaluated_bytes: usize,
+    /// What an LSI reach-back cost on the base table, in read units, summed over
+    /// every row walked rather than every row kept.
+    base_read_units: f64,
 }
 
 /// Read up to `limit` rows starting after `cursor`, and keep the ones the WHERE
@@ -633,6 +605,8 @@ async fn evaluate_window<S: StorageBackend>(
     table_key_schema: &crate::actions::helpers::KeySchema,
     cursor: Option<&Cursor>,
     limit: Option<usize>,
+    reach_back: bool,
+    consistent_read: bool,
 ) -> Result<Window> {
     let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
 
@@ -747,6 +721,7 @@ async fn evaluate_window<S: StorageBackend>(
     // matching every row costs, and one matching nothing costs the same again.
     // Captured eu-west-2 2026-08-15 and 2026-08-16 on ten fixtures.
     let mut evaluated_bytes = 0usize;
+    let mut base_read_units = 0f64;
     let mut matched = Vec::new();
     for (_, _, json) in rows {
         // A row that will not deserialise is a storage fault, and it is reported
@@ -759,8 +734,38 @@ async fn evaluate_window<S: StorageBackend>(
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
         })?;
         evaluated_bytes += crate::types::item_size(&item);
+
+        // The reach-back runs on every row walked, not on the rows the filter
+        // keeps. Charging only the survivors made a filter that matched nothing
+        // free, where AWS charged the same 4.5 on the table arm as the
+        // unfiltered read of the same three rows. Captured eu-west-2 2026-08-17.
+        //
+        // Each reach-back is charged on the bytes of the base item it read, at
+        // the request's consistency, and the per-row charges are summed rather
+        // than the bytes. Three rows reaching back cost 1.5 on the table arm for
+        // ~50 byte and ~3KB base items alike, 4.5 for ~9KB ones, and 9 for the
+        // same 9KB rows under ConsistentRead. Summing the bytes first would
+        // report 3.5 for the 9KB case, which is what the same rows cost read
+        // straight from the table; the reach-back rounds per row instead.
+        let full = if reach_back {
+            fetch_base_item(storage, table_name, table_key_schema, &item).await?
+        } else {
+            None
+        };
+        if let Some(ref full) = full {
+            base_read_units += crate::types::read_capacity_units_with_consistency(
+                crate::types::item_size(full),
+                consistent_read,
+            );
+        }
+
+        // The filter still reads the index row rather than the base item it
+        // reached back for. That is what the index can evaluate, which is why a
+        // keyed read naming an unprojected filter attribute is rejected outright
+        // and an unkeyed one matches nothing. The reach-back serves the
+        // projection, not the WHERE clause.
         if matches_where(&item, where_clause, parameters) {
-            matched.push(item);
+            matched.push(full.unwrap_or(item));
         }
     }
 
@@ -769,7 +774,39 @@ async fn evaluate_window<S: StorageBackend>(
         last_evaluated,
         evaluated,
         evaluated_bytes,
+        base_read_units,
     })
+}
+
+/// Read the base table item an index row points at, for an LSI projection the
+/// index cannot serve on its own.
+///
+/// `None` when the row is genuinely absent, which the caller answers from the
+/// index row instead. A row that is present but will not deserialise is a
+/// storage fault and is reported, the same way the index row itself is.
+async fn fetch_base_item<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    table_key_schema: &crate::actions::helpers::KeySchema,
+    index_row: &Item,
+) -> Result<Option<Item>> {
+    let pk = index_row
+        .get(&table_key_schema.partition_key)
+        .and_then(|v| v.to_key_string())
+        .unwrap_or_default();
+    let sk = match table_key_schema.sort_key.as_deref() {
+        Some(name) => index_row
+            .get(name)
+            .and_then(|v| v.to_key_string())
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    match storage.get_item(table_name, &pk, &sk).await? {
+        Some(json) => Ok(Some(serde_json::from_str::<Item>(&json).map_err(|e| {
+            DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// Where a page stopped: the storage keys of its last row.
@@ -888,9 +925,16 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
 }
 
 /// A digest of the parts of a SELECT that determine its row walk: the WHERE
-/// clause and the parameters. Projections are left out deliberately, because
-/// they run after the read and do not move the cursor. Tokens are ephemeral
-/// and in-process, so the hash does not need to be stable across builds.
+/// clause's groups and the parameters. Projections are left out deliberately,
+/// because they run after the read and do not move the cursor. Tokens are
+/// ephemeral and in-process, so the hash does not need to be stable across
+/// builds.
+///
+/// Whatever is hashed here is part of the continuation token's contract, so the
+/// fields are named one at a time rather than taken off a whole value's `Debug`.
+/// Hashing `WhereClause` wholesale made every field it might ever gain part of
+/// that contract, and adding one that has no bearing on the walk then
+/// invalidated every token already in flight with nothing to say it had.
 fn statement_fingerprint(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
@@ -898,7 +942,13 @@ fn statement_fingerprint(
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{where_clause:?}").hash(&mut hasher);
+    // The groups are the walk. `wrote_or` records how the clause was spelled,
+    // which only decides the wording of a write's refusal, and a clause with no
+    // groups at all is not the same as no clause.
+    match where_clause {
+        Some(wc) => format!("{:?}", wc.groups).hash(&mut hasher),
+        None => "no-where".hash(&mut hasher),
+    }
     // The index is part of the walk, not just of the filter: a token minted
     // against one index would otherwise resume against another at a position
     // that means nothing there.
@@ -1138,14 +1188,16 @@ impl ResolvedTable {
 /// key is per statement. A statement whose key cannot be read yields `None` and
 /// is left to fail on its own terms during execution rather than surfacing here
 /// as a duplicate-detection failure.
+///
+/// The table name comes off the resolution rather than being passed alongside
+/// it, so the two cannot disagree about which table the key belongs to.
 pub fn statement_target_in(
     stmt: &Statement,
     parameters: &[AttributeValue],
-    table_name: &str,
     resolved: &ResolvedTable,
 ) -> Option<(String, String, String)> {
     statement_key(stmt, parameters, &resolved.key_schema)
-        .map(|(pk, sk)| (table_name.to_string(), pk, sk))
+        .map(|(pk, sk)| (resolved.table_name.clone(), pk, sk))
 }
 
 /// The single item a statement names, read off an already-parsed key schema.
@@ -1344,47 +1396,10 @@ async fn execute_update<S: StorageBackend>(
         DynoxideError::ValidationException("UPDATE requires a WHERE clause".to_string())
     })?;
 
-    // DynamoDB does not support OR in UPDATE WHERE clauses. Keyed on what the
-    // author wrote rather than on the group count: De Morgan turns a `NOT` over
-    // a conjunction into several groups, so counting them refused
-    // `NOT (a=1 AND b=2)` with a message about an OR that is not in the
-    // statement.
-    if wc.wrote_or {
-        return Err(DynoxideError::ValidationException(
-            "UPDATE does not support OR conditions in WHERE clause".to_string(),
-        ));
-    }
-
-    // Extract partition key from WHERE (must be in first/only group for key lookup)
-    let pk_cond =
-        find_comparison_in_groups(&wc.groups, &key_schema.partition_key).ok_or_else(|| {
-            DynoxideError::ValidationException(
-                "Where clause does not contain a mandatory equality on all key attributes"
-                    .to_string(),
-            )
-        })?;
-
-    let pk_val = resolve_value(&pk_cond.value, parameters)?;
-    let pk_str = pk_val
-        .to_key_string()
-        .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
-
-    let sk_str = if let Some(ref sk_name) = key_schema.sort_key {
-        let sk_cond = find_comparison_in_groups(&wc.groups, sk_name);
-        if sk_cond.is_none() {
-            return Err(DynoxideError::ValidationException(
-                "Where clause does not contain a mandatory equality on all key attributes"
-                    .to_string(),
-            ));
-        }
-        sk_cond
-            .map(|c| resolve_value(&c.value, parameters))
-            .transpose()?
-            .and_then(|v| v.to_key_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // An UPDATE addresses one item, so the clause has to name one. Judged on the
+    // flattened groups rather than on the syntax, which was wrong both ways
+    // round: see `single_item_key`.
+    let (pk_str, sk_str) = single_item_key("UPDATE", wc, key_schema, parameters)?;
 
     // Get existing item
     let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
@@ -1652,55 +1667,11 @@ async fn execute_delete<S: StorageBackend>(
         DynoxideError::ValidationException("DELETE requires a WHERE clause".to_string())
     })?;
 
-    // DynamoDB does not support OR in DELETE WHERE clauses. Keyed on what the
-    // author wrote rather than on the group count: De Morgan turns a `NOT` over
-    // a conjunction into several groups, so counting them refused
-    // `NOT (a=1 AND b=2)` with a message about an OR that is not in the
-    // statement.
-    if wc.wrote_or {
-        return Err(DynoxideError::ValidationException(
-            "DELETE does not support OR conditions in WHERE clause".to_string(),
-        ));
-    }
-
-    let pk_cond =
-        find_comparison_in_groups(&wc.groups, &key_schema.partition_key).ok_or_else(|| {
-            DynoxideError::ValidationException(
-                "Where clause does not contain a mandatory equality on all key attributes"
-                    .to_string(),
-            )
-        })?;
-
-    let pk_val = resolve_value(&pk_cond.value, parameters)?;
-    let pk_str = pk_val
-        .to_key_string()
-        .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
-
-    // I15: Validate that the sort key is present in the WHERE clause if the table has one
-    if let Some(ref sk_name) = key_schema.sort_key {
-        let has_sk_condition = wc.groups.iter().any(|group| {
-            group.iter().any(|c| match c {
-                WhereCondition::Comparison(comp) => comp.path == *sk_name && comp.op == CompOp::Eq,
-                _ => false,
-            })
-        });
-        if !has_sk_condition {
-            return Err(DynoxideError::ValidationException(
-                "Where clause does not contain a mandatory equality on all key attributes"
-                    .to_string(),
-            ));
-        }
-    }
-
-    let sk_str = if let Some(ref sk_name) = key_schema.sort_key {
-        find_comparison_in_groups(&wc.groups, sk_name)
-            .map(|c| resolve_value(&c.value, parameters))
-            .transpose()?
-            .and_then(|v| v.to_key_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // A DELETE addresses one item, so the clause has to name one, including the
+    // sort key where the table has one. Judged on the flattened groups rather
+    // than on the syntax, which was wrong both ways round: see
+    // `single_item_key`.
+    let (pk_str, sk_str) = single_item_key("DELETE", wc, key_schema, parameters)?;
 
     // Non-key WHERE predicates act as a condition on the existing item, like a
     // conditional write. AWS raises ConditionalCheckFailedException when the item
@@ -1773,6 +1744,81 @@ async fn require_table<S: StorageBackend>(
 
 /// Find a comparison condition matching a given path with Eq operator,
 /// searching across all OR groups.
+/// The single item a write's WHERE clause addresses, as `(pk, sk)` key strings,
+/// or the rejection to give the author.
+///
+/// UPDATE and DELETE address exactly one item, so their WHERE clause has to name
+/// exactly one. Judging that on what the author wrote is wrong in both
+/// directions once De Morgan is involved. `NOT (NOT pk='a' AND NOT pk='b')`
+/// contains no `OR` and names two items, and it used to be accepted and then
+/// silently write only one of them. `pk='a' AND NOT (v='x' OR v='y')` contains
+/// an `OR` and names one item, and it used to be refused. So the judgement is
+/// made on the flattened clause: every group has to pin the same partition key
+/// equality, and the same sort key equality where the table has one.
+///
+/// `wrote_or` survives only to choose the wording, so an author who wrote an
+/// `OR` still hears about their `OR` rather than about a flattening they never
+/// asked for.
+fn single_item_key(
+    verb: &str,
+    wc: &WhereClause,
+    key_schema: &crate::actions::helpers::KeySchema,
+    parameters: &[AttributeValue],
+) -> Result<(String, String)> {
+    // A clause that never expanded can only fail by leaving a key unpinned, and
+    // that is the message AWS gives for it.
+    let unpinned = || {
+        DynoxideError::ValidationException(
+            "Where clause does not contain a mandatory equality on all key attributes".to_string(),
+        )
+    };
+    let expands = || {
+        DynoxideError::ValidationException(if wc.wrote_or {
+            format!("{verb} does not support OR conditions in WHERE clause")
+        } else {
+            format!("{verb} requires a WHERE clause that identifies a single item")
+        })
+    };
+    // More than one group means the clause is a disjunction, however it was
+    // spelled, so a group that fails is a second item rather than a typo.
+    let refusal = || {
+        if wc.groups.len() > 1 {
+            expands()
+        } else {
+            unpinned()
+        }
+    };
+
+    let mut pinned: Option<(String, String)> = None;
+    for group in &wc.groups {
+        let pk_cond = find_comparison(group, &key_schema.partition_key).ok_or_else(refusal)?;
+        let pk = resolve_value(&pk_cond.value, parameters)?
+            .to_key_string()
+            .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
+        let sk = match key_schema.sort_key {
+            Some(ref sk_name) => {
+                let sk_cond = find_comparison(group, sk_name).ok_or_else(refusal)?;
+                resolve_value(&sk_cond.value, parameters)?
+                    .to_key_string()
+                    .unwrap_or_default()
+            }
+            None => String::new(),
+        };
+        let key = (pk, sk);
+        match pinned {
+            // Every group has to name the same item, or the statement addresses
+            // more than one and cannot run as a single write.
+            Some(ref already) => {
+                if *already != key {
+                    return Err(expands());
+                }
+            }
+            None => pinned = Some(key),
+        }
+    }
+    pinned.ok_or_else(unpinned)
+}
+
 fn find_comparison_in_groups<'a>(
     groups: &'a [Vec<WhereCondition>],
     path: &str,

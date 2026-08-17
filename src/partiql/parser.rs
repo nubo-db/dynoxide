@@ -310,33 +310,27 @@ pub struct WhereClause {
 }
 
 impl WhereClause {
-    /// Create a WhereClause from a single group of AND-joined conditions.
-    pub fn from_conditions(conditions: Vec<WhereCondition>) -> Self {
-        Self {
-            groups: vec![conditions],
-            wrote_or: false,
-        }
-    }
-
-    /// Create a WhereClause from multiple OR-groups.
+    /// Create a WhereClause from flattened OR-groups, saying separately whether
+    /// the clause was written with an `OR`.
     ///
-    /// More than one group is taken as an `OR`, which is what a caller building
-    /// groups by hand means by them. The parser knows better and says so with
-    /// [`WhereClause::from_groups_written`].
-    pub fn from_groups(groups: Vec<Vec<WhereCondition>>) -> Self {
-        let wrote_or = groups.len() > 1;
-        Self { groups, wrote_or }
-    }
-
-    /// Create a WhereClause from flattened groups, saying separately whether the
-    /// clause was written with an `OR`.
+    /// The only constructor, because `wrote_or` cannot be worked out from the
+    /// groups. The two that tried, by taking more than one group to mean an `OR`
+    /// and one group to mean none, were wrong in both directions: De Morgan
+    /// turns `NOT (a=1 AND b=2)` into two groups from a clause with no `OR` in
+    /// it, and flattens `pk='x' AND NOT (a=1 OR b=2)` from a clause that has one
+    /// into groups that all name the same item.
     pub fn from_groups_written(groups: Vec<Vec<WhereCondition>>, wrote_or: bool) -> Self {
         Self { groups, wrote_or }
     }
 }
 
 /// A single condition in a WHERE clause — either a comparison or a function call.
+///
+/// Non-exhaustive, like `WhereClause` and `Statement`. The parser gains variants
+/// as it learns predicates, and each one it gained used to break every
+/// downstream `match` on it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum WhereCondition {
     Comparison(Condition),
     /// `NOT` of a comparison, in the same shape as `NotBeginsWith` and
@@ -868,7 +862,7 @@ fn parse_primary(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
             )),
         }
     } else {
-        Ok(BoolExpr::Leaf(parse_single_condition(t)?))
+        Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?))
     }
 }
 
@@ -978,6 +972,20 @@ const MAX_OR_GROUPS: usize = 256;
 /// pathological statement a rejection.
 const MAX_EXPR_DEPTH: usize = 64;
 
+/// How many conditions a flattened clause may hold in total.
+///
+/// `MAX_OR_GROUPS` bounds the number of groups, not the conditions inside them,
+/// and a single group can be very wide: `NOT a IN [8000 items]` is one group of
+/// 8000 leaves under De Morgan. A handful of negated conjunctions then clones
+/// that group up to `MAX_OR_GROUPS` times, so a statement of a few tens of
+/// kilobytes turns into tens of millions of cloned conditions and burns minutes
+/// of CPU before the group cap ever trips. Budgeting the total keeps that a
+/// rejection.
+const MAX_TOTAL_CONDITIONS: usize = 4096;
+
+/// The rejection every clause-complexity budget shares.
+const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
+
 /// The rejection both descents share when they run past `MAX_EXPR_DEPTH`.
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
 
@@ -992,6 +1000,15 @@ fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
             let mut out = Vec::new();
             for term in terms {
                 out.extend(to_dnf(term)?);
+                // Checked inside the loop, not after it. `out` only ever grows
+                // here, so a clause rejected at the end was already over the cap
+                // at the term that crossed it; testing as we go rejects exactly
+                // the same statements without first building the whole thing.
+                // A wide alternation is otherwise gigabytes of groups before the
+                // rejection it was always going to get.
+                if out.len() > MAX_OR_GROUPS {
+                    return Err(TOO_COMPLEX.to_string());
+                }
             }
             out
         }
@@ -999,30 +1016,50 @@ fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
             let mut out: Vec<Vec<WhereCondition>> = vec![Vec::new()];
             for term in terms {
                 let term_groups = to_dnf(term)?;
-                if out.len().saturating_mul(term_groups.len()) > MAX_OR_GROUPS {
-                    return Err("WHERE clause is too complex to evaluate".to_string());
-                }
-                let mut next = Vec::with_capacity(out.len() * term_groups.len());
-                for existing in &out {
-                    for group in &term_groups {
-                        let mut combined = existing.clone();
-                        combined.extend(group.iter().cloned());
-                        next.push(combined);
+                // The common shape: the term is a single conjunction, so the
+                // cross product is just an append onto every group in hand. Take
+                // it without cloning every group we already have.
+                if term_groups.len() == 1 {
+                    for group in out.iter_mut() {
+                        group.extend(term_groups[0].iter().cloned());
                     }
+                } else {
+                    if out.len().saturating_mul(term_groups.len()) > MAX_OR_GROUPS {
+                        return Err(TOO_COMPLEX.to_string());
+                    }
+                    let mut next = Vec::with_capacity(out.len() * term_groups.len());
+                    for existing in &out {
+                        for group in &term_groups {
+                            let mut combined = existing.clone();
+                            combined.extend(group.iter().cloned());
+                            next.push(combined);
+                        }
+                    }
+                    out = next;
                 }
-                out = next;
+                // Group count alone does not bound the work: one group can be
+                // thousands of conditions wide, and the cross product copies
+                // every one of them per term. Budget the conditions too.
+                if out.iter().map(Vec::len).sum::<usize>() > MAX_TOTAL_CONDITIONS {
+                    return Err(TOO_COMPLEX.to_string());
+                }
             }
             out
         }
     };
     if groups.len() > MAX_OR_GROUPS {
-        return Err("WHERE clause is too complex to evaluate".to_string());
+        return Err(TOO_COMPLEX.to_string());
     }
     Ok(groups)
 }
 
 /// Parse a single condition (comparison, function call, etc.).
-fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
+///
+/// `depth` is the boolean nesting already spent getting here, and it carries on
+/// into the value parser rather than restarting at zero. The two descents share
+/// one stack, so a budget each let a clause nested to the limit hold a value
+/// nested to the limit and spend twice the budget in frames.
+fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondition, String> {
     let tok = t.next_token()?.ok_or("Expected condition in WHERE")?;
     let tok_upper = tok.to_uppercase();
 
@@ -1040,7 +1077,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
             if comma != "," {
                 return Err(format!("Expected ',' but got '{comma}'"));
             }
-            let value = parse_value(t, 0)?;
+            let value = parse_value(t, depth)?;
             expect_char(t, ")")?;
             Ok(WhereCondition::BeginsWith(path, value))
         }
@@ -1051,7 +1088,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
             if comma != "," {
                 return Err(format!("Expected ',' but got '{comma}'"));
             }
-            let value = parse_value(t, 0)?;
+            let value = parse_value(t, depth)?;
             expect_char(t, ")")?;
             Ok(WhereCondition::Contains(path, value))
         }
@@ -1069,7 +1106,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                 if comma != "," {
                     return Err(format!("Expected ',' but got '{comma}'"));
                 }
-                let value = parse_value(t, 0)?;
+                let value = parse_value(t, depth)?;
                 expect_char(t, ")")?;
                 Ok(WhereCondition::NotBeginsWith(path, value))
             } else {
@@ -1090,9 +1127,9 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
             match next_upper.as_str() {
                 "BETWEEN" => {
                     t.next_token()?; // consume BETWEEN
-                    let low = parse_value(t, 0)?;
+                    let low = parse_value(t, depth)?;
                     expect_keyword(t, "AND")?;
-                    let high = parse_value(t, 0)?;
+                    let high = parse_value(t, depth)?;
                     Ok(WhereCondition::Between(path, low, high))
                 }
                 "IN" => {
@@ -1119,7 +1156,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                             t.next_token()?; // consume comma
                             continue;
                         }
-                        values.push(parse_value(t, 0)?);
+                        values.push(parse_value(t, depth)?);
                     }
                     Ok(WhereCondition::In(path, values))
                 }
@@ -1150,7 +1187,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                         ">=" => CompOp::Ge,
                         other => return Err(format!("Unknown operator: {other}")),
                     };
-                    let value = parse_value(t, 0)?;
+                    let value = parse_value(t, depth)?;
                     Ok(WhereCondition::Comparison(Condition { path, op, value }))
                 }
             }

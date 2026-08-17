@@ -3991,3 +3991,39 @@ fn partiql_surfaces_reject_an_unknown_return_consumed_capacity() {
         );
     }
 }
+
+/// The same rejection on a replayed `ClientRequestToken`.
+///
+/// A same-token call replays the stored result instead of running the
+/// statements, and the token is keyed on the statements alone, so a replay can
+/// carry a capacity mode the first call never did. The check therefore has to
+/// sit ahead of the idempotency cache, not only inside the work it skips.
+#[test]
+fn a_replayed_transaction_still_rejects_an_unknown_return_consumed_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "rcc_replay");
+    put_test_item(&db, "rcc_replay", "a", "n");
+
+    let call = |mode: &str| {
+        db.execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                statement: "SELECT * FROM \"rcc_replay\" WHERE pk='a'".to_string(),
+                parameters: None,
+            }],
+            client_request_token: Some("rcc-replay-token".to_string()),
+            return_consumed_capacity: Some(mode.to_string()),
+        })
+    };
+
+    // The first call is valid, so it runs and its result is cached against the
+    // token.
+    call("TOTAL").expect("a valid mode runs");
+
+    // The second call would replay that cached result. It must still be
+    // rejected on its own capacity mode.
+    let msg = format!("{:?}", call("TOTALS").unwrap_err());
+    assert!(
+        msg.contains("returnConsumedCapacity") && msg.contains("[INDEXES, TOTAL, NONE]"),
+        "a replay should reject an unknown mode, got {msg}"
+    );
+}

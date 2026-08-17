@@ -71,17 +71,28 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
+/// Reject a `ReturnConsumedCapacity` outside the enum.
+///
+/// Called at the entry points ahead of the idempotency cache as well as inside
+/// [`execute_cached`]. A same-token replay never reaches `execute_cached`, and
+/// the token is keyed on the statements alone, so a second call may carry a
+/// capacity mode the first one never did. A check living only in
+/// `execute_cached` lets that one through. It stays there for callers that reach
+/// it directly.
+pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
+    match crate::validation::return_consumed_capacity_rejection(mode) {
+        Some(msg) => Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn execute_cached<S: StorageBackend>(
     storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<CachedTransaction> {
-    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
-    }
+    reject_bad_capacity_mode(request.return_consumed_capacity.as_deref())?;
 
     let statements = &request.transact_statements;
 
@@ -164,7 +175,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         let Some(resolved) = tables.get(name) else {
             continue;
         };
-        if let Some(target) = partiql::executor::statement_target_in(stmt, params, name, resolved)
+        if let Some(target) = partiql::executor::statement_target_in(stmt, params, resolved)
             && !seen_targets.insert(target)
         {
             return Err(DynoxideError::ValidationException(

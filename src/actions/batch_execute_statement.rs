@@ -84,6 +84,14 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: BatchExecuteStatementRequest,
 ) -> Result<BatchExecuteStatementResponse> {
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
     if request.statements.is_empty() {
         return Err(DynoxideError::ValidationException(
             "1 validation error detected: Value '[]' at 'statements' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),

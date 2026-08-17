@@ -1091,6 +1091,13 @@ fn find_pk_condition<'a>(
 /// The key schema is the half worth carrying. Metadata is answered from a cache
 /// on the native backend and crosses the bridge on wasm, but the key schema is
 /// parsed out of JSON on every call on both, and nothing keeps the parsed form.
+///
+/// A batch resolves this before any of its statements run and every statement
+/// then works from it, so `require_table` no longer runs per statement and a
+/// table altered or dropped part way through a batch is served from the
+/// snapshot taken at the start of it. The window is one request wide and
+/// DynamoDB promises nothing across the members of a batch, so this is recorded
+/// rather than closed.
 #[non_exhaustive]
 pub struct ResolvedTable {
     pub meta: crate::storage::TableMetadata,

@@ -75,6 +75,14 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<CachedTransaction> {
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
     let statements = &request.transact_statements;
 
     // Validate: must have between 1 and 100 statements

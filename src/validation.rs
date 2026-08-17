@@ -139,6 +139,26 @@ pub(crate) fn envelope_message(msg: &str) -> String {
     format!("1 validation error detected: {msg}")
 }
 
+/// The rejection for a `ReturnConsumedCapacity` outside the enum, or `None` when
+/// the value is one DynamoDB accepts.
+///
+/// `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and `Scan` each
+/// spell this check out during their own deserialisation. The PartiQL surfaces
+/// derive their requests instead, so they had nowhere to put it and accepted
+/// anything. That was invisible while the value only chose whether a figure was
+/// reported; it stopped being invisible once an unrecognised value also meant
+/// the write path skipped sizing its indexes.
+pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<String> {
+    let mode = mode?;
+    if ["INDEXES", "TOTAL", "NONE"].contains(&mode) {
+        return None;
+    }
+    Some(format!(
+        "Value '{mode}' at 'returnConsumedCapacity' failed to satisfy constraint: \
+         Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+    ))
+}
+
 /// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
 /// envelope, converting it to a plain `ValidationException`. Every other error
 /// passes through unchanged.

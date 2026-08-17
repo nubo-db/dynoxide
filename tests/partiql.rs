@@ -3929,3 +3929,65 @@ fn test_select_with_an_untranslatable_sort_key_condition_still_filters_correctly
         .collect();
     assert_eq!(sks, vec!["s1", "s4"]);
 }
+
+/// An unrecognised `ReturnConsumedCapacity` is rejected on the PartiQL surfaces
+/// as it already was on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`,
+/// `Query` and `Scan`.
+///
+/// These three derived their requests rather than validating them by hand, so
+/// they took anything. That was hard to see while the value only decided
+/// whether a figure came back; it matters more now that an unrecognised value
+/// also means the write path skips sizing its indexes.
+#[test]
+fn partiql_surfaces_reject_an_unknown_return_consumed_capacity() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "rcc_enum");
+    put_test_item(&db, "rcc_enum", "a", "n");
+    let sql = "SELECT * FROM \"rcc_enum\" WHERE pk='a'";
+
+    let single = db.execute_statement(ExecuteStatementRequest {
+        statement: sql.to_string(),
+        return_consumed_capacity: Some("TOTALS".to_string()),
+        ..Default::default()
+    });
+    let msg = format!("{:?}", single.unwrap_err());
+    assert!(
+        msg.contains("returnConsumedCapacity") && msg.contains("[INDEXES, TOTAL, NONE]"),
+        "ExecuteStatement should reject an unknown mode, got {msg}"
+    );
+
+    let batch = db.batch_execute_statement(BatchExecuteStatementRequest {
+        statements: vec![batch_stmt(sql.to_string())],
+        return_consumed_capacity: Some("TOTALS".to_string()),
+    });
+    assert!(
+        format!("{:?}", batch.unwrap_err()).contains("returnConsumedCapacity"),
+        "BatchExecuteStatement should reject an unknown mode"
+    );
+
+    let txn = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![ParameterizedStatement {
+            statement: sql.to_string(),
+            parameters: None,
+        }],
+        return_consumed_capacity: Some("TOTALS".to_string()),
+        ..Default::default()
+    });
+    assert!(
+        format!("{:?}", txn.unwrap_err()).contains("returnConsumedCapacity"),
+        "ExecuteTransaction should reject an unknown mode"
+    );
+
+    // The three modes DynamoDB does accept still go through.
+    for mode in ["INDEXES", "TOTAL", "NONE"] {
+        assert!(
+            db.execute_statement(ExecuteStatementRequest {
+                statement: sql.to_string(),
+                return_consumed_capacity: Some(mode.to_string()),
+                ..Default::default()
+            })
+            .is_ok(),
+            "{mode} should be accepted"
+        );
+    }
+}

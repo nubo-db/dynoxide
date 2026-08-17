@@ -9,6 +9,14 @@
 //! Without the feature the counters compile to nothing and every test skips, so
 //! the default `cargo test` is unaffected.
 //!
+//! The counters are process-wide, and the test harness runs tests in parallel by
+//! default, so a measurement can pick up another test's work. That is not a
+//! hypothetical: read under parallel threads, an insert into a two-index table
+//! reported 8 entries built where the true figure is 2, and an insert costing
+//! more than an overwrite is the opposite of the answer. Every test therefore
+//! takes `METER` for its whole body, so the counters mean what they say however
+//! the suite is run.
+//!
 //! The metadata figure is the one worth reading carefully. It is counted at the
 //! `StorageBackend` boundary, so it is what a *caller* asks for, not what a
 //! backend does about it. The native backend answers most of them from a
@@ -20,6 +28,7 @@
 
 use dynoxide::Database;
 use dynoxide::bench_counters::{Counts, reset, snapshot};
+use std::sync::{Mutex, MutexGuard};
 
 const TABLE: &str = "counts_tbl";
 
@@ -75,7 +84,23 @@ fn put(db: &Database, sk: &str, mode: Option<&str>) {
     db.put_item(serde_json::from_value(req).unwrap()).unwrap();
 }
 
-/// Count what one operation costs, with the setup already done.
+static METER: Mutex<()> = Mutex::new(());
+
+/// Claim the counters for one test, for its whole body.
+///
+/// It has to cover the setup too, not just the measurements. Building a fixture
+/// table reads metadata, so a test still in `two_index_table` lands its reads in
+/// whatever another test is measuring at that moment. Guarding only `measure`
+/// leaves that hole open, and it is the hole that made an insert read as 8
+/// entries built rather than 2.
+fn meter() -> MutexGuard<'static, ()> {
+    // A panicking test would otherwise poison the lock and turn every later test
+    // into a second, unrelated failure that buries the real one.
+    METER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Count what one operation costs, with the setup already done. Call `meter()`
+/// at the top of the test first.
 fn measure(f: impl FnOnce()) -> Counts {
     reset();
     f();
@@ -86,6 +111,7 @@ fn measure(f: impl FnOnce()) -> Counts {
 
 #[test]
 fn report_index_entry_builds_on_an_overwrite() {
+    let _meter = meter();
     let db = two_index_table();
     put(&db, "s1", None); // seed, so the write measured below has an old image
 
@@ -121,6 +147,7 @@ fn report_index_entry_builds_on_an_overwrite() {
 
 #[test]
 fn report_index_entry_builds_on_an_insert() {
+    let _meter = meter();
     let db = two_index_table();
     let counts = measure(|| put(&db, "fresh", None));
     println!(
@@ -149,6 +176,7 @@ fn batch(db: &Database, count: usize) {
 
 #[test]
 fn report_metadata_reads_across_a_batch() {
+    let _meter = meter();
     let db = two_index_table();
 
     let one = measure(|| batch(&db, 1));
@@ -178,6 +206,7 @@ fn report_metadata_reads_across_a_batch() {
 
 #[test]
 fn report_metadata_reads_for_a_single_statement() {
+    let _meter = meter();
     let db = two_index_table();
     let counts = measure(|| {
         db.execute_statement(

@@ -142,12 +142,16 @@ pub(crate) fn envelope_message(msg: &str) -> String {
 /// The rejection for a `ReturnConsumedCapacity` outside the enum, or `None` when
 /// the value is one DynamoDB accepts.
 ///
-/// `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and `Scan` each
-/// spell this check out during their own deserialisation. The PartiQL surfaces
-/// derive their requests instead, so they had nowhere to put it and accepted
-/// anything. That was invisible while the value only chose whether a figure was
-/// reported; it stopped being invisible once an unrecognised value also meant
-/// the write path skipped sizing its indexes.
+/// The only copy of the enum and its message. `GetItem`, `PutItem`,
+/// `UpdateItem`, `DeleteItem`, `Query` and `Scan` each spelled it out during
+/// their own deserialisation, and the PartiQL surfaces derive their requests
+/// instead, so they had nowhere to put it and accepted anything. That was
+/// invisible while the value only chose whether a figure was reported; it
+/// stopped being invisible once an unrecognised value also meant the write path
+/// skipped sizing its indexes. All nine now ask here.
+///
+/// Callers that collect several failures push the message onto their own errors
+/// vec, so the multi-error envelope they report is unchanged.
 pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<String> {
     let mode = mode?;
     if ["INDEXES", "TOTAL", "NONE"].contains(&mode) {

@@ -141,7 +141,7 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
-- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping to any depth. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally; a clause whose flattened form exceeds 256 alternatives is rejected as too complex
+- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally; a clause whose flattened form exceeds 256 alternatives is rejected as too complex
 - **Projections:** Nested dot-notation paths
 - **Aggregates:** Not supported, matching DynamoDB: a `COUNT(...)` projection is rejected with DynamoDB's `Unexpected path component` message carrying the token's position (captured against eu-west-2)
 - **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2)

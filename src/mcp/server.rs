@@ -364,7 +364,7 @@ pub struct BatchGetItemParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecutePartiqlParams {
     #[schemars(
-        description = "PartiQL statement to execute. Supports SELECT (with LIMIT, nested path projections, and NextToken paging), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping to any depth, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier."
+        description = "PartiQL statement to execute. Supports SELECT (with LIMIT, nested path projections, and NextToken paging), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping up to 64 levels deep, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier."
     )]
     pub statement: String,
 
@@ -1294,7 +1294,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping to any depth, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier. Write statements are blocked in read-only mode."
+        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping up to 64 levels deep, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier. Write statements are blocked in read-only mode."
     )]
     fn execute_partiql(
         &self,

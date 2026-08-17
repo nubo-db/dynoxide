@@ -95,14 +95,10 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         let table_name = raw.table_name.unwrap_or_default();
 
         // ReturnConsumedCapacity enum
-        if let Some(ref rcc) = raw.return_consumed_capacity {
-            if !["INDEXES", "TOTAL", "NONE"].contains(&rcc.as_str()) {
-                errors.push(format!(
-                    "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                    rcc
-                ));
-            }
+        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+            raw.return_consumed_capacity.as_deref(),
+        ) {
+            errors.push(msg);
         }
 
         // Select enum

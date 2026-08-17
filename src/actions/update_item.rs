@@ -82,14 +82,10 @@ fn first_invalid_return_enum(
             ));
         }
     }
-    if let Some(rcc) = return_consumed_capacity {
-        if !["INDEXES", "TOTAL", "NONE"].contains(&rcc) {
-            return Some(format!(
-                "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                rcc
-            ));
-        }
+    if let Some(msg) =
+        crate::validation::return_consumed_capacity_rejection(return_consumed_capacity)
+    {
+        return Some(msg);
     }
     if let Some(ricm) = return_item_collection_metrics {
         if !["SIZE", "NONE"].contains(&ricm) {

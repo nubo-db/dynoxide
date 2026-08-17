@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `execute_partiql` MCP tool accepts `ConsistentRead`. Omitting it was harmless while the field only chose a rate; it now also decides whether a select qualified by a GSI is rejected, so an agent had no way to reach either behaviour.
+
 - `BatchExecuteStatement` accepts `ReturnConsumedCapacity` and reports capacity, which it previously had no way to do at all. Per-table entries with index arms, aggregated across the batch. A failed statement is still charged the write it attempted, sized on the larger of the row already stored and the item it carried; a batch in which nothing succeeds reports no capacity, and a table whose statements all failed is omitted entirely. Captured against eu-west-2.
 
 ### Changed
+
+- **Breaking (behaviour):** the three PartiQL surfaces reject a `ReturnConsumedCapacity` outside `INDEXES`, `TOTAL` and `NONE`, as `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` and `Scan` already did. They derived their requests rather than validating them, so a typo was read as `NONE` and reported nothing. It now also decides whether a write sizes its indexes, so the same typo quietly skipped that too. A request carrying an unrecognised value used to succeed and now fails.
 
 - **Breaking (behaviour):** `BatchExecuteStatement` and `ExecuteTransaction` now reject two request shapes they used to accept, matching DynamoDB. A batch or transaction may not mix reads and writes, and may not name the same item twice, reads included. Both are rejected up front with a top-level `ValidationException` before any statement runs; a request that previously succeeded in either shape now fails. An unparseable member is unaffected and still reports against itself while the rest of the batch runs. Captured against eu-west-2.
 
@@ -75,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An ordering comparison rejects an operand whose type has no ordering. DynamoDB orders `S`, `N` and `B`, and rejects `<`, `<=`, `>`, `>=` and `BETWEEN` against anything else before it resolves the table; dynoxide answered no rows. `=` and `<>` are unaffected, being defined for every type. Captured against eu-west-2.
 
 - An index-qualified `SELECT` inside `ExecuteTransaction` is rejected, as it is on DynamoDB, rather than served and charged to the base table arm.
+
+- A PartiQL read is charged on the rows it walked rather than the rows it handed back. DynamoDB sizes a read before the `WHERE` clause and before the projection, so a `SELECT` matching one row costs what one matching every row costs, and naming one attribute costs what naming all of them costs. `Query` and `Scan` already did this; the PartiQL executor summed the rows it was about to return, so any filtered or projected statement under-reported. Captured against eu-west-2.
+
+- A statement nested deeper than the parser can walk is rejected rather than taking the process with it. Around 250 nested parentheses in a `WHERE` clause, or a few thousand leading `NOT`s, overflowed the stack, and the release profile aborts on panic, so a statement of about a kilobyte was enough to stop the host. Nested list and map literals reached the same end by a second route. Both descents now carry a depth budget and reject past it, as an over-complex clause already was.
+
+- A negated comparison keeps the rows its attribute is missing from. `NOT a='x'` answered on rows holding an `a` and skipped the rest, because negation flipped the operator and `<>` is false on a missing path, while `NOT CONTAINS` wrapped instead and kept them. The two disagreed with each other on the same data. Negation now wraps in every form, so a row the comparison cannot answer for is a row the negation matches.
+
+- A `SELECT` inside `BatchExecuteStatement` naming a table that does not exist reports the missing table. It reported that the statement must specify a primary key in the where clause, which it had, because the check that reads a member's target cannot tell a missing key from a missing table and only the reads went through it. The same batch reported a missing table correctly for a write and misleadingly for a read.
+
+- An LSI read that reaches back to the base table is charged on the bytes each base read moved, not a flat half unit apiece. The flat figure came from one capture of three small rows and holds up to 4KB. Captured again across item sizes: the same three rows at 9KB each cost 4.5 rather than 1.5, and 9 under `ConsistentRead`. A `SELECT *` against an `INCLUDE` index does not reach back at all, and did not before.
+
+- Two pieces of repeated work on the write and batch paths are gone. Index writes were sized on every write, and `ReturnConsumedCapacity` defaults to `NONE`, where the response builders discard the figure, so a default write projected the old image of every index for nobody. An overwrite against a table with two indexes now builds two projected entries rather than four. Separately, a batch resolved each statement's table metadata and parsed its key schema twice, and a failing statement a third time; both are per-table facts, so a batch resolves each table once however many statements it carries. A 25-statement batch goes from 51 metadata loads and 51 key schema parses to one of each, which matters most on the wasm backend, where every load crosses the bridge to a JS worker and nothing caches the result.
 
 - An LSI serves a projection naming an attribute it does not carry by reading the base item, which is what DynamoDB does and a GSI cannot. dynoxide returned rows of empty objects. The base reads land on the table arm at read granularity apiece, so three rows served this way report total 2, table 1.5, lsi 0.5.
 

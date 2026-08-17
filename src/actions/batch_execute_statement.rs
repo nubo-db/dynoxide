@@ -174,7 +174,19 @@ pub async fn execute<S: StorageBackend>(
                 // same message, so an index-qualified read is unreachable here
                 // even when it does name the primary key. Captured eu-west-2
                 // 2026-08-15.
+                //
+                // Only for a table that resolved. A statement has no target
+                // either when its WHERE names no key or when its table could not
+                // be read, and the second is not this rejection: an INSERT or a
+                // DELETE against a table that does not exist reports
+                // ResourceNotFound with the table echoed, and a SELECT must say
+                // the same rather than claim the key is missing when it is
+                // there. Letting it through to `execute_page` is what produces
+                // that, because table resolution is the first thing a SELECT
+                // does.
+                let table_resolved = table.as_deref().is_some_and(|t| tables.contains_key(t));
                 let unkeyed_read = matches!(stmt, partiql::parser::Statement::Select { .. })
+                    && table_resolved
                     && (prepared.target.is_none() || partiql::parser::index_name(&stmt).is_some());
                 if unkeyed_read {
                     responses.push(BatchStatementResponse {

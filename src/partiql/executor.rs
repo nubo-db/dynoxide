@@ -30,7 +30,8 @@ pub async fn execute<S: StorageBackend>(
 }
 
 /// Like [`execute`], but also returns the total item byte size the statement
-/// touched. SELECT reports the summed size of the rows returned;
+/// touched. SELECT reports the summed size of the rows it walked, which is
+/// before its WHERE clause and its projection narrow them;
 /// INSERT/UPDATE/DELETE report the affected item's size (0 when the statement
 /// was a no-op, e.g. a missing DELETE target).
 ///
@@ -70,10 +71,13 @@ pub struct StatementPage {
     /// for every write. Capacity lands on this index's arm rather than on the
     /// table's, which the caller cannot work out from the statement alone.
     pub read_index: Option<ReadIndex>,
-    /// Base table items an LSI reach-back read to serve attributes the index
-    /// does not project. Charged to the table arm, which is why an index read
-    /// can report a non-zero one.
-    pub base_reads: usize,
+    /// What an LSI reach-back cost on the base table, in read units, for the
+    /// attributes the index does not project. Charged to the table arm, which is
+    /// why an index read can report a non-zero one.
+    ///
+    /// Units rather than a row count, because each base read is charged on its
+    /// own bytes at the request's consistency and the sizes are only known here.
+    pub base_read_units: f64,
 }
 
 /// The index a `SELECT` was served from.
@@ -131,7 +135,9 @@ fn validate_ordering_operands(
     for group in &wc.groups {
         for condition in group {
             match condition {
-                WhereCondition::Comparison(c) => {
+                // A negated comparison is checked too: `NOT a < ?` reads the
+                // same operand and DynamoDB rejects it on the same terms.
+                WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => {
                     let op = match c.op {
                         CompOp::Lt => "<",
                         CompOp::Le => "<=",
@@ -188,6 +194,17 @@ pub async fn execute_page<S: StorageBackend>(
             "This operation is not supported on an index".to_string(),
         ));
     }
+
+    // A resolution is an optimisation the caller passes in, and taking it on
+    // trust means applying whatever key schema it holds. A caller that handed
+    // back the wrong table's would have this statement read and write by another
+    // table's keys, silently. Dropping a mismatch costs only the resolution this
+    // was meant to save: the executor loads the table itself instead, which is
+    // slower and right. Every caller in the tree matches, so nothing pays today.
+    let resolved = resolved.filter(|r| {
+        crate::partiql::parser::table_name(stmt).is_some_and(|name| r.table_name == name)
+    });
+
     match stmt {
         Statement::Select {
             table_name,
@@ -218,7 +235,7 @@ pub async fn execute_page<S: StorageBackend>(
                     name: i.def.index_name,
                     is_lsi: i.is_lsi,
                 }),
-                base_reads: outcome.base_reads,
+                base_read_units: outcome.base_read_units,
             })
         }
         Statement::Insert {
@@ -504,7 +521,14 @@ async fn execute_select<S: StorageBackend>(
                 .any(|p| !idx.projects(root_attribute(p), table_key_schema))
     });
 
-    let mut base_reads = 0usize;
+    // Each reach-back is charged on the bytes of the base item it read, at the
+    // request's consistency, and the per-row charges are summed rather than the
+    // bytes. Captured eu-west-2 2026-08-17: three rows reaching back cost 1.5 on
+    // the table arm for ~50 byte and ~3KB base items alike, 4.5 for ~9KB ones,
+    // and 9 for the same 9KB rows under ConsistentRead. Summing the bytes first
+    // would report 3.5 for the 9KB case, which is what the same rows cost read
+    // straight from the table; the reach-back rounds per row instead.
+    let mut base_read_units = 0f64;
     let mut rows = Vec::with_capacity(window.matched.len());
     for item in window.matched {
         if reach_back {
@@ -521,7 +545,10 @@ async fn execute_select<S: StorageBackend>(
             };
             if let Some(json) = storage.get_item(table_name, &pk, &sk).await? {
                 if let Ok(full) = serde_json::from_str::<Item>(&json) {
-                    base_reads += 1;
+                    base_read_units += crate::types::read_capacity_units_with_consistency(
+                        crate::types::item_size(&full),
+                        consistent_read,
+                    );
                     rows.push(full);
                     continue;
                 }
@@ -554,7 +581,7 @@ async fn execute_select<S: StorageBackend>(
         evaluated_bytes: window.evaluated_bytes,
         next_token: token,
         index,
-        base_reads,
+        base_read_units,
     })
 }
 
@@ -569,9 +596,9 @@ struct SelectOutcome {
     evaluated_bytes: usize,
     next_token: Option<String>,
     index: Option<ResolvedIndex>,
-    /// How many base table items an LSI reach-back read. Each one is charged to
-    /// the table arm, leaving the index arm to cover the index read alone.
-    base_reads: usize,
+    /// What an LSI reach-back cost on the base table, in read units. It lands
+    /// on the table arm, leaving the index arm to cover the index read alone.
+    base_read_units: f64,
 }
 
 /// One read of the table: the rows that matched, plus where the read stopped.
@@ -722,9 +749,15 @@ async fn evaluate_window<S: StorageBackend>(
     let mut evaluated_bytes = 0usize;
     let mut matched = Vec::new();
     for (_, _, json) in rows {
-        let Ok(item) = serde_json::from_str::<Item>(&json) else {
-            continue;
-        };
+        // A row that will not deserialise is a storage fault, and it is reported
+        // rather than walked past. Skipping it left the row counted in
+        // `evaluated`, which paces the limit and mints the continuation, but not
+        // in `evaluated_bytes`, which is what the read is charged on, so the two
+        // halves of the same page disagreed about it. `actions::scan` reports the
+        // same fault on the same JSON.
+        let item: Item = serde_json::from_str(&json).map_err(|e| {
+            DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
+        })?;
         evaluated_bytes += crate::types::item_size(&item);
         if matches_where(&item, where_clause, parameters) {
             matched.push(item);
@@ -802,7 +835,7 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
     for group in &wc.groups {
         for condition in group {
             let path = match condition {
-                WhereCondition::Comparison(c) => c.path.as_str(),
+                WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => c.path.as_str(),
                 WhereCondition::Exists(p)
                 | WhereCondition::NotExists(p)
                 | WhereCondition::BeginsWith(p, _)
@@ -981,10 +1014,14 @@ fn translate_sk_conditions(
                     prefix,
                 ));
             }
-            // Any other condition shape on the sort key (IN, contains, negated
-            // begins_with, the existence checks) has no key-condition
-            // equivalent, so nothing at all is pushed down for the sort key.
-            WhereCondition::NotBeginsWith(path, _)
+            // Any other condition shape on the sort key (IN, contains, a
+            // negated comparison, negated begins_with, the existence checks) has
+            // no key-condition equivalent, so nothing at all is pushed down for
+            // the sort key. A negated comparison in particular must never drive
+            // the read: it keeps rows that have no sort key value to compare,
+            // and a range read cannot express that.
+            WhereCondition::NotComparison(crate::partiql::parser::Condition { path, .. })
+            | WhereCondition::NotBeginsWith(path, _)
             | WhereCondition::In(path, _)
             | WhereCondition::Contains(path, _)
             | WhereCondition::Exists(path)
@@ -1010,6 +1047,13 @@ fn translate_sk_conditions(
 /// down as a single key and still scans; AWS rejects an unprojected filter
 /// alongside it. An index key reached through OR does not count, and AWS
 /// accepts an unprojected filter there. Captured eu-west-2 2026-08-15.
+///
+/// "Reached through OR" is the presence of an alternation, not the absence of
+/// the key from some branch of it. Case R11 in that capture ran
+/// `(gsiPk='x' AND nonproj='N1') OR (gsiPk='y')`, where every branch does name
+/// the key, and AWS still accepted the unprojected filter. So the group count is
+/// the test, and a rule reading the key off every group would reject what AWS
+/// allows.
 fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     let Some(wc) = where_clause else {
         return false;
@@ -1042,53 +1086,51 @@ fn find_pk_condition<'a>(
     }
 }
 
-/// The `(table, pk, sk)` a statement targets, for duplicate detection across a
-/// batch. `None` when the statement does not resolve to a single item, which
-/// covers a `SELECT` spanning a partition and anything whose key cannot be read
-/// off the statement.
-///
-/// A `SELECT` naming every key attribute does resolve, and AWS rejects a batch
-/// carrying two of them against one item just as it does for writes.
-///
-/// The result is a tuple rather than a joined string. Joining on a delimiter is
-/// not injective once a key value contains it: `pk='a#b', sk='c'` and
-/// `pk='a', sk='b#c'` render alike, and AWS accepts that pair as two distinct
-/// items.
-///
-/// Errors are swallowed deliberately. A statement whose key cannot be resolved,
-/// or whose table cannot be read, is left to fail on its own terms during
-/// execution rather than surfacing here as a duplicate-detection failure.
-pub async fn statement_target<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-) -> Option<(String, String, String)> {
-    prepare_statement(storage, stmt, parameters).await.target
-}
-
 /// A table's metadata and its parsed key schema, worked out once.
 ///
 /// The key schema is the half worth carrying. Metadata is answered from a cache
 /// on the native backend and crosses the bridge on wasm, but the key schema is
 /// parsed out of JSON on every call on both, and nothing keeps the parsed form.
+#[non_exhaustive]
 pub struct ResolvedTable {
     pub meta: crate::storage::TableMetadata,
     pub key_schema: crate::actions::helpers::KeySchema,
+    /// The table this was resolved from, so a caller handing it to
+    /// [`execute_page`] alongside a statement against another table can be
+    /// spotted rather than obeyed.
+    pub table_name: String,
 }
 
 impl ResolvedTable {
     pub async fn load<S: StorageBackend>(storage: &S, table_name: &str) -> Result<Self> {
         let meta = require_table(storage, table_name).await?;
         let key_schema = crate::actions::helpers::parse_key_schema(&meta)?;
-        Ok(Self { meta, key_schema })
+        Ok(Self {
+            meta,
+            key_schema,
+            table_name: table_name.to_string(),
+        })
     }
 }
 
-/// The single item a statement names, given its table already resolved.
+/// The `(table, pk, sk)` a statement targets, given its table already resolved.
+///
+/// For duplicate detection across a batch. `None` when the statement does not
+/// resolve to a single item, which covers a `SELECT` spanning a partition and
+/// anything whose key cannot be read off the statement. A `SELECT` naming every
+/// key attribute does resolve, and AWS rejects a batch carrying two of them
+/// against one item just as it does for writes.
+///
+/// The result is a tuple rather than a joined string. Joining on a delimiter is
+/// not injective once a key value contains it: `pk='a#b', sk='c'` and
+/// `pk='a', sk='b#c'` render alike, and AWS accepts that pair as two distinct
+/// items.
 ///
 /// Both batch surfaces resolve a table once and then ask this of every statement
 /// against it, because the metadata and the key schema are per table while the
-/// key is per statement.
+/// key is per statement. A statement whose key cannot be read yields `None` and
+/// is left to fail on its own terms during execution rather than surfacing here
+/// as a duplicate-detection failure.
 pub fn statement_target_in(
     stmt: &Statement,
     parameters: &[AttributeValue],
@@ -1097,43 +1139,6 @@ pub fn statement_target_in(
 ) -> Option<(String, String, String)> {
     statement_key(stmt, parameters, &resolved.key_schema)
         .map(|(pk, sk)| (table_name.to_string(), pk, sk))
-}
-
-/// What a preparation pass worked out about one statement, so the executor does
-/// not work it out again.
-///
-/// `resolved` is present whenever the table could be read, including for a
-/// statement that pins no single item, because the executor needs it either way.
-/// A batch that hands this back to [`execute_page`] resolves each statement's
-/// table once rather than twice.
-#[derive(Default)]
-pub struct PreparedStatement {
-    pub resolved: Option<ResolvedTable>,
-    /// `(table, pk, sk)` when the statement names exactly one item.
-    pub target: Option<(String, String, String)>,
-}
-
-/// Resolve a statement's table and, where it names one, its single item.
-///
-/// Errors are swallowed for the same reason [`statement_target`] swallows them:
-/// a statement whose table cannot be read is left to fail on its own terms
-/// during execution.
-pub async fn prepare_statement<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-) -> PreparedStatement {
-    let Some(table_name) = crate::partiql::parser::table_name(stmt) else {
-        return PreparedStatement::default();
-    };
-    let Ok(resolved) = ResolvedTable::load(storage, table_name).await else {
-        return PreparedStatement::default();
-    };
-    let target = statement_target_in(stmt, parameters, table_name, &resolved);
-    PreparedStatement {
-        resolved: Some(resolved),
-        target,
-    }
 }
 
 /// The single item a statement names, read off an already-parsed key schema.
@@ -1332,8 +1337,12 @@ async fn execute_update<S: StorageBackend>(
         DynoxideError::ValidationException("UPDATE requires a WHERE clause".to_string())
     })?;
 
-    // DynamoDB does not support OR in UPDATE WHERE clauses
-    if wc.groups.len() > 1 {
+    // DynamoDB does not support OR in UPDATE WHERE clauses. Keyed on what the
+    // author wrote rather than on the group count: De Morgan turns a `NOT` over
+    // a conjunction into several groups, so counting them refused
+    // `NOT (a=1 AND b=2)` with a message about an OR that is not in the
+    // statement.
+    if wc.wrote_or {
         return Err(DynoxideError::ValidationException(
             "UPDATE does not support OR conditions in WHERE clause".to_string(),
         ));
@@ -1636,8 +1645,12 @@ async fn execute_delete<S: StorageBackend>(
         DynoxideError::ValidationException("DELETE requires a WHERE clause".to_string())
     })?;
 
-    // DynamoDB does not support OR in DELETE WHERE clauses
-    if wc.groups.len() > 1 {
+    // DynamoDB does not support OR in DELETE WHERE clauses. Keyed on what the
+    // author wrote rather than on the group count: De Morgan turns a `NOT` over
+    // a conjunction into several groups, so counting them refused
+    // `NOT (a=1 AND b=2)` with a message about an OR that is not in the
+    // statement.
+    if wc.wrote_or {
         return Err(DynoxideError::ValidationException(
             "DELETE does not support OR conditions in WHERE clause".to_string(),
         ));
@@ -2063,6 +2076,21 @@ fn matches_conditions(
                 };
                 if !compare_values(item_val, &c.op, &target) {
                     return false;
+                }
+            }
+            WhereCondition::NotComparison(c) => {
+                // Logical negation of the comparison, which is why the missing
+                // path is kept rather than dropped: the comparison is false on a
+                // row that has no such attribute, so its negation is true. The
+                // same shape `NOT CONTAINS` and `NOT BEGINS_WITH` already use.
+                if let Some(item_val) = resolve_nested_path(item, &c.path) {
+                    let target = match resolve_value(&c.value, parameters) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    };
+                    if compare_values(item_val, &c.op, &target) {
+                        return false;
+                    }
                 }
             }
             WhereCondition::Exists(path) | WhereCondition::IsNotMissing(path) => {

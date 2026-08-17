@@ -85,7 +85,7 @@ pub async fn execute<S: StorageBackend>(
         capacity,
         next_token,
         read_index,
-        base_reads,
+        base_read_units,
     } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
@@ -109,16 +109,18 @@ pub async fn execute<S: StorageBackend>(
             return match read_index {
                 Some(index) if index.is_lsi => {
                     // A reach-back read the base item for each row, and those
-                    // land on the table arm at read granularity apiece, leaving
-                    // the index arm to cover the index read. Captured
-                    // eu-west-2 2026-08-15: three rows served this way reported
-                    // total 2, table 1.5, lsi 0.5.
-                    let table_units = crate::types::read_capacity_units_with_consistency(0, false)
-                        * base_reads as f64;
+                    // land on the table arm, leaving the index arm to cover the
+                    // index read. Each one is charged on its own bytes at the
+                    // request's consistency and the charges are summed, which
+                    // the executor works out because only it sees the sizes.
+                    // Captured eu-west-2 2026-08-15: three small rows served
+                    // this way reported total 2, table 1.5, lsi 0.5. Captured
+                    // again 2026-08-17 across item sizes: the same three rows at
+                    // ~9KB apiece report table 4.5, and 9 under ConsistentRead.
                     let lsi_units = std::collections::HashMap::from([(index.name, units)]);
                     crate::types::consumed_capacity_with_secondary_indexes(
                         table,
-                        table_units,
+                        base_read_units,
                         &std::collections::HashMap::new(),
                         &lsi_units,
                         &request.return_consumed_capacity,

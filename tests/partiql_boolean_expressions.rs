@@ -239,3 +239,173 @@ fn equality_accepts_every_operand_type() {
         );
     }
 }
+
+// --- nesting is bounded ---------------------------------------------------
+//
+// Both halves of the parser are recursive descents, and neither had a bound.
+// A statement nested past the stack's depth overflowed it, and a stack overflow
+// is not a rejection: the release profile aborts on panic, so one statement took
+// the host process with it rather than failing on its own. These fix the depth
+// budget in place, so what used to abort now comes back as a parse error.
+
+/// The parse rejection a statement gets, or a panic naming what came back
+/// instead.
+fn parse_rejection(db: &Database, statement: String) -> String {
+    match db.execute_statement(ExecuteStatementRequest {
+        statement,
+        ..Default::default()
+    }) {
+        Ok(_) => panic!("a statement nested past the budget must be rejected"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn a_deeply_parenthesised_clause_is_rejected_rather_than_overflowing_the_stack() {
+    let db = seeded();
+    let err = parse_rejection(
+        &db,
+        format!(
+            "SELECT * FROM \"{TABLE}\" WHERE {}pk='1'{}",
+            "(".repeat(500),
+            ")".repeat(500)
+        ),
+    );
+    assert!(err.contains("nested too deeply"), "got {err}");
+}
+
+#[test]
+fn a_long_run_of_nots_is_rejected_rather_than_overflowing_the_stack() {
+    // `NOT` recurses on its own, so it reaches the same cliff by a different
+    // route: this one needs no parentheses at all.
+    let db = seeded();
+    let err = parse_rejection(
+        &db,
+        format!(
+            "SELECT * FROM \"{TABLE}\" WHERE {}pk='1'",
+            "NOT ".repeat(5000)
+        ),
+    );
+    assert!(err.contains("nested too deeply"), "got {err}");
+}
+
+#[test]
+fn a_clause_nested_within_the_budget_still_parses() {
+    // The bound has to leave room for anything anyone would write. Ten levels
+    // of parentheses is already far past that and must still run.
+    let db = seeded();
+    assert_eq!(
+        selects(&db, &format!("{}a='x'{}", "(".repeat(10), ")".repeat(10))),
+        "1"
+    );
+}
+
+// --- a negated comparison and a missing attribute --------------------------
+
+const GAP_TABLE: &str = "pq_bool_gap";
+
+/// Three items, one of which carries no `a` at all, so a negation has something
+/// to be wrong about.
+fn seeded_with_a_gap() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": GAP_TABLE,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (pk, a) in [("1", Some("x")), ("2", Some("y")), ("3", None)] {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+        if let Some(a) = a {
+            item.insert("a".to_string(), AttributeValue::S(a.to_string()));
+        }
+        db.put_item(
+            serde_json::from_value(serde_json::json!({"TableName": GAP_TABLE, "Item": item}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+fn selects_with_a_gap(db: &Database, where_clause: &str) -> String {
+    let resp = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: format!("SELECT pk FROM \"{GAP_TABLE}\" WHERE {where_clause}"),
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| panic!("{where_clause} failed: {e}"));
+    let mut keys: Vec<String> = resp
+        .items
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|i| match i.get("pk") {
+            Some(AttributeValue::S(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    keys.sort();
+    keys.join(",")
+}
+
+#[test]
+fn a_negated_comparison_agrees_with_not_contains_on_a_missing_attribute() {
+    // `a = 'x'` is false on an item carrying no `a`, so `NOT a = 'x'` is true
+    // and that row belongs in the result. Negating by flipping the operator to
+    // `<>` asked a comparison of a value that is not there, which is false
+    // again, so the row was dropped: `NOT a='x'` and `NOT CONTAINS(a, 'x')`
+    // disagreed about item 3 while meaning the same thing about it.
+    let db = seeded_with_a_gap();
+    assert_eq!(selects_with_a_gap(&db, "NOT CONTAINS(a, 'x')"), "2,3");
+    assert_eq!(selects_with_a_gap(&db, "NOT a='x'"), "2,3");
+    // The unnegated form is the control: a missing attribute matches nothing.
+    assert_eq!(selects_with_a_gap(&db, "a='x'"), "1");
+}
+
+#[test]
+fn not_in_and_not_between_keep_a_missing_attribute_too() {
+    // Both expand into negated comparisons rather than flipped ones, so the
+    // rule holds through the expansion as well as at a single condition.
+    let db = seeded_with_a_gap();
+    assert_eq!(selects_with_a_gap(&db, "NOT a IN ['x']"), "2,3");
+    assert_eq!(selects_with_a_gap(&db, "NOT a BETWEEN 'x' AND 'x'"), "2,3");
+    // And a negated group, which reaches the same place through De Morgan.
+    assert_eq!(selects_with_a_gap(&db, "NOT (a='x' OR a='y')"), "3");
+}
+
+// --- what UPDATE and DELETE refuse ----------------------------------------
+
+#[test]
+fn a_not_in_an_update_where_is_not_refused_as_an_or() {
+    // UPDATE and DELETE refuse an OR. De Morgan turns a `NOT` over a
+    // conjunction into a disjunction, so a clause counted after flattening
+    // looked like an OR to the guard and the rejection named something the
+    // author never wrote. The clause is now judged on what was written.
+    let db = seeded();
+    db.execute_statement(ExecuteStatementRequest {
+        statement: format!("UPDATE \"{TABLE}\" SET b='z' WHERE pk='1' AND NOT (a='q' AND b='q')"),
+        ..Default::default()
+    })
+    .expect("a NOT in an UPDATE WHERE is not an OR");
+    assert_eq!(selects(&db, "b='z'"), "1");
+}
+
+#[test]
+fn an_or_in_an_update_where_is_still_refused() {
+    // The control. An OR the author did write is still refused, and the
+    // message still names it.
+    let db = seeded();
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: format!("UPDATE \"{TABLE}\" SET b='z' WHERE pk='1' OR pk='2'"),
+            ..Default::default()
+        })
+        .expect_err("an OR in an UPDATE WHERE is refused")
+        .to_string();
+    assert!(err.contains("does not support OR conditions"), "got {err}");
+}

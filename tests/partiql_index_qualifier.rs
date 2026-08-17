@@ -917,3 +917,134 @@ fn a_token_minted_against_the_table_is_rejected_by_an_index() {
         "got {msg}"
     );
 }
+
+// --- what an LSI reach-back costs, by item size ---------------------------
+//
+// Captured eu-west-2 2026-08-17. The reach-back used to be charged a flat 0.5
+// per row whatever the base item weighed and whatever consistency was asked
+// for, which is right only for items that fit in one read block.
+
+const BIG_TABLE: &str = "pq_idxq_big";
+
+/// Three rows under one partition, each carrying a ~9KB attribute the LSI does
+/// not project, so a select naming it has to read the base item back.
+fn big_items() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": BIG_TABLE,
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi-inc",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["projattr"]}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for n in 1..=3 {
+        db.put_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": BIG_TABLE,
+                "Item": {
+                    "pk": {"S": "p"},
+                    "sk": {"S": format!("s{n}")},
+                    "lsiSk": {"S": format!("l{n}")},
+                    "projattr": {"S": format!("P{n}")},
+                    // Just over two read blocks, so each row rounds to three.
+                    "nonproj": {"S": "x".repeat(9000)}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+fn capacity_in(db: &Database, req: serde_json::Value) -> ConsumedCapacity {
+    db.execute_statement(serde_json::from_value(req).unwrap())
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES mode reports capacity")
+}
+
+#[test]
+fn a_reach_back_over_large_items_is_charged_on_their_bytes() {
+    // Three ~9KB rows report table 4.5, not the 1.5 a flat per-row rate gives.
+    // Each base read rounds on its own bytes (three blocks apiece) and the
+    // charges are summed, which is why this is not 3.5 either: that is what the
+    // same rows cost read straight from the table, where the bytes are summed
+    // before rounding.
+    let db = big_items();
+    let cap = capacity_in(
+        &db,
+        serde_json::json!({
+            "Statement": format!("SELECT nonproj FROM \"{BIG_TABLE}\".\"lsi-inc\" WHERE pk='p'"),
+            "ReturnConsumedCapacity": "INDEXES"
+        }),
+    );
+    assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(4.5));
+    assert_eq!(
+        cap.local_secondary_indexes
+            .as_ref()
+            .and_then(|m| m.get("lsi-inc"))
+            .map(|d| d.capacity_units),
+        Some(0.5)
+    );
+}
+
+#[test]
+fn a_reach_back_follows_the_requests_consistency() {
+    // The same three rows under ConsistentRead report table 9, twice the
+    // eventual rate, so the flag reaches the base reads as well as the index
+    // read.
+    let db = big_items();
+    let cap = capacity_in(
+        &db,
+        serde_json::json!({
+            "Statement": format!("SELECT nonproj FROM \"{BIG_TABLE}\".\"lsi-inc\" WHERE pk='p'"),
+            "ConsistentRead": true,
+            "ReturnConsumedCapacity": "INDEXES"
+        }),
+    );
+    assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(9.0));
+    assert_eq!(
+        cap.local_secondary_indexes
+            .as_ref()
+            .and_then(|m| m.get("lsi-inc"))
+            .map(|d| d.capacity_units),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn select_star_against_an_include_index_does_not_reach_back() {
+    // The control, and a surprise worth pinning: `SELECT *` names no attribute
+    // the index fails to project, so it is served from the index alone and the
+    // table arm stays at zero however large the base items are. Captured at
+    // total 0.5.
+    let db = big_items();
+    let cap = capacity_in(
+        &db,
+        serde_json::json!({
+            "Statement": format!("SELECT * FROM \"{BIG_TABLE}\".\"lsi-inc\" WHERE pk='p'"),
+            "ReturnConsumedCapacity": "INDEXES"
+        }),
+    );
+    assert_eq!(cap.table.as_ref().map(|t| t.capacity_units), Some(0.0));
+    assert_eq!(cap.capacity_units, 0.5);
+}

@@ -8,6 +8,7 @@
 use dynoxide::Database;
 use dynoxide::actions::batch_write_item::{BatchWriteItemRequest, PutRequest, WriteRequest};
 use dynoxide::actions::create_table::CreateTableRequest;
+use dynoxide::actions::execute_statement::ExecuteStatementRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::transact_write_items::{
     TransactPut, TransactUpdate, TransactWriteItem, TransactWriteItemsRequest,
@@ -311,4 +312,114 @@ fn a_transacted_update_is_not_charged_the_standalone_update_overhead() {
         ..Default::default()
     })
     .expect("a transacted update accepts it");
+}
+
+#[test]
+fn an_update_can_never_store_an_item_over_the_hard_limit() {
+    // Taking the key attributes out of the update measure buys headroom that
+    // grows with the key. DynamoDB really does let a long-key update past 400KB,
+    // but storing an over-limit item is what this issue was about: the recorded
+    // size feeds table statistics, and no other write path can replace the row.
+    let db = Database::memory().unwrap();
+    db.create_table(CreateTableRequest {
+        table_name: "Big".to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::HASH,
+        }],
+        attribute_definitions: vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: ScalarAttributeType::S,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let key = "k".repeat(2000);
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Big".to_string(),
+            key: HashMap::from([("pk".to_string(), AttributeValue::S(key.clone()))]),
+            update_expression: Some("SET #b = :v".to_string()),
+            expression_attribute_names: Some(HashMap::from([("#b".to_string(), "b".to_string())])),
+            expression_attribute_values: Some(HashMap::from([(
+                ":v".to_string(),
+                // resulting item = pk (2 + 2000) + "b" (1) + blob, one byte over
+                AttributeValue::S("x".repeat(MAX_ITEM_SIZE - 2003 + 1)),
+            )])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Item size to update has exceeded the maximum allowed size"
+    );
+
+    let stats = db.table_stats().unwrap();
+    let big = stats.iter().find(|s| s.table_name == "Big").unwrap();
+    assert_eq!(big.item_count, 0, "nothing over the limit was stored");
+}
+
+/// Run a PartiQL statement, returning the error text if it was refused.
+fn partiql(db: &Database, statement: String) -> Result<(), String> {
+    db.execute_statement(ExecuteStatementRequest {
+        statement,
+        ..Default::default()
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn the_partiql_write_paths_hold_the_item_size_limit() {
+    // Both used to compute a size, hand it to storage and never check it, so the
+    // symptom this issue is about survived on two more write surfaces: an
+    // over-limit row stored, and its size fed to table statistics.
+    let db = make_db();
+    let over = "x".repeat(MAX_ITEM_SIZE + 1);
+
+    let err = partiql(
+        &db,
+        format!("INSERT INTO \"Items\" VALUE {{'pk': 'k1', 'b': '{over}'}}"),
+    )
+    .expect_err("INSERT over the limit");
+    assert_eq!(err, "Item size has exceeded the maximum allowed size");
+
+    partiql(&db, "INSERT INTO \"Items\" VALUE {'pk': 'k2'}".to_string()).unwrap();
+    let err = partiql(
+        &db,
+        format!("UPDATE \"Items\" SET b = '{over}' WHERE pk = 'k2'"),
+    )
+    .expect_err("UPDATE over the limit");
+    assert_eq!(
+        err,
+        "Item size to update has exceeded the maximum allowed size"
+    );
+
+    let stats = db.table_stats().unwrap();
+    let items = stats.iter().find(|s| s.table_name == "Items").unwrap();
+    assert!(
+        (items.size_bytes as usize) < MAX_ITEM_SIZE,
+        "nothing over the limit was stored"
+    );
+}
+
+#[test]
+fn a_partiql_update_is_measured_flat_like_an_insert() {
+    // Captured against eu-west-2: a PartiQL UPDATE accepts a resulting item of
+    // 409,600, which the standalone UpdateItem refuses at the same key because
+    // it takes the key attributes out and charges per action. Of the write
+    // surfaces, only UpdateItem carries that rule.
+    let db = make_db();
+    partiql(&db, "INSERT INTO \"Items\" VALUE {'pk': 'k'}".to_string()).unwrap();
+
+    // resulting item = pk (2 + 1) + "b" (1) + blob, landing exactly on the limit
+    let blob = "x".repeat(MAX_ITEM_SIZE - 4);
+    partiql(
+        &db,
+        format!("UPDATE \"Items\" SET b = '{blob}' WHERE pk = 'k'"),
+    )
+    .expect("PartiQL UPDATE accepts an item at the flat limit");
+
+    set_blob(&db, "k2", MAX_ITEM_SIZE - 4).expect_err("UpdateItem refuses the same item");
 }

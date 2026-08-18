@@ -606,9 +606,19 @@ async fn execute_inner<S: StorageBackend>(
         // differently from a put: the key attributes come out of the figure and
         // each action adds a fixed cost, so an item can be reachable by PutItem
         // and out of reach by UpdateItem. See `UpdateExpr::size_overhead`.
+        //
+        // The item itself is held to the hard limit as well. Taking the key out
+        // of the measure buys headroom that grows with the key, and DynamoDB
+        // does let an update past 400KB on a long key: at a 2,000-byte key it
+        // accepts a finished item of 410,596 bytes. Storing that is the very
+        // thing this issue was about, because the recorded size then feeds table
+        // statistics and the item-collection estimate, and nothing else in the
+        // engine can write or replace the row. So the ceiling stays, and a
+        // narrow band of long-key updates that DynamoDB accepts are refused
+        // here. Short keys, which is nearly all of them, are unaffected.
         let size = types::item_size(&item);
         let measured = size.saturating_sub(key_attributes_size(&item, &key_schema)) + size_overhead;
-        if measured > types::MAX_ITEM_SIZE {
+        if measured > types::MAX_ITEM_SIZE || size > types::MAX_ITEM_SIZE {
             return Err(DynoxideError::ValidationException(
                 "Item size to update has exceeded the maximum allowed size".to_string(),
             ));

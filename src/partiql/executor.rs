@@ -1310,6 +1310,15 @@ async fn execute_insert<S: StorageBackend>(
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
     let item_size = crate::types::item_size(&item);
 
+    // An INSERT is held to the same flat limit as PutItem, and reports it in the
+    // same words. Captured against eu-west-2, where the ceiling is 409,600 on
+    // the item itself.
+    if item_size > crate::types::MAX_ITEM_SIZE {
+        return Err(DynoxideError::ValidationException(
+            "Item size has exceeded the maximum allowed size".to_string(),
+        ));
+    }
+
     let hash_prefix = item
         .get(&key_schema.partition_key)
         .map(crate::storage::compute_hash_prefix)
@@ -1452,6 +1461,17 @@ async fn execute_update<S: StorageBackend>(
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
     let item_size = crate::types::item_size(&item);
+
+    // A PartiQL UPDATE is measured flat against the resulting item, the same as
+    // an INSERT, and unlike the standalone UpdateItem, which takes the key
+    // attributes out and charges per action. Captured against eu-west-2: an
+    // update this surface accepts at 409,600 is refused by UpdateItem at the
+    // same key. Only the wording is shared with UpdateItem.
+    if item_size > crate::types::MAX_ITEM_SIZE {
+        return Err(DynoxideError::ValidationException(
+            "Item size to update has exceeded the maximum allowed size".to_string(),
+        ));
+    }
 
     let hash_prefix = item
         .get(&key_schema.partition_key)

@@ -535,6 +535,7 @@ fn is_well_formed_dynamo_number(s: &str) -> bool {
 /// agree if the measure does not move.
 pub fn number_size(num_str: &str) -> usize {
     let trimmed = num_str.trim();
+    let negative = trimmed.starts_with('-');
     let abs = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
     let (mantissa, exponent) = parse_number_parts(abs);
 
@@ -544,7 +545,12 @@ pub fn number_size(num_str: &str) -> usize {
     let int_digits = exponent.clamp(0, mantissa.len() as i32) as usize;
     let frac_digits = mantissa.len() - int_digits;
 
-    int_digits.div_ceil(2) + frac_digits.div_ceil(2) + 1
+    // A negative number costs a byte more than the same magnitude positive:
+    // `-42` measures 3 where `42` measures 2. Zero is never negative, whatever
+    // the literal said, so `-0` costs the same as `0`.
+    let sign = usize::from(negative && !mantissa.is_empty());
+
+    int_digits.div_ceil(2) + frac_digits.div_ceil(2) + 1 + sign
 }
 
 /// Normalize a DynamoDB number string to its canonical form.
@@ -1715,6 +1721,12 @@ mod tests {
             ("100.5", 4),
             ("0.15", 2),
             ("15", 2),
+            // a sign costs a byte
+            ("-42", 3),
+            ("-12345", 5),
+            ("-1E125", 3),
+            ("-0.15", 3),
+            ("-0", 1),
         ];
         for (literal, expected) in cases {
             assert_eq!(

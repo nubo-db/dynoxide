@@ -65,7 +65,6 @@ pub struct DeleteAction {
     pub value_ref: String,
 }
 
-/// Parse an UpdateExpression string.
 impl UpdateExpr {
     /// Bytes DynamoDB adds on top of the resulting item when it measures an
     /// update against the 400KB limit.
@@ -93,6 +92,7 @@ impl UpdateExpr {
     }
 }
 
+/// Parse an UpdateExpression string.
 pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
     // Prefix the size error like every other UpdateExpression error; real
     // DynamoDB returns "Invalid UpdateExpression: Expression size has exceeded
@@ -1000,12 +1000,17 @@ mod overhead_tests {
 
     /// The two forms the model knowingly under-charges. Both leave the engine
     /// accepting a little more than DynamoDB, never less, which is the direction
-    /// to be wrong in.
+    /// to be wrong in. Asserted exactly rather than as a bound, so that dropping
+    /// the per-action charge altogether fails here instead of passing.
     #[test]
     fn size_overhead_undercharges_the_two_known_forms() {
-        // DynamoDB charges 42 for a list-index assignment and 91 for arithmetic.
-        assert!(parse("SET b = :v, l[0] = :w").unwrap().size_overhead() <= 42);
-        assert!(parse("SET b = :v, n = n + :one").unwrap().size_overhead() <= 91);
+        // DynamoDB charges 42 for a list-index assignment and 91 for arithmetic,
+        // against the 41 the model charges for either.
+        assert_eq!(parse("SET b = :v, l[0] = :w").unwrap().size_overhead(), 41);
+        assert_eq!(
+            parse("SET b = :v, n = n + :one").unwrap().size_overhead(),
+            41
+        );
     }
 }
 

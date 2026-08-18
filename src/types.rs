@@ -1041,6 +1041,34 @@ fn secondary_index_capacity(
     }
 }
 
+/// Build a `ConsumedCapacity` carrying the classic index arms and the vector
+/// arm together.
+///
+/// The single mode argument is the point: the classic builder and the vector
+/// attach each need one, and passing them separately leaves a caller free to
+/// build under one mode and attach under another, which would put a
+/// `VectorIndexes` map on a `TOTAL`-shaped response.
+pub fn consumed_capacity_with_vector_indexes(
+    table_name: &str,
+    table_units: f64,
+    gsi_units: &HashMap<String, f64>,
+    lsi_units: &HashMap<String, f64>,
+    vector_bytes: &HashMap<String, f64>,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    attach_vector_index_capacity(
+        consumed_capacity_with_secondary_indexes(
+            table_name,
+            table_units,
+            gsi_units,
+            lsi_units,
+            mode,
+        ),
+        vector_bytes,
+        mode,
+    )
+}
+
 /// Attach per-vector-index write bytes to a capacity report.
 ///
 /// Vector replication sits on its own axis, so this never touches
@@ -1049,7 +1077,7 @@ fn secondary_index_capacity(
 /// capture, and an empty `vector_bytes` leaves the response untouched so a
 /// write that changed no vector index reports no map at all rather than an
 /// empty one.
-pub fn attach_vector_index_capacity(
+pub(crate) fn attach_vector_index_capacity(
     capacity: Option<ConsumedCapacity>,
     vector_bytes: &HashMap<String, f64>,
     mode: &Option<String>,

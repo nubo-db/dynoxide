@@ -197,21 +197,28 @@ pub struct SearchVectorsResponse {
     pub consumed_capacity: Option<crate::types::VectorSearchCapacity>,
 }
 
-/// The billable size of a search request: the query vector as the f32s it is
-/// scored against, plus the expression text the request carries, held to the
+/// The billable size of a search: the index entries it scanned, held to the
 /// 1KB floor.
 ///
-/// The capture observed 1024.0 for a three-dimensional fixture, which is that
-/// floor rather than a constant, and left magnitudes above it unpinned. This is
-/// the documented per-byte model, to be refined if a capture ever pins a curve.
-fn search_request_bytes(request: &SearchVectorsRequest) -> f64 {
-    let vector = request.search_vector.len() * std::mem::size_of::<f32>();
-    let condition = request
-        .search_condition_expression
-        .as_deref()
-        .map_or(0, str::len);
-    let projection = request.projection_expression.as_deref().map_or(0, str::len);
-    crate::types::vector_request_bytes(vector + condition + projection)
+/// Captured against eu-west-2 on 2026-08-18, real DynamoDB bills this on the
+/// data the search read rather than on the request. The figure moved with the
+/// table's contents and not with the query, and it does not repeat: five
+/// identical searches over one unchanged 512-dimension index reported 14214,
+/// 13903, 14214, 14214 and 14518. A local engine cannot match a figure AWS does
+/// not reproduce, so this reports the same quantity deterministically, sized on
+/// the entries actually scanned with the write path's captured measure. A
+/// documented divergence in the same class as the equal-score tie break:
+/// deterministic where AWS is not.
+fn search_scanned_bytes(candidates: &[VectorCandidateRow], vix: &VectorIndex) -> f64 {
+    let scanned: usize = candidates
+        .iter()
+        .map(|row| {
+            serde_json::from_str::<Item>(&row.item_json)
+                .map(|projected| crate::actions::vector_index::vector_entry_bytes(&projected, vix))
+                .unwrap_or(0)
+        })
+        .sum();
+    crate::types::vector_request_bytes(scanned)
 }
 
 /// One search hit: the projected item and its score as a JSON double.
@@ -715,7 +722,7 @@ pub async fn execute<S: StorageBackend>(
     let consumed_capacity =
         crate::types::capacity_wanted(request.return_consumed_capacity.as_deref()).then(|| {
             crate::types::VectorSearchCapacity {
-                vector_search_request_bytes: search_request_bytes(&request),
+                vector_search_request_bytes: search_scanned_bytes(&candidates, vix),
             }
         });
 

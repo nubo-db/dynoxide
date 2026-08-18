@@ -441,14 +441,11 @@ pub async fn execute<S: StorageBackend>(
                 .get(table_name)
                 .cloned()
                 .unwrap_or_default();
-            if let Some(cc) = crate::types::attach_vector_index_capacity(
-                crate::types::consumed_capacity_with_secondary_indexes(
-                    table_name,
-                    total_wcu,
-                    &gsi_units,
-                    &lsi_units,
-                    &request.return_consumed_capacity,
-                ),
+            if let Some(cc) = crate::types::consumed_capacity_with_vector_indexes(
+                table_name,
+                total_wcu,
+                &gsi_units,
+                &lsi_units,
                 &vector_bytes,
                 &request.return_consumed_capacity,
             ) {

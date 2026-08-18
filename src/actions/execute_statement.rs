@@ -148,14 +148,11 @@ pub async fn execute<S: StorageBackend>(
                 }
             };
         };
-        crate::types::attach_vector_index_capacity(
-            crate::types::consumed_capacity_with_secondary_indexes(
-                table,
-                crate::types::table_write_capacity_units(capacity.old_size, capacity.new_size),
-                &capacity.gsi_units,
-                &capacity.lsi_units,
-                &request.return_consumed_capacity,
-            ),
+        crate::types::consumed_capacity_with_vector_indexes(
+            table,
+            crate::types::table_write_capacity_units(capacity.old_size, capacity.new_size),
+            &capacity.gsi_units,
+            &capacity.lsi_units,
             &capacity.vector_bytes,
             &request.return_consumed_capacity,
         )

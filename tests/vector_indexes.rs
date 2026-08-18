@@ -738,8 +738,8 @@ fn index_arm(
 /// Per-index capacity reporting and vector shadow-table maintenance run back to
 /// back inside one write transaction. The classic arms must read exactly as
 /// they do on a table with no vector index (total 3, table 1, gsi 1, lsi 1,
-/// from the #176 capture), and the vector index must not appear as an arm of
-/// its own: its capacity shape is a separate surface that reports nothing yet.
+/// from the #176 capture) while the vector arm reports beside them, so this is
+/// the one place all three families are proven correct in a single response.
 #[tokio::test(flavor = "current_thread")]
 async fn classic_index_capacity_is_unchanged_beside_vector_maintenance() {
     let storage = Storage::memory().unwrap();
@@ -766,8 +766,9 @@ async fn classic_index_capacity_is_unchanged_beside_vector_maintenance() {
     assert_eq!(cc.capacity_units, 3.0, "total");
     assert_eq!(index_arm(&cc.global_secondary_indexes, "gsi1"), Some(1.0));
     assert_eq!(index_arm(&cc.local_secondary_indexes, "lsi1"), Some(1.0));
-    // The shadow row landed, so the figures above are not the result of the
-    // vector fan-out having been skipped.
+    // All three families report in one response, and the vector bytes stay off
+    // the unit total asserted above.
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0));
     assert_eq!(shadow_row_count(&storage, "MixedCap::vector::vix"), 1);
 
     let delete = serde_json::from_value(json!({
@@ -784,6 +785,7 @@ async fn classic_index_capacity_is_unchanged_beside_vector_maintenance() {
     assert_eq!(cc.capacity_units, 3.0, "total");
     assert_eq!(index_arm(&cc.global_secondary_indexes, "gsi1"), Some(1.0));
     assert_eq!(index_arm(&cc.local_secondary_indexes, "lsi1"), Some(1.0));
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0));
     assert_eq!(shadow_row_count(&storage, "MixedCap::vector::vix"), 0);
 }
 
@@ -2796,6 +2798,119 @@ async fn delete_charges_the_vector_index_the_item_belonged_to() {
     assert!(cc.vector_indexes.is_none());
 }
 
+/// The captured byte formula, pinned above the 1KB floor where it is actually
+/// visible. Every figure here was observed against real DynamoDB in eu-west-2
+/// on 2026-08-18:
+///
+///   bytes = 4 * dimensions + vector attribute name + item size of the rest of
+///           the projected entry, floored at 1024
+///
+/// The vector is billed at its f32 width, not as the decimal text it stores as,
+/// and it is counted once even when the projection also carries it.
+#[tokio::test(flavor = "current_thread")]
+async fn vector_write_bytes_match_the_captured_formula_above_the_floor() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecBytes").await;
+
+    // 3 dimensions, pk "a", plus a 1500-byte blob.
+    // 12 (vector) + 3 (pk) + 9 (embedding name) + 1504 (blob) = 1528
+    let put = |blob_len: usize, pk: &str| {
+        serde_json::from_value(json!({
+            "TableName": "VecBytes",
+            "Item": {
+                "pk": {"S": pk},
+                "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]},
+                "blob": {"S": "y".repeat(blob_len)}
+            },
+            "ReturnConsumedCapacity": "INDEXES"
+        }))
+        .unwrap()
+    };
+
+    let cc = dynoxide::actions::put_item::execute(&storage, put(1500, "a"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(
+        vector_arm(&cc, "vix"),
+        Some(1528.0),
+        "3-dim + 1500-byte blob"
+    );
+
+    // 12 + 3 + 9 + 3004 = 3028
+    let cc = dynoxide::actions::put_item::execute(&storage, put(3000, "b"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(
+        vector_arm(&cc, "vix"),
+        Some(3028.0),
+        "3-dim + 3000-byte blob"
+    );
+}
+
+/// The same formula at 512 dimensions, across both projection types, which is
+/// where billing the vector as JSON text rather than as f32 diverges most.
+#[tokio::test(flavor = "current_thread")]
+async fn vector_write_bytes_bill_the_vector_at_f32_width_once() {
+    let storage = Storage::memory().unwrap();
+    let vec512: Vec<serde_json::Value> = (0..512).map(|_| json!({"N": "0.5"})).collect();
+    let req: CreateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecWide",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [
+            {"IndexName": "vall", "VectorAttribute": {"AttributeName": "embedding"},
+             "Dimensions": 512, "DistanceFunction": "COSINE",
+             "Projection": {"ProjectionType": "ALL"}},
+            {"IndexName": "vkeys", "VectorAttribute": {"AttributeName": "embedding"},
+             "Dimensions": 512, "DistanceFunction": "COSINE",
+             "Projection": {"ProjectionType": "KEYS_ONLY"}}
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::create_table::execute(&storage, req)
+        .await
+        .unwrap();
+
+    let put = |note: &str| {
+        serde_json::from_value(json!({
+            "TableName": "VecWide",
+            "Item": {"pk": {"S": "a"}, "embedding": {"L": vec512}, "note": {"S": note}},
+            "ReturnConsumedCapacity": "INDEXES"
+        }))
+        .unwrap()
+    };
+
+    let cc = dynoxide::actions::put_item::execute(&storage, put("x"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    // KEYS_ONLY: 2048 + 3 (pk) + 9 (embedding name) = 2060
+    assert_eq!(vector_arm(&cc, "vkeys"), Some(2060.0));
+    // ALL also projects note (4 + 1): 2065
+    assert_eq!(vector_arm(&cc, "vall"), Some(2065.0));
+
+    // Changing only the non-vector attribute charges the index that projects
+    // it and leaves the one that does not entirely absent. Captured against
+    // eu-west-2 with exactly this fixture.
+    let cc = dynoxide::actions::put_item::execute(&storage, put("y"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(vector_arm(&cc, "vall"), Some(2065.0));
+    assert_eq!(
+        vector_arm(&cc, "vkeys"),
+        None,
+        "KEYS_ONLY does not project the changed attribute, so its view is untouched"
+    );
+}
+
 /// The batch and transactional surfaces report the vector arm too. A batch
 /// sums the bytes across its items; a transaction charges the index at its
 /// single-write cost, as the classic arms are (the 2x factor reaches the base
@@ -2997,6 +3112,24 @@ async fn write_valid_for_one_index_and_invalid_for_another_rejects_wholesale() {
 // ---------------------------------------------------------------------------
 
 /// Run a PartiQL statement against the storage, returning the result.
+/// As [`exec_partiql`], asking for per-index capacity so the vector arm is
+/// observable.
+async fn exec_partiql_indexes(
+    storage: &Storage,
+    statement: &str,
+) -> dynoxide::actions::execute_statement::ExecuteStatementResponse {
+    dynoxide::actions::execute_statement::execute(
+        storage,
+        dynoxide::actions::execute_statement::ExecuteStatementRequest {
+            statement: statement.to_string(),
+            return_consumed_capacity: Some("INDEXES".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
 async fn exec_partiql(
     storage: &Storage,
     statement: &str,
@@ -3498,4 +3631,156 @@ async fn update_table_backfill_skips_empty_binary_and_mismatched_filter_values()
         )
         .unwrap();
     assert_eq!(table_pk, "S:scoped");
+}
+
+/// The six write call sites the first cut of this work left unobserved. Each
+/// threads its own old image and capacity mode into the vector fan-out by hand,
+/// so a wrong variable at any one of them compiles and passes every other test.
+#[tokio::test(flavor = "current_thread")]
+async fn every_write_surface_reports_the_vector_arm() {
+    // UpdateItem: an upsert that creates the row, then a REMOVE that drops it.
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecU").await;
+
+    let upsert = serde_json::from_value(json!({
+        "TableName": "VecU",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET embedding = :v",
+        "ExpressionAttributeValues": {":v": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::update_item::execute(&storage, upsert)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0), "UpdateItem creating");
+
+    let remove = serde_json::from_value(json!({
+        "TableName": "VecU",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "REMOVE embedding",
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::update_item::execute(&storage, remove)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(
+        vector_arm(&cc, "vix"),
+        Some(1024.0),
+        "UpdateItem de-indexing charges the row it removed"
+    );
+
+    // BatchWriteItem delete.
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecBD").await;
+    let seed = serde_json::from_value(json!({
+        "TableName": "VecBD",
+        "Item": {"pk": {"S": "a"}, "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}}
+    }))
+    .unwrap();
+    dynoxide::actions::put_item::execute(&storage, seed)
+        .await
+        .unwrap();
+    let batch = serde_json::from_value(json!({
+        "RequestItems": {"VecBD": [{"DeleteRequest": {"Key": {"pk": {"S": "a"}}}}]},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let caps = dynoxide::actions::batch_write_item::execute(&storage, batch)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    let cc = caps.iter().find(|c| c.table_name == "VecBD").unwrap();
+    assert_eq!(vector_arm(cc, "vix"), Some(1024.0), "BatchWriteItem delete");
+
+    // TransactWriteItems update and delete.
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecTC").await;
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [{"Update": {
+            "TableName": "VecTC",
+            "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET embedding = :v",
+            "ExpressionAttributeValues": {":v": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}}
+        }}],
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let caps = dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    let cc = caps.iter().find(|c| c.table_name == "VecTC").unwrap();
+    assert_eq!(vector_arm(cc, "vix"), Some(1024.0), "transacted Update");
+
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [{"Delete": {"TableName": "VecTC", "Key": {"pk": {"S": "a"}}}}],
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let caps = dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    let cc = caps.iter().find(|c| c.table_name == "VecTC").unwrap();
+    assert_eq!(vector_arm(cc, "vix"), Some(1024.0), "transacted Delete");
+}
+
+/// The three PartiQL write paths, which carry their own copy of the wiring.
+#[tokio::test(flavor = "current_thread")]
+async fn partiql_write_paths_report_the_vector_arm() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecPQ").await;
+
+    let resp = exec_partiql_indexes(
+        &storage,
+        "INSERT INTO \"VecPQ\" VALUE {'pk': 'a', 'embedding': [1, 0, 0]}",
+    )
+    .await;
+    let cc = resp.consumed_capacity.expect("INSERT reports capacity");
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0), "PartiQL INSERT");
+
+    let resp = exec_partiql_indexes(
+        &storage,
+        "UPDATE \"VecPQ\" SET embedding = [0, 1, 0] WHERE pk = 'a'",
+    )
+    .await;
+    let cc = resp.consumed_capacity.expect("UPDATE reports capacity");
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0), "PartiQL UPDATE");
+
+    let resp = exec_partiql_indexes(&storage, "DELETE FROM \"VecPQ\" WHERE pk = 'a'").await;
+    let cc = resp.consumed_capacity.expect("DELETE reports capacity");
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0), "PartiQL DELETE");
+}
+
+/// The wire shape, asserted as JSON rather than through Rust fields, so a
+/// serde rename typo cannot pass. The search side is pinned the same way in
+/// tests/search_vectors.rs.
+#[tokio::test(flavor = "current_thread")]
+async fn the_vector_arm_serialises_under_the_captured_key_names() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecWire").await;
+
+    let put = serde_json::from_value(json!({
+        "TableName": "VecWire",
+        "Item": {"pk": {"S": "a"}, "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let resp = dynoxide::actions::put_item::execute(&storage, put)
+        .await
+        .unwrap();
+    let body = serde_json::to_value(&resp).unwrap();
+    assert_eq!(
+        body["ConsumedCapacity"]["VectorIndexes"],
+        json!({"vix": {"VectorWriteRequestBytes": 1024.0}})
+    );
 }

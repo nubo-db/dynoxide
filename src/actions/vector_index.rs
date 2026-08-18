@@ -254,7 +254,21 @@ fn run_vector_write_validation(
 /// on the live path everything rejectable was already rejected by
 /// [`validate_vector_write_attributes`], so only the missing-attribute shapes
 /// still fall through to `None` there.
-pub fn vector_index_row(
+/// A derived shadow row together with the projected entry it was built from.
+///
+/// The projected item is kept rather than discarded because both the capacity
+/// size and the changed-or-not comparison want it as an item: the size is
+/// DynamoDB's own item measure over it, and the comparison is
+/// [`super::index_capacity::unchanged`], the same one the classic arms use.
+/// Serialising it and reading it back would lose both.
+pub(crate) struct DerivedVectorRow {
+    pub row: VectorItemRow,
+    pub projected: Item,
+}
+
+/// As [`vector_index_row`], keeping the projected entry for sizing and
+/// comparison.
+pub(crate) fn derive_vector_row(
     item: &Item,
     vix: &VectorIndex,
     pk_attr: &str,
@@ -262,7 +276,7 @@ pub fn vector_index_row(
     attr_defs: &[AttributeDefinition],
     table_pk: &str,
     table_sk: &str,
-) -> Result<Option<VectorItemRow>> {
+) -> Result<Option<DerivedVectorRow>> {
     let Some(value) = item.get(&vix.vector_attribute.attribute_name) else {
         return Ok(None);
     };
@@ -339,14 +353,34 @@ pub fn vector_index_row(
     let vector_json = serde_json::to_string(&values)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
-    Ok(Some(VectorItemRow {
-        table_pk: table_pk.to_string(),
-        table_sk: table_sk.to_string(),
-        hash_value,
-        vector_json,
-        filter_json,
-        item_json,
+    Ok(Some(DerivedVectorRow {
+        row: VectorItemRow {
+            table_pk: table_pk.to_string(),
+            table_sk: table_sk.to_string(),
+            hash_value,
+            vector_json,
+            filter_json,
+            item_json,
+        },
+        projected,
     }))
+}
+
+/// The shadow row alone, for callers that only write it (the UpdateTable
+/// backfill).
+pub fn vector_index_row(
+    item: &Item,
+    vix: &VectorIndex,
+    pk_attr: &str,
+    sk_attr: Option<&str>,
+    attr_defs: &[AttributeDefinition],
+    table_pk: &str,
+    table_sk: &str,
+) -> Result<Option<VectorItemRow>> {
+    Ok(
+        derive_vector_row(item, vix, pk_attr, sk_attr, attr_defs, table_pk, table_sk)?
+            .map(|derived| derived.row),
+    )
 }
 
 /// Build the projected item copy for a vector index row. The vector attribute
@@ -408,46 +442,50 @@ fn build_vector_index_item(
     }
 }
 
-/// The billable size of one shadow-table row: the stored vector, the filter
-/// values, the projected item copy, and the keys addressing it.
-fn vector_row_bytes(row: &VectorItemRow) -> usize {
-    row.table_pk.len()
-        + row.table_sk.len()
-        + row.hash_value.len()
-        + row.vector_json.len()
-        + row.filter_json.len()
-        + row.item_json.len()
+/// The billable size of one vector index entry, captured against eu-west-2 on
+/// 2026-08-18.
+///
+/// DynamoDB measures the projected entry with its own item-size rule, and bills
+/// the vector itself at its f32 width rather than as the decimal text it
+/// serialises to: `4 * dimensions`, plus the vector attribute's name, plus the
+/// item size of everything else the index projects. Five fixtures fit it with
+/// no residual, from a bare 3-dimensional item at the floor to a 512-dimension
+/// entry carrying a further attribute.
+///
+/// The vector is counted once. Under an ALL projection the projected copy also
+/// carries the vector, so its value is taken out here rather than billed twice.
+pub(crate) fn vector_entry_bytes(projected: &Item, vix: &VectorIndex) -> usize {
+    let vector_attr = vix.vector_attribute.attribute_name.as_str();
+    let rest: usize = projected
+        .iter()
+        .filter(|(name, _)| name.as_str() != vector_attr)
+        .map(|(name, value)| name.len() + value.size())
+        .sum();
+    4 * vix.dimensions as usize + vector_attr.len() + rest
 }
 
-/// Whether two derived rows hold the same stored view, so an overwrite that
+/// Whether two derived entries hold the same stored view, so an overwrite that
 /// produced them is free.
 ///
-/// The projected copy and the filter values are compared as parsed items, not
-/// as the JSON they serialise to. `Item` is a `HashMap`, so two equal items can
-/// serialise to different strings, and the sets inside one are unordered on
-/// DynamoDB's terms while their backing `Vec` is not. The classic fan-out
-/// answers the same question with `index_capacity::unchanged`, and this asks
-/// there so the two families cannot disagree about what a change is.
-///
-/// `hash_value` and `vector_json` are compared directly: one is a key string
-/// and the other an ordered array of f32s, both deterministic.
-fn vector_rows_agree(a: &VectorItemRow, b: &VectorItemRow) -> bool {
-    if a.hash_value != b.hash_value || a.vector_json != b.vector_json {
-        return false;
-    }
-    json_items_agree(&a.filter_json, &b.filter_json) && json_items_agree(&a.item_json, &b.item_json)
-}
-
-/// Compare two serialised items structurally. Unparseable JSON falls back to a
-/// byte comparison, which cannot happen for rows this module derived.
-fn json_items_agree(a: &str, b: &str) -> bool {
-    match (
-        serde_json::from_str::<Item>(a),
-        serde_json::from_str::<Item>(b),
-    ) {
-        (Ok(x), Ok(y)) => super::index_capacity::unchanged(&x, &y),
-        _ => a == b,
-    }
+/// The projected entry is compared with [`super::index_capacity::unchanged`],
+/// the same answer the GSI and LSI arms get. That matters twice over: `Item` is
+/// a `HashMap`, so two equal items can serialise to different strings, and a
+/// re-listed set is unchanged on DynamoDB's terms while its backing `Vec` is
+/// not. The `hash_value` and `vector_json` strings are compared directly, being
+/// a key string and an ordered array of f32s.
+fn vector_rows_agree(a: &DerivedVectorRow, b: &DerivedVectorRow) -> bool {
+    let VectorItemRow {
+        table_pk: _,
+        table_sk: _,
+        hash_value,
+        vector_json,
+        filter_json,
+        item_json: _,
+    } = &a.row;
+    hash_value == &b.row.hash_value
+        && vector_json == &b.row.vector_json
+        && filter_json == &b.row.filter_json
+        && super::index_capacity::unchanged(&a.projected, &b.projected)
 }
 
 /// Bytes charged against one vector index for a write, or `None` when the
@@ -457,8 +495,13 @@ fn json_items_agree(a: &str, b: &str) -> bool {
 /// disappearing costs its own size, an entry changing costs the larger of the
 /// two images, and an identical overwrite costs nothing. `None` is distinct
 /// from `Some(0.0)`, so an untouched index is absent from the response rather
-/// than present and zeroed. Vector figures are bytes against a 1KB floor
-/// rather than KB-rounded units.
+/// than present and zeroed.
+///
+/// A write that leaves the vector alone still charges an index that projects
+/// the attribute it did change, and charges nothing on an index that does not.
+/// Captured against eu-west-2 on 2026-08-18 with two indexes over one vector
+/// attribute differing only in projection: the ALL index was charged, the
+/// KEYS_ONLY index reported no arm at all.
 ///
 /// The classic table has a sixth row, the key move that costs both sides
 /// because it is a delete from one position and an insert into another. A
@@ -466,15 +509,20 @@ fn json_items_agree(a: &str, b: &str) -> bool {
 /// cannot change, so the row is always replaced in place and that row is
 /// unreachable here. Changing the SearchSchema HASH value rewrites a column,
 /// not the row's address.
-fn vector_write_bytes(old: Option<&VectorItemRow>, new: Option<&VectorItemRow>) -> Option<f64> {
+fn vector_write_bytes(
+    old: Option<&DerivedVectorRow>,
+    new: Option<&DerivedVectorRow>,
+    vix: &VectorIndex,
+) -> Option<f64> {
     match (old, new) {
         (None, None) => None,
-        (None, Some(row)) | (Some(row), None) => {
-            Some(crate::types::vector_request_bytes(vector_row_bytes(row)))
-        }
+        (None, Some(entry)) | (Some(entry), None) => Some(crate::types::vector_request_bytes(
+            vector_entry_bytes(&entry.projected, vix),
+        )),
         (Some(before), Some(after)) if vector_rows_agree(before, after) => None,
         (Some(before), Some(after)) => Some(crate::types::vector_request_bytes(
-            vector_row_bytes(before).max(vector_row_bytes(after)),
+            vector_entry_bytes(&before.projected, vix)
+                .max(vector_entry_bytes(&after.projected, vix)),
         )),
     }
 }
@@ -535,7 +583,9 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
     if vixs.is_empty() {
         return Ok(HashMap::new());
     }
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    // Only INDEXES can carry the map to the wire, so TOTAL must not pay for a
+    // figure the response builder will drop.
+    let want_capacity = capacity_mode == Some("INDEXES");
     let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -549,9 +599,7 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
             });
         }
 
-        // Built once here and handed to the sizing below, which would
-        // otherwise derive the same row again.
-        let row = vector_index_row(
+        let derived = derive_vector_row(
             item,
             vix,
             target.pk_attr,
@@ -560,17 +608,12 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
             target.pk,
             target.sk,
         )?;
-        if let Some(ref row) = row {
-            ops.push(IndexWriteOp::InsertVector {
-                table_name: target.table_name.to_string(),
-                index_name: vix.index_name.clone(),
-                row: Box::new(row.clone()),
-            });
-        }
 
+        // Sized before the row is handed to the op list, so the row moves
+        // rather than being cloned to keep it alive for the sizing.
         if want_capacity {
             let previous = match old_item {
-                Some(old) => vector_index_row(
+                Some(old) => derive_vector_row(
                     old,
                     vix,
                     target.pk_attr,
@@ -581,9 +624,17 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
                 )?,
                 None => None,
             };
-            if let Some(bytes) = vector_write_bytes(previous.as_ref(), row.as_ref()) {
+            if let Some(bytes) = vector_write_bytes(previous.as_ref(), derived.as_ref(), vix) {
                 vector_bytes.insert(vix.index_name.clone(), bytes);
             }
+        }
+
+        if let Some(derived) = derived {
+            ops.push(IndexWriteOp::InsertVector {
+                table_name: target.table_name.to_string(),
+                index_name: vix.index_name.clone(),
+                row: Box::new(derived.row),
+            });
         }
     }
 
@@ -632,7 +683,7 @@ pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
     if vixs.is_empty() {
         return Ok(HashMap::new());
     }
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let want_capacity = capacity_mode == Some("INDEXES");
     let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -646,7 +697,7 @@ pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
 
         if want_capacity
             && let Some(old) = old_item
-            && let Some(row) = vector_index_row(
+            && let Some(derived) = derive_vector_row(
                 old,
                 vix,
                 target.pk_attr,
@@ -655,7 +706,7 @@ pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
                 target.pk,
                 target.sk,
             )?
-            && let Some(bytes) = vector_write_bytes(Some(&row), None)
+            && let Some(bytes) = vector_write_bytes(Some(&derived), None, vix)
         {
             vector_bytes.insert(vix.index_name.clone(), bytes);
         }

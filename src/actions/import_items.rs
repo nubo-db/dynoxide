@@ -245,7 +245,7 @@ async fn execute_inner<S: StorageBackend>(
                 };
                 // An import reports no capacity, so the fan-out is asked for
                 // none and skips deriving the old image to size it.
-                super::vector_index::maintain_vector_indexes_after_write_with_defs(
+                let _ = super::vector_index::maintain_vector_indexes_after_write_with_defs(
                     storage,
                     &vector_defs,
                     &attr_defs,

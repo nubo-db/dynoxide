@@ -127,7 +127,15 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"], optio
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 proptest = "1"
-aws-sdk-dynamodb = "1"
+# `default-features = false` drops the SDK's `rustls` feature, which is the
+# legacy hyper 0.14 TLS stack rather than the modern client the same default
+# set already selects. That path carried its own h2 0.3, rustls 0.101 and
+# rustls-pemfile 1.0, none of which have a patched release, and all of which
+# were reported against a dev-dependency the published crate never ships.
+aws-sdk-dynamodb = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 tempfile = "3.25.0"

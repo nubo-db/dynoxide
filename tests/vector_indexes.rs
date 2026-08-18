@@ -724,6 +724,113 @@ fn physical_table_exists(storage: &Storage, name: &str) -> bool {
     count == 1
 }
 
+/// One index's arm of a `ConsumedCapacity`, or `None` when the write left that
+/// index alone and the arm is absent rather than present and zeroed.
+fn index_arm(
+    map: &Option<std::collections::HashMap<String, dynoxide::types::CapacityDetail>>,
+    name: &str,
+) -> Option<f64> {
+    map.as_ref()
+        .and_then(|m| m.get(name))
+        .map(|d| d.capacity_units)
+}
+
+/// Per-index capacity reporting and vector shadow-table maintenance run back to
+/// back inside one write transaction. The classic arms must read exactly as
+/// they do on a table with no vector index (total 3, table 1, gsi 1, lsi 1,
+/// from the #176 capture), and the vector index must not appear as an arm of
+/// its own: its capacity shape is a separate surface that reports nothing yet.
+#[tokio::test(flavor = "current_thread")]
+async fn classic_index_capacity_is_unchanged_beside_vector_maintenance() {
+    let storage = Storage::memory().unwrap();
+    let req: CreateTableRequest = serde_json::from_value(full_house_request("MixedCap")).unwrap();
+    dynoxide::actions::create_table::execute(&storage, req)
+        .await
+        .unwrap();
+
+    let put = serde_json::from_value(json!({
+        "TableName": "MixedCap",
+        "Item": {
+            "pk": {"S": "a"}, "sk": {"S": "1"},
+            "gsi_pk": {"S": "g"}, "lsi_sk": {"S": "l"},
+            "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+        },
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::put_item::execute(&storage, put)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert_eq!(cc.capacity_units, 3.0, "total");
+    assert_eq!(index_arm(&cc.global_secondary_indexes, "gsi1"), Some(1.0));
+    assert_eq!(index_arm(&cc.local_secondary_indexes, "lsi1"), Some(1.0));
+    // The shadow row landed, so the figures above are not the result of the
+    // vector fan-out having been skipped.
+    assert_eq!(shadow_row_count(&storage, "MixedCap::vector::vix"), 1);
+
+    let delete = serde_json::from_value(json!({
+        "TableName": "MixedCap",
+        "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::delete_item::execute(&storage, delete)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert_eq!(cc.capacity_units, 3.0, "total");
+    assert_eq!(index_arm(&cc.global_secondary_indexes, "gsi1"), Some(1.0));
+    assert_eq!(index_arm(&cc.local_secondary_indexes, "lsi1"), Some(1.0));
+    assert_eq!(shadow_row_count(&storage, "MixedCap::vector::vix"), 0);
+}
+
+/// The batch path parses each index family's definitions once per table and
+/// hands the slices to the defs-accepting fan-out, so its arms are worth
+/// pinning separately from the single-item paths.
+#[tokio::test(flavor = "current_thread")]
+async fn batch_write_reports_classic_index_capacity_beside_vector_maintenance() {
+    let storage = Storage::memory().unwrap();
+    let req: CreateTableRequest = serde_json::from_value(full_house_request("MixedBatch")).unwrap();
+    dynoxide::actions::create_table::execute(&storage, req)
+        .await
+        .unwrap();
+
+    let batch = serde_json::from_value(json!({
+        "RequestItems": {
+            "MixedBatch": [
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "a"}, "sk": {"S": "1"},
+                    "gsi_pk": {"S": "g"}, "lsi_sk": {"S": "l"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }}},
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "b"}, "sk": {"S": "1"},
+                    "gsi_pk": {"S": "g"}, "lsi_sk": {"S": "l"},
+                    "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+                }}}
+            ]
+        },
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let resp = dynoxide::actions::batch_write_item::execute(&storage, batch)
+        .await
+        .unwrap();
+    let per_table = resp.consumed_capacity.expect("INDEXES reports capacity");
+    let cc = per_table
+        .iter()
+        .find(|c| c.table_name == "MixedBatch")
+        .expect("the written table reports an entry");
+    // Two items, each charged one unit on each of the table, the GSI and the LSI.
+    assert_eq!(cc.capacity_units, 6.0, "total");
+    assert_eq!(index_arm(&cc.global_secondary_indexes, "gsi1"), Some(2.0));
+    assert_eq!(index_arm(&cc.local_secondary_indexes, "lsi1"), Some(2.0));
+    assert_eq!(shadow_row_count(&storage, "MixedBatch::vector::vix"), 2);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn vector_index_coexists_with_gsi_and_lsi() {
     let storage = Storage::memory().unwrap();
@@ -2521,6 +2628,51 @@ async fn transact_write_items_maintains_vector_indexes_like_put_item() {
         .await
         .unwrap();
     assert_eq!(shadow_row_count(&storage, "VecTx::vector::vix"), 1);
+}
+
+/// TransactWriteItems carries a separate vector maintenance call for each of
+/// its three action kinds. Put and Delete are covered above; this pins Update,
+/// which creates the item on the first call and de-indexes it on the second.
+#[tokio::test(flavor = "current_thread")]
+async fn transact_update_maintains_vector_indexes_like_update_item() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecTxUpd").await;
+
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [
+            {"Update": {
+                "TableName": "VecTxUpd",
+                "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET embedding = :v",
+                "ExpressionAttributeValues": {
+                    ":v": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }
+            }}
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecTxUpd::vector::vix"), 1);
+
+    // Removing the vector attribute de-indexes through the same path, leaving
+    // the base item in place.
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [
+            {"Update": {
+                "TableName": "VecTxUpd",
+                "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "REMOVE embedding"
+            }}
+        ]
+    }))
+    .unwrap();
+    dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap();
+    assert_eq!(shadow_row_count(&storage, "VecTxUpd::vector::vix"), 0);
+    assert_eq!(shadow_row_count(&storage, "VecTxUpd"), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

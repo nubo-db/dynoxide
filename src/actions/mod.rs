@@ -15,6 +15,9 @@ pub mod get_shard_iterator;
 pub(crate) mod gsi;
 pub(crate) mod helpers;
 pub mod import_items;
+// Public because `partiql::executor::StatementPage` carries a `WriteCapacity`
+// on a public field, and a consumer reading it has to be able to name the type.
+pub mod index_capacity;
 pub mod list_streams;
 pub mod list_tables;
 pub mod list_tags_of_resource;

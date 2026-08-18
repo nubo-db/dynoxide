@@ -1,4 +1,7 @@
 use crate::actions::helpers;
+use crate::actions::index_capacity::{
+    WriteCapacity, aggregate_by_table, per_table_capacity, transactional_read_units,
+};
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
@@ -108,10 +111,34 @@ pub struct TransactWriteItemsResponse {
     pub item_collection_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
 }
 
+/// A first-call result together with what a same-token replay needs to bill it.
+///
+/// The replay is charged against the images each action was sized on, which the
+/// request cannot supply: a `Delete` or a `ConditionCheck` carries only a key.
+/// Those sizes are internal bookkeeping, so they live here, on the type the
+/// idempotency cache holds, rather than on the response type callers see.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CachedWrite {
+    pub(crate) response: TransactWriteItemsResponse,
+    /// Per-action `(table, image size)`.
+    pub(crate) replay_sizes: Vec<(String, usize)>,
+}
+
+/// Run a transactional write.
+///
+/// Callers driving idempotency want [`execute_cached`], which also hands back
+/// the sizes a replay is billed against.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: TransactWriteItemsRequest,
 ) -> Result<TransactWriteItemsResponse> {
+    Ok(execute_cached(storage, request).await?.response)
+}
+
+pub(crate) async fn execute_cached<S: StorageBackend>(
+    storage: &S,
+    request: TransactWriteItemsRequest,
+) -> Result<CachedWrite> {
     let items = &request.transact_items;
 
     // Validate: at least 1 action
@@ -147,6 +174,21 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Validate: each Put is within the item-size limit. This sits out here rather
+    // than inside the action because a put's size is knowable from the request,
+    // so DynamoDB answers it as a plain validation error before the transaction
+    // runs. An update's size is not: it depends on the stored item, and comes
+    // back as a cancellation reason instead. Captured against eu-west-2.
+    for item in items {
+        if let Some(ref put) = item.put {
+            if types::item_size(&put.item) > types::MAX_ITEM_SIZE {
+                return Err(DynoxideError::ValidationException(
+                    "Item size has exceeded the maximum allowed size".to_string(),
+                ));
+            }
+        }
+    }
+
     // Validate: aggregate item size must not exceed 4MB
     let total_size: usize = items.iter().map(|i| get_action_table_and_size(i).1).sum();
     if total_size > 4 * 1024 * 1024 {
@@ -156,84 +198,105 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // All actions run inside one SQLite transaction (all-or-nothing).
-    helpers::with_write_transaction(storage, execute_within_transaction(storage, items)).await?;
+    let capacity_mode = request.return_consumed_capacity.as_deref();
+    let capacity = helpers::with_write_transaction(
+        storage,
+        execute_within_transaction(storage, items, capacity_mode),
+    )
+    .await?;
 
-    // Build consumed capacity per table
-    let consumed_capacity = crate::types::build_transactional_capacity(
-        &transact_write_table_units(items),
-        &request.return_consumed_capacity,
-        crate::types::transactional_write_capacity,
-    );
-    Ok(TransactWriteItemsResponse {
-        consumed_capacity,
-        item_collection_metrics: None,
+    Ok(CachedWrite {
+        response: TransactWriteItemsResponse {
+            consumed_capacity: build_write_capacity(&capacity, &request.return_consumed_capacity),
+            item_collection_metrics: None,
+        },
+        replay_sizes: replay_sizes(&capacity),
     })
 }
 
-/// Per-table transactional write units for a set of actions. AWS charges 2 WCU
-/// per item for a transactional write: each item is rounded up to whole write
-/// units first, then doubled by the transactional factor, then summed per table
-/// (aggregating sizes before rounding would undercharge items straddling a 1KB
-/// boundary). Backs `execute`'s first-call write capacity.
-pub(crate) fn transact_write_table_units(items: &[TransactWriteItem]) -> HashMap<String, f64> {
-    let mut table_units: HashMap<String, f64> = HashMap::new();
-    for item in items {
-        let (table, size) = get_action_table_and_size(item);
-        *table_units.entry(table).or_default() +=
-            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::write_capacity_units(size);
-    }
-    table_units
+/// The image size each action was charged on, kept for a same-token replay.
+///
+/// The write is sized on the larger of the two images, and a capture shows the
+/// replay charging against that same image, so the choice is made once here
+/// rather than twice with a chance of drifting apart.
+fn replay_sizes(capacity: &[WriteCapacity]) -> Vec<(String, usize)> {
+    capacity
+        .iter()
+        .map(|record| {
+            let larger = record
+                .old_size
+                .unwrap_or(0)
+                .max(record.new_size.unwrap_or(0));
+            (record.table_name.clone(), larger)
+        })
+        .collect()
 }
 
-/// Per-table transactional read units for a set of actions. Real AWS recomputes
-/// a same-token replay as a transactional read against each item's size: 2 RCU
-/// per item, rounded at 4KB read granularity before the transactional factor,
-/// summed per table. This differs from the write magnitude above 1KB, where
-/// writes round at 1KB and reads at 4KB. Backs `replay_response`.
-fn transact_read_table_units(items: &[TransactWriteItem]) -> HashMap<String, f64> {
-    let mut table_units: HashMap<String, f64> = HashMap::new();
-    for item in items {
-        let (table, size) = get_action_table_and_size(item);
-        *table_units.entry(table).or_default() +=
-            crate::types::TRANSACTIONAL_CAPACITY_FACTOR * crate::types::read_capacity_units(size);
+/// Fold the per-action records into one `ConsumedCapacity` per table.
+///
+/// The transactional factor reaches the base table arm only. Index arms are
+/// charged at their single-write cost, which is what a capture against real
+/// DynamoDB reports: a transactional put of an indexed item costs table 2 and
+/// gsi 1, where the same put outside a transaction costs table 1 and gsi 1.
+fn build_write_capacity(
+    capacity: &[WriteCapacity],
+    mode: &Option<String>,
+) -> Option<Vec<crate::types::ConsumedCapacity>> {
+    // Checked before aggregating, not just inside the shared builder. Most
+    // calls ask for no capacity at all, and aggregation walks every action and
+    // allocates a map per table before the builder could discard it.
+    if !matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
+        return None;
     }
-    table_units
+
+    let by_table = aggregate_by_table(capacity, crate::types::TRANSACTIONAL_CAPACITY_FACTOR);
+    per_table_capacity(
+        &by_table,
+        mode,
+        crate::types::transactional_write_capacity_with_indexes,
+    )
 }
 
 /// Build the response for a same-token idempotent replay. The items are
 /// identical to the first call (the idempotency hash matched), so capacity is
-/// recomputed as a transactional READ against the item sizes rather than
-/// re-serving the first call's write numbers, honouring the replay request's
-/// own `ReturnConsumedCapacity` mode (the original call's mode does not carry
-/// over). The read cost is computed at 4KB read granularity, which diverges
-/// from the first-call write magnitude above 1KB. `cached_metrics` carries the
-/// item collection metrics from the cached first-call response.
-pub(crate) fn replay_response(
-    items: &[TransactWriteItem],
-    mode: &Option<String>,
-    cached_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
-) -> TransactWriteItemsResponse {
-    TransactWriteItemsResponse {
-        consumed_capacity: crate::types::build_transactional_capacity(
-            &transact_read_table_units(items),
-            mode,
-            crate::types::transactional_read_capacity,
-        ),
-        item_collection_metrics: cached_metrics,
+/// recomputed as a transactional READ against the image sizes the first call
+/// recorded rather than re-serving its write numbers, honouring the replay
+/// request's own `ReturnConsumedCapacity` mode (the original call's mode does
+/// not carry over). The read cost is computed at 4KB read granularity, which
+/// diverges from the first-call write magnitude above 1KB. `cached` is what the
+/// first call stored: its response, and the image sizes to bill against.
+pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> CachedWrite {
+    CachedWrite {
+        response: TransactWriteItemsResponse {
+            consumed_capacity: crate::types::build_transactional_capacity(
+                &transactional_read_units(&cached.replay_sizes),
+                mode,
+                crate::types::transactional_read_capacity,
+            ),
+            item_collection_metrics: cached.response.item_collection_metrics.clone(),
+        },
+        replay_sizes: cached.replay_sizes.clone(),
     }
 }
 
+/// Run every action, returning what each contributed to `ConsumedCapacity`.
+///
+/// The records are only meaningful when the whole transaction commits; a
+/// cancellation returns an error and reports no capacity at all.
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     items: &[TransactWriteItem],
-) -> Result<()> {
+    capacity_mode: Option<&str>,
+) -> Result<Vec<WriteCapacity>> {
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(items.len());
+    let mut capacity: Vec<WriteCapacity> = Vec::with_capacity(items.len());
     let mut has_failure = false;
 
     for item in items {
-        let reason = execute_single_action(storage, item).await;
+        let reason = execute_single_action(storage, item, capacity_mode).await;
         match reason {
-            Ok(()) => {
+            Ok(action_capacity) => {
+                capacity.push(action_capacity);
                 cancellation_reasons.push(CancellationReason {
                     code: "None".to_string(),
                     message: None,
@@ -280,19 +343,20 @@ async fn execute_within_transaction<S: StorageBackend>(
         ));
     }
 
-    Ok(())
+    Ok(capacity)
 }
 
 async fn execute_single_action<S: StorageBackend>(
     storage: &S,
     item: &TransactWriteItem,
-) -> Result<()> {
+    capacity_mode: Option<&str>,
+) -> Result<WriteCapacity> {
     if let Some(ref put) = item.put {
-        execute_put(storage, put).await
+        execute_put(storage, put, capacity_mode).await
     } else if let Some(ref update) = item.update {
-        execute_update(storage, update).await
+        execute_update(storage, update, capacity_mode).await
     } else if let Some(ref delete) = item.delete {
-        execute_delete(storage, delete).await
+        execute_delete(storage, delete, capacity_mode).await
     } else if let Some(ref check) = item.condition_check {
         execute_condition_check(storage, check).await
     } else {
@@ -315,7 +379,11 @@ fn validate_eav_nesting(values: &Option<HashMap<String, AttributeValue>>) -> Res
     Ok(())
 }
 
-async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Result<()> {
+async fn execute_put<S: StorageBackend>(
+    storage: &S,
+    put: &TransactPut,
+    capacity_mode: Option<&str>,
+) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&put.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &put.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
@@ -327,12 +395,9 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
     let mut item = put.item.clone();
     crate::validation::normalize_item_sets(&mut item);
 
+    // The item-size limit was applied to this put before the transaction opened,
+    // and normalising cannot grow the item, so there is nothing to recheck here.
     let size = types::item_size(&item);
-    if size > types::MAX_ITEM_SIZE {
-        return Err(DynoxideError::ValidationException(
-            "Item size has exceeded the maximum allowed size".to_string(),
-        ));
-    }
 
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
@@ -382,27 +447,33 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
         .put_item_with_hash(&put.table_name, &pk, &sk, &item_json, size, &hash_prefix)
         .await?;
 
-    let _ = super::gsi::maintain_gsis_after_write(
+    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
+
+    let target = super::gsi::IndexWrite {
+        table_name: &put.table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    let gsi_units = super::gsi::maintain_gsis_after_write(
         storage,
-        &put.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
+        capacity_mode,
     )
     .await?;
 
-    super::lsi::maintain_lsis_after_write(
+    let lsi_units = super::lsi::maintain_lsis_after_write(
         storage,
-        &put.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
+        capacity_mode,
     )
     .await?;
 
@@ -418,13 +489,22 @@ async fn execute_put<S: StorageBackend>(storage: &S, put: &TransactPut) -> Resul
     .await?;
 
     // Record stream event
-    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
-    Ok(())
+    Ok(WriteCapacity::new(
+        &put.table_name,
+        old_item.as_ref().map(types::item_size),
+        Some(size),
+        gsi_units,
+        lsi_units,
+    ))
 }
 
-async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate) -> Result<()> {
+async fn execute_update<S: StorageBackend>(
+    storage: &S,
+    update: &TransactUpdate,
+    capacity_mode: Option<&str>,
+) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&update.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &update.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
@@ -496,10 +576,13 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
     // Reject an index key this update set to an invalid value (see helpers).
     helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
 
+    // A transacted update is measured flat against the resulting item, unlike the
+    // standalone UpdateItem, which takes the key attributes out and charges per
+    // action. Both were captured against eu-west-2; the two really do differ.
     let size = types::item_size(&item);
     if size > types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
-            "Item size has exceeded the maximum allowed size".to_string(),
+            "Item size to update has exceeded the maximum allowed size".to_string(),
         ));
     }
 
@@ -517,27 +600,33 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
         .put_item_with_hash(&update.table_name, &pk, &sk, &item_json, size, &hash_prefix)
         .await?;
 
-    let _ = super::gsi::maintain_gsis_after_write(
+    let old_item: Option<Item> = old_for_stream.and_then(|j| serde_json::from_str(&j).ok());
+
+    let target = super::gsi::IndexWrite {
+        table_name: &update.table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    let gsi_units = super::gsi::maintain_gsis_after_write(
         storage,
-        &update.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
+        capacity_mode,
     )
     .await?;
 
-    super::lsi::maintain_lsis_after_write(
+    let lsi_units = super::lsi::maintain_lsis_after_write(
         storage,
-        &update.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema.partition_key,
-        key_schema.sort_key.as_deref(),
+        capacity_mode,
     )
     .await?;
 
@@ -553,13 +642,26 @@ async fn execute_update<S: StorageBackend>(storage: &S, update: &TransactUpdate)
     .await?;
 
     // Record stream event
-    let old_item: Option<Item> = old_for_stream.and_then(|j| serde_json::from_str(&j).ok());
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
 
-    Ok(())
+    // `old_item` comes from the stored JSON rather than from the assembled item,
+    // which matters on an upsert: the assembled item carries the key attributes
+    // this function injected, and charging against that would read as a key move
+    // rather than an insert.
+    Ok(WriteCapacity::new(
+        &update.table_name,
+        old_item.as_ref().map(types::item_size),
+        Some(size),
+        gsi_units,
+        lsi_units,
+    ))
 }
 
-async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete) -> Result<()> {
+async fn execute_delete<S: StorageBackend>(
+    storage: &S,
+    delete: &TransactDelete,
+    capacity_mode: Option<&str>,
+) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&delete.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &delete.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
@@ -604,9 +706,32 @@ async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete)
     tracker.check_unused()?;
 
     let old_json = storage.delete_item(&delete.table_name, &pk, &sk).await?;
-    let _ = super::gsi::maintain_gsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk)
-        .await?;
-    super::lsi::maintain_lsis_after_delete(storage, &delete.table_name, &meta, &pk, &sk).await?;
+    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
+
+    let target = super::gsi::IndexWrite {
+        table_name: &delete.table_name,
+        pk: &pk,
+        sk: &sk,
+        pk_attr: &key_schema.partition_key,
+        sk_attr: key_schema.sort_key.as_deref(),
+    };
+
+    let gsi_units = super::gsi::maintain_gsis_after_delete(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
+    )
+    .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_delete(
+        storage,
+        &meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
+    )
+    .await?;
     super::vector_index::maintain_vector_indexes_after_delete(
         storage,
         &delete.table_name,
@@ -617,18 +742,23 @@ async fn execute_delete<S: StorageBackend>(storage: &S, delete: &TransactDelete)
     .await?;
 
     // Record stream event
-    let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
     if old_item.is_some() {
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
-    Ok(())
+    Ok(WriteCapacity::from_items(
+        &delete.table_name,
+        old_item.as_ref(),
+        None,
+        gsi_units,
+        lsi_units,
+    ))
 }
 
 async fn execute_condition_check<S: StorageBackend>(
     storage: &S,
     check: &TransactConditionCheck,
-) -> Result<()> {
+) -> Result<WriteCapacity> {
     crate::validation::validate_table_name(&check.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &check.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
@@ -671,7 +801,12 @@ async fn execute_condition_check<S: StorageBackend>(
     )?;
 
     tracker.check_unused()?;
-    Ok(())
+    // A check writes nothing and touches no index, and is still charged against
+    // the image it read.
+    Ok(WriteCapacity::condition_check(
+        &check.table_name,
+        existing_json.is_some().then_some(&existing_item),
+    ))
 }
 
 fn check_condition_tracked(

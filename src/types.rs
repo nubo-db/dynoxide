@@ -44,23 +44,12 @@ impl AttributeValue {
     pub fn size(&self) -> usize {
         match self {
             AttributeValue::S(s) => s.len(),
-            AttributeValue::N(n) => {
-                // DynamoDB: (number of significant digits / 2) + 1, minimum 1
-                let significant = n.chars().filter(|c| c.is_ascii_digit()).count();
-                let significant = significant.max(1);
-                (significant / 2) + 1
-            }
+            AttributeValue::N(n) => number_size(n),
             AttributeValue::B(b) => b.len(),
             AttributeValue::BOOL(_) => 1,
             AttributeValue::NULL(_) => 1,
             AttributeValue::SS(ss) => ss.iter().map(|s| s.len()).sum(),
-            AttributeValue::NS(ns) => ns
-                .iter()
-                .map(|n| {
-                    let significant = n.chars().filter(|c| c.is_ascii_digit()).count().max(1);
-                    (significant / 2) + 1
-                })
-                .sum(),
+            AttributeValue::NS(ns) => ns.iter().map(|n| number_size(n)).sum(),
             AttributeValue::BS(bs) => bs.iter().map(|b| b.len()).sum(),
             AttributeValue::L(items) => {
                 // List overhead: 3 bytes + 1 byte per element + sum of element sizes
@@ -531,6 +520,39 @@ fn is_well_formed_dynamo_number(s: &str) -> bool {
     i == n
 }
 
+/// Byte cost of a number, as DynamoDB accounts for it in an item's size.
+///
+/// One byte, plus `ceil(integer significant digits / 2)` and
+/// `ceil(fraction significant digits / 2)`, over the value with leading and
+/// trailing zeros trimmed. Measured byte-exact against eu-west-2 by bisecting
+/// the 400KB item-size gate.
+///
+/// Counting significant digits rather than characters is what makes the answer
+/// survive storage: DynamoDB expands scientific notation when it stores a
+/// number, so a measure taken over the digits of the string would give one
+/// answer for the request and another for the stored row. Every write path
+/// checks the limit somewhere either side of that expansion, and they can only
+/// agree if the measure does not move.
+pub fn number_size(num_str: &str) -> usize {
+    let trimmed = num_str.trim();
+    let negative = trimmed.starts_with('-');
+    let abs = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
+    let (mantissa, exponent) = parse_number_parts(abs);
+
+    // `exponent` is how many significant digits fall before the decimal point:
+    // negative for a pure fraction, past the end of the mantissa for a value
+    // whose trailing zeros were trimmed. Either way the split is a clamp.
+    let int_digits = exponent.clamp(0, mantissa.len() as i32) as usize;
+    let frac_digits = mantissa.len() - int_digits;
+
+    // A negative number costs a byte more than the same magnitude positive:
+    // `-42` measures 3 where `42` measures 2. Zero is never negative, whatever
+    // the literal said, so `-0` costs the same as `0`.
+    let sign = usize::from(negative && !mantissa.is_empty());
+
+    int_digits.div_ceil(2) + frac_digits.div_ceil(2) + 1 + sign
+}
+
 /// Normalize a DynamoDB number string to its canonical form.
 ///
 /// DynamoDB normalises numbers when storing them:
@@ -798,6 +820,36 @@ pub fn write_capacity_units(item_size_bytes: usize) -> f64 {
     ((item_size_bytes as f64) / 1024.0).ceil().max(1.0)
 }
 
+/// Write capacity units the base table consumes for a single write.
+///
+/// DynamoDB sizes a write on the larger of the item's before and after images,
+/// so shrinking an item still costs what the old one did. `old_size` is `None`
+/// when nothing was there beforehand, and `new_size` is `None` on a delete,
+/// where only the old image exists.
+pub fn table_write_capacity_units(old_size: Option<usize>, new_size: Option<usize>) -> f64 {
+    let old = old_size.map(write_capacity_units);
+    let new = new_size.map(write_capacity_units);
+    match (old, new) {
+        (Some(old), Some(new)) => old.max(new),
+        (Some(units), None) | (None, Some(units)) => units,
+        // No image either side is not a write DynamoDB would charge for, but a
+        // write is never free, so fall back to the one-unit minimum.
+        (None, None) => write_capacity_units(0),
+    }
+}
+
+/// Read capacity units one write's images cost when charged as a read.
+///
+/// A same-token transactional replay is billed as a read against the image the
+/// original write was sized on, which is the larger of the before and after
+/// images, but rounded at 4KB rather than 1KB. Captured in eu-west-2: a replayed
+/// put that shrank a 9KB item to nothing reports 6, and so does the replay of
+/// the write that grew it, so neither side alone explains the figure.
+pub fn table_read_capacity_units(old_size: Option<usize>, new_size: Option<usize>) -> f64 {
+    let larger = old_size.unwrap_or(0).max(new_size.unwrap_or(0));
+    read_capacity_units(larger)
+}
+
 /// Calculate read capacity units assuming strongly consistent reads
 /// (1 RCU per 4KB, rounded up). Used when ConsistentRead is true or
 /// when the read type is not specified.
@@ -812,6 +864,17 @@ pub fn read_capacity_units(item_size_bytes: usize) -> f64 {
 pub fn read_capacity_units_with_consistency(item_size_bytes: usize, consistent: bool) -> f64 {
     let strongly = read_capacity_units(item_size_bytes);
     if consistent { strongly } else { strongly / 2.0 }
+}
+
+/// Whether a `ReturnConsumedCapacity` value asks for a figure at all.
+///
+/// Every `consumed_capacity*` builder below throws its inputs away unless the
+/// mode is `TOTAL` or `INDEXES`, so work done only to feed them is wasted in
+/// every other mode, and `NONE` is the default. Callers that can skip that work
+/// ask here rather than each spelling the comparison out, so the set of modes
+/// that mean "yes" is written down once.
+pub fn capacity_wanted(mode: Option<&str>) -> bool {
+    matches!(mode, Some("TOTAL") | Some("INDEXES"))
 }
 
 /// Build a `ConsumedCapacity` for a simple table operation.
@@ -869,55 +932,71 @@ pub fn consumed_capacity_with_secondary_indexes(
     lsi_units: &HashMap<String, f64>,
     mode: &Option<String>,
 ) -> Option<ConsumedCapacity> {
-    let units_to_map = |units: &HashMap<String, f64>| -> Option<HashMap<String, CapacityDetail>> {
-        if units.is_empty() {
-            None
-        } else {
-            Some(
-                units
-                    .iter()
-                    .map(|(name, &u)| {
-                        (
-                            name.clone(),
-                            CapacityDetail {
-                                capacity_units: u,
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect(),
-            )
+    secondary_index_capacity(
+        table_name,
+        table_units,
+        gsi_units,
+        lsi_units,
+        mode,
+        CapacityAxis::None,
+    )
+}
+
+/// Whether a response mirrors its units into a named axis alongside
+/// `CapacityUnits`.
+///
+/// Single-item and PartiQL responses report `CapacityUnits` alone at every
+/// level. Transactional responses mirror the units into `WriteCapacityUnits`
+/// at every level, including each index arm. Both shapes are captured against
+/// real DynamoDB.
+#[derive(Clone, Copy, PartialEq)]
+enum CapacityAxis {
+    None,
+    Write,
+}
+
+impl CapacityAxis {
+    /// The `WriteCapacityUnits` value for a detail carrying `units`.
+    fn write_units(self, units: f64) -> Option<f64> {
+        match self {
+            Self::None => None,
+            Self::Write => Some(units),
         }
-    };
+    }
+}
+
+/// Shared body for the per-index capacity builders. `table_units` carries the
+/// transactional factor already, when one applies; the index maps never do.
+fn secondary_index_capacity(
+    table_name: &str,
+    table_units: f64,
+    gsi_units: &HashMap<String, f64>,
+    lsi_units: &HashMap<String, f64>,
+    mode: &Option<String>,
+    axis: CapacityAxis,
+) -> Option<ConsumedCapacity> {
+    let total = table_units + gsi_units.values().sum::<f64>() + lsi_units.values().sum::<f64>();
 
     match mode.as_deref().unwrap_or("NONE") {
-        "INDEXES" => {
-            let gsi_total: f64 = gsi_units.values().sum();
-            let lsi_total: f64 = lsi_units.values().sum();
-            Some(ConsumedCapacity {
-                table_name: table_name.to_string(),
-                capacity_units: table_units + gsi_total + lsi_total,
-                table: Some(CapacityDetail {
-                    capacity_units: table_units,
-                    ..Default::default()
-                }),
-                global_secondary_indexes: units_to_map(gsi_units),
-                local_secondary_indexes: units_to_map(lsi_units),
+        "INDEXES" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: total,
+            write_capacity_units: axis.write_units(total),
+            table: Some(CapacityDetail {
+                capacity_units: table_units,
+                write_capacity_units: axis.write_units(table_units),
                 ..Default::default()
-            })
-        }
-        "TOTAL" => {
-            let gsi_total: f64 = gsi_units.values().sum();
-            let lsi_total: f64 = lsi_units.values().sum();
-            Some(ConsumedCapacity {
-                table_name: table_name.to_string(),
-                capacity_units: table_units + gsi_total + lsi_total,
-                table: None,
-                global_secondary_indexes: None,
-                local_secondary_indexes: None,
-                ..Default::default()
-            })
-        }
+            }),
+            global_secondary_indexes: capacity_detail_map(gsi_units, axis),
+            local_secondary_indexes: capacity_detail_map(lsi_units, axis),
+            ..Default::default()
+        }),
+        "TOTAL" => Some(ConsumedCapacity {
+            table_name: table_name.to_string(),
+            capacity_units: total,
+            write_capacity_units: axis.write_units(total),
+            ..Default::default()
+        }),
         _ => None,
     }
 }
@@ -964,16 +1043,77 @@ pub fn build_transactional_capacity(
     mode: &Option<String>,
     builder: fn(&str, f64, &Option<String>) -> Option<ConsumedCapacity>,
 ) -> Option<Vec<ConsumedCapacity>> {
-    if matches!(mode.as_deref(), Some("TOTAL") | Some("INDEXES")) {
-        Some(
-            table_units
-                .iter()
-                .filter_map(|(table, &units)| builder(table, units, mode))
-                .collect(),
-        )
-    } else {
-        None
+    if !capacity_wanted(mode.as_deref()) {
+        return None;
     }
+
+    // Sorted by table name, matching the write path. Iterating the map handed
+    // back a different order per process, so a two-table read set or replay
+    // could report its tables either way round while the write half of the same
+    // response family was stable.
+    let mut tables: Vec<&String> = table_units.keys().collect();
+    tables.sort();
+
+    Some(
+        tables
+            .into_iter()
+            .filter_map(|table| builder(table, *table_units.get(table)?, mode))
+            .collect(),
+    )
+}
+
+/// Build a `ConsumedCapacity` for one table in a transactional write, with the
+/// per-index breakdown.
+///
+/// `table_units` already carries the transactional 2x factor; the index maps do
+/// not. DynamoDB applies that factor to the base table arm alone, so an index
+/// arm inside a transaction costs what the same write costs outside one.
+///
+/// `CapacityUnits` and `WriteCapacityUnits` both report the table arm plus the
+/// index arms. The `Table` detail reports the table arm on its own, and every
+/// index arm carries the write axis too, which is where this shape differs from
+/// the single-item one.
+pub fn transactional_write_capacity_with_indexes(
+    table_name: &str,
+    table_units: f64,
+    gsi_units: &HashMap<String, f64>,
+    lsi_units: &HashMap<String, f64>,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    secondary_index_capacity(
+        table_name,
+        table_units,
+        gsi_units,
+        lsi_units,
+        mode,
+        CapacityAxis::Write,
+    )
+}
+
+/// Turn per-index units into the response's detail map, or `None` when nothing
+/// was charged so the arm is absent rather than present and empty.
+fn capacity_detail_map(
+    units: &HashMap<String, f64>,
+    axis: CapacityAxis,
+) -> Option<HashMap<String, CapacityDetail>> {
+    if units.is_empty() {
+        return None;
+    }
+    Some(
+        units
+            .iter()
+            .map(|(name, &u)| {
+                (
+                    name.clone(),
+                    CapacityDetail {
+                        capacity_units: u,
+                        write_capacity_units: axis.write_units(u),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Build a `ConsumedCapacity` for one table in a transactional write
@@ -1669,9 +1809,93 @@ mod tests {
 
     #[test]
     fn test_size_number() {
-        // "42" has 2 significant digits → (2/2) + 1 = 2
+        // "42" has 2 significant digits → ceil(2/2) + 1 = 2
         let val = AttributeValue::N("42".to_string());
         assert_eq!(val.size(), 2);
+    }
+
+    #[test]
+    fn test_size_number_matches_dynamodb() {
+        // Byte-exact ground truth, measured against eu-west-2 by bisecting the
+        // 400KB item-size gate (which resolves to the byte, unlike the 1KB
+        // granularity of consumed capacity). A number costs
+        // ceil(integer significant digits / 2) + ceil(fraction significant
+        // digits / 2) + 1, over the value with leading and trailing zeros
+        // trimmed. The count is a property of the significant digits, so it does
+        // not change when scientific notation is expanded on storage.
+        let cases: &[(&str, usize)] = &[
+            // digit counts either side of the decimal point
+            ("1", 2),
+            ("12", 2),
+            ("123", 3),
+            ("1234", 3),
+            ("12345", 4),
+            ("123456", 4),
+            ("1234567", 5),
+            ("12345678", 5),
+            ("123456789", 6),
+            ("1234567891", 6),
+            ("12345678912", 7),
+            ("123456789123", 7),
+            ("1234567890123456789", 11),
+            ("12345678901234567890123456789012345678", 20),
+            // zeros the wire carries but DynamoDB trims
+            ("0042", 2),
+            ("100", 2),
+            ("1010", 3),
+            ("0.0000001", 2),
+            ("0", 1),
+            // scientific notation, which expands on storage without growing
+            ("1E125", 2),
+            ("1E-100", 2),
+            // significant digits straddling the decimal point are counted in two
+            // halves, so these cost a byte more than the digit total alone implies
+            ("1.5", 3),
+            ("1.2", 3),
+            ("1.200", 3),
+            ("1.234", 4),
+            ("3.14159", 5),
+            ("100.5", 4),
+            ("0.15", 2),
+            ("15", 2),
+            // a sign costs a byte
+            ("-42", 3),
+            ("-12345", 5),
+            ("-1E125", 3),
+            ("-0.15", 3),
+            ("-0", 1),
+        ];
+        for (literal, expected) in cases {
+            assert_eq!(
+                AttributeValue::N((*literal).to_string()).size(),
+                *expected,
+                "size of N {literal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_size_number_survives_normalisation() {
+        // The reason the write paths could disagree: sizing has to be invariant
+        // under the normalisation that happens on storage, or the same item
+        // measures differently either side of it.
+        for literal in [
+            "1E125",
+            "1E-100",
+            "0042",
+            "1.200",
+            "0.0000001",
+            "100",
+            "3.14159",
+            "42",
+        ] {
+            let raw = AttributeValue::N(literal.to_string()).size();
+            let normalised = AttributeValue::N(normalize_dynamo_number(literal)).size();
+            assert_eq!(
+                raw, normalised,
+                "N {literal:?} changed size when normalised"
+            );
+        }
     }
 
     #[test]

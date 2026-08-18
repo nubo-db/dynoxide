@@ -11,6 +11,10 @@ struct UpdateWorkResult {
     item: HashMap<String, AttributeValue>,
     item_json: String,
     size: usize,
+    /// Size of the item as it genuinely stood beforehand, or `None` when the
+    /// update was an upsert that created it. Distinct from `old_item`, which
+    /// carries injected key attributes in that case.
+    old_size: Option<usize>,
 }
 
 /// Internal deserialization struct for detecting missing fields.
@@ -78,14 +82,10 @@ fn first_invalid_return_enum(
             ));
         }
     }
-    if let Some(rcc) = return_consumed_capacity {
-        if !["INDEXES", "TOTAL", "NONE"].contains(&rcc) {
-            return Some(format!(
-                "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                rcc
-            ));
-        }
+    if let Some(msg) =
+        crate::validation::return_consumed_capacity_rejection(return_consumed_capacity)
+    {
+        return Some(msg);
     }
     if let Some(ricm) = return_item_collection_metrics {
         if !["SIZE", "NONE"].contains(&ricm) {
@@ -482,8 +482,10 @@ async fn execute_inner<S: StorageBackend>(
             item,
             item_json,
             size,
+            old_size,
         },
         gsi_units,
+        lsi_units,
     ) = helpers::with_write_transaction(storage, async {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -529,6 +531,7 @@ async fn execute_inner<S: StorageBackend>(
         let old_item = item.clone();
 
         // Apply UpdateExpression
+        let mut size_overhead = 0usize;
         if let Some(ref update_expr) = request.update_expression {
             let parsed = crate::expressions::update::parse(update_expr)
                 .map_err(DynoxideError::ValidationException)?;
@@ -572,12 +575,14 @@ async fn execute_inner<S: StorageBackend>(
 
             crate::expressions::update::apply(&mut item, &parsed, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
+            size_overhead = parsed.size_overhead();
         }
 
         // Apply legacy AttributeUpdates (if no UpdateExpression was provided)
         if request.update_expression.is_none() {
             if let Some(ref updates) = request.attribute_updates {
                 apply_attribute_updates(&mut item, updates, &key_schema)?;
+                size_overhead = attribute_updates_size_overhead(updates);
             }
         }
 
@@ -597,9 +602,21 @@ async fn execute_inner<S: StorageBackend>(
         // error surfaces. Checks only what this update changed (see the helper).
         helpers::validate_updated_index_keys(&old_item, &item, &meta)?;
 
-        // Validate updated item size
+        // Validate updated item size. An update is measured against the limit
+        // differently from a put: the key attributes come out of the figure and
+        // each action adds a fixed cost, so an item can be reachable by PutItem
+        // and out of reach by UpdateItem. See `UpdateExpr::size_overhead`.
+        //
+        // The item itself is held to the limit as well, so the pair of checks is
+        // `max(item, item - key + overhead) <= 400KB`. Taking the key out of the
+        // measure only ever buys back what the actions cost, never more: once
+        // the key attributes reach the overhead, the item's own size binds and
+        // the ceiling sits flat at 400KB however long the key gets. Measured
+        // across key lengths from 1 to 1024 bytes, the finished item never
+        // exceeds 409,600 on any of them.
         let size = types::item_size(&item);
-        if size > types::MAX_ITEM_SIZE {
+        let measured = size.saturating_sub(key_attributes_size(&item, &key_schema)) + size_overhead;
+        if measured > types::MAX_ITEM_SIZE || size > types::MAX_ITEM_SIZE {
             return Err(DynoxideError::ValidationException(
                 "Item size to update has exceeded the maximum allowed size".to_string(),
             ));
@@ -624,29 +641,40 @@ async fn execute_inner<S: StorageBackend>(
             )
             .await?;
 
+        // `old_item` is cloned after the key attributes are injected for the
+        // upsert case, so on a create-through-update it is a `{pk, sk}` image
+        // rather than an absent one. The index delta has to see genuine absence,
+        // so gate on whether a row was actually read back.
+        let prior_image = existing_json.is_some().then_some(&old_item);
+        let old_size = prior_image.map(types::item_size);
+
+        let target = super::gsi::IndexWrite {
+            table_name: &request.table_name,
+            pk: &pk,
+            sk: &sk,
+            pk_attr: &key_schema.partition_key,
+            sk_attr: key_schema.sort_key.as_deref(),
+        };
+
         // Maintain GSI tables (inside the transaction)
         let gsi_units = super::gsi::maintain_gsis_after_write(
             storage,
-            &request.table_name,
             &meta,
-            &pk,
-            &sk,
+            &target,
+            prior_image,
             &item,
-            &key_schema.partition_key,
-            key_schema.sort_key.as_deref(),
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
         // Maintain LSI tables (inside the transaction)
-        super::lsi::maintain_lsis_after_write(
+        let lsi_units = super::lsi::maintain_lsis_after_write(
             storage,
-            &request.table_name,
             &meta,
-            &pk,
-            &sk,
+            &target,
+            prior_image,
             &item,
-            &key_schema.partition_key,
-            key_schema.sort_key.as_deref(),
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
@@ -665,12 +693,7 @@ async fn execute_inner<S: StorageBackend>(
         .await?;
 
         // Record stream event (inside the transaction)
-        let old_for_stream = if existing_json.is_some() {
-            Some(&old_item)
-        } else {
-            None
-        };
-        crate::streams::record_stream_event(storage, &meta, old_for_stream, Some(&item)).await?;
+        crate::streams::record_stream_event(storage, &meta, prior_image, Some(&item)).await?;
 
         Ok((
             UpdateWorkResult {
@@ -678,8 +701,10 @@ async fn execute_inner<S: StorageBackend>(
                 item,
                 item_json,
                 size,
+                old_size,
             },
             gsi_units,
+            lsi_units,
         ))
     })
     .await?;
@@ -749,10 +774,11 @@ async fn execute_inner<S: StorageBackend>(
     )
     .await?;
 
-    let consumed_capacity = types::consumed_capacity_with_indexes(
+    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
-        types::write_capacity_units(size),
+        types::table_write_capacity_units(old_size, Some(size)),
         &gsi_units,
+        &lsi_units,
         &request.return_consumed_capacity,
     );
 
@@ -761,6 +787,37 @@ async fn execute_inner<S: StorageBackend>(
         consumed_capacity,
         item_collection_metrics,
     })
+}
+
+/// Size of the key attributes, which DynamoDB leaves out of the figure it
+/// measures an update against.
+fn key_attributes_size(
+    item: &HashMap<String, AttributeValue>,
+    key_schema: &helpers::KeySchema,
+) -> usize {
+    let mut size = 0;
+    for name in std::iter::once(&key_schema.partition_key).chain(key_schema.sort_key.iter()) {
+        if let Some(value) = item.get(name) {
+            size += name.len() + value.size();
+        }
+    }
+    size
+}
+
+/// The `UpdateExpr::size_overhead` equivalent for the legacy `AttributeUpdates`
+/// parameter, whose actions map onto the same three shapes. Inferred from the
+/// expression form rather than captured separately, so it is deliberately no
+/// stricter: an action that is not recognised is charged nothing.
+fn attribute_updates_size_overhead(updates: &HashMap<String, AttributeValueUpdate>) -> usize {
+    let mut overhead = 3;
+    for update in updates.values() {
+        overhead += match update.action.to_uppercase().as_str() {
+            "PUT" | "ADD" => 19,
+            "DELETE" => 2,
+            _ => 0,
+        };
+    }
+    overhead
 }
 
 /// Apply legacy `AttributeUpdates` to the item, mutating it in place.

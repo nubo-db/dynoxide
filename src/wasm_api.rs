@@ -298,21 +298,20 @@ async fn execute_transaction<S: StorageBackend>(
     let statements = request.transact_statements.clone();
     let token = request.client_request_token.clone();
     let capacity_mode = request.return_consumed_capacity.clone();
+    // Ahead of the cache, not only inside the work: a replayed token skips the
+    // work entirely, and the token is keyed on the statements alone, so a replay
+    // may carry a capacity mode the first call never did.
+    actions::execute_transaction::reject_bad_capacity_mode(capacity_mode.as_deref())?;
 
     let response = crate::run_idempotent_async(
         ctx.tokens.execute_transaction(),
         token.as_deref(),
         &statements,
-        actions::execute_transaction::execute(backend, request),
-        |cached| {
-            actions::execute_transaction::replay_response(
-                &statements,
-                &capacity_mode,
-                cached.responses.clone(),
-            )
-        },
+        actions::execute_transaction::execute_cached(backend, request),
+        |cached| actions::execute_transaction::replay_response(cached, &capacity_mode),
     )
-    .await?;
+    .await?
+    .response;
 
     serde_json::to_string(&response).map_err(|e| DynoxideError::InternalServerError(e.to_string()))
 }

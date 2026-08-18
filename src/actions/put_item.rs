@@ -80,14 +80,10 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
         }
 
         // ReturnConsumedCapacity enum validation
-        if let Some(ref rcc) = raw.return_consumed_capacity {
-            if !["INDEXES", "TOTAL", "NONE"].contains(&rcc.as_str()) {
-                errors.push(format!(
-                    "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                    rcc
-                ));
-            }
+        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+            raw.return_consumed_capacity.as_deref(),
+        ) {
+            errors.push(msg);
         }
 
         // ReturnValues enum validation
@@ -306,6 +302,14 @@ async fn execute_inner<S: StorageBackend>(
     // Normalize sets (deduplication)
     crate::validation::normalize_item_sets(&mut request.item);
 
+    // Size again, now over what is actually written: the figure recorded
+    // alongside the row and the capacity charged for the write. It matches the
+    // limit check above, which measured the request as it arrived, because a
+    // number is sized by its significant digits and normalising does not change
+    // those. Do not reintroduce a measure that counts characters, or the two
+    // sites drift apart and an over-limit item gets stored.
+    let size = types::item_size(&request.item);
+
     // Extract key values
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&request.item, &key_schema)?;
@@ -329,7 +333,7 @@ async fn execute_inner<S: StorageBackend>(
     // leaving no torn index. The transaction is unconditional (not just for
     // ConditionExpression) because the atomicity guarantee applies to every
     // single-item write.
-    let (old_json, gsi_units) = helpers::with_write_transaction(storage, async {
+    let (old_item, gsi_units, lsi_units) = helpers::with_write_transaction(storage, async {
         // Evaluate ConditionExpression against existing item (if any)
         let old_json = if request.condition_expression.is_some() {
             let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -405,29 +409,37 @@ async fn execute_inner<S: StorageBackend>(
                 .await?
         };
 
+        // The displaced item, parsed once here for the index capacity delta and
+        // reused for the stream record below.
+        let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+
+        let target = super::gsi::IndexWrite {
+            table_name: &request.table_name,
+            pk: &pk,
+            sk: &sk,
+            pk_attr: &key_schema.partition_key,
+            sk_attr: key_schema.sort_key.as_deref(),
+        };
+
         // Maintain GSI tables (inside the transaction)
         let gsi_units = super::gsi::maintain_gsis_after_write(
             storage,
-            &request.table_name,
             &meta,
-            &pk,
-            &sk,
+            &target,
+            old_item.as_ref(),
             &request.item,
-            &key_schema.partition_key,
-            key_schema.sort_key.as_deref(),
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
         // Maintain LSI tables (inside the transaction)
-        super::lsi::maintain_lsis_after_write(
+        let lsi_units = super::lsi::maintain_lsis_after_write(
             storage,
-            &request.table_name,
             &meta,
-            &pk,
-            &sk,
+            &target,
+            old_item.as_ref(),
             &request.item,
-            &key_schema.partition_key,
-            key_schema.sort_key.as_deref(),
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
@@ -444,17 +456,10 @@ async fn execute_inner<S: StorageBackend>(
         .await?;
 
         // Record stream event (inside the transaction)
-        let old_item_for_stream: Option<Item> =
-            old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-        crate::streams::record_stream_event(
-            storage,
-            &meta,
-            old_item_for_stream.as_ref(),
-            Some(&request.item),
-        )
-        .await?;
+        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&request.item))
+            .await?;
 
-        Ok((old_json, gsi_units))
+        Ok((old_item, gsi_units, lsi_units))
     })
     .await?;
 
@@ -465,13 +470,7 @@ async fn execute_inner<S: StorageBackend>(
         .unwrap_or("NONE")
         .eq_ignore_ascii_case("ALL_OLD");
 
-    let attributes = if return_old {
-        old_json
-            .as_ref()
-            .and_then(|json| serde_json::from_str::<Item>(json).ok())
-    } else {
-        None
-    };
+    let attributes = if return_old { old_item.clone() } else { None };
 
     // Build item collection metrics (only for tables with LSIs)
     let pk_value = request.item.get(&key_schema.partition_key).cloned();
@@ -488,10 +487,11 @@ async fn execute_inner<S: StorageBackend>(
     )
     .await?;
 
-    let consumed_capacity = types::consumed_capacity_with_indexes(
+    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
         &request.table_name,
-        types::write_capacity_units(size),
+        types::table_write_capacity_units(old_item.as_ref().map(types::item_size), Some(size)),
         &gsi_units,
+        &lsi_units,
         &request.return_consumed_capacity,
     );
 

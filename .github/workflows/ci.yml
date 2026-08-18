@@ -24,6 +24,12 @@ jobs:
             flags: "--no-default-features --features encryption --lib"
           - name: encryption+http-server
             flags: "--no-default-features --features encryption,http-server"
+          # The work counters are off by default and compile to nothing when
+          # absent, so nothing else in the matrix builds the harness that
+          # measures repeated work. Without this leg the evidence behind the
+          # performance changes could stop compiling and no job would notice.
+          - name: bench-counters
+            flags: "--features bench-counters --test repeated_work_counts"
 
     steps:
       - uses: actions/checkout@v5
@@ -71,6 +77,19 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+  benchmark-scripts:
+    name: Benchmark script tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The benchmark workflows read criterion's output through these scripts,
+      # and a parser that quietly returns nothing turns a failed comparison
+      # into a red check with no explanation.
+      - name: Test
+        run: python3 -m unittest discover -s benchmarks/scripts -p 'test_*.py' -v
+
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
@@ -103,6 +122,44 @@ jobs:
             echo "ERROR: no SQLite backend should cause compile_error!"
             exit 1
           fi
+
+      # A non-zero exit is not enough on its own: every combination below
+      # already failed to compile before the guard existed, on unrelated type
+      # errors, so an exit-status-only check would pass with the guard deleted.
+      # Assert on the guard's own message instead.
+      #
+      # The first case is the one a consumer hits by accident, where the
+      # defaults union in a native backend. It does not isolate any single arm
+      # of the guard's `any(...)`, because the defaults satisfy two of them at
+      # once, so the three that follow pin one arm each. Without those, dropping
+      # an arm from the predicate stays green.
+      - name: wasm-sqlite alongside a native feature must fail on the guard
+        run: |
+          must_fail_on_guard() {
+            desc="$1"
+            shift
+            if out=$(cargo check --lib "$@" 2>&1); then
+              echo "ERROR: $desc should cause compile_error!"
+              exit 1
+            fi
+            if ! grep -q "mutually exclusive with the native backends" <<<"$out"; then
+              echo "ERROR: $desc failed, but not on the feature guard:"
+              echo "$out"
+              exit 1
+            fi
+            echo "OK: $desc"
+          }
+          must_fail_on_guard "wasm-sqlite on top of the defaults" \
+            --features wasm-sqlite
+          must_fail_on_guard "the native-sqlite arm" \
+            --no-default-features --features wasm-sqlite,native-sqlite
+          must_fail_on_guard "the cli arm, reached through mcp-server" \
+            --no-default-features --features wasm-sqlite,mcp-server
+          must_fail_on_guard "the _has-encryption arm" \
+            --no-default-features --features wasm-sqlite,_has-encryption
+
+      - name: wasm-sqlite on its own must build
+        run: cargo check --no-default-features --features wasm-sqlite
 
   wasm-check:
     name: wasm-sqlite build check

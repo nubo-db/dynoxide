@@ -88,6 +88,7 @@ pub async fn require_table_for_item_op<S: StorageBackend>(
 
 /// Parse key schema and attribute definitions from table metadata.
 pub fn parse_key_schema(meta: &TableMetadata) -> Result<KeySchema> {
+    crate::bench_counters::record(&crate::bench_counters::KEY_SCHEMA_PARSES);
     let key_schema: Vec<KeySchemaElement> = serde_json::from_str(&meta.key_schema)
         .map_err(|e| DynoxideError::InternalServerError(format!("Bad key schema JSON: {e}")))?;
     let attr_defs: Vec<AttributeDefinition> = serde_json::from_str(&meta.attribute_definitions)

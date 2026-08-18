@@ -48,6 +48,23 @@ pub struct BatchWriteItemResponse {
     pub item_collection_metrics: Option<HashMap<String, Vec<crate::types::ItemCollectionMetrics>>>,
 }
 
+/// Fold one item's per-index units into the running per-table totals. A batch
+/// reports the sum across its items, and an index no item in the batch touched
+/// stays absent rather than appearing as a zero.
+fn accumulate_index_units(
+    totals: &mut HashMap<String, HashMap<String, f64>>,
+    table_name: &str,
+    units: &HashMap<String, f64>,
+) {
+    if units.is_empty() {
+        return;
+    }
+    let table_entry = totals.entry(table_name.to_string()).or_default();
+    for (index_name, units) in units {
+        *table_entry.entry(index_name.clone()).or_insert(0.0) += units;
+    }
+}
+
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     mut request: BatchWriteItemRequest,
@@ -184,8 +201,10 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // Track per-table GSI capacity and affected partition keys for deferred metrics
+    // Track per-table secondary index capacity and affected partition keys for
+    // deferred metrics
     let mut table_gsi_units: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut table_lsi_units: HashMap<String, HashMap<String, f64>> = HashMap::new();
     // Track per-table WCU (table-level, excludes GSI)
     let mut table_wcu: HashMap<String, f64> = HashMap::new();
     // Collect unique (table, pk_str, pk_attr, pk_value) for deferred metrics computation
@@ -234,66 +253,79 @@ pub async fn execute<S: StorageBackend>(
                 // item: a mid-fan-out failure rolls this item's write back.
                 // BatchWriteItem items are independent, so this is one
                 // transaction per write request.
-                let gsi_units = helpers::with_write_transaction(storage, async {
-                    let old_json = storage
-                        .put_item_with_hash(table_name, &pk, &sk, &item_json, size, &hash_prefix)
+                let (old_size, gsi_units, lsi_units) =
+                    helpers::with_write_transaction(storage, async {
+                        let old_json = storage
+                            .put_item_with_hash(
+                                table_name,
+                                &pk,
+                                &sk,
+                                &item_json,
+                                size,
+                                &hash_prefix,
+                            )
+                            .await?;
+                        let old_item: Option<Item> =
+                            old_json.and_then(|j| serde_json::from_str(&j).ok());
+                        let target = super::gsi::IndexWrite {
+                            table_name,
+                            pk: &pk,
+                            sk: &sk,
+                            pk_attr: &key_schema.partition_key,
+                            sk_attr: key_schema.sort_key.as_deref(),
+                        };
+                        let gsi_units = super::gsi::maintain_gsis_after_write_with_defs(
+                            storage,
+                            &gsi_defs,
+                            &target,
+                            old_item.as_ref(),
+                            &put_req.item,
+                            request.return_consumed_capacity.as_deref(),
+                        )
                         .await?;
-                    let gsi_units = super::gsi::maintain_gsis_after_write_with_defs(
-                        storage,
-                        table_name,
-                        &gsi_defs,
-                        &pk,
-                        &sk,
-                        &put_req.item,
-                        &key_schema.partition_key,
-                        key_schema.sort_key.as_deref(),
-                    )
+                        let lsi_units = super::lsi::maintain_lsis_after_write_with_defs(
+                            storage,
+                            &lsi_defs,
+                            &target,
+                            old_item.as_ref(),
+                            &put_req.item,
+                            request.return_consumed_capacity.as_deref(),
+                        )
+                        .await?;
+                        super::vector_index::maintain_vector_indexes_after_write_with_defs(
+                            storage,
+                            table_name,
+                            &vector_defs,
+                            &attr_defs,
+                            &pk,
+                            &sk,
+                            &put_req.item,
+                            &key_schema,
+                            false,
+                        )
+                        .await?;
+                        crate::streams::record_stream_event(
+                            storage,
+                            &meta,
+                            old_item.as_ref(),
+                            Some(&put_req.item),
+                        )
+                        .await?;
+                        Ok((
+                            old_item.as_ref().map(types::item_size),
+                            gsi_units,
+                            lsi_units,
+                        ))
+                    })
                     .await?;
-                    super::lsi::maintain_lsis_after_write_with_defs(
-                        storage,
-                        table_name,
-                        &lsi_defs,
-                        &pk,
-                        &sk,
-                        &put_req.item,
-                        &key_schema.partition_key,
-                        key_schema.sort_key.as_deref(),
-                    )
-                    .await?;
-                    super::vector_index::maintain_vector_indexes_after_write_with_defs(
-                        storage,
-                        table_name,
-                        &vector_defs,
-                        &attr_defs,
-                        &pk,
-                        &sk,
-                        &put_req.item,
-                        &key_schema,
-                        false,
-                    )
-                    .await?;
-                    let old_item: Option<Item> =
-                        old_json.and_then(|j| serde_json::from_str(&j).ok());
-                    crate::streams::record_stream_event(
-                        storage,
-                        &meta,
-                        old_item.as_ref(),
-                        Some(&put_req.item),
-                    )
-                    .await?;
-                    Ok(gsi_units)
-                })
-                .await?;
 
-                // Accumulate WCU based on item size
+                // Accumulate WCU on the larger of the displaced and new images
                 *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
-                    types::write_capacity_units(size);
+                    types::table_write_capacity_units(old_size, Some(size));
 
-                // Accumulate GSI units per table
-                let table_entry = table_gsi_units.entry(table_name.clone()).or_default();
-                for (gsi_name, units) in &gsi_units {
-                    *table_entry.entry(gsi_name.clone()).or_insert(0.0) += units;
-                }
+                // Accumulate secondary index units per table
+                accumulate_index_units(&mut table_gsi_units, table_name, &gsi_units);
+                accumulate_index_units(&mut table_lsi_units, table_name, &lsi_units);
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = put_req.item.get(&key_schema.partition_key) {
@@ -310,52 +342,65 @@ pub async fn execute<S: StorageBackend>(
                 let (pk, sk) = helpers::extract_key_strings(&del_req.key, &key_schema)?;
 
                 // Base delete + index fan-out + stream are one atomic unit per item.
-                let (old_item, gsi_units) = helpers::with_write_transaction(storage, async {
-                    let old_json = storage.delete_item(table_name, &pk, &sk).await?;
-                    let old_item: Option<Item> =
-                        old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-                    let gsi_units = super::gsi::maintain_gsis_after_delete_with_defs(
-                        storage, table_name, &gsi_defs, &pk, &sk,
-                    )
-                    .await?;
-                    super::lsi::maintain_lsis_after_delete_with_defs(
-                        storage, table_name, &lsi_defs, &pk, &sk,
-                    )
-                    .await?;
-                    super::vector_index::maintain_vector_indexes_after_delete_with_defs(
-                        storage,
-                        table_name,
-                        &vector_defs,
-                        &pk,
-                        &sk,
-                    )
-                    .await?;
-                    if old_item.is_some() {
-                        crate::streams::record_stream_event(
+                let (old_item, gsi_units, lsi_units) =
+                    helpers::with_write_transaction(storage, async {
+                        let old_json = storage.delete_item(table_name, &pk, &sk).await?;
+                        let old_item: Option<Item> =
+                            old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+                        let target = super::gsi::IndexWrite {
+                            table_name,
+                            pk: &pk,
+                            sk: &sk,
+                            pk_attr: &key_schema.partition_key,
+                            sk_attr: key_schema.sort_key.as_deref(),
+                        };
+                        let gsi_units = super::gsi::maintain_gsis_after_delete_with_defs(
                             storage,
-                            &meta,
+                            &gsi_defs,
+                            &target,
                             old_item.as_ref(),
-                            None,
+                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
-                    }
-                    Ok((old_item, gsi_units))
-                })
-                .await?;
+                        let lsi_units = super::lsi::maintain_lsis_after_delete_with_defs(
+                            storage,
+                            &lsi_defs,
+                            &target,
+                            old_item.as_ref(),
+                            request.return_consumed_capacity.as_deref(),
+                        )
+                        .await?;
+                        super::vector_index::maintain_vector_indexes_after_delete_with_defs(
+                            storage,
+                            table_name,
+                            &vector_defs,
+                            &pk,
+                            &sk,
+                        )
+                        .await?;
+                        if old_item.is_some() {
+                            crate::streams::record_stream_event(
+                                storage,
+                                &meta,
+                                old_item.as_ref(),
+                                None,
+                            )
+                            .await?;
+                        }
+                        Ok((old_item, gsi_units, lsi_units))
+                    })
+                    .await?;
 
                 // Accumulate WCU: based on old item size if it existed, else 1 WCU
-                let delete_wcu = if let Some(ref old) = old_item {
-                    types::write_capacity_units(types::item_size(old))
-                } else {
-                    1.0
-                };
-                *table_wcu.entry(table_name.clone()).or_insert(0.0) += delete_wcu;
+                *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
+                    types::table_write_capacity_units(
+                        old_item.as_ref().map(types::item_size),
+                        None,
+                    );
 
-                // Accumulate GSI units per table
-                let table_entry = table_gsi_units.entry(table_name.clone()).or_default();
-                for (gsi_name, units) in &gsi_units {
-                    *table_entry.entry(gsi_name.clone()).or_insert(0.0) += units;
-                }
+                // Accumulate secondary index units per table
+                accumulate_index_units(&mut table_gsi_units, table_name, &gsi_units);
+                accumulate_index_units(&mut table_lsi_units, table_name, &lsi_units);
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = del_req.key.get(&key_schema.partition_key) {
@@ -383,10 +428,12 @@ pub async fn execute<S: StorageBackend>(
         for table_name in request.request_items.keys() {
             let total_wcu = table_wcu.get(table_name).copied().unwrap_or(0.0);
             let gsi_units = table_gsi_units.get(table_name).cloned().unwrap_or_default();
-            if let Some(cc) = crate::types::consumed_capacity_with_indexes(
+            let lsi_units = table_lsi_units.get(table_name).cloned().unwrap_or_default();
+            if let Some(cc) = crate::types::consumed_capacity_with_secondary_indexes(
                 table_name,
                 total_wcu,
                 &gsi_units,
+                &lsi_units,
                 &request.return_consumed_capacity,
             ) {
                 caps.push(cc);

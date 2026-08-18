@@ -29,6 +29,23 @@ compile_error!(
      Use the `encryption` feature for vendored OpenSSL on non-Apple platforms."
 );
 
+#[cfg(all(
+    feature = "wasm-sqlite",
+    any(
+        feature = "native-sqlite",
+        feature = "_has-encryption",
+        feature = "cli"
+    )
+))]
+compile_error!(
+    "The `wasm-sqlite` backend is mutually exclusive with the native backends and \
+     with the CLI, server and MCP features, which are native-only.\n\
+     If your manifest names none of those, they came from the defaults: Cargo adds \
+     the default features to whatever you list, so `features = [\"wasm-sqlite\"]` \
+     enables the native backend as well. Turn them off:\n  \
+     dynoxide-rs = { version = \"...\", default-features = false, features = [\"wasm-sqlite\"] }"
+);
+
 #[cfg(not(any(
     feature = "native-sqlite",
     feature = "_has-encryption",
@@ -42,6 +59,7 @@ compile_error!(
 
 pub mod actions;
 pub mod auth_material;
+pub mod bench_counters;
 pub mod errors;
 pub mod expressions;
 #[cfg(feature = "import")]
@@ -126,17 +144,17 @@ type TokenSlot<T> = (Instant, u64, Option<T>);
 /// Idempotency cache keyed by `ClientRequestToken`.
 type TokenCache<T> = HashMap<String, TokenSlot<T>>;
 
-/// Cached `TransactWriteItems` responses.
-type TransactWriteTokenCache =
-    TokenCache<actions::transact_write_items::TransactWriteItemsResponse>;
+/// Cached `TransactWriteItems` responses, alongside the image sizes a replay is
+/// billed against. Those sizes are cache bookkeeping, so they ride here rather
+/// than on the response type a caller sees.
+type TransactWriteTokenCache = TokenCache<actions::transact_write_items::CachedWrite>;
 
 /// Cached `ExecuteTransaction` responses. Separate from
 /// [`TransactWriteTokenCache`] because the response type differs and
 /// `ClientRequestToken` idempotency is scoped per API operation in AWS: a token
 /// reused across `TransactWriteItems` and `ExecuteTransaction` executes once in
 /// each, so the two caches are independent by design.
-type ExecuteTransactionTokenCache =
-    TokenCache<actions::execute_transaction::ExecuteTransactionResponse>;
+type ExecuteTransactionTokenCache = TokenCache<actions::execute_transaction::CachedTransaction>;
 
 /// The transactional idempotency caches one engine instance owns.
 ///
@@ -477,11 +495,12 @@ pub type WasmDatabase = Database<WasmBridgeBackend>;
 
 /// Build-visible preview marker for the wasm-sqlite backend.
 ///
-/// `true` when built with `--features wasm-sqlite`, `false` otherwise. The wasm
-/// backend covers CRUD, query, scan, GSI/LSI, and PartiQL, and passes the
-/// conformance cases for all of them, but it still leaves several operations
-/// unimplemented. Consumers can read this constant to tell whether the artifact
-/// they hold is the fully conformant native build or the wasm preview.
+/// `true` when built with `--no-default-features --features wasm-sqlite`,
+/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI, and
+/// PartiQL, and passes the conformance cases for all of them, but it still
+/// leaves several operations unimplemented. Consumers can read this constant to
+/// tell whether the artifact they hold is the fully conformant native build or
+/// the wasm preview.
 #[cfg(feature = "wasm-sqlite")]
 pub const WASM_PREVIEW: bool = true;
 /// Build-visible preview marker for the wasm-sqlite backend. See the
@@ -861,21 +880,24 @@ impl Database<RusqliteBackend> {
             &request.transact_items,
             || {
                 self.with_storage(|s| {
-                    pollster::block_on(actions::transact_write_items::execute(s, request.clone()))
+                    pollster::block_on(actions::transact_write_items::execute_cached(
+                        s,
+                        request.clone(),
+                    ))
                 })
             },
             |cached| {
                 // The replay recomputes a transactional read cost against the
-                // item sizes (4KB read granularity, diverging from the first
-                // call's 1KB-granular write above 1KB) and carries over the
-                // cached item collection metrics.
+                // image sizes the first call recorded (4KB read granularity,
+                // diverging from that call's 1KB-granular write above 1KB) and
+                // carries over its item collection metrics.
                 actions::transact_write_items::replay_response(
-                    &request.transact_items,
+                    cached,
                     &request.return_consumed_capacity,
-                    cached.item_collection_metrics.clone(),
                 )
             },
         )
+        .map(|cached| cached.response)
     }
 
     /// Execute a transactional read (up to 100 gets).
@@ -973,25 +995,34 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
+        // Ahead of the cache, not only inside the work: a replayed token skips
+        // the work entirely, and the token is keyed on the statements alone, so
+        // a replay may carry a capacity mode the first call never did.
+        actions::execute_transaction::reject_bad_capacity_mode(
+            request.return_consumed_capacity.as_deref(),
+        )?;
         run_idempotent(
             &self.tokens.execute_transaction,
             request.client_request_token.as_deref(),
             &request.transact_statements,
             || {
                 self.with_storage(|s| {
-                    pollster::block_on(actions::execute_transaction::execute(s, request.clone()))
+                    pollster::block_on(actions::execute_transaction::execute_cached(
+                        s,
+                        request.clone(),
+                    ))
                 })
             },
             |cached| {
-                // The replay reports transactional read capacity and carries
-                // over the cached first-call responses.
+                // The replay reports transactional read capacity against the
+                // sizes the first call recorded, and carries over its responses.
                 actions::execute_transaction::replay_response(
-                    &request.transact_statements,
+                    cached,
                     &request.return_consumed_capacity,
-                    cached.responses.clone(),
                 )
             },
         )
+        .map(|cached| cached.response)
     }
 
     /// Execute a batch of PartiQL statements.

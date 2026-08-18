@@ -21,12 +21,23 @@ jobs:
             .
             benchmarks
 
+      - name: Discard any cached criterion state
+        # A cache hit brings back benchmarks/target with target/criterion in a
+        # half state: the per-benchmark base directory is there but the
+        # sample.json inside it is not. Criterion takes the directory alone as
+        # a baseline to compare against, fails to read it, and prints the error
+        # to stdout in the middle of the result line it was writing, leaving
+        # the comparison below nothing to parse. The baseline this job wants
+        # comes from the benchmark-data branch, so criterion's own on-disk one
+        # is only ever leftovers from an unrelated PR.
+        run: rm -rf benchmarks/target/criterion
+
       - name: Run criterion micro-benchmarks
         # shell: bash adds -o pipefail. Without it the exit status of the pipe
         # is tee's, so a bench that dies partway leaves a truncated file and
         # still reports success.
         shell: bash
-        run: cd benchmarks && rm -rf target/criterion && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
+        run: cd benchmarks && cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
 
       - name: Compare against recent baselines
         id: compare
@@ -45,6 +56,16 @@ jobs:
           # advisory: the step stays green and the warning is the whole signal,
           # because wall-clock timings on shared runners move on their own.
           #
+          # Exit 4 means the run lost benchmarks. It fails the step, but the
+          # comparison it wrote covers the ones that survived and names the
+          # ones that did not, so keep that file rather than replacing it with
+          # the error block below.
+          if [ "$status" -eq 4 ]; then
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::criterion run produced no result for some benchmarks"
+            exit "$status"
+          fi
+
           # Any other non-zero means no comparison happened at all. That fails
           # the step, since a check that could not run must not look like one
           # that passed. It still does not block merge -- this job is not a

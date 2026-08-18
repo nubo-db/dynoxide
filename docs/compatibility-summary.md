@@ -100,6 +100,36 @@ the ones worth knowing.
 | **LSI projection ALL / KEYS_ONLY / INCLUDE** | Supported |
 | **LSI Query routing** | Supported |
 | **LSI Scan routing** | Supported |
+| **Per-LSI ConsumedCapacity (INDEXES mode)** | Supported |
+
+Index write capacity is charged against the change to what an index stores, as
+DynamoDB does, rather than against the item the write leaves behind. A write that
+leaves an index's stored view untouched reports no arm for that index at all,
+moving an index key costs two writes, and removing one costs a single delete.
+Sizing is on the projected index entry, so an attribute the index does not
+project costs it nothing.
+
+Every write surface reports the breakdown: `PutItem`, `UpdateItem`, `DeleteItem`,
+`BatchWriteItem`, `TransactWriteItems`, `ExecuteStatement`, `ExecuteTransaction`
+and `BatchExecuteStatement`.
+
+The transactional 2x factor applies to the base table arm alone. An index arm
+inside a `TransactWriteItems` or `ExecuteTransaction` costs what the same write
+costs outside a transaction, so a GSI key move charges the index the same either
+way while the table arm doubles.
+
+A transactional table arm is sized on the larger of the item's before and after
+images, which covers a `ConditionCheck` too: it writes nothing and is still
+charged on the image it read. A same-token replay is charged against those same
+images at 4KB read granularity.
+
+A PartiQL `SELECT` served from an index is charged against that index's arm with
+the table arm at zero, matching `Query` and `Scan`.
+
+One read-side gap remains, and it is not specific to indexes: a PartiQL read with
+no key condition is charged on the rows it returns, where DynamoDB charges a flat
+figure for the scan regardless of how many rows it evaluated. An unqualified base
+table scan diverges by the same margin as an index one.
 
 ---
 
@@ -107,21 +137,30 @@ the ones worth knowing.
 
 Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 
-- **Comparisons:** `=`, `<>`, `<`, `>`, `<=`, `>=`
+- **Comparisons:** `=` and `<>` on every attribute type; `<`, `>`, `<=`, `>=` and `BETWEEN` on the three DynamoDB orders (`S`, `N`, `B`), rejecting any other operand with `Incorrect operand type for operator or function` before the table is resolved. Sets compare without regard to member order, lists in order, maps on their key set; the same comparison serves condition expressions, so the two surfaces cannot drift
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
-- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping
+- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally; a clause whose flattened form exceeds 256 alternatives is rejected as too complex
 - **Projections:** Nested dot-notation paths
 - **Aggregates:** Not supported, matching DynamoDB: a `COUNT(...)` projection is rejected with DynamoDB's `Unexpected path component` message carrying the token's position (captured against eu-west-2)
 - **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2)
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
 - **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics
+- **Index qualifier:** `SELECT * FROM "table"."index"` is served from the named GSI or LSI. The read follows the index, so items the index does not hold are absent and a `KEYS_ONLY` or `INCLUDE` projection returns only what it projects. An unknown index name, a path of more than two components, an empty path component and a strongly consistent read of a GSI are each rejected with DynamoDB's own wording. A GSI rejects a projection naming an attribute it does not carry; either kind rejects a filter on one when the read is keyed on the index partition key, and matches nothing when it is not. `INSERT` rejects a qualifier at parse, `UPDATE` and `DELETE` reject it in execution. Captured against eu-west-2
+
+  An index-qualified `SELECT` inside `ExecuteTransaction` is rejected, as it is on DynamoDB. One limit remains: an LSI serves a projection naming an unprojected attribute from the base table on DynamoDB and returns nothing here
 
 Parameter placeholders (`?`) supported in all positions including nested list/map values.
 
 **`RETURNING`:** honoured on `ExecuteStatement` (`DELETE ALL OLD *`, and `UPDATE` in all four `ALL`/`MODIFIED` × `OLD`/`NEW` variants, with `MODIFIED` excluding the key) and on `BatchExecuteStatement`; rejected inside `ExecuteTransaction` with a `ValidationException`. `DELETE` accepts only `RETURNING ALL OLD *` and rejects the other variants, matching DynamoDB.
+
+**Batch and transaction shape:** `BatchExecuteStatement` and `ExecuteTransaction` reject a request that mixes reads with writes, and one that names the same item twice, reads included. Both raise a top-level `ValidationException` before any statement runs, each with its own message. A member that does not parse is reported against itself and does not stop the rest of a batch. Captured against eu-west-2.
+
+**`ReturnConsumedCapacity`:** accepted on all three PartiQL surfaces. `BatchExecuteStatement` aggregates per table across the batch and charges a failed statement the write it attempted, sized on the row already stored.
+
+**Batch member options:** `BatchStatementRequest` carries `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`. `ConsistentRead` is per member and sets the rate that member's read is charged at, so a batch mixing the two sums both rates; it does not change which rows come back. `ReturnValuesOnConditionCheckFailure` is accepted and inert, matching DynamoDB: a member whose condition fails returns the same response whether it is `ALL_OLD`, `NONE` or absent, and never the item. A batch `SELECT` must name the table's primary key and may not name an index; either shape is rejected against that member while the rest of the batch runs.
 
 ---
 

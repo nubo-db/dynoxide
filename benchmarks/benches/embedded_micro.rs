@@ -1,4 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use dynoxide::actions::batch_execute_statement::{
+    BatchExecuteStatementRequest, BatchStatementRequest,
+};
 use dynoxide::actions::batch_get_item::{BatchGetItemRequest, KeysAndAttributes};
 use dynoxide::actions::batch_write_item::{BatchWriteItemRequest, PutRequest, WriteRequest};
 use dynoxide::actions::delete_item::DeleteItemRequest;
@@ -373,6 +376,77 @@ fn bench_transact_write_items(c: &mut Criterion) {
 // Criterion configuration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// BatchExecuteStatement (25 PartiQL statements)
+//
+// The PartiQL surfaces had no benchmark of any kind until this one, so a change
+// to their hot path could not be measured at all.
+//
+// Two things learned the hard way here, for whoever measures against it next.
+//
+// Assert the workload succeeded. This benchmark's first version inserted a
+// string into a sort key declared `N`, so all 25 statements were rejected. The
+// call still returns `Ok`, because a batch reports member failures inside a
+// successful response, so nothing complained. Every figure taken from it was a
+// measurement of the rejection path, and the conclusions drawn from those
+// figures were wrong in ways no amount of care in the arithmetic would have
+// caught. That is what the check outside the timing loop below is for.
+//
+// Know the noise floor before explaining a small difference. Repeat runs of
+// identical code here have differed by around 6 per cent. A change smaller
+// than that is not evidence of anything, whatever mechanism suggests itself.
+// ---------------------------------------------------------------------------
+
+fn batch_of_25(counter: usize) -> Vec<BatchStatementRequest> {
+    (0..25)
+        .map(|i| {
+            let mut stmt = BatchStatementRequest::default();
+            // `sk` is declared N on the bench table, so it has to be a number.
+            // A string here is rejected per statement and the batch as a whole
+            // still returns Ok, which measures the rejection path instead.
+            stmt.statement = format!(
+                "INSERT INTO \"{}\" VALUE {{'pk':'bench-{}','sk':{}}}",
+                BENCH_TABLE,
+                counter + i,
+                counter + i
+            );
+            stmt
+        })
+        .collect()
+}
+
+fn bench_batch_execute_statement(c: &mut Criterion) {
+    c.bench_function("batch_execute_statement_25", |b| {
+        let db = setup_database(PRE_POPULATED_COUNT, ItemSize::Medium);
+        let mut counter = PRE_POPULATED_COUNT;
+
+        // BatchExecuteStatement reports member failures inside a successful
+        // response, so `unwrap` proves nothing about the workload. Check once,
+        // outside the timing loop, that every statement actually runs.
+        let check = db
+            .batch_execute_statement(BatchExecuteStatementRequest {
+                statements: batch_of_25(counter),
+                return_consumed_capacity: None,
+            })
+            .unwrap();
+        assert!(
+            check.responses.iter().all(|r| r.error.is_none()),
+            "benchmark workload is failing, so this measures rejection: {:?}",
+            check.responses.iter().find_map(|r| r.error.as_ref())
+        );
+        counter += 25;
+
+        b.iter(|| {
+            counter += 25;
+            db.batch_execute_statement(BatchExecuteStatementRequest {
+                statements: batch_of_25(counter),
+                return_consumed_capacity: None,
+            })
+            .unwrap();
+        });
+    });
+}
+
 criterion_group! {
     name = embedded_micro;
     config = Criterion::default()
@@ -388,6 +462,7 @@ criterion_group! {
         bench_delete_item,
         bench_batch_write_item,
         bench_batch_get_item,
+        bench_batch_execute_statement,
         bench_transact_write_items
 }
 

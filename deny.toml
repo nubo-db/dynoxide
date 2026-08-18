@@ -13,11 +13,12 @@
 # rustls 0.23 + aws-lc) under a 2025+ BehaviorVersion. Revisit and remove these
 # entries when that migration lands.
 ignore = [
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101: URI name constraints incorrectly accepted. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101: wildcard name constraints accepted. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101: reachable panic in CRL parsing. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
-    { id = "RUSTSEC-2026-0009", reason = "rustls-webpki 0.101: denial of service via stack exhaustion. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1.0 unmaintained. Dev-only via the AWS SDK legacy default TLS; not in the published crate or binary. Revisit on the AWS default-https-client / rustls 0.23 migration." },
+    # The only one left. `time` fixed it in 0.3.47, which needs Rust 1.88
+    # against this crate's declared 1.85, so taking the patch would move a
+    # published MSRV to close a dev-only hole. `time` reaches us through the
+    # AWS SDK we test against and is not in the shipped graph, and the attack
+    # needs a malicious RFC 2822 date, which nothing here parses.
+    { id = "RUSTSEC-2026-0009", reason = "time 0.3.45: stack exhaustion parsing a hostile RFC 2822 date. Dev-only via the AWS SDK, not in the published crate or binary. The fix in 0.3.47 requires Rust 1.88 and the crate declares 1.85. Revisit when the MSRV moves." },
 ]
 
 [licenses]

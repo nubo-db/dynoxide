@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A number is sized by its significant digits, so an item measures the same before and after storage normalises it ([#187](https://github.com/nubo-db/dynoxide/issues/187)). Sizing counted the digit characters of whatever string it held, and normalising expands scientific notation, so the same item measured one size as it arrived and another once stored. `PutItem` checked the limit before that expansion and the other three write paths after it, which is how an item of 8000 attributes holding `N "1E125"` passed `PutItem`, was refused by `BatchWriteItem`, and was then recorded at 552,004 bytes against a 409,600 limit. The recorded size feeds table statistics and the `ItemCollectionMetrics` estimate.
+
+  Captured against eu-west-2 by bisecting the 400KB gate, which resolves to the byte. A number costs one byte, plus `ceil(integer significant digits / 2)` and `ceil(fraction significant digits / 2)`, over the value with leading and trailing zeros trimmed. Two consequences beyond the reported bug: zeros DynamoDB trims were being charged for, so `0.0000001` was sized at 5 bytes rather than 2, and the halving rounded down where DynamoDB rounds up, so every number with an odd count of significant digits was a byte light. Both fed consumed capacity on every write, `table_stats`, the query and scan byte budgets, and index capacity.
+
 - `ConsumedCapacity` under `INDEXES` charges index writes on the change to what an index stores, not on the item the write leaves behind ([#176](https://github.com/nubo-db/dynoxide/issues/176)). Each index used to be charged a unit whenever the finished item belonged to it, which is right for a plain insert and wrong for most else:
 
   - LSI writes are charged. The `LocalSecondaryIndexes` arm never appeared before, and its units never reached the total.

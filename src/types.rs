@@ -44,23 +44,12 @@ impl AttributeValue {
     pub fn size(&self) -> usize {
         match self {
             AttributeValue::S(s) => s.len(),
-            AttributeValue::N(n) => {
-                // DynamoDB: (number of significant digits / 2) + 1, minimum 1
-                let significant = n.chars().filter(|c| c.is_ascii_digit()).count();
-                let significant = significant.max(1);
-                (significant / 2) + 1
-            }
+            AttributeValue::N(n) => number_size(n),
             AttributeValue::B(b) => b.len(),
             AttributeValue::BOOL(_) => 1,
             AttributeValue::NULL(_) => 1,
             AttributeValue::SS(ss) => ss.iter().map(|s| s.len()).sum(),
-            AttributeValue::NS(ns) => ns
-                .iter()
-                .map(|n| {
-                    let significant = n.chars().filter(|c| c.is_ascii_digit()).count().max(1);
-                    (significant / 2) + 1
-                })
-                .sum(),
+            AttributeValue::NS(ns) => ns.iter().map(|n| number_size(n)).sum(),
             AttributeValue::BS(bs) => bs.iter().map(|b| b.len()).sum(),
             AttributeValue::L(items) => {
                 // List overhead: 3 bytes + 1 byte per element + sum of element sizes
@@ -529,6 +518,33 @@ fn is_well_formed_dynamo_number(s: &str) -> bool {
 
     // Anything left over (stray chars, trailing whitespace) is invalid.
     i == n
+}
+
+/// Byte cost of a number, as DynamoDB accounts for it in an item's size.
+///
+/// One byte, plus `ceil(integer significant digits / 2)` and
+/// `ceil(fraction significant digits / 2)`, over the value with leading and
+/// trailing zeros trimmed. Measured byte-exact against eu-west-2 by bisecting
+/// the 400KB item-size gate.
+///
+/// Counting significant digits rather than characters is what makes the answer
+/// survive storage: DynamoDB expands scientific notation when it stores a
+/// number, so a measure taken over the digits of the string would give one
+/// answer for the request and another for the stored row. Every write path
+/// checks the limit somewhere either side of that expansion, and they can only
+/// agree if the measure does not move.
+pub fn number_size(num_str: &str) -> usize {
+    let trimmed = num_str.trim();
+    let abs = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
+    let (mantissa, exponent) = parse_number_parts(abs);
+
+    // `exponent` is how many significant digits fall before the decimal point:
+    // negative for a pure fraction, past the end of the mantissa for a value
+    // whose trailing zeros were trimmed. Either way the split is a clamp.
+    let int_digits = exponent.clamp(0, mantissa.len() as i32) as usize;
+    let frac_digits = mantissa.len() - int_digits;
+
+    int_digits.div_ceil(2) + frac_digits.div_ceil(2) + 1
 }
 
 /// Normalize a DynamoDB number string to its canonical form.
@@ -1650,9 +1666,87 @@ mod tests {
 
     #[test]
     fn test_size_number() {
-        // "42" has 2 significant digits → (2/2) + 1 = 2
+        // "42" has 2 significant digits → ceil(2/2) + 1 = 2
         let val = AttributeValue::N("42".to_string());
         assert_eq!(val.size(), 2);
+    }
+
+    #[test]
+    fn test_size_number_matches_dynamodb() {
+        // Byte-exact ground truth, measured against eu-west-2 by bisecting the
+        // 400KB item-size gate (which resolves to the byte, unlike the 1KB
+        // granularity of consumed capacity). A number costs
+        // ceil(integer significant digits / 2) + ceil(fraction significant
+        // digits / 2) + 1, over the value with leading and trailing zeros
+        // trimmed. The count is a property of the significant digits, so it does
+        // not change when scientific notation is expanded on storage.
+        let cases: &[(&str, usize)] = &[
+            // digit counts either side of the decimal point
+            ("1", 2),
+            ("12", 2),
+            ("123", 3),
+            ("1234", 3),
+            ("12345", 4),
+            ("123456", 4),
+            ("1234567", 5),
+            ("12345678", 5),
+            ("123456789", 6),
+            ("1234567891", 6),
+            ("12345678912", 7),
+            ("123456789123", 7),
+            ("1234567890123456789", 11),
+            ("12345678901234567890123456789012345678", 20),
+            // zeros the wire carries but DynamoDB trims
+            ("0042", 2),
+            ("100", 2),
+            ("1010", 3),
+            ("0.0000001", 2),
+            ("0", 1),
+            // scientific notation, which expands on storage without growing
+            ("1E125", 2),
+            ("1E-100", 2),
+            // significant digits straddling the decimal point are counted in two
+            // halves, so these cost a byte more than the digit total alone implies
+            ("1.5", 3),
+            ("1.2", 3),
+            ("1.200", 3),
+            ("1.234", 4),
+            ("3.14159", 5),
+            ("100.5", 4),
+            ("0.15", 2),
+            ("15", 2),
+        ];
+        for (literal, expected) in cases {
+            assert_eq!(
+                AttributeValue::N((*literal).to_string()).size(),
+                *expected,
+                "size of N {literal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_size_number_survives_normalisation() {
+        // The reason the write paths could disagree: sizing has to be invariant
+        // under the normalisation that happens on storage, or the same item
+        // measures differently either side of it.
+        for literal in [
+            "1E125",
+            "1E-100",
+            "0042",
+            "1.200",
+            "0.0000001",
+            "100",
+            "3.14159",
+            "42",
+        ] {
+            let raw = AttributeValue::N(literal.to_string()).size();
+            let normalised = AttributeValue::N(normalize_dynamo_number(literal)).size();
+            assert_eq!(
+                raw, normalised,
+                "N {literal:?} changed size when normalised"
+            );
+        }
     }
 
     #[test]

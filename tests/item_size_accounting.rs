@@ -10,7 +10,7 @@ use dynoxide::actions::batch_write_item::{BatchWriteItemRequest, PutRequest, Wri
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::transact_write_items::{
-    TransactPut, TransactWriteItem, TransactWriteItemsRequest,
+    TransactPut, TransactUpdate, TransactWriteItem, TransactWriteItemsRequest,
 };
 use dynoxide::actions::update_item::UpdateItemRequest;
 use dynoxide::types::*;
@@ -223,4 +223,92 @@ fn each_update_action_adds_to_what_the_gate_measures() {
 
     run("k", two_set_ceiling).expect("at the two-action ceiling");
     run("k2", two_set_ceiling + 1).expect_err("one byte over");
+}
+
+#[test]
+fn a_transacted_write_reports_an_oversized_item_the_way_dynamodb_does() {
+    // Captured against eu-west-2. The two actions differ, because a put's size is
+    // knowable from the request and an update's is not:
+    //   Put    -> a plain ValidationException, before the transaction runs
+    //   Update -> a cancellation reason, and the message names it as an update
+    let db = make_db();
+
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("k".to_string()));
+    item.insert("b".to_string(), AttributeValue::S("x".repeat(409_601)));
+    let err = db
+        .transact_write_items(TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                put: Some(TransactPut {
+                    table_name: "Items".to_string(),
+                    item,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Item size has exceeded the maximum allowed size"
+    );
+
+    let err = db
+        .transact_write_items(TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                update: Some(TransactUpdate {
+                    table_name: "Items".to_string(),
+                    key: HashMap::from([("pk".to_string(), AttributeValue::S("k2".to_string()))]),
+                    update_expression: "SET b = :v".to_string(),
+                    expression_attribute_values: Some(HashMap::from([(
+                        ":v".to_string(),
+                        AttributeValue::S("x".repeat(409_601)),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        dynoxide::errors::DynoxideError::TransactionCanceledException(_, reasons) => {
+            assert_eq!(reasons[0].code, "ValidationError");
+            assert_eq!(
+                reasons[0].message.as_deref(),
+                Some("Item size to update has exceeded the maximum allowed size")
+            );
+        }
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_transacted_update_is_not_charged_the_standalone_update_overhead() {
+    // The standalone UpdateItem takes the key attributes out and charges per
+    // action; a transacted one is measured flat against the resulting item. So
+    // an item that UpdateItem refuses goes through inside a transaction.
+    let db = make_db();
+    let just_over_update_ceiling = 409_581 - 4 + 1;
+
+    set_blob(&db, "k", just_over_update_ceiling).expect_err("UpdateItem refuses it");
+
+    db.transact_write_items(TransactWriteItemsRequest {
+        transact_items: vec![TransactWriteItem {
+            update: Some(TransactUpdate {
+                table_name: "Items".to_string(),
+                key: HashMap::from([("pk".to_string(), AttributeValue::S("k".to_string()))]),
+                update_expression: "SET b = :v".to_string(),
+                expression_attribute_values: Some(HashMap::from([(
+                    ":v".to_string(),
+                    AttributeValue::S("x".repeat(just_over_update_ceiling)),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .expect("a transacted update accepts it");
 }

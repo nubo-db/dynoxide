@@ -174,6 +174,21 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         }
     }
 
+    // Validate: each Put is within the item-size limit. This sits out here rather
+    // than inside the action because a put's size is knowable from the request,
+    // so DynamoDB answers it as a plain validation error before the transaction
+    // runs. An update's size is not: it depends on the stored item, and comes
+    // back as a cancellation reason instead. Captured against eu-west-2.
+    for item in items {
+        if let Some(ref put) = item.put {
+            if types::item_size(&put.item) > types::MAX_ITEM_SIZE {
+                return Err(DynoxideError::ValidationException(
+                    "Item size has exceeded the maximum allowed size".to_string(),
+                ));
+            }
+        }
+    }
+
     // Validate: aggregate item size must not exceed 4MB
     let total_size: usize = items.iter().map(|i| get_action_table_and_size(i).1).sum();
     if total_size > 4 * 1024 * 1024 {
@@ -380,12 +395,9 @@ async fn execute_put<S: StorageBackend>(
     let mut item = put.item.clone();
     crate::validation::normalize_item_sets(&mut item);
 
+    // The item-size limit was applied to this put before the transaction opened,
+    // and normalising cannot grow the item, so there is nothing to recheck here.
     let size = types::item_size(&item);
-    if size > types::MAX_ITEM_SIZE {
-        return Err(DynoxideError::ValidationException(
-            "Item size has exceeded the maximum allowed size".to_string(),
-        ));
-    }
 
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
@@ -553,10 +565,13 @@ async fn execute_update<S: StorageBackend>(
     // Reject an index key this update set to an invalid value (see helpers).
     helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
 
+    // A transacted update is measured flat against the resulting item, unlike the
+    // standalone UpdateItem, which takes the key attributes out and charges per
+    // action. Both were captured against eu-west-2; the two really do differ.
     let size = types::item_size(&item);
     if size > types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
-            "Item size has exceeded the maximum allowed size".to_string(),
+            "Item size to update has exceeded the maximum allowed size".to_string(),
         ));
     }
 

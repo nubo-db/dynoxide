@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Two forms are charged less than DynamoDB charges them, so the engine still accepts a little more than DynamoDB rather than less: assigning through a list index costs a byte more, and an arithmetic assignment such as `SET n = n + :one` costs fifty more. The legacy `AttributeUpdates` parameter is charged on the same shapes, inferred from the expression form rather than captured separately.
 
+- `TransactWriteItems` reports an oversized item the way DynamoDB does ([#187](https://github.com/nubo-db/dynoxide/issues/187)). Both actions used to come back as a cancellation carrying the put wording. Captured against eu-west-2, they differ, and the split follows what each can be answered from: a put's size is knowable from the request, so it is rejected up front with a plain `ValidationException` before the transaction opens, while an update's depends on the stored item and comes back as a `ValidationError` cancellation reason reading `Item size to update has exceeded the maximum allowed size`.
+
+  A transacted update is also measured flat against the resulting item, without the key exclusion and per-action cost that the standalone `UpdateItem` carries, so an item `UpdateItem` refuses can still be written inside a transaction. That asymmetry is DynamoDB's, and both halves were captured.
+
 - `ConsumedCapacity` under `INDEXES` charges index writes on the change to what an index stores, not on the item the write leaves behind ([#176](https://github.com/nubo-db/dynoxide/issues/176)). Each index used to be charged a unit whenever the finished item belonged to it, which is right for a plain insert and wrong for most else:
 
   - LSI writes are charged. The `LocalSecondaryIndexes` arm never appeared before, and its units never reached the total.

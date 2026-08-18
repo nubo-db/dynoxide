@@ -531,6 +531,7 @@ async fn execute_inner<S: StorageBackend>(
         let old_item = item.clone();
 
         // Apply UpdateExpression
+        let mut size_overhead = 0usize;
         if let Some(ref update_expr) = request.update_expression {
             let parsed = crate::expressions::update::parse(update_expr)
                 .map_err(DynoxideError::ValidationException)?;
@@ -574,12 +575,14 @@ async fn execute_inner<S: StorageBackend>(
 
             crate::expressions::update::apply(&mut item, &parsed, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
+            size_overhead = parsed.size_overhead();
         }
 
         // Apply legacy AttributeUpdates (if no UpdateExpression was provided)
         if request.update_expression.is_none() {
             if let Some(ref updates) = request.attribute_updates {
                 apply_attribute_updates(&mut item, updates, &key_schema)?;
+                size_overhead = attribute_updates_size_overhead(updates);
             }
         }
 
@@ -599,9 +602,21 @@ async fn execute_inner<S: StorageBackend>(
         // error surfaces. Checks only what this update changed (see the helper).
         helpers::validate_updated_index_keys(&old_item, &item, &meta)?;
 
-        // Validate updated item size
+        // Validate updated item size. An update is measured against the limit
+        // differently from a put: the key attributes come out of the figure and
+        // each action adds a fixed cost, so an item can be reachable by PutItem
+        // and out of reach by UpdateItem. See `UpdateExpr::size_overhead`.
+        //
+        // The item itself is held to the limit as well, so the pair of checks is
+        // `max(item, item - key + overhead) <= 400KB`. Taking the key out of the
+        // measure only ever buys back what the actions cost, never more: once
+        // the key attributes reach the overhead, the item's own size binds and
+        // the ceiling sits flat at 400KB however long the key gets. Measured
+        // across key lengths from 1 to 1024 bytes, the finished item never
+        // exceeds 409,600 on any of them.
         let size = types::item_size(&item);
-        if size > types::MAX_ITEM_SIZE {
+        let measured = size.saturating_sub(key_attributes_size(&item, &key_schema)) + size_overhead;
+        if measured > types::MAX_ITEM_SIZE || size > types::MAX_ITEM_SIZE {
             return Err(DynoxideError::ValidationException(
                 "Item size to update has exceeded the maximum allowed size".to_string(),
             ));
@@ -758,6 +773,37 @@ async fn execute_inner<S: StorageBackend>(
         consumed_capacity,
         item_collection_metrics,
     })
+}
+
+/// Size of the key attributes, which DynamoDB leaves out of the figure it
+/// measures an update against.
+fn key_attributes_size(
+    item: &HashMap<String, AttributeValue>,
+    key_schema: &helpers::KeySchema,
+) -> usize {
+    let mut size = 0;
+    for name in std::iter::once(&key_schema.partition_key).chain(key_schema.sort_key.iter()) {
+        if let Some(value) = item.get(name) {
+            size += name.len() + value.size();
+        }
+    }
+    size
+}
+
+/// The `UpdateExpr::size_overhead` equivalent for the legacy `AttributeUpdates`
+/// parameter, whose actions map onto the same three shapes. Inferred from the
+/// expression form rather than captured separately, so it is deliberately no
+/// stricter: an action that is not recognised is charged nothing.
+fn attribute_updates_size_overhead(updates: &HashMap<String, AttributeValueUpdate>) -> usize {
+    let mut overhead = 3;
+    for update in updates.values() {
+        overhead += match update.action.to_uppercase().as_str() {
+            "PUT" | "ADD" => 19,
+            "DELETE" => 2,
+            _ => 0,
+        };
+    }
+    overhead
 }
 
 /// Apply legacy `AttributeUpdates` to the item, mutating it in place.

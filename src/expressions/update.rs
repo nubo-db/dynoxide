@@ -65,6 +65,33 @@ pub struct DeleteAction {
     pub value_ref: String,
 }
 
+impl UpdateExpr {
+    /// Bytes DynamoDB adds on top of the resulting item when it measures an
+    /// update against the 400KB limit.
+    ///
+    /// An update is not sized the way a put is. DynamoDB leaves the key
+    /// attributes out of the figure and charges a fixed amount per action, so
+    /// the same finished item can be small enough to `PutItem` and too large to
+    /// reach by `UpdateItem`. Measured against eu-west-2 by bisecting the gate:
+    /// three bytes for the update itself, nineteen for each action that writes a
+    /// value, and two for each that clears one. The cost does not vary with the
+    /// value written, the attribute name, or the expression text.
+    ///
+    /// Two forms cost more than this reports, both of which leave the engine
+    /// accepting a little more than DynamoDB rather than less: assigning through
+    /// a list index costs one byte more, and an arithmetic assignment such as
+    /// `SET n = n + :one` costs fifty more.
+    pub fn size_overhead(&self) -> usize {
+        const UPDATE: usize = 3;
+        const WRITES_A_VALUE: usize = 19;
+        const CLEARS_A_VALUE: usize = 2;
+
+        UPDATE
+            + WRITES_A_VALUE * (self.set_actions.len() + self.add_actions.len())
+            + CLEARS_A_VALUE * (self.remove_actions.len() + self.delete_actions.len())
+    }
+}
+
 /// Parse an UpdateExpression string.
 pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
     // Prefix the size error like every other UpdateExpression error; real
@@ -942,6 +969,48 @@ fn format_number(n: &bigdecimal::BigDecimal) -> String {
         normalized.with_scale(0).to_string()
     } else {
         normalized.to_string()
+    }
+}
+
+#[cfg(test)]
+mod overhead_tests {
+    use super::parse;
+
+    /// Ground truth measured against eu-west-2 by bisecting the update gate and
+    /// reading the accepted item back, so the figures are the true item sizes
+    /// rather than predicted ones. Each entry is the overhead DynamoDB added on
+    /// top of the resulting item once the key attributes were taken out.
+    #[test]
+    fn size_overhead_matches_dynamodb() {
+        let cases: &[(&str, usize)] = &[
+            ("SET b = :v", 22),
+            ("SET b = :v, c = :w", 41),
+            ("SET b = :v REMOVE r", 24),
+            ("SET b = :v DELETE t :d", 24),
+            ("SET b = :v ADD n :one", 41),
+            ("SET b = :v, m.f = :w", 41),
+            ("REMOVE r", 5),
+            ("REMOVE r, s", 7),
+        ];
+        for (expr, expected) in cases {
+            let parsed = parse(expr).unwrap_or_else(|e| panic!("parse {expr:?}: {e}"));
+            assert_eq!(parsed.size_overhead(), *expected, "overhead of {expr:?}");
+        }
+    }
+
+    /// The two forms the model knowingly under-charges. Both leave the engine
+    /// accepting a little more than DynamoDB, never less, which is the direction
+    /// to be wrong in. Asserted exactly rather than as a bound, so that dropping
+    /// the per-action charge altogether fails here instead of passing.
+    #[test]
+    fn size_overhead_undercharges_the_two_known_forms() {
+        // DynamoDB charges 42 for a list-index assignment and 91 for arithmetic,
+        // against the 41 the model charges for either.
+        assert_eq!(parse("SET b = :v, l[0] = :w").unwrap().size_overhead(), 41);
+        assert_eq!(
+            parse("SET b = :v, n = n + :one").unwrap().size_overhead(),
+            41
+        );
     }
 }
 

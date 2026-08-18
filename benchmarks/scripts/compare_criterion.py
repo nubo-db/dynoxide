@@ -35,8 +35,23 @@ import subprocess
 import sys
 
 
-# criterion --output-format bencher: "test NAME ... bench: N,NNN ns/iter (+/- N)"
-BENCHER_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter")
+# criterion --output-format bencher writes a result as "test NAME ... " and
+# "bench: N,NNN ns/iter (+/- N)", in two separate writes with the measurement
+# in between. On a clean run they land on one line:
+#
+#     test get_item ... bench: 15,543 ns/iter (+/- 755)
+#
+# Criterion prints its own errors to stdout rather than stderr, so anything it
+# has to report during the run splits that line in two:
+#
+#     test get_item ... Criterion.rs ERROR: error: Failed to access file "..."
+#     bench: 15,543 ns/iter (+/- 755)
+#
+# Matching the header and the measurement separately reads both shapes. A
+# header with no measurement after it is a benchmark that produced no result,
+# and is left out so the caller reports it as missing.
+HEADER_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s*(.*)$")
+BENCH_RE = re.compile(r"^\s*bench:\s+([\d,]+)\s+ns/iter")
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -48,11 +63,32 @@ EXIT_REGRESSED = 3
 def parse_bencher(text):
     """Parse criterion bencher-format output into {benchmark_name: ns}."""
     results = {}
+    pending = None
     for line in text.splitlines():
-        match = BENCHER_RE.match(line)
-        if match:
-            results[match.group(1)] = int(match.group(2).replace(",", ""))
+        header = HEADER_RE.match(line)
+        if header:
+            name, remainder = header.group(1), header.group(2)
+            measurement = BENCH_RE.match(remainder)
+            if measurement:
+                results[name] = _nanoseconds(measurement)
+                pending = None
+            else:
+                # Whatever criterion printed here pushed the measurement onto
+                # the next line. Hold the name until it arrives; if it never
+                # does, the next header discards it.
+                pending = name
+            continue
+
+        measurement = BENCH_RE.match(line)
+        if measurement and pending is not None:
+            results[pending] = _nanoseconds(measurement)
+            pending = None
     return results
+
+
+def _nanoseconds(measurement):
+    """Read the ns/iter figure out of a matched measurement."""
+    return int(measurement.group(1).replace(",", ""))
 
 
 def git(*args):

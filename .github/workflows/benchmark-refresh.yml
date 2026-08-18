@@ -153,14 +153,26 @@ jobs:
         shell: bash
         run: |
           cd benchmarks
+          # A cache hit brings target/criterion back with the per-benchmark
+          # base directory present but no sample.json in it. Criterion takes
+          # that as a baseline to compare against, fails to read it, and prints
+          # the error into the middle of the result line it was writing. Start
+          # from nothing so the output stays parseable.
+          rm -rf target/criterion
           cargo bench --bench embedded_micro -- --output-format bencher | tee criterion_output.txt
           python3 -c "
-          import json, re
-          results = {}
-          for line in open('criterion_output.txt'):
-              m = re.match(r'^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter', line)
-              if m:
-                  results[m.group(1)] = int(m.group(2).replace(',', ''))
+          import json, sys
+          sys.path.insert(0, 'scripts')
+          from compare_criterion import parse_bencher
+          with open('criterion_output.txt') as handle:
+              results = parse_bencher(handle.read())
+          # An empty baseline stored on benchmark-data is skipped by every
+          # later comparison, quietly shrinking the window the median rests on.
+          # Failing here stops the store and the README PR as well, so a refresh
+          # that cannot read its own criterion numbers publishes none of them.
+          # The raw results are still uploaded by the artifact step.
+          if not results:
+              sys.exit('no criterion results parsed from criterion_output.txt')
           with open('results/criterion_baseline.json', 'w') as f:
               json.dump(results, f, indent=2)
           "

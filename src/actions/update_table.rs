@@ -1499,9 +1499,15 @@ async fn backfill_vector_index<S: StorageBackend>(
             let item: Item = serde_json::from_str(item_json)
                 .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
 
-            if let Some(row) =
-                super::vector_index::vector_index_row(&item, vix, key_schema, attr_defs, pk, sk)?
-            {
+            if let Some(row) = super::vector_index::vector_index_row(
+                &item,
+                vix,
+                &key_schema.partition_key,
+                key_schema.sort_key.as_deref(),
+                attr_defs,
+                pk,
+                sk,
+            )? {
                 rows.push(row);
             }
         }

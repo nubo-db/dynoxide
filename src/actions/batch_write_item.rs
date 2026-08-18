@@ -205,6 +205,9 @@ pub async fn execute<S: StorageBackend>(
     // deferred metrics
     let mut table_gsi_units: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut table_lsi_units: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    // Vector replication is billed in bytes, so it accumulates on its own map
+    // and never joins the unit totals.
+    let mut table_vector_bytes: HashMap<String, HashMap<String, f64>> = HashMap::new();
     // Track per-table WCU (table-level, excludes GSI)
     let mut table_wcu: HashMap<String, f64> = HashMap::new();
     // Collect unique (table, pk_str, pk_attr, pk_value) for deferred metrics computation
@@ -253,7 +256,7 @@ pub async fn execute<S: StorageBackend>(
                 // item: a mid-fan-out failure rolls this item's write back.
                 // BatchWriteItem items are independent, so this is one
                 // transaction per write request.
-                let (old_size, gsi_units, lsi_units) =
+                let (old_size, gsi_units, lsi_units, vector_bytes) =
                     helpers::with_write_transaction(storage, async {
                         let old_json = storage
                             .put_item_with_hash(
@@ -292,18 +295,18 @@ pub async fn execute<S: StorageBackend>(
                             request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
-                        super::vector_index::maintain_vector_indexes_after_write_with_defs(
-                            storage,
-                            table_name,
-                            &vector_defs,
-                            &attr_defs,
-                            &pk,
-                            &sk,
-                            &put_req.item,
-                            &key_schema,
-                            false,
-                        )
-                        .await?;
+                        let vector_bytes =
+                            super::vector_index::maintain_vector_indexes_after_write_with_defs(
+                                storage,
+                                &vector_defs,
+                                &attr_defs,
+                                &target,
+                                old_item.as_ref(),
+                                &put_req.item,
+                                request.return_consumed_capacity.as_deref(),
+                                false,
+                            )
+                            .await?;
                         crate::streams::record_stream_event(
                             storage,
                             &meta,
@@ -315,6 +318,7 @@ pub async fn execute<S: StorageBackend>(
                             old_item.as_ref().map(types::item_size),
                             gsi_units,
                             lsi_units,
+                            vector_bytes,
                         ))
                     })
                     .await?;
@@ -326,6 +330,7 @@ pub async fn execute<S: StorageBackend>(
                 // Accumulate secondary index units per table
                 accumulate_index_units(&mut table_gsi_units, table_name, &gsi_units);
                 accumulate_index_units(&mut table_lsi_units, table_name, &lsi_units);
+                accumulate_index_units(&mut table_vector_bytes, table_name, &vector_bytes);
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = put_req.item.get(&key_schema.partition_key) {
@@ -342,7 +347,7 @@ pub async fn execute<S: StorageBackend>(
                 let (pk, sk) = helpers::extract_key_strings(&del_req.key, &key_schema)?;
 
                 // Base delete + index fan-out + stream are one atomic unit per item.
-                let (old_item, gsi_units, lsi_units) =
+                let (old_item, gsi_units, lsi_units, vector_bytes) =
                     helpers::with_write_transaction(storage, async {
                         let old_json = storage.delete_item(table_name, &pk, &sk).await?;
                         let old_item: Option<Item> =
@@ -370,14 +375,16 @@ pub async fn execute<S: StorageBackend>(
                             request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
-                        super::vector_index::maintain_vector_indexes_after_delete_with_defs(
-                            storage,
-                            table_name,
-                            &vector_defs,
-                            &pk,
-                            &sk,
-                        )
-                        .await?;
+                        let vector_bytes =
+                            super::vector_index::maintain_vector_indexes_after_delete_with_defs(
+                                storage,
+                                &vector_defs,
+                                &attr_defs,
+                                &target,
+                                old_item.as_ref(),
+                                request.return_consumed_capacity.as_deref(),
+                            )
+                            .await?;
                         if old_item.is_some() {
                             crate::streams::record_stream_event(
                                 storage,
@@ -387,7 +394,7 @@ pub async fn execute<S: StorageBackend>(
                             )
                             .await?;
                         }
-                        Ok((old_item, gsi_units, lsi_units))
+                        Ok((old_item, gsi_units, lsi_units, vector_bytes))
                     })
                     .await?;
 
@@ -401,6 +408,7 @@ pub async fn execute<S: StorageBackend>(
                 // Accumulate secondary index units per table
                 accumulate_index_units(&mut table_gsi_units, table_name, &gsi_units);
                 accumulate_index_units(&mut table_lsi_units, table_name, &lsi_units);
+                accumulate_index_units(&mut table_vector_bytes, table_name, &vector_bytes);
 
                 // Track affected partition for deferred metrics
                 if let Some(pk_val) = del_req.key.get(&key_schema.partition_key) {
@@ -429,11 +437,19 @@ pub async fn execute<S: StorageBackend>(
             let total_wcu = table_wcu.get(table_name).copied().unwrap_or(0.0);
             let gsi_units = table_gsi_units.get(table_name).cloned().unwrap_or_default();
             let lsi_units = table_lsi_units.get(table_name).cloned().unwrap_or_default();
-            if let Some(cc) = crate::types::consumed_capacity_with_secondary_indexes(
-                table_name,
-                total_wcu,
-                &gsi_units,
-                &lsi_units,
+            let vector_bytes = table_vector_bytes
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(cc) = crate::types::attach_vector_index_capacity(
+                crate::types::consumed_capacity_with_secondary_indexes(
+                    table_name,
+                    total_wcu,
+                    &gsi_units,
+                    &lsi_units,
+                    &request.return_consumed_capacity,
+                ),
+                &vector_bytes,
                 &request.return_consumed_capacity,
             ) {
                 caps.push(cc);

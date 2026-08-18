@@ -486,6 +486,7 @@ async fn execute_inner<S: StorageBackend>(
         },
         gsi_units,
         lsi_units,
+        vector_bytes,
     ) = helpers::with_write_transaction(storage, async {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -681,14 +682,13 @@ async fn execute_inner<S: StorageBackend>(
         // Maintain vector index shadow tables (inside the transaction). A
         // REMOVE of the vector attribute derives no row, so this de-indexes
         // the item; restoring the attribute re-indexes it.
-        super::vector_index::maintain_vector_indexes_after_write(
+        let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
             storage,
-            &request.table_name,
             &meta,
-            &pk,
-            &sk,
+            &target,
+            prior_image,
             &item,
-            &key_schema,
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
@@ -705,6 +705,7 @@ async fn execute_inner<S: StorageBackend>(
             },
             gsi_units,
             lsi_units,
+            vector_bytes,
         ))
     })
     .await?;
@@ -774,11 +775,15 @@ async fn execute_inner<S: StorageBackend>(
     )
     .await?;
 
-    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
-        &request.table_name,
-        types::table_write_capacity_units(old_size, Some(size)),
-        &gsi_units,
-        &lsi_units,
+    let consumed_capacity = types::attach_vector_index_capacity(
+        types::consumed_capacity_with_secondary_indexes(
+            &request.table_name,
+            types::table_write_capacity_units(old_size, Some(size)),
+            &gsi_units,
+            &lsi_units,
+            &request.return_consumed_capacity,
+        ),
+        &vector_bytes,
         &request.return_consumed_capacity,
     );
 

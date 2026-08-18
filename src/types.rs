@@ -796,6 +796,11 @@ pub struct ConsumedCapacity {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_secondary_indexes: Option<HashMap<String, CapacityDetail>>,
+    /// Per-vector-index replication cost. Reported under `INDEXES` alone, and
+    /// never folded into `capacity_units`: vector replication is billed in
+    /// bytes on its own axis rather than in capacity units.
+    #[serde(rename = "VectorIndexes", skip_serializing_if = "Option::is_none")]
+    pub vector_indexes: Option<HashMap<String, VectorCapacityDetail>>,
 }
 
 /// Per-resource capacity detail.
@@ -807,6 +812,41 @@ pub struct CapacityDetail {
     pub read_capacity_units: Option<f64>,
     #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
     pub write_capacity_units: Option<f64>,
+}
+
+/// One vector index's replication cost for a write.
+///
+/// Vector indexes are billed in bytes rather than capacity units, so this
+/// carries no `CapacityUnits` and the figure never reaches the response's
+/// total. An index a write leaves alone is absent from the map rather than
+/// present and zeroed (captured 2026-08-11, eu-west-2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorCapacityDetail {
+    #[serde(rename = "VectorWriteRequestBytes")]
+    pub vector_write_request_bytes: f64,
+}
+
+/// The `ConsumedCapacity` a `SearchVectors` response carries.
+///
+/// A vector search is billed on request bytes alone. The shape has no
+/// `CapacityUnits` and no `TableName`, reads identically under `TOTAL` and
+/// `INDEXES`, and is absent under `NONE` (captured 2026-08-11, eu-west-2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorSearchCapacity {
+    #[serde(rename = "VectorSearchRequestBytes")]
+    pub vector_search_request_bytes: f64,
+}
+
+/// The billable minimum for a vector request, in bytes.
+///
+/// DynamoDB documents a 1KB minimum on vector billing and the capture observed
+/// 1024.0 for a three-dimensional fixture, which is this floor rather than a
+/// constant. Magnitudes above it are unpinned: the suite asserts the shape.
+pub const MIN_VECTOR_REQUEST_BYTES: f64 = 1024.0;
+
+/// The billable byte figure for a vector request measuring `bytes`.
+pub fn vector_request_bytes(bytes: usize) -> f64 {
+    (bytes as f64).max(MIN_VECTOR_REQUEST_BYTES)
 }
 
 /// The transactional capacity multiplier. `TransactWriteItems` and
@@ -999,6 +1039,39 @@ fn secondary_index_capacity(
         }),
         _ => None,
     }
+}
+
+/// Attach per-vector-index write bytes to a capacity report.
+///
+/// Vector replication sits on its own axis, so this never touches
+/// `capacity_units`: the bytes are reported beside the classic arms, not
+/// summed into them. The map appears under `INDEXES` alone, matching the
+/// capture, and an empty `vector_bytes` leaves the response untouched so a
+/// write that changed no vector index reports no map at all rather than an
+/// empty one.
+pub fn attach_vector_index_capacity(
+    capacity: Option<ConsumedCapacity>,
+    vector_bytes: &HashMap<String, f64>,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    let mut capacity = capacity?;
+    if vector_bytes.is_empty() || mode.as_deref() != Some("INDEXES") {
+        return Some(capacity);
+    }
+    capacity.vector_indexes = Some(
+        vector_bytes
+            .iter()
+            .map(|(name, bytes)| {
+                (
+                    name.clone(),
+                    VectorCapacityDetail {
+                        vector_write_request_bytes: *bytes,
+                    },
+                )
+            })
+            .collect(),
+    );
+    Some(capacity)
 }
 
 /// Build a `ConsumedCapacity` for one table in a transactional read

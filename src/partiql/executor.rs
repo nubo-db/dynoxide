@@ -1358,8 +1358,13 @@ async fn execute_insert<S: StorageBackend>(
     .await?;
 
     // Vector index maintenance
-    crate::actions::vector_index::maintain_vector_indexes_after_write(
-        storage, table_name, meta, &pk, &sk, &item, key_schema,
+    let vector_bytes = crate::actions::vector_index::maintain_vector_indexes_after_write(
+        storage,
+        meta,
+        &target,
+        old_item.as_ref(),
+        &item,
+        capacity_mode,
     )
     .await?;
 
@@ -1374,7 +1379,8 @@ async fn execute_insert<S: StorageBackend>(
         Some(item_size),
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 /// Applies an UPDATE and returns the `RETURNING` projection (or `None` when the
@@ -1527,8 +1533,13 @@ async fn execute_update<S: StorageBackend>(
     .await?;
 
     // Vector index maintenance
-    crate::actions::vector_index::maintain_vector_indexes_after_write(
-        storage, table_name, meta, &pk_str, &sk_str, &item, key_schema,
+    let vector_bytes = crate::actions::vector_index::maintain_vector_indexes_after_write(
+        storage,
+        meta,
+        &target,
+        old_ref,
+        &item,
+        capacity_mode,
     )
     .await?;
 
@@ -1556,7 +1567,8 @@ async fn execute_update<S: StorageBackend>(
             Some(item_size),
             gsi_units,
             lsi_units,
-        ),
+        )
+        .with_vector_bytes(vector_bytes),
     ))
 }
 
@@ -1752,8 +1764,12 @@ async fn execute_delete<S: StorageBackend>(
     .await?;
 
     // Vector index maintenance
-    crate::actions::vector_index::maintain_vector_indexes_after_delete(
-        storage, table_name, meta, &pk_str, &sk_str,
+    let vector_bytes = crate::actions::vector_index::maintain_vector_indexes_after_delete(
+        storage,
+        meta,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
     )
     .await?;
 
@@ -1765,7 +1781,8 @@ async fn execute_delete<S: StorageBackend>(
     // A delete is charged on the item it removed, so a no-op delete against a
     // missing target carries no image and falls back to the one-unit minimum.
     let capacity =
-        WriteCapacity::from_items(table_name, old_item.as_ref(), None, gsi_units, lsi_units);
+        WriteCapacity::from_items(table_name, old_item.as_ref(), None, gsi_units, lsi_units)
+            .with_vector_bytes(vector_bytes);
     Ok((old_item, capacity))
 }
 

@@ -477,14 +477,13 @@ async fn execute_put<S: StorageBackend>(
     )
     .await?;
 
-    super::vector_index::maintain_vector_indexes_after_write(
+    let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
         storage,
-        &put.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema,
+        capacity_mode,
     )
     .await?;
 
@@ -497,7 +496,8 @@ async fn execute_put<S: StorageBackend>(
         Some(size),
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 async fn execute_update<S: StorageBackend>(
@@ -630,14 +630,13 @@ async fn execute_update<S: StorageBackend>(
     )
     .await?;
 
-    super::vector_index::maintain_vector_indexes_after_write(
+    let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
         storage,
-        &update.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
         &item,
-        &key_schema,
+        capacity_mode,
     )
     .await?;
 
@@ -654,7 +653,8 @@ async fn execute_update<S: StorageBackend>(
         Some(size),
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 async fn execute_delete<S: StorageBackend>(
@@ -732,12 +732,12 @@ async fn execute_delete<S: StorageBackend>(
         capacity_mode,
     )
     .await?;
-    super::vector_index::maintain_vector_indexes_after_delete(
+    let vector_bytes = super::vector_index::maintain_vector_indexes_after_delete(
         storage,
-        &delete.table_name,
         &meta,
-        &pk,
-        &sk,
+        &target,
+        old_item.as_ref(),
+        capacity_mode,
     )
     .await?;
 
@@ -752,7 +752,8 @@ async fn execute_delete<S: StorageBackend>(
         None,
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 async fn execute_condition_check<S: StorageBackend>(

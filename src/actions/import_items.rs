@@ -236,15 +236,23 @@ async fn execute_inner<S: StorageBackend>(
             // write would reject (the backfill asymmetry), so an invalid
             // vector value imports its base item with no shadow row.
             if index_fan_out {
+                let target = super::gsi::IndexWrite {
+                    table_name,
+                    pk: &pk,
+                    sk: &sk,
+                    pk_attr: &key_schema.partition_key,
+                    sk_attr: key_schema.sort_key.as_deref(),
+                };
+                // An import reports no capacity, so the fan-out is asked for
+                // none and skips deriving the old image to size it.
                 super::vector_index::maintain_vector_indexes_after_write_with_defs(
                     storage,
-                    table_name,
                     &vector_defs,
                     &attr_defs,
-                    &pk,
-                    &sk,
+                    &target,
+                    None,
                     &item,
-                    &key_schema,
+                    None,
                     skip_gsi_deletes,
                 )
                 .await?;

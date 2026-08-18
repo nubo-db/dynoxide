@@ -77,8 +77,6 @@ pub struct SearchVectorsRequest {
     pub projection_expression: Option<String>,
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    /// Accepted and validated; capacity reporting itself is not wired up yet,
-    /// so the response never carries ConsumedCapacity.
     pub return_consumed_capacity: Option<String>,
 }
 
@@ -188,12 +186,32 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
 
 /// A SearchVectors response: ranked results, best first. `SearchResults` is
 /// the response's only data key; there is no pagination surface (captured).
-/// ConsumedCapacity is not reported yet; the vector capacity shape is a
-/// separate slice of work.
+///
+/// `ConsumedCapacity` carries request bytes alone, with no `CapacityUnits` and
+/// no `TableName`, and reads the same under `TOTAL` and `INDEXES`.
 #[derive(Debug, Default, Serialize)]
 pub struct SearchVectorsResponse {
     #[serde(rename = "SearchResults")]
     pub search_results: Vec<SearchResult>,
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    pub consumed_capacity: Option<crate::types::VectorSearchCapacity>,
+}
+
+/// The billable size of a search request: the query vector as the f32s it is
+/// scored against, plus the expression text the request carries, held to the
+/// 1KB floor.
+///
+/// The capture observed 1024.0 for a three-dimensional fixture, which is that
+/// floor rather than a constant, and left magnitudes above it unpinned. This is
+/// the documented per-byte model, to be refined if a capture ever pins a curve.
+fn search_request_bytes(request: &SearchVectorsRequest) -> f64 {
+    let vector = request.search_vector.len() * std::mem::size_of::<f32>();
+    let condition = request
+        .search_condition_expression
+        .as_deref()
+        .map_or(0, str::len);
+    let projection = request.projection_expression.as_deref().map_or(0, str::len);
+    crate::types::vector_request_bytes(vector + condition + projection)
 }
 
 /// One search hit: the projected item and its score as a JSON double.
@@ -693,5 +711,16 @@ pub async fn execute<S: StorageBackend>(
     // family rejects them (uncaptured for this operation).
     tracker.check_unused()?;
 
-    Ok(SearchVectorsResponse { search_results })
+    // Identical under TOTAL and INDEXES, absent under NONE (captured).
+    let consumed_capacity =
+        crate::types::capacity_wanted(request.return_consumed_capacity.as_deref()).then(|| {
+            crate::types::VectorSearchCapacity {
+                vector_search_request_bytes: search_request_bytes(&request),
+            }
+        });
+
+    Ok(SearchVectorsResponse {
+        search_results,
+        consumed_capacity,
+    })
 }

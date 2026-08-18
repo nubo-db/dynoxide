@@ -2630,6 +2630,237 @@ async fn transact_write_items_maintains_vector_indexes_like_put_item() {
     assert_eq!(shadow_row_count(&storage, "VecTx::vector::vix"), 1);
 }
 
+/// One vector index's arm of a `ConsumedCapacity`, in bytes.
+fn vector_arm(cc: &dynoxide::types::ConsumedCapacity, name: &str) -> Option<f64> {
+    cc.vector_indexes
+        .as_ref()
+        .and_then(|m| m.get(name))
+        .map(|d| d.vector_write_request_bytes)
+}
+
+/// Vector replication is reported in bytes under `INDEXES` alone, on its own
+/// axis: the figure never joins `CapacityUnits`, and `TOTAL` carries no vector
+/// fields at all (captured 2026-08-11, eu-west-2).
+#[tokio::test(flavor = "current_thread")]
+async fn vector_write_reports_bytes_under_indexes_and_nothing_under_total() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecWCap").await;
+
+    let put = |rcc: &str, pk: &str| {
+        serde_json::from_value(json!({
+            "TableName": "VecWCap",
+            "Item": {
+                "pk": {"S": pk},
+                "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+            },
+            "ReturnConsumedCapacity": rcc
+        }))
+        .unwrap()
+    };
+
+    let cc = dynoxide::actions::put_item::execute(&storage, put("INDEXES", "a"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0));
+    // The bytes stay off the unit total: one table write, nothing more.
+    assert_eq!(cc.capacity_units, 1.0);
+
+    let cc = dynoxide::actions::put_item::execute(&storage, put("TOTAL", "b"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("TOTAL reports capacity");
+    assert!(
+        cc.vector_indexes.is_none(),
+        "TOTAL carries no vector fields at all"
+    );
+    assert_eq!(cc.capacity_units, 1.0);
+}
+
+/// Replication is delta-based, so an overwrite that leaves the index's stored
+/// view alone reports no map at all rather than a zeroed arm (captured).
+#[tokio::test(flavor = "current_thread")]
+async fn identical_overwrite_reports_no_vector_map_and_a_changed_vector_does() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecDelta").await;
+
+    let put = |vector: serde_json::Value| {
+        serde_json::from_value(json!({
+            "TableName": "VecDelta",
+            "Item": {"pk": {"S": "a"}, "embedding": vector},
+            "ReturnConsumedCapacity": "INDEXES"
+        }))
+        .unwrap()
+    };
+    let original = json!({"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]});
+
+    dynoxide::actions::put_item::execute(&storage, put(original.clone()))
+        .await
+        .unwrap();
+
+    let cc = dynoxide::actions::put_item::execute(&storage, put(original))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert!(
+        cc.vector_indexes.is_none(),
+        "an identical overwrite charges nothing, so the map is absent"
+    );
+
+    let cc = dynoxide::actions::put_item::execute(
+        &storage,
+        put(json!({"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]})),
+    )
+    .await
+    .unwrap()
+    .consumed_capacity
+    .expect("INDEXES reports capacity");
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0));
+}
+
+/// A table with no vector index never carries the map, and neither does a
+/// write to a vector-indexed table that leaves the vector attribute alone.
+#[tokio::test(flavor = "current_thread")]
+async fn writes_that_touch_no_vector_index_carry_no_map() {
+    let storage = Storage::memory().unwrap();
+    let req: CreateTableRequest = serde_json::from_value(full_house_request("VecNone")).unwrap();
+    dynoxide::actions::create_table::execute(&storage, req)
+        .await
+        .unwrap();
+
+    // Member of the GSI and the LSI, but carrying no vector attribute.
+    let put = serde_json::from_value(json!({
+        "TableName": "VecNone",
+        "Item": {
+            "pk": {"S": "a"}, "sk": {"S": "1"},
+            "gsi_pk": {"S": "g"}, "lsi_sk": {"S": "l"}
+        },
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::put_item::execute(&storage, put)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert!(cc.vector_indexes.is_none());
+    // The classic arms are unaffected by the vector index existing.
+    assert_eq!(index_arm(&cc.global_secondary_indexes, "gsi1"), Some(1.0));
+    assert_eq!(index_arm(&cc.local_secondary_indexes, "lsi1"), Some(1.0));
+}
+
+/// A delete charges the index the removed item was a member of, sized on the
+/// row it held.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_charges_the_vector_index_the_item_belonged_to() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecDelCap").await;
+
+    let put = serde_json::from_value(json!({
+        "TableName": "VecDelCap",
+        "Item": {"pk": {"S": "a"}, "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}}
+    }))
+    .unwrap();
+    dynoxide::actions::put_item::execute(&storage, put)
+        .await
+        .unwrap();
+
+    let del = serde_json::from_value(json!({
+        "TableName": "VecDelCap",
+        "Key": {"pk": {"S": "a"}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::delete_item::execute(&storage, del)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert_eq!(vector_arm(&cc, "vix"), Some(1024.0));
+
+    // Deleting what is no longer there charges nothing.
+    let del = serde_json::from_value(json!({
+        "TableName": "VecDelCap",
+        "Key": {"pk": {"S": "a"}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::delete_item::execute(&storage, del)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    assert!(cc.vector_indexes.is_none());
+}
+
+/// The batch and transactional surfaces report the vector arm too. A batch
+/// sums the bytes across its items; a transaction charges the index at its
+/// single-write cost, as the classic arms are (the 2x factor reaches the base
+/// table arm alone).
+#[tokio::test(flavor = "current_thread")]
+async fn batch_and_transact_report_the_vector_arm() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecMulti").await;
+
+    let batch = serde_json::from_value(json!({
+        "RequestItems": {
+            "VecMulti": [
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "a"},
+                    "embedding": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}
+                }}},
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "b"},
+                    "embedding": {"L": [{"N": "0"}, {"N": "1"}, {"N": "0"}]}
+                }}}
+            ]
+        },
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let caps = dynoxide::actions::batch_write_item::execute(&storage, batch)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    let cc = caps
+        .iter()
+        .find(|c| c.table_name == "VecMulti")
+        .expect("the written table reports an entry");
+    // Two newly indexed items, each at the billable floor.
+    assert_eq!(vector_arm(cc, "vix"), Some(2048.0));
+
+    let tx = serde_json::from_value(json!({
+        "TransactItems": [
+            {"Put": {
+                "TableName": "VecMulti",
+                "Item": {
+                    "pk": {"S": "c"},
+                    "embedding": {"L": [{"N": "0"}, {"N": "0"}, {"N": "1"}]}
+                }
+            }}
+        ],
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let caps = dynoxide::actions::transact_write_items::execute(&storage, tx)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    let cc = caps
+        .iter()
+        .find(|c| c.table_name == "VecMulti")
+        .expect("the written table reports an entry");
+    assert_eq!(vector_arm(cc, "vix"), Some(1024.0));
+    // The transactional factor doubles the base table arm and leaves the
+    // vector bytes alone.
+    assert_eq!(cc.capacity_units, 2.0);
+}
+
 /// TransactWriteItems carries a separate vector maintenance call for each of
 /// its three action kinds. Put and Delete are covered above; this pins Update,
 /// which creates the item on the first call and de-indexes it on the second.

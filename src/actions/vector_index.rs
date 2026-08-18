@@ -10,13 +10,14 @@
 //! eu-west-2 and us-east-1, 2026-08-12), while the live write silently
 //! de-indexes only items missing the vector or SearchSchema HASH attribute.
 
-use crate::actions::helpers::KeySchema;
+use crate::actions::gsi::IndexWrite;
 use crate::errors::{DynoxideError, Result};
 use crate::storage::TableMetadata;
 use crate::storage_backend::{IndexWriteOp, StorageBackend, VectorItemRow};
 use crate::types::{
     AttributeDefinition, AttributeValue, Item, ScalarAttributeType, VectorIndex, VectorValueError,
 };
+use std::collections::HashMap;
 
 /// Parse vector index definitions from table metadata.
 pub fn parse_vector_defs(meta: &TableMetadata) -> Result<Vec<VectorIndex>> {
@@ -256,7 +257,8 @@ fn run_vector_write_validation(
 pub fn vector_index_row(
     item: &Item,
     vix: &VectorIndex,
-    key_schema: &KeySchema,
+    pk_attr: &str,
+    sk_attr: Option<&str>,
     attr_defs: &[AttributeDefinition],
     table_pk: &str,
     table_sk: &str,
@@ -331,7 +333,7 @@ pub fn vector_index_row(
             .map(|v| AttributeValue::N(crate::types::f32_number_string(*v)))
             .collect(),
     );
-    let projected = build_vector_index_item(item, vix, key_schema, &f32_value);
+    let projected = build_vector_index_item(item, vix, pk_attr, sk_attr, &f32_value);
     let item_json = serde_json::to_string(&projected)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
     let vector_json = serde_json::to_string(&values)
@@ -354,7 +356,8 @@ pub fn vector_index_row(
 fn build_vector_index_item(
     item: &Item,
     vix: &VectorIndex,
-    key_schema: &KeySchema,
+    pk_attr: &str,
+    sk_attr: Option<&str>,
     f32_value: &AttributeValue,
 ) -> Item {
     use crate::types::ProjectionType;
@@ -371,12 +374,12 @@ fn build_vector_index_item(
         ProjectionType::KEYS_ONLY | ProjectionType::INCLUDE => {
             let mut projected = Item::new();
             // Table keys
-            if let Some(v) = item.get(&key_schema.partition_key) {
-                projected.insert(key_schema.partition_key.clone(), v.clone());
+            if let Some(v) = item.get(pk_attr) {
+                projected.insert(pk_attr.to_string(), v.clone());
             }
-            if let Some(ref sk) = key_schema.sort_key {
+            if let Some(sk) = sk_attr {
                 if let Some(v) = item.get(sk) {
-                    projected.insert(sk.clone(), v.clone());
+                    projected.insert(sk.to_string(), v.clone());
                 }
             }
             // SearchSchema attributes
@@ -405,34 +408,109 @@ fn build_vector_index_item(
     }
 }
 
+/// The billable size of one shadow-table row: the stored vector, the filter
+/// values, the projected item copy, and the keys addressing it.
+fn vector_row_bytes(row: &VectorItemRow) -> usize {
+    row.table_pk.len()
+        + row.table_sk.len()
+        + row.hash_value.len()
+        + row.vector_json.len()
+        + row.filter_json.len()
+        + row.item_json.len()
+}
+
+/// Whether two derived rows hold the same stored view, so an overwrite that
+/// produced them is free.
+///
+/// The projected copy and the filter values are compared as parsed items, not
+/// as the JSON they serialise to. `Item` is a `HashMap`, so two equal items can
+/// serialise to different strings, and the sets inside one are unordered on
+/// DynamoDB's terms while their backing `Vec` is not. The classic fan-out
+/// answers the same question with `index_capacity::unchanged`, and this asks
+/// there so the two families cannot disagree about what a change is.
+///
+/// `hash_value` and `vector_json` are compared directly: one is a key string
+/// and the other an ordered array of f32s, both deterministic.
+fn vector_rows_agree(a: &VectorItemRow, b: &VectorItemRow) -> bool {
+    if a.hash_value != b.hash_value || a.vector_json != b.vector_json {
+        return false;
+    }
+    json_items_agree(&a.filter_json, &b.filter_json) && json_items_agree(&a.item_json, &b.item_json)
+}
+
+/// Compare two serialised items structurally. Unparseable JSON falls back to a
+/// byte comparison, which cannot happen for rows this module derived.
+fn json_items_agree(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<Item>(a),
+        serde_json::from_str::<Item>(b),
+    ) {
+        (Ok(x), Ok(y)) => super::index_capacity::unchanged(&x, &y),
+        _ => a == b,
+    }
+}
+
+/// Bytes charged against one vector index for a write, or `None` when the
+/// index's stored view does not change.
+///
+/// The rules mirror the classic index replication table: an entry appearing or
+/// disappearing costs its own size, an entry changing costs the larger of the
+/// two images, and an identical overwrite costs nothing. `None` is distinct
+/// from `Some(0.0)`, so an untouched index is absent from the response rather
+/// than present and zeroed. Vector figures are bytes against a 1KB floor
+/// rather than KB-rounded units.
+///
+/// The classic table has a sixth row, the key move that costs both sides
+/// because it is a delete from one position and an insert into another. A
+/// vector shadow row is addressed by the base table key, which an update
+/// cannot change, so the row is always replaced in place and that row is
+/// unreachable here. Changing the SearchSchema HASH value rewrites a column,
+/// not the row's address.
+fn vector_write_bytes(old: Option<&VectorItemRow>, new: Option<&VectorItemRow>) -> Option<f64> {
+    match (old, new) {
+        (None, None) => None,
+        (None, Some(row)) | (Some(row), None) => {
+            Some(crate::types::vector_request_bytes(vector_row_bytes(row)))
+        }
+        (Some(before), Some(after)) if vector_rows_agree(before, after) => None,
+        (Some(before), Some(after)) => Some(crate::types::vector_request_bytes(
+            vector_row_bytes(before).max(vector_row_bytes(after)),
+        )),
+    }
+}
+
 /// Update all vector shadow tables after an item write (put/update),
 /// mirroring `maintain_gsis_after_write`: remove any existing row for the
 /// base key, then insert the derived row when the item belongs in the index.
 /// An item missing the vector attribute or the SearchSchema HASH attribute
 /// derives no row, so the delete alone silently de-indexes it.
+///
+/// Returns a map of index name to the bytes that index's replication cost, on
+/// the same absent-not-zero terms as the classic fan-out. `capacity_mode` is
+/// the caller's `ReturnConsumedCapacity`, forwarded rather than interpreted;
+/// sizing costs a derivation of the old image per index that nothing else
+/// wants, so the map comes back empty when nobody asked.
 pub async fn maintain_vector_indexes_after_write<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     meta: &TableMetadata,
-    table_pk_str: &str,
-    table_sk_str: &str,
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
     item: &Item,
-    key_schema: &KeySchema,
-) -> Result<()> {
+    capacity_mode: Option<&str>,
+) -> Result<HashMap<String, f64>> {
     let vixs = parse_vector_defs(meta)?;
     if vixs.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
     let attr_defs = parse_attr_defs(meta)?;
     maintain_vector_indexes_after_write_with_defs(
         storage,
-        table_name,
         &vixs,
         &attr_defs,
-        table_pk_str,
-        table_sk_str,
+        target,
+        old_item,
         item,
-        key_schema,
+        capacity_mode,
         false,
     )
     .await
@@ -446,61 +524,97 @@ pub async fn maintain_vector_indexes_after_write<S: StorageBackend>(
 #[allow(clippy::too_many_arguments)]
 pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     vixs: &[VectorIndex],
     attr_defs: &[AttributeDefinition],
-    table_pk_str: &str,
-    table_sk_str: &str,
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
     item: &Item,
-    key_schema: &KeySchema,
+    capacity_mode: Option<&str>,
     skip_deletes: bool,
-) -> Result<()> {
+) -> Result<HashMap<String, f64>> {
     if vixs.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
     for vix in vixs {
         if !skip_deletes {
             ops.push(IndexWriteOp::DeleteVector {
-                table_name: table_name.to_string(),
+                table_name: target.table_name.to_string(),
                 index_name: vix.index_name.clone(),
-                table_pk: table_pk_str.to_string(),
-                table_sk: table_sk_str.to_string(),
+                table_pk: target.pk.to_string(),
+                table_sk: target.sk.to_string(),
             });
         }
 
-        if let Some(row) =
-            vector_index_row(item, vix, key_schema, attr_defs, table_pk_str, table_sk_str)?
-        {
+        // Built once here and handed to the sizing below, which would
+        // otherwise derive the same row again.
+        let row = vector_index_row(
+            item,
+            vix,
+            target.pk_attr,
+            target.sk_attr,
+            attr_defs,
+            target.pk,
+            target.sk,
+        )?;
+        if let Some(ref row) = row {
             ops.push(IndexWriteOp::InsertVector {
-                table_name: table_name.to_string(),
+                table_name: target.table_name.to_string(),
                 index_name: vix.index_name.clone(),
-                row: Box::new(row),
+                row: Box::new(row.clone()),
             });
+        }
+
+        if want_capacity {
+            let previous = match old_item {
+                Some(old) => vector_index_row(
+                    old,
+                    vix,
+                    target.pk_attr,
+                    target.sk_attr,
+                    attr_defs,
+                    target.pk,
+                    target.sk,
+                )?,
+                None => None,
+            };
+            if let Some(bytes) = vector_write_bytes(previous.as_ref(), row.as_ref()) {
+                vector_bytes.insert(vix.index_name.clone(), bytes);
+            }
         }
     }
 
     storage.apply_index_writes(&ops).await?;
-    Ok(())
+    Ok(vector_bytes)
 }
 
 /// Remove an item from all vector shadow tables after a delete, mirroring
 /// `maintain_gsis_after_delete`. Also called by the TTL reaper.
+///
+/// Charges only the indexes the deleted item was a member of, sized on the row
+/// it held, as on [`maintain_vector_indexes_after_write`].
 pub async fn maintain_vector_indexes_after_delete<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     meta: &TableMetadata,
-    table_pk_str: &str,
-    table_sk_str: &str,
-) -> Result<()> {
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
+    capacity_mode: Option<&str>,
+) -> Result<HashMap<String, f64>> {
     let vixs = parse_vector_defs(meta)?;
+    if vixs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let attr_defs = parse_attr_defs(meta)?;
     maintain_vector_indexes_after_delete_with_defs(
         storage,
-        table_name,
         &vixs,
-        table_pk_str,
-        table_sk_str,
+        &attr_defs,
+        target,
+        old_item,
+        capacity_mode,
     )
     .await
 }
@@ -509,23 +623,44 @@ pub async fn maintain_vector_indexes_after_delete<S: StorageBackend>(
 /// callers that parse the definitions once per batch (BatchWriteItem).
 pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
     storage: &S,
-    table_name: &str,
     vixs: &[VectorIndex],
-    table_pk_str: &str,
-    table_sk_str: &str,
-) -> Result<()> {
+    attr_defs: &[AttributeDefinition],
+    target: &IndexWrite<'_>,
+    old_item: Option<&Item>,
+    capacity_mode: Option<&str>,
+) -> Result<HashMap<String, f64>> {
     if vixs.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
+
     for vix in vixs {
         ops.push(IndexWriteOp::DeleteVector {
-            table_name: table_name.to_string(),
+            table_name: target.table_name.to_string(),
             index_name: vix.index_name.clone(),
-            table_pk: table_pk_str.to_string(),
-            table_sk: table_sk_str.to_string(),
+            table_pk: target.pk.to_string(),
+            table_sk: target.sk.to_string(),
         });
+
+        if want_capacity
+            && let Some(old) = old_item
+            && let Some(row) = vector_index_row(
+                old,
+                vix,
+                target.pk_attr,
+                target.sk_attr,
+                attr_defs,
+                target.pk,
+                target.sk,
+            )?
+            && let Some(bytes) = vector_write_bytes(Some(&row), None)
+        {
+            vector_bytes.insert(vix.index_name.clone(), bytes);
+        }
     }
+
     storage.apply_index_writes(&ops).await?;
-    Ok(())
+    Ok(vector_bytes)
 }

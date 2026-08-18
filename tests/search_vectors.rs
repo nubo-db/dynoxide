@@ -1570,9 +1570,11 @@ async fn empty_table_search_returns_an_empty_search_results_array() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn consumed_capacity_is_absent_under_indexes_and_total() {
-    // Capacity reporting for SearchVectors is not wired up yet; the
-    // dedicated vector capacity work replaces this pin when it lands.
+async fn consumed_capacity_reports_request_bytes_alone_under_total_and_indexes() {
+    // Captured 2026-08-11, eu-west-2: a search reports VectorSearchRequestBytes
+    // and nothing else. No CapacityUnits, no TableName, no Table arm, and the
+    // two modes read identically. 1024.0 is the billable floor, which the
+    // capture's three-dimensional fixture also reported.
     let storage = Storage::memory().unwrap();
     create_distance_fixture(&storage, "VecCap").await;
 
@@ -1587,10 +1589,33 @@ async fn consumed_capacity_is_absent_under_indexes_and_total() {
         )
         .await
         .unwrap();
+        let body = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            body["ConsumedCapacity"],
+            json!({"VectorSearchRequestBytes": 1024.0}),
+            "capacity shape under {rcc}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn consumed_capacity_is_absent_under_none_and_when_unasked() {
+    let storage = Storage::memory().unwrap();
+    create_distance_fixture(&storage, "VecCap2").await;
+
+    for rcc in [Some("NONE"), None] {
+        let mut req = json!({
+            "TableName": "VecCap2", "IndexName": "cosine",
+            "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 1
+        });
+        if let Some(mode) = rcc {
+            req["ReturnConsumedCapacity"] = json!(mode);
+        }
+        let resp = search(&storage, req).await.unwrap();
         let body = serde_json::to_string(&resp).unwrap();
         assert!(
             !body.contains("ConsumedCapacity"),
-            "unexpected capacity under {rcc}: {body}"
+            "unexpected capacity under {rcc:?}: {body}"
         );
     }
 }

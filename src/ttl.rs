@@ -90,12 +90,12 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                             None,
                         )
                         .await?;
-                        vector_index::maintain_vector_indexes_after_delete(
+                        let _ = vector_index::maintain_vector_indexes_after_delete(
                             storage,
-                            &meta.table_name,
                             meta,
-                            pk,
-                            sk,
+                            &target,
+                            Some(&item),
+                            None,
                         )
                         .await?;
                         // Generate stream REMOVE record with TTL service identity

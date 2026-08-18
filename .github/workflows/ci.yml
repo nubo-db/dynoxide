@@ -77,6 +77,19 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+  benchmark-scripts:
+    name: Benchmark script tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The benchmark workflows read criterion's output through these scripts,
+      # and a parser that quietly returns nothing turns a failed comparison
+      # into a red check with no explanation.
+      - name: Test
+        run: python3 -m unittest discover -s benchmarks/scripts -p 'test_*.py' -v
+
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest

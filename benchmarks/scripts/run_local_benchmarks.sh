@@ -177,12 +177,11 @@ echo ""
 echo "--- Criterion micro-benchmarks (embedded_micro) ---"
 cargo bench --bench embedded_micro -- --output-format bencher | tee "$RESULTS_DIR/criterion_output.txt"
 python3 -c "
-import json, re
-results = {}
-for line in open('$RESULTS_DIR/criterion_output.txt'):
-    m = re.match(r'^test\s+(.+?)\s+\.\.\.\s+bench:\s+([\d,]+)\s+ns/iter', line)
-    if m:
-        results[m.group(1)] = int(m.group(2).replace(',', ''))
+import json, sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from compare_criterion import parse_bencher
+with open('$RESULTS_DIR/criterion_output.txt') as handle:
+    results = parse_bencher(handle.read())
 with open('$RESULTS_DIR/criterion_baseline.json', 'w') as f:
     json.dump(results, f, indent=2)
 print(f'Parsed {len(results)} criterion benchmarks')

@@ -109,15 +109,16 @@ fn the_size_recorded_for_a_stored_item_is_the_size_that_was_checked() {
 }
 
 #[test]
-fn update_item_agrees_with_put_item_on_the_same_resulting_item() {
+fn update_item_sizes_expanding_numbers_the_same_way() {
     // Built the other way round from the PutItem cases: a base item already near
     // the limit, then an update that adds numbers which expand on storage. The
     // update expression stays small, so this isolates the size measure from the
-    // separate 4KB expression limit.
+    // separate 4KB expression limit. Sized to clear UpdateItem's own lower
+    // ceiling, which the tests below cover.
     let db = make_db();
     let mut base = HashMap::new();
     base.insert("pk".to_string(), AttributeValue::S("k".to_string()));
-    base.insert("b".to_string(), AttributeValue::S("x".repeat(409_000)));
+    base.insert("b".to_string(), AttributeValue::S("x".repeat(408_000)));
     db.put_item(PutItemRequest {
         table_name: "Items".to_string(),
         item: base,
@@ -145,4 +146,81 @@ fn update_item_agrees_with_put_item_on_the_same_resulting_item() {
     let stats = db.table_stats().unwrap();
     let stored = stats.iter().find(|s| s.table_name == "Items").unwrap();
     assert!((stored.size_bytes as usize) < MAX_ITEM_SIZE);
+}
+
+/// One `SET` of a blob of `blob_len` bytes onto key `pk`, which upserts.
+fn set_blob(db: &Database, pk: &str, blob_len: usize) -> Result<(), String> {
+    db.update_item(UpdateItemRequest {
+        table_name: "Items".to_string(),
+        key: HashMap::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]),
+        update_expression: Some("SET #b = :v".to_string()),
+        expression_attribute_names: Some(HashMap::from([("#b".to_string(), "b".to_string())])),
+        expression_attribute_values: Some(HashMap::from([(
+            ":v".to_string(),
+            AttributeValue::S("x".repeat(blob_len)),
+        )])),
+        ..Default::default()
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn update_item_is_measured_against_a_lower_ceiling_than_put_item() {
+    // Captured against eu-west-2. An update is not sized the way a put is: the
+    // key attributes come out of the figure and each action adds a fixed cost,
+    // three bytes for the update plus nineteen for a SET. With a one-character
+    // key the resulting item may reach 409,581, where PutItem accepts 409,600.
+    //
+    //   resulting item = pk (2 + 1) + "b" (1) + blob
+    let db = make_db();
+    let ceiling = 409_581 - 4;
+
+    set_blob(&db, "k", ceiling).expect("at the ceiling");
+    let err = set_blob(&db, "k2", ceiling + 1).expect_err("one byte over");
+    assert_eq!(
+        err,
+        "Item size to update has exceeded the maximum allowed size"
+    );
+
+    // The same finished item is within reach of PutItem, which is the asymmetry
+    // the capture found: an item can be puttable and not updatable.
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("k3".to_string()));
+    item.insert("b".to_string(), AttributeValue::S("x".repeat(ceiling + 1)));
+    db.put_item(PutItemRequest {
+        table_name: "Items".to_string(),
+        item,
+        ..Default::default()
+    })
+    .expect("PutItem accepts what UpdateItem refused");
+}
+
+#[test]
+fn each_update_action_adds_to_what_the_gate_measures() {
+    // A second SET costs nineteen more, so the ceiling drops by nineteen.
+    let db = make_db();
+    let two_set_ceiling = 409_581 - 19 - 4 - 2; // second attribute is name + 1 byte
+
+    let run = |pk: &str, blob_len: usize| {
+        db.update_item(UpdateItemRequest {
+            table_name: "Items".to_string(),
+            key: HashMap::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]),
+            update_expression: Some("SET #b = :v, #c = :w".to_string()),
+            expression_attribute_names: Some(HashMap::from([
+                ("#b".to_string(), "b".to_string()),
+                ("#c".to_string(), "c".to_string()),
+            ])),
+            expression_attribute_values: Some(HashMap::from([
+                (":v".to_string(), AttributeValue::S("x".repeat(blob_len))),
+                (":w".to_string(), AttributeValue::S("z".to_string())),
+            ])),
+            ..Default::default()
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+
+    run("k", two_set_ceiling).expect("at the two-action ceiling");
+    run("k2", two_set_ceiling + 1).expect_err("one byte over");
 }

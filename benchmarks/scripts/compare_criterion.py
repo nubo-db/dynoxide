@@ -16,6 +16,7 @@ branch on the exit code, so it is a contract:
     1  could not compare
     2  usage error (argparse's own)
     3  threshold exceeded, advisory
+    4  compared, but benchmarks in the baseline produced no result
 
 Usage:
     python3 benchmarks/scripts/compare_criterion.py \
@@ -58,6 +59,10 @@ EXIT_ERROR = 1
 # Not 2: argparse exits 2 on a usage error, and a caller branching on the
 # regression signal must not read a mistyped flag as a regression.
 EXIT_REGRESSED = 3
+# A run that lost benchmarks compared the ones it still had, so the report is
+# worth keeping. It is separate from 1 for that reason: the caller has a table
+# to show, where an exit 1 leaves it nothing.
+EXIT_INCOMPLETE = 4
 
 
 def parse_bencher(text):
@@ -164,7 +169,11 @@ def sanitize(text):
 
 
 def build_report(current, baseline, history, threshold):
-    """Render the markdown comparison. Returns (markdown, regressions)."""
+    """Render the markdown comparison.
+
+    Returns (markdown, regressions, missing), where `missing` names the
+    baselined benchmarks this run produced no result for.
+    """
     regressions = []
     missing = []
     rows = []
@@ -237,29 +246,34 @@ def build_report(current, baseline, history, threshold):
             "> No stored runs to compare against. Baselines are recorded by "
             "the benchmark refresh workflow."
         )
-    elif regressions:
-        lines.append(
-            "> :warning: {} benchmark(s) came in more than {:.0%} above the "
-            "{}-run median. Check whether the current value falls outside the "
-            "range column before treating it as real; iai-callgrind gives a "
-            "deterministic instruction-count answer.".format(
-                len(regressions), threshold - 1, window
-            )
-        )
-    elif missing:
-        lines.append(
-            "> :warning: {} benchmark(s) in the baseline produced no result in "
-            "this run: {}. A partial bench run reports the rest as clean, so "
-            "treat this as a failed comparison rather than a pass.".format(
-                len(missing), ", ".join(sanitize(n) for n in missing)
-            )
-        )
     else:
-        lines.append(
-            "> All benchmarks within {:.0%} of the {}-run median.".format(
-                threshold - 1, window
+        if regressions:
+            lines.append(
+                "> :warning: {} benchmark(s) came in more than {:.0%} above the "
+                "{}-run median. Check whether the current value falls outside "
+                "the range column before treating it as real; iai-callgrind "
+                "gives a deterministic instruction-count answer.".format(
+                    len(regressions), threshold - 1, window
+                )
             )
-        )
+        # Not an elif. A run can both lose benchmarks and regress on the ones
+        # it kept, and the missing list is the more important of the two to
+        # read, so it must not be hidden behind the regression warning.
+        if missing:
+            lines.append(
+                "> :warning: {} benchmark(s) in the baseline produced no result "
+                "in this run: {}. A partial bench run reports the rest as "
+                "clean, so treat this as a failed comparison rather than a "
+                "pass.".format(
+                    len(missing), ", ".join(sanitize(n) for n in missing)
+                )
+            )
+        if not regressions and not missing:
+            lines.append(
+                "> All benchmarks within {:.0%} of the {}-run median.".format(
+                    threshold - 1, window
+                )
+            )
 
     if window:
         lines.append("")
@@ -270,7 +284,7 @@ def build_report(current, baseline, history, threshold):
         lines.append("")
         lines.append("</details>")
 
-    return "\n".join(lines) + "\n", regressions
+    return "\n".join(lines) + "\n", regressions, missing
 
 
 def main():
@@ -317,7 +331,7 @@ def main():
     if not history:
         print("no stored runs found on '{}'".format(args.ref), file=sys.stderr)
 
-    markdown, regressions = build_report(
+    markdown, regressions, missing = build_report(
         current, build_baseline(history), history, args.threshold
     )
 
@@ -330,6 +344,14 @@ def main():
     if regressions:
         print("exceeded threshold: {}".format(", ".join(regressions)),
               file=sys.stderr)
+
+    # Reported before the regression exit, and takes precedence over it. A run
+    # missing benchmarks cannot say the rest are clean, so it must not leave
+    # the advisory exit 3 -- or worse, exit 0 -- as the whole signal.
+    if missing:
+        print("no result for: {}".format(", ".join(missing)), file=sys.stderr)
+        return EXIT_INCOMPLETE
+    if regressions:
         return EXIT_REGRESSED
     return EXIT_OK
 

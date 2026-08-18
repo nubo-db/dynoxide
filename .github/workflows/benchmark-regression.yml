@@ -56,6 +56,16 @@ jobs:
           # advisory: the step stays green and the warning is the whole signal,
           # because wall-clock timings on shared runners move on their own.
           #
+          # Exit 4 means the run lost benchmarks. It fails the step, but the
+          # comparison it wrote covers the ones that survived and names the
+          # ones that did not, so keep that file rather than replacing it with
+          # the error block below.
+          if [ "$status" -eq 4 ]; then
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::criterion run produced no result for some benchmarks"
+            exit "$status"
+          fi
+
           # Any other non-zero means no comparison happened at all. That fails
           # the step, since a check that could not run must not look like one
           # that passed. It still does not block merge -- this job is not a

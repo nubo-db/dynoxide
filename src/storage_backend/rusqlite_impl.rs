@@ -55,6 +55,11 @@ impl StorageBackend for Storage {
         &self,
         table_name: &str,
     ) -> Result<Option<TableMetadata>, BackendError> {
+        // Counted at the trait boundary rather than inside `Storage`, because
+        // the figure that matters is how many times a caller asks. This backend
+        // answers most of them from its own cache; the wasm one crosses a bridge
+        // for every single call and caches nothing.
+        crate::bench_counters::record(&crate::bench_counters::METADATA_READS);
         Storage::get_table_metadata(self, table_name).map_err(dyno_to_backend)
     }
 

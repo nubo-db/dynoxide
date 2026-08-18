@@ -24,6 +24,12 @@ jobs:
             flags: "--no-default-features --features encryption --lib"
           - name: encryption+http-server
             flags: "--no-default-features --features encryption,http-server"
+          # The work counters are off by default and compile to nothing when
+          # absent, so nothing else in the matrix builds the harness that
+          # measures repeated work. Without this leg the evidence behind the
+          # performance changes could stop compiling and no job would notice.
+          - name: bench-counters
+            flags: "--features bench-counters --test repeated_work_counts"
 
     steps:
       - uses: actions/checkout@v5

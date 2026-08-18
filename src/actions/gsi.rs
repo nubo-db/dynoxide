@@ -36,6 +36,30 @@ pub struct IndexDef {
 pub type GsiDef = IndexDef;
 
 impl IndexDef {
+    /// Whether an entry in this index carries `attr`.
+    ///
+    /// The index keys and the base table keys are always carried, whatever the
+    /// projection says, because an entry cannot point back at its item without
+    /// them. `build_index_item` projects by this rule and the PartiQL read path
+    /// rejects by it, so it lives here rather than in either of them.
+    pub fn projects(&self, attr: &str, table_pk: &str, table_sk: Option<&str>) -> bool {
+        if attr == self.pk_attr
+            || self.sk_attr.as_deref() == Some(attr)
+            || attr == table_pk
+            || table_sk == Some(attr)
+        {
+            return true;
+        }
+        match self.projection_type {
+            ProjectionType::ALL => true,
+            ProjectionType::KEYS_ONLY => false,
+            ProjectionType::INCLUDE => self
+                .non_key_attributes
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|n| n == attr)),
+        }
+    }
+
     /// The `(pk, sk)` key strings for this item's index entry, or `None` if the
     /// item is excluded. Sparse-index behaviour: an item missing the partition
     /// key, or the sort key when one is defined, or holding a non-scalar where a
@@ -92,61 +116,14 @@ pub fn build_index_item(
     table_pk: &str,
     table_sk: Option<&str>,
 ) -> Item {
-    match index.projection_type {
-        ProjectionType::ALL => item.clone(),
-        ProjectionType::KEYS_ONLY => {
-            let mut projected = HashMap::new();
-            // Table keys
-            if let Some(v) = item.get(table_pk) {
-                projected.insert(table_pk.to_string(), v.clone());
-            }
-            if let Some(sk) = table_sk {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.to_string(), v.clone());
-                }
-            }
-            // Index keys
-            if let Some(v) = item.get(&index.pk_attr) {
-                projected.insert(index.pk_attr.clone(), v.clone());
-            }
-            if let Some(ref sk) = index.sk_attr {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.clone(), v.clone());
-                }
-            }
-            projected
-        }
-        ProjectionType::INCLUDE => {
-            let mut projected = HashMap::new();
-            // Table keys
-            if let Some(v) = item.get(table_pk) {
-                projected.insert(table_pk.to_string(), v.clone());
-            }
-            if let Some(sk) = table_sk {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.to_string(), v.clone());
-                }
-            }
-            // Index keys
-            if let Some(v) = item.get(&index.pk_attr) {
-                projected.insert(index.pk_attr.clone(), v.clone());
-            }
-            if let Some(ref sk) = index.sk_attr {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.clone(), v.clone());
-                }
-            }
-            // Non-key attributes
-            if let Some(ref attrs) = index.non_key_attributes {
-                for attr in attrs {
-                    if let Some(v) = item.get(attr) {
-                        projected.insert(attr.clone(), v.clone());
-                    }
-                }
-            }
-            projected
-        }
+    crate::bench_counters::record(&crate::bench_counters::INDEX_ENTRIES_BUILT);
+    if index.projection_type == ProjectionType::ALL {
+        return item.clone();
     }
+    item.iter()
+        .filter(|(name, _)| index.projects(name, table_pk, table_sk))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// Update all GSI tables after an item write (put/update).
@@ -156,13 +133,20 @@ pub fn build_index_item(
 /// stored view the write leaves untouched is absent from the map rather than
 /// present and zeroed, so the response omits its arm entirely. `old_item` is the
 /// item as it stood before the write, or `None` when there was no item.
+///
+/// `capacity_mode` is the caller's `ReturnConsumedCapacity`, forwarded rather
+/// than interpreted, so a call site is right by passing a field it already
+/// holds. The map comes back empty when it asks for nothing, and sizing an index
+/// costs a projection of the old image per index that nothing else wants.
 pub async fn maintain_gsis_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
     old_item: Option<&Item>,
     item: &Item,
+    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -176,10 +160,13 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
             table_sk: target.sk.to_string(),
         });
 
-        // Insert only when the item belongs in this index (sparse).
-        if let Some((gsi_pk, gsi_sk)) = gsi.index_key_strings(item) {
-            let projected = build_index_item(item, gsi, target.pk_attr, target.sk_attr);
-            let item_json = serde_json::to_string(&projected)
+        // Insert only when the item belongs in this index (sparse). The entry
+        // is built once here and handed to the capacity calculation below,
+        // which would otherwise project the same item again.
+        let entry = super::index_capacity::entry_for(item, gsi, target.pk_attr, target.sk_attr);
+        if let Some(ref entry) = entry {
+            let (gsi_pk, gsi_sk) = entry.key.clone();
+            let item_json = serde_json::to_string(&entry.projected)
                 .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
             ops.push(IndexWriteOp::InsertGsi {
@@ -195,13 +182,15 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 
         // Capacity is the change to what the index stores, so it is charged even
         // when the item leaves the index and no insert is queued above.
-        if let Some(units) = super::index_capacity::index_write_units(
-            old_item,
-            Some(item),
-            gsi,
-            target.pk_attr,
-            target.sk_attr,
-        ) {
+        if want_capacity
+            && let Some(units) = super::index_capacity::index_write_units_for(
+                old_item,
+                entry,
+                gsi,
+                target.pk_attr,
+                target.sk_attr,
+            )
+        {
             gsi_units.insert(gsi.index_name.clone(), units);
         }
     }
@@ -219,12 +208,18 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
 /// Returns a map of GSI name to write capacity units consumed. Only an index the
 /// deleted item was actually a member of is charged, sized on the entry it held.
 /// `old_item` is the deleted item, or `None` when the delete removed nothing.
+///
+/// `capacity_mode` is the caller's `ReturnConsumedCapacity`, as on
+/// [`maintain_gsis_after_write`]. A delete queues its ops from the target key
+/// alone, so sizing is the only thing that projects the deleted item at all.
 pub async fn maintain_gsis_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
     old_item: Option<&Item>,
+    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let gsi_defs = parse_gsi_defs(meta)?;
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
@@ -237,13 +232,15 @@ pub async fn maintain_gsis_after_delete<S: StorageBackend>(
             table_sk: target.sk.to_string(),
         });
 
-        if let Some(units) = super::index_capacity::index_write_units(
-            old_item,
-            None,
-            gsi,
-            target.pk_attr,
-            target.sk_attr,
-        ) {
+        if want_capacity
+            && let Some(units) = super::index_capacity::index_write_units(
+                old_item,
+                None,
+                gsi,
+                target.pk_attr,
+                target.sk_attr,
+            )
+        {
             gsi_units.insert(gsi.index_name.clone(), units);
         }
     }

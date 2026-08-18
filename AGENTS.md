@@ -46,12 +46,13 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 - New behaviour ships with tests in `tests/` or inline module tests.
 - Bug fixes ship with a regression test that fails before the fix.
 - `cargo test` on default features is what most contributors run
-  locally. CI goes further and runs a feature matrix across four
+  locally. CI goes further and runs a feature matrix across five
   configurations:
   - default (all default features)
   - `--no-default-features --features native-sqlite --lib`
   - `--no-default-features --features encryption --lib`
   - `--no-default-features --features encryption,http-server`
+  - `--features bench-counters --test repeated_work_counts`
   A separate feature-guard job checks that deliberately incompatible
   feature combinations fail to compile (for example
   `native-sqlite + encryption`). A `wasm-check` job builds the library

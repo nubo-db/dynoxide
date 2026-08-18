@@ -59,6 +59,7 @@ compile_error!(
 
 pub mod actions;
 pub mod auth_material;
+pub mod bench_counters;
 pub mod errors;
 pub mod expressions;
 #[cfg(feature = "import")]
@@ -986,6 +987,12 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
+        // Ahead of the cache, not only inside the work: a replayed token skips
+        // the work entirely, and the token is keyed on the statements alone, so
+        // a replay may carry a capacity mode the first call never did.
+        actions::execute_transaction::reject_bad_capacity_mode(
+            request.return_consumed_capacity.as_deref(),
+        )?;
         run_idempotent(
             &self.tokens.execute_transaction,
             request.client_request_token.as_deref(),

@@ -4,6 +4,7 @@ use crate::actions::index_capacity::{
 };
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::partiql;
+use crate::partiql::executor::ResolvedTable;
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
@@ -70,10 +71,29 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
+/// Reject a `ReturnConsumedCapacity` outside the enum.
+///
+/// Called at the entry points ahead of the idempotency cache as well as inside
+/// [`execute_cached`]. A same-token replay never reaches `execute_cached`, and
+/// the token is keyed on the statements alone, so a second call may carry a
+/// capacity mode the first one never did. A check living only in
+/// `execute_cached` lets that one through. It stays there for callers that reach
+/// it directly.
+pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
+    match crate::validation::return_consumed_capacity_rejection(mode) {
+        Some(msg) => Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn execute_cached<S: StorageBackend>(
     storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<CachedTransaction> {
+    reject_bad_capacity_mode(request.return_consumed_capacity.as_deref())?;
+
     let statements = &request.transact_statements;
 
     // Validate: must have between 1 and 100 statements
@@ -97,17 +117,24 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         if let Some(msg) = partiql::parser::count_projection_rejection(&stmt.statement) {
             return Err(DynoxideError::ValidationException(msg));
         }
-        let ast = partiql::parser::parse(&stmt.statement).map_err(|e| {
-            DynoxideError::ValidationException(format!(
-                "Statement wasn't well formed, can't be processed: {e}"
-            ))
-        })?;
+        let ast = partiql::parser::parse(&stmt.statement)
+            .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
         // DynamoDB rejects a RETURNING clause on any member of a transaction with
         // a top-level ValidationException, before applying any write. This is a
         // plain validation failure, not a TransactionCanceledException.
         if partiql::parser::returning_variant(&ast).is_some() {
             return Err(DynoxideError::ValidationException(format!(
                 "Validation failed in TransactStatements[{index}]: RETURNING clause is not supported in ExecuteTransaction."
+            )));
+        }
+        // An index-qualified read is rejected outright inside a transaction, so
+        // there is no arm for it to be charged to. Rejected up front like the
+        // RETURNING case, not as a cancellation. Captured eu-west-2 2026-08-15.
+        if matches!(ast, partiql::parser::Statement::Select { .. })
+            && partiql::parser::index_name(&ast).is_some()
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: Reads on indices are not supported within transactions."
             )));
         }
         let params = stmt.parameters.clone().unwrap_or_default();
@@ -127,22 +154,47 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         ));
     }
 
+    // Duplicate detection resolves each statement's table, and the executor
+    // needs the same metadata and key schema a moment later, so they are kept
+    // here rather than resolved twice per statement.
     let mut seen_targets = HashSet::new();
+    // Keyed by table rather than by statement: the metadata and key schema are
+    // per table, and only the key is per statement.
+    let mut tables: HashMap<String, ResolvedTable> = HashMap::new();
     for (stmt, params) in &parsed {
-        if let Some(target) = partiql::executor::statement_target(storage, stmt, params).await {
-            if !seen_targets.insert(target) {
-                return Err(DynoxideError::ValidationException(
-                    "Transaction request cannot include multiple operations on one item"
-                        .to_string(),
-                ));
-            }
+        let Some(name) = partiql::parser::table_name(stmt) else {
+            continue;
+        };
+        if !tables.contains_key(name)
+            && let Ok(resolved) = ResolvedTable::load(storage, name).await
+        {
+            tables.insert(name.to_string(), resolved);
+        }
+        // Absent when the table could not be read, which leaves the statement to
+        // fail on its own terms during execution rather than as a duplicate.
+        let Some(resolved) = tables.get(name) else {
+            continue;
+        };
+        if let Some(target) = partiql::executor::statement_target_in(stmt, params, resolved)
+            && !seen_targets.insert(target)
+        {
+            return Err(DynoxideError::ValidationException(
+                "Transaction request cannot include multiple operations on one item".to_string(),
+            ));
         }
     }
 
     // All statements run inside one SQLite transaction (all-or-nothing).
-    let (responses, charges) =
-        helpers::with_write_transaction(storage, execute_within_transaction(storage, &parsed))
-            .await?;
+    let (responses, charges) = helpers::with_write_transaction(
+        storage,
+        execute_within_transaction(
+            storage,
+            &parsed,
+            &tables,
+            request.return_consumed_capacity.as_deref(),
+        ),
+    )
+    .await?;
 
     // Transactional capacity, split by statement kind: an all-SELECT read set
     // reports read capacity, any INSERT/UPDATE/DELETE makes it a write set. Both
@@ -170,7 +222,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
 
 /// What one statement contributed to the transaction's capacity.
 enum StatementCharge {
-    /// A `SELECT`, charged on the rows it returned at read granularity.
+    /// A `SELECT`, charged on the rows it walked at read granularity.
     Read { table_name: String, size: usize },
     /// A write, charged on its images and its per-index units.
     Write(WriteCapacity),
@@ -287,13 +339,26 @@ pub(crate) fn replay_response(
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
+    tables: &HashMap<String, ResolvedTable>,
+    capacity_mode: Option<&str>,
 ) -> Result<(Vec<ItemResponse>, Vec<StatementCharge>)> {
     let mut responses = Vec::with_capacity(parsed.len());
     let mut charges: Vec<StatementCharge> = Vec::with_capacity(parsed.len());
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
 
     for (stmt, params) in parsed {
-        match partiql::executor::execute_page(storage, stmt, params, None, None).await {
+        match partiql::executor::execute_page(
+            storage,
+            stmt,
+            params,
+            None,
+            None,
+            false,
+            capacity_mode,
+            partiql::parser::table_name(stmt).and_then(|t| tables.get(t)),
+        )
+        .await
+        {
             Ok(page) => {
                 let table_name = partiql::parser::table_name(stmt).unwrap_or_default();
                 charges.push(match page.capacity {

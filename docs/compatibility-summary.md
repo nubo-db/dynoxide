@@ -123,9 +123,13 @@ images, which covers a `ConditionCheck` too: it writes nothing and is still
 charged on the image it read. A same-token replay is charged against those same
 images at 4KB read granularity.
 
-One read-side gap remains: a PartiQL `SELECT` served from an index reports its
-units against the base table arm, because the index qualifier is not honoured at
-all ([#179](https://github.com/nubo-db/dynoxide/issues/179)).
+A PartiQL `SELECT` served from an index is charged against that index's arm with
+the table arm at zero, matching `Query` and `Scan`.
+
+One read-side gap remains, and it is not specific to indexes: a PartiQL read with
+no key condition is charged on the rows it returns, where DynamoDB charges a flat
+figure for the scan regardless of how many rows it evaluated. An unqualified base
+table scan diverges by the same margin as an index one.
 
 ---
 
@@ -133,17 +137,20 @@ all ([#179](https://github.com/nubo-db/dynoxide/issues/179)).
 
 Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 
-- **Comparisons:** `=`, `<>`, `<`, `>`, `<=`, `>=`
+- **Comparisons:** `=` and `<>` on every attribute type; `<`, `>`, `<=`, `>=` and `BETWEEN` on the three DynamoDB orders (`S`, `N`, `B`), rejecting any other operand with `Incorrect operand type for operator or function` before the table is resolved. Sets compare without regard to member order, lists in order, maps on their key set; the same comparison serves condition expressions, so the two surfaces cannot drift
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
-- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping
+- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally; a clause whose flattened form exceeds 256 alternatives is rejected as too complex
 - **Projections:** Nested dot-notation paths
 - **Aggregates:** Not supported, matching DynamoDB: a `COUNT(...)` projection is rejected with DynamoDB's `Unexpected path component` message carrying the token's position (captured against eu-west-2)
 - **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2)
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
 - **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
 - **Transactions:** `ExecuteTransaction` with all-or-nothing semantics
+- **Index qualifier:** `SELECT * FROM "table"."index"` is served from the named GSI or LSI. The read follows the index, so items the index does not hold are absent and a `KEYS_ONLY` or `INCLUDE` projection returns only what it projects. An unknown index name, a path of more than two components, an empty path component and a strongly consistent read of a GSI are each rejected with DynamoDB's own wording. A GSI rejects a projection naming an attribute it does not carry; either kind rejects a filter on one when the read is keyed on the index partition key, and matches nothing when it is not. `INSERT` rejects a qualifier at parse, `UPDATE` and `DELETE` reject it in execution. Captured against eu-west-2
+
+  An index-qualified `SELECT` inside `ExecuteTransaction` is rejected, as it is on DynamoDB. One limit remains: an LSI serves a projection naming an unprojected attribute from the base table on DynamoDB and returns nothing here
 
 Parameter placeholders (`?`) supported in all positions including nested list/map values.
 
@@ -153,7 +160,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 
 **`ReturnConsumedCapacity`:** accepted on all three PartiQL surfaces. `BatchExecuteStatement` aggregates per table across the batch and charges a failed statement the write it attempted, sized on the row already stored.
 
-`BatchStatementRequest` does not yet carry `ConsistentRead` or `ReturnValuesOnConditionCheckFailure`, so a batch member setting either is parsed as though it had not.
+**Batch member options:** `BatchStatementRequest` carries `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`. `ConsistentRead` is per member and sets the rate that member's read is charged at, so a batch mixing the two sums both rates; it does not change which rows come back. `ReturnValuesOnConditionCheckFailure` is accepted and inert, matching DynamoDB: a member whose condition fails returns the same response whether it is `ALL_OLD`, `NONE` or absent, and never the item. A batch `SELECT` must name the table's primary key and may not name an index; either shape is rejected against that member while the rest of the batch runs.
 
 ---
 

@@ -202,6 +202,86 @@ fn bench_delete_item((db, request): (Database, DeleteItemRequest)) {
 /// which is precisely the kind of cost the wall-clock suite is too noisy to
 /// resolve.
 #[cfg(feature = "iai-callgrind")]
+const TWO_INDEX_TABLE: &str = "bench_two_index";
+
+/// A table carrying a GSI and an LSI, seeded so the write under measurement has
+/// an old image to compare against.
+///
+/// The rest of the suite inserts fresh keys against a single-index table, which
+/// is the one shape that cannot show what an overwrite costs: with no old image
+/// there is no old index entry to build, and with one index there is half as
+/// much of it. `ReturnConsumedCapacity` is left unset, which is the default and
+/// so the common case.
+#[cfg(feature = "iai-callgrind")]
+fn setup_overwrite_two_indexes(capacity: Option<&str>) -> (Database, PutItemRequest) {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": TWO_INDEX_TABLE,
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi-inc",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["proj"]}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi-all",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let item = serde_json::json!({
+        "pk": {"S": "p"}, "sk": {"S": "s"},
+        "gsiPk": {"S": "g"}, "lsiSk": {"S": "l"},
+        "proj": {"S": "projected"}, "other": {"S": "not projected"}
+    });
+    let mut request = serde_json::json!({"TableName": TWO_INDEX_TABLE, "Item": item});
+    if let Some(mode) = capacity {
+        request["ReturnConsumedCapacity"] = serde_json::json!(mode);
+    }
+    let request: PutItemRequest = serde_json::from_value(request).unwrap();
+
+    // Seed, so the measured call is an overwrite rather than an insert.
+    db.put_item(
+        serde_json::from_value(serde_json::json!({
+            "TableName": TWO_INDEX_TABLE,
+            "Item": item
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    (db, request)
+}
+
+#[cfg(feature = "iai-callgrind")]
+fn setup_overwrite_two_indexes_default() -> (Database, PutItemRequest) {
+    setup_overwrite_two_indexes(None)
+}
+
+#[cfg(feature = "iai-callgrind")]
+fn setup_overwrite_two_indexes_indexes() -> (Database, PutItemRequest) {
+    setup_overwrite_two_indexes(Some("INDEXES"))
+}
+
+#[cfg(feature = "iai-callgrind")]
 fn setup_batch_execute_statement() -> (Database, BatchExecuteStatementRequest) {
     let db = setup_database(1000, ItemSize::Medium);
     let build = || -> BatchExecuteStatementRequest {
@@ -246,6 +326,14 @@ fn bench_batch_execute_statement((db, request): (Database, BatchExecuteStatement
 // ---- Group and harness registration ----
 
 #[cfg(feature = "iai-callgrind")]
+#[library_benchmark]
+#[bench::no_capacity(setup_overwrite_two_indexes_default())]
+#[bench::indexes(setup_overwrite_two_indexes_indexes())]
+fn bench_overwrite_two_indexes((db, request): (Database, PutItemRequest)) {
+    black_box(db.put_item(request).unwrap());
+}
+
+#[cfg(feature = "iai-callgrind")]
 library_benchmark_group!(
     name = core_operations;
     benchmarks =
@@ -255,7 +343,8 @@ library_benchmark_group!(
         bench_scan,
         bench_update_item,
         bench_delete_item,
-        bench_batch_execute_statement
+        bench_batch_execute_statement,
+        bench_overwrite_two_indexes
 );
 
 #[cfg(feature = "iai-callgrind")]

@@ -80,14 +80,10 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
         }
 
         // ReturnConsumedCapacity enum validation
-        if let Some(ref rcc) = raw.return_consumed_capacity {
-            if !["INDEXES", "TOTAL", "NONE"].contains(&rcc.as_str()) {
-                errors.push(format!(
-                    "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                    rcc
-                ));
-            }
+        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+            raw.return_consumed_capacity.as_deref(),
+        ) {
+            errors.push(msg);
         }
 
         // ReturnValues enum validation
@@ -432,6 +428,7 @@ async fn execute_inner<S: StorageBackend>(
             &target,
             old_item.as_ref(),
             &request.item,
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 
@@ -442,6 +439,7 @@ async fn execute_inner<S: StorageBackend>(
             &target,
             old_item.as_ref(),
             &request.item,
+            request.return_consumed_capacity.as_deref(),
         )
         .await?;
 

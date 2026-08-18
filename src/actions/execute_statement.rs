@@ -14,8 +14,10 @@ pub struct ExecuteStatementRequest {
     pub limit: Option<usize>,
     #[serde(rename = "NextToken", default)]
     pub next_token: Option<String>,
-    /// Accepted for API compatibility. Has no behavioural effect — SQLite
-    /// reads are always consistent.
+    /// Does not change which rows come back, because every read against SQLite
+    /// is already strongly consistent. It does change two things: the rate the
+    /// read is charged at, and whether a select qualified by a GSI is rejected
+    /// at all.
     #[serde(rename = "ConsistentRead", default)]
     pub consistent_read: Option<bool>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
@@ -50,6 +52,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
     // A COUNT projection is rejected before parsing, with DynamoDB's bare
     // message rather than the wasn't-well-formed wrapper the parse errors
     // below carry. ExecuteStatement is the captured surface for this shape.
@@ -57,11 +67,11 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(msg));
     }
 
-    let stmt = partiql::parser::parse(&request.statement).map_err(|e| {
-        DynoxideError::ValidationException(format!(
-            "Statement wasn't well formed, can't be processed: {e}"
-        ))
-    })?;
+    // The parser says which envelope its rejection takes: a malformed statement
+    // gets DynamoDB's "wasn't well formed" wrapper, while a rejection DynamoDB
+    // reports on its own terms is passed through bare.
+    let stmt = partiql::parser::parse(&request.statement)
+        .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
 
     let params = request.parameters.unwrap_or_default();
     let page = partiql::executor::execute_page(
@@ -70,6 +80,11 @@ pub async fn execute<S: StorageBackend>(
         &params,
         request.limit,
         request.next_token.as_deref(),
+        request.consistent_read.unwrap_or(false),
+        request.return_consumed_capacity.as_deref(),
+        // A single statement has no preparation pass to share a resolution
+        // with, so the executor resolves the table itself, once.
+        None,
     )
     .await?;
     let partiql::executor::StatementPage {
@@ -77,12 +92,15 @@ pub async fn execute<S: StorageBackend>(
         size,
         capacity,
         next_token,
+        read_index,
+        base_read_units,
     } = page;
 
     // ConsumedCapacity is returned whenever ReturnConsumedCapacity is requested,
     // unlike some emulators that omit it. A SELECT is charged read units (an
     // eventually consistent read unless ConsistentRead is set) against the rows
-    // it returned. A write is charged the base table arm plus a per-index arm,
+    // it walked, which is before its WHERE clause and its projection narrow
+    // them. A write is charged the base table arm plus a per-index arm,
     // with no transactional factor: a capture against real DynamoDB reports a
     // PartiQL INSERT of an item in two indexes as total 3, table 1, one unit per
     // index, exactly as the equivalent `PutItem`.
@@ -92,11 +110,43 @@ pub async fn execute<S: StorageBackend>(
                 size,
                 request.consistent_read.unwrap_or(false),
             );
-            return crate::types::consumed_capacity(
-                table,
-                units,
-                &request.return_consumed_capacity,
-            );
+            // A read served from an index is charged against that index's arm
+            // with the table arm at zero, the same shape Query and Scan already
+            // report. Captured eu-west-2 2026-08-15: a keyed GSI select is
+            // total 0.5, table 0, gsi 0.5, where dynoxide charged the table.
+            return match read_index {
+                Some(index) if index.is_lsi => {
+                    // A reach-back read the base item for each row, and those
+                    // land on the table arm, leaving the index arm to cover the
+                    // index read. Each one is charged on its own bytes at the
+                    // request's consistency and the charges are summed, which
+                    // the executor works out because only it sees the sizes.
+                    // Captured eu-west-2 2026-08-15: three small rows served
+                    // this way reported total 2, table 1.5, lsi 0.5. Captured
+                    // again 2026-08-17 across item sizes: the same three rows at
+                    // ~9KB apiece report table 4.5, and 9 under ConsistentRead.
+                    let lsi_units = std::collections::HashMap::from([(index.name, units)]);
+                    crate::types::consumed_capacity_with_secondary_indexes(
+                        table,
+                        base_read_units,
+                        &std::collections::HashMap::new(),
+                        &lsi_units,
+                        &request.return_consumed_capacity,
+                    )
+                }
+                Some(index) => {
+                    let gsi_units = std::collections::HashMap::from([(index.name, units)]);
+                    crate::types::consumed_capacity_with_indexes(
+                        table,
+                        0.0,
+                        &gsi_units,
+                        &request.return_consumed_capacity,
+                    )
+                }
+                None => {
+                    crate::types::consumed_capacity(table, units, &request.return_consumed_capacity)
+                }
+            };
         };
         crate::types::consumed_capacity_with_secondary_indexes(
             table,

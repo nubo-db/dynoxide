@@ -9,20 +9,68 @@
 use crate::types::AttributeValue;
 use std::collections::HashMap;
 
+/// Why a statement did not parse.
+///
+/// DynamoDB wraps a syntax error in `Statement wasn't well formed, can't be
+/// processed: ` and returns some rejections bare, so which envelope a message
+/// takes is part of the observable contract. The parser says which it is rather
+/// than leaving each caller to guess from the text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParseError {
+    /// A malformed statement. The caller wraps this in DynamoDB's envelope.
+    #[error("{0}")]
+    Syntax(String),
+    /// A well-formed statement DynamoDB rejects on its own terms, reported
+    /// without the envelope.
+    #[error("{0}")]
+    Validation(String),
+}
+
+impl ParseError {
+    /// The message DynamoDB returns, envelope included where it uses one.
+    pub fn into_message(self) -> String {
+        match self {
+            ParseError::Syntax(m) => {
+                format!("Statement wasn't well formed, can't be processed: {m}")
+            }
+            ParseError::Validation(m) => m,
+        }
+    }
+}
+
+// Every helper below still returns a bare `String` for a syntax error, so `?`
+// lifts it into the common case and only the handful of sites with their own
+// envelope name a variant.
+impl From<String> for ParseError {
+    fn from(message: String) -> Self {
+        ParseError::Syntax(message)
+    }
+}
+
+impl From<&str> for ParseError {
+    fn from(message: &str) -> Self {
+        ParseError::Syntax(message.to_string())
+    }
+}
+
 /// A parsed PartiQL statement.
 ///
-/// The `Update` and `Delete` variants are `#[non_exhaustive]`: they carry a
-/// growing set of clauses (a `RETURNING` variant was added in 0.12.0), so
+/// Every variant is `#[non_exhaustive]`: they carry a growing set of clauses (a
+/// `RETURNING` variant was added in 0.12.0, an index qualifier after that), so
 /// downstream code must match them with `..` and cannot build them by struct
 /// literal. This keeps later clause additions non-breaking, matching the
 /// precedent set by `DynoxideError`.
 #[derive(Debug, Clone)]
 pub enum Statement {
+    #[non_exhaustive]
     Select {
         table_name: String,
+        /// The index named by a `"table"."index"` qualifier, if any.
+        index_name: Option<String>,
         projections: Vec<String>, // empty = SELECT *
         where_clause: Option<WhereClause>,
     },
+    #[non_exhaustive]
     Insert {
         table_name: String,
         item: HashMap<String, PartiqlValue>,
@@ -31,6 +79,10 @@ pub enum Statement {
     #[non_exhaustive]
     Update {
         table_name: String,
+        /// The index named by a `"table"."index"` qualifier, if any. DynamoDB
+        /// parses one here and rejects it in execution, so the parser carries
+        /// it rather than failing, and the executor produces the message.
+        index_name: Option<String>,
         set_clauses: Vec<SetClause>,
         remove_paths: Vec<String>,
         where_clause: Option<WhereClause>,
@@ -41,6 +93,9 @@ pub enum Statement {
     #[non_exhaustive]
     Delete {
         table_name: String,
+        /// The index named by a `"table"."index"` qualifier, if any. Carried
+        /// for the same reason as on `Update`.
+        index_name: Option<String>,
         where_clause: Option<WhereClause>,
         /// The `RETURNING` variant when the statement ends with a `RETURNING`
         /// clause. DynamoDB allows only `ALL OLD *` on `DELETE`; the executor
@@ -84,6 +139,24 @@ pub fn table_name(stmt: &Statement) -> Option<&str> {
         | Statement::Insert { table_name, .. }
         | Statement::Update { table_name, .. }
         | Statement::Delete { table_name, .. } => Some(table_name),
+    }
+}
+
+/// The index a statement's `FROM` clause qualified its table with, as in
+/// `SELECT * FROM "table"."index"`. `None` when the statement names a table
+/// alone.
+///
+/// Carried for every statement kind rather than for `SELECT` alone, because
+/// DynamoDB rejects a qualifier on `UPDATE` and `DELETE` semantically rather
+/// than at parse time, and the executor needs the name to say so.
+pub fn index_name(stmt: &Statement) -> Option<&str> {
+    match stmt {
+        Statement::Select { index_name, .. }
+        | Statement::Update { index_name, .. }
+        | Statement::Delete { index_name, .. } => index_name.as_deref(),
+        // An INSERT never carries one: DynamoDB rejects a qualified name there
+        // at parse time, so the statement does not survive to be executed.
+        Statement::Insert { .. } => None,
     }
 }
 
@@ -221,29 +294,55 @@ pub enum SetValue {
 /// Groups are OR-joined; conditions within each group are AND-joined.
 /// `WHERE a = 1 AND b = 2 OR c = 3` parses as `[[a=1, b=2], [c=3]]`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WhereClause {
     /// OR-groups: outer = OR, inner = AND.
     pub groups: Vec<Vec<WhereCondition>>,
+    /// Whether the clause as written joined anything with `OR`.
+    ///
+    /// More than one group no longer means the author wrote an `OR`. A `NOT`
+    /// over a conjunction becomes a disjunction under De Morgan, so
+    /// `NOT (a=1 AND b=2)` flattens to two groups from a clause with no `OR` in
+    /// it at all. UPDATE and DELETE refuse an `OR`, and the refusal has to name
+    /// what the author actually wrote, so it is recorded here before the
+    /// flattening rather than inferred from the result of it.
+    pub wrote_or: bool,
 }
 
 impl WhereClause {
-    /// Create a WhereClause from a single group of AND-joined conditions.
-    pub fn from_conditions(conditions: Vec<WhereCondition>) -> Self {
-        Self {
-            groups: vec![conditions],
-        }
-    }
-
-    /// Create a WhereClause from multiple OR-groups.
-    pub fn from_groups(groups: Vec<Vec<WhereCondition>>) -> Self {
-        Self { groups }
+    /// Create a WhereClause from flattened OR-groups, saying separately whether
+    /// the clause was written with an `OR`.
+    ///
+    /// The only constructor, because `wrote_or` cannot be worked out from the
+    /// groups. The two that tried, by taking more than one group to mean an `OR`
+    /// and one group to mean none, were wrong in both directions: De Morgan
+    /// turns `NOT (a=1 AND b=2)` into two groups from a clause with no `OR` in
+    /// it, and flattens `pk='x' AND NOT (a=1 OR b=2)` from a clause that has one
+    /// into groups that all name the same item.
+    pub fn from_groups_written(groups: Vec<Vec<WhereCondition>>, wrote_or: bool) -> Self {
+        Self { groups, wrote_or }
     }
 }
 
 /// A single condition in a WHERE clause — either a comparison or a function call.
+///
+/// Non-exhaustive, like `WhereClause` and `Statement`. The parser gains variants
+/// as it learns predicates, and each one it gained used to break every
+/// downstream `match` on it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum WhereCondition {
     Comparison(Condition),
+    /// `NOT` of a comparison, in the same shape as `NotBeginsWith` and
+    /// `NotContains` rather than as a flipped operator.
+    ///
+    /// The flip is wrong on a row that lacks the attribute. `a = 'x'` on an item
+    /// with no `a` is false, so its negation is true and the row belongs in the
+    /// result; rewriting it to `a <> 'x'` asks a comparison of a value that is
+    /// not there, which is false again, and the row is dropped. Wrapping keeps
+    /// the missing path a match, which is also how `NOT CONTAINS` already
+    /// behaved, so the two now agree.
+    NotComparison(Condition),
     Exists(String),
     NotExists(String),
     BeginsWith(String, PartiqlValue),
@@ -251,6 +350,9 @@ pub enum WhereCondition {
     Between(String, PartiqlValue, PartiqlValue),
     In(String, Vec<PartiqlValue>),
     Contains(String, PartiqlValue),
+    /// `NOT CONTAINS(path, value)`. Reachable only through a `NOT` in front of
+    /// a `CONTAINS`, which De Morgan may also produce from a negated group.
+    NotContains(String, PartiqlValue),
     IsMissing(String),
     IsNotMissing(String),
 }
@@ -264,15 +366,12 @@ pub struct Condition {
 }
 
 /// Comparison operator.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CompOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
+///
+/// The condition-expression engine's operator, rather than a second enum with
+/// the same shape. The two comparison implementations behind them have already
+/// drifted once; sharing the operator keeps the seam between the surfaces
+/// narrow enough that it cannot happen again by accident.
+pub use crate::expressions::condition::CompOp;
 
 /// A value in a PartiQL expression — either a literal or a parameter placeholder.
 #[derive(Debug, Clone, PartialEq)]
@@ -282,7 +381,7 @@ pub enum PartiqlValue {
 }
 
 /// Parse a PartiQL statement string.
-pub fn parse(input: &str) -> Result<Statement, String> {
+pub fn parse(input: &str) -> Result<Statement, ParseError> {
     let mut tokenizer = Tokenizer::new(input)?;
     let first = tokenizer
         .next_token()?
@@ -296,25 +395,26 @@ pub fn parse(input: &str) -> Result<Statement, String> {
         "DELETE" => parse_delete(&mut tokenizer),
         // A statement that does not begin with a DML keyword is not valid
         // PartiQL; DynamoDB reports this as "Expected data manipulation".
-        _ => Err("Expected data manipulation".to_string()),
+        _ => Err("Expected data manipulation".into()),
     }
 }
 
-fn parse_select(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_select(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     // Parse projections
     let projections = parse_projections(t)?;
 
     // Expect FROM
     expect_keyword(t, "FROM")?;
 
-    // Parse table name
-    let table_name = parse_table_name(t)?;
+    // Parse table name, plus any index the FROM clause qualified it with
+    let target = parse_table_name(t)?;
 
     // Optional WHERE clause
     let where_clause = parse_optional_where(t)?;
 
     Ok(Statement::Select {
-        table_name,
+        table_name: target.name,
+        index_name: target.index,
         projections,
         where_clause,
     })
@@ -376,13 +476,24 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
     Ok(projections)
 }
 
-fn parse_insert(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_insert(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "INTO")?;
-    let table_name = parse_table_name(t)?;
+    let target = parse_table_name(t)?;
+    // Unlike UPDATE and DELETE, which parse a qualifier and reject it in
+    // execution, DynamoDB rejects one on INSERT here, and reports where the
+    // table name sat. Captured eu-west-2 2026-08-15.
+    if target.index.is_some() {
+        return Err(ParseError::Validation(format!(
+            "FROM clause may only contain a single table name in data \
+             manipulation statements at {}",
+            t.position(target.span)
+        )));
+    }
+    let table_name = target.name;
     expect_keyword(t, "VALUE")?;
 
     // Parse the item literal as a map of possibly-parameterised values
-    let item = parse_item_literal_partiql(t)?;
+    let item = parse_item_literal_partiql(t, 0)?;
 
     // Check for IF NOT EXISTS
     let if_not_exists = if let Some(ref tok) = t.peek_token()? {
@@ -405,8 +516,8 @@ fn parse_insert(t: &mut Tokenizer) -> Result<Statement, String> {
     })
 }
 
-fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
-    let table_name = parse_table_name(t)?;
+fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
+    let target = parse_table_name(t)?;
 
     // SET and REMOVE are both optional but at least one must be present.
     // Parse SET clauses if the next keyword is SET.
@@ -422,7 +533,7 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
 
                 let eq = t.next_token()?.ok_or("Expected '='")?;
                 if eq != "=" {
-                    return Err(format!("Expected '=' but got '{eq}'"));
+                    return Err(format!("Expected '=' but got '{eq}'").into());
                 }
 
                 let value = parse_set_value(t)?;
@@ -457,14 +568,15 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, String> {
     }
 
     if set_clauses.is_empty() && remove_paths.is_empty() {
-        return Err("UPDATE requires at least one SET or REMOVE clause".to_string());
+        return Err("UPDATE requires at least one SET or REMOVE clause".into());
     }
 
     let where_clause = parse_optional_where(t)?;
     let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Update {
-        table_name,
+        table_name: target.name,
+        index_name: target.index,
         set_clauses,
         remove_paths,
         where_clause,
@@ -480,24 +592,24 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
         if tok.eq_ignore_ascii_case("list_append") {
             t.next_token()?; // consume list_append
             expect_char(t, "(")?;
-            let first = parse_value(t)?;
+            let first = parse_value(t, 0)?;
             let comma = t.next_token()?.ok_or("Expected ',' in list_append")?;
             if comma != "," {
                 return Err(format!("Expected ',' but got '{comma}'"));
             }
-            let second = parse_value(t)?;
+            let second = parse_value(t, 0)?;
             expect_char(t, ")")?;
             return Ok(SetValue::ListAppend(first, second));
         }
     }
 
-    let first = parse_value(t)?;
+    let first = parse_value(t, 0)?;
 
     // Peek for + or -
     match t.peek_token()? {
         Some(ref s) if s == "+" => {
             t.next_token()?; // consume +
-            let second = parse_value(t)?;
+            let second = parse_value(t, 0)?;
             // The first value should be a path reference (attribute name).
             // In PartiQL, `SET x = x + 1` means add 1 to the current value of x.
             let attr_path = match &first {
@@ -516,7 +628,7 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
         }
         Some(ref s) if s == "-" => {
             t.next_token()?; // consume -
-            let second = parse_value(t)?;
+            let second = parse_value(t, 0)?;
             let attr_path = match &first {
                 PartiqlValue::Literal(AttributeValue::S(s)) => s.clone(),
                 _ => {
@@ -531,14 +643,15 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
     }
 }
 
-fn parse_delete(t: &mut Tokenizer) -> Result<Statement, String> {
+fn parse_delete(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "FROM")?;
-    let table_name = parse_table_name(t)?;
+    let target = parse_table_name(t)?;
     let where_clause = parse_optional_where(t)?;
     let returning = parse_optional_returning(t)?;
 
     Ok(Statement::Delete {
-        table_name,
+        table_name: target.name,
+        index_name: target.index,
         where_clause,
         returning,
     })
@@ -589,51 +702,364 @@ fn parse_optional_returning(t: &mut Tokenizer) -> Result<Option<ReturningVariant
     }
 }
 
-fn parse_table_name(t: &mut Tokenizer) -> Result<String, String> {
-    let name = t.next_token()?.ok_or("Expected table name")?;
-    Ok(unquote(&name))
+/// A `FROM` target: a table, and the index its name was qualified with.
+///
+/// `"table"."index"` is DynamoDB's way of naming an index in PartiQL. The
+/// tokenizer emits `.` as its own token, so the qualifier has to be consumed
+/// here; leaving it in the stream makes the next clause parse against `.` and
+/// the index name, which silently drops that clause.
+struct TableTarget {
+    name: String,
+    index: Option<String>,
+    /// Where the table name sat in the source, for the `INSERT` rejection.
+    span: Span,
+}
+
+fn parse_table_name(t: &mut Tokenizer) -> Result<TableTarget, ParseError> {
+    let span = t.span_at(t.pos);
+    let raw = t.next_token()?.ok_or("Expected table name")?;
+    let name = unquote(&raw);
+    if name.is_empty() {
+        return Err(ParseError::Validation(
+            "Path component cannot be an empty string".to_string(),
+        ));
+    }
+
+    let index = match t.peek_token()? {
+        Some(ref dot) if dot == "." => {
+            t.next_token()?; // consume '.'
+            let raw = t.next_token()?.ok_or("Expected index name after '.'")?;
+            let index = unquote(&raw);
+            if index.is_empty() {
+                return Err(ParseError::Validation(
+                    "Path component cannot be an empty string".to_string(),
+                ));
+            }
+            // A third component is its own rejection rather than a generic
+            // parse failure, matching DynamoDB.
+            if matches!(t.peek_token()?, Some(ref dot) if dot == ".") {
+                return Err(ParseError::Validation(
+                    "A path may contain at most 2 components in the FROM clause".to_string(),
+                ));
+            }
+            Some(index)
+        }
+        _ => None,
+    };
+
+    Ok(TableTarget { name, index, span })
 }
 
 fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String> {
     match t.peek_token()? {
         Some(ref s) if s.eq_ignore_ascii_case("WHERE") => {
             t.next_token()?; // consume WHERE
-            let groups = parse_conditions_with_or(t)?;
-            Ok(Some(WhereClause::from_groups(groups)))
+            let (groups, wrote_or) = parse_conditions_with_or(t)?;
+            Ok(Some(WhereClause::from_groups_written(groups, wrote_or)))
         }
         _ => Ok(None),
     }
 }
 
 /// Parse conditions supporting both AND and OR.
-/// Returns a list of OR-groups, where each group is a list of AND-joined conditions.
-fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<Vec<Vec<WhereCondition>>, String> {
-    let mut groups: Vec<Vec<WhereCondition>> = Vec::new();
-    let mut current_group: Vec<WhereCondition> = Vec::new();
+///
+/// Returns a list of OR-groups, where each group is a list of AND-joined
+/// conditions, alongside whether the clause as written joined anything with
+/// `OR`. That has to be read off the tree before `push_not_down` runs: De Morgan
+/// turns a negated conjunction into a disjunction, so counting groups afterwards
+/// reports an `OR` in a clause that never had one.
+fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<(Vec<Vec<WhereCondition>>, bool), String> {
+    let expr = parse_or_expr(t, 0)?;
+    let wrote_or = contains_or(&expr);
+    let expr = push_not_down(expr, false)?;
+    Ok((to_dnf(expr)?, wrote_or))
+}
 
-    loop {
-        let condition = parse_single_condition(t)?;
-        current_group.push(condition);
+/// Whether an expression as parsed holds an `OR` anywhere.
+fn contains_or(expr: &BoolExpr) -> bool {
+    match expr {
+        BoolExpr::Or(_) => true,
+        BoolExpr::And(terms) => terms.iter().any(contains_or),
+        BoolExpr::Not(inner) => contains_or(inner),
+        BoolExpr::Leaf(_) => false,
+    }
+}
 
-        match t.peek_token()? {
-            Some(ref s) if s.eq_ignore_ascii_case("AND") => {
-                t.next_token()?; // consume AND — continue in current group
-            }
-            Some(ref s) if s.eq_ignore_ascii_case("OR") => {
-                t.next_token()?; // consume OR — start new group
-                groups.push(current_group);
-                current_group = Vec::new();
-            }
-            _ => break,
+/// A WHERE clause as written, before it is flattened.
+///
+/// `WhereClause` holds an OR of ANDs, which is the shape the executor and the
+/// key-condition pushdown both read. Parentheses and `NOT` do not fit that
+/// shape as written, so they are parsed into a tree here and flattened into it
+/// afterwards. Nothing below the parser sees this type.
+enum BoolExpr {
+    Leaf(WhereCondition),
+    And(Vec<BoolExpr>),
+    Or(Vec<BoolExpr>),
+    Not(Box<BoolExpr>),
+}
+
+/// `depth` counts the nesting levels above this expression: one per set of
+/// parentheses and one per `NOT`, which are the two edges that come back round
+/// to a parser already on the stack. Alternation and conjunction chains are
+/// loops rather than recursion, so a long `a OR b OR c ...` does not spend it.
+fn parse_or_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
+    let mut terms = vec![parse_and_expr(t, depth)?];
+    while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("OR")) {
+        t.next_token()?;
+        terms.push(parse_and_expr(t, depth)?);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        BoolExpr::Or(terms)
+    })
+}
+
+fn parse_and_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
+    let mut terms = vec![parse_not_expr(t, depth)?];
+    while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("AND")) {
+        t.next_token()?;
+        terms.push(parse_not_expr(t, depth)?);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        BoolExpr::And(terms)
+    })
+}
+
+fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
+    // `NOT EXISTS(x)` and `NOT BEGINS_WITH(x, y)` are single conditions with
+    // their own variants, so they belong to parse_single_condition and are left
+    // to it. A `NOT` in front of anything else is the boolean operator.
+    if matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("NOT")) {
+        let next = t.peek_token_at(1)?.unwrap_or_default();
+        let is_condition_form =
+            next.eq_ignore_ascii_case("EXISTS") || next.eq_ignore_ascii_case("BEGINS_WITH");
+        if !is_condition_form {
+            t.next_token()?;
+            return Ok(BoolExpr::Not(Box::new(parse_not_expr(t, depth + 1)?)));
         }
     }
+    parse_primary(t, depth)
+}
 
-    groups.push(current_group);
+fn parse_primary(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
+    if matches!(t.peek_token()?, Some(ref s) if s == "(") {
+        t.next_token()?;
+        let inner = parse_or_expr(t, depth + 1)?;
+        match t.next_token()? {
+            Some(ref s) if s == ")" => Ok(inner),
+            other => Err(format!(
+                "Expected ')' but got '{}'",
+                other.unwrap_or_else(|| "end of statement".to_string())
+            )),
+        }
+    } else {
+        Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?))
+    }
+}
+
+/// Drive `NOT` down to the leaves by De Morgan, so the tree that reaches
+/// `to_dnf` is a plain AND/OR of conditions.
+fn push_not_down(expr: BoolExpr, negated: bool) -> Result<BoolExpr, String> {
+    match expr {
+        BoolExpr::Not(inner) => push_not_down(*inner, !negated),
+        BoolExpr::And(terms) => {
+            let terms = terms
+                .into_iter()
+                .map(|e| push_not_down(e, negated))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(if negated {
+                BoolExpr::Or(terms)
+            } else {
+                BoolExpr::And(terms)
+            })
+        }
+        BoolExpr::Or(terms) => {
+            let terms = terms
+                .into_iter()
+                .map(|e| push_not_down(e, negated))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(if negated {
+                BoolExpr::And(terms)
+            } else {
+                BoolExpr::Or(terms)
+            })
+        }
+        BoolExpr::Leaf(cond) => {
+            if negated {
+                negate_condition(cond)
+            } else {
+                Ok(BoolExpr::Leaf(cond))
+            }
+        }
+    }
+}
+
+/// The negation of a single condition.
+///
+/// A comparison is wrapped rather than flipped. Flipping the operator loses the
+/// rows that have no such attribute at all: the comparison is false on those,
+/// so its negation must be true, and `NotComparison` is what says so. See the
+/// variant's own note.
+///
+/// Two of these are not single conditions once negated and become subtrees:
+/// `NOT BETWEEN` is a disjunction and `NOT IN` a conjunction. Both expand
+/// through the wrapped form as well, so a row missing the attribute survives
+/// them for the same reason.
+fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
+    use WhereCondition as W;
+    // A negated comparison on `path`, as its own condition.
+    let not_cmp = |path: String, op: CompOp, value: PartiqlValue| -> BoolExpr {
+        W::NotComparison(Condition { path, op, value }).into()
+    };
+    Ok(match cond {
+        W::Comparison(c) => W::NotComparison(c).into(),
+        W::NotComparison(c) => W::Comparison(c).into(),
+        W::Exists(p) => W::NotExists(p).into(),
+        W::NotExists(p) => W::Exists(p).into(),
+        W::BeginsWith(p, v) => W::NotBeginsWith(p, v).into(),
+        W::NotBeginsWith(p, v) => W::BeginsWith(p, v).into(),
+        W::IsMissing(p) => W::IsNotMissing(p).into(),
+        W::IsNotMissing(p) => W::IsMissing(p).into(),
+        W::Contains(p, v) => W::NotContains(p, v).into(),
+        W::NotContains(p, v) => W::Contains(p, v).into(),
+        // Not `< low OR > high`, which would drop a row with no such attribute
+        // twice over. `NOT (>= low) OR NOT (<= high)` says the same thing about
+        // a row that has the attribute and keeps the one that does not.
+        W::Between(p, low, high) => BoolExpr::Or(vec![
+            not_cmp(p.clone(), CompOp::Ge, low),
+            not_cmp(p, CompOp::Le, high),
+        ]),
+        W::In(p, values) => BoolExpr::And(
+            values
+                .into_iter()
+                .map(|v| not_cmp(p.clone(), CompOp::Eq, v))
+                .collect(),
+        ),
+    })
+}
+
+impl From<WhereCondition> for BoolExpr {
+    fn from(cond: WhereCondition) -> Self {
+        BoolExpr::Leaf(cond)
+    }
+}
+
+/// How many OR groups a flattened clause may have.
+///
+/// Distributing an AND over ORs multiplies group counts, so a clause built from
+/// nested alternations can expand far beyond what was written. The cap keeps a
+/// pathological statement a rejection rather than an allocation.
+const MAX_OR_GROUPS: usize = 256;
+
+/// How deeply a statement may nest.
+///
+/// The companion to `MAX_OR_GROUPS`, which bounds a clause that expands rather
+/// than one that nests. Both the boolean-expression parser and the value parser
+/// are recursive descents, so a WHERE clause written with hundreds of
+/// parentheses or `NOT`s, or an item literal holding hundreds of nested maps,
+/// recurses until the stack runs out. That is not a failure the engine can
+/// report: the release profile aborts on panic, so a stack overflow takes the
+/// whole host process down rather than the one statement. The budget keeps a
+/// pathological statement a rejection.
+const MAX_EXPR_DEPTH: usize = 64;
+
+/// How many conditions a flattened clause may hold in total.
+///
+/// `MAX_OR_GROUPS` bounds the number of groups, not the conditions inside them,
+/// and a single group can be very wide: `NOT a IN [8000 items]` is one group of
+/// 8000 leaves under De Morgan. A handful of negated conjunctions then clones
+/// that group up to `MAX_OR_GROUPS` times, so a statement of a few tens of
+/// kilobytes turns into tens of millions of cloned conditions and burns minutes
+/// of CPU before the group cap ever trips. Budgeting the total keeps that a
+/// rejection.
+const MAX_TOTAL_CONDITIONS: usize = 4096;
+
+/// The rejection every clause-complexity budget shares.
+const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
+
+/// The rejection both descents share when they run past `MAX_EXPR_DEPTH`.
+const TOO_DEEP: &str = "Statement is nested too deeply to parse";
+
+/// Flatten an AND/OR tree into the OR-of-ANDs the rest of the engine reads.
+fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
+    let groups = match expr {
+        BoolExpr::Leaf(cond) => vec![vec![cond]],
+        BoolExpr::Not(_) => {
+            unreachable!("push_not_down removes every Not before to_dnf sees the tree")
+        }
+        BoolExpr::Or(terms) => {
+            let mut out = Vec::new();
+            for term in terms {
+                out.extend(to_dnf(term)?);
+                // Checked inside the loop, not after it. `out` only ever grows
+                // here, so a clause rejected at the end was already over the cap
+                // at the term that crossed it; testing as we go rejects exactly
+                // the same statements without first building the whole thing.
+                // A wide alternation is otherwise gigabytes of groups before the
+                // rejection it was always going to get.
+                if out.len() > MAX_OR_GROUPS {
+                    return Err(TOO_COMPLEX.to_string());
+                }
+            }
+            out
+        }
+        BoolExpr::And(terms) => {
+            let mut out: Vec<Vec<WhereCondition>> = vec![Vec::new()];
+            for term in terms {
+                let term_groups = to_dnf(term)?;
+                // The common shape: the term is a single conjunction, so the
+                // cross product is just an append onto every group in hand. Take
+                // it without cloning every group we already have.
+                if term_groups.len() == 1 {
+                    for group in out.iter_mut() {
+                        group.extend(term_groups[0].iter().cloned());
+                    }
+                } else {
+                    if out.len().saturating_mul(term_groups.len()) > MAX_OR_GROUPS {
+                        return Err(TOO_COMPLEX.to_string());
+                    }
+                    let mut next = Vec::with_capacity(out.len() * term_groups.len());
+                    for existing in &out {
+                        for group in &term_groups {
+                            let mut combined = existing.clone();
+                            combined.extend(group.iter().cloned());
+                            next.push(combined);
+                        }
+                    }
+                    out = next;
+                }
+                // Group count alone does not bound the work: one group can be
+                // thousands of conditions wide, and the cross product copies
+                // every one of them per term. Budget the conditions too.
+                if out.iter().map(Vec::len).sum::<usize>() > MAX_TOTAL_CONDITIONS {
+                    return Err(TOO_COMPLEX.to_string());
+                }
+            }
+            out
+        }
+    };
+    if groups.len() > MAX_OR_GROUPS {
+        return Err(TOO_COMPLEX.to_string());
+    }
     Ok(groups)
 }
 
 /// Parse a single condition (comparison, function call, etc.).
-fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
+///
+/// `depth` is the boolean nesting already spent getting here, and it carries on
+/// into the value parser rather than restarting at zero. The two descents share
+/// one stack, so a budget each let a clause nested to the limit hold a value
+/// nested to the limit and spend twice the budget in frames.
+fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondition, String> {
     let tok = t.next_token()?.ok_or("Expected condition in WHERE")?;
     let tok_upper = tok.to_uppercase();
 
@@ -651,7 +1077,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
             if comma != "," {
                 return Err(format!("Expected ',' but got '{comma}'"));
             }
-            let value = parse_value(t)?;
+            let value = parse_value(t, depth)?;
             expect_char(t, ")")?;
             Ok(WhereCondition::BeginsWith(path, value))
         }
@@ -662,7 +1088,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
             if comma != "," {
                 return Err(format!("Expected ',' but got '{comma}'"));
             }
-            let value = parse_value(t)?;
+            let value = parse_value(t, depth)?;
             expect_char(t, ")")?;
             Ok(WhereCondition::Contains(path, value))
         }
@@ -680,7 +1106,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                 if comma != "," {
                     return Err(format!("Expected ',' but got '{comma}'"));
                 }
-                let value = parse_value(t)?;
+                let value = parse_value(t, depth)?;
                 expect_char(t, ")")?;
                 Ok(WhereCondition::NotBeginsWith(path, value))
             } else {
@@ -701,9 +1127,9 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
             match next_upper.as_str() {
                 "BETWEEN" => {
                     t.next_token()?; // consume BETWEEN
-                    let low = parse_value(t)?;
+                    let low = parse_value(t, depth)?;
                     expect_keyword(t, "AND")?;
-                    let high = parse_value(t)?;
+                    let high = parse_value(t, depth)?;
                     Ok(WhereCondition::Between(path, low, high))
                 }
                 "IN" => {
@@ -730,7 +1156,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                             t.next_token()?; // consume comma
                             continue;
                         }
-                        values.push(parse_value(t)?);
+                        values.push(parse_value(t, depth)?);
                     }
                     Ok(WhereCondition::In(path, values))
                 }
@@ -761,7 +1187,7 @@ fn parse_single_condition(t: &mut Tokenizer) -> Result<WhereCondition, String> {
                         ">=" => CompOp::Ge,
                         other => return Err(format!("Unknown operator: {other}")),
                     };
-                    let value = parse_value(t)?;
+                    let value = parse_value(t, depth)?;
                     Ok(WhereCondition::Comparison(Condition { path, op, value }))
                 }
             }
@@ -811,7 +1237,12 @@ fn expect_char(t: &mut Tokenizer, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_value(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
+/// `depth` counts the collection levels above this value, so a literal nested
+/// past `MAX_EXPR_DEPTH` is a rejection rather than a stack overflow.
+fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
     let tok = t.next_token()?.ok_or("Expected value")?;
 
     if tok == "?" {
@@ -846,7 +1277,7 @@ fn parse_value(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
                         t.next_token()?;
                         continue;
                     }
-                    elements.push(parse_value(t)?);
+                    elements.push(parse_value(t, depth + 1)?);
                 }
                 return set_literal_to_value(elements);
             }
@@ -866,7 +1297,7 @@ fn parse_value(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
                 t.next_token()?;
                 continue;
             }
-            items.push(parse_value(t)?);
+            items.push(parse_value(t, depth + 1)?);
         }
         // We can only produce a Literal list if all elements are literals
         let mut avs = Vec::new();
@@ -906,7 +1337,7 @@ fn parse_value(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
             if colon != ":" {
                 return Err(format!("Expected ':' but got '{colon}'"));
             }
-            let val = parse_value(t)?;
+            let val = parse_value(t, depth + 1)?;
             match val {
                 PartiqlValue::Literal(av) => {
                     map.insert(key, av);
@@ -1014,7 +1445,10 @@ fn set_literal_to_value(elements: Vec<PartiqlValue>) -> Result<PartiqlValue, Str
 }
 
 /// Parse a `{ 'key': 'value', ... }` item literal into a DynamoDB attribute map.
-fn parse_item_literal(t: &mut Tokenizer) -> Result<HashMap<String, AttributeValue>, String> {
+fn parse_item_literal(
+    t: &mut Tokenizer,
+    depth: usize,
+) -> Result<HashMap<String, AttributeValue>, String> {
     let open = t.next_token()?.ok_or("Expected '{'")?;
     if open != "{" {
         return Err(format!("Expected '{{' but got '{open}'"));
@@ -1045,7 +1479,7 @@ fn parse_item_literal(t: &mut Tokenizer) -> Result<HashMap<String, AttributeValu
         }
 
         // Parse value
-        let val = parse_item_value(t)?;
+        let val = parse_item_value(t, depth)?;
         item.insert(key, val);
     }
 
@@ -1053,12 +1487,15 @@ fn parse_item_literal(t: &mut Tokenizer) -> Result<HashMap<String, AttributeValu
 }
 
 /// Parse a value inside an item literal (supports nested maps, lists, set literals, etc.).
-fn parse_item_value(t: &mut Tokenizer) -> Result<AttributeValue, String> {
+fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
     let tok = t.peek_token()?.ok_or("Expected value")?;
 
     if tok == "{" {
         // Nested map
-        let inner = parse_item_literal(t)?;
+        let inner = parse_item_literal(t, depth + 1)?;
         return Ok(AttributeValue::M(inner));
     }
 
@@ -1076,7 +1513,7 @@ fn parse_item_value(t: &mut Tokenizer) -> Result<AttributeValue, String> {
                 t.next_token()?;
                 continue;
             }
-            items.push(parse_item_value(t)?);
+            items.push(parse_item_value(t, depth + 1)?);
         }
         return Ok(AttributeValue::L(items));
     }
@@ -1101,7 +1538,7 @@ fn parse_item_value(t: &mut Tokenizer) -> Result<AttributeValue, String> {
                         t.next_token()?;
                         continue;
                     }
-                    elements.push(parse_item_value(t)?);
+                    elements.push(parse_item_value(t, depth + 1)?);
                 }
                 return item_value_set_literal(elements);
             }
@@ -1174,7 +1611,10 @@ fn item_value_set_literal(elements: Vec<AttributeValue>) -> Result<AttributeValu
 
 /// Parse a `{ 'key': value, ... }` item literal where values may be `?` parameter placeholders.
 /// Returns `PartiqlValue` wrappers so parameters can be resolved at execution time.
-fn parse_item_literal_partiql(t: &mut Tokenizer) -> Result<HashMap<String, PartiqlValue>, String> {
+fn parse_item_literal_partiql(
+    t: &mut Tokenizer,
+    depth: usize,
+) -> Result<HashMap<String, PartiqlValue>, String> {
     let open = t.next_token()?.ok_or("Expected '{'")?;
     if open != "{" {
         return Err(format!("Expected '{{' but got '{open}'"));
@@ -1205,7 +1645,7 @@ fn parse_item_literal_partiql(t: &mut Tokenizer) -> Result<HashMap<String, Parti
         }
 
         // Parse value (may be a parameter placeholder)
-        let val = parse_item_value_partiql(t)?;
+        let val = parse_item_value_partiql(t, depth)?;
         item.insert(key, val);
     }
 
@@ -1214,7 +1654,10 @@ fn parse_item_literal_partiql(t: &mut Tokenizer) -> Result<HashMap<String, Parti
 
 /// Parse a value inside an item literal, supporting `?` parameter placeholders
 /// and nested maps/lists (which are stored as `PartiqlValue::Literal`).
-fn parse_item_value_partiql(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
+fn parse_item_value_partiql(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
     let tok = t.peek_token()?.ok_or("Expected value")?;
 
     if tok == "?" {
@@ -1225,13 +1668,13 @@ fn parse_item_value_partiql(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
 
     // For lists, use parse_value which supports `?` inside list elements
     if tok == "[" {
-        return parse_value(t);
+        return parse_value(t, depth + 1);
     }
 
     // For nested maps, use recursive partiql parsing to support `?`
     if tok == "{" {
         // Parse nested map with partiql-aware parser
-        let inner = parse_item_literal_partiql(t)?;
+        let inner = parse_item_literal_partiql(t, depth + 1)?;
         // Check if all values are literals — if so, collapse to a single Literal
         let mut map = HashMap::new();
         for (k, v) in inner {
@@ -1254,13 +1697,18 @@ fn parse_item_value_partiql(t: &mut Tokenizer) -> Result<PartiqlValue, String> {
 
     // For set literals << >>, delegate to parse_item_value which handles them
     // For other scalar values, use parse_item_value and wrap
-    let av = parse_item_value(t)?;
+    let av = parse_item_value(t, depth)?;
     Ok(PartiqlValue::Literal(av))
 }
 
 /// Remove surrounding single or double quotes from a string.
 fn unquote(s: &str) -> String {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+    // The length guard is not redundant with the tokenizer's unterminated-quote
+    // rejection: a bare `"` starts and ends with the same character, so without
+    // it this slices s[1..0] and panics rather than returning anything.
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
@@ -1281,18 +1729,42 @@ fn expect_keyword(t: &mut Tokenizer, kw: &str) -> Result<(), String> {
 
 struct Tokenizer {
     tokens: Vec<String>,
+    spans: Vec<Span>,
+    /// The statement as written, kept so a span can be turned into a line and
+    /// column when a rejection needs one.
+    input: String,
     pos: usize,
     param_counter: usize,
 }
 
 impl Tokenizer {
     fn new(input: &str) -> Result<Self, String> {
-        let tokens = tokenize(input)?;
+        let (tokens, spans) = tokenize(input)?;
         Ok(Self {
             tokens,
+            spans,
+            input: input.to_string(),
             pos: 0,
             param_counter: 0,
         })
+    }
+
+    /// The source span of the token at `index`, for the one rejection message
+    /// that reports a position. Out of range yields a zero span rather than
+    /// panicking, so a malformed statement still produces an error rather than
+    /// bringing the process down.
+    fn span_at(&self, index: usize) -> Span {
+        self.spans
+            .get(index)
+            .copied()
+            .unwrap_or(Span { start: 0, len: 0 })
+    }
+
+    /// A span as DynamoDB reports it: `line:column:length`, all 1-based, with
+    /// the length in source characters.
+    fn position(&self, span: Span) -> String {
+        let (line, col) = span.line_col(&self.input);
+        format!("{line}:{col}:{}", span.len)
     }
 
     fn next_token(&mut self) -> Result<Option<String>, String> {
@@ -1327,11 +1799,58 @@ impl Tokenizer {
     }
 }
 
-/// Tokenise a PartiQL string into tokens.
-fn tokenize(input: &str) -> Result<Vec<String>, String> {
-    let mut tokens = Vec::new();
+/// Where a token started in the source, and how long it was as written.
+///
+/// DynamoDB reports a table name's position when it rejects a qualified name on
+/// an `INSERT`, as `line:column:length` counted from 1 with the length measured
+/// in source characters (so a quoted name includes its quotes). Reproducing that
+/// message means the position has to survive tokenisation. Captured eu-west-2
+/// 2026-08-15.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    /// Character offset of the token's first character.
+    start: usize,
+    len: usize,
+}
+
+impl Span {
+    /// The 1-based line and column of the token's first character.
+    ///
+    /// Walked from the start of the statement on demand. Only one rejection
+    /// message reports a position, so paying for it per parse would mean
+    /// counting newlines for every statement to serve a case that almost never
+    /// fires.
+    fn line_col(&self, input: &str) -> (usize, usize) {
+        let (mut line, mut col) = (1usize, 1usize);
+        for c in input.chars().take(self.start) {
+            if c == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+}
+
+fn emit(tokens: &mut Vec<String>, spans: &mut Vec<Span>, tok: String, start: usize, end: usize) {
+    spans.push(Span {
+        start,
+        len: end - start,
+    });
+    tokens.push(tok);
+}
+
+/// Tokenise a PartiQL string into tokens and their source spans.
+fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
+    let mut tokens = Vec::new();
+    // Roughly one token per four characters on the statements this sees; the
+    // exact figure does not matter, only that it stops reallocating from zero.
+    let mut spans = Vec::with_capacity(len / 4 + 1);
+
     let mut i = 0;
 
     while i < len {
@@ -1341,12 +1860,15 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             continue;
         }
 
+        let start = i;
+
         // Single-char tokens
         match chars[i] {
             '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '*' | '?' | '+' | '-' | '.' => {
                 // Check for multi-char - or +  as start of number? No, treat as separate.
-                tokens.push(chars[i].to_string());
+                let tok = chars[i].to_string();
                 i += 1;
+                emit(&mut tokens, &mut spans, tok, start, i);
                 continue;
             }
             _ => {}
@@ -1357,8 +1879,8 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             let two = format!("{}{}", chars[i], chars[i + 1]);
             match two.as_str() {
                 "<>" | "<=" | ">=" | "!=" => {
-                    tokens.push(two);
                     i += 2;
+                    emit(&mut tokens, &mut spans, two, start, i);
                     continue;
                 }
                 _ => {}
@@ -1367,8 +1889,9 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
 
         // Single-char operators
         if matches!(chars[i], '=' | '<' | '>') {
-            tokens.push(chars[i].to_string());
+            let tok = chars[i].to_string();
             i += 1;
+            emit(&mut tokens, &mut spans, tok, start, i);
             continue;
         }
 
@@ -1390,11 +1913,19 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                     i += 1;
                 }
             }
-            if i < len {
-                s.push('\'');
-                i += 1;
+            if i >= len {
+                // DynamoDB returns the envelope with nothing after it here.
+                // The detail is deliberately kept anyway: the exception type and
+                // the accept/reject outcome match, and the wording is the half
+                // that drifts. AWS's own validation prose differed across two of
+                // four regions in the 2026-06 capture, so a caller matching it
+                // exactly is already broken; one branching on the type is not.
+                // Extra detail is additive and cannot break either.
+                return Err("Unterminated string literal".to_string());
             }
-            tokens.push(s);
+            s.push('\'');
+            i += 1;
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1416,11 +1947,18 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                     i += 1;
                 }
             }
-            if i < len {
-                s.push('"');
-                i += 1;
+            // An unterminated identifier used to be emitted as a token that
+            // still carried its opening quote. `unquote` then saw a string that
+            // both starts and ends with `"` when the quote was the only
+            // character, and sliced s[1..0], which panics. Rejecting it here
+            // fixes the crash at its source and leaves `unquote` total.
+            if i >= len {
+                // Detail kept, for the reason given on the string-literal case.
+                return Err("Unterminated quoted identifier".to_string());
             }
-            tokens.push(s);
+            s.push('"');
+            i += 1;
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1431,7 +1969,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            tokens.push(s);
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1442,7 +1980,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            tokens.push(s);
+            emit(&mut tokens, &mut spans, s, start, i);
             continue;
         }
 
@@ -1450,7 +1988,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
         return Err(format!("Unexpected character: '{}'", chars[i]));
     }
 
-    Ok(tokens)
+    Ok((tokens, spans))
 }
 
 #[cfg(test)]
@@ -1465,6 +2003,7 @@ mod tests {
                 table_name,
                 projections,
                 where_clause,
+                ..
             } => {
                 assert_eq!(table_name, "TestTable");
                 assert!(projections.is_empty());
@@ -1559,6 +2098,7 @@ mod tests {
                 table_name,
                 where_clause,
                 returning,
+                ..
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
@@ -1576,6 +2116,7 @@ mod tests {
                 table_name,
                 where_clause,
                 returning,
+                ..
             } => {
                 assert_eq!(table_name, "T");
                 assert!(where_clause.is_some());
@@ -1659,7 +2200,7 @@ mod tests {
         ] {
             let err = parse(&format!("DELETE FROM \"T\" WHERE pk = 'k1' {clause}")).unwrap_err();
             assert!(
-                err.contains("Unsupported RETURNING clause"),
+                err.to_string().contains("Unsupported RETURNING clause"),
                 "clause {clause} gave unexpected error: {err}"
             );
         }
@@ -2069,5 +2610,193 @@ mod tests {
             },
             _ => panic!("Expected SELECT with WHERE"),
         }
+    }
+
+    // An index qualifier is `"table"."index"`. The tokenizer emits `.` as its
+    // own token, so a table name parser that takes one token leaves `.` and the
+    // index name in the stream, and whatever clause follows is read against
+    // those instead. Every statement kind goes through `parse_table_name`, so
+    // all four lose their clauses the same way. Captured eu-west-2 2026-08-15.
+
+    #[test]
+    fn select_index_qualifier_keeps_the_where_clause() {
+        let stmt = parse("SELECT * FROM \"T\".\"idx\" WHERE pk = 'p'").unwrap();
+        match stmt {
+            Statement::Select {
+                table_name,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "T");
+                assert!(
+                    where_clause.is_some(),
+                    "the qualifier stranded the WHERE clause"
+                );
+            }
+            _ => panic!("Expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn delete_index_qualifier_keeps_the_where_clause() {
+        let stmt = parse("DELETE FROM \"T\".\"idx\" WHERE pk = 'p'").unwrap();
+        match stmt {
+            Statement::Delete {
+                table_name,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "T");
+                // The parser accepts a DELETE with no WHERE and the executor
+                // rejects it, so a stranded clause surfaces there as "DELETE
+                // requires a WHERE clause" on a statement that plainly has one.
+                assert!(
+                    where_clause.is_some(),
+                    "the qualifier stranded the WHERE clause"
+                );
+            }
+            _ => panic!("Expected DELETE"),
+        }
+    }
+
+    #[test]
+    fn update_index_qualifier_keeps_its_clauses() {
+        let stmt = parse("UPDATE \"T\".\"idx\" SET a = 'x' WHERE pk = 'p'")
+            .expect("the qualifier stranded the SET clause");
+        match stmt {
+            Statement::Update {
+                table_name,
+                set_clauses,
+                where_clause,
+                ..
+            } => {
+                assert_eq!(table_name, "T");
+                assert_eq!(set_clauses.len(), 1);
+                assert!(where_clause.is_some());
+            }
+            _ => panic!("Expected UPDATE"),
+        }
+    }
+
+    #[test]
+    fn select_index_qualifier_is_captured() {
+        let stmt = parse("SELECT * FROM \"T\".\"idx\"").unwrap();
+        assert_eq!(index_name(&stmt), Some("idx"));
+        assert_eq!(table_name(&stmt), Some("T"));
+    }
+
+    #[test]
+    fn select_without_a_qualifier_carries_no_index() {
+        let stmt = parse("SELECT * FROM \"T\" WHERE pk = 'p'").unwrap();
+        assert_eq!(index_name(&stmt), None);
+    }
+
+    #[test]
+    fn unquoted_index_qualifier_parses() {
+        let stmt = parse("SELECT * FROM T.idx").unwrap();
+        assert_eq!(table_name(&stmt), Some("T"));
+        assert_eq!(index_name(&stmt), Some("idx"));
+    }
+
+    #[test]
+    fn write_statements_carry_the_qualifier_for_the_executor_to_reject() {
+        // AWS rejects a qualifier on all three, but UPDATE and DELETE parse it
+        // and reject semantically while INSERT fails at parse. Parsing it here
+        // lets the executor carry DynamoDB's own message rather than a parse
+        // error, which is how the RETURNING variants are already handled.
+        let stmt = parse("UPDATE \"T\".\"idx\" SET a = 'x' WHERE pk = 'p'").unwrap();
+        assert_eq!(index_name(&stmt), Some("idx"));
+        let stmt = parse("DELETE FROM \"T\".\"idx\" WHERE pk = 'p'").unwrap();
+        assert_eq!(index_name(&stmt), Some("idx"));
+    }
+
+    #[test]
+    fn insert_rejects_a_qualifier_and_reports_the_table_name_position() {
+        // `line:column:length`, counted from 1, with the length measured in
+        // source characters so a quoted name includes its quotes. Every figure
+        // below was read off eu-west-2 on 2026-08-15.
+        let err = parse("INSERT INTO \"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        // Bare, not wrapped: AWS reports this one on its own terms.
+        assert_eq!(
+            err,
+            ParseError::Validation(
+                "FROM clause may only contain a single table name in data \
+                 manipulation statements at 1:13:10"
+                    .to_string()
+            )
+        );
+
+        // The column tracks real whitespace rather than being a constant.
+        let err = parse("INSERT   INTO   \"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        assert!(err.to_string().ends_with("at 1:17:10"), "got {err}");
+
+        // A newline before the table name moves the line and resets the column.
+        let err = parse("INSERT INTO\n\"abcdefgh\".\"idx\" VALUE {'pk':'a'}").unwrap_err();
+        assert!(err.to_string().ends_with("at 2:1:10"), "got {err}");
+
+        // An unquoted name is measured without quotes it never had.
+        let err = parse("INSERT INTO abcdefgh.idx VALUE {'pk':'a'}").unwrap_err();
+        assert!(err.to_string().ends_with("at 1:13:8"), "got {err}");
+    }
+
+    #[test]
+    fn insert_without_a_qualifier_is_unaffected() {
+        let stmt = parse("INSERT INTO \"T\" VALUE {'pk':'a'}").unwrap();
+        assert_eq!(table_name(&stmt), Some("T"));
+        assert_eq!(index_name(&stmt), None);
+    }
+
+    #[test]
+    fn an_unterminated_quote_is_rejected_rather_than_panicking() {
+        // `unquote` sliced s[1..0] on a lone `"`, which panics, and the release
+        // profile sets panic = "abort", so this aborted the server process. The
+        // bare-table form predates the index qualifier; the qualifier added a
+        // second way in.
+        for stmt in [
+            "SELECT * FROM \"",
+            "SELECT * FROM \"T\".\"",
+            "SELECT * FROM \"unterminated",
+            "SELECT * FROM \"T\" WHERE pk = 'oops",
+        ] {
+            let err = parse(stmt).unwrap_err();
+            assert!(
+                matches!(err, ParseError::Syntax(_)),
+                "{stmt:?} should be a syntax error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquote_is_total() {
+        // Called on every name the parser reads, so it must not panic on any
+        // token the tokenizer can produce.
+        for input in ["", "\"", "'", "\"\"", "''", "\"a\"", "a"] {
+            let _ = unquote(input);
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_with_no_index_name_is_an_error() {
+        assert!(parse("SELECT * FROM \"T\".").is_err());
+    }
+
+    #[test]
+    fn an_empty_index_component_is_rejected() {
+        let err = parse("SELECT * FROM \"T\".\"\"").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::Validation("Path component cannot be an empty string".to_string())
+        );
+    }
+
+    #[test]
+    fn a_three_part_name_is_rejected() {
+        let err = parse("SELECT * FROM \"T\".\"idx\".\"more\"").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::Validation(
+                "A path may contain at most 2 components in the FROM clause".to_string()
+            )
+        );
     }
 }

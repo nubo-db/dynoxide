@@ -1,6 +1,7 @@
 use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table, per_table_capacity};
 use crate::errors::{DynoxideError, Result};
 use crate::partiql;
+use crate::partiql::executor::ResolvedTable;
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,21 @@ pub struct BatchStatementRequest {
     pub statement: String,
     #[serde(rename = "Parameters", default)]
     pub parameters: Option<Vec<AttributeValue>>,
+    /// Per member, not per batch. Does not change which rows come back, because
+    /// every read against SQLite is already strongly consistent, but it does
+    /// change the rate the read is charged at: a keyed batch `SELECT` costs 0.5
+    /// without it and 1 with it, and a batch mixing the two sums both rates.
+    /// Captured eu-west-2 2026-08-15.
+    #[serde(rename = "ConsistentRead", default)]
+    pub consistent_read: Option<bool>,
+    /// Accepted and inert, which is what DynamoDB does with it. A batch member
+    /// whose condition fails returns the same response whether this is
+    /// `ALL_OLD`, `NONE`, or absent, and never carries the item: measured
+    /// against a `TransactWriteItems` `ConditionCheck` in the same round, which
+    /// does return it. The field is deserialised so a client setting it meets a
+    /// field dynoxide knows rather than one it drops.
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
+    pub return_values_on_condition_check_failure: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -68,6 +84,14 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: BatchExecuteStatementRequest,
 ) -> Result<BatchExecuteStatementResponse> {
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
     if request.statements.is_empty() {
         return Err(DynoxideError::ValidationException(
             "1 validation error detected: Value '[]' at 'statements' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),
@@ -86,7 +110,7 @@ pub async fn execute<S: StorageBackend>(
     // that member and runs the rest. Parse failure and an unresolvable target
     // are different things, which is why they are a `Result` and an `Option`
     // rather than one fallible value.
-    let prepared = prepare(storage, &request.statements).await;
+    let (prepared, tables) = prepare(storage, &request.statements).await;
 
     // A batch is all-read or all-write. AWS rejects a mixed one up front,
     // before any statement runs, rather than per statement. A statement that
@@ -115,7 +139,8 @@ pub async fn execute<S: StorageBackend>(
 
     let mut responses = Vec::with_capacity(request.statements.len());
     let mut records: Vec<WriteCapacity> = Vec::new();
-    let mut read_units: Vec<(String, usize)> = Vec::new();
+    // Table, bytes read, and whether that member asked for a consistent read.
+    let mut read_units: Vec<(String, usize, bool)> = Vec::new();
     let mut failures: Vec<(String, f64)> = Vec::new();
 
     for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
@@ -141,7 +166,7 @@ pub async fn execute<S: StorageBackend>(
                     // `ValidationError` code, the same as an execution error,
                     // matching DynamoDB.
                     code: "ValidationError".to_string(),
-                    message: format!("Statement wasn't well formed, can't be processed: {e}"),
+                    message: e.into_message(),
                 }),
                 item: None,
                 table_name: None,
@@ -151,15 +176,63 @@ pub async fn execute<S: StorageBackend>(
                 // not on a per-statement error.
                 let table = partiql::parser::table_name(&stmt).map(str::to_string);
                 let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                match partiql::executor::execute_page(storage, &stmt, params, None, None).await {
+                // A batch read must name a single item. A SELECT that does not
+                // resolve to one, or that names an index, is rejected against
+                // itself while the rest of the batch runs. Both shapes carry the
+                // same message, so an index-qualified read is unreachable here
+                // even when it does name the primary key. Captured eu-west-2
+                // 2026-08-15.
+                //
+                // Only for a table that resolved. A statement has no target
+                // either when its WHERE names no key or when its table could not
+                // be read, and the second is not this rejection: an INSERT or a
+                // DELETE against a table that does not exist reports
+                // ResourceNotFound with the table echoed, and a SELECT must say
+                // the same rather than claim the key is missing when it is
+                // there. Letting it through to `execute_page` is what produces
+                // that, because table resolution is the first thing a SELECT
+                // does.
+                let table_resolved = table.as_deref().is_some_and(|t| tables.contains_key(t));
+                let unkeyed_read = matches!(stmt, partiql::parser::Statement::Select { .. })
+                    && table_resolved
+                    && (prepared.target.is_none() || partiql::parser::index_name(&stmt).is_some());
+                if unkeyed_read {
+                    responses.push(BatchStatementResponse {
+                        error: Some(BatchStatementError {
+                            code: "ValidationError".to_string(),
+                            message: "Select statements within BatchExecuteStatement must \
+                                      specify the primary key in the where clause."
+                                .to_string(),
+                        }),
+                        item: None,
+                        table_name: None,
+                    });
+                    continue;
+                }
+                match partiql::executor::execute_page(
+                    storage,
+                    &stmt,
+                    params,
+                    None,
+                    None,
+                    stmt_req.consistent_read.unwrap_or(false),
+                    request.return_consumed_capacity.as_deref(),
+                    table.as_deref().and_then(|t| tables.get(t)),
+                )
+                .await
+                {
                     Ok(page) => {
                         match page.capacity {
                             Some(capacity) => records.push(capacity),
                             // A SELECT is charged read units against the rows it
-                            // returned, with no index arm on a base table read.
+                            // walked, with no index arm on a base table read.
                             None => {
                                 if let Some(ref name) = table {
-                                    read_units.push((name.clone(), page.size));
+                                    read_units.push((
+                                        name.clone(),
+                                        page.size,
+                                        stmt_req.consistent_read.unwrap_or(false),
+                                    ));
                                 }
                             }
                         }
@@ -183,17 +256,28 @@ pub async fn execute<S: StorageBackend>(
                         // that is the one kind whose attempt can be sized
                         // without reading anything. Everything else falls back
                         // to the one-unit minimum.
-                        if let Some(name) = table {
-                            let units = attempted_units(storage, &stmt, params).await;
-                            failures.push((name, units));
+                        if let Some(ref name) = table {
+                            let units =
+                                attempted_units(storage, &stmt, params, prepared.target.as_ref())
+                                    .await;
+                            failures.push((name.clone(), units));
                         }
+                        // DynamoDB echoes the table on a member whose statement
+                        // ran and failed, and omits it on one rejected before it
+                        // ran. `ConditionalCheckFailed` and `DuplicateItem` both
+                        // carry it; a `ValidationError` does not, which is what
+                        // an invalid RETURNING variant or a bad expression is.
+                        // Captured eu-west-2 2026-08-15 for the first pair and
+                        // 2026-07 for the second.
+                        let code = e.short_error_code().to_string();
+                        let echoes_table = code != "ValidationError";
                         BatchStatementResponse {
                             error: Some(BatchStatementError {
-                                code: e.short_error_code().to_string(),
+                                code,
                                 message: e.to_string(),
                             }),
                             item: None,
-                            table_name: None,
+                            table_name: if echoes_table { table } else { None },
                         }
                     }
                 }
@@ -218,7 +302,7 @@ pub async fn execute<S: StorageBackend>(
 struct Prepared {
     /// The parse result. An `Err` is a per-statement error, not a request-level
     /// one: AWS reports `ValidationError` against that member and runs the rest.
-    stmt: std::result::Result<partiql::parser::Statement, String>,
+    stmt: std::result::Result<partiql::parser::Statement, partiql::parser::ParseError>,
     /// The item this statement targets, for duplicate detection. `None` when it
     /// does not resolve to one, which covers a partition-spanning `SELECT` and
     /// anything whose key cannot be read off the request.
@@ -233,30 +317,46 @@ struct Prepared {
 /// resolution does, so the parsing was the larger half of the overhead by more
 /// than two to one.
 ///
-/// Target resolution is not shared and not cheap: it loads the table's metadata
-/// and parses its key schema per statement, and the executor does both again a
-/// moment later. Sharing that is a separate change from this one, and it is
-/// worth more on the wasm backend, which caches no metadata at all.
+/// Target resolution loads the table's metadata and parses its key schema, and
+/// both are now kept rather than thrown away once the target is read off them.
+/// The executor takes them as they are instead of resolving the same table a
+/// second time, which halves the metadata loads a batch performs. That is worth
+/// most on the wasm backend, where every load crosses the bridge to a JS worker
+/// and nothing caches the result, but the key schema half is a JSON parse and is
+/// paid on both backends.
 async fn prepare<S: StorageBackend>(
     storage: &S,
     statements: &[BatchStatementRequest],
-) -> Vec<Prepared> {
+) -> (Vec<Prepared>, HashMap<String, ResolvedTable>) {
     let mut prepared = Vec::with_capacity(statements.len());
+    // Keyed by table, not by statement: a batch is usually 25 statements
+    // against one table, and that is one resolution rather than 25.
+    let mut tables: HashMap<String, ResolvedTable> = HashMap::new();
+
     for stmt_req in statements {
         let parsed = partiql::parser::parse(&stmt_req.statement);
-        let target = match parsed {
-            Ok(ref stmt) => {
-                let params = stmt_req.parameters.as_deref().unwrap_or_default();
-                partiql::executor::statement_target(storage, stmt, params).await
+        let mut target = None;
+        if let Ok(ref stmt) = parsed
+            && let Some(name) = partiql::parser::table_name(stmt)
+        {
+            if !tables.contains_key(name)
+                && let Ok(resolved) = ResolvedTable::load(storage, name).await
+            {
+                tables.insert(name.to_string(), resolved);
             }
-            Err(_) => None,
-        };
+            // Absent when the table could not be read, which leaves the
+            // statement to fail on its own terms during execution.
+            if let Some(resolved) = tables.get(name) {
+                let params = stmt_req.parameters.as_deref().unwrap_or_default();
+                target = partiql::executor::statement_target_in(stmt, params, resolved);
+            }
+        }
         prepared.push(Prepared {
             stmt: parsed,
             target,
         });
     }
-    prepared
+    (prepared, tables)
 }
 
 /// The write units a failed statement is charged.
@@ -269,14 +369,18 @@ async fn prepare<S: StorageBackend>(
 /// to 2. Two of the failures name tiny items and cost 1 each; the third names a
 /// tiny item too, but the row already at that key is 3KB, and it costs 3. Sizing
 /// on the statement alone reports 5.
+/// `target` is the one the preparation pass already resolved. Sizing used to
+/// resolve it again here, which made a batch of failures cost three metadata
+/// loads per statement rather than two.
 async fn attempted_units<S: StorageBackend>(
     storage: &S,
     stmt: &partiql::parser::Statement,
     parameters: &[AttributeValue],
+    target: Option<&(String, String, String)>,
 ) -> f64 {
-    let stored_size = match partiql::executor::statement_target(storage, stmt, parameters).await {
+    let stored_size = match target {
         Some((table, pk, sk)) => storage
-            .get_item(&table, &pk, &sk)
+            .get_item(table, pk, sk)
             .await
             .ok()
             .flatten()
@@ -316,7 +420,7 @@ async fn attempted_units<S: StorageBackend>(
 /// counts for a unit when another statement in the batch succeeds.
 fn build_capacity(
     records: &[WriteCapacity],
-    read_units: &[(String, usize)],
+    read_units: &[(String, usize, bool)],
     failures: &[(String, f64)],
     mode: &Option<String>,
 ) -> Option<Vec<crate::types::ConsumedCapacity>> {
@@ -328,9 +432,9 @@ fn build_capacity(
     }
 
     let mut by_table = aggregate_by_table(records, 1.0);
-    for (table, size) in read_units {
+    for (table, size, consistent) in read_units {
         by_table.entry(table.clone()).or_default().table_units +=
-            crate::types::read_capacity_units_with_consistency(*size, false);
+            crate::types::read_capacity_units_with_consistency(*size, *consistent);
     }
 
     let mut entries = per_table_capacity(

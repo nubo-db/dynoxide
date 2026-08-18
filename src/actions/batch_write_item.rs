@@ -279,6 +279,7 @@ pub async fn execute<S: StorageBackend>(
                             &target,
                             old_item.as_ref(),
                             &put_req.item,
+                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
                         let lsi_units = super::lsi::maintain_lsis_after_write(
@@ -287,6 +288,7 @@ pub async fn execute<S: StorageBackend>(
                             &target,
                             old_item.as_ref(),
                             &put_req.item,
+                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
                         crate::streams::record_stream_event(
@@ -344,6 +346,7 @@ pub async fn execute<S: StorageBackend>(
                             &meta,
                             &target,
                             old_item.as_ref(),
+                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
                         let lsi_units = super::lsi::maintain_lsis_after_delete(
@@ -351,6 +354,7 @@ pub async fn execute<S: StorageBackend>(
                             &meta,
                             &target,
                             old_item.as_ref(),
+                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
                         if old_item.is_some() {

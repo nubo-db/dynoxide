@@ -82,14 +82,10 @@ fn first_invalid_return_enum(
             ));
         }
     }
-    if let Some(rcc) = return_consumed_capacity {
-        if !["INDEXES", "TOTAL", "NONE"].contains(&rcc) {
-            return Some(format!(
-                "Value '{}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
-                rcc
-            ));
-        }
+    if let Some(msg) =
+        crate::validation::return_consumed_capacity_rejection(return_consumed_capacity)
+    {
+        return Some(msg);
     }
     if let Some(ricm) = return_item_collection_metrics {
         if !["SIZE", "NONE"].contains(&ricm) {
@@ -646,14 +642,26 @@ async fn execute_inner<S: StorageBackend>(
         };
 
         // Maintain GSI tables (inside the transaction)
-        let gsi_units =
-            super::gsi::maintain_gsis_after_write(storage, &meta, &target, prior_image, &item)
-                .await?;
+        let gsi_units = super::gsi::maintain_gsis_after_write(
+            storage,
+            &meta,
+            &target,
+            prior_image,
+            &item,
+            request.return_consumed_capacity.as_deref(),
+        )
+        .await?;
 
         // Maintain LSI tables (inside the transaction)
-        let lsi_units =
-            super::lsi::maintain_lsis_after_write(storage, &meta, &target, prior_image, &item)
-                .await?;
+        let lsi_units = super::lsi::maintain_lsis_after_write(
+            storage,
+            &meta,
+            &target,
+            prior_image,
+            &item,
+            request.return_consumed_capacity.as_deref(),
+        )
+        .await?;
 
         // Record stream event (inside the transaction)
         crate::streams::record_stream_event(storage, &meta, prior_image, Some(&item)).await?;

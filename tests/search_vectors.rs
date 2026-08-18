@@ -481,6 +481,22 @@ fn top_k_zero_rejects_at_the_request_model_layer_enveloped() {
     );
 }
 
+#[test]
+fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
+    // SearchVectors asks the shared enum helper rather than carrying its own
+    // copy, so the wording here is the same one Query, Scan and PutItem give.
+    let err = request_model_error(serde_json::from_value(json!({
+        "TableName": "T", "IndexName": "vix",
+        "SearchVector": [{"N": "1"}], "TopK": 1,
+        "ReturnConsumedCapacity": "INDEX"
+    })));
+    assert_eq!(
+        err,
+        "1 validation error detected: Value 'INDEX' at 'returnConsumedCapacity' failed to \
+         satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn top_k_101_rejects_bare_with_the_value_interpolated() {
     let storage = Storage::memory().unwrap();

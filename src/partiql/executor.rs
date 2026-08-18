@@ -1359,13 +1359,7 @@ async fn execute_insert<S: StorageBackend>(
 
     // Vector index maintenance
     crate::actions::vector_index::maintain_vector_indexes_after_write(
-        storage,
-        table_name,
-        meta,
-        &pk,
-        &sk,
-        &item,
-        key_schema,
+        storage, table_name, meta, &pk, &sk, &item, key_schema,
     )
     .await?;
 
@@ -1534,13 +1528,7 @@ async fn execute_update<S: StorageBackend>(
 
     // Vector index maintenance
     crate::actions::vector_index::maintain_vector_indexes_after_write(
-        storage,
-        table_name,
-        meta,
-        &pk_str,
-        &sk_str,
-        &item,
-        key_schema,
+        storage, table_name, meta, &pk_str, &sk_str, &item, key_schema,
     )
     .await?;
 

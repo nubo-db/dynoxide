@@ -161,13 +161,11 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
             Some(_) => {}
         }
 
-        if let Some(ref rcc) = raw.return_consumed_capacity {
-            if !["INDEXES", "TOTAL", "NONE"].contains(&rcc.as_str()) {
-                errors.push(format!(
-                    "Value '{rcc}' at 'returnConsumedCapacity' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
-                ));
-            }
+        // ReturnConsumedCapacity enum validation
+        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+            raw.return_consumed_capacity.as_deref(),
+        ) {
+            errors.push(msg);
         }
 
         if let Some(msg) = format_validation_errors(&errors) {

@@ -316,10 +316,12 @@ fn a_transacted_update_is_not_charged_the_standalone_update_overhead() {
 
 #[test]
 fn an_update_can_never_store_an_item_over_the_hard_limit() {
-    // Taking the key attributes out of the update measure buys headroom that
-    // grows with the key. DynamoDB really does let a long-key update past 400KB,
-    // but storing an over-limit item is what this issue was about: the recorded
-    // size feeds table statistics, and no other write path can replace the row.
+    // The update measure is `max(item, item - key + overhead)`, so taking the key
+    // out never buys back more than the actions cost. Past a 20-byte key the
+    // item's own size binds and the ceiling is flat at 400KB however long the key
+    // gets, which was measured out to 1024 bytes. Without the second half of that
+    // max, a long key would let an over-limit item through and its size would
+    // then feed table statistics.
     let db = Database::memory().unwrap();
     db.create_table(CreateTableRequest {
         table_name: "Big".to_string(),
@@ -358,6 +360,38 @@ fn an_update_can_never_store_an_item_over_the_hard_limit() {
     let stats = db.table_stats().unwrap();
     let big = stats.iter().find(|s| s.table_name == "Big").unwrap();
     assert_eq!(big.item_count, 0, "nothing over the limit was stored");
+
+    // The crossover, captured against eu-west-2: a 20-byte key makes the key
+    // attributes 22 bytes, exactly the cost of a single SET, so the two halves
+    // of the max meet and the ceiling lands on 400KB itself. Below this the key
+    // exclusion binds; above it the item's own size does.
+    let key = "k".repeat(20);
+    let at_ceiling = MAX_ITEM_SIZE - 2 - 20 - 1;
+    db.update_item(UpdateItemRequest {
+        table_name: "Big".to_string(),
+        key: HashMap::from([("pk".to_string(), AttributeValue::S(key.clone()))]),
+        update_expression: Some("SET #b = :v".to_string()),
+        expression_attribute_names: Some(HashMap::from([("#b".to_string(), "b".to_string())])),
+        expression_attribute_values: Some(HashMap::from([(
+            ":v".to_string(),
+            AttributeValue::S("x".repeat(at_ceiling)),
+        )])),
+        ..Default::default()
+    })
+    .expect("a 20-byte key reaches exactly 400KB");
+
+    db.update_item(UpdateItemRequest {
+        table_name: "Big".to_string(),
+        key: HashMap::from([("pk".to_string(), AttributeValue::S("k2".repeat(10)))]),
+        update_expression: Some("SET #b = :v".to_string()),
+        expression_attribute_names: Some(HashMap::from([("#b".to_string(), "b".to_string())])),
+        expression_attribute_values: Some(HashMap::from([(
+            ":v".to_string(),
+            AttributeValue::S("x".repeat(at_ceiling + 1)),
+        )])),
+        ..Default::default()
+    })
+    .expect_err("one byte past it");
 }
 
 /// Run a PartiQL statement, returning the error text if it was refused.

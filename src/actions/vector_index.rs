@@ -353,6 +353,12 @@ pub(crate) fn derive_vector_row(
     let vector_json = serde_json::to_string(&values)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
 
+    // Measured here, where the projected entry is already in hand, and stored
+    // with the row. A search then sums a column instead of rebuilding every
+    // entry it scanned, and the figure is the captured write measure rather
+    // than a stand-in for it.
+    let entry_bytes = vector_entry_bytes(&projected, vix) as i64;
+
     Ok(Some(DerivedVectorRow {
         row: VectorItemRow {
             table_pk: table_pk.to_string(),
@@ -361,6 +367,7 @@ pub(crate) fn derive_vector_row(
             vector_json,
             filter_json,
             item_json,
+            entry_bytes,
         },
         projected,
     }))
@@ -481,6 +488,9 @@ fn vector_rows_agree(a: &DerivedVectorRow, b: &DerivedVectorRow) -> bool {
         vector_json,
         filter_json,
         item_json: _,
+        // Derived from the projected entry, which `unchanged` compares below,
+        // so it carries no information the comparison does not already have.
+        entry_bytes: _,
     } = &a.row;
     hash_value == &b.row.hash_value
         && vector_json == &b.row.vector_json

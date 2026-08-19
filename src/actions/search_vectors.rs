@@ -207,21 +207,22 @@ pub struct SearchVectorsResponse {
 /// 13903, 14214, 14214 and 14518. There is no figure to match, so this reports
 /// the same quantity deterministically instead.
 ///
-/// The measure is the serialised length of the entries scanned. That is a
-/// monotonic proxy and not DynamoDB's item sizing: JSON punctuation and the
-/// type wrappers make it read high, and the vector counts as the decimal text
-/// it stores as rather than at its f32 width. Both are acceptable here because
-/// the axis has no ground truth to be wrong against, and neither is acceptable
-/// as evidence in a conformance claim: cite the write axis, which is captured
-/// byte-exact, and never this one. Sizing on the true item measure would mean
-/// parsing every scanned entry to throw it away, which cost a 4000-entry search
-/// twenty-three times its own runtime.
+/// The measure is DynamoDB's own item measure over each entry, the same one the
+/// write axis is captured against, summed over the entries the search scanned.
+/// Each entry's size is computed once at write and stored with the row, so this
+/// reads a column rather than rebuilding what it scanned; an earlier cut sized
+/// on the serialised length instead, to avoid parsing every entry, and this
+/// needs neither compromise.
+///
+/// The quantity still diverges from AWS by construction, because AWS does not
+/// reproduce its own, so it is not evidence in a conformance claim. What has
+/// changed is that the unit is now the captured one rather than a stand-in.
 ///
 /// A documented divergence in the same class as the equal-score tie break:
 /// deterministic where AWS is not.
 fn search_scanned_bytes(candidates: &[VectorCandidateRow]) -> f64 {
-    let scanned: usize = candidates.iter().map(|row| row.item_json.len()).sum();
-    crate::types::vector_request_bytes(scanned)
+    let scanned: i64 = candidates.iter().map(|row| row.entry_bytes).sum();
+    crate::types::vector_request_bytes(scanned.max(0) as usize)
 }
 
 /// One search hit: the projected item and its score as a JSON double.
@@ -716,9 +717,30 @@ pub async fn execute<S: StorageBackend>(
         &request.expression_attribute_values,
     );
     let no_keys: &[String] = &[];
+
+    // The projected entries are loaded here, for the survivors alone. The
+    // candidate scan leaves them behind, so a search over a large index no
+    // longer materialises every entry to score it and drop it.
+    let survivor_keys: Vec<(String, String)> = scored
+        .iter()
+        .map(|(_, row)| (row.table_pk.clone(), row.table_sk.clone()))
+        .collect();
+    let items: HashMap<(String, String), String> = storage
+        .vector_items_for_keys(&request.table_name, &request.index_name, &survivor_keys)
+        .await?
+        .into_iter()
+        .map(|(pk, sk, item_json)| ((pk, sk), item_json))
+        .collect();
+
     let mut search_results = Vec::with_capacity(scored.len());
     for (score, row) in scored {
-        let item: Item = serde_json::from_str(&row.item_json).map_err(|e| {
+        let key = (row.table_pk.clone(), row.table_sk.clone());
+        let item_json = items.get(&key).ok_or_else(|| {
+            DynoxideError::InternalServerError(
+                "Vector index row vanished between scoring and read".to_string(),
+            )
+        })?;
+        let item: Item = serde_json::from_str(item_json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
         })?;
         let result_item = if let Some(ref proj) = projection {

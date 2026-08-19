@@ -226,6 +226,15 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn vector_items_for_keys(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError> {
+        unimplemented!()
+    }
+
     async fn insert_gsi_item(
         &self,
         _table_name: &str,

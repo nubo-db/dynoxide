@@ -135,9 +135,12 @@ the real thing.
 divergence by construction. Real DynamoDB bills a search on the data it read and
 does not reproduce its own number between identical calls; five identical
 searches over one unchanged index reported 14214, 13903, 14214, 14214 and 14518.
-Dynoxide reports a deterministic stand-in sized on the entries the search
-scanned. Treat it as a monotonic proxy for how much work a search did, not as a
-figure to compare against AWS. The write axis is the captured one: a write's
+Dynoxide reports a deterministic figure sized on the entries the search scanned,
+using the same measure a write is captured against. The unit is therefore the
+captured one, but the quantity is still Dynoxide's own and not a figure to
+compare against AWS. Each entry's size is computed once when it is written and
+stored with it, so asking a search for capacity costs nothing extra. The write
+axis is the captured one: a write's
 `VectorWriteRequestBytes` is `4 * dimensions` plus the vector attribute's name
 plus the item size of the rest of the projected entry, held to a 1KB floor, and
 matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.

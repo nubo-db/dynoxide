@@ -644,6 +644,7 @@ pub fn create_vector_table(table_name: &str, index_name: &str) -> (String, Vec<S
                 vector_json TEXT NOT NULL,
                 filter_json TEXT NOT NULL DEFAULT '{{}}',
                 item_json TEXT NOT NULL,
+                entry_bytes INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (table_pk, table_sk)
             );
             CREATE INDEX IF NOT EXISTS \"{idx}\" ON \"{escaped}\" (hash_value);"
@@ -656,7 +657,7 @@ pub fn create_vector_table(table_name: &str, index_name: &str) -> (String, Vec<S
 pub fn vector_insert_sql(table_name: &str, index_name: &str) -> String {
     let vix = format!("{table_name}::vector::{index_name}");
     format!(
-        "INSERT OR REPLACE INTO \"{}\" (table_pk, table_sk, hash_value, vector_json, filter_json, item_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO \"{}\" (table_pk, table_sk, hash_value, vector_json, filter_json, item_json, entry_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         escape_table_name(&vix)
     )
 }
@@ -670,6 +671,7 @@ pub fn vector_insert_params<'a>(
     vector_json: &'a str,
     filter_json: &'a str,
     item_json: &'a str,
+    entry_bytes: i64,
 ) -> Vec<SqlParam<'a>> {
     vec![
         SqlParam::text(table_pk),
@@ -678,7 +680,38 @@ pub fn vector_insert_params<'a>(
         SqlParam::text(vector_json),
         SqlParam::text(filter_json),
         SqlParam::text(item_json),
+        SqlParam::Integer(entry_bytes),
     ]
+}
+
+/// Load the projected entries for a set of base-table keys, for the rows a
+/// search actually returns.
+///
+/// The candidate scan deliberately leaves `item_json` behind, because a search
+/// over a large index would otherwise materialise every projected entry only to
+/// score it and drop it. The keys here are the post-`TopK` survivors, so this
+/// reads at most `TopK` rows however many were scanned.
+pub fn vector_items_for_keys<'a>(
+    table_name: &str,
+    index_name: &str,
+    keys: &'a [(String, String)],
+) -> (String, Vec<SqlParam<'a>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    let escaped = escape_table_name(&vix);
+    let placeholders: Vec<String> = (0..keys.len())
+        .map(|i| format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2))
+        .collect();
+    let sql = format!(
+        "SELECT table_pk, table_sk, item_json FROM \"{escaped}\" \
+         WHERE (table_pk, table_sk) IN ({})",
+        placeholders.join(", ")
+    );
+    let mut params = Vec::with_capacity(keys.len() * 2);
+    for (pk, sk) in keys {
+        params.push(SqlParam::text(pk));
+        params.push(SqlParam::text(sk));
+    }
+    (sql, params)
 }
 
 /// Delete a vector shadow-table row by base-table primary key, mirroring
@@ -715,14 +748,14 @@ pub fn query_vector_candidates<'a>(
     match hash_value {
         Some(hv) => (
             format!(
-                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
                  \"{escaped}\" WHERE hash_value = ?1 ORDER BY table_pk ASC, table_sk ASC"
             ),
             vec![SqlParam::text(hv)],
         ),
         None => (
             format!(
-                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
                  \"{escaped}\" ORDER BY table_pk ASC, table_sk ASC"
             ),
             Vec::new(),
@@ -1532,6 +1565,7 @@ mod tests {
                 vector_json TEXT NOT NULL,
                 filter_json TEXT NOT NULL DEFAULT '{}',
                 item_json TEXT NOT NULL,
+                entry_bytes INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (table_pk, table_sk)
             );
             CREATE INDEX IF NOT EXISTS \"Docs::vector::vix::hash_value\" ON \"Docs::vector::vix\" (hash_value);"
@@ -1571,7 +1605,7 @@ mod tests {
         assert_eq!(
             vector_insert_sql("Docs", "vix"),
             "INSERT OR REPLACE INTO \"Docs::vector::vix\" (table_pk, table_sk, hash_value, \
-             vector_json, filter_json, item_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+             vector_json, filter_json, item_json, entry_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         );
         assert_eq!(
             vector_insert_params(
@@ -1580,7 +1614,8 @@ mod tests {
                 "S:t1",
                 "[1.0,0.0,0.0]",
                 "{}",
-                "{\"pk\":{\"S\":\"p\"}}"
+                "{\"pk\":{\"S\":\"p\"}}",
+                1024,
             ),
             vec![
                 SqlParam::text("p"),
@@ -1589,6 +1624,7 @@ mod tests {
                 SqlParam::text("[1.0,0.0,0.0]"),
                 SqlParam::text("{}"),
                 SqlParam::text("{\"pk\":{\"S\":\"p\"}}"),
+                SqlParam::Integer(1024),
             ]
         );
     }
@@ -1598,7 +1634,7 @@ mod tests {
         assert_eq!(
             query_vector_candidates("Docs", "vix", None),
             (
-                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
                  \"Docs::vector::vix\" ORDER BY table_pk ASC, table_sk ASC"
                     .to_string(),
                 Vec::new(),
@@ -1607,7 +1643,7 @@ mod tests {
         assert_eq!(
             query_vector_candidates("Docs", "vix", Some("S:t1")),
             (
-                "SELECT table_pk, table_sk, vector_json, filter_json, item_json FROM \
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
                  \"Docs::vector::vix\" WHERE hash_value = ?1 ORDER BY table_pk ASC, \
                  table_sk ASC"
                     .to_string(),

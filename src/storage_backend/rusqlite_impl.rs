@@ -234,6 +234,15 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError> {
+        Storage::vector_items_for_keys(self, table_name, index_name, keys).map_err(dyno_to_backend)
+    }
+
     async fn insert_gsi_item(
         &self,
         table_name: &str,

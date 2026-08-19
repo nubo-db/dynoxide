@@ -112,6 +112,10 @@ pub struct VectorItemRow {
     pub filter_json: String,
     /// Projected item JSON.
     pub item_json: String,
+    /// The entry's billable size in bytes, by the captured write formula.
+    /// Stored so a search sums a column instead of rebuilding every entry it
+    /// scanned.
+    pub entry_bytes: i64,
 }
 
 /// One candidate row loaded from a vector shadow table for scoring by
@@ -129,8 +133,12 @@ pub struct VectorCandidateRow {
     pub vector_json: String,
     /// INLINE_FILTER attribute values as a wire-shaped JSON object.
     pub filter_json: String,
-    /// Projected item JSON.
-    pub item_json: String,
+    /// The entry's billable size, read back rather than recomputed. The
+    /// projected item is deliberately absent: a search scores from the vector
+    /// and the filter, and only the rows it returns need the item, so carrying
+    /// it here made a scan of a large index materialise every entry to throw
+    /// almost all of them away.
+    pub entry_bytes: i64,
 }
 
 /// One index-table write operation, backend-neutral.
@@ -404,6 +412,21 @@ pub trait StorageBackend {
         index_name: &str,
         hash_value: Option<&str>,
     ) -> Result<Vec<VectorCandidateRow>, BackendError>;
+
+    /// Load the projected entries for the base-table keys a search returns.
+    ///
+    /// Paired with [`query_vector_candidates`](Self::query_vector_candidates),
+    /// which leaves the projected item behind so a scan of a large index does
+    /// not materialise every entry only to score it and drop it. `keys` are the
+    /// post-`TopK` survivors, so this reads at most `TopK` rows. Returns
+    /// `(table_pk, table_sk, item_json)` per row found; a key with no row is
+    /// omitted rather than erroring.
+    async fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError>;
 
     // -----------------------------------------------------------------------
     // GSI item operations

@@ -1076,6 +1076,7 @@ impl Storage {
                 &row.vector_json,
                 &row.filter_json,
                 &row.item_json,
+                row.entry_bytes,
             );
             stmt.execute(rusqlite::params_from_iter(params.iter()))?;
         }
@@ -1118,8 +1119,28 @@ impl Storage {
                     table_sk: row.get(1)?,
                     vector_json: row.get(2)?,
                     filter_json: row.get(3)?,
-                    item_json: row.get(4)?,
+                    entry_bytes: row.get(4)?,
                 })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Load the projected entries for the keys a search returns.
+    pub fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, params) = sql_builders::vector_items_for_keys(table_name, index_name, keys);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)

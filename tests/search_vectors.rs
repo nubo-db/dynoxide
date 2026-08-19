@@ -1745,10 +1745,11 @@ async fn search_capacity_sizes_on_the_entries_scanned_not_the_results_returned()
     // The search axis has no oracle. Real DynamoDB does not reproduce its own
     // figure: five identical searches over one unchanged index reported 14214,
     // 13903, 14214, 14214 and 14518 in eu-west-2 on 2026-08-18. So this pins
-    // Dynoxide's deterministic stand-in, not an AWS number, and it must sit
-    // above the 1024 floor or it cannot tell one model from another. Every
-    // other search capacity assertion in this file sits on the floor and would
-    // pass against any model at all.
+    // Dynoxide's deterministic answer, not an AWS number, and it must sit above
+    // the 1024 floor or it cannot tell one model from another. Every other
+    // search capacity assertion in this file sits on the floor and would pass
+    // against any model at all. The unit is the captured write measure, summed
+    // over the entries scanned and read from the column each write stores.
     let storage = Storage::memory().unwrap();
     create_above_floor_fixture(&storage, "VecAbove", 3).await;
 
@@ -1778,7 +1779,10 @@ async fn search_capacity_sizes_on_the_entries_scanned_not_the_results_returned()
         seen.push(bytes);
     }
     assert_eq!(seen[0], seen[1], "TopK must not move the scanned figure");
-    assert_eq!(seen[0], 1773.0);
+    // 3 entries at 531 bytes each, by the captured formula: 4 * 3 dimensions,
+    // plus 9 for the vector attribute's name, plus the item size of the
+    // rest of the entry (6 for pk, 504 for the blob).
+    assert_eq!(seen[0], 1593.0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1809,8 +1813,8 @@ async fn search_capacity_grows_with_the_number_of_entries_scanned() {
         );
     }
 
-    assert_eq!(figures[0], 1773.0, "three entries");
-    assert_eq!(figures[1], 3546.0, "six entries");
+    assert_eq!(figures[0], 1593.0, "three entries");
+    assert_eq!(figures[1], 3186.0, "six entries");
     assert_eq!(
         figures[1],
         figures[0] * 2.0,

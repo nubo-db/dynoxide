@@ -314,6 +314,7 @@ fn index_write_op_sql(op: &IndexWriteOp) -> (String, Vec<SqlParam<'_>>) {
                 &row.vector_json,
                 &row.filter_json,
                 &row.item_json,
+                row.entry_bytes,
             ),
         ),
     }
@@ -710,6 +711,7 @@ impl StorageBackend for WasmBridgeBackend {
                     &row.vector_json,
                     &row.filter_json,
                     &row.item_json,
+                    row.entry_bytes,
                 )
             })
             .collect();
@@ -744,8 +746,31 @@ impl StorageBackend for WasmBridgeBackend {
                 table_sk: col_text(&row, 1).unwrap_or_default(),
                 vector_json: col_text(&row, 2).unwrap_or_default(),
                 filter_json: col_text(&row, 3).unwrap_or_default(),
-                item_json: col_text(&row, 4).unwrap_or_default(),
+                entry_bytes: col_i64(&row, 4),
             });
+        }
+        Ok(out)
+    }
+
+    async fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, p) = sql_builders::vector_items_for_keys(table_name, index_name, keys);
+        let rows = self.query(&sql, p).await?;
+        let mut out = Vec::with_capacity(rows.length() as usize);
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            out.push((
+                col_text(&row, 0).unwrap_or_default(),
+                col_text(&row, 1).unwrap_or_default(),
+                col_text(&row, 2).unwrap_or_default(),
+            ));
         }
         Ok(out)
     }

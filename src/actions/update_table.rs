@@ -208,7 +208,7 @@ pub struct VectorIndexUpdate {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DeleteVectorIndexAction {
-    #[serde(rename = "IndexName", alias = "index_name")]
+    #[serde(rename = "IndexName")]
     pub index_name: String,
 }
 
@@ -271,23 +271,20 @@ pub(crate) fn parse_vector_index_updates(
             .as_object()
             .ok_or_else(|| "Unexpected value type in payload".to_string())?;
         let mut update = VectorIndexUpdate::default();
-        // Both spellings, because the MCP surface names its fields in
-        // snake_case and `VectorIndex` already accepts them throughout. Without
-        // this the documented `{delete: {index_name}}` shape parsed into an
-        // empty update and answered that neither action was present.
-        let action = |name: &str, lower: &str| {
-            obj.get(name)
-                .filter(|v| !v.is_null())
-                .or_else(|| obj.get(lower).filter(|v| !v.is_null()))
-        };
-        if let Some(create) = action("Create", "create") {
+        // Wire member names are case sensitive, and every guard around this
+        // parser keys on the wire spelling: the request-model collector and the
+        // pre-deserialisation type checks both read `Create` and `Delete`. A
+        // second spelling accepted here would reach neither, so a lowercase
+        // action would apply with nothing validating it. A caller that speaks
+        // another casing canonicalises before calling in.
+        if let Some(create) = obj.get("Create").filter(|v| !v.is_null()) {
             let mut create = create.clone();
             if let Some(create_obj) = create.as_object_mut() {
                 crate::actions::create_table::normalise_vix_dimensions_obj(create_obj);
             }
             update.create = Some(serde_json::from_value(create).map_err(|e| e.to_string())?);
         }
-        if let Some(delete) = action("Delete", "delete") {
+        if let Some(delete) = obj.get("Delete").filter(|v| !v.is_null()) {
             update.delete =
                 Some(serde_json::from_value(delete.clone()).map_err(|e| e.to_string())?);
         }

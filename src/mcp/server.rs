@@ -690,6 +690,52 @@ fn parse_optional_dynamo_map(
 
 /// Return a tool-level validation error (keeps the agent conversation flowing,
 /// unlike McpError which may abort it).
+/// Rewrite a `vector_index_updates` value into the wire spelling.
+///
+/// This surface documents snake_case, as the rest of its tools do, while the
+/// shared parser and its guards are case sensitive like DynamoDB. Translating
+/// here rather than loosening the parser keeps a wire client held to the wire
+/// names and still lets an agent write the shape the tool describes. An entry
+/// naming neither action is passed through untouched, so the parser reports it
+/// rather than this dropping it quietly.
+fn canonicalise_vector_index_updates(val: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = val.as_array() else {
+        return val.clone();
+    };
+    serde_json::Value::Array(
+        arr.iter()
+            .map(|entry| {
+                let Some(obj) = entry.as_object() else {
+                    return entry.clone();
+                };
+                let mut out = serde_json::Map::new();
+                if let Some(c) = obj.get("Create").or_else(|| obj.get("create")) {
+                    // A create action is a vector index definition, and that
+                    // type carries snake_case aliases throughout, so a round
+                    // trip through it is the translation.
+                    let canonical = serde_json::from_value::<crate::types::VectorIndex>(c.clone())
+                        .ok()
+                        .and_then(|v| serde_json::to_value(v).ok())
+                        .unwrap_or_else(|| c.clone());
+                    out.insert("Create".to_string(), canonical);
+                }
+                if let Some(d) = obj.get("Delete").or_else(|| obj.get("delete")) {
+                    let name = d
+                        .get("IndexName")
+                        .or_else(|| d.get("index_name"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    out.insert("Delete".to_string(), serde_json::json!({"IndexName": name}));
+                }
+                if out.is_empty() {
+                    return entry.clone();
+                }
+                serde_json::Value::Object(out)
+            })
+            .collect(),
+    )
+}
+
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
     CallToolResult::error(vec![Content::text(
         serde_json::json!({
@@ -1662,10 +1708,16 @@ impl McpServer {
                 ));
             }
         };
-        // Parsed by the wire path's own parser, so an agent and a wire client
-        // are held to the same rules, dimension normalisation included.
-        let vector_index_updates = match params
+        // Rewritten into the wire spelling before anything reads it. The shared
+        // parser and every guard around it are case sensitive, as DynamoDB is,
+        // so a second spelling accepted down there would reach the parser and
+        // miss the validation. Canonicalising here keeps the wire strict and
+        // still lets an agent write the snake_case this surface documents.
+        let canonical_updates = params
             .vector_index_updates
+            .as_ref()
+            .map(canonicalise_vector_index_updates);
+        let vector_index_updates = match canonical_updates
             .as_ref()
             .map(crate::actions::update_table::parse_vector_index_updates)
             .transpose()
@@ -1680,30 +1732,9 @@ impl McpServer {
         };
         // And held to the same request-model constraints, which the raw
         // request's Deserialize applies and this path would otherwise skip.
-        if let Some(ref updates) = vector_index_updates {
-            let canonical = serde_json::Value::Array(
-                updates
-                    .iter()
-                    .map(|u| {
-                        let mut obj = serde_json::Map::new();
-                        if let Some(ref c) = u.create {
-                            obj.insert(
-                                "Create".to_string(),
-                                serde_json::to_value(c).unwrap_or(serde_json::Value::Null),
-                            );
-                        }
-                        if let Some(ref d) = u.delete {
-                            obj.insert(
-                                "Delete".to_string(),
-                                serde_json::json!({"IndexName": d.index_name}),
-                            );
-                        }
-                        serde_json::Value::Object(obj)
-                    })
-                    .collect(),
-            );
+        if let Some(ref canonical) = canonical_updates {
             if let Some(msg) =
-                crate::actions::update_table::vector_index_updates_request_model_error(&canonical)
+                crate::actions::update_table::vector_index_updates_request_model_error(canonical)
             {
                 return Ok(tool_validation_error("ValidationException", &msg));
             }
@@ -2394,7 +2425,8 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
                                 .map(|e| {
                                     serde_json::json!({
                                         "attribute_name": e.attribute_name,
-                                        "element_type": e.search_schema_element_type,
+                                        "search_schema_element_type":
+                                            e.search_schema_element_type,
                                     })
                                 })
                                 .collect()
@@ -2411,7 +2443,7 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
                         },
                         "dimensions": vix.dimensions,
                         "distance_function": vix.distance_function,
-                        "projection_type": vix.projection.projection_type,
+                        "projection": {"projection_type": vix.projection.projection_type},
                         "search_schema": schema,
                         "item_count": vix.item_count.unwrap_or(0),
                     })

@@ -2833,6 +2833,53 @@ async fn empty_vector_attribute_name_rejected_at_the_request_model_layer() {
     );
 }
 
+/// Member names are case sensitive on the wire, and every guard around the
+/// update parser reads the wire spelling. A second spelling accepted in the
+/// parser would reach it and miss the request-model collector and the
+/// pre-deserialisation type checks, so a lowercase action would apply with
+/// nothing validating it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lowercase_action_key_does_not_bypass_the_wire_guards() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "WireCase").await;
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "WireCase",
+        "VectorIndexUpdates": [{"create": {
+            "IndexName": "sneak",
+            "VectorAttribute": {"AttributeName": ""},
+            "Projection": {"ProjectionType": "ALL"},
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE"
+        }}]
+    }))
+    .expect("the lowercase key deserialises, carrying no recognised action");
+
+    let err = dynoxide::actions::update_table::execute(&storage, req)
+        .await
+        .expect_err("an unrecognised action is refused, not applied unvalidated");
+    assert!(
+        err.to_string().contains("must not be null"),
+        "expected the no-action rejection, got {err}"
+    );
+
+    // And nothing was created behind it.
+    let desc = dynoxide::actions::describe_table::execute(
+        &storage,
+        serde_json::from_value(json!({"TableName": "WireCase"})).unwrap(),
+    )
+    .await
+    .unwrap();
+    let names: Vec<String> = desc
+        .table
+        .vector_indexes
+        .unwrap_or_default()
+        .iter()
+        .map(|v| v.index_name.clone())
+        .collect();
+    assert!(!names.contains(&"sneak".to_string()), "got {names:?}");
+}
+
 /// Query and Scan refuse a vector index by type, as PartiQL does, rather than
 /// reporting an index DescribeTable lists as missing. Captured against
 /// eu-west-2 on 2026-08-19. The two messages are not symmetric: Query's ends

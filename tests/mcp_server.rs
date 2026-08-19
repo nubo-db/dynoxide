@@ -1343,11 +1343,17 @@ fn an_index_read_back_can_be_fed_straight_to_create_table() {
     let create = json!({
         "table_name": "McpClone",
         "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
-        "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+        "attribute_definitions": [
+            {"attribute_name": "pk", "attribute_type": "S"},
+            {"attribute_name": "tenant", "attribute_type": "S"}
+        ],
         "billing_mode": "PAY_PER_REQUEST",
         "vector_indexes": [{
             "index_name": "vix",
             "vector_attribute": {"attribute_name": "emb"},
+            "search_schema": [
+                {"attribute_name": "tenant", "search_schema_element_type": "HASH"}
+            ],
             "projection": {"projection_type": "ALL"},
             "dimensions": 3,
             "distance_function": "COSINE"
@@ -1364,19 +1370,9 @@ fn an_index_read_back_can_be_fed_straight_to_create_table() {
     let described = tool_content(&resp);
     let vixs = described["vector_indexes"].as_array().unwrap().clone();
 
-    // Feed what came back straight into a second create.
-    let cloned: Vec<serde_json::Value> = vixs
-        .iter()
-        .map(|v| {
-            json!({
-                "index_name": v["index_name"],
-                "vector_attribute": v["vector_attribute"],
-                "projection": {"projection_type": v["projection_type"]},
-                "dimensions": v["dimensions"],
-                "distance_function": v["distance_function"]
-            })
-        })
-        .collect();
+    // Fed back verbatim. Rebuilding it by hand here is what let the projection
+    // and search schema shapes drift without the test noticing.
+    let cloned = vixs.clone();
     let resp = call_tool(
         &mut child,
         3,
@@ -1384,7 +1380,10 @@ fn an_index_read_back_can_be_fed_straight_to_create_table() {
         json!({
             "table_name": "McpCloneCopy",
             "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
-            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "tenant", "attribute_type": "S"}
+            ],
             "billing_mode": "PAY_PER_REQUEST",
             "vector_indexes": cloned
         }),

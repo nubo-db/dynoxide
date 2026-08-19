@@ -109,13 +109,27 @@ the ones worth knowing.
 | **`SearchVectors` (COSINE, EUCLIDEAN, DOT_PRODUCT)** | Supported |
 | **Per-vector-index ConsumedCapacity (INDEXES mode)** | Supported |
 
-A vector index goes `ACTIVE` immediately, where AWS reports it `CREATING` and
-backfills in the background before it becomes searchable. The backfilled data
-matches; only the lifecycle is compressed. The same is true of adding a GSI, and
-it has the same consequence: the `Backfilling` flag and the errors that only
-arise while an index is still filling are unreachable here, so code that waits
-for them will wait forever against Dynoxide and should poll for `ACTIVE`
-instead.
+A vector index goes `ACTIVE` immediately and is searchable the moment it says
+so. Real DynamoDB is slower and, more importantly, shaped differently, so read
+this one carefully before you write a readiness check against it.
+
+On AWS the index passes through `CREATING` with `Backfilling: true`, and when it
+reaches `ACTIVE` the `Backfilling` field is not set to `false`, it disappears.
+A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling` is `false`"
+therefore never comes true. Neither does waiting for the field at all against
+Dynoxide, where it is never set.
+
+The sharper trap is that `ACTIVE` arrives early on AWS. The index reports
+`ACTIVE` before it will answer a search, by minutes: an index added to a
+25-item table took roughly a quarter of an hour after `ACTIVE` before it stopped
+refusing searches. Dynoxide has no such gap, so a readiness check that polls for
+`ACTIVE` and searches immediately passes here every time and fails against the
+real thing. If you need one that works on both, search in a retry loop and treat
+the refusal as "not yet" rather than trusting the status.
+
+The errors that only arise while an index is still filling are unreachable here
+for the same reason. Adding a GSI is compressed the same way, with the same
+consequence.
 
 Vector search is exact brute-force KNN rather than an approximate index. At
 emulator and embedded scale that reaches a correct answer faster than building

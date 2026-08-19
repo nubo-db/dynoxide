@@ -40,7 +40,7 @@ pub fn parse_onetable(json: &str) -> Result<DataModel, String> {
     let format = doc
         .get("format")
         .and_then(|v| v.as_str())
-        .ok_or("data model file missing \"format\" field — is this a OneTable schema?")?;
+        .ok_or("data model file missing \"format\" field: is this a OneTable schema?")?;
 
     if format != "onetable:1.1.0" {
         return Err(format!(

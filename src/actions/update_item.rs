@@ -160,7 +160,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
     }
 }
 
-/// Legacy `AttributeUpdates` entry — one per attribute being modified.
+/// Legacy `AttributeUpdates` entry: one per attribute being modified.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AttributeValueUpdate {
     #[serde(rename = "Action", default = "default_put_action")]
@@ -463,7 +463,7 @@ async fn execute_inner<S: StorageBackend>(
         .as_ref()
         .map(|updates| updates.keys().cloned().collect());
 
-    // Execution tracker — tracking disabled because unused-reference validation was
+    // Execution tracker: tracking disabled because unused-reference validation was
     // already done statically by Tracker 1 (pre-validation block above). This tracker
     // only needs name/value resolution, not usage tracking.
     let tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
@@ -588,7 +588,7 @@ async fn execute_inner<S: StorageBackend>(
         }
 
         // Note: unused expression attribute validation already done in pre-validation
-        // block (Tracker 1). Not repeated here — runtime evaluation may skip branches
+        // block (Tracker 1). Not repeated here: runtime evaluation may skip branches
         // (e.g., if_not_exists short-circuits) which would cause false positives.
 
         // Validate attribute values after update expression applied. This
@@ -928,7 +928,7 @@ fn extract_updated_attrs(
 /// Collapse an empty projection to `None` so `Attributes` is omitted entirely.
 ///
 /// AWS omits `Attributes` from a `UPDATED_NEW` / `UPDATED_OLD` response when
-/// nothing was projected — for example a REMOVE-only update under `UPDATED_NEW`,
+/// nothing was projected: for example a REMOVE-only update under `UPDATED_NEW`,
 /// where no attribute was set to a new value. Returning `Some({})` instead would
 /// serialise an empty `Attributes` map, which AWS never does.
 fn omit_if_empty(map: HashMap<String, AttributeValue>) -> Option<HashMap<String, AttributeValue>> {

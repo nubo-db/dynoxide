@@ -958,7 +958,7 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("delete_table") {
             return Ok(err);
         }
-        // Auto-snapshot before destructive operation — failure blocks the delete
+        // Auto-snapshot before destructive operation: failure blocks the delete
         let snap_info = match snapshots::auto_snapshot(&self.db, &params.table_name) {
             Ok(info) => info,
             Err(e) => {
@@ -1429,7 +1429,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "[WRITE] Create a snapshot of the current database state. Returns the snapshot name for later restoration via restore_snapshot. A global limit of 20 snapshots is enforced — when full, auto-snapshots are evicted first, then the oldest manual snapshots. Note: holds the database lock for the duration of the copy — large databases may briefly block other operations."
+        description = "[WRITE] Create a snapshot of the current database state. Returns the snapshot name for later restoration via restore_snapshot. A global limit of 20 snapshots is enforced, and when it is reached auto-snapshots are evicted first, then the oldest manual ones. This holds the database lock for the duration of the copy, so a large database may briefly block other operations."
     )]
     fn create_snapshot(
         &self,
@@ -1982,7 +1982,7 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let base_instructions = "\
             Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. \
-            All data is local — no AWS credentials required.\n\n\
+            All data is local: no AWS credentials required.\n\n\
             ## Getting started\n\
             1. Call `get_database_info` first to see tables, key schemas, and server config.\n\
             2. Use `describe_table` for detailed schema of a specific table.\n\n\

@@ -1,10 +1,10 @@
 //! DynamoDB expression parsing and evaluation.
 //!
 //! Supports all five expression types:
-//! - `ConditionExpression` / `FilterExpression` — conditional checks
-//! - `KeyConditionExpression` — Query partition + sort key conditions
-//! - `ProjectionExpression` — attribute subset selection
-//! - `UpdateExpression` — item mutation (SET, REMOVE, ADD, DELETE)
+//! - `ConditionExpression` / `FilterExpression`: conditional checks
+//! - `KeyConditionExpression`: Query partition + sort key conditions
+//! - `ProjectionExpression`: attribute subset selection
+//! - `UpdateExpression`: item mutation (SET, REMOVE, ADD, DELETE)
 
 pub mod condition;
 pub mod key_condition;

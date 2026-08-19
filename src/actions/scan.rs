@@ -602,7 +602,7 @@ pub async fn execute<S: StorageBackend>(
             .map_err(DynoxideError::ValidationException)?;
     }
 
-    // Untracked variant for the per-item hot loop — tracking already done above
+    // Untracked variant for the per-item hot loop: tracking already done above
     let loop_tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
         &request.expression_attribute_names,
         &request.expression_attribute_values,
@@ -645,7 +645,7 @@ pub async fn execute<S: StorageBackend>(
 
         scanned_count += 1;
 
-        // Check 1MB limit BEFORE filtering — DynamoDB counts all evaluated data
+        // Check 1MB limit BEFORE filtering - DynamoDB counts all evaluated data
         // towards the 1MB response size limit, not just items that pass the filter.
         let item_size = crate::types::item_size(&item);
         if cumulative_size + item_size > MAX_RESPONSE_SIZE && scanned_count > 1 {

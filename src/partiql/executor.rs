@@ -1898,7 +1898,7 @@ fn resolve_set_value(
                     Ok(AttributeValue::N(format_bigdecimal(&result)))
                 }
                 (None, AttributeValue::N(_)) => {
-                    // Attribute doesn't exist yet — use the operand value
+                    // Attribute doesn't exist yet: use the operand value
                     Ok(operand)
                 }
                 _ => Err(DynoxideError::ValidationException(
@@ -1923,7 +1923,7 @@ fn resolve_set_value(
                     Ok(AttributeValue::N(format_bigdecimal(&result)))
                 }
                 (None, AttributeValue::N(sub)) => {
-                    // Attribute doesn't exist yet — treat as 0 - operand
+                    // Attribute doesn't exist yet: treat as 0 - operand
                     use bigdecimal::BigDecimal;
                     use std::str::FromStr;
                     let b = BigDecimal::from_str(sub).map_err(|e| {

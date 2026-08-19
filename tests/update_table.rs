@@ -198,7 +198,7 @@ fn test_update_table_create_gsi_backfills_existing_items() {
         Some("org#B"),
         Some("user#3"),
     );
-    // This item lacks GSI keys — should NOT appear in GSI
+    // This item lacks GSI keys: should NOT appear in GSI
     put_item(&db, "TestTable", "user#4", "settings", None, None);
 
     // Now create the GSI
@@ -224,7 +224,7 @@ fn test_update_table_create_gsi_backfills_existing_items() {
     .unwrap();
     db.update_table(req).unwrap();
 
-    // Query the GSI — should find backfilled items
+    // Query the GSI: should find backfilled items
     let query_req = serde_json::from_value(json!({
         "TableName": "TestTable",
         "IndexName": "GSI1",
@@ -253,9 +253,9 @@ fn test_update_table_create_gsi_backfill_skips_item_without_sort_key() {
     let db = make_db();
     create_simple_table(&db, "TestTable");
 
-    // Has the GSI partition key but not the sort key — excluded.
+    // Has the GSI partition key but not the sort key: excluded.
     put_item(&db, "TestTable", "user#1", "profile", Some("org#A"), None);
-    // Has both GSI keys — included.
+    // Has both GSI keys: included.
     put_item(
         &db,
         "TestTable",
@@ -992,7 +992,7 @@ fn test_update_table_gsi_projection_types() {
     .unwrap();
     db.update_table(req).unwrap();
 
-    // Query GSI — should only return key attributes
+    // Query GSI: should only return key attributes
     let query_req = serde_json::from_value(json!({
         "TableName": "TestTable",
         "IndexName": "GSI1",

@@ -28,7 +28,7 @@ pub async fn execute<S: StorageBackend>(
     }
     let table_name = helpers::parse_table_name_from_arn(arn)?;
 
-    // Verify table exists — real DynamoDB returns AccessDeniedException for non-existent ARNs
+    // Verify table exists: real DynamoDB returns AccessDeniedException for non-existent ARNs
     if !storage.table_exists(table_name).await? {
         return Err(DynoxideError::AccessDeniedException(format!(
             "User: arn:aws:iam::000000000000:root is not authorized to perform: dynamodb:ListTagsOfResource on resource: {arn}"

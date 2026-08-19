@@ -6,7 +6,7 @@
 //! Example: if `userId = "USER#123"` is anonymised to `"USER#abc"` in the
 //! Users table, it should also become `"USER#abc"` in the Orders table.
 //!
-//! Hash actions are excluded from the map because SHA-256 is deterministic —
+//! Hash actions are excluded from the map because SHA-256 is deterministic -
 //! the same input always produces the same output, so consistency is inherent.
 
 use crate::types::AttributeValue;
@@ -60,7 +60,7 @@ impl ConsistencyMap {
         if field_map.len() >= self.max_entries_per_field {
             if self.capped_fields.insert(field_name.clone()) {
                 return Some(format!(
-                    "consistency map for field '{}' reached {} entries — \
+                    "consistency map for field '{}' reached {} entries - \
                      consistency is no longer guaranteed for new unseen values of this field",
                     field_name, self.max_entries_per_field
                 ));

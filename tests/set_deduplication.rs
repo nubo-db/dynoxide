@@ -131,7 +131,7 @@ fn test_add_to_ss_no_duplicates() {
     })
     .unwrap();
 
-    // ADD with overlapping values — should merge without creating duplicates
+    // ADD with overlapping values: should merge without creating duplicates
     let mut key = HashMap::new();
     key.insert("pk".to_string(), AttributeValue::S("k1".to_string()));
     let mut expr_values = HashMap::new();

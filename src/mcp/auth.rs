@@ -56,9 +56,9 @@ pub enum AuthError {
 }
 
 /// Classify a bind host against a strict, closed loopback set. Everything not
-/// in the set — including `0.0.0.0`, other `127.x.x.x`, IPv4-mapped IPv6, and
-/// resolved DNS names — is non-loopback. The literal string is matched; we do
-/// not resolve and re-classify.
+/// in the set is non-loopback, and that includes `0.0.0.0`, other
+/// `127.x.x.x`, IPv4-mapped IPv6, and resolved DNS names. The literal string
+/// is matched; we do not resolve and re-classify.
 pub fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
@@ -75,14 +75,14 @@ pub fn token_matches(expected: &str, presented: &str) -> bool {
     a.ct_eq(b).into()
 }
 
-/// Identical 401 body for both missing and wrong tokens — no oracle.
+/// Identical 401 body for both missing and wrong tokens: no oracle.
 const UNAUTHORIZED_BODY: &str = r#"{"error":"unauthorized"}"#;
 
 /// axum middleware enforcing the bearer token on every request.
 ///
 /// Runs *outside* rmcp's Host/Origin checks (it wraps the whole router), so an
 /// unauthenticated caller gets 401 regardless of Host. A caller holding a valid
-/// token who spoofs the Host still hits rmcp's 403 — auth does not replace that
+/// token who spoofs the Host still hits rmcp's 403: auth does not replace that
 /// defense-in-depth, it sits in front of it.
 pub async fn enforce(
     axum::extract::State(mode): axum::extract::State<AuthMode>,
@@ -199,7 +199,7 @@ pub fn resolve_auth(
 pub fn first_run_message(url: &str, token: &str, path: &Path) -> String {
     format!(
         "Generated an MCP auth token and saved it to {path}.\n\
-         Add it to your MCP client config — e.g. Claude Code .mcp.json:\n\
+         Add it to your MCP client config, for example Claude Code .mcp.json:\n\
          \n\
          \x20\x20\"dynoxide\": {{\n\
          \x20\x20\x20\x20\"type\": \"http\",\n\

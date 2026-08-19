@@ -1,7 +1,7 @@
 /// Trait for inserting values into an item map, with `Option<T>` support.
 ///
 /// When the value is `None`, the key is omitted from the map.
-/// This is not public API — it exists to support the `item!` macro.
+/// This is not public API: it exists to support the `item!` macro.
 #[doc(hidden)]
 pub trait ItemInsert {
     fn __item_insert(

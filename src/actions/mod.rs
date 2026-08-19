@@ -280,7 +280,7 @@ pub struct VectorIndexDescription {
 /// The primary scheme persists a random v4 UUID assigned at create time (see
 /// `Storage::insert_table_metadata` and the v8 migration's backfill), matching
 /// AWS: stable across reads, and a new id for a dropped-and-recreated table.
-/// This fallback only applies to a row whose stored `table_id` is `None` — for
+/// This fallback only applies to a row whose stored `table_id` is `None`: for
 /// example one written by an older binary into a newer database. It derives a
 /// stable UUID (v5) from the table name and creation timestamp so such a row
 /// still reports a consistent id across reads, rather than the per-call random

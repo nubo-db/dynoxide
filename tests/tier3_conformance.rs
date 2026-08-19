@@ -109,7 +109,7 @@ fn create_table_invalid_pattern_returns_constraint_format() {
 
 #[test]
 fn create_table_short_name_returns_constraint_format() {
-    // Table name "ab" is length 2 — should get constraint format, not old flat message
+    // Table name "ab" is length 2: should get constraint format, not old flat message
     let result = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
         "TableName": "ab",
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -333,7 +333,7 @@ fn query_allows_consistent_read_on_lsi() {
         ..Default::default()
     };
 
-    // Should succeed — ConsistentRead is allowed on LSIs
+    // Should succeed - ConsistentRead is allowed on LSIs
     let result = db.query(request);
     assert!(
         result.is_ok(),
@@ -354,7 +354,7 @@ fn query_rejects_undefined_expression_attribute_name_in_filter() {
             (":pk".to_string(), AttributeValue::S("test".to_string())),
             (":val".to_string(), AttributeValue::S("x".to_string())),
         ])),
-        // No ExpressionAttributeNames provided — #nonexistent is undefined
+        // No ExpressionAttributeNames provided - #nonexistent is undefined
         ..Default::default()
     };
 

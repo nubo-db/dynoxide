@@ -13,7 +13,7 @@
 //! the same the native HTTP server speaks:
 //!
 //! - Success: the action's response struct serialised to DynamoDB JSON
-//!   (`Count`, `ScannedCount`, and — when the request asks for it —
+//!   (`Count`, `ScannedCount`, and, when the request asks for it,
 //!   `ConsumedCapacity` are all present on Query/Scan).
 //! - API error: [`DynoxideError::to_json`], carrying `__type` and a message.
 //! - Unknown or preview-unsupported op: an `UnsupportedOperation` envelope with
@@ -334,7 +334,7 @@ async fn execute_transaction<S: StorageBackend>(
 // One persistent engine per Worker. the wasm engine is single-threaded, so a
 // thread-local holding the opened database is sufficient and avoids exporting a
 // generic type across the wasm boundary. `WasmDatabase` is `Clone` (only `Arc`s
-// move), so each call clones the handle out of the cell before awaiting — the
+// move), so each call clones the handle out of the cell before awaiting: the
 // `RefCell` borrow never spans an await point.
 // ---------------------------------------------------------------------------
 
@@ -456,7 +456,7 @@ mod engine {
     }
 
     /// The supported-operation list, as a JSON array of op names. The client's
-    /// positive feature-detection path — it hides anything not listed rather
+    /// positive feature-detection path: it hides anything not listed rather
     /// than probing for `UnsupportedOperation` errors.
     #[wasm_bindgen]
     pub fn capabilities() -> String {

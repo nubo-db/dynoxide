@@ -288,7 +288,7 @@ fn test_size_on_number_type_returns_no_match() {
         ],
     );
 
-    // Query with filter: size(num) > 0 — should NOT match since N doesn't support size()
+    // Query with filter: size(num) > 0 - should NOT match since N doesn't support size()
     let qr = QueryRequest {
         table_name: "TestTbl".to_string(),
         key_condition_expression: Some("pk = :pk".to_string()),
@@ -374,7 +374,7 @@ fn test_gsi_query_lek_includes_table_primary_key() {
     let db = Database::memory().unwrap();
     create_table_with_gsi(&db);
 
-    // Insert 3 items — query GSI with Limit=1 to trigger pagination
+    // Insert 3 items: query GSI with Limit=1 to trigger pagination
     for i in 0..3 {
         let req: serde_json::Value = serde_json::json!({
             "TableName": "Orders",

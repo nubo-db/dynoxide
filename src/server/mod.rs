@@ -169,7 +169,7 @@ async fn handle_root(
         }
         Method::POST => handle_request(uri, State(db), headers.clone(), body).await,
         _ => {
-            // OPTIONS without Origin, DELETE, PUT, PATCH, etc. — all return 404.
+            // OPTIONS without Origin, DELETE, PUT, PATCH, etc.: all return 404.
             dynamo_response_raw(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
         }
     };
@@ -185,7 +185,7 @@ async fn handle_root(
     resp
 }
 
-/// Fallback for all unmatched routes — returns 404.
+/// Fallback for all unmatched routes: returns 404.
 async fn handle_fallback() -> Response {
     dynamo_response_raw(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
 }
@@ -216,7 +216,7 @@ async fn handle_request(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // Check Content-Type header — DynamoDB accepts both application/json and
+    // Check Content-Type header - DynamoDB accepts both application/json and
     // application/x-amz-json-1.0, with optional parameters (e.g. ;charset=utf-8).
     // The response Content-Type echoes the base media type from the request.
     let raw_ct = headers
@@ -252,12 +252,12 @@ async fn handle_request(
     }
 
     // Check x-amz-target header
-    // NOTE: empty body check happens after target resolution — DynamoDB returns
+    // NOTE: empty body check happens after target resolution - DynamoDB returns
     // UnknownOperationException if no target, even with empty body.
     let target = match headers.get("x-amz-target").and_then(|v| v.to_str().ok()) {
         Some(t) => t,
         None => {
-            // No target header — UnknownOperationException (no message)
+            // No target header - UnknownOperationException (no message)
             return unknown_operation_response(response_ct);
         }
     };
@@ -274,7 +274,7 @@ async fn handle_request(
         }
     };
 
-    // Validate authentication headers — DynamoDB checks auth after target resolution.
+    // Validate authentication headers - DynamoDB checks auth after target resolution.
     if let Some(auth_error) = validate_auth(&headers, &uri, response_ct) {
         return auth_error;
     }

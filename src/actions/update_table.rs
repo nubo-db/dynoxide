@@ -1263,7 +1263,7 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
         }
     }
 
-    // "At least one of ..." — a request must change something. A lone
+    // "At least one of ...": a request must change something. A lone
     // TableClass, OnDemandThroughput, or DeletionProtectionEnabled counts, the
     // same as a throughput/billing/stream change. An empty
     // GlobalSecondaryIndexUpdates array is treated as "no GSI change" rather

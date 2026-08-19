@@ -101,7 +101,7 @@ fn num_to_buffer(num_str: &str) -> Vec<u8> {
     let exp_sum = exponent + append_zero;
     let exp_byte_val = floor_div(exp_sum, 2) - 64;
     if is_negative {
-        // byteArray[0] ^= 0xffffffff — JS bitwise XOR on a number
+        // byteArray[0] ^= 0xffffffff - JS bitwise XOR on a number
         // This effectively does a bitwise NOT on the low byte
         byte_array[0] = (exp_byte_val ^ !0i64) as u8;
     } else {
@@ -242,7 +242,7 @@ pub struct QueryParams<'a> {
 /// Low-level SQLite storage layer.
 ///
 /// Manages the SQLite connection, metadata tables, and per-DynamoDB-table
-/// data tables. All SQL lives here — higher layers work with Rust types.
+/// data tables. All SQL lives here: higher layers work with Rust types.
 ///
 /// Native-only: this type is the rusqlite-backed backend and is compiled out
 /// of backend-neutral builds (for example `wasm-sqlite`).
@@ -314,7 +314,7 @@ impl Storage {
         // Safety: key is validated to be exactly 64 hex characters [0-9a-fA-F]
         // by Database::new_encrypted(), so no injection is possible in the
         // x'...' hex literal format. Note: pragma_update does NOT use parameter
-        // binding for the PRAGMA value — hex validation is the sole injection defense.
+        // binding for the PRAGMA value: hex validation is the sole injection defense.
         let mut pragma_val = format!("x'{key}'");
         conn.pragma_update(None, "key", &pragma_val)?;
         pragma_val.zeroize();
@@ -1568,7 +1568,7 @@ impl Storage {
 
     /// Backup the current database to a new in-memory SQLite connection.
     ///
-    /// Used for in-memory snapshot storage — the returned connection holds
+    /// Used for in-memory snapshot storage: the returned connection holds
     /// a complete copy of the database without touching the filesystem.
     pub fn backup_to_memory(&self) -> Result<Connection> {
         let mut dest = Connection::open_in_memory()?;
@@ -1947,7 +1947,7 @@ mod tests {
     fn test_migrate_v6_to_v7_adds_on_demand_throughput_column() {
         // Issue #44: the on_demand_throughput column must be added to existing
         // on-disk databases through the versioned migration chain, not just the
-        // fresh CREATE — otherwise DescribeTable on a pre-existing table errors.
+        // fresh CREATE: otherwise DescribeTable on a pre-existing table errors.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
 

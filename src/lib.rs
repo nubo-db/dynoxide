@@ -1128,7 +1128,7 @@ impl Database<RusqliteBackend> {
     ///
     /// Uses SQLite's backup API to replace the current database contents
     /// with the snapshot. Works for both in-memory and file-backed databases.
-    /// The backup is atomic — either all pages are copied or none are.
+    /// The backup is atomic: either all pages are copied or none are.
     pub fn restore_from(&self, path: &str) -> Result<()> {
         self.with_storage_mut(|s| s.restore_from(path))
     }
@@ -1136,7 +1136,7 @@ impl Database<RusqliteBackend> {
     /// Backup the current database to a new in-memory SQLite connection.
     ///
     /// Returns an owned `Connection` holding a complete copy. Used for
-    /// in-memory snapshot storage — no filesystem side-effects.
+    /// in-memory snapshot storage: no filesystem side-effects.
     #[cfg(feature = "mcp-server")]
     pub(crate) fn backup_to_memory(&self) -> Result<rusqlite::Connection> {
         self.with_storage(|s| s.backup_to_memory())

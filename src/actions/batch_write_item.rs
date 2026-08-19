@@ -445,7 +445,7 @@ pub async fn execute<S: StorageBackend>(
         None
     };
 
-    // Compute item collection metrics once per unique (table, pk) — deferred from the write loop
+    // Item collection metrics are computed once per unique (table, pk), deferred from the write loop
     let mut all_item_collection_metrics: HashMap<String, Vec<crate::types::ItemCollectionMetrics>> =
         HashMap::new();
     if matches!(

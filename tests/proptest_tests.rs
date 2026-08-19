@@ -32,7 +32,7 @@ fn prop_normalize_preserves_ordering() {
         let fa: f64 = a.parse().unwrap();
         let fb: f64 = b.parse().unwrap();
 
-        // Skip NaN/Inf — DynamoDB numbers are always finite
+        // Skip NaN/Inf - DynamoDB numbers are always finite
         if !fa.is_finite() || !fb.is_finite() {
             return Ok(());
         }
@@ -50,7 +50,7 @@ fn prop_normalize_preserves_ordering() {
             Some(std::cmp::Ordering::Equal) => {
                 prop_assert!(na == nb, "Expected {a} ({na}) == {b} ({nb})");
             }
-            None => {} // NaN — skip
+            None => {} // NaN: skip
         }
     });
 }

@@ -9,7 +9,7 @@ use crate::types::{
 use serde::{Deserialize, Serialize};
 use web_time::{SystemTime, UNIX_EPOCH};
 
-/// Internal raw deserialization struct — uses serde_json::Value for fields
+/// Internal raw deserialization struct: uses serde_json::Value for fields
 /// that participate in DynamoDB's multi-field constraint validation.
 #[derive(Debug, Default, Deserialize)]
 struct RawRequest {
@@ -43,7 +43,7 @@ struct RawRequest {
     on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
-/// Public request type — fully validated, typed fields.
+/// Public request type: fully validated, typed fields.
 /// Can be constructed directly (programmatic use) or deserialized from JSON.
 #[derive(Debug, Default)]
 pub struct CreateTableRequest {

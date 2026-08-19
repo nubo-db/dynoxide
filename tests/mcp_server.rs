@@ -1067,7 +1067,7 @@ fn test_put_get_delete_item() {
     let content = tool_content(&resp);
     assert_eq!(content["Attributes"]["name"]["S"], "Widget");
 
-    // Get item again — should be empty
+    // Get item again: should be empty
     let resp = call_tool(
         &mut child,
         5,
@@ -1554,7 +1554,7 @@ fn test_delete_table_with_auto_snapshot() {
         json!({"table_name": "Ephemeral", "item": {"pk": {"S": "x"}}}),
     );
 
-    // Delete the table — should auto-snapshot
+    // Delete the table: should auto-snapshot
     let resp = call_tool(
         &mut child,
         3,
@@ -1751,7 +1751,7 @@ fn test_snapshot_lifecycle() {
     assert_eq!(content["name"].as_str().unwrap(), "test-snap");
     assert!(content["size_bytes"].as_u64().unwrap() > 0);
 
-    // List snapshots — should have at least 1
+    // List snapshots: should have at least 1
     let resp = call_tool(&mut child, 4, "list_snapshots", json!({}));
     assert!(!is_tool_error(&resp));
     let content = tool_content(&resp);
@@ -1944,13 +1944,13 @@ fn test_max_items_limit() {
         );
     }
 
-    // Scan without explicit limit — should be capped at 2
+    // Scan without explicit limit: should be capped at 2
     let resp = call_tool(&mut child, 20, "scan", json!({"table_name": "Limited"}));
     let content = tool_content(&resp);
     assert_eq!(content["Count"], 2);
     assert!(content["LastEvaluatedKey"].is_object());
 
-    // Query without explicit limit — should be capped at 2
+    // Query without explicit limit: should be capped at 2
     let resp = call_tool(
         &mut child,
         21,
@@ -2049,7 +2049,7 @@ fn test_max_size_bytes_limit() {
         }),
     );
     // A single item query might or might not exceed 100 bytes
-    // The response includes Count, ScannedCount, Items — might be close
+    // The response includes Count, ScannedCount, Items: might be close
     // Let's not assert on this one since it depends on serialization size
 
     // get_database_info should report the limit
@@ -2462,7 +2462,7 @@ fn test_index_name_resolution_uses_name_field() {
     let content = tool_content(&resp);
     let entities = content["data_model"]["entities"].as_array().unwrap();
 
-    // Find User entity — should have GSI1, not gs1
+    // Find User entity: should have GSI1, not gs1
     let user = entities.iter().find(|e| e["name"] == "User").unwrap();
     let gsis = user["gsi_mappings"].as_array().unwrap();
     assert_eq!(
@@ -2895,7 +2895,7 @@ fn token_flag_beats_env() {
         with_env.starts_with("HTTP/1.1 401"),
         "env token should be rejected when flag is set, got: {with_env}"
     );
-    // The rejected env token must look identical to no token — no oracle.
+    // The rejected env token must look identical to no token: no oracle.
     assert_eq!(
         response_body(&with_env),
         response_body(&no_token),
@@ -3012,7 +3012,7 @@ fn allowed_host_extends_acceptance() {
 #[test]
 fn off_loopback_bind_is_reachable_with_token() {
     // #24: a 0.0.0.0 bind with a token is reachable over loopback and
-    // authenticates — the core Docker reachability shape. Existing auth tests
+    // authenticates: the core Docker reachability shape. Existing auth tests
     // all bind the 127.0.0.1 default; this is the only widened-bind happy path.
     let port = free_port();
     let _srv = spawn_authed_mcp_host(port, "the-secret-token", "0.0.0.0", &[]);

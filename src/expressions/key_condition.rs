@@ -321,7 +321,7 @@ fn strip_outer_parens(mut tokens: Vec<(Token, TokenSpan)>) -> Vec<(Token, TokenS
             }
         }
         if close_pos == Some(tokens.len() - 1) {
-            // The outermost parens wrap the entire expression — strip them.
+            // The outermost parens wrap the entire expression: strip them.
             tokens.remove(tokens.len() - 1);
             tokens.remove(0);
         } else {

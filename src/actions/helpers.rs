@@ -656,7 +656,7 @@ pub struct ExpressionParamContext<'a> {
     pub all_expression_param_names: Vec<&'a str>,
     pub expression_attribute_names: &'a Option<HashMap<String, String>>,
     pub expression_attribute_values: &'a Option<HashMap<String, AttributeValue>>,
-    /// Raw JSON for ExpressionAttributeValues — when present, used for key
+    /// Raw JSON for ExpressionAttributeValues: when present, used for key
     /// validation and parsed with key-specific error messages.
     pub expression_attribute_values_raw: &'a Option<serde_json::Value>,
 }
@@ -737,7 +737,7 @@ pub fn validate_expression_params(
         }
     }
 
-    // ExpressionAttributeValues — prefer raw JSON if available (for key-specific errors)
+    // ExpressionAttributeValues: prefer raw JSON if available (for key-specific errors)
     if let Some(raw_val) = ctx.expression_attribute_values_raw {
         if let Some(obj) = raw_val.as_object() {
             if obj.is_empty() {
@@ -1100,7 +1100,7 @@ pub async fn build_item_collection_metrics<S: StorageBackend>(
 
     let mut partition_bytes = storage.get_partition_size(table_name, pk_str).await?;
 
-    // Include LSI table sizes — DynamoDB's 10GB item collection limit applies
+    // Include LSI table sizes - DynamoDB's 10GB item collection limit applies
     // to the aggregate across base table and all LSIs.
     if let Some(ref lsi_json) = meta.lsi_definitions {
         if let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json) {
@@ -1862,7 +1862,7 @@ pub fn extract_key_strings(
 pub fn parse_exclusive_start_key(
     value: &serde_json::Value,
 ) -> Result<HashMap<String, AttributeValue>> {
-    // First, try to deserialise — this catches multi-type and number errors
+    // First, try to deserialise: this catches multi-type and number errors
     let parsed = match serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone()) {
         Ok(map) => map,
         Err(e) => {
@@ -1992,8 +1992,8 @@ pub fn parse_exclusive_start_key(
 
 /// Validate ESK count and index key types (stages 1 and 2 of ESK validation).
 ///
-/// Stage 1: Count check — error uses `count_mismatch_msg`.
-/// Stage 2: Index key type check (if index) — missing attr returns
+/// Stage 1: Count check - error uses `count_mismatch_msg`.
+/// Stage 2: Index key type check (if index) - missing attr returns
 /// "The provided starting key is invalid", wrong type returns
 /// "The provided key element does not match the schema".
 ///
@@ -2137,7 +2137,7 @@ fn get_index_key_schema(meta: &TableMetadata, index_name: &str) -> Result<Vec<Ke
             }
         }
     }
-    // Index not found — the caller should already have validated this
+    // Index not found: the caller should already have validated this
     Ok(Vec::new())
 }
 

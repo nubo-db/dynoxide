@@ -2455,7 +2455,7 @@ fn test_delete_with_is_missing() {
     })
     .unwrap();
 
-    // Delete uses pk equality — IS MISSING is not used to identify the item
+    // Delete uses pk equality - IS MISSING is not used to identify the item
     // but we can verify that the parser handles it in a WHERE clause
     exec(&db, "DELETE FROM \"Data\" WHERE pk = 'd2'");
 
@@ -2478,7 +2478,7 @@ fn test_combined_between_and_is_not_missing() {
         "SELECT * FROM \"Items\" WHERE age BETWEEN 30 AND 60 AND email IS NOT MISSING",
     );
     let items = resp.items.unwrap();
-    // Frank: age 40, has email — only match
+    // Frank: age 40, has email - only match
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0].get("name"),

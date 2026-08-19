@@ -39,7 +39,7 @@ pub enum ConditionExpr {
     BeginsWith(Operand, Operand),
     /// `contains(path, operand)`
     Contains(Operand, Operand),
-    /// `size(path)` — used as operand in comparisons, handled specially
+    /// `size(path)`: used as operand in comparisons, handled specially
     /// This is actually an operand, not standalone. We handle `size()` as an Operand variant.
 
     /// `expr AND expr`
@@ -75,7 +75,7 @@ pub enum Operand {
 /// Parse a condition/filter expression string.
 ///
 /// Errors returned are the raw error text without the "Invalid FilterExpression: " etc.
-/// prefix — callers must add the appropriate prefix for their expression type.
+/// prefix: callers must add the appropriate prefix for their expression type.
 pub fn parse(expr: &str) -> Result<ConditionExpr, String> {
     super::check_expression_size(expr)?;
     let tokens = tokenize(expr).map_err(|e| e.to_string())?;
@@ -264,7 +264,7 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
         let name_owned = name.clone();
         let func_name = name_owned.to_lowercase();
 
-        // Check if next token after identifier is '(' — if so, it's a function call
+        // If the next token after the identifier is '(', this is a function call
         let is_function_call = {
             let saved = stream.pos();
             stream.next(); // consume identifier
@@ -327,7 +327,7 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
                 }
             }
         } else {
-            // Not a function call — fall through to comparison parsing.
+            // Not a function call: fall through to comparison parsing.
             // Reserved keyword check happens in parse_raw_path.
         }
     }
@@ -540,7 +540,7 @@ fn resolve_operand(
                         AttributeValue::BS(set) => set.len(),
                         AttributeValue::L(list) => list.len(),
                         AttributeValue::M(map) => map.len(),
-                        // N, BOOL, NULL do not support size() — return None
+                        // size() does not apply to N, BOOL or NULL, so there is nothing to return
                         // so the comparison evaluates to false (no match).
                         _ => return Ok(None),
                     };
@@ -575,7 +575,7 @@ pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &Attribu
         // String comparisons
         (AttributeValue::S(a), AttributeValue::S(b)) => compare_ord(a, b, op),
 
-        // Number comparisons — f64 fast-path for common cases, BigDecimal for edge cases
+        // Number comparisons: f64 fast-path for common cases, BigDecimal for edge cases
         (AttributeValue::N(a), AttributeValue::N(b)) => {
             // Fast path: f64 is exact for ≤15 significant digits with no scientific notation
             if can_use_f64(a) && can_use_f64(b) {
@@ -597,21 +597,21 @@ pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &Attribu
         // Binary comparisons
         (AttributeValue::B(a), AttributeValue::B(b)) => compare_ord(a, b, op),
 
-        // Bool — only equality
+        // Bool: only equality
         (AttributeValue::BOOL(a), AttributeValue::BOOL(b)) => match op {
             CompOp::Eq => a == b,
             CompOp::Ne => a != b,
             _ => false,
         },
 
-        // Null — only equality
+        // Null: only equality
         (AttributeValue::NULL(a), AttributeValue::NULL(b)) => match op {
             CompOp::Eq => a == b,
             CompOp::Ne => a != b,
             _ => false,
         },
 
-        // String Set — set equality (order-independent)
+        // String Set: set equality (order-independent)
         (AttributeValue::SS(a), AttributeValue::SS(b)) => {
             let mut sa = a.clone();
             let mut sb = b.clone();
@@ -624,7 +624,7 @@ pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &Attribu
             }
         }
 
-        // Number Set — set equality (order-independent). Compared via the canonical
+        // Number Set: set equality (order-independent). Compared via the canonical
         // numeric form (full 38-digit precision), matching how NS duplicates are
         // detected on write. f64 would collapse values differing only beyond ~15
         // significant digits and wrongly report distinct sets as equal.
@@ -649,7 +649,7 @@ pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &Attribu
             }
         }
 
-        // Binary Set — set equality (order-independent)
+        // Binary Set: set equality (order-independent)
         (AttributeValue::BS(a), AttributeValue::BS(b)) => {
             let mut sa = a.clone();
             let mut sb = b.clone();
@@ -692,7 +692,7 @@ pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &Attribu
             }
         }
 
-        // Different types — only <> is true
+        // Different types: only <> is true
         _ => matches!(op, CompOp::Ne),
     }
 }
@@ -1216,7 +1216,7 @@ fn collect_path_undefined_refs(
 /// f64 has 15-17 significant decimal digits of precision; ≤15 digit strings
 /// are always exactly representable so no precision is lost.
 fn can_use_f64(s: &str) -> bool {
-    // Reject scientific notation — uncommon and complicates digit counting
+    // Reject scientific notation: uncommon and complicates digit counting
     if s.contains('E') || s.contains('e') {
         return false;
     }

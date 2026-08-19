@@ -353,7 +353,7 @@ pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
         _ => {}
     }
 
-    // Common map fields — checked AFTER operation-specific nested fields
+    // Common map fields: checked AFTER operation-specific nested fields
     check_field_is_map(
         obj,
         "Key",
@@ -392,7 +392,7 @@ pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
         }
     }
 
-    // Common scalar fields — checked AFTER nested fields to match DynamoDB ordering
+    // Common scalar fields: checked AFTER nested fields to match DynamoDB ordering
     check_field_is_string(obj, "TableName")?;
     check_field_is_string(obj, "IndexName")?;
     check_field_is_string(obj, "ReturnConsumedCapacity")?;

@@ -8,7 +8,7 @@ pub mod onetable;
 use serde::Serialize;
 
 /// Application-level data model parsed from a schema file (e.g., OneTable).
-/// Designed for agent consumption — serializes to JSON for MCP responses.
+/// Designed for agent consumption: serializes to JSON for MCP responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct DataModel {
     /// Schema format identifier, e.g. "onetable:1.1.0"

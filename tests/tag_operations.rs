@@ -137,7 +137,7 @@ fn test_untag_resource_nonexistent_key_is_noop() {
     })
     .unwrap();
 
-    // Remove a key that doesn't exist — should succeed
+    // Remove a key that doesn't exist: should succeed
     db.untag_resource(UntagResourceRequest {
         resource_arn: Some(table_arn("TestTable")),
         tag_keys: vec!["nonexistent".to_string()],
@@ -171,7 +171,7 @@ fn test_tag_resource_max_50() {
     let db = make_db();
     create_table(&db, "TestTable");
 
-    // Add 50 tags — should succeed
+    // Add 50 tags: should succeed
     let tags: Vec<Tag> = (0..50)
         .map(|i| tag(&format!("key{i}"), &format!("val{i}")))
         .collect();
@@ -255,7 +255,7 @@ fn test_tags_independent_of_describe_table() {
     }))
     .unwrap();
     let resp = db.describe_table(desc_req).unwrap();
-    // TableDescription struct has no tags field — this verifies the separation
+    // TableDescription struct has no tags field: this verifies the separation
     assert_eq!(resp.table.table_name, "TestTable");
 }
 

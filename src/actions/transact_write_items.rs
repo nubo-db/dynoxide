@@ -102,7 +102,7 @@ pub struct TransactConditionCheck {
 pub struct TransactWriteItemsResponse {
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<Vec<crate::types::ConsumedCapacity>>,
-    /// Item collection metrics per table. Currently always `None` — full metrics
+    /// Item collection metrics per table. Currently always `None`: full metrics
     /// computation for transactional writes is deferred to a future release.
     #[serde(
         rename = "ItemCollectionMetrics",

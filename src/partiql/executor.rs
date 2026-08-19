@@ -919,6 +919,18 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
             is_lsi: false,
         });
     }
+    // A vector index exists but no PartiQL read can address it, and DynamoDB
+    // says so by type rather than reporting the index missing (captured
+    // eu-west-2, 2026-08-11). Checked after the two reachable kinds so a
+    // GSI or LSI qualifier never pays for parsing the vector definitions.
+    if crate::actions::vector_index::parse_vector_defs(meta)?
+        .iter()
+        .any(|v| v.index_name == index_name)
+    {
+        return Err(DynoxideError::ValidationException(
+            "Scan operation not supported on this index type".to_string(),
+        ));
+    }
     Err(DynoxideError::ValidationException(
         "The table does not have the specified index".to_string(),
     ))

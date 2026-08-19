@@ -53,6 +53,7 @@ the ones worth knowing.
 | **Tags** | TagResource, UntagResource, ListTagsOfResource | Full | Not supported |
 | **Streams** | ListStreams, DescribeStream, GetShardIterator, GetRecords | Full | Full (single-shard) |
 | **PartiQL** | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Full | Partial - wrong error code for duplicate INSERT |
+| **Vector search** | SearchVectors | Full | Not supported |
 
 ### Not Implemented
 
@@ -65,7 +66,7 @@ the ones worth knowing.
 | **Capacity** | DescribeReservedCapacity, DescribeLimits, etc. (5 ops) | Not applicable |
 | **Other** | ContributorInsights, ResourcePolicy, TableReplicas, DescribeEndpoints (9 ops) | Not applicable |
 
-**27 of 27 applicable DynamoDB operations are implemented.** The remaining 39 operations are cloud-infrastructure features with no meaningful local equivalent.
+**28 of 28 applicable DynamoDB operations are implemented**, including `SearchVectors` and the vector index surface on `CreateTable`, `UpdateTable` and `DescribeTable`. The remaining 39 operations are cloud-infrastructure features with no meaningful local equivalent.
 
 ---
 
@@ -101,6 +102,50 @@ the ones worth knowing.
 | **LSI Query routing** | Supported |
 | **LSI Scan routing** | Supported |
 | **Per-LSI ConsumedCapacity (INDEXES mode)** | Supported |
+| **Vector index on CreateTable** | Supported |
+| **Vector index add/remove via UpdateTable** | Supported (with backfill) |
+| **Vector index projection ALL / KEYS_ONLY / INCLUDE** | Supported |
+| **SearchSchema HASH scoping and INLINE_FILTER** | Supported |
+| **`SearchVectors` (COSINE, EUCLIDEAN, DOT_PRODUCT)** | Supported |
+| **Per-vector-index ConsumedCapacity (INDEXES mode)** | Supported |
+
+A vector index goes `ACTIVE` immediately, where AWS reports it `CREATING` and
+backfills in the background before it becomes searchable. The backfilled data
+matches; only the lifecycle is compressed. The same is true of adding a GSI, and
+it has the same consequence: the `Backfilling` flag and the errors that only
+arise while an index is still filling are unreachable here, so code that waits
+for them will wait forever against Dynoxide and should poll for `ACTIVE`
+instead.
+
+Vector search is exact brute-force KNN rather than an approximate index. At
+emulator and embedded scale that reaches a correct answer faster than building
+an ANN structure would, and it removes the recall question entirely: the top-k
+is the true top-k. It also means a search costs time linear in the number of
+indexed entries, so a local table holding millions of vectors is outside what
+this is built for.
+
+Two scoring details worth knowing. Vectors are stored and compared at `f32`,
+so a value written at full `f64` precision reads back through the index rounded,
+while the base table keeps exactly what was written. And where several entries
+tie on score, Dynoxide breaks the tie deterministically; AWS does not commit to
+an order there, so a tie-dependent assertion will hold here and may not against
+the real thing.
+
+`SearchVectors` reports `VectorSearchRequestBytes`, and that figure is a
+divergence by construction. Real DynamoDB bills a search on the data it read and
+does not reproduce its own number between identical calls; five identical
+searches over one unchanged index reported 14214, 13903, 14214, 14214 and 14518.
+Dynoxide reports a deterministic stand-in sized on the entries the search
+scanned. Treat it as a monotonic proxy for how much work a search did, not as a
+figure to compare against AWS. The write axis is the captured one: a write's
+`VectorWriteRequestBytes` is `4 * dimensions` plus the vector attribute's name
+plus the item size of the rest of the projected entry, held to a 1KB floor, and
+matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.
+
+A vector index is not reachable through PartiQL, matching AWS: naming one in a
+`"table"."index"` qualifier answers `Scan operation not supported on this index
+type`. PartiQL reads of the base table return the vector attribute like any
+other attribute.
 
 Index write capacity is charged against the change to what an index stores, as
 DynamoDB does, rather than against the item the write leaves behind. A write that

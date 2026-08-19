@@ -1620,6 +1620,118 @@ async fn consumed_capacity_is_absent_under_none_and_when_unasked() {
     }
 }
 
+/// A one-index table whose entries are large enough to clear the 1KB floor,
+/// so a capacity assertion over it can tell one sizing model from another.
+/// `entries` controls how many the index holds, which is what the search
+/// figure is sized on.
+async fn create_above_floor_fixture(storage: &Storage, table: &str, entries: usize) {
+    create_table(
+        storage,
+        json!({
+            "TableName": table,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [
+                {"IndexName": "vix", "VectorAttribute": {"AttributeName": "embedding"},
+                 "Dimensions": 3, "DistanceFunction": "COSINE",
+                 "Projection": {"ProjectionType": "ALL"}}
+            ]
+        }),
+    )
+    .await;
+    for i in 0..entries {
+        put_item(
+            storage,
+            table,
+            json!({
+                "pk": {"S": format!("k{i:03}")},
+                "blob": {"S": "x".repeat(500)},
+                "embedding": {"L": n_vec(&["1", "0", "0"])}
+            }),
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn search_capacity_sizes_on_the_entries_scanned_not_the_results_returned() {
+    // The search axis has no oracle. Real DynamoDB does not reproduce its own
+    // figure: five identical searches over one unchanged index reported 14214,
+    // 13903, 14214, 14214 and 14518 in eu-west-2 on 2026-08-18. So this pins
+    // Dynoxide's deterministic stand-in, not an AWS number, and it must sit
+    // above the 1024 floor or it cannot tell one model from another. Every
+    // other search capacity assertion in this file sits on the floor and would
+    // pass against any model at all.
+    let storage = Storage::memory().unwrap();
+    create_above_floor_fixture(&storage, "VecAbove", 3).await;
+
+    // TopK does not move the figure: the charge is for the entries scanned, so
+    // asking for one result costs the same as asking for all three.
+    let mut seen = Vec::new();
+    for top_k in [1, 3] {
+        let resp = search(
+            &storage,
+            json!({
+                "TableName": "VecAbove", "IndexName": "vix",
+                "SearchVector": n_vec(&["1", "0", "0"]), "TopK": top_k,
+                "ReturnConsumedCapacity": "INDEXES"
+            }),
+        )
+        .await
+        .unwrap();
+        let bytes =
+            serde_json::to_value(&resp).unwrap()["ConsumedCapacity"]["VectorSearchRequestBytes"]
+                .as_f64()
+                .expect("a search asked for capacity reports it");
+        assert!(
+            bytes > 1024.0,
+            "TopK {top_k} reported {bytes}, which is at or below the floor, so \
+             this assertion cannot distinguish two sizing models"
+        );
+        seen.push(bytes);
+    }
+    assert_eq!(seen[0], seen[1], "TopK must not move the scanned figure");
+    assert_eq!(seen[0], 1773.0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn search_capacity_grows_with_the_number_of_entries_scanned() {
+    // The companion property: the figure is sized on what the search read, so
+    // doubling the entries doubles it. A model sized on the query, the request
+    // or the results would report the same for both.
+    let storage = Storage::memory().unwrap();
+    create_above_floor_fixture(&storage, "VecGrow3", 3).await;
+    create_above_floor_fixture(&storage, "VecGrow6", 6).await;
+
+    let mut figures = Vec::new();
+    for table in ["VecGrow3", "VecGrow6"] {
+        let resp = search(
+            &storage,
+            json!({
+                "TableName": table, "IndexName": "vix",
+                "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 1,
+                "ReturnConsumedCapacity": "INDEXES"
+            }),
+        )
+        .await
+        .unwrap();
+        figures.push(
+            serde_json::to_value(&resp).unwrap()["ConsumedCapacity"]["VectorSearchRequestBytes"]
+                .as_f64()
+                .expect("a search asked for capacity reports it"),
+        );
+    }
+
+    assert_eq!(figures[0], 1773.0, "three entries");
+    assert_eq!(figures[1], 3546.0, "six entries");
+    assert_eq!(
+        figures[1],
+        figures[0] * 2.0,
+        "the figure must track the entries scanned"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn remove_update_deindexes_the_item_end_to_end() {
     let storage = Storage::memory().unwrap();

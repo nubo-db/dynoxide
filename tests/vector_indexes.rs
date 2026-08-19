@@ -2849,6 +2849,21 @@ async fn vector_write_bytes_match_the_captured_formula_above_the_floor() {
         Some(3028.0),
         "3-dim + 3000-byte blob"
     );
+
+    // Shrinking an entry is charged on the larger of the two images, so
+    // overwriting the 3000-byte item with a 1500-byte one still costs 3028 and
+    // not 1528. Without this the two images are the same size everywhere else
+    // in the suite, and taking the smaller of the pair passes unnoticed.
+    let cc = dynoxide::actions::put_item::execute(&storage, put(1500, "b"))
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(
+        vector_arm(&cc, "vix"),
+        Some(3028.0),
+        "a shrinking overwrite is charged on the larger image"
+    );
 }
 
 /// The same formula at 512 dimensions, across both projection types, which is
@@ -2909,6 +2924,45 @@ async fn vector_write_bytes_bill_the_vector_at_f32_width_once() {
         None,
         "KEYS_ONLY does not project the changed attribute, so its view is untouched"
     );
+
+    // Changing only the vector charges both indexes, KEYS_ONLY included: the
+    // shadow row stores the vector whatever the projection, so its view moves
+    // either way. Captured against eu-west-2 on 2026-08-19 with this shape.
+    let wide_other: Vec<serde_json::Value> = (0..512).map(|_| json!({"N": "0.25"})).collect();
+    let vector_only: dynoxide::actions::put_item::PutItemRequest = serde_json::from_value(json!({
+        "TableName": "VecWide",
+        "Item": {"pk": {"S": "a"}, "embedding": {"L": wide_other}, "note": {"S": "y"}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::put_item::execute(&storage, vector_only)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(vector_arm(&cc, "vall"), Some(2065.0), "vector-only change");
+    assert_eq!(
+        vector_arm(&cc, "vkeys"),
+        Some(2060.0),
+        "a vector-only change moves the KEYS_ONLY view too"
+    );
+
+    // A delete is charged on the image it removes, so it clears the floor on
+    // the same fixture. Every other delete assertion in this suite sits at
+    // 1024 and cannot tell a correct delete charge from a floored one.
+    let del: dynoxide::actions::delete_item::DeleteItemRequest = serde_json::from_value(json!({
+        "TableName": "VecWide",
+        "Key": {"pk": {"S": "a"}},
+        "ReturnConsumedCapacity": "INDEXES"
+    }))
+    .unwrap();
+    let cc = dynoxide::actions::delete_item::execute(&storage, del)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .unwrap();
+    assert_eq!(vector_arm(&cc, "vall"), Some(2065.0), "delete, ALL");
+    assert_eq!(vector_arm(&cc, "vkeys"), Some(2060.0), "delete, KEYS_ONLY");
 }
 
 /// The batch and transactional surfaces report the vector arm too. A batch
@@ -3111,7 +3165,6 @@ async fn write_valid_for_one_index_and_invalid_for_another_rejects_wholesale() {
 // PartiQL write paths
 // ---------------------------------------------------------------------------
 
-/// Run a PartiQL statement against the storage, returning the result.
 /// As [`exec_partiql`], asking for per-index capacity so the vector arm is
 /// observable.
 async fn exec_partiql_indexes(
@@ -3130,6 +3183,7 @@ async fn exec_partiql_indexes(
     .unwrap()
 }
 
+/// Run a PartiQL statement against the storage, returning the result.
 async fn exec_partiql(
     storage: &Storage,
     statement: &str,
@@ -3633,11 +3687,14 @@ async fn update_table_backfill_skips_empty_binary_and_mismatched_filter_values()
     assert_eq!(table_pk, "S:scoped");
 }
 
-/// The six write call sites the first cut of this work left unobserved. Each
-/// threads its own old image and capacity mode into the vector fan-out by hand,
-/// so a wrong variable at any one of them compiles and passes every other test.
+/// The item-level write surfaces, each of which threads its own old image and
+/// capacity mode into the vector fan-out by hand, so a wrong variable at any
+/// one of them compiles and passes every other test. The statement surfaces
+/// are covered by `partiql_write_paths_report_the_vector_arm` and
+/// `statement_batch_and_transaction_report_the_vector_arm`; between the three
+/// every call site that can report the arm has an assertion.
 #[tokio::test(flavor = "current_thread")]
-async fn every_write_surface_reports_the_vector_arm() {
+async fn item_write_surfaces_report_the_vector_arm() {
     // UpdateItem: an upsert that creates the row, then a REMOVE that drops it.
     let storage = Storage::memory().unwrap();
     create_vector_table(&storage, "VecU").await;
@@ -3732,6 +3789,57 @@ async fn every_write_surface_reports_the_vector_arm() {
         .unwrap();
     let cc = caps.iter().find(|c| c.table_name == "VecTC").unwrap();
     assert_eq!(vector_arm(cc, "vix"), Some(1024.0), "transacted Delete");
+}
+
+/// The two statement surfaces that reach the fan-out through
+/// `per_table_capacity` rather than through their own builder. Both were
+/// unobserved: `ExecuteTransaction` rebuilds a bare `WriteCapacity` for its
+/// read arm and relies on a clone for the write arm to carry the vector bytes,
+/// so a refactor that built the write arm the same way would drop the map with
+/// nothing failing.
+#[tokio::test(flavor = "current_thread")]
+async fn statement_batch_and_transaction_report_the_vector_arm() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecSB").await;
+    create_vector_table(&storage, "VecST").await;
+
+    let batch: dynoxide::actions::batch_execute_statement::BatchExecuteStatementRequest =
+        serde_json::from_value(json!({
+            "Statements": [
+                {"Statement": "INSERT INTO \"VecSB\" VALUE {'pk': 'a', 'embedding': [1, 0, 0]}"}
+            ],
+            "ReturnConsumedCapacity": "INDEXES"
+        }))
+        .unwrap();
+    let caps = dynoxide::actions::batch_execute_statement::execute(&storage, batch)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    let cc = caps
+        .iter()
+        .find(|c| c.table_name == "VecSB")
+        .expect("the written table reports an arm");
+    assert_eq!(vector_arm(cc, "vix"), Some(1024.0), "BatchExecuteStatement");
+
+    let txn: dynoxide::actions::execute_transaction::ExecuteTransactionRequest =
+        serde_json::from_value(json!({
+            "TransactStatements": [
+                {"Statement": "INSERT INTO \"VecST\" VALUE {'pk': 'a', 'embedding': [1, 0, 0]}"}
+            ],
+            "ReturnConsumedCapacity": "INDEXES"
+        }))
+        .unwrap();
+    let caps = dynoxide::actions::execute_transaction::execute(&storage, txn)
+        .await
+        .unwrap()
+        .consumed_capacity
+        .expect("INDEXES reports capacity");
+    let cc = caps
+        .iter()
+        .find(|c| c.table_name == "VecST")
+        .expect("the written table reports an arm");
+    assert_eq!(vector_arm(cc, "vix"), Some(1024.0), "ExecuteTransaction");
 }
 
 /// The three PartiQL write paths, which carry their own copy of the wiring.

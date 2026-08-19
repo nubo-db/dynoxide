@@ -204,20 +204,23 @@ pub struct SearchVectorsResponse {
 /// data the search read rather than on the request. The figure moved with the
 /// table's contents and not with the query, and it does not repeat: five
 /// identical searches over one unchanged 512-dimension index reported 14214,
-/// 13903, 14214, 14214 and 14518. A local engine cannot match a figure AWS does
-/// not reproduce, so this reports the same quantity deterministically, sized on
-/// the entries actually scanned with the write path's captured measure. A
-/// documented divergence in the same class as the equal-score tie break:
+/// 13903, 14214, 14214 and 14518. There is no figure to match, so this reports
+/// the same quantity deterministically instead.
+///
+/// The measure is the serialised length of the entries scanned. That is a
+/// monotonic proxy and not DynamoDB's item sizing: JSON punctuation and the
+/// type wrappers make it read high, and the vector counts as the decimal text
+/// it stores as rather than at its f32 width. Both are acceptable here because
+/// the axis has no ground truth to be wrong against, and neither is acceptable
+/// as evidence in a conformance claim: cite the write axis, which is captured
+/// byte-exact, and never this one. Sizing on the true item measure would mean
+/// parsing every scanned entry to throw it away, which cost a 4000-entry search
+/// twenty-three times its own runtime.
+///
+/// A documented divergence in the same class as the equal-score tie break:
 /// deterministic where AWS is not.
-fn search_scanned_bytes(candidates: &[VectorCandidateRow], vix: &VectorIndex) -> f64 {
-    let scanned: usize = candidates
-        .iter()
-        .map(|row| {
-            serde_json::from_str::<Item>(&row.item_json)
-                .map(|projected| crate::actions::vector_index::vector_entry_bytes(&projected, vix))
-                .unwrap_or(0)
-        })
-        .sum();
+fn search_scanned_bytes(candidates: &[VectorCandidateRow]) -> f64 {
+    let scanned: usize = candidates.iter().map(|row| row.item_json.len()).sum();
     crate::types::vector_request_bytes(scanned)
 }
 
@@ -722,7 +725,7 @@ pub async fn execute<S: StorageBackend>(
     let consumed_capacity =
         crate::types::capacity_wanted(request.return_consumed_capacity.as_deref()).then(|| {
             crate::types::VectorSearchCapacity {
-                vector_search_request_bytes: search_scanned_bytes(&candidates, vix),
+                vector_search_request_bytes: search_scanned_bytes(&candidates),
             }
         });
 

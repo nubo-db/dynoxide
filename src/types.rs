@@ -828,9 +828,11 @@ pub struct VectorCapacityDetail {
 
 /// The `ConsumedCapacity` a `SearchVectors` response carries.
 ///
-/// A vector search is billed on request bytes alone. The shape has no
-/// `CapacityUnits` and no `TableName`, reads identically under `TOTAL` and
-/// `INDEXES`, and is absent under `NONE` (captured 2026-08-11, eu-west-2).
+/// The shape has no `CapacityUnits` and no `TableName`, reads identically under
+/// `TOTAL` and `INDEXES`, and is absent under `NONE` (captured 2026-08-11,
+/// eu-west-2). Despite the field name, real DynamoDB bills the figure on the
+/// data the search read rather than on the request, and does not reproduce it
+/// between identical calls; Dynoxide reports a deterministic stand-in instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VectorSearchCapacity {
     #[serde(rename = "VectorSearchRequestBytes")]
@@ -841,7 +843,15 @@ pub struct VectorSearchCapacity {
 ///
 /// DynamoDB documents a 1KB minimum on vector billing and the capture observed
 /// 1024.0 for a three-dimensional fixture, which is this floor rather than a
-/// constant. Magnitudes above it are unpinned: the suite asserts the shape.
+/// constant.
+///
+/// The two axes above the floor are not on the same footing. The write figure
+/// is captured byte-exact (eu-west-2, 2026-08-18): five fixtures from 3 to 512
+/// dimensions fit `4 * dimensions + vector attribute name + item size of the
+/// rest of the projected entry` with no residual, and the tests fail on a
+/// one-byte error. The search figure has no oracle at all, because real
+/// DynamoDB does not reproduce its own, so what Dynoxide reports there is a
+/// deterministic stand-in rather than a match.
 pub const MIN_VECTOR_REQUEST_BYTES: f64 = 1024.0;
 
 /// The billable byte figure for a vector request measuring `bytes`.

@@ -238,6 +238,18 @@ fn run_vector_write_validation(
     Ok(())
 }
 
+/// A derived shadow row together with the projected entry it was built from.
+///
+/// The projected item is kept rather than discarded because both the capacity
+/// size and the changed-or-not comparison want it as an item: the size is
+/// DynamoDB's own item measure over it, and the comparison is
+/// [`super::index_capacity::unchanged`], the same one the classic arms use.
+/// Serialising it and reading it back would lose both.
+pub(crate) struct DerivedVectorRow {
+    pub row: VectorItemRow,
+    pub projected: Item,
+}
+
 /// Derive the shadow-table row for one base item, or `None` when the item
 /// does not belong in the index (sparse): an invalid vector value (missing
 /// attribute, wrong type, wrong element count, non-numeric or out-of-f32-range
@@ -254,20 +266,8 @@ fn run_vector_write_validation(
 /// on the live path everything rejectable was already rejected by
 /// [`validate_vector_write_attributes`], so only the missing-attribute shapes
 /// still fall through to `None` there.
-/// A derived shadow row together with the projected entry it was built from.
 ///
-/// The projected item is kept rather than discarded because both the capacity
-/// size and the changed-or-not comparison want it as an item: the size is
-/// DynamoDB's own item measure over it, and the comparison is
-/// [`super::index_capacity::unchanged`], the same one the classic arms use.
-/// Serialising it and reading it back would lose both.
-pub(crate) struct DerivedVectorRow {
-    pub row: VectorItemRow,
-    pub projected: Item,
-}
-
-/// As [`vector_index_row`], keeping the projected entry for sizing and
-/// comparison.
+/// Keeps the projected entry alongside the row, for sizing and comparison.
 pub(crate) fn derive_vector_row(
     item: &Item,
     vix: &VectorIndex,
@@ -535,9 +535,12 @@ fn vector_write_bytes(
 ///
 /// Returns a map of index name to the bytes that index's replication cost, on
 /// the same absent-not-zero terms as the classic fan-out. `capacity_mode` is
-/// the caller's `ReturnConsumedCapacity`, forwarded rather than interpreted;
-/// sizing costs a derivation of the old image per index that nothing else
-/// wants, so the map comes back empty when nobody asked.
+/// the caller's `ReturnConsumedCapacity`, and this reads it rather than merely
+/// passing it on: the map is built under `INDEXES` alone, because that is the
+/// only mode the response carries it in. `TOTAL` gets an empty map even though
+/// it did ask for capacity, which is deliberate and differs from the classic
+/// helpers. Sizing costs a derivation of the old image per index that nothing
+/// else wants, so it is skipped rather than done and discarded.
 pub async fn maintain_vector_indexes_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
@@ -646,7 +649,8 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
 /// `maintain_gsis_after_delete`. Also called by the TTL reaper.
 ///
 /// Charges only the indexes the deleted item was a member of, sized on the row
-/// it held, as on [`maintain_vector_indexes_after_write`].
+/// it held, as on [`maintain_vector_indexes_after_write`], and reads
+/// `capacity_mode` on the same terms: the map is built under `INDEXES` alone.
 pub async fn maintain_vector_indexes_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,

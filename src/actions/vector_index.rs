@@ -545,26 +545,15 @@ pub async fn maintain_vector_indexes_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let vixs = parse_vector_defs(meta)?;
     if vixs.is_empty() {
         return Ok(HashMap::new());
     }
     let attr_defs = parse_attr_defs(meta)?;
-    maintain_vector_indexes_after_write_with_defs(
-        storage,
-        &vixs,
-        &attr_defs,
-        target,
-        old_item,
-        item,
-        capacity_mode,
-        false,
-    )
-    .await
+    maintain_vector_indexes_after_write_with_defs(storage, &vixs, &attr_defs, target, item, false)
+        .await
 }
 
 /// Defs-accepting form of [`maintain_vector_indexes_after_write`], for callers
@@ -578,9 +567,7 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
     vixs: &[VectorIndex],
     attr_defs: &[AttributeDefinition],
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
     skip_deletes: bool,
 ) -> Result<HashMap<String, f64>> {
     if vixs.is_empty() {
@@ -588,7 +575,7 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
     }
     // Only INDEXES can carry the map to the wire, so TOTAL must not pay for a
     // figure the response builder will drop.
-    let want_capacity = crate::types::vector_capacity_wanted(capacity_mode);
+    let want_capacity = crate::types::vector_capacity_wanted(target.capacity_mode);
     let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -615,7 +602,7 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
         // Sized before the row is handed to the op list, so the row moves
         // rather than being cloned to keep it alive for the sizing.
         if want_capacity {
-            let previous = match old_item {
+            let previous = match target.old_item {
                 Some(old) => derive_vector_row(
                     old,
                     vix,
@@ -655,23 +642,13 @@ pub async fn maintain_vector_indexes_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let vixs = parse_vector_defs(meta)?;
     if vixs.is_empty() {
         return Ok(HashMap::new());
     }
     let attr_defs = parse_attr_defs(meta)?;
-    maintain_vector_indexes_after_delete_with_defs(
-        storage,
-        &vixs,
-        &attr_defs,
-        target,
-        old_item,
-        capacity_mode,
-    )
-    .await
+    maintain_vector_indexes_after_delete_with_defs(storage, &vixs, &attr_defs, target).await
 }
 
 /// Defs-accepting form of [`maintain_vector_indexes_after_delete`], for
@@ -681,13 +658,11 @@ pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
     vixs: &[VectorIndex],
     attr_defs: &[AttributeDefinition],
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     if vixs.is_empty() {
         return Ok(HashMap::new());
     }
-    let want_capacity = crate::types::vector_capacity_wanted(capacity_mode);
+    let want_capacity = crate::types::vector_capacity_wanted(target.capacity_mode);
     let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -700,7 +675,7 @@ pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
         });
 
         if want_capacity
-            && let Some(old) = old_item
+            && let Some(old) = target.old_item
             && let Some(derived) = derive_vector_row(
                 old,
                 vix,

@@ -422,38 +422,26 @@ async fn execute_inner<S: StorageBackend>(
                 sk: &sk,
                 pk_attr: &key_schema.partition_key,
                 sk_attr: key_schema.sort_key.as_deref(),
+                old_item: old_item.as_ref(),
+                capacity_mode: request.return_consumed_capacity.as_deref(),
             };
 
             // Maintain GSI tables (inside the transaction)
-            let gsi_units = super::gsi::maintain_gsis_after_write(
-                storage,
-                &meta,
-                &target,
-                old_item.as_ref(),
-                &request.item,
-                request.return_consumed_capacity.as_deref(),
-            )
-            .await?;
+            let gsi_units =
+                super::gsi::maintain_gsis_after_write(storage, &meta, &target, &request.item)
+                    .await?;
 
             // Maintain LSI tables (inside the transaction)
-            let lsi_units = super::lsi::maintain_lsis_after_write(
-                storage,
-                &meta,
-                &target,
-                old_item.as_ref(),
-                &request.item,
-                request.return_consumed_capacity.as_deref(),
-            )
-            .await?;
+            let lsi_units =
+                super::lsi::maintain_lsis_after_write(storage, &meta, &target, &request.item)
+                    .await?;
 
             // Maintain vector index shadow tables (inside the transaction)
             let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
                 storage,
                 &meta,
                 &target,
-                old_item.as_ref(),
                 &request.item,
-                request.return_consumed_capacity.as_deref(),
             )
             .await?;
 

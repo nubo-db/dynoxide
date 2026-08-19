@@ -242,6 +242,8 @@ async fn execute_inner<S: StorageBackend>(
                     sk: &sk,
                     pk_attr: &key_schema.partition_key,
                     sk_attr: key_schema.sort_key.as_deref(),
+                    old_item: None,
+                    capacity_mode: None,
                 };
                 // An import reports no capacity, so the fan-out is asked for
                 // none and skips deriving the old image to size it.
@@ -250,9 +252,7 @@ async fn execute_inner<S: StorageBackend>(
                     &vector_defs,
                     &attr_defs,
                     &target,
-                    None,
                     &item,
-                    None,
                     skip_gsi_deletes,
                 )
                 .await?;

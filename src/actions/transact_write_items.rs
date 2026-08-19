@@ -455,37 +455,17 @@ async fn execute_put<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_write(storage, &meta, &target, &item).await?;
 
-    let lsi_units = super::lsi::maintain_lsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_write(storage, &meta, &target, &item).await?;
 
-    let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let vector_bytes =
+        super::vector_index::maintain_vector_indexes_after_write(storage, &meta, &target, &item)
+            .await?;
 
     // Record stream event
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -608,37 +588,17 @@ async fn execute_update<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_write(storage, &meta, &target, &item).await?;
 
-    let lsi_units = super::lsi::maintain_lsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_write(storage, &meta, &target, &item).await?;
 
-    let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let vector_bytes =
+        super::vector_index::maintain_vector_indexes_after_write(storage, &meta, &target, &item)
+            .await?;
 
     // Record stream event
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -714,32 +674,14 @@ async fn execute_delete<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = super::gsi::maintain_gsis_after_delete(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
-    let lsi_units = super::lsi::maintain_lsis_after_delete(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
-    let vector_bytes = super::vector_index::maintain_vector_indexes_after_delete(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_delete(storage, &meta, &target).await?;
+    let lsi_units = super::lsi::maintain_lsis_after_delete(storage, &meta, &target).await?;
+    let vector_bytes =
+        super::vector_index::maintain_vector_indexes_after_delete(storage, &meta, &target).await?;
 
     // Record stream event
     if old_item.is_some() {

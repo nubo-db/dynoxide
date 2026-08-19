@@ -655,40 +655,23 @@ async fn execute_inner<S: StorageBackend>(
             sk: &sk,
             pk_attr: &key_schema.partition_key,
             sk_attr: key_schema.sort_key.as_deref(),
+            old_item: prior_image,
+            capacity_mode: request.return_consumed_capacity.as_deref(),
         };
 
         // Maintain GSI tables (inside the transaction)
-        let gsi_units = super::gsi::maintain_gsis_after_write(
-            storage,
-            &meta,
-            &target,
-            prior_image,
-            &item,
-            request.return_consumed_capacity.as_deref(),
-        )
-        .await?;
+        let gsi_units =
+            super::gsi::maintain_gsis_after_write(storage, &meta, &target, &item).await?;
 
         // Maintain LSI tables (inside the transaction)
-        let lsi_units = super::lsi::maintain_lsis_after_write(
-            storage,
-            &meta,
-            &target,
-            prior_image,
-            &item,
-            request.return_consumed_capacity.as_deref(),
-        )
-        .await?;
+        let lsi_units =
+            super::lsi::maintain_lsis_after_write(storage, &meta, &target, &item).await?;
 
         // Maintain vector index shadow tables (inside the transaction). A
         // REMOVE of the vector attribute derives no row, so this de-indexes
         // the item; restoring the attribute re-indexes it.
         let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
-            storage,
-            &meta,
-            &target,
-            prior_image,
-            &item,
-            request.return_consumed_capacity.as_deref(),
+            storage, &meta, &target, &item,
         )
         .await?;
 

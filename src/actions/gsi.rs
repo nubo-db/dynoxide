@@ -8,10 +8,20 @@ use crate::storage_backend::{IndexWriteOp, StorageBackend};
 use crate::types::{GlobalSecondaryIndex, Item, KeyType, ProjectionType};
 use std::collections::HashMap;
 
-/// Where a write lands in the base table, and how the table's own keys are
-/// named. Shared by the GSI and LSI fan-out, which both need the key strings to
+/// Where a write lands in the base table, how the table's own keys are named,
+/// what the item looked like before it, and whether the caller wants capacity.
+/// Shared by the GSI, LSI and vector fan-out, which all need the key strings to
 /// address index rows and the key attribute names to rebuild the projected entry
 /// on either side of the write.
+///
+/// The old image and the capacity mode live here rather than as arguments
+/// because all three fan-outs must be given the same pair. Passed separately
+/// they were repeated at every call site, and a site with two plausible old
+/// images in scope could hand one fan-out the wrong one and still compile:
+/// `update_item` holds both the pre-mutation copy and the genuinely-absent
+/// image a create-through-update needs, and swapping them turns an insert
+/// charge into a change charge. Built once per site, the three fan-outs cannot
+/// disagree.
 pub struct IndexWrite<'a> {
     pub table_name: &'a str,
     /// The base table partition key, as the string index rows are addressed by.
@@ -20,6 +30,13 @@ pub struct IndexWrite<'a> {
     pub sk: &'a str,
     pub pk_attr: &'a str,
     pub sk_attr: Option<&'a str>,
+    /// The item as it stood before this write, or `None` where no row existed.
+    /// Absence has to be genuine: a key-only stand-in reads as a change rather
+    /// than an insert.
+    pub old_item: Option<&'a Item>,
+    /// The caller's `ReturnConsumedCapacity`, deciding whether the fan-outs
+    /// size their work at all.
+    pub capacity_mode: Option<&'a str>,
 }
 
 /// Parsed index definition for convenient access. Used for both GSI and LSI,
@@ -131,7 +148,7 @@ pub fn build_index_item(
 ///
 /// Returns a map of GSI name to write capacity units consumed. An index whose
 /// stored view the write leaves untouched is absent from the map rather than
-/// present and zeroed, so the response omits its arm entirely. `old_item` is the
+/// present and zeroed, so the response omits its arm entirely. `target.old_item` is the
 /// item as it stood before the write, or `None` when there was no item.
 ///
 /// `capacity_mode` is the caller's `ReturnConsumedCapacity`, forwarded rather
@@ -142,13 +159,10 @@ pub async fn maintain_gsis_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
-    maintain_gsis_after_write_with_defs(storage, &gsi_defs, target, old_item, item, capacity_mode)
-        .await
+    maintain_gsis_after_write_with_defs(storage, &gsi_defs, target, item).await
 }
 
 /// Defs-accepting form of [`maintain_gsis_after_write`], for callers that
@@ -157,11 +171,9 @@ pub async fn maintain_gsis_after_write_with_defs<S: StorageBackend>(
     storage: &S,
     gsi_defs: &[GsiDef],
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let want_capacity = crate::types::capacity_wanted(target.capacity_mode);
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -198,7 +210,7 @@ pub async fn maintain_gsis_after_write_with_defs<S: StorageBackend>(
         // when the item leaves the index and no insert is queued above.
         if want_capacity
             && let Some(units) = super::index_capacity::index_write_units_for(
-                old_item,
+                target.old_item,
                 entry,
                 gsi,
                 target.pk_attr,
@@ -221,7 +233,7 @@ pub async fn maintain_gsis_after_write_with_defs<S: StorageBackend>(
 ///
 /// Returns a map of GSI name to write capacity units consumed. Only an index the
 /// deleted item was actually a member of is charged, sized on the entry it held.
-/// `old_item` is the deleted item, or `None` when the delete removed nothing.
+/// `target.old_item` is the deleted item, or `None` when the delete removed nothing.
 ///
 /// `capacity_mode` is the caller's `ReturnConsumedCapacity`, as on
 /// [`maintain_gsis_after_write`]. A delete queues its ops from the target key
@@ -230,11 +242,9 @@ pub async fn maintain_gsis_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let gsi_defs = parse_gsi_defs(meta)?;
-    maintain_gsis_after_delete_with_defs(storage, &gsi_defs, target, old_item, capacity_mode).await
+    maintain_gsis_after_delete_with_defs(storage, &gsi_defs, target).await
 }
 
 /// Defs-accepting form of [`maintain_gsis_after_delete`], for callers that
@@ -243,10 +253,8 @@ pub async fn maintain_gsis_after_delete_with_defs<S: StorageBackend>(
     storage: &S,
     gsi_defs: &[GsiDef],
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let want_capacity = crate::types::capacity_wanted(target.capacity_mode);
     let mut gsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -260,7 +268,7 @@ pub async fn maintain_gsis_after_delete_with_defs<S: StorageBackend>(
 
         if want_capacity
             && let Some(units) = super::index_capacity::index_write_units(
-                old_item,
+                target.old_item,
                 None,
                 gsi,
                 target.pk_attr,

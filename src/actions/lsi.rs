@@ -75,13 +75,10 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let lsi_defs = parse_lsi_defs(meta)?;
-    maintain_lsis_after_write_with_defs(storage, &lsi_defs, target, old_item, item, capacity_mode)
-        .await
+    maintain_lsis_after_write_with_defs(storage, &lsi_defs, target, item).await
 }
 
 /// Defs-accepting form of [`maintain_lsis_after_write`], for callers that
@@ -90,11 +87,9 @@ pub async fn maintain_lsis_after_write_with_defs<S: StorageBackend>(
     storage: &S,
     lsi_defs: &[LsiDef],
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let want_capacity = crate::types::capacity_wanted(target.capacity_mode);
     let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -130,7 +125,7 @@ pub async fn maintain_lsis_after_write_with_defs<S: StorageBackend>(
 
         if want_capacity
             && let Some(units) = super::index_capacity::index_write_units_for(
-                old_item,
+                target.old_item,
                 entry,
                 lsi,
                 target.pk_attr,
@@ -154,11 +149,9 @@ pub async fn maintain_lsis_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let lsi_defs = parse_lsi_defs(meta)?;
-    maintain_lsis_after_delete_with_defs(storage, &lsi_defs, target, old_item, capacity_mode).await
+    maintain_lsis_after_delete_with_defs(storage, &lsi_defs, target).await
 }
 
 /// Defs-accepting form of [`maintain_lsis_after_delete`], for callers that
@@ -167,10 +160,8 @@ pub async fn maintain_lsis_after_delete_with_defs<S: StorageBackend>(
     storage: &S,
     lsi_defs: &[LsiDef],
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
+    let want_capacity = crate::types::capacity_wanted(target.capacity_mode);
     let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -184,7 +175,7 @@ pub async fn maintain_lsis_after_delete_with_defs<S: StorageBackend>(
 
         if want_capacity
             && let Some(units) = super::index_capacity::index_write_units(
-                old_item,
+                target.old_item,
                 None,
                 lsi,
                 target.pk_attr,

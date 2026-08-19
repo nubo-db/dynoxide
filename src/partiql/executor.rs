@@ -1335,36 +1335,19 @@ async fn execute_insert<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = crate::actions::gsi::maintain_gsis_after_write(
-        storage,
-        meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units =
+        crate::actions::gsi::maintain_gsis_after_write(storage, meta, &target, &item).await?;
 
-    let lsi_units = crate::actions::lsi::maintain_lsis_after_write(
-        storage,
-        meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units =
+        crate::actions::lsi::maintain_lsis_after_write(storage, meta, &target, &item).await?;
 
     // Vector index maintenance
     let vector_bytes = crate::actions::vector_index::maintain_vector_indexes_after_write(
-        storage,
-        meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
+        storage, meta, &target, &item,
     )
     .await?;
 
@@ -1510,36 +1493,19 @@ async fn execute_update<S: StorageBackend>(
         sk: &sk_str,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_ref,
+        capacity_mode,
     };
 
-    let gsi_units = crate::actions::gsi::maintain_gsis_after_write(
-        storage,
-        meta,
-        &target,
-        old_ref,
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units =
+        crate::actions::gsi::maintain_gsis_after_write(storage, meta, &target, &item).await?;
 
-    let lsi_units = crate::actions::lsi::maintain_lsis_after_write(
-        storage,
-        meta,
-        &target,
-        old_ref,
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units =
+        crate::actions::lsi::maintain_lsis_after_write(storage, meta, &target, &item).await?;
 
     // Vector index maintenance
     let vector_bytes = crate::actions::vector_index::maintain_vector_indexes_after_write(
-        storage,
-        meta,
-        &target,
-        old_ref,
-        &item,
-        capacity_mode,
+        storage, meta, &target, &item,
     )
     .await?;
 
@@ -1743,35 +1709,18 @@ async fn execute_delete<S: StorageBackend>(
         sk: &sk_str,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = crate::actions::gsi::maintain_gsis_after_delete(
-        storage,
-        meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = crate::actions::gsi::maintain_gsis_after_delete(storage, meta, &target).await?;
 
-    let lsi_units = crate::actions::lsi::maintain_lsis_after_delete(
-        storage,
-        meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units = crate::actions::lsi::maintain_lsis_after_delete(storage, meta, &target).await?;
 
     // Vector index maintenance
-    let vector_bytes = crate::actions::vector_index::maintain_vector_indexes_after_delete(
-        storage,
-        meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
+    let vector_bytes =
+        crate::actions::vector_index::maintain_vector_indexes_after_delete(storage, meta, &target)
+            .await?;
 
     // Stream record
     if old_item.is_some() {

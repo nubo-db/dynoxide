@@ -276,23 +276,21 @@ pub async fn execute<S: StorageBackend>(
                             sk: &sk,
                             pk_attr: &key_schema.partition_key,
                             sk_attr: key_schema.sort_key.as_deref(),
+                            old_item: old_item.as_ref(),
+                            capacity_mode: request.return_consumed_capacity.as_deref(),
                         };
                         let gsi_units = super::gsi::maintain_gsis_after_write_with_defs(
                             storage,
                             &gsi_defs,
                             &target,
-                            old_item.as_ref(),
                             &put_req.item,
-                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
                         let lsi_units = super::lsi::maintain_lsis_after_write_with_defs(
                             storage,
                             &lsi_defs,
                             &target,
-                            old_item.as_ref(),
                             &put_req.item,
-                            request.return_consumed_capacity.as_deref(),
                         )
                         .await?;
                         let vector_bytes =
@@ -301,9 +299,7 @@ pub async fn execute<S: StorageBackend>(
                                 &vector_defs,
                                 &attr_defs,
                                 &target,
-                                old_item.as_ref(),
                                 &put_req.item,
-                                request.return_consumed_capacity.as_deref(),
                                 false,
                             )
                             .await?;
@@ -358,21 +354,15 @@ pub async fn execute<S: StorageBackend>(
                             sk: &sk,
                             pk_attr: &key_schema.partition_key,
                             sk_attr: key_schema.sort_key.as_deref(),
+                            old_item: old_item.as_ref(),
+                            capacity_mode: request.return_consumed_capacity.as_deref(),
                         };
                         let gsi_units = super::gsi::maintain_gsis_after_delete_with_defs(
-                            storage,
-                            &gsi_defs,
-                            &target,
-                            old_item.as_ref(),
-                            request.return_consumed_capacity.as_deref(),
+                            storage, &gsi_defs, &target,
                         )
                         .await?;
                         let lsi_units = super::lsi::maintain_lsis_after_delete_with_defs(
-                            storage,
-                            &lsi_defs,
-                            &target,
-                            old_item.as_ref(),
-                            request.return_consumed_capacity.as_deref(),
+                            storage, &lsi_defs, &target,
                         )
                         .await?;
                         let vector_bytes =
@@ -381,8 +371,6 @@ pub async fn execute<S: StorageBackend>(
                                 &vector_defs,
                                 &attr_defs,
                                 &target,
-                                old_item.as_ref(),
-                                request.return_consumed_capacity.as_deref(),
                             )
                             .await?;
                         if old_item.is_some() {

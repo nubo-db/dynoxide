@@ -150,8 +150,16 @@ pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
             if let Some(serde_json::Value::Array(arr)) = obj.get("VectorIndexUpdates") {
                 for item in arr {
                     if let Some(inner) = item.as_object() {
-                        check_field_is_struct(inner, "Create")?;
-                        check_field_is_struct(inner, "Delete")?;
+                        check_field_is_struct_as(
+                            inner,
+                            "Create",
+                            "com.amazonaws.dynamodb.v20120810.CreateVectorIndexAction",
+                        )?;
+                        check_field_is_struct_as(
+                            inner,
+                            "Delete",
+                            "com.amazonaws.dynamodb.v20120810.DeleteVectorIndexAction",
+                        )?;
                         if let Some(create) = inner.get("Create").and_then(|v| v.as_object()) {
                             check_field_is_struct(create, "VectorAttribute")?;
                             check_field_is_struct(create, "Projection")?;
@@ -690,6 +698,32 @@ fn check_field_is_map(
 
 /// Check that a field, if present and not null, is a JSON object (struct).
 /// Returns SerializationException with the appropriate message for the wrong type.
+/// As [`check_field_is_struct`], but for a field whose type depends on which
+/// parent holds it. `Create` and `Delete` name a GSI action under
+/// `GlobalSecondaryIndexUpdates` and a vector action under
+/// `VectorIndexUpdates`, and the field name alone cannot tell them apart, so
+/// the vector call sites pass their own class rather than inheriting the GSI
+/// one and reporting the wrong type.
+fn check_field_is_struct_as(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    class: &str,
+) -> crate::Result<()> {
+    let val = match obj.get(field) {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(()),
+    };
+    if val.is_object() {
+        return Ok(());
+    }
+    let msg = if val.is_array() {
+        format!("Unrecognized collection type class {class}")
+    } else {
+        "Start of structure or map found where not expected".to_string()
+    };
+    Err(crate::DynoxideError::SerializationException(msg))
+}
+
 fn check_field_is_struct(
     obj: &serde_json::Map<String, serde_json::Value>,
     field: &str,

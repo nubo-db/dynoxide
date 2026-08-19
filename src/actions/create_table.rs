@@ -1107,6 +1107,16 @@ pub(crate) fn collect_vix_obj_errors(
             errors.push(format!(
                 "Value null at '{path}.vectorAttribute.attributeName' failed to satisfy constraint: Member must not be null"
             ));
+        } else if let Some(name) = va.get("AttributeName").and_then(|v| v.as_str()) {
+            // The API model bounds this at one character, which the AWS CLI
+            // enforces before the request leaves the client. Without it an
+            // empty name was accepted, the index reported ACTIVE, and no item
+            // could ever derive a row, so the index stayed empty for good.
+            if name.is_empty() {
+                errors.push(format!(
+                    "Value '' at '{path}.vectorAttribute.attributeName' failed to satisfy constraint: Member must have length greater than or equal to 1"
+                ));
+            }
         }
     }
     if let Some(schema) = obj.get("SearchSchema").and_then(|v| v.as_array()) {

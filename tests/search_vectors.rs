@@ -1095,14 +1095,14 @@ async fn type_mismatched_hash_operand_rejects_with_both_types() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn contradictory_hash_equalities_match_nothing() {
+async fn contradictory_hash_equalities_are_refused_as_duplicate_conditions() {
     let storage = Storage::memory().unwrap();
     create_schema_fixture(&storage, "VecContra").await;
 
-    // Two same-type equalities naming different values can never both equal
-    // one stored key string, so the search matches nothing rather than
-    // erroring (uncaptured).
-    let resp = search(
+    // Two equalities on one attribute are refused whatever their values, so
+    // this never reaches the scoped load. Matching nothing was the earlier
+    // reading and the 2026-08-19 capture retired it.
+    let err = search(
         &storage,
         json!({
             "TableName": "VecContra", "IndexName": "schema",
@@ -1112,19 +1112,23 @@ async fn contradictory_hash_equalities_match_nothing() {
         }),
     )
     .await
-    .unwrap();
-    assert!(resp.search_results.is_empty());
+    .expect_err("one condition per attribute");
+    assert_eq!(
+        err.to_string(),
+        "Invalid SearchConditionExpression: SearchConditionExpression must only contain \
+         one condition per attribute"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn nested_path_conjunct_matches_nothing() {
+async fn nested_path_conjunct_is_refused() {
     let storage = Storage::memory().unwrap();
     create_schema_fixture(&storage, "VecNested").await;
 
-    // A nested path under a schema attribute can never equal a stored scalar
-    // schema value, so the conjunct matches nothing (uncaptured; the
-    // top-level name still counts for schema membership).
-    let resp = search(
+    // A nested path is refused rather than quietly matching nothing, so a
+    // malformed search cannot be mistaken for an empty one. Matching nothing
+    // was the earlier reading and the 2026-08-19 capture retired it.
+    let err = search(
         &storage,
         json!({
             "TableName": "VecNested", "IndexName": "schema",
@@ -1134,8 +1138,12 @@ async fn nested_path_conjunct_matches_nothing() {
         }),
     )
     .await
-    .unwrap();
-    assert!(resp.search_results.is_empty());
+    .expect_err("a nested condition is refused");
+    assert_eq!(
+        err.to_string(),
+        "Invalid SearchConditionExpression: SearchConditionExpression cannot have \
+         conditions on nested attributes"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,6 +1575,84 @@ async fn empty_table_search_returns_an_empty_search_results_array() {
         serde_json::to_string(&resp).unwrap(),
         r#"{"SearchResults":[]}"#
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_nested_path_in_the_condition_is_rejected_not_silently_empty() {
+    // Captured eu-west-2, 2026-08-19: a condition on a nested attribute is
+    // refused outright, and the same message covers a HASH element and an
+    // INLINE_FILTER one. Answering with an empty result set instead would let
+    // a malformed search look like a search that matched nothing.
+    let storage = Storage::memory().unwrap();
+    create_schema_fixture(&storage, "VecNest").await;
+
+    for expr in ["#t.deep = :t", "#t = :t AND #c.deep = :c"] {
+        let err = search(
+            &storage,
+            json!({
+                "TableName": "VecNest", "IndexName": "schema",
+                "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 5,
+                "SearchConditionExpression": expr,
+                "ExpressionAttributeNames": {"#t": "tenant", "#c": "category"},
+                "ExpressionAttributeValues": {":t": {"S": "t1"}, ":c": {"S": "c1"}}
+            }),
+        )
+        .await
+        .expect_err("a nested condition is refused");
+        assert_eq!(
+            err.to_string(),
+            "Invalid SearchConditionExpression: SearchConditionExpression cannot have \
+             conditions on nested attributes",
+            "expression: {expr}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_conditions_on_one_attribute_are_rejected_however_they_are_ordered() {
+    // Captured eu-west-2, 2026-08-19. DynamoDB allows exactly one condition per
+    // attribute: two that contradict, two that agree, and two with a type error
+    // among them all give the same message, and reordering does not change it.
+    // So an engine that tries to reconcile two scope values is modelling
+    // something the wire never accepts.
+    let storage = Storage::memory().unwrap();
+    create_schema_fixture(&storage, "VecDup").await;
+
+    let cases = [
+        (
+            json!({":a": {"S": "x"}, ":b": {"S": "y"}}),
+            "#t = :a AND #t = :b",
+        ),
+        (json!({":a": {"S": "t1"}}), "#t = :a AND #t = :a"),
+        (
+            json!({":a": {"S": "x"}, ":b": {"S": "y"}, ":c": {"N": "1"}}),
+            "#t = :a AND #t = :b AND #t = :c",
+        ),
+        (
+            json!({":a": {"S": "x"}, ":b": {"S": "y"}, ":c": {"N": "1"}}),
+            "#t = :c AND #t = :a AND #t = :b",
+        ),
+    ];
+    for (values, expr) in cases {
+        let err = search(
+            &storage,
+            json!({
+                "TableName": "VecDup", "IndexName": "schema",
+                "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 5,
+                "SearchConditionExpression": expr,
+                "ExpressionAttributeNames": {"#t": "tenant"},
+                "ExpressionAttributeValues": values
+            }),
+        )
+        .await
+        .expect_err("one condition per attribute");
+        assert_eq!(
+            err.to_string(),
+            "Invalid SearchConditionExpression: SearchConditionExpression must only contain \
+             one condition per attribute",
+            "expression: {expr}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

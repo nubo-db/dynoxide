@@ -2798,6 +2798,41 @@ async fn delete_charges_the_vector_index_the_item_belonged_to() {
     assert!(cc.vector_indexes.is_none());
 }
 
+/// An empty vector attribute name is refused at the request-model layer. The
+/// API model bounds it at one character, which the AWS CLI enforces before the
+/// request leaves the client. Left unbounded it created an index that reported
+/// ACTIVE and could never hold a row, because no item can carry an attribute
+/// with no name.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_vector_attribute_name_rejected_at_the_request_model_layer() {
+    let storage = Storage::memory().unwrap();
+    let req: Result<CreateTableRequest, _> = serde_json::from_value(json!({
+        "TableName": "VecEmptyAttr",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [{
+            "IndexName": "vix",
+            "VectorAttribute": {"AttributeName": ""},
+            "Projection": {"ProjectionType": "ALL"},
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE"
+        }]
+    }));
+    let err = match req {
+        Err(e) => e.to_string(),
+        Ok(r) => dynoxide::actions::create_table::execute(&storage, r)
+            .await
+            .expect_err("an empty vector attribute name is refused")
+            .to_string(),
+    };
+    assert!(
+        err.contains("vectorIndexes.1.member.vectorAttribute.attributeName")
+            && err.contains("Member must have length greater than or equal to 1"),
+        "got {err}"
+    );
+}
+
 /// Query and Scan refuse a vector index by type, as PartiQL does, rather than
 /// reporting an index DescribeTable lists as missing. Captured against
 /// eu-west-2 on 2026-08-19. The two messages are not symmetric: Query's ends

@@ -1450,6 +1450,32 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
         "Start of structure or map found where not expected"
     );
 
+    // A Create or Delete inside VectorIndexUpdates names the vector action,
+    // not the GSI one. The two share a field name and the class the message
+    // reports is decided by the parent, so resolving on the field name alone
+    // told a caller their vector update was a global secondary index action.
+    for (field, class) in [
+        ("Create", "CreateVectorIndexAction"),
+        ("Delete", "DeleteVectorIndexAction"),
+    ] {
+        let resp = dynamo_request(
+            &url,
+            "UpdateTable",
+            json!({
+                "TableName": "AnyTable",
+                "VectorIndexUpdates": [{ field: [] }]
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["Message"],
+            format!("Unrecognized collection type class com.amazonaws.dynamodb.v20120810.{class}"),
+            "field {field}"
+        );
+    }
+
     // TopK as a string is a serialisation-layer type mismatch.
     let resp = dynamo_request(
         &url,

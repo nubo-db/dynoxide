@@ -548,6 +548,37 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // A condition on a nested attribute is refused outright, with one message
+    // covering both element types (captured eu-west-2, 2026-08-19). Without
+    // this a nested path silently matched nothing, so a malformed search was
+    // indistinguishable from one that found nothing.
+    if pairs.iter().any(|p| p.nested) {
+        return Err(DynoxideError::ValidationException(
+            "Invalid SearchConditionExpression: SearchConditionExpression cannot have \
+             conditions on nested attributes"
+                .to_string(),
+        ));
+    }
+
+    // Exactly one condition per attribute. Two that contradict, two that agree,
+    // and two carrying a type error between them all give this same message,
+    // and the order they appear in does not change it (captured eu-west-2,
+    // 2026-08-19). Reconciling two scope values would be modelling something
+    // the wire never accepts, so the checks below can assume one pair each.
+    {
+        let mut seen: Vec<&str> = Vec::with_capacity(pairs.len());
+        for pair in &pairs {
+            if seen.contains(&pair.attr.as_str()) {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid SearchConditionExpression: SearchConditionExpression must only \
+                     contain one condition per attribute"
+                        .to_string(),
+                ));
+            }
+            seen.push(&pair.attr);
+        }
+    }
+
     // A HASH-schema index scopes every search to one partition value, so an
     // equality on the HASH attribute is mandatory. Captured for the
     // absent-expression case; an expression that omits the HASH attribute
@@ -578,11 +609,12 @@ pub async fn execute<S: StorageBackend>(
     // schema declares a HASH element. The operand is encoded with the same
     // key-string encoding the write path stores, so the two sides agree by
     // construction.
-    let mut unmatchable_hash = false;
     let mut hash_scope: Option<String> = None;
     if let Some(hash) = index_hash_attr {
         let attr_defs = parse_attr_defs(&meta)?;
-        for pair in pairs.iter().filter(|p| p.attr == hash && !p.nested) {
+        // At most one pair survives the duplicate check above, so this settles
+        // a single scope value rather than reconciling several.
+        for pair in pairs.iter().filter(|p| p.attr == hash) {
             // An operand whose type differs from the attribute's declared
             // AttributeDefinitions type rejects. Captured for an N operand
             // against a declared S (eu-west-2 and us-east-1, 2026-08-13);
@@ -611,26 +643,13 @@ pub async fn execute<S: StorageBackend>(
                      attribute cannot contain an empty string value. Key: {hash}"
                 )));
             }
-            // Every remaining HASH pair must agree on one scope value: two
-            // pairs naming different values can never both equal one stored
-            // key string, so the search matches nothing rather than erroring
-            // (uncaptured). The non-key-able arm of `to_key_string` is
-            // unreachable after the type check above and stays only as
-            // defence in depth.
-            match (pair.value.to_key_string(), &hash_scope) {
-                (Some(key), None) => hash_scope = Some(key),
-                (Some(key), Some(scope)) if key == *scope => {}
-                _ => {
-                    unmatchable_hash = true;
-                    break;
-                }
-            }
+            // The non-key-able arm of `to_key_string` is unreachable after the
+            // type check above and stays only as defence in depth.
+            hash_scope = pair.value.to_key_string();
         }
     }
 
-    let candidates: Vec<VectorCandidateRow> = if unmatchable_hash {
-        Vec::new()
-    } else {
+    let candidates: Vec<VectorCandidateRow> = {
         storage
             .query_vector_candidates(
                 &request.table_name,
@@ -649,7 +668,7 @@ pub async fn execute<S: StorageBackend>(
     // nested path is never settled by the scoped load and matches nothing.
     let filter_pairs: Vec<&EqualityPair> = pairs
         .iter()
-        .filter(|p| p.nested || Some(p.attr.as_str()) != index_hash_attr)
+        .filter(|p| Some(p.attr.as_str()) != index_hash_attr)
         .collect();
     let mut scored: Vec<(f64, &VectorCandidateRow)> = Vec::with_capacity(candidates.len());
     for row in &candidates {
@@ -661,10 +680,9 @@ pub async fn execute<S: StorageBackend>(
             })?
         };
         let passes = filter_pairs.iter().all(|pair| {
-            !pair.nested
-                && filter_map
-                    .get(&pair.attr)
-                    .is_some_and(|stored| expressions::condition::values_equal(stored, &pair.value))
+            filter_map
+                .get(&pair.attr)
+                .is_some_and(|stored| expressions::condition::values_equal(stored, &pair.value))
         });
         if !passes {
             continue;

@@ -76,6 +76,11 @@ pub mod schema;
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.
 pub(crate) mod serde_errors;
+// Shared by the HTTP server and the wasm dispatch: both must reject a
+// mistyped field with the same SerializationException, or the two surfaces
+// disagree on requests neither has deserialised yet.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) mod serialization_checks;
 #[cfg(feature = "http-server")]
 pub mod server;
 #[cfg(feature = "mcp-server")]
@@ -1293,6 +1298,17 @@ impl Database<WasmBridgeBackend> {
     ) -> Result<actions::scan::ScanResponse> {
         let backend = self.backend().await;
         actions::scan::execute(&*backend, request).await
+    }
+
+    /// Search a vector index, as [`Database::search_vectors`] on the native
+    /// build. The scoring runs in the engine and the candidate load is one
+    /// bridge crossing, so the answer is the same either side.
+    pub async fn search_vectors(
+        &self,
+        request: actions::search_vectors::SearchVectorsRequest,
+    ) -> Result<actions::search_vectors::SearchVectorsResponse> {
+        let backend = self.backend().await;
+        actions::search_vectors::execute(&*backend, request).await
     }
 }
 

@@ -53,7 +53,7 @@ the ones worth knowing.
 | **Tags** | TagResource, UntagResource, ListTagsOfResource | Full | Not supported |
 | **Streams** | ListStreams, DescribeStream, GetShardIterator, GetRecords | Full | Full (single-shard) |
 | **PartiQL** | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Full | Partial - wrong error code for duplicate INSERT |
-| **Vector search** | SearchVectors | Full | Not supported |
+| **Vector search** | SearchVectors | Full (native and wasm) | Not supported |
 
 ### Not Implemented
 

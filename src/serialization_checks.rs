@@ -15,7 +15,7 @@ const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflecti
 /// `Option<serde_json::Value>` for these fields, serde accepts any JSON type.
 /// This function inspects the raw JSON and returns the appropriate
 /// SerializationException before serde gets involved.
-pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crate::Result<()> {
+pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crate::Result<()> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
 

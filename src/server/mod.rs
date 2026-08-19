@@ -3,11 +3,10 @@
 //! Only compiled with the `http-server` feature flag.
 
 mod auth;
-mod serialization_checks;
 
 use crate::serde_errors::{deserialize, serialize};
+use crate::serialization_checks::pre_check_serialization_types;
 use auth::validate_auth;
-use serialization_checks::pre_check_serialization_types;
 
 use crate::Database;
 use crate::net::bind_exclusive;

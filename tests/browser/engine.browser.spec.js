@@ -109,6 +109,80 @@ test("data survives a reload: a fresh client on the same name sees the writes (#
   expect(reopened.count).toBe(1);
 });
 
+test("a vector index survives a reload and is still searchable from OPFS", async ({ page }) => {
+  // The migration risk in one test: the vector definitions live in a column
+  // added to _tables by an ALTER on open, and the shadow rows live in their own
+  // table. Both have to come back after the handles are released and retaken,
+  // or a browser database created today stops answering tomorrow.
+  const name = `vec-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const VEC = {
+    TableName: "Vecs",
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+    BillingMode: "PAY_PER_REQUEST",
+    VectorIndexes: [
+      {
+        IndexName: "vix",
+        VectorAttribute: { AttributeName: "emb" },
+        Projection: { ProjectionType: "ALL" },
+        Dimensions: 3,
+        DistanceFunction: "COSINE",
+      },
+    ],
+  };
+
+  const first = await page.evaluate(async ({ name, table }) => {
+    const client = globalThis.dynoxide.makeClient({ name });
+    await client.ready();
+    await client.execute("CreateTable", table);
+    for (const [pk, emb] of [["a", ["1", "0", "0"]], ["b", ["0", "1", "0"]]]) {
+      await client.execute("PutItem", {
+        TableName: table.TableName,
+        Item: { pk: { S: pk }, emb: { L: emb.map((n) => ({ N: n })) } },
+      });
+    }
+    const mode = client.persistenceMode;
+    client.terminate();
+    return mode;
+  }, { name, table: VEC });
+  expect(first).toBe("opfs");
+
+  await page.waitForTimeout(150);
+
+  const reopened = await page.evaluate(async ({ name, table }) => {
+    const client = globalThis.dynoxide.makeClient({ name });
+    await client.ready();
+    const described = await client.execute("DescribeTable", {
+      TableName: table.TableName,
+    });
+    const search = await client.execute("SearchVectors", {
+      TableName: table.TableName,
+      IndexName: "vix",
+      SearchVector: [{ N: "1" }, { N: "0" }, { N: "0" }],
+      TopK: 2,
+    });
+    const out = {
+      mode: client.persistenceMode,
+      indexName: described.Table.VectorIndexes?.[0]?.IndexName,
+      indexStatus: described.Table.VectorIndexes?.[0]?.IndexStatus,
+      top: search.SearchResults?.[0]?.Item?.pk?.S,
+      topScore: search.SearchResults?.[0]?.Score,
+      returned: search.SearchResults?.length,
+    };
+    client.terminate();
+    return out;
+  }, { name, table: VEC });
+
+  expect(reopened.mode).toBe("opfs");
+  expect(reopened.indexName).toBe("vix");
+  expect(reopened.indexStatus).toBe("ACTIVE");
+  // The shadow rows survived, so the search still ranks both entries and the
+  // self match is still exact (COSINE is a distance, so 0).
+  expect(reopened.returned).toBe(2);
+  expect(reopened.top).toBe("a");
+  expect(reopened.topScore).toBe(0);
+});
+
 test("a second client on a busy OPFS database fails clearly instead of silently forking to memory (#64)", async ({ page }) => {
   const result = await page.evaluate(async () => {
     const name = `busy-${crypto.randomUUID()}`;

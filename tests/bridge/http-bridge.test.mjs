@@ -117,6 +117,83 @@ test("a supported operation round-trips through the browser to the engine", asyn
   assert.deepEqual(got.body.Item, { pk: { S: "a" }, v: { N: "1" } });
 });
 
+test("the vector family survives the transport, control plane and data plane", async () => {
+  // The whole point of the unit: an index the control plane advertises must be
+  // one the data plane can answer, over the same transport the suite uses.
+  const created = await call(
+    "DynamoDB_20120810.CreateTable",
+    JSON.stringify({
+      TableName: "BridgeVec",
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+      VectorIndexes: [
+        {
+          IndexName: "vix",
+          VectorAttribute: { AttributeName: "emb" },
+          Projection: { ProjectionType: "ALL" },
+          Dimensions: 3,
+          DistanceFunction: "COSINE",
+        },
+      ],
+    }),
+  );
+  assert.equal(created.status, 200);
+
+  const described = await call(
+    "DynamoDB_20120810.DescribeTable",
+    JSON.stringify({ TableName: "BridgeVec" }),
+  );
+  assert.equal(described.status, 200);
+  assert.equal(described.body.Table.VectorIndexes[0].IndexName, "vix");
+  assert.equal(described.body.Table.VectorIndexes[0].IndexStatus, "ACTIVE");
+
+  for (const [pk, emb] of [
+    ["a", ["1", "0", "0"]],
+    ["b", ["0", "1", "0"]],
+  ]) {
+    const put = await call(
+      "DynamoDB_20120810.PutItem",
+      JSON.stringify({
+        TableName: "BridgeVec",
+        Item: { pk: { S: pk }, emb: { L: emb.map((n) => ({ N: n })) } },
+      }),
+    );
+    assert.equal(put.status, 200);
+  }
+
+  const searched = await call(
+    "DynamoDB_20120810.SearchVectors",
+    JSON.stringify({
+      TableName: "BridgeVec",
+      IndexName: "vix",
+      SearchVector: [{ N: "1" }, { N: "0" }, { N: "0" }],
+      TopK: 1,
+    }),
+  );
+  assert.equal(searched.status, 200, JSON.stringify(searched.body));
+  assert.equal(searched.body.SearchResults.length, 1);
+  assert.equal(searched.body.SearchResults[0].Item.pk.S, "a");
+  // COSINE is a distance, so the self match scores 0.
+  assert.equal(searched.body.SearchResults[0].Score, 0);
+  // The vector attribute is excluded from the projection by default.
+  assert.equal(searched.body.SearchResults[0].Item.emb, undefined);
+});
+
+test("a search against a table with no vector index is a validation error, not a skip", async () => {
+  const out = await call(
+    "DynamoDB_20120810.SearchVectors",
+    JSON.stringify({
+      TableName: "Bridge",
+      IndexName: "nope",
+      SearchVector: [{ N: "1" }],
+      TopK: 1,
+    }),
+  );
+  assert.notEqual(out.status, 501, "the operation is implemented, so this is not scope");
+  assert.equal(out.status, 400);
+});
+
 test("an unimplemented operation is a 501 the suite scores as a skip", async () => {
   // The load-bearing case: without this the preview's whole unimplemented
   // surface lands in the failed column instead of being reported as scope.
@@ -274,7 +351,7 @@ test("the engine starts empty, so shared-table setup cannot collide", async () =
   assert.equal(out.status, 200);
   assert.deepEqual(
     [...out.body.TableNames].sort(),
-    ["Bridge", "BridgePartiql"],
+    ["Bridge", "BridgePartiql", "BridgeVec"],
     "only this run's tables should be present",
   );
 });

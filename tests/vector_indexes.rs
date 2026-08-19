@@ -2798,6 +2798,86 @@ async fn delete_charges_the_vector_index_the_item_belonged_to() {
     assert!(cc.vector_indexes.is_none());
 }
 
+/// Query and Scan refuse a vector index by type, as PartiQL does, rather than
+/// reporting an index DescribeTable lists as missing. Captured against
+/// eu-west-2 on 2026-08-19. The two messages are not symmetric: Query's ends
+/// with a full stop and Scan's does not, which is AWS's own inconsistency and
+/// not a transcription slip.
+#[tokio::test(flavor = "current_thread")]
+async fn query_and_scan_refuse_a_vector_index_by_type() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecQS").await;
+
+    let q: dynoxide::actions::query::QueryRequest = serde_json::from_value(json!({
+        "TableName": "VecQS",
+        "IndexName": "vix",
+        "KeyConditionExpression": "pk = :p",
+        "ExpressionAttributeValues": {":p": {"S": "a"}}
+    }))
+    .unwrap();
+    let err = dynoxide::actions::query::execute(&storage, q)
+        .await
+        .expect_err("a vector index is not queryable");
+    assert_eq!(
+        err.to_string(),
+        "Query operation not supported on this index type."
+    );
+
+    let sc: dynoxide::actions::scan::ScanRequest = serde_json::from_value(json!({
+        "TableName": "VecQS",
+        "IndexName": "vix"
+    }))
+    .unwrap();
+    let err = dynoxide::actions::scan::execute(&storage, sc)
+        .await
+        .expect_err("a vector index is not scannable");
+    assert_eq!(
+        err.to_string(),
+        "Scan operation not supported on this index type"
+    );
+}
+
+/// An index that is not any of the three kinds still reports absence, and a
+/// consistent read against a vector index keeps the GSI wording. Both captured
+/// the same day: AWS itself says "global secondary indexes" there, so matching
+/// it means repeating a phrase that is wrong about the index type.
+#[tokio::test(flavor = "current_thread")]
+async fn the_vector_refusal_does_not_swallow_the_neighbouring_rejections() {
+    let storage = Storage::memory().unwrap();
+    create_vector_table(&storage, "VecQS2").await;
+
+    let sc: dynoxide::actions::scan::ScanRequest = serde_json::from_value(json!({
+        "TableName": "VecQS2",
+        "IndexName": "nosuchindex"
+    }))
+    .unwrap();
+    let err = dynoxide::actions::scan::execute(&storage, sc)
+        .await
+        .expect_err("an unknown index is still unknown");
+    assert!(
+        err.to_string()
+            .contains("does not have the specified index"),
+        "got {err}"
+    );
+
+    let q: dynoxide::actions::query::QueryRequest = serde_json::from_value(json!({
+        "TableName": "VecQS2",
+        "IndexName": "vix",
+        "ConsistentRead": true,
+        "KeyConditionExpression": "pk = :p",
+        "ExpressionAttributeValues": {":p": {"S": "a"}}
+    }))
+    .unwrap();
+    let err = dynoxide::actions::query::execute(&storage, q)
+        .await
+        .expect_err("a consistent read on a vector index is refused");
+    assert_eq!(
+        err.to_string(),
+        "Consistent reads are not supported on global secondary indexes",
+        "the consistent-read check fires before the index-type one, as captured"
+    );
+}
+
 /// The captured byte formula, pinned above the 1KB floor where it is actually
 /// visible. Every figure here was observed against real DynamoDB in eu-west-2
 /// on 2026-08-18:

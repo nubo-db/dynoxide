@@ -407,6 +407,12 @@ pub async fn execute<S: StorageBackend>(
         if let Some(keys) = lsi_keys {
             keys
         } else {
+            // A vector index is listed by DescribeTable but no Scan can read
+            // it, and DynamoDB refuses it by type rather than reporting the
+            // index missing (captured eu-west-2, 2026-08-19). Checked before
+            // the GSI lookup, which would otherwise answer "does not have the
+            // specified index" for an index the table does have.
+            reject_vector_index(&meta, index_name)?;
             super::gsi::parse_gsi_key_schema(&meta, index_name)?
         }
     } else {
@@ -766,4 +772,24 @@ pub async fn execute<S: StorageBackend>(
         last_evaluated_key,
         consumed_capacity,
     })
+}
+
+/// Refuse a read against a vector index by type.
+///
+/// The wording differs between the two operations, full stop included: AWS
+/// ends Scan's with one where the other has none. Captured eu-west-2,
+/// 2026-08-19.
+fn reject_vector_index(
+    meta: &crate::storage::TableMetadata,
+    index_name: &str,
+) -> crate::errors::Result<()> {
+    if super::vector_index::parse_vector_defs(meta)?
+        .iter()
+        .any(|v| v.index_name == index_name)
+    {
+        return Err(DynoxideError::ValidationException(
+            "Scan operation not supported on this index type".to_string(),
+        ));
+    }
+    Ok(())
 }

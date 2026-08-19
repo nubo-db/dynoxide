@@ -696,14 +696,12 @@ fn check_field_is_map(
     Err(crate::DynoxideError::SerializationException(msg))
 }
 
-/// Check that a field, if present and not null, is a JSON object (struct).
-/// Returns SerializationException with the appropriate message for the wrong type.
 /// As [`check_field_is_struct`], but for a field whose type depends on which
 /// parent holds it. `Create` and `Delete` name a GSI action under
 /// `GlobalSecondaryIndexUpdates` and a vector action under
 /// `VectorIndexUpdates`, and the field name alone cannot tell them apart, so
 /// the vector call sites pass their own class rather than inheriting the GSI
-/// one and reporting the wrong type.
+/// one and reporting the wrong type. Every other answer matches the sibling.
 fn check_field_is_struct_as(
     obj: &serde_json::Map<String, serde_json::Value>,
     field: &str,
@@ -719,11 +717,13 @@ fn check_field_is_struct_as(
     let msg = if val.is_array() {
         format!("Unrecognized collection type class {class}")
     } else {
-        "Start of structure or map found where not expected".to_string()
+        "Unexpected field type".to_string()
     };
     Err(crate::DynoxideError::SerializationException(msg))
 }
 
+/// Check that a field, if present and not null, is a JSON object (struct).
+/// Returns SerializationException with the appropriate message for the wrong type.
 fn check_field_is_struct(
     obj: &serde_json::Map<String, serde_json::Value>,
     field: &str,

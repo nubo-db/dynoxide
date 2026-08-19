@@ -1058,6 +1058,31 @@ fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
     }
 }
 
+/// Run the `VectorIndexes` request-model constraints and format the envelope
+/// DynamoDB answers with, for a caller that does not arrive through the raw
+/// request's `Deserialize`.
+///
+/// The MCP surface builds its request field by field, so without this it skips
+/// every constraint collected here. Feed it the canonical PascalCase form: the
+/// collectors read the wire spelling, and MCP names its fields in snake_case,
+/// so re-serialising the typed value first is what makes the two agree.
+pub(crate) fn vector_indexes_request_model_error(
+    vix_val: &Option<serde_json::Value>,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    collect_vix_errors(vix_val, &mut errors);
+    errors.truncate(10);
+    if errors.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} validation error{} detected: {}",
+        errors.len(),
+        if errors.len() == 1 { "" } else { "s" },
+        errors.join("; ")
+    ))
+}
+
 /// Request-model constraint errors for `VectorIndexes`, in API-model member
 /// order: indexName, vectorAttribute, searchSchema, projection, dimensions,
 /// distanceFunction. The `Dimensions` lower-bound form is captured from real

@@ -1127,7 +1127,7 @@ fn vector_index_round_trips_through_mcp_alone() {
         .expect("the agent-facing view reports the index");
     assert_eq!(vixs.len(), 1);
     assert_eq!(vixs[0]["index_name"], "vix");
-    assert_eq!(vixs[0]["vector_attribute"], "emb");
+    assert_eq!(vixs[0]["vector_attribute"]["attribute_name"], "emb");
     assert_eq!(vixs[0]["dimensions"], 3);
     assert_eq!(vixs[0]["distance_function"], "COSINE");
 
@@ -1210,6 +1210,204 @@ fn a_fractional_dimension_count_truncates_through_mcp_as_it_does_on_the_wire() {
         vixs[0]["dimensions"], 3,
         "3.7 truncates to 3, as on the wire"
     );
+}
+
+#[test]
+fn an_empty_vector_attribute_name_is_refused_through_mcp_too() {
+    // The request-model constraints are enforced by the raw request's
+    // Deserialize, which the MCP surface does not go through, so deserialising
+    // alone let an agent create an index a wire client could not: an empty
+    // vector attribute name reaching ACTIVE and never holding a row.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpEmptyAttr",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": ""},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("vectorAttribute.attributeName")
+            && body.contains("length greater than or equal to 1"),
+        "expected the wire request-model error: {body}"
+    );
+
+    // And the table is not created.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "McpEmptyAttr"}),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("not found") || body.contains("ResourceNotFound"),
+        "got {body}"
+    );
+}
+
+#[test]
+fn vector_index_updates_work_in_the_shape_the_tool_documents() {
+    // The tool description names snake_case fields, as the rest of the surface
+    // does, but the parser read the wire spelling alone, so every documented
+    // shape parsed into an empty update and was refused for carrying no action.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecUpd",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    // Add one in the documented shape.
+    call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpVecUpd",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "McpVecUpd"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(vixs.len(), 1, "create through the documented shape");
+    assert_eq!(vixs[0]["index_name"], "vix");
+
+    // Remove it in the documented shape.
+    call_tool(
+        &mut child,
+        4,
+        "update_table",
+        json!({
+            "table_name": "McpVecUpd",
+            "vector_index_updates": [{"delete": {"index_name": "vix"}}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        5,
+        "describe_table",
+        json!({"table_name": "McpVecUpd"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(vixs.is_empty(), "delete through the documented shape");
+}
+
+#[test]
+fn an_index_read_back_can_be_fed_straight_to_create_table() {
+    // Cloning a table is the obvious thing an agent does with describe_table,
+    // so what it reports has to be what create_table accepts. A flattened
+    // vector_attribute read back as a bare string failed to deserialise.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let create = json!({
+        "table_name": "McpClone",
+        "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+        "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+        "billing_mode": "PAY_PER_REQUEST",
+        "vector_indexes": [{
+            "index_name": "vix",
+            "vector_attribute": {"attribute_name": "emb"},
+            "projection": {"projection_type": "ALL"},
+            "dimensions": 3,
+            "distance_function": "COSINE"
+        }]
+    });
+    call_tool(&mut child, 1, "create_table", create);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "McpClone"}),
+    );
+    let described = tool_content(&resp);
+    let vixs = described["vector_indexes"].as_array().unwrap().clone();
+
+    // Feed what came back straight into a second create.
+    let cloned: Vec<serde_json::Value> = vixs
+        .iter()
+        .map(|v| {
+            json!({
+                "index_name": v["index_name"],
+                "vector_attribute": v["vector_attribute"],
+                "projection": {"projection_type": v["projection_type"]},
+                "dimensions": v["dimensions"],
+                "distance_function": v["distance_function"]
+            })
+        })
+        .collect();
+    let resp = call_tool(
+        &mut child,
+        3,
+        "create_table",
+        json!({
+            "table_name": "McpCloneCopy",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": cloned
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !body.contains("Invalid vector_indexes"),
+        "clone was refused: {body}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "describe_table",
+        json!({"table_name": "McpCloneCopy"}),
+    );
+    let copy = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(copy.len(), 1, "the clone carries the index");
+    assert_eq!(copy[0]["vector_attribute"]["attribute_name"], "emb");
+    assert_eq!(copy[0]["dimensions"], 3);
 }
 
 #[test]

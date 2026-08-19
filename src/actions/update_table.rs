@@ -208,7 +208,7 @@ pub struct VectorIndexUpdate {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DeleteVectorIndexAction {
-    #[serde(rename = "IndexName")]
+    #[serde(rename = "IndexName", alias = "index_name")]
     pub index_name: String,
 }
 
@@ -237,6 +237,25 @@ fn collect_vix_update_errors(val: &serde_json::Value, errors: &mut Vec<String>) 
 /// Parse the raw `VectorIndexUpdates` JSON into typed updates, normalising
 /// each create action's `Dimensions` the way the CreateTable path does so a
 /// fractional or over-range value cannot fail the typed `u32` parse.
+/// Run the `VectorIndexUpdates` request-model constraints and format the
+/// envelope, for a caller that does not arrive through the raw request's
+/// `Deserialize`. Feed it the canonical wire spelling; see the CreateTable
+/// sibling for why.
+pub(crate) fn vector_index_updates_request_model_error(val: &serde_json::Value) -> Option<String> {
+    let mut errors = Vec::new();
+    collect_vix_update_errors(val, &mut errors);
+    errors.truncate(10);
+    if errors.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} validation error{} detected: {}",
+        errors.len(),
+        if errors.len() == 1 { "" } else { "s" },
+        errors.join("; ")
+    ))
+}
+
 /// Shared with the MCP surface, so an agent's update is parsed by the same code
 /// as a wire client's and the two cannot disagree about what a create action
 /// accepts.
@@ -252,14 +271,23 @@ pub(crate) fn parse_vector_index_updates(
             .as_object()
             .ok_or_else(|| "Unexpected value type in payload".to_string())?;
         let mut update = VectorIndexUpdate::default();
-        if let Some(create) = obj.get("Create").filter(|v| !v.is_null()) {
+        // Both spellings, because the MCP surface names its fields in
+        // snake_case and `VectorIndex` already accepts them throughout. Without
+        // this the documented `{delete: {index_name}}` shape parsed into an
+        // empty update and answered that neither action was present.
+        let action = |name: &str, lower: &str| {
+            obj.get(name)
+                .filter(|v| !v.is_null())
+                .or_else(|| obj.get(lower).filter(|v| !v.is_null()))
+        };
+        if let Some(create) = action("Create", "create") {
             let mut create = create.clone();
             if let Some(create_obj) = create.as_object_mut() {
                 crate::actions::create_table::normalise_vix_dimensions_obj(create_obj);
             }
             update.create = Some(serde_json::from_value(create).map_err(|e| e.to_string())?);
         }
-        if let Some(delete) = obj.get("Delete").filter(|v| !v.is_null()) {
+        if let Some(delete) = action("Delete", "delete") {
             update.delete =
                 Some(serde_json::from_value(delete.clone()).map_err(|e| e.to_string())?);
         }

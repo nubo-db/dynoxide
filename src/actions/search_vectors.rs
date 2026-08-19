@@ -611,6 +611,7 @@ pub async fn execute<S: StorageBackend>(
     // key-string encoding the write path stores, so the two sides agree by
     // construction.
     let mut hash_scope: Option<String> = None;
+    let mut unscopable_hash = false;
     if let Some(hash) = index_hash_attr {
         let attr_defs = parse_attr_defs(&meta)?;
         // At most one pair survives the duplicate check above, so this settles
@@ -645,12 +646,21 @@ pub async fn execute<S: StorageBackend>(
                 )));
             }
             // The non-key-able arm of `to_key_string` is unreachable after the
-            // type check above and stays only as defence in depth.
-            hash_scope = pair.value.to_key_string();
+            // type check above, which itself only runs when the attribute has a
+            // declaration to check against. It stays as defence in depth, and
+            // it fails closed: leaving the scope unset would load every
+            // partition rather than none, so a value that cannot be a key
+            // matches nothing instead of matching everything.
+            match pair.value.to_key_string() {
+                Some(key) => hash_scope = Some(key),
+                None => unscopable_hash = true,
+            }
         }
     }
 
-    let candidates: Vec<VectorCandidateRow> = {
+    let candidates: Vec<VectorCandidateRow> = if unscopable_hash {
+        Vec::new()
+    } else {
         storage
             .query_vector_candidates(
                 &request.table_name,
@@ -665,8 +675,6 @@ pub async fn execute<S: StorageBackend>(
     // the condition machinery's equality (numeric for N). An item without
     // the filter attribute is excluded. HASH pairs were fully settled by the
     // scoped load above.
-    // Nested pairs stay in the per-row set even on the HASH attribute: a
-    // nested path is never settled by the scoped load and matches nothing.
     let filter_pairs: Vec<&EqualityPair> = pairs
         .iter()
         .filter(|p| Some(p.attr.as_str()) != index_hash_attr)
@@ -735,11 +743,15 @@ pub async fn execute<S: StorageBackend>(
     let mut search_results = Vec::with_capacity(scored.len());
     for (score, row) in scored {
         let key = (row.table_pk.clone(), row.table_sk.clone());
-        let item_json = items.get(&key).ok_or_else(|| {
-            DynoxideError::InternalServerError(
-                "Vector index row vanished between scoring and read".to_string(),
-            )
-        })?;
+        // A row that went between the scoring pass and this read is dropped
+        // rather than raised. The facade holds the backend for the whole call
+        // so it cannot happen there, but a caller driving the storage trait
+        // directly can delete underneath a search, and answering a concurrent
+        // delete with a 500 would be worse than answering with one result
+        // fewer.
+        let Some(item_json) = items.get(&key) else {
+            continue;
+        };
         let item: Item = serde_json::from_str(item_json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
         })?;

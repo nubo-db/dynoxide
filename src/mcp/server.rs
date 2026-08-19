@@ -901,7 +901,7 @@ impl McpServer {
         };
         // Normalised first, exactly as the wire path does, so a fractional
         // dimension count truncates here rather than being refused.
-        let vector_indexes = match params
+        let vector_indexes: Option<Vec<crate::types::VectorIndex>> = match params
             .vector_indexes
             .as_ref()
             .map(crate::actions::create_table::normalise_vix_dimensions)
@@ -916,6 +916,20 @@ impl McpServer {
                 ));
             }
         };
+        // Then held to the same request-model constraints the wire path
+        // applies. Deserialising alone does not enforce them, so without this
+        // an agent could create an index a wire client could not: an empty
+        // vector attribute name reaches ACTIVE and can never hold a row.
+        // Validated against the re-serialised value because the collectors read
+        // the wire spelling and these params are snake_case.
+        if let Some(ref vixs) = vector_indexes {
+            let canonical = serde_json::to_value(vixs).ok();
+            if let Some(msg) =
+                crate::actions::create_table::vector_indexes_request_model_error(&canonical)
+            {
+                return Ok(tool_validation_error("ValidationException", &msg));
+            }
+        }
         let local_secondary_indexes = match params
             .local_secondary_indexes
             .map(serde_json::from_value)
@@ -1664,6 +1678,36 @@ impl McpServer {
                 ));
             }
         };
+        // And held to the same request-model constraints, which the raw
+        // request's Deserialize applies and this path would otherwise skip.
+        if let Some(ref updates) = vector_index_updates {
+            let canonical = serde_json::Value::Array(
+                updates
+                    .iter()
+                    .map(|u| {
+                        let mut obj = serde_json::Map::new();
+                        if let Some(ref c) = u.create {
+                            obj.insert(
+                                "Create".to_string(),
+                                serde_json::to_value(c).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                        if let Some(ref d) = u.delete {
+                            obj.insert(
+                                "Delete".to_string(),
+                                serde_json::json!({"IndexName": d.index_name}),
+                            );
+                        }
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect(),
+            );
+            if let Some(msg) =
+                crate::actions::update_table::vector_index_updates_request_model_error(&canonical)
+            {
+                return Ok(tool_validation_error("ValidationException", &msg));
+            }
+        }
         let stream_specification = match params
             .stream_specification
             .map(serde_json::from_value)
@@ -2358,7 +2402,13 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
                         .unwrap_or_default();
                     serde_json::json!({
                         "index_name": vix.index_name,
-                        "vector_attribute": vix.vector_attribute.attribute_name,
+                        // Shaped as create_table takes it, not flattened to a
+                        // bare name: reading an index back and handing it to
+                        // the create tool is the obvious way to clone a table,
+                        // and a bare string fails to deserialise there.
+                        "vector_attribute": {
+                            "attribute_name": vix.vector_attribute.attribute_name
+                        },
                         "dimensions": vix.dimensions,
                         "distance_function": vix.distance_function,
                         "projection_type": vix.projection.projection_type,

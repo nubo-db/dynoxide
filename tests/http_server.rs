@@ -1476,6 +1476,18 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
         );
     }
 
+    // A scalar in the same position answers as it does under the GSI family:
+    // only the collection class differs by parent, not the scalar wording.
+    let resp = dynamo_request(
+        &url,
+        "UpdateTable",
+        json!({"TableName": "AnyTable", "VectorIndexUpdates": [{"Create": 5}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["Message"], "Unexpected field type");
+
     // TopK as a string is a serialisation-layer type mismatch.
     let resp = dynamo_request(
         &url,

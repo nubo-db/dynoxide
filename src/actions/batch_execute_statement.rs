@@ -17,12 +17,13 @@ pub struct BatchExecuteStatementRequest {
 
 /// One member of a batch.
 ///
-/// `#[non_exhaustive]` because this type is short of DynamoDB's: it still lacks
-/// `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`, so it will gain
-/// fields again. Construct one from `Default` and assign, or deserialise it.
-/// The enclosing `BatchExecuteStatementRequest` is deliberately not marked: it
-/// carries `Statements` and `ReturnConsumedCapacity`, which is the whole of
-/// DynamoDB's shape, so there is nothing left to add to it.
+/// `#[non_exhaustive]` because DynamoDB grows this shape and has already grown
+/// it twice here: `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`
+/// both arrived after the type was first written. The attribute means the next
+/// one costs consumers nothing. Construct one from `Default` and assign, or
+/// deserialise it. The enclosing `BatchExecuteStatementRequest` is deliberately
+/// not marked: it carries `Statements` and `ReturnConsumedCapacity`, which is
+/// the whole of DynamoDB's shape.
 #[derive(Debug, Default, Deserialize)]
 #[non_exhaustive]
 pub struct BatchStatementRequest {

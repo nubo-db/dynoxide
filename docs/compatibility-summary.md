@@ -127,6 +127,10 @@ refusing searches. Dynoxide has no such gap, so a readiness check that polls for
 real thing. If you need one that works on both, search in a retry loop and treat
 the refusal as "not yet" rather than trusting the status.
 
+The behaviour above, and where AWS's own documentation contradicts it, is
+written up in [what the DynamoDB vector search docs get
+wrong](https://martinhicks.dev/articles/dynamodb-vector-search-docs-get-wrong).
+
 The errors that only arise while an index is still filling are unreachable here
 for the same reason. Adding a GSI is compressed the same way, with the same
 consequence.

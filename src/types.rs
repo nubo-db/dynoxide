@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-/// DynamoDB AttributeValue — the core type system.
+/// DynamoDB AttributeValue - the core type system.
 ///
 /// Each variant corresponds to a DynamoDB type descriptor:
 /// S (String), N (Number as string), B (Binary), BOOL, NULL,
@@ -15,9 +15,9 @@ use std::fmt;
 pub enum AttributeValue {
     /// String type
     S(String),
-    /// Number type — stored as string per DynamoDB convention
+    /// Number type - stored as string per DynamoDB convention
     N(String),
-    /// Binary type — raw bytes, serialized as base64
+    /// Binary type - raw bytes, serialized as base64
     B(Vec<u8>),
     /// Boolean type
     BOOL(bool),
@@ -25,13 +25,13 @@ pub enum AttributeValue {
     NULL(bool),
     /// String Set
     SS(Vec<String>),
-    /// Number Set — each number stored as string
+    /// Number Set - each number stored as string
     NS(Vec<String>),
-    /// Binary Set — each element is raw bytes
+    /// Binary Set - each element is raw bytes
     BS(Vec<Vec<u8>>),
-    /// List — ordered collection of AttributeValues
+    /// List - ordered collection of AttributeValues
     L(Vec<AttributeValue>),
-    /// Map — key-value pairs
+    /// Map - key-value pairs
     M(HashMap<String, AttributeValue>),
 }
 
@@ -39,7 +39,7 @@ impl AttributeValue {
     /// Calculate the size of this attribute value in bytes,
     /// following DynamoDB's item size calculation rules.
     ///
-    /// This does NOT include the attribute name — the caller
+    /// This does NOT include the attribute name - the caller
     /// is responsible for adding the name's UTF-8 byte length.
     pub fn size(&self) -> usize {
         match self {
@@ -456,7 +456,7 @@ pub fn validate_dynamo_number(
     // But with more digits, exponent can be lower, e.g. 1.0E-130 has (mantissa=[1], exponent=-129)
     // Actually, the smallest representable is 1E-130. In our representation, 1E-130 = 0.1 * 10^-129
     // So exponent = -129 with mantissa [1].
-    // For 1E-131 = 0.1 * 10^-130, exponent = -130 — that's too small.
+    // For 1E-131 = 0.1 * 10^-130, exponent = -130 - that's too small.
     if exponent < -129 {
         return Err(crate::errors::DynoxideError::ValidationException(
             "Number underflow. Attempting to store a number with magnitude smaller than supported range"
@@ -927,6 +927,19 @@ pub fn capacity_wanted(mode: Option<&str>) -> bool {
     matches!(mode, Some("TOTAL") | Some("INDEXES"))
 }
 
+/// Whether a `ReturnConsumedCapacity` mode carries the vector write map.
+///
+/// Narrower than [`capacity_wanted`], because the per-index vector map reaches
+/// the wire under `INDEXES` alone (captured 2026-08-11, eu-west-2); `TOTAL`
+/// asks for capacity and still carries no vector fields. The sizing costs a
+/// derivation of the old image per index, so the fan-out asks here and skips
+/// the work rather than doing it and having the response builder drop it. Both
+/// ends read the same predicate so they cannot disagree about which modes mean
+/// yes.
+pub fn vector_capacity_wanted(mode: Option<&str>) -> bool {
+    matches!(mode, Some("INDEXES"))
+}
+
 /// Build a `ConsumedCapacity` for a simple table operation.
 pub fn consumed_capacity(
     table_name: &str,
@@ -1093,7 +1106,7 @@ pub(crate) fn attach_vector_index_capacity(
     mode: &Option<String>,
 ) -> Option<ConsumedCapacity> {
     let mut capacity = capacity?;
-    if vector_bytes.is_empty() || mode.as_deref() != Some("INDEXES") {
+    if vector_bytes.is_empty() || !vector_capacity_wanted(mode.as_deref()) {
         return Some(capacity);
     }
     capacity.vector_indexes = Some(
@@ -1258,7 +1271,7 @@ pub fn transactional_write_capacity(
     }
 }
 
-/// Key schema element — defines a key attribute.
+/// Key schema element - defines a key attribute.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct KeySchemaElement {
     #[serde(rename = "AttributeName", alias = "attribute_name")]
@@ -1275,7 +1288,7 @@ pub enum KeyType {
     RANGE,
 }
 
-/// Attribute definition — declares an attribute's type.
+/// Attribute definition - declares an attribute's type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AttributeDefinition {
     #[serde(rename = "AttributeName", alias = "attribute_name")]
@@ -1567,7 +1580,7 @@ impl From<&[u8]> for AttributeValue {
     }
 }
 
-// Integer types — all finite, all fit in DynamoDB's number range.
+// Integer types - all finite, all fit in DynamoDB's number range.
 macro_rules! impl_from_integer {
     ($($t:ty),+) => {
         $(

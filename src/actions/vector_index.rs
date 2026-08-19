@@ -588,7 +588,7 @@ pub async fn maintain_vector_indexes_after_write_with_defs<S: StorageBackend>(
     }
     // Only INDEXES can carry the map to the wire, so TOTAL must not pay for a
     // figure the response builder will drop.
-    let want_capacity = capacity_mode == Some("INDEXES");
+    let want_capacity = crate::types::vector_capacity_wanted(capacity_mode);
     let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
@@ -687,7 +687,7 @@ pub async fn maintain_vector_indexes_after_delete_with_defs<S: StorageBackend>(
     if vixs.is_empty() {
         return Ok(HashMap::new());
     }
-    let want_capacity = capacity_mode == Some("INDEXES");
+    let want_capacity = crate::types::vector_capacity_wanted(capacity_mode);
     let mut vector_bytes: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 

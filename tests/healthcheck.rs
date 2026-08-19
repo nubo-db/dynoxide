@@ -14,6 +14,20 @@ fn dynoxide_bin() -> &'static str {
     env!("CARGO_BIN_EXE_dynoxide")
 }
 
+/// Run the binary once so the timed tests are not measuring its first exec.
+///
+/// The first spawn of a freshly built binary pays code signature validation
+/// and dynamic linking, which costs well over a second on macOS and nothing on
+/// every spawn after it. The tests below bound how long a healthcheck takes to
+/// give up on a socket, so that one-off cost is not what they mean to measure,
+/// and it is large enough on its own to push a sub-3s assertion over the line.
+fn warm_binary() {
+    static WARMED: std::sync::Once = std::sync::Once::new();
+    WARMED.call_once(|| {
+        let _ = Command::new(dynoxide_bin()).arg("--version").output();
+    });
+}
+
 /// Spawn a real dynoxide HTTP server in-process on a random loopback port.
 async fn start_loopback_server() -> (u16, tokio::task::JoinHandle<()>) {
     let db = dynoxide::Database::memory().unwrap();
@@ -44,6 +58,7 @@ fn fails_fast_on_unused_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     };
+    warm_binary();
     let started = Instant::now();
     let status = Command::new(dynoxide_bin())
         .args(["healthcheck", "--port", &port.to_string(), "--timeout", "2"])
@@ -85,6 +100,7 @@ fn times_out_on_listener_that_never_writes() {
             held.push(s);
         }
     });
+    warm_binary();
     let started = Instant::now();
     let status = Command::new(dynoxide_bin())
         .args(["healthcheck", "--port", &port.to_string(), "--timeout", "1"])

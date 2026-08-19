@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The MCP surface reaches vector parity. `create_table` takes `vector_indexes`, `update_table` takes `vector_index_updates`, `describe_table` reports vector indexes beside the GSIs, and a new `search_vectors` tool runs the search. Before this the create tool had no vector field at all, so a request carrying one was accepted and the index silently dropped. Both parse routes now share the wire path's own parsing, so a fractional dimension count truncates for an agent exactly as it does for a wire client rather than being refused.
+
 - The `execute_partiql` MCP tool accepts `ConsistentRead`. Omitting it was harmless while the field only chose a rate; it now also decides whether a select qualified by a GSI is rejected, so an agent had no way to reach either behaviour.
 
 - `BatchExecuteStatement` accepts `ReturnConsumedCapacity` and reports capacity, which it previously had no way to do at all. Per-table entries with index arms, aggregated across the batch. A failed statement is still charged the write it attempted, sized on the larger of the row already stored and the item it carried; a batch in which nothing succeeds reports no capacity, and a table whose statements all failed is omitted entirely. Captured against eu-west-2.

@@ -101,7 +101,7 @@ With a OneTable data model for single-table designs:
 }
 ```
 
-## Available tools (34)
+## Available tools (35)
 
 | Category | Tools |
 |----------|-------|
@@ -109,6 +109,7 @@ With a OneTable data model for single-table designs:
 | Items | `get_item`, `put_item`, `update_item`, `delete_item` |
 | Batch | `batch_get_item`, `batch_write_item`, `bulk_put_items` |
 | Query | `query`, `scan` |
+| Vector search | `search_vectors` |
 | Transactions | `transact_get_items`, `transact_write_items` |
 | PartiQL | `execute_partiql`, `batch_execute_partiql`, `execute_transaction_partiql` |
 | TTL | `update_time_to_live`, `describe_time_to_live`, `sweep_ttl` |
@@ -116,6 +117,14 @@ With a OneTable data model for single-table designs:
 | Streams | `list_streams`, `describe_stream`, `get_shard_iterator`, `get_records` |
 | Snapshots | `create_snapshot`, `restore_snapshot`, `list_snapshots`, `delete_snapshot` |
 | Info | `get_database_info` |
+
+## Vector indexes
+
+An agent can create a vector index and search it without a wire client. `create_table` takes `vector_indexes`, `update_table` takes `vector_index_updates` to add or remove one, `describe_table` reports them alongside the GSIs, and `search_vectors` runs the search.
+
+The search is exact brute-force KNN over the whole index, so the top-k it returns is the true top-k. `COSINE` and `EUCLIDEAN` score as distances, where a self match is 0; `DOT_PRODUCT` scores as a similarity and can be negative. The vector attribute is left out of results unless a projection expression names it and the index projects it. A table carrying a vector index has to be `PAY_PER_REQUEST`.
+
+The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would.
 
 ## Safety options
 

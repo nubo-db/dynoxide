@@ -1208,7 +1208,7 @@ fn truncated_dimensions(v: &serde_json::Value) -> Option<i64> {
 /// `u32::MAX`, which is over the 4096 ceiling, so the typed validator then
 /// rejects them with the captured over-range message rather than letting a
 /// raw serde error surface.
-fn normalise_vix_dimensions(vix_val: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn normalise_vix_dimensions(vix_val: &serde_json::Value) -> serde_json::Value {
     let mut val = vix_val.clone();
     if let Some(arr) = val.as_array_mut() {
         for elem in arr {
@@ -1224,7 +1224,15 @@ fn normalise_vix_dimensions(vix_val: &serde_json::Value) -> serde_json::Value {
 /// with the `UpdateTable` create-action path so both parse routes apply the
 /// same truncation and clamping before the typed `u32` parse.
 pub(crate) fn normalise_vix_dimensions_obj(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    let Some(dims) = obj.get_mut("Dimensions") else {
+    // The MCP surface names its fields in snake_case, which `VectorIndex`
+    // accepts by alias, so the normalisation has to recognise both spellings or
+    // an agent would be refused a value a wire client gets truncated.
+    let key = if obj.contains_key("Dimensions") {
+        "Dimensions"
+    } else {
+        "dimensions"
+    };
+    let Some(dims) = obj.get_mut(key) else {
         return;
     };
     if let Some(d) = truncated_dimensions(dims) {

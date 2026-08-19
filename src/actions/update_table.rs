@@ -237,7 +237,10 @@ fn collect_vix_update_errors(val: &serde_json::Value, errors: &mut Vec<String>) 
 /// Parse the raw `VectorIndexUpdates` JSON into typed updates, normalising
 /// each create action's `Dimensions` the way the CreateTable path does so a
 /// fractional or over-range value cannot fail the typed `u32` parse.
-fn parse_vector_index_updates(
+/// Shared with the MCP surface, so an agent's update is parsed by the same code
+/// as a wire client's and the two cannot disagree about what a create action
+/// accepts.
+pub(crate) fn parse_vector_index_updates(
     val: &serde_json::Value,
 ) -> std::result::Result<Vec<VectorIndexUpdate>, String> {
     let arr = val

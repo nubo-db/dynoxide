@@ -170,7 +170,9 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"sweep_ttl"));
     // Bulk operations
     assert!(tool_names.contains(&"bulk_put_items"));
-    assert_eq!(tool_names.len(), 34);
+    // Vector search
+    assert!(tool_names.contains(&"search_vectors"));
+    assert_eq!(tool_names.len(), 35);
 
     drop(child.stdin.take());
     let _ = child.wait();
@@ -1082,6 +1084,196 @@ fn test_put_get_delete_item() {
 
     drop(child.stdin.take());
     let _ = child.wait();
+}
+
+#[test]
+fn vector_index_round_trips_through_mcp_alone() {
+    // An agent must be able to do the whole thing without a wire client: create
+    // the index, write to it, and search it. Before this the create tool had no
+    // vector field at all, so a request carrying one was silently dropped and
+    // the table came back without the index.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "AgentVecs",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+
+    // The control plane reflects it, so the drop is really gone.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "AgentVecs"}),
+    );
+    let described = tool_content(&resp);
+    let vixs = described["vector_indexes"]
+        .as_array()
+        .expect("the agent-facing view reports the index");
+    assert_eq!(vixs.len(), 1);
+    assert_eq!(vixs[0]["index_name"], "vix");
+    assert_eq!(vixs[0]["vector_attribute"], "emb");
+    assert_eq!(vixs[0]["dimensions"], 3);
+    assert_eq!(vixs[0]["distance_function"], "COSINE");
+
+    for (pk, emb) in [("a", ["1", "0", "0"]), ("b", ["0", "1", "0"])] {
+        call_tool(
+            &mut child,
+            10,
+            "put_item",
+            json!({
+                "table_name": "AgentVecs",
+                "item": {
+                    "pk": {"S": pk},
+                    "emb": {"L": emb.iter().map(|n| json!({"N": n})).collect::<Vec<_>>()}
+                }
+            }),
+        );
+    }
+
+    let resp = call_tool(
+        &mut child,
+        20,
+        "search_vectors",
+        json!({
+            "table_name": "AgentVecs",
+            "index_name": "vix",
+            "search_vector": [{"N": "1"}, {"N": "0"}, {"N": "0"}],
+            "top_k": 1
+        }),
+    );
+    let content = tool_content(&resp);
+    let results = content["SearchResults"].as_array().expect("SearchResults");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["Item"]["pk"]["S"], "a");
+    // COSINE is a distance, so the self match scores 0.
+    assert_eq!(results[0]["Score"], 0.0);
+    // The vector attribute is excluded from the projection by default.
+    assert!(results[0]["Item"].get("emb").is_none());
+}
+
+#[test]
+fn a_fractional_dimension_count_truncates_through_mcp_as_it_does_on_the_wire() {
+    // The wire path truncates and clamps Dimensions before the typed parse.
+    // The MCP surface names the field in snake_case, so the normalisation has
+    // to recognise both spellings or an agent is refused a value a wire client
+    // gets accepted.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "AgentFrac",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3.7,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "AgentFrac"}),
+    );
+    let described = tool_content(&resp);
+    let vixs = described["vector_indexes"]
+        .as_array()
+        .expect("index created");
+    assert_eq!(vixs.len(), 1);
+    assert_eq!(
+        vixs[0]["dimensions"], 3,
+        "3.7 truncates to 3, as on the wire"
+    );
+}
+
+#[test]
+fn vector_errors_through_mcp_are_the_wire_errors() {
+    // The tools are thin wrappers over the same facade the wire surface uses,
+    // so an agent sees the captured strings rather than an MCP paraphrase.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    // A vector index on a provisioned table is refused, as on the wire.
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "AgentVecBad",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PROVISIONED",
+            "provisioned_throughput": {"read_capacity_units": 1, "write_capacity_units": 1},
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("PAY_PER_REQUEST"),
+        "a provisioned table must refuse a vector index: {body}"
+    );
+
+    call_tool(
+        &mut child,
+        2,
+        "create_table",
+        json!({
+            "table_name": "AgentPlain",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    // Searching a table with no vector index reports the index missing.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "search_vectors",
+        json!({
+            "table_name": "AgentPlain",
+            "index_name": "nope",
+            "search_vector": [{"N": "1"}],
+            "top_k": 1
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("does not have the specified index"),
+        "expected the captured missing-index string: {body}"
+    );
 }
 
 #[test]

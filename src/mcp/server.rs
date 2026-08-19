@@ -104,6 +104,11 @@ pub struct CreateTableParams {
     )]
     pub local_secondary_indexes: Option<serde_json::Value>,
 
+    #[schemars(
+        description = "Optional vector index definitions as array of {index_name, vector_attribute: {attribute_name}, dimensions, distance_function, projection} objects. distance_function is COSINE, EUCLIDEAN or DOT_PRODUCT. Optional search_schema is an array of {attribute_name, search_schema_element_type} with element type HASH or INLINE_FILTER. A table carrying one must use PAY_PER_REQUEST. Search it with search_vectors."
+    )]
+    pub vector_indexes: Option<serde_json::Value>,
+
     #[schemars(description = "Optional stream specification {stream_enabled, stream_view_type}")]
     pub stream_specification: Option<serde_json::Value>,
 
@@ -228,6 +233,39 @@ pub struct UpdateItemParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchVectorsParams {
+    #[schemars(description = "Name of the table holding the vector index")]
+    pub table_name: String,
+
+    #[schemars(description = "Name of the vector index to search")]
+    pub index_name: String,
+
+    #[schemars(
+        description = "Query vector as an array of DynamoDB numbers, e.g. [{\"N\": \"0.1\"}, {\"N\": \"0.2\"}]. Its length must equal the index's dimensions."
+    )]
+    pub search_vector: serde_json::Value,
+
+    #[schemars(description = "How many nearest entries to return.")]
+    pub top_k: i64,
+
+    #[schemars(
+        description = "Optional equality conditions over the index's SearchSchema attributes, e.g. \"tenant = :t\". Equality only, one condition per attribute, and mandatory when the schema declares a HASH element."
+    )]
+    pub search_condition_expression: Option<String>,
+
+    #[schemars(
+        description = "Optional projection expression. The vector attribute is excluded unless named here and projected by the index."
+    )]
+    pub projection_expression: Option<String>,
+
+    #[schemars(description = "Optional expression attribute name substitutions")]
+    pub expression_attribute_names: Option<std::collections::HashMap<String, String>>,
+
+    #[schemars(description = "Optional expression attribute values as DynamoDB-typed JSON")]
+    pub expression_attribute_values: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct QueryParams {
     #[schemars(description = "Name of the table to query")]
     pub table_name: String,
@@ -426,6 +464,11 @@ pub struct UpdateTableParams {
         description = "GSI updates as array of {Create?: {index_name, key_schema, projection}, Delete?: {index_name}} objects"
     )]
     pub global_secondary_index_updates: Option<serde_json::Value>,
+
+    #[schemars(
+        description = "Vector index updates as array of {create} or {delete} objects. A create carries the same shape as a create_table vector index; a delete carries {index_name}. One index per call."
+    )]
+    pub vector_index_updates: Option<serde_json::Value>,
 
     #[schemars(description = "Stream specification {stream_enabled, stream_view_type}")]
     pub stream_specification: Option<serde_json::Value>,
@@ -856,6 +899,23 @@ impl McpServer {
                 ));
             }
         };
+        // Normalised first, exactly as the wire path does, so a fractional
+        // dimension count truncates here rather than being refused.
+        let vector_indexes = match params
+            .vector_indexes
+            .as_ref()
+            .map(crate::actions::create_table::normalise_vix_dimensions)
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidVectorIndexes",
+                    &format!("Invalid vector_indexes: {e}"),
+                ));
+            }
+        };
         let local_secondary_indexes = match params
             .local_secondary_indexes
             .map(serde_json::from_value)
@@ -932,7 +992,7 @@ impl McpServer {
             attribute_definitions,
             global_secondary_indexes,
             local_secondary_indexes,
-            vector_indexes: None,
+            vector_indexes,
             stream_specification,
             sse_specification,
             billing_mode: params.billing_mode,
@@ -1104,6 +1164,52 @@ impl McpServer {
         };
         match self.db.update_item(request) {
             Ok(resp) => json_result(&resp),
+            Err(err) => Ok(to_tool_error(err)),
+        }
+    }
+
+    #[tool(
+        description = "[READ] Search a vector index for the nearest entries to a query vector. Exact brute-force KNN over the whole index, so the top-k is the true top-k. COSINE and EUCLIDEAN score as distances, where a self match is 0; DOT_PRODUCT scores as a similarity and can be negative. The vector attribute is excluded from results unless a projection_expression names it and the index projects it. Create the index with create_table's vector_indexes."
+    )]
+    fn search_vectors(
+        &self,
+        Parameters(params): Parameters<SearchVectorsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let search_vector = match serde_json::from_value(params.search_vector) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidSearchVector",
+                    &format!("Invalid search_vector: {e}"),
+                ));
+            }
+        };
+        let expression_attribute_values = match parse_optional_dynamo_map(
+            params.expression_attribute_values,
+            "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
+        ) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+
+        let request = crate::actions::search_vectors::SearchVectorsRequest {
+            table_name: params.table_name,
+            index_name: params.index_name,
+            search_vector,
+            top_k: params.top_k,
+            search_condition_expression: params.search_condition_expression,
+            projection_expression: params.projection_expression,
+            expression_attribute_names: params.expression_attribute_names,
+            expression_attribute_values,
+            ..Default::default()
+        };
+        match self.db.search_vectors(request) {
+            Ok(resp) => {
+                let json = serde_json::to_value(&resp)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                self.json_result_checked(&json)
+            }
             Err(err) => Ok(to_tool_error(err)),
         }
     }
@@ -1542,6 +1648,22 @@ impl McpServer {
                 ));
             }
         };
+        // Parsed by the wire path's own parser, so an agent and a wire client
+        // are held to the same rules, dimension normalisation included.
+        let vector_index_updates = match params
+            .vector_index_updates
+            .as_ref()
+            .map(crate::actions::update_table::parse_vector_index_updates)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidVectorIndexUpdates",
+                    &format!("Invalid vector_index_updates: {e}"),
+                ));
+            }
+        };
         let stream_specification = match params
             .stream_specification
             .map(serde_json::from_value)
@@ -1590,9 +1712,7 @@ impl McpServer {
             table_name: params.table_name,
             attribute_definitions,
             global_secondary_index_updates,
-            // Vector index updates through MCP arrive with the wider MCP
-            // vector-parity work, not this tool revision.
-            vector_index_updates: None,
+            vector_index_updates,
             stream_specification,
             deletion_protection_enabled: params.deletion_protection_enabled,
             billing_mode: params.billing_mode,
@@ -2212,6 +2332,44 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
         })
         .unwrap_or_default();
 
+    // Vector indexes are summarised on the same terms as the GSIs. Without
+    // this an agent could create one and never see it again, since this view
+    // is the only shape describe_table returns through MCP.
+    let vector_indexes: Vec<serde_json::Value> = desc
+        .vector_indexes
+        .as_ref()
+        .map(|vixs| {
+            vixs.iter()
+                .map(|vix| {
+                    let schema: Vec<serde_json::Value> = vix
+                        .search_schema
+                        .as_ref()
+                        .map(|elems| {
+                            elems
+                                .iter()
+                                .map(|e| {
+                                    serde_json::json!({
+                                        "attribute_name": e.attribute_name,
+                                        "element_type": e.search_schema_element_type,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "index_name": vix.index_name,
+                        "vector_attribute": vix.vector_attribute.attribute_name,
+                        "dimensions": vix.dimensions,
+                        "distance_function": vix.distance_function,
+                        "projection_type": vix.projection.projection_type,
+                        "search_schema": schema,
+                        "item_count": vix.item_count.unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let stream_enabled = desc.latest_stream_arn.is_some();
 
     let billing_mode = desc
@@ -2233,6 +2391,7 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
         "item_count": desc.item_count.unwrap_or(0),
         "size_bytes": desc.table_size_bytes.unwrap_or(0),
         "gsis": gsis,
+        "vector_indexes": vector_indexes,
         "stream_enabled": stream_enabled,
         "billing_mode": billing_mode,
         "table_class": table_class,

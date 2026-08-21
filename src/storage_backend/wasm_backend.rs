@@ -119,22 +119,39 @@ impl WasmBridgeBackend {
             .map_err(js_err)?;
         // A database persisted before schema version 9 lacks the
         // `vector_index_definitions` column, and `CREATE TABLE IF NOT EXISTS`
-        // cannot add it, so the column is added with an ALTER on open. Only
-        // SQLite's duplicate-column error (the already-upgraded case) is
-        // tolerated; any other failure fails the open, because swallowing a
-        // real OPFS fault would leave the column silently absent and every
-        // later metadata statement failing far from the cause.
-        if let Err(e) = bridge_exec(
+        // cannot add it, so the column is added with an ALTER on open.
+        //
+        // The ALTER is asked for only when the column is genuinely missing.
+        // `INIT_SCHEMA` above already creates `_tables` with it, so running the
+        // ALTER unconditionally would fail on every open of every database
+        // except a legacy one, leaving the tolerated-error path as the only
+        // path most opens ever take. That is noisy, and it puts the whole open
+        // one error-message rewording away from failing, since the tolerance is
+        // a substring match. Native gates the equivalent migration on the
+        // recorded schema version; the column check is the wasm equivalent and
+        // works before any version has been stamped.
+        let existing = bridge_query(
             &handle,
-            sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN,
+            sql_builders::TABLES_COLUMN_NAMES,
             js_sys::Array::new(),
         )
         .await
-        {
-            let err = js_err(e);
-            if !sql_builders::is_duplicate_column_error(&err.to_string()) {
-                return Err(err);
-            }
+        .map_err(js_err)?;
+        let has_vector_column = js_sys::Array::from(&existing).iter().any(|row| {
+            col_text(&js_sys::Array::from(&row), 0).as_deref()
+                == Some(sql_builders::VECTOR_INDEX_DEFINITIONS_COLUMN)
+        });
+        if !has_vector_column {
+            // A real failure here fails the open: swallowing an OPFS fault
+            // would leave the column absent and every later metadata statement
+            // failing far from the cause.
+            bridge_exec(
+                &handle,
+                sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN,
+                js_sys::Array::new(),
+            )
+            .await
+            .map_err(js_err)?;
         }
         // Record the schema version (if none is recorded yet) so future wasm
         // schema changes can migrate versioned, as the native backend does,

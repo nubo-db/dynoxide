@@ -987,7 +987,22 @@ impl McpServer {
                 ));
             }
         };
-        // Normalised first, exactly as the wire path does, so a fractional
+        // Request-model constraints run against the raw values, before any
+        // normalisation, because that is the order the wire path uses and the
+        // collector echoes back what it was given. Normalising first told an
+        // agent its `-1` was a `0`, which is not the string a wire client gets
+        // for the same mistake. Only the member names are rewritten, since the
+        // collector reads the wire spelling and these params are snake_case.
+        let raw_wire_vixs = params
+            .vector_indexes
+            .as_ref()
+            .map(canonicalise_member_names);
+        if let Some(msg) =
+            crate::actions::create_table::vector_indexes_request_model_error(&raw_wire_vixs)
+        {
+            return Ok(tool_validation_error("ValidationException", &msg));
+        }
+        // Then normalised, exactly as the wire path does, so a fractional
         // dimension count truncates here rather than being refused.
         let vector_indexes: Option<Vec<crate::types::VectorIndex>> = match params
             .vector_indexes
@@ -1004,20 +1019,6 @@ impl McpServer {
                 ));
             }
         };
-        // Then held to the same request-model constraints the wire path
-        // applies. Deserialising alone does not enforce them, so without this
-        // an agent could create an index a wire client could not: an empty
-        // vector attribute name reaches ACTIVE and can never hold a row.
-        // Validated against the re-serialised value because the collectors read
-        // the wire spelling and these params are snake_case.
-        if let Some(ref vixs) = vector_indexes {
-            let canonical = serde_json::to_value(vixs).ok();
-            if let Some(msg) =
-                crate::actions::create_table::vector_indexes_request_model_error(&canonical)
-            {
-                return Ok(tool_validation_error("ValidationException", &msg));
-            }
-        }
         let local_secondary_indexes = match params
             .local_secondary_indexes
             .map(serde_json::from_value)
@@ -1277,15 +1278,6 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchVectorsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let search_vector = match serde_json::from_value(params.search_vector) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(tool_validation_error(
-                    "InvalidSearchVector",
-                    &format!("Invalid search_vector: {e}"),
-                ));
-            }
-        };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
@@ -1295,17 +1287,51 @@ impl McpServer {
             Err(err) => return Ok(err),
         };
 
-        let request = crate::actions::search_vectors::SearchVectorsRequest {
-            table_name: params.table_name,
-            index_name: params.index_name,
-            search_vector,
-            top_k: params.top_k,
-            search_condition_expression: params.search_condition_expression,
-            projection_expression: params.projection_expression,
-            expression_attribute_names: params.expression_attribute_names,
-            expression_attribute_values,
-            ..Default::default()
-        };
+        // Built as wire JSON and deserialised through the request's own
+        // `Deserialize`, rather than assembled field by field. That is where
+        // the `topK`, `SearchVector` and `IndexName` bounds live, so building
+        // the struct directly skipped every one of them and answered an agent
+        // with the operation-layer message where a wire client gets the
+        // enveloped member-path constraint. The values go across as given; only
+        // the member names change, because these params are snake_case.
+        let mut wire = serde_json::json!({
+            "TableName": params.table_name,
+            "IndexName": params.index_name,
+            "SearchVector": params.search_vector,
+            "TopK": params.top_k,
+        });
+        let optional: [(&str, Option<serde_json::Value>); 4] = [
+            (
+                "SearchConditionExpression",
+                params
+                    .search_condition_expression
+                    .map(serde_json::Value::from),
+            ),
+            (
+                "ProjectionExpression",
+                params.projection_expression.map(serde_json::Value::from),
+            ),
+            (
+                "ExpressionAttributeNames",
+                params
+                    .expression_attribute_names
+                    .and_then(|v| serde_json::to_value(v).ok()),
+            ),
+            (
+                "ExpressionAttributeValues",
+                expression_attribute_values.and_then(|v| serde_json::to_value(v).ok()),
+            ),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                wire[name] = value;
+            }
+        }
+        let request: crate::actions::search_vectors::SearchVectorsRequest =
+            match parse_json_param(wire, "search_request") {
+                Ok(r) => r,
+                Err(e) => return Ok(e),
+            };
         match self.db.search_vectors(request) {
             Ok(resp) => {
                 let json = serde_json::to_value(&resp)

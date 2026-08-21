@@ -118,6 +118,14 @@ pub const SCHEMA_VERSION: &str = "9";
 pub const ADD_VECTOR_INDEX_DEFINITIONS_COLUMN: &str =
     "ALTER TABLE _tables ADD COLUMN vector_index_definitions TEXT";
 
+/// The column the ALTER above adds, for a caller checking whether it is needed.
+pub const VECTOR_INDEX_DEFINITIONS_COLUMN: &str = "vector_index_definitions";
+
+/// Column names of `_tables`, for deciding whether a legacy database still
+/// needs the vector column added. `PRAGMA table_info` returns the name second,
+/// so this selects it alone and keeps the caller's indexing obvious.
+pub const TABLES_COLUMN_NAMES: &str = "SELECT name FROM pragma_table_info('_tables')";
+
 /// Whether a SQLite error message reports the duplicate-column failure an
 /// idempotent `ALTER TABLE ... ADD COLUMN` re-run produces. This is the only
 /// failure the column-adding open/migration steps tolerate: anything else is

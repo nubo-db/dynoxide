@@ -3684,3 +3684,130 @@ fn a_create_missing_a_member_is_named_the_way_the_wire_names_it() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+#[test]
+fn an_agents_negative_dimensions_are_echoed_the_way_the_wire_echoes_them() {
+    // The collector reads the raw value, so it must run before normalisation.
+    // Reversed, the clamp lands first and the agent is told its -1 was a 0,
+    // which is a different string from the one a wire client gets for the same
+    // mistake. The wire side pins the same text in
+    // `create_table_negative_dimensions_reports_the_value_as_given`.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpNegDims",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": -1,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("Value '-1' at 'vectorIndexes.1.member.dimensions'"),
+        "the raw value is what gets echoed: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn an_agents_search_is_held_to_the_wire_request_model() {
+    // The tool built SearchVectorsRequest field by field, which skips the
+    // hand-written Deserialize where the topK, SearchVector and IndexName
+    // bounds live. Nothing was wrongly accepted, but an agent got a different
+    // string than a wire client for the same mistake, on the one vector tool
+    // the parity work missed.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpSearchRM",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+
+    // topK below the floor: the enveloped member-path constraint, not the
+    // operation-layer range message.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "search_vectors",
+        json!({
+            "table_name": "McpSearchRM", "index_name": "vix",
+            "search_vector": [{"N": "1"}, {"N": "1"}, {"N": "0"}], "top_k": 0
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("'topK' failed to satisfy constraint"),
+        "topK must answer the request-model constraint: {msg}"
+    );
+
+    // An empty search vector: the no-echo 'SearchVector' member-path form.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "search_vectors",
+        json!({
+            "table_name": "McpSearchRM", "index_name": "vix",
+            "search_vector": [], "top_k": 5
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("'SearchVector' failed to satisfy constraint"),
+        "an empty vector must answer the request-model constraint: {msg}"
+    );
+
+    // An index name under the floor is a length constraint, not a lookup miss.
+    let resp = call_tool(
+        &mut child,
+        4,
+        "search_vectors",
+        json!({
+            "table_name": "McpSearchRM", "index_name": "ab",
+            "search_vector": [{"N": "1"}, {"N": "1"}, {"N": "0"}], "top_k": 5
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("'IndexName' failed to satisfy constraint"),
+        "a short index name must answer the length constraint: {msg}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

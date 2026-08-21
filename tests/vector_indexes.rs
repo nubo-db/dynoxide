@@ -4076,3 +4076,26 @@ fn update_table_search_schema_missing_attribute_name_rejected_at_request_model_l
          satisfy constraint: Member must not be null"
     );
 }
+
+#[test]
+fn create_table_negative_dimensions_reports_the_value_as_given() {
+    // The request-model collector reads the raw value, so a negative count is
+    // echoed as it arrived rather than as the clamp would leave it. Pinned here
+    // and on the MCP surface, which had been normalising before collecting and
+    // so reported the clamped value instead.
+    let mut vix = vix_json("vix");
+    vix.as_object_mut()
+        .unwrap()
+        .insert("Dimensions".to_string(), json!(-1));
+    let err = request_model_error(serde_json::from_value::<CreateTableRequest>(json!({
+        "TableName": "VecNegDims",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [vix]
+    })));
+    assert!(
+        err.contains("Value '-1' at 'vectorIndexes.1.member.dimensions'"),
+        "the raw value is what gets echoed: {err}"
+    );
+}

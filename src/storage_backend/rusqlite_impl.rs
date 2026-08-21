@@ -253,6 +253,8 @@ impl StorageBackend for Storage {
         table_sk: &str,
         item_json: &str,
     ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        self.check_gsi_insert_fault().map_err(dyno_to_backend)?;
         Storage::insert_gsi_item(
             self, table_name, index_name, gsi_pk, gsi_sk, table_pk, table_sk, item_json,
         )

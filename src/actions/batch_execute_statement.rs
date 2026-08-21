@@ -210,7 +210,7 @@ pub async fn execute<S: StorageBackend>(
                     });
                     continue;
                 }
-                match partiql::executor::execute_page(
+                let run = partiql::executor::execute_page(
                     storage,
                     &stmt,
                     params,
@@ -219,9 +219,16 @@ pub async fn execute<S: StorageBackend>(
                     stmt_req.consistent_read.unwrap_or(false),
                     request.return_consumed_capacity.as_deref(),
                     table.as_deref().and_then(|t| tables.get(t)),
-                )
-                .await
-                {
+                );
+                // One transaction per statement, not per batch: a batch is not
+                // atomic across its statements, so each one commits or rolls
+                // back on its own, base write and index fan-out together.
+                let outcome = if matches!(stmt, partiql::parser::Statement::Select { .. }) {
+                    run.await
+                } else {
+                    super::helpers::with_write_transaction(storage, run).await
+                };
+                match outcome {
                     Ok(page) => {
                         match page.capacity {
                             Some(capacity) => records.push(capacity),
@@ -463,4 +470,128 @@ fn build_capacity(
     }
 
     Some(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+    use crate::types::AttributeValue;
+
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_string())
+    }
+
+    async fn seed(storage: &Storage) {
+        let req = serde_json::from_value(serde_json::json!({
+            "TableName": "pq_btx",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g1", "AttributeType": "S"},
+                {"AttributeName": "g2", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "gsi-one",
+                    "KeySchema": [{"AttributeName": "g1", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                },
+                {
+                    "IndexName": "gsi-two",
+                    "KeySchema": [{"AttributeName": "g2", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }
+            ]
+        }))
+        .unwrap();
+        crate::actions::create_table::execute(storage, req)
+            .await
+            .unwrap();
+        for pk in ["a", "b"] {
+            let put = crate::actions::put_item::PutItemRequest {
+                table_name: "pq_btx".to_string(),
+                item: [
+                    ("pk".to_string(), s(pk)),
+                    ("g1".to_string(), s("x")),
+                    ("g2".to_string(), s("y")),
+                    ("val".to_string(), s("before")),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            crate::actions::put_item::execute(storage, put)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn val_of(storage: &Storage, pk: &str) -> String {
+        let req = crate::actions::get_item::GetItemRequest {
+            table_name: "pq_btx".to_string(),
+            key: [("pk".to_string(), s(pk))].into_iter().collect(),
+            ..Default::default()
+        };
+        match crate::actions::get_item::execute(storage, req)
+            .await
+            .unwrap()
+            .item
+            .unwrap()
+            .get("val")
+            .unwrap()
+        {
+            AttributeValue::S(v) => v.clone(),
+            other => panic!("unexpected val: {other:?}"),
+        }
+    }
+
+    fn stmt(statement: &str) -> BatchStatementRequest {
+        BatchStatementRequest {
+            statement: statement.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_statement_rolls_back_without_taking_its_neighbour_with_it() {
+        // The transaction is per statement, not per batch. A batch is not
+        // atomic across its statements on DynamoDB, so the one that fails must
+        // roll its own fan-out back and leave the one that succeeded standing.
+        let storage = Storage::memory().unwrap();
+        seed(&storage).await;
+
+        // The first statement's fan-out runs clean (two inserts), the second
+        // gets one insert in and fails on the other.
+        storage.fail_gsi_insert_after(3);
+        let out = execute(
+            &storage,
+            BatchExecuteStatementRequest {
+                statements: vec![
+                    stmt("UPDATE \"pq_btx\" SET val='after' WHERE pk='a'"),
+                    stmt("UPDATE \"pq_btx\" SET val='after' WHERE pk='b'"),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.responses[0].error.is_none(),
+            "the first statement should stand: {:?}",
+            out.responses[0].error
+        );
+        assert_eq!(
+            val_of(&storage, "a").await,
+            "after",
+            "a committed statement must survive its neighbour failing"
+        );
+        assert_eq!(
+            val_of(&storage, "b").await,
+            "before",
+            "the failed statement must roll its own base row back"
+        );
+    }
 }

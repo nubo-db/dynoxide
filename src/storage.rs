@@ -254,6 +254,11 @@ pub struct Storage {
     metadata_cache: RefCell<HashMap<String, TableMetadata>>,
     /// Wall-clock used by stream / TTL paths. Defaults to [`SystemClock`].
     clock: Arc<dyn Clock>,
+    /// Countdown to a forced GSI insert failure, for tests that need a write
+    /// to fail part way through its index fan-out. `None` never fires. Compiled
+    /// out of every build but the crate's own unit tests.
+    #[cfg(test)]
+    gsi_insert_fault: RefCell<Option<u32>>,
 }
 
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
@@ -264,10 +269,37 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize().map_err(Self::maybe_encrypted_error)?;
         Ok(storage)
+    }
+
+    /// Arm a forced failure on the nth GSI insert, counting from one, so a
+    /// write fails part way through its index fan-out. Nothing else can
+    /// produce that: a fan-out either runs to completion or the whole write
+    /// was rejected before it started.
+    #[cfg(test)]
+    pub(crate) fn fail_gsi_insert_after(&self, successes: u32) {
+        *self.gsi_insert_fault.borrow_mut() = Some(successes);
+    }
+
+    /// Consume one step of the armed countdown, erroring when it reaches zero.
+    #[cfg(test)]
+    pub(crate) fn check_gsi_insert_fault(&self) -> Result<()> {
+        let mut fault = self.gsi_insert_fault.borrow_mut();
+        match fault.as_mut() {
+            Some(0) => Err(crate::errors::DynoxideError::InternalServerError(
+                "injected GSI insert failure".to_string(),
+            )),
+            Some(remaining) => {
+                *remaining -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Replace the [`Clock`] used by the stream and TTL paths. Returns `self`
@@ -323,6 +355,8 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
@@ -335,6 +369,8 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;

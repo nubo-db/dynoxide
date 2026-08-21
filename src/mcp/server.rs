@@ -688,8 +688,6 @@ fn parse_optional_dynamo_map(
 // Helper: serialize response to tool result
 // ---------------------------------------------------------------------------
 
-/// Return a tool-level validation error (keeps the agent conversation flowing,
-/// unlike McpError which may abort it).
 /// Rewrite a `vector_index_updates` value into the wire spelling.
 ///
 /// This surface documents snake_case, as the rest of its tools do, while the
@@ -709,23 +707,16 @@ fn canonicalise_vector_index_updates(val: &serde_json::Value) -> serde_json::Val
                     return entry.clone();
                 };
                 let mut out = serde_json::Map::new();
+                // Whatever the action holds is renamed and handed on, null
+                // included: the parser and the collector each have their own
+                // rule for a null or ill-typed action, and both of those match
+                // the wire already. Deciding here instead would answer a type
+                // error where the wire answers that neither action was given.
                 if let Some(c) = obj.get("Create").or_else(|| obj.get("create")) {
-                    // A create action is a vector index definition, and that
-                    // type carries snake_case aliases throughout, so a round
-                    // trip through it is the translation.
-                    let canonical = serde_json::from_value::<crate::types::VectorIndex>(c.clone())
-                        .ok()
-                        .and_then(|v| serde_json::to_value(v).ok())
-                        .unwrap_or_else(|| c.clone());
-                    out.insert("Create".to_string(), canonical);
+                    out.insert("Create".to_string(), canonicalise_member_names(c));
                 }
                 if let Some(d) = obj.get("Delete").or_else(|| obj.get("delete")) {
-                    let name = d
-                        .get("IndexName")
-                        .or_else(|| d.get("index_name"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    out.insert("Delete".to_string(), serde_json::json!({"IndexName": name}));
+                    out.insert("Delete".to_string(), canonicalise_member_names(d));
                 }
                 if out.is_empty() {
                     return entry.clone();
@@ -736,6 +727,57 @@ fn canonicalise_vector_index_updates(val: &serde_json::Value) -> serde_json::Val
     )
 }
 
+/// The wire spelling of a vector index member name, for the members a create
+/// or delete action carries. Anything else is passed through as it arrived.
+///
+/// The names are unique across the shapes a definition nests, so one flat map
+/// applied at every depth cannot collide: `attribute_name` means the same
+/// thing under `VectorAttribute` as under a `SearchSchema` element.
+fn wire_member_name(key: &str) -> &str {
+    match key {
+        "index_name" => "IndexName",
+        "vector_attribute" => "VectorAttribute",
+        "search_schema" => "SearchSchema",
+        "projection" => "Projection",
+        "dimensions" => "Dimensions",
+        "distance_function" => "DistanceFunction",
+        "attribute_name" => "AttributeName",
+        "search_schema_element_type" => "SearchSchemaElementType",
+        "projection_type" => "ProjectionType",
+        "non_key_attributes" => "NonKeyAttributes",
+        other => other,
+    }
+}
+
+/// Rewrite every member name in an action into its wire spelling, at any depth.
+///
+/// A rename and nothing else, so it cannot fail. That matters more than it
+/// looks: the request-model collector reads wire spellings alone, so anything
+/// reaching it in another casing is reported as a null member the caller did in
+/// fact supply. Translating through the typed definition instead left exactly
+/// the values that fail a `u32` parse, a fractional or over-range `dimensions`
+/// among them, to fall through untranslated and be described that way.
+fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(obj) => serde_json::Value::Object(
+            obj.iter()
+                .map(|(k, v)| {
+                    (
+                        wire_member_name(k).to_string(),
+                        canonicalise_member_names(v),
+                    )
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalise_member_names).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Return a tool-level validation error (keeps the agent conversation flowing,
+/// unlike McpError which may abort it).
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
     CallToolResult::error(vec![Content::text(
         serde_json::json!({
@@ -1717,6 +1759,17 @@ impl McpServer {
             .vector_index_updates
             .as_ref()
             .map(canonicalise_vector_index_updates);
+        // Request-model constraints first, then the typed parse, which is the
+        // order the raw request's Deserialize runs them in. Reversed, a create
+        // missing a member answers a serde error where the wire names the
+        // member and its path.
+        if let Some(ref canonical) = canonical_updates {
+            if let Some(msg) =
+                crate::actions::update_table::vector_index_updates_request_model_error(canonical)
+            {
+                return Ok(tool_validation_error("ValidationException", &msg));
+            }
+        }
         let vector_index_updates = match canonical_updates
             .as_ref()
             .map(crate::actions::update_table::parse_vector_index_updates)
@@ -1730,15 +1783,6 @@ impl McpServer {
                 ));
             }
         };
-        // And held to the same request-model constraints, which the raw
-        // request's Deserialize applies and this path would otherwise skip.
-        if let Some(ref canonical) = canonical_updates {
-            if let Some(msg) =
-                crate::actions::update_table::vector_index_updates_request_model_error(canonical)
-            {
-                return Ok(tool_validation_error("ValidationException", &msg));
-            }
-        }
         let stream_specification = match params
             .stream_specification
             .map(serde_json::from_value)
@@ -2416,10 +2460,11 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
         .map(|vixs| {
             vixs.iter()
                 .map(|vix| {
-                    let schema: Vec<serde_json::Value> = vix
-                        .search_schema
-                        .as_ref()
-                        .map(|elems| {
+                    // Absent stays absent. Defaulting to `[]` would be read
+                    // back and fed to create_table as an empty search schema
+                    // the index never carried.
+                    let schema: Option<Vec<serde_json::Value>> =
+                        vix.search_schema.as_ref().map(|elems| {
                             elems
                                 .iter()
                                 .map(|e| {
@@ -2430,9 +2475,8 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
                                     })
                                 })
                                 .collect()
-                        })
-                        .unwrap_or_default();
-                    serde_json::json!({
+                        });
+                    let mut out = serde_json::json!({
                         "index_name": vix.index_name,
                         // Shaped as create_table takes it, not flattened to a
                         // bare name: reading an index back and handing it to
@@ -2444,9 +2488,12 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
                         "dimensions": vix.dimensions,
                         "distance_function": vix.distance_function,
                         "projection": {"projection_type": vix.projection.projection_type},
-                        "search_schema": schema,
                         "item_count": vix.item_count.unwrap_or(0),
-                    })
+                    });
+                    if let Some(schema) = schema {
+                        out["search_schema"] = serde_json::Value::Array(schema);
+                    }
+                    out
                 })
                 .collect()
         })

@@ -4054,3 +4054,25 @@ async fn the_vector_arm_serialises_under_the_captured_key_names() {
         json!({"vix": {"VectorWriteRequestBytes": 1024.0}})
     );
 }
+
+#[test]
+fn update_table_search_schema_missing_attribute_name_rejected_at_request_model_layer() {
+    // The message the MCP surface is pinned to as well, in
+    // `a_create_missing_a_member_is_named_the_way_the_wire_names_it`. Both
+    // spell it out in full so the two cannot drift apart quietly.
+    let mut create = vix_json("vix");
+    create.as_object_mut().unwrap().insert(
+        "SearchSchema".to_string(),
+        json!([{"SearchSchemaElementType": "HASH"}]),
+    );
+    let err = request_model_error(serde_json::from_value::<UpdateTableRequest>(json!({
+        "TableName": "VecSchemaNoName",
+        "VectorIndexUpdates": [{"Create": create}]
+    })));
+    assert_eq!(
+        err,
+        "1 validation error detected: Value null at \
+         'vectorIndexUpdates.1.member.create.searchSchema.1.member.attributeName' failed to \
+         satisfy constraint: Member must not be null"
+    );
+}

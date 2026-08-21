@@ -3436,3 +3436,251 @@ fn off_loopback_bind_accepts_allowlisted_name() {
         "allowlisted by-name Host on a 0.0.0.0 bind should be accepted, got: {resp}"
     );
 }
+
+#[test]
+fn a_snake_case_create_the_canonicaliser_cannot_parse_is_still_validated() {
+    // The canonicaliser rewrites a create action by round-tripping it through
+    // `VectorIndex`, and falls back to the caller's raw object when that parse
+    // fails. A fractional `dimensions` fails it, because the typed field is a
+    // `u32` and normalisation has not run yet. The raw object is snake_case, so
+    // the request-model collector, which reads wire spellings alone, reports
+    // every member as null, naming five fields the caller did supply. The wire
+    // path normalises before it validates; this one has to as well.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecBypass",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpVecBypass",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": ""},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3.5,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    let msg = content["message"].as_str().unwrap();
+    assert!(
+        msg.contains("vectorAttribute.attributeName"),
+        "the empty attribute name is the fault worth reporting: {content}"
+    );
+    assert!(
+        !msg.contains("indexName' failed to satisfy constraint: Member must not be null"),
+        "a supplied member must not be reported as null: {content}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "McpVecBypass"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        vixs.is_empty(),
+        "a refused create must not leave an index behind: {vixs:?}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_null_delete_action_is_reported_as_a_missing_action() {
+    // The canonicaliser rewrote any delete value, null included, into
+    // `{"IndexName": null}`. That is no longer null, so the parser's own null
+    // filter stopped skipping it and the entry answered a type error where the
+    // wire answers that neither action was supplied.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpNullDel",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpNullDel",
+            "vector_index_updates": [{"delete": null}]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("One of VectorIndexUpdate.Create, VectorIndexUpdate.Delete must not be null"),
+        "unexpected message: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn an_index_without_a_search_schema_clones_without_one() {
+    // The read-back defaulted an absent search schema to `[]`, and the clone
+    // test fed the read-back straight back to create_table, so a copy gained an
+    // empty search schema the original never carried. The sibling clone test
+    // covers the populated case; this one covers the absent case it stopped
+    // exercising when its fixture gained a schema.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpNoSchema",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "McpNoSchema"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(vixs.len(), 1);
+    assert!(
+        vixs[0].get("search_schema").is_none(),
+        "an index created without a search schema must read back without one: {}",
+        vixs[0]
+    );
+
+    // Feed it back verbatim, the way an agent cloning a table would.
+    call_tool(
+        &mut child,
+        3,
+        "create_table",
+        json!({
+            "table_name": "McpNoSchemaCopy",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": vixs
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        4,
+        "describe_table",
+        json!({"table_name": "McpNoSchemaCopy"}),
+    );
+    let copied = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(copied.len(), 1, "the clone carries the index");
+    assert!(
+        copied[0].get("search_schema").is_none(),
+        "the clone must not gain a search schema: {}",
+        copied[0]
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_create_missing_a_member_is_named_the_way_the_wire_names_it() {
+    // The request-model constraints run before the typed parse here, as they do
+    // in the raw request's Deserialize. Reversed, a search schema element with
+    // no attribute name answered serde's `missing field` where the wire names
+    // the member and the path it sits on.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecOrder",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpVecOrder",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "search_schema": [{"search_schema_element_type": "HASH"}],
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    // The wire's own string, verbatim. Its sibling on the wire side is
+    // `update_table_search_schema_missing_attribute_name_rejected_at_request_model_layer`,
+    // which pins the same literal, so a drift on either surface fails there.
+    assert_eq!(
+        content["message"],
+        "1 validation error detected: Value null at \
+         'vectorIndexUpdates.1.member.create.searchSchema.1.member.attributeName' failed to \
+         satisfy constraint: Member must not be null"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

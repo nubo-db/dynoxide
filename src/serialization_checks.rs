@@ -15,7 +15,7 @@ const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflecti
 /// `Option<serde_json::Value>` for these fields, serde accepts any JSON type.
 /// This function inspects the raw JSON and returns the appropriate
 /// SerializationException before serde gets involved.
-pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crate::Result<()> {
+pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crate::Result<()> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
 
@@ -30,10 +30,12 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
             check_field_is_list(obj, "KeySchema")?;
             check_field_is_list(obj, "LocalSecondaryIndexes")?;
             check_field_is_list(obj, "GlobalSecondaryIndexes")?;
+            check_field_is_list(obj, "VectorIndexes")?;
             check_list_elements_are_structs(obj, "AttributeDefinitions")?;
             check_list_elements_are_structs(obj, "KeySchema")?;
             check_list_elements_are_structs(obj, "LocalSecondaryIndexes")?;
             check_list_elements_are_structs(obj, "GlobalSecondaryIndexes")?;
+            check_list_elements_are_structs(obj, "VectorIndexes")?;
 
             // Check struct fields and their inner scalar types
             check_field_is_struct(obj, "ProvisionedThroughput")?;
@@ -81,6 +83,37 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
                     }
                 }
             }
+
+            // Check nested fields inside VectorIndexes
+            if let Some(serde_json::Value::Array(arr)) = obj.get("VectorIndexes") {
+                for item in arr {
+                    if let Some(inner) = item.as_object() {
+                        check_field_is_struct(inner, "VectorAttribute")?;
+                        check_field_is_struct(inner, "Projection")?;
+                        check_field_is_list(inner, "SearchSchema")?;
+                        check_list_elements_are_structs(inner, "SearchSchema")?;
+                        check_field_is_string(inner, "IndexName")?;
+                        check_field_is_string(inner, "DistanceFunction")?;
+                        check_field_is_int(inner, "Dimensions")?;
+                        check_nested_projection_fields(inner)?;
+                        if let Some(va) = inner.get("VectorAttribute").and_then(|v| v.as_object()) {
+                            check_field_is_string(va, "AttributeName")?;
+                        }
+                        if let Some(serde_json::Value::Array(schema)) = inner.get("SearchSchema") {
+                            for elem in schema {
+                                if let Some(eo) = elem.as_object() {
+                                    check_field_is_string(eo, "AttributeName")?;
+                                    check_field_is_string(eo, "SearchSchemaElementType")?;
+                                }
+                            }
+                        }
+                        if let Some(proj) = inner.get("Projection").and_then(|p| p.as_object()) {
+                            check_field_is_list(proj, "NonKeyAttributes")?;
+                            check_nested_list_strings(proj, "NonKeyAttributes")?;
+                        }
+                    }
+                }
+            }
         }
         "UpdateTable" => {
             check_field_is_list(obj, "GlobalSecondaryIndexUpdates")?;
@@ -106,6 +139,59 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
                         if let Some(update) = inner.get("Update").and_then(|v| v.as_object()) {
                             check_field_is_struct(update, "ProvisionedThroughput")?;
                             check_nested_pt_fields(update)?;
+                        }
+                    }
+                }
+            }
+            // Check inside VectorIndexUpdates; the Create action carries the
+            // same shape as a CreateTable VectorIndexes entry.
+            check_field_is_list(obj, "VectorIndexUpdates")?;
+            check_list_elements_are_structs(obj, "VectorIndexUpdates")?;
+            if let Some(serde_json::Value::Array(arr)) = obj.get("VectorIndexUpdates") {
+                for item in arr {
+                    if let Some(inner) = item.as_object() {
+                        check_field_is_struct_as(
+                            inner,
+                            "Create",
+                            "com.amazonaws.dynamodb.v20120810.CreateVectorIndexAction",
+                        )?;
+                        check_field_is_struct_as(
+                            inner,
+                            "Delete",
+                            "com.amazonaws.dynamodb.v20120810.DeleteVectorIndexAction",
+                        )?;
+                        if let Some(create) = inner.get("Create").and_then(|v| v.as_object()) {
+                            check_field_is_struct(create, "VectorAttribute")?;
+                            check_field_is_struct(create, "Projection")?;
+                            check_field_is_list(create, "SearchSchema")?;
+                            check_list_elements_are_structs(create, "SearchSchema")?;
+                            check_field_is_string(create, "IndexName")?;
+                            check_field_is_string(create, "DistanceFunction")?;
+                            check_field_is_int(create, "Dimensions")?;
+                            check_nested_projection_fields(create)?;
+                            if let Some(va) =
+                                create.get("VectorAttribute").and_then(|v| v.as_object())
+                            {
+                                check_field_is_string(va, "AttributeName")?;
+                            }
+                            if let Some(serde_json::Value::Array(schema)) =
+                                create.get("SearchSchema")
+                            {
+                                for elem in schema {
+                                    if let Some(eo) = elem.as_object() {
+                                        check_field_is_string(eo, "AttributeName")?;
+                                        check_field_is_string(eo, "SearchSchemaElementType")?;
+                                    }
+                                }
+                            }
+                            if let Some(proj) = create.get("Projection").and_then(|p| p.as_object())
+                            {
+                                check_field_is_list(proj, "NonKeyAttributes")?;
+                                check_nested_list_strings(proj, "NonKeyAttributes")?;
+                            }
+                        }
+                        if let Some(delete) = inner.get("Delete").and_then(|v| v.as_object()) {
+                            check_field_is_string(delete, "IndexName")?;
                         }
                     }
                 }
@@ -254,10 +340,20 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
             check_field_is_list(obj, "Tags")?;
             check_list_elements_are_structs(obj, "Tags")?;
         }
+        "SearchVectors" => {
+            // SearchVector is a bare array of AttributeValue structs, not
+            // wrapped in L. TableName, IndexName, ProjectionExpression, and
+            // the expression attribute maps are covered by the common checks
+            // below.
+            check_field_is_list(obj, "SearchVector")?;
+            check_list_elements_are_structs(obj, "SearchVector")?;
+            check_field_is_int(obj, "TopK")?;
+            check_field_is_string(obj, "SearchConditionExpression")?;
+        }
         _ => {}
     }
 
-    // Common map fields — checked AFTER operation-specific nested fields
+    // Common map fields: checked AFTER operation-specific nested fields
     check_field_is_map(
         obj,
         "Key",
@@ -296,7 +392,7 @@ pub(super) fn pre_check_serialization_types(operation: &str, body: &str) -> crat
         }
     }
 
-    // Common scalar fields — checked AFTER nested fields to match DynamoDB ordering
+    // Common scalar fields: checked AFTER nested fields to match DynamoDB ordering
     check_field_is_string(obj, "TableName")?;
     check_field_is_string(obj, "IndexName")?;
     check_field_is_string(obj, "ReturnConsumedCapacity")?;
@@ -454,6 +550,10 @@ fn check_list_elements_are_structs(
         "GlobalSecondaryIndexUpdates" => {
             "com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndexUpdate"
         }
+        "VectorIndexes" => "com.amazonaws.dynamodb.v20120810.VectorIndex",
+        "VectorIndexUpdates" => "com.amazonaws.dynamodb.v20120810.VectorIndexUpdate",
+        "SearchSchema" => "com.amazonaws.dynamodb.v20120810.SearchSchemaElement",
+        "SearchVector" => "com.amazonaws.dynamodb.v20120810.AttributeValue",
         "Tags" => "com.amazonaws.dynamodb.v20120810.Tag",
         _ => "Unknown",
     };
@@ -596,6 +696,32 @@ fn check_field_is_map(
     Err(crate::DynoxideError::SerializationException(msg))
 }
 
+/// As [`check_field_is_struct`], but for a field whose type depends on which
+/// parent holds it. `Create` and `Delete` name a GSI action under
+/// `GlobalSecondaryIndexUpdates` and a vector action under
+/// `VectorIndexUpdates`, and the field name alone cannot tell them apart, so
+/// the vector call sites pass their own class rather than inheriting the GSI
+/// one and reporting the wrong type. Every other answer matches the sibling.
+fn check_field_is_struct_as(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    class: &str,
+) -> crate::Result<()> {
+    let val = match obj.get(field) {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(()),
+    };
+    if val.is_object() {
+        return Ok(());
+    }
+    let msg = if val.is_array() {
+        format!("Unrecognized collection type class {class}")
+    } else {
+        "Unexpected field type".to_string()
+    };
+    Err(crate::DynoxideError::SerializationException(msg))
+}
+
 /// Check that a field, if present and not null, is a JSON object (struct).
 /// Returns SerializationException with the appropriate message for the wrong type.
 fn check_field_is_struct(
@@ -618,6 +744,7 @@ fn check_field_is_struct(
                 Some("com.amazonaws.dynamodb.v20120810.ProvisionedThroughput")
             }
             "Projection" => Some("com.amazonaws.dynamodb.v20120810.Projection"),
+            "VectorAttribute" => Some("com.amazonaws.dynamodb.v20120810.VectorAttributeDefinition"),
             "DeleteRequest" => Some("com.amazonaws.dynamodb.v20120810.DeleteRequest"),
             "PutRequest" => Some("com.amazonaws.dynamodb.v20120810.PutRequest"),
             "Create" => Some("com.amazonaws.dynamodb.v20120810.CreateGlobalSecondaryIndexAction"),

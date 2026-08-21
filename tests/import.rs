@@ -810,6 +810,114 @@ fields = ["email"]
     }
 
     #[test]
+    fn test_scaffold_round_trips_a_vector_index_alongside_a_gsi_and_lsi() {
+        // A table's own DescribeTable output, fed back in as a schema file,
+        // must rebuild every index type. The round trip is the invariant: it
+        // catches a dropped field without anyone maintaining a list of fields.
+        let source_db = dynoxide::Database::memory().unwrap();
+        let create = serde_json::json!({
+            "TableName": "VecRoundTrip",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"},
+                {"AttributeName": "tenant", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi1",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "KEYS_ONLY"}
+            }],
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "SearchSchema": [
+                    {"AttributeName": "tenant", "SearchSchemaElementType": "HASH"}
+                ],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["label"]},
+                "Dimensions": 8,
+                "DistanceFunction": "EUCLIDEAN"
+            }]
+        });
+        source_db
+            .create_table(serde_json::from_value(create).unwrap())
+            .unwrap();
+        let described = source_db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "VecRoundTrip".to_string(),
+            })
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        let schema = serde_json::json!({
+            "Table": serde_json::to_value(&described.table).unwrap()
+        });
+        create_schema_file(&schema_file, &[schema]);
+
+        let db = dynoxide::Database::memory().unwrap();
+        let n = import::scaffold_from_schema(&db, &schema_file).unwrap();
+        assert_eq!(n, 1);
+
+        let info = db
+            .describe_table(dynoxide::actions::describe_table::DescribeTableRequest {
+                table_name: "VecRoundTrip".to_string(),
+            })
+            .unwrap();
+
+        // A vector index forces PAY_PER_REQUEST, and DescribeTable reports a
+        // zeroed ProvisionedThroughput block beside it that CreateTable
+        // rejects. The round trip only works because the billing-mode hoist
+        // strips that block, so this covers the seam between the two.
+        let billing = info
+            .table
+            .billing_mode_summary
+            .expect("billing mode survives");
+        assert_eq!(billing.billing_mode, "PAY_PER_REQUEST");
+
+        let gsis = info.table.global_secondary_indexes.expect("GSI survives");
+        assert_eq!(gsis.len(), 1);
+        assert_eq!(gsis[0].index_name, "gsi1");
+        let lsis = info.table.local_secondary_indexes.expect("LSI survives");
+        assert_eq!(lsis.len(), 1);
+        assert_eq!(lsis[0].index_name, "lsi1");
+
+        let vixs = info.table.vector_indexes.expect("vector index survives");
+        assert_eq!(vixs.len(), 1);
+        let vix = &vixs[0];
+        assert_eq!(vix.index_name, "vix");
+        assert_eq!(vix.vector_attribute.attribute_name, "embedding");
+        assert_eq!(vix.dimensions, 8);
+        assert_eq!(vix.distance_function, "EUCLIDEAN");
+        assert_eq!(
+            vix.projection.projection_type,
+            Some(dynoxide::types::ProjectionType::INCLUDE)
+        );
+        assert_eq!(
+            vix.projection.non_key_attributes.as_deref(),
+            Some(["label".to_string()].as_slice())
+        );
+        let schema_elems = vix.search_schema.as_ref().expect("SearchSchema survives");
+        assert_eq!(schema_elems.len(), 1);
+        assert_eq!(schema_elems[0].attribute_name, "tenant");
+        assert_eq!(schema_elems[0].search_schema_element_type, "HASH");
+    }
+
+    #[test]
     fn test_scaffold_missing_file_errors() {
         let db = dynoxide::Database::memory().unwrap();
         let result = import::scaffold_from_schema(

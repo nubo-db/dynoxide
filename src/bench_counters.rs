@@ -31,6 +31,9 @@ mod enabled {
     pub static METADATA_READS: AtomicUsize = AtomicUsize::new(0);
     /// Key schemas parsed out of a table's metadata JSON.
     pub static KEY_SCHEMA_PARSES: AtomicUsize = AtomicUsize::new(0);
+    /// Index definition sets deserialised out of a table's metadata JSON, by
+    /// the `parse_*_defs` helpers. One per family per call.
+    pub static INDEX_DEFS_PARSES: AtomicUsize = AtomicUsize::new(0);
 
     pub fn record(counter: &AtomicUsize) {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -38,7 +41,12 @@ mod enabled {
 
     /// Zero every counter. Call before the operation under measurement.
     pub fn reset() {
-        for counter in [&INDEX_ENTRIES_BUILT, &METADATA_READS, &KEY_SCHEMA_PARSES] {
+        for counter in [
+            &INDEX_ENTRIES_BUILT,
+            &METADATA_READS,
+            &KEY_SCHEMA_PARSES,
+            &INDEX_DEFS_PARSES,
+        ] {
             counter.store(0, Ordering::Relaxed);
         }
     }
@@ -49,6 +57,7 @@ mod enabled {
             index_entries_built: INDEX_ENTRIES_BUILT.load(Ordering::Relaxed),
             metadata_reads: METADATA_READS.load(Ordering::Relaxed),
             key_schema_parses: KEY_SCHEMA_PARSES.load(Ordering::Relaxed),
+            index_defs_parses: INDEX_DEFS_PARSES.load(Ordering::Relaxed),
         }
     }
 
@@ -57,6 +66,7 @@ mod enabled {
         pub index_entries_built: usize,
         pub metadata_reads: usize,
         pub key_schema_parses: usize,
+        pub index_defs_parses: usize,
     }
 }
 
@@ -68,6 +78,7 @@ mod enabled {
     pub static INDEX_ENTRIES_BUILT: Counter = Counter;
     pub static METADATA_READS: Counter = Counter;
     pub static KEY_SCHEMA_PARSES: Counter = Counter;
+    pub static INDEX_DEFS_PARSES: Counter = Counter;
 
     #[inline(always)]
     pub fn record(_counter: &Counter) {}

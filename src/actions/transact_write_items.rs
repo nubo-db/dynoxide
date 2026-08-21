@@ -102,7 +102,7 @@ pub struct TransactConditionCheck {
 pub struct TransactWriteItemsResponse {
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<Vec<crate::types::ConsumedCapacity>>,
-    /// Item collection metrics per table. Currently always `None` — full metrics
+    /// Item collection metrics per table. Currently always `None`: full metrics
     /// computation for transactional writes is deferred to a future release.
     #[serde(
         rename = "ItemCollectionMetrics",
@@ -455,27 +455,17 @@ async fn execute_put<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_write(storage, &meta, &target, &item).await?;
 
-    let lsi_units = super::lsi::maintain_lsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_write(storage, &meta, &target, &item).await?;
+
+    let vector_bytes =
+        super::vector_index::maintain_vector_indexes_after_write(storage, &meta, &target, &item)
+            .await?;
 
     // Record stream event
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -486,7 +476,8 @@ async fn execute_put<S: StorageBackend>(
         Some(size),
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 async fn execute_update<S: StorageBackend>(
@@ -597,27 +588,17 @@ async fn execute_update<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = super::gsi::maintain_gsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_write(storage, &meta, &target, &item).await?;
 
-    let lsi_units = super::lsi::maintain_lsis_after_write(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        &item,
-        capacity_mode,
-    )
-    .await?;
+    let lsi_units = super::lsi::maintain_lsis_after_write(storage, &meta, &target, &item).await?;
+
+    let vector_bytes =
+        super::vector_index::maintain_vector_indexes_after_write(storage, &meta, &target, &item)
+            .await?;
 
     // Record stream event
     crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&item)).await?;
@@ -632,7 +613,8 @@ async fn execute_update<S: StorageBackend>(
         Some(size),
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 async fn execute_delete<S: StorageBackend>(
@@ -692,24 +674,14 @@ async fn execute_delete<S: StorageBackend>(
         sk: &sk,
         pk_attr: &key_schema.partition_key,
         sk_attr: key_schema.sort_key.as_deref(),
+        old_item: old_item.as_ref(),
+        capacity_mode,
     };
 
-    let gsi_units = super::gsi::maintain_gsis_after_delete(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
-    let lsi_units = super::lsi::maintain_lsis_after_delete(
-        storage,
-        &meta,
-        &target,
-        old_item.as_ref(),
-        capacity_mode,
-    )
-    .await?;
+    let gsi_units = super::gsi::maintain_gsis_after_delete(storage, &meta, &target).await?;
+    let lsi_units = super::lsi::maintain_lsis_after_delete(storage, &meta, &target).await?;
+    let vector_bytes =
+        super::vector_index::maintain_vector_indexes_after_delete(storage, &meta, &target).await?;
 
     // Record stream event
     if old_item.is_some() {
@@ -722,7 +694,8 @@ async fn execute_delete<S: StorageBackend>(
         None,
         gsi_units,
         lsi_units,
-    ))
+    )
+    .with_vector_bytes(vector_bytes))
 }
 
 async fn execute_condition_check<S: StorageBackend>(

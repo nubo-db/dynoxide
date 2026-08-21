@@ -170,7 +170,9 @@ fn test_tools_list() {
     assert!(tool_names.contains(&"sweep_ttl"));
     // Bulk operations
     assert!(tool_names.contains(&"bulk_put_items"));
-    assert_eq!(tool_names.len(), 34);
+    // Vector search
+    assert!(tool_names.contains(&"search_vectors"));
+    assert_eq!(tool_names.len(), 35);
 
     drop(child.stdin.take());
     let _ = child.wait();
@@ -1067,7 +1069,7 @@ fn test_put_get_delete_item() {
     let content = tool_content(&resp);
     assert_eq!(content["Attributes"]["name"]["S"], "Widget");
 
-    // Get item again — should be empty
+    // Get item again: should be empty
     let resp = call_tool(
         &mut child,
         5,
@@ -1082,6 +1084,393 @@ fn test_put_get_delete_item() {
 
     drop(child.stdin.take());
     let _ = child.wait();
+}
+
+#[test]
+fn vector_index_round_trips_through_mcp_alone() {
+    // An agent must be able to do the whole thing without a wire client: create
+    // the index, write to it, and search it. Before this the create tool had no
+    // vector field at all, so a request carrying one was silently dropped and
+    // the table came back without the index.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "AgentVecs",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+
+    // The control plane reflects it, so the drop is really gone.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "AgentVecs"}),
+    );
+    let described = tool_content(&resp);
+    let vixs = described["vector_indexes"]
+        .as_array()
+        .expect("the agent-facing view reports the index");
+    assert_eq!(vixs.len(), 1);
+    assert_eq!(vixs[0]["index_name"], "vix");
+    assert_eq!(vixs[0]["vector_attribute"]["attribute_name"], "emb");
+    assert_eq!(vixs[0]["dimensions"], 3);
+    assert_eq!(vixs[0]["distance_function"], "COSINE");
+
+    for (pk, emb) in [("a", ["1", "0", "0"]), ("b", ["0", "1", "0"])] {
+        call_tool(
+            &mut child,
+            10,
+            "put_item",
+            json!({
+                "table_name": "AgentVecs",
+                "item": {
+                    "pk": {"S": pk},
+                    "emb": {"L": emb.iter().map(|n| json!({"N": n})).collect::<Vec<_>>()}
+                }
+            }),
+        );
+    }
+
+    let resp = call_tool(
+        &mut child,
+        20,
+        "search_vectors",
+        json!({
+            "table_name": "AgentVecs",
+            "index_name": "vix",
+            "search_vector": [{"N": "1"}, {"N": "0"}, {"N": "0"}],
+            "top_k": 1
+        }),
+    );
+    let content = tool_content(&resp);
+    let results = content["SearchResults"].as_array().expect("SearchResults");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["Item"]["pk"]["S"], "a");
+    // COSINE is a distance, so the self match scores 0.
+    assert_eq!(results[0]["Score"], 0.0);
+    // The vector attribute is excluded from the projection by default.
+    assert!(results[0]["Item"].get("emb").is_none());
+}
+
+#[test]
+fn a_fractional_dimension_count_truncates_through_mcp_as_it_does_on_the_wire() {
+    // The wire path truncates and clamps Dimensions before the typed parse.
+    // The MCP surface names the field in snake_case, so the normalisation has
+    // to recognise both spellings or an agent is refused a value a wire client
+    // gets accepted.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "AgentFrac",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3.7,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "AgentFrac"}),
+    );
+    let described = tool_content(&resp);
+    let vixs = described["vector_indexes"]
+        .as_array()
+        .expect("index created");
+    assert_eq!(vixs.len(), 1);
+    assert_eq!(
+        vixs[0]["dimensions"], 3,
+        "3.7 truncates to 3, as on the wire"
+    );
+}
+
+#[test]
+fn an_empty_vector_attribute_name_is_refused_through_mcp_too() {
+    // The request-model constraints are enforced by the raw request's
+    // Deserialize, which the MCP surface does not go through, so deserialising
+    // alone let an agent create an index a wire client could not: an empty
+    // vector attribute name reaching ACTIVE and never holding a row.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpEmptyAttr",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": ""},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("vectorAttribute.attributeName")
+            && body.contains("length greater than or equal to 1"),
+        "expected the wire request-model error: {body}"
+    );
+
+    // And the table is not created.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "McpEmptyAttr"}),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("not found") || body.contains("ResourceNotFound"),
+        "got {body}"
+    );
+}
+
+#[test]
+fn vector_index_updates_work_in_the_shape_the_tool_documents() {
+    // The tool description names snake_case fields, as the rest of the surface
+    // does, but the parser read the wire spelling alone, so every documented
+    // shape parsed into an empty update and was refused for carrying no action.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecUpd",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    // Add one in the documented shape.
+    call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpVecUpd",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "McpVecUpd"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(vixs.len(), 1, "create through the documented shape");
+    assert_eq!(vixs[0]["index_name"], "vix");
+
+    // Remove it in the documented shape.
+    call_tool(
+        &mut child,
+        4,
+        "update_table",
+        json!({
+            "table_name": "McpVecUpd",
+            "vector_index_updates": [{"delete": {"index_name": "vix"}}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        5,
+        "describe_table",
+        json!({"table_name": "McpVecUpd"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(vixs.is_empty(), "delete through the documented shape");
+}
+
+#[test]
+fn an_index_read_back_can_be_fed_straight_to_create_table() {
+    // Cloning a table is the obvious thing an agent does with describe_table,
+    // so what it reports has to be what create_table accepts. A flattened
+    // vector_attribute read back as a bare string failed to deserialise.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let create = json!({
+        "table_name": "McpClone",
+        "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+        "attribute_definitions": [
+            {"attribute_name": "pk", "attribute_type": "S"},
+            {"attribute_name": "tenant", "attribute_type": "S"}
+        ],
+        "billing_mode": "PAY_PER_REQUEST",
+        "vector_indexes": [{
+            "index_name": "vix",
+            "vector_attribute": {"attribute_name": "emb"},
+            "search_schema": [
+                {"attribute_name": "tenant", "search_schema_element_type": "HASH"}
+            ],
+            "projection": {"projection_type": "ALL"},
+            "dimensions": 3,
+            "distance_function": "COSINE"
+        }]
+    });
+    call_tool(&mut child, 1, "create_table", create);
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "McpClone"}),
+    );
+    let described = tool_content(&resp);
+    let vixs = described["vector_indexes"].as_array().unwrap().clone();
+
+    // Fed back verbatim. Rebuilding it by hand here is what let the projection
+    // and search schema shapes drift without the test noticing.
+    let cloned = vixs.clone();
+    let resp = call_tool(
+        &mut child,
+        3,
+        "create_table",
+        json!({
+            "table_name": "McpCloneCopy",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "tenant", "attribute_type": "S"}
+            ],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": cloned
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !body.contains("Invalid vector_indexes"),
+        "clone was refused: {body}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "describe_table",
+        json!({"table_name": "McpCloneCopy"}),
+    );
+    let copy = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(copy.len(), 1, "the clone carries the index");
+    assert_eq!(copy[0]["vector_attribute"]["attribute_name"], "emb");
+    assert_eq!(copy[0]["dimensions"], 3);
+}
+
+#[test]
+fn vector_errors_through_mcp_are_the_wire_errors() {
+    // The tools are thin wrappers over the same facade the wire surface uses,
+    // so an agent sees the captured strings rather than an MCP paraphrase.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    // A vector index on a provisioned table is refused, as on the wire.
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "AgentVecBad",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PROVISIONED",
+            "provisioned_throughput": {"read_capacity_units": 1, "write_capacity_units": 1},
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("PAY_PER_REQUEST"),
+        "a provisioned table must refuse a vector index: {body}"
+    );
+
+    call_tool(
+        &mut child,
+        2,
+        "create_table",
+        json!({
+            "table_name": "AgentPlain",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    // Searching a table with no vector index reports the index missing.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "search_vectors",
+        json!({
+            "table_name": "AgentPlain",
+            "index_name": "nope",
+            "search_vector": [{"N": "1"}],
+            "top_k": 1
+        }),
+    );
+    let body = serde_json::to_string(&resp).unwrap();
+    assert!(
+        body.contains("does not have the specified index"),
+        "expected the captured missing-index string: {body}"
+    );
 }
 
 #[test]
@@ -1554,7 +1943,7 @@ fn test_delete_table_with_auto_snapshot() {
         json!({"table_name": "Ephemeral", "item": {"pk": {"S": "x"}}}),
     );
 
-    // Delete the table — should auto-snapshot
+    // Delete the table: should auto-snapshot
     let resp = call_tool(
         &mut child,
         3,
@@ -1751,7 +2140,7 @@ fn test_snapshot_lifecycle() {
     assert_eq!(content["name"].as_str().unwrap(), "test-snap");
     assert!(content["size_bytes"].as_u64().unwrap() > 0);
 
-    // List snapshots — should have at least 1
+    // List snapshots: should have at least 1
     let resp = call_tool(&mut child, 4, "list_snapshots", json!({}));
     assert!(!is_tool_error(&resp));
     let content = tool_content(&resp);
@@ -1944,13 +2333,13 @@ fn test_max_items_limit() {
         );
     }
 
-    // Scan without explicit limit — should be capped at 2
+    // Scan without explicit limit: should be capped at 2
     let resp = call_tool(&mut child, 20, "scan", json!({"table_name": "Limited"}));
     let content = tool_content(&resp);
     assert_eq!(content["Count"], 2);
     assert!(content["LastEvaluatedKey"].is_object());
 
-    // Query without explicit limit — should be capped at 2
+    // Query without explicit limit: should be capped at 2
     let resp = call_tool(
         &mut child,
         21,
@@ -2049,7 +2438,7 @@ fn test_max_size_bytes_limit() {
         }),
     );
     // A single item query might or might not exceed 100 bytes
-    // The response includes Count, ScannedCount, Items — might be close
+    // The response includes Count, ScannedCount, Items: might be close
     // Let's not assert on this one since it depends on serialization size
 
     // get_database_info should report the limit
@@ -2462,7 +2851,7 @@ fn test_index_name_resolution_uses_name_field() {
     let content = tool_content(&resp);
     let entities = content["data_model"]["entities"].as_array().unwrap();
 
-    // Find User entity — should have GSI1, not gs1
+    // Find User entity: should have GSI1, not gs1
     let user = entities.iter().find(|e| e["name"] == "User").unwrap();
     let gsis = user["gsi_mappings"].as_array().unwrap();
     assert_eq!(
@@ -2895,7 +3284,7 @@ fn token_flag_beats_env() {
         with_env.starts_with("HTTP/1.1 401"),
         "env token should be rejected when flag is set, got: {with_env}"
     );
-    // The rejected env token must look identical to no token — no oracle.
+    // The rejected env token must look identical to no token: no oracle.
     assert_eq!(
         response_body(&with_env),
         response_body(&no_token),
@@ -3012,7 +3401,7 @@ fn allowed_host_extends_acceptance() {
 #[test]
 fn off_loopback_bind_is_reachable_with_token() {
     // #24: a 0.0.0.0 bind with a token is reachable over loopback and
-    // authenticates — the core Docker reachability shape. Existing auth tests
+    // authenticates: the core Docker reachability shape. Existing auth tests
     // all bind the 127.0.0.1 default; this is the only widened-bind happy path.
     let port = free_port();
     let _srv = spawn_authed_mcp_host(port, "the-secret-token", "0.0.0.0", &[]);
@@ -3046,4 +3435,379 @@ fn off_loopback_bind_accepts_allowlisted_name() {
         resp.starts_with("HTTP/1.1 2"),
         "allowlisted by-name Host on a 0.0.0.0 bind should be accepted, got: {resp}"
     );
+}
+
+#[test]
+fn a_snake_case_create_the_canonicaliser_cannot_parse_is_still_validated() {
+    // The canonicaliser rewrites a create action by round-tripping it through
+    // `VectorIndex`, and falls back to the caller's raw object when that parse
+    // fails. A fractional `dimensions` fails it, because the typed field is a
+    // `u32` and normalisation has not run yet. The raw object is snake_case, so
+    // the request-model collector, which reads wire spellings alone, reports
+    // every member as null, naming five fields the caller did supply. The wire
+    // path normalises before it validates; this one has to as well.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecBypass",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpVecBypass",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": ""},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3.5,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    let msg = content["message"].as_str().unwrap();
+    assert!(
+        msg.contains("vectorAttribute.attributeName"),
+        "the empty attribute name is the fault worth reporting: {content}"
+    );
+    assert!(
+        !msg.contains("indexName' failed to satisfy constraint: Member must not be null"),
+        "a supplied member must not be reported as null: {content}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "describe_table",
+        json!({"table_name": "McpVecBypass"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        vixs.is_empty(),
+        "a refused create must not leave an index behind: {vixs:?}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_null_delete_action_is_reported_as_a_missing_action() {
+    // The canonicaliser rewrote any delete value, null included, into
+    // `{"IndexName": null}`. That is no longer null, so the parser's own null
+    // filter stopped skipping it and the entry answered a type error where the
+    // wire answers that neither action was supplied.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpNullDel",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpNullDel",
+            "vector_index_updates": [{"delete": null}]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("One of VectorIndexUpdate.Create, VectorIndexUpdate.Delete must not be null"),
+        "unexpected message: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn an_index_without_a_search_schema_clones_without_one() {
+    // The read-back defaulted an absent search schema to `[]`, and the clone
+    // test fed the read-back straight back to create_table, so a copy gained an
+    // empty search schema the original never carried. The sibling clone test
+    // covers the populated case; this one covers the absent case it stopped
+    // exercising when its fixture gained a schema.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpNoSchema",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "describe_table",
+        json!({"table_name": "McpNoSchema"}),
+    );
+    let vixs = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(vixs.len(), 1);
+    assert!(
+        vixs[0].get("search_schema").is_none(),
+        "an index created without a search schema must read back without one: {}",
+        vixs[0]
+    );
+
+    // Feed it back verbatim, the way an agent cloning a table would.
+    call_tool(
+        &mut child,
+        3,
+        "create_table",
+        json!({
+            "table_name": "McpNoSchemaCopy",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": vixs
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        4,
+        "describe_table",
+        json!({"table_name": "McpNoSchemaCopy"}),
+    );
+    let copied = tool_content(&resp)["vector_indexes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(copied.len(), 1, "the clone carries the index");
+    assert!(
+        copied[0].get("search_schema").is_none(),
+        "the clone must not gain a search schema: {}",
+        copied[0]
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_create_missing_a_member_is_named_the_way_the_wire_names_it() {
+    // The request-model constraints run before the typed parse here, as they do
+    // in the raw request's Deserialize. Reversed, a search schema element with
+    // no attribute name answered serde's `missing field` where the wire names
+    // the member and the path it sits on.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecOrder",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "update_table",
+        json!({
+            "table_name": "McpVecOrder",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "search_schema": [{"search_schema_element_type": "HASH"}],
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    // The wire's own string, verbatim. Its sibling on the wire side is
+    // `update_table_search_schema_missing_attribute_name_rejected_at_request_model_layer`,
+    // which pins the same literal, so a drift on either surface fails there.
+    assert_eq!(
+        content["message"],
+        "1 validation error detected: Value null at \
+         'vectorIndexUpdates.1.member.create.searchSchema.1.member.attributeName' failed to \
+         satisfy constraint: Member must not be null"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn an_agents_negative_dimensions_are_echoed_the_way_the_wire_echoes_them() {
+    // The collector reads the raw value, so it must run before normalisation.
+    // Reversed, the clamp lands first and the agent is told its -1 was a 0,
+    // which is a different string from the one a wire client gets for the same
+    // mistake. The wire side pins the same text in
+    // `create_table_negative_dimensions_reports_the_value_as_given`.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpNegDims",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": -1,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let content = tool_content(&resp);
+    assert!(
+        content["message"]
+            .as_str()
+            .unwrap()
+            .contains("Value '-1' at 'vectorIndexes.1.member.dimensions'"),
+        "the raw value is what gets echoed: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn an_agents_search_is_held_to_the_wire_request_model() {
+    // The tool built SearchVectorsRequest field by field, which skips the
+    // hand-written Deserialize where the topK, SearchVector and IndexName
+    // bounds live. Nothing was wrongly accepted, but an agent got a different
+    // string than a wire client for the same mistake, on the one vector tool
+    // the parity work missed.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpSearchRM",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST",
+            "vector_indexes": [{
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }]
+        }),
+    );
+
+    // topK below the floor: the enveloped member-path constraint, not the
+    // operation-layer range message.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "search_vectors",
+        json!({
+            "table_name": "McpSearchRM", "index_name": "vix",
+            "search_vector": [{"N": "1"}, {"N": "1"}, {"N": "0"}], "top_k": 0
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("'topK' failed to satisfy constraint"),
+        "topK must answer the request-model constraint: {msg}"
+    );
+
+    // An empty search vector: the no-echo 'SearchVector' member-path form.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "search_vectors",
+        json!({
+            "table_name": "McpSearchRM", "index_name": "vix",
+            "search_vector": [], "top_k": 5
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("'SearchVector' failed to satisfy constraint"),
+        "an empty vector must answer the request-model constraint: {msg}"
+    );
+
+    // An index name under the floor is a length constraint, not a lookup miss.
+    let resp = call_tool(
+        &mut child,
+        4,
+        "search_vectors",
+        json!({
+            "table_name": "McpSearchRM", "index_name": "ab",
+            "search_vector": [{"N": "1"}, {"N": "1"}, {"N": "0"}], "top_k": 5
+        }),
+    );
+    assert!(is_tool_error(&resp), "expected a tool error: {resp}");
+    let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("'IndexName' failed to satisfy constraint"),
+        "a short index name must answer the length constraint: {msg}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
 }

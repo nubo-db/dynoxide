@@ -144,7 +144,8 @@ pub fn validate_item_keys(
     schema: &KeySchema,
     meta: &TableMetadata,
 ) -> Result<()> {
-    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)?;
+    validate_vector_write_attributes_after_keys(item, meta)
 }
 
 /// Like [`validate_item_keys`], but a wrong-type or non-scalar table key yields
@@ -157,7 +158,34 @@ pub fn validate_item_keys_for_batch(
     schema: &KeySchema,
     meta: &TableMetadata,
 ) -> Result<()> {
-    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::SchemaMismatch)
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::SchemaMismatch)?;
+    validate_vector_write_attributes_after_keys(item, meta)
+}
+
+/// Like [`validate_item_keys`], but skips the vector index write validation.
+/// ImportItems uses this: an import is backfill-shaped, so a vector index
+/// value a live write would reject is sparse-skipped by the row derivation
+/// (base item imported, no shadow row) rather than failing the import. The
+/// classic table-key and GSI/LSI index-key checks are exactly those of
+/// [`validate_item_keys`].
+pub fn validate_item_keys_for_import(
+    item: &HashMap<String, AttributeValue>,
+    schema: &KeySchema,
+    meta: &TableMetadata,
+) -> Result<()> {
+    validate_item_keys_inner(item, schema, meta, TableKeyTypeError::TypeMismatch)
+}
+
+/// Reject any present-but-invalid vector index attribute (the vector value,
+/// or a SearchSchema HASH or INLINE_FILTER value). Runs after the classic
+/// index-key checks; where real AWS orders the vector family relative to the
+/// classic one is uncaptured, so it follows the family it borrows its shape
+/// from.
+fn validate_vector_write_attributes_after_keys(
+    item: &HashMap<String, AttributeValue>,
+    meta: &TableMetadata,
+) -> Result<()> {
+    super::vector_index::validate_vector_write_attributes(item, meta)
 }
 
 fn validate_item_keys_inner(
@@ -215,7 +243,10 @@ fn validate_item_keys_inner(
     }
 
     // Reject any present-but-invalid GSI/LSI key attribute. Runs after the
-    // table-key checks so a bad table key is reported first.
+    // table-key checks so a bad table key is reported first. The vector
+    // family's write validation is layered on by the public wrappers above,
+    // so the import path can keep these classic checks while letting its row
+    // derivation sparse-skip invalid vector shapes.
     validate_index_key_attributes(item, meta)?;
 
     Ok(())
@@ -421,7 +452,11 @@ pub fn validate_updated_index_keys(
     after: &HashMap<String, AttributeValue>,
     meta: &TableMetadata,
 ) -> Result<()> {
-    run_index_key_validation(after, meta, Some(before))
+    run_index_key_validation(after, meta, Some(before))?;
+    // The vector family gets the same changed-values-only treatment, so an
+    // unrelated update never re-rejects a pre-existing invalid vector value
+    // (for example an item the index backfill sparse-skipped).
+    super::vector_index::validate_updated_vector_attributes(before, after, meta)
 }
 
 /// Validate that a Key map has exactly the key attributes (for GetItem/DeleteItem/UpdateItem).
@@ -621,7 +656,7 @@ pub struct ExpressionParamContext<'a> {
     pub all_expression_param_names: Vec<&'a str>,
     pub expression_attribute_names: &'a Option<HashMap<String, String>>,
     pub expression_attribute_values: &'a Option<HashMap<String, AttributeValue>>,
-    /// Raw JSON for ExpressionAttributeValues — when present, used for key
+    /// Raw JSON for ExpressionAttributeValues: when present, used for key
     /// validation and parsed with key-specific error messages.
     pub expression_attribute_values_raw: &'a Option<serde_json::Value>,
 }
@@ -702,7 +737,7 @@ pub fn validate_expression_params(
         }
     }
 
-    // ExpressionAttributeValues — prefer raw JSON if available (for key-specific errors)
+    // ExpressionAttributeValues: prefer raw JSON if available (for key-specific errors)
     if let Some(raw_val) = ctx.expression_attribute_values_raw {
         if let Some(obj) = raw_val.as_object() {
             if obj.is_empty() {
@@ -1065,7 +1100,7 @@ pub async fn build_item_collection_metrics<S: StorageBackend>(
 
     let mut partition_bytes = storage.get_partition_size(table_name, pk_str).await?;
 
-    // Include LSI table sizes — DynamoDB's 10GB item collection limit applies
+    // Include LSI table sizes - DynamoDB's 10GB item collection limit applies
     // to the aggregate across base table and all LSIs.
     if let Some(ref lsi_json) = meta.lsi_definitions {
         if let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json) {
@@ -1827,7 +1862,7 @@ pub fn extract_key_strings(
 pub fn parse_exclusive_start_key(
     value: &serde_json::Value,
 ) -> Result<HashMap<String, AttributeValue>> {
-    // First, try to deserialise — this catches multi-type and number errors
+    // First, try to deserialise: this catches multi-type and number errors
     let parsed = match serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone()) {
         Ok(map) => map,
         Err(e) => {
@@ -1957,8 +1992,8 @@ pub fn parse_exclusive_start_key(
 
 /// Validate ESK count and index key types (stages 1 and 2 of ESK validation).
 ///
-/// Stage 1: Count check — error uses `count_mismatch_msg`.
-/// Stage 2: Index key type check (if index) — missing attr returns
+/// Stage 1: Count check - error uses `count_mismatch_msg`.
+/// Stage 2: Index key type check (if index) - missing attr returns
 /// "The provided starting key is invalid", wrong type returns
 /// "The provided key element does not match the schema".
 ///
@@ -2102,7 +2137,7 @@ fn get_index_key_schema(meta: &TableMetadata, index_name: &str) -> Result<Vec<Ke
             }
         }
     }
-    // Index not found — the caller should already have validated this
+    // Index not found: the caller should already have validated this
     Ok(Vec::new())
 }
 

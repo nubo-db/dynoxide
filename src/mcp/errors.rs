@@ -40,7 +40,7 @@ fn short_error_type(err: &DynoxideError) -> &'static str {
 
 /// Whether this error type would be retryable against real DynamoDB.
 ///
-/// This is informational — for a local emulator, the same request will produce
+/// This is informational: for a local emulator, the same request will produce
 /// the same error. But agents building muscle memory for production should learn
 /// which errors are transient vs permanent.
 fn is_retryable(err: &DynoxideError) -> bool {

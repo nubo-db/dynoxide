@@ -13,7 +13,7 @@
 //! the same the native HTTP server speaks:
 //!
 //! - Success: the action's response struct serialised to DynamoDB JSON
-//!   (`Count`, `ScannedCount`, and — when the request asks for it —
+//!   (`Count`, `ScannedCount`, and, when the request asks for it,
 //!   `ConsumedCapacity` are all present on Query/Scan).
 //! - API error: [`DynoxideError::to_json`], carrying `__type` and a message.
 //! - Unknown or preview-unsupported op: an `UnsupportedOperation` envelope with
@@ -62,6 +62,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "ExecuteStatement",
     "BatchExecuteStatement",
     "ExecuteTransaction",
+    "SearchVectors",
 ];
 
 /// The idempotency caches a dispatch needs to honour `ClientRequestToken`.
@@ -253,28 +254,39 @@ async fn route<S: StorageBackend>(
         }};
     }
 
-    let result: crate::Result<String> = match op {
-        "CreateTable" => run!(create_table),
-        "DeleteTable" => run!(delete_table),
-        "DescribeTable" => run!(describe_table),
-        "UpdateTable" => run!(update_table),
-        "ListTables" => run!(list_tables),
-        "PutItem" => run!(put_item),
-        "GetItem" => run!(get_item),
-        "DeleteItem" => run!(delete_item),
-        "UpdateItem" => run!(update_item),
-        "Query" => run!(query),
-        "Scan" => run!(scan),
-        "BatchGetItem" => run!(batch_get_item),
-        "BatchWriteItem" => run!(batch_write_item),
-        "TransactGetItems" => run!(transact_get_items),
-        "ExecuteStatement" => run!(execute_statement),
-        "BatchExecuteStatement" => run!(batch_execute_statement),
-        "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
-        other => Err(DynoxideError::InternalServerError(format!(
-            "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
-        ))),
-    };
+    // The same pre-deserialisation type checks the HTTP server runs. Request
+    // structs hold several fields as `serde_json::Value`, which accepts any
+    // JSON type, so without this a mistyped field reaches serde and comes back
+    // as raw serde text here while the server answers with the captured
+    // SerializationException. Both surfaces read one implementation so they
+    // cannot drift.
+    let result: crate::Result<String> =
+        match crate::serialization_checks::pre_check_serialization_types(op, request_json) {
+            Err(e) => Err(e),
+            Ok(()) => match op {
+                "CreateTable" => run!(create_table),
+                "DeleteTable" => run!(delete_table),
+                "DescribeTable" => run!(describe_table),
+                "UpdateTable" => run!(update_table),
+                "ListTables" => run!(list_tables),
+                "PutItem" => run!(put_item),
+                "GetItem" => run!(get_item),
+                "DeleteItem" => run!(delete_item),
+                "UpdateItem" => run!(update_item),
+                "Query" => run!(query),
+                "Scan" => run!(scan),
+                "BatchGetItem" => run!(batch_get_item),
+                "BatchWriteItem" => run!(batch_write_item),
+                "TransactGetItems" => run!(transact_get_items),
+                "ExecuteStatement" => run!(execute_statement),
+                "BatchExecuteStatement" => run!(batch_execute_statement),
+                "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
+                "SearchVectors" => run!(search_vectors),
+                other => Err(DynoxideError::InternalServerError(format!(
+                    "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
+                ))),
+            },
+        };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
     // EnvelopedValidation tag for the operation before serialising.
@@ -322,7 +334,7 @@ async fn execute_transaction<S: StorageBackend>(
 // One persistent engine per Worker. the wasm engine is single-threaded, so a
 // thread-local holding the opened database is sufficient and avoids exporting a
 // generic type across the wasm boundary. `WasmDatabase` is `Clone` (only `Arc`s
-// move), so each call clones the handle out of the cell before awaiting — the
+// move), so each call clones the handle out of the cell before awaiting: the
 // `RefCell` borrow never spans an await point.
 // ---------------------------------------------------------------------------
 
@@ -444,7 +456,7 @@ mod engine {
     }
 
     /// The supported-operation list, as a JSON array of op names. The client's
-    /// positive feature-detection path — it hides anything not listed rather
+    /// positive feature-detection path: it hides anything not listed rather
     /// than probing for `UnsupportedOperation` errors.
     #[wasm_bindgen]
     pub fn capabilities() -> String {
@@ -661,6 +673,116 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&err).unwrap();
         assert_eq!(v["__type"], "com.dynoxide.wasm#UnsupportedOperation");
         assert!(v["message"].as_str().unwrap().contains("not supported"));
+    }
+
+    #[test]
+    fn search_vectors_is_served_rather_than_refused_as_unsupported() {
+        // The control plane could always create a vector index here, because
+        // the engine logic and the six storage methods are shared with native.
+        // Until the operation was routed, the build reported an index it could
+        // not search: DescribeTable said ACTIVE and SearchVectors answered 501.
+        let backend = Storage::memory().unwrap();
+        let create = r#"{"TableName":"VecW","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+          "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+          "BillingMode":"PAY_PER_REQUEST",
+          "VectorIndexes":[{"IndexName":"vix","VectorAttribute":{"AttributeName":"emb"},
+          "Projection":{"ProjectionType":"ALL"},"Dimensions":3,"DistanceFunction":"COSINE"}]}"#;
+        run(&backend, "CreateTable", create).unwrap();
+        run(
+            &backend,
+            "PutItem",
+            r#"{"TableName":"VecW","Item":{"pk":{"S":"a"},"emb":{"L":[{"N":"1"},{"N":"0"},{"N":"0"}]}}}"#,
+        )
+        .unwrap();
+
+        let body = run(
+            &backend,
+            "SearchVectors",
+            r#"{"TableName":"VecW","IndexName":"vix","SearchVector":[{"N":"1"},{"N":"0"},{"N":"0"}],"TopK":1}"#,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let results = v["SearchResults"].as_array().expect("SearchResults");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["Item"]["pk"]["S"], "a");
+        // COSINE is a distance rather than a similarity, so a self match scores
+        // 0 and an opposite vector scores 2 (captured 2026-08-11). The vector
+        // attribute is excluded from the projection by default.
+        assert_eq!(results[0]["Score"], 0.0);
+        assert!(results[0]["Item"].get("emb").is_none());
+
+        let out = http(&backend, Some("DynamoDB_20120810.SearchVectors"), create);
+        assert_ne!(
+            out.status, 501,
+            "the operation must no longer read as a skip"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_vector_field_is_a_serialization_exception_here_too() {
+        // The checks live in one module both surfaces read, because a request
+        // struct holds several fields as serde_json::Value and serde accepts
+        // any JSON type there. Without the shared pre-check this answered with
+        // raw serde text while the HTTP server answered with the captured
+        // SerializationException, on exactly the fields the vector work added.
+        let backend = Storage::memory().unwrap();
+        let err = run(
+            &backend,
+            "CreateTable",
+            r#"{"TableName":"VecBad","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+              "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+              "BillingMode":"PAY_PER_REQUEST","VectorIndexes":"not-a-list"}"#,
+        )
+        .unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            v["__type"]
+                .as_str()
+                .unwrap()
+                .contains("SerializationException"),
+            "got {v}"
+        );
+        // Raw serde text leaks a byte offset; the captured message never does.
+        let message = v["Message"].as_str().expect("the envelope carries Message");
+        assert_eq!(message, "Unexpected field type");
+        assert!(
+            !message.contains("at line"),
+            "raw serde text leaked instead of the captured message: {v}"
+        );
+    }
+
+    #[test]
+    fn the_vector_control_plane_and_data_plane_agree() {
+        // The pairing that matters: if DescribeTable reflects an index, a
+        // search against it must be answerable. Asserting them together stops
+        // one being wired without the other.
+        let backend = Storage::memory().unwrap();
+        run(
+            &backend,
+            "CreateTable",
+            r#"{"TableName":"VecPair","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+              "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+              "BillingMode":"PAY_PER_REQUEST",
+              "VectorIndexes":[{"IndexName":"vix","VectorAttribute":{"AttributeName":"emb"},
+              "Projection":{"ProjectionType":"ALL"},"Dimensions":3,"DistanceFunction":"COSINE"}]}"#,
+        )
+        .unwrap();
+
+        let d = run(&backend, "DescribeTable", r#"{"TableName":"VecPair"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&d).unwrap();
+        let reflected = v["Table"]["VectorIndexes"][0]["IndexStatus"] == "ACTIVE";
+        assert!(reflected, "the control plane reports the index");
+
+        let searchable = run(
+            &backend,
+            "SearchVectors",
+            r#"{"TableName":"VecPair","IndexName":"vix","SearchVector":[{"N":"1"},{"N":"0"},{"N":"0"}],"TopK":1}"#,
+        )
+        .is_ok();
+        assert_eq!(
+            reflected, searchable,
+            "an index the control plane advertises must be one the data plane can serve"
+        );
     }
 
     #[test]

@@ -433,7 +433,7 @@ fn test_get_with_projection_attribute_names() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — SET
+// UpdateItem: SET
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -568,7 +568,7 @@ fn test_if_not_exists_value_ref_not_falsely_reported_unused() {
     );
 
     // SET existing = if_not_exists(existing, :def), newone = if_not_exists(newone, :def2)
-    // :def is referenced but if_not_exists short-circuits — DynamoDB still considers it "used"
+    // :def is referenced but if_not_exists short-circuits - DynamoDB still considers it "used"
     db.update_item(UpdateItemRequest {
         table_name: "Tbl".to_string(),
         key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
@@ -582,7 +582,7 @@ fn test_if_not_exists_value_ref_not_falsely_reported_unused() {
         ])),
         ..Default::default()
     })
-    .expect("should not reject :def as unused — it appears in the expression text");
+    .expect("should not reject :def as unused - it appears in the expression text");
 
     let resp = db
         .get_item(GetItemRequest {
@@ -593,9 +593,9 @@ fn test_if_not_exists_value_ref_not_falsely_reported_unused() {
         .unwrap();
 
     let item = resp.item.unwrap();
-    // existing was already there — if_not_exists returns the existing value
+    // existing was already there: if_not_exists returns the existing value
     assert_eq!(item["existing"], AttributeValue::S("already_here".into()));
-    // newone didn't exist — if_not_exists uses the default
+    // newone didn't exist: if_not_exists uses the default
     assert_eq!(item["newone"], AttributeValue::S("default2".into()));
 }
 
@@ -651,7 +651,7 @@ fn test_update_set_list_append() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — REMOVE
+// UpdateItem: REMOVE
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -697,7 +697,7 @@ fn test_update_remove() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — ADD
+// UpdateItem: ADD
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -796,7 +796,7 @@ fn test_update_add_string_set() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — DELETE (set elements)
+// UpdateItem: DELETE (set elements)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -849,7 +849,7 @@ fn test_update_delete_set_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — combined SET + REMOVE
+// UpdateItem: combined SET + REMOVE
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -898,7 +898,7 @@ fn test_update_combined_set_remove() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — upsert (item doesn't exist)
+// UpdateItem: upsert (item doesn't exist)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -937,7 +937,7 @@ fn test_update_upsert() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — ReturnValues
+// UpdateItem: ReturnValues
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1015,7 +1015,7 @@ fn test_update_return_all_new() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — SET evaluation semantics (#35) and ReturnValues granularity (#36)
+// UpdateItem: SET evaluation semantics (#35) and ReturnValues granularity (#36)
 // ---------------------------------------------------------------------------
 
 /// #35(a): the whole UpdateExpression is evaluated against the pre-update image,
@@ -1217,7 +1217,7 @@ fn test_update_updated_new_list_index_keeps_siblings() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — cannot modify key attributes
+// UpdateItem: cannot modify key attributes
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1250,7 +1250,7 @@ fn test_update_cannot_modify_key() {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateItem — with ConditionExpression
+// UpdateItem: with ConditionExpression
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1353,7 +1353,7 @@ fn test_update_with_attribute_names() {
 }
 
 // ---------------------------------------------------------------------------
-// SET list index beyond bounds — should pad with NULLs
+// SET list index beyond bounds: should pad with NULLs
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1378,7 +1378,7 @@ fn test_set_list_index_beyond_bounds_pads_with_nulls() {
         ],
     );
 
-    // SET myList[5] = :val — should pad indices 3,4 with NULL
+    // SET myList[5] = :val - should pad indices 3,4 with NULL
     db.update_item(UpdateItemRequest {
         table_name: "Tbl".into(),
         key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
@@ -1477,7 +1477,7 @@ fn test_set_nested_path_through_list_index_beyond_bounds() {
         ],
     );
 
-    // SET myList[2].name = :val — index 1 should be NULL-padded, index 2 gets a map
+    // SET myList[2].name = :val - index 1 should be NULL-padded, index 2 gets a map
     db.update_item(UpdateItemRequest {
         table_name: "Tbl".into(),
         key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
@@ -1537,7 +1537,7 @@ fn test_remove_list_index_out_of_bounds_is_noop() {
         ],
     );
 
-    // REMOVE myList[999] — should be a no-op
+    // REMOVE myList[999]: should be a no-op
     db.update_item(UpdateItemRequest {
         table_name: "Tbl".into(),
         key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
@@ -1792,7 +1792,7 @@ fn test_projection_same_list_index_mixed_compacts() {
 }
 
 // ---------------------------------------------------------------------------
-// SET intermediate map path — auto-create missing intermediate maps
+// SET intermediate map path: auto-create missing intermediate maps
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1802,7 +1802,7 @@ fn test_set_rejects_missing_intermediate_path() {
 
     put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
 
-    // SET a.b.c = :val where "a" doesn't exist — should fail
+    // SET a.b.c = :val where "a" doesn't exist - should fail
     let err = db
         .update_item(UpdateItemRequest {
             table_name: "Tbl".into(),
@@ -1851,7 +1851,7 @@ fn test_set_adds_key_to_existing_map() {
         ],
     );
 
-    // SET mymap.newKey = :val — should succeed (adding key to existing map)
+    // SET mymap.newKey = :val - should succeed (adding key to existing map)
     db.update_item(UpdateItemRequest {
         table_name: "Tbl".into(),
         key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
@@ -1903,7 +1903,7 @@ fn test_set_rejects_deep_missing_intermediate() {
         ],
     );
 
-    // SET parentMap.absent.deep = :val — should fail because parentMap.absent doesn't exist
+    // SET parentMap.absent.deep = :val - should fail because parentMap.absent doesn't exist
     let err = db
         .update_item(UpdateItemRequest {
             table_name: "Tbl".into(),

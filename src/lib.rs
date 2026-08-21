@@ -76,6 +76,11 @@ pub mod schema;
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.
 pub(crate) mod serde_errors;
+// Shared by the HTTP server and the wasm dispatch: both must reject a
+// mistyped field with the same SerializationException, or the two surfaces
+// disagree on requests neither has deserialised yet.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) mod serialization_checks;
 #[cfg(feature = "http-server")]
 pub mod server;
 #[cfg(feature = "mcp-server")]
@@ -852,6 +857,14 @@ impl Database<RusqliteBackend> {
         self.with_storage(|s| pollster::block_on(actions::scan::execute(s, request)))
     }
 
+    /// Search a vector index with exact brute-force KNN, ranked best first.
+    pub fn search_vectors(
+        &self,
+        request: actions::search_vectors::SearchVectorsRequest,
+    ) -> Result<actions::search_vectors::SearchVectorsResponse> {
+        self.with_storage(|s| pollster::block_on(actions::search_vectors::execute(s, request)))
+    }
+
     // -------------------------------------------------------------------
     // Transactions
     // -------------------------------------------------------------------
@@ -1115,7 +1128,7 @@ impl Database<RusqliteBackend> {
     ///
     /// Uses SQLite's backup API to replace the current database contents
     /// with the snapshot. Works for both in-memory and file-backed databases.
-    /// The backup is atomic — either all pages are copied or none are.
+    /// The backup is atomic: either all pages are copied or none are.
     pub fn restore_from(&self, path: &str) -> Result<()> {
         self.with_storage_mut(|s| s.restore_from(path))
     }
@@ -1123,7 +1136,7 @@ impl Database<RusqliteBackend> {
     /// Backup the current database to a new in-memory SQLite connection.
     ///
     /// Returns an owned `Connection` holding a complete copy. Used for
-    /// in-memory snapshot storage — no filesystem side-effects.
+    /// in-memory snapshot storage: no filesystem side-effects.
     #[cfg(feature = "mcp-server")]
     pub(crate) fn backup_to_memory(&self) -> Result<rusqlite::Connection> {
         self.with_storage(|s| s.backup_to_memory())
@@ -1285,6 +1298,17 @@ impl Database<WasmBridgeBackend> {
     ) -> Result<actions::scan::ScanResponse> {
         let backend = self.backend().await;
         actions::scan::execute(&*backend, request).await
+    }
+
+    /// Search a vector index, as [`Database::search_vectors`] on the native
+    /// build. The scoring runs in the engine and the candidate load is one
+    /// bridge crossing, so the answer is the same either side.
+    pub async fn search_vectors(
+        &self,
+        request: actions::search_vectors::SearchVectorsRequest,
+    ) -> Result<actions::search_vectors::SearchVectorsResponse> {
+        let backend = self.backend().await;
+        actions::search_vectors::execute(&*backend, request).await
     }
 }
 

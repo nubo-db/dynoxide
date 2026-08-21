@@ -58,12 +58,36 @@ pub fn generate_stream_label(clock: &dyn Clock) -> String {
 
 /// Extract only key attributes from an item given the key schema JSON.
 pub fn extract_keys(item: &Item, key_schema_json: &str) -> HashMap<String, AttributeValue> {
+    crate::bench_counters::record(&crate::bench_counters::KEY_SCHEMA_PARSES);
     let key_schema: Vec<crate::types::KeySchemaElement> =
         serde_json::from_str(key_schema_json).unwrap_or_default();
     let mut keys = HashMap::new();
     for ks in &key_schema {
         if let Some(val) = item.get(&ks.attribute_name) {
             keys.insert(ks.attribute_name.clone(), val.clone());
+        }
+    }
+    keys
+}
+
+/// As [`extract_keys`], for a caller that already holds the parsed schema.
+///
+/// A sweep is the case that needs it: the JSON form deserialises the schema on
+/// every call, and the TTL reaper calls this once per expired item.
+pub fn extract_keys_with_schema(
+    item: &Item,
+    key_schema: &crate::actions::helpers::KeySchema,
+) -> HashMap<String, AttributeValue> {
+    let mut keys = HashMap::new();
+    for name in [
+        Some(&key_schema.partition_key),
+        key_schema.sort_key.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(val) = item.get(name) {
+            keys.insert(name.clone(), val.clone());
         }
     }
     keys

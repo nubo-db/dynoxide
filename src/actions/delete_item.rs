@@ -284,81 +284,78 @@ pub async fn execute<S: StorageBackend>(
     // transaction so a mid-fan-out failure rolls the whole delete back, leaving
     // no torn index. Unconditional (not just for ConditionExpression) because
     // the atomicity guarantee applies to every single-item write.
-    let (old_item, gsi_units, lsi_units) = helpers::with_write_transaction(storage, async {
-        // Evaluate ConditionExpression against existing item
-        if let Some(ref cond_expr) = request.condition_expression {
-            let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
-            let existing_item: HashMap<String, AttributeValue> = existing_json
-                .as_ref()
-                .and_then(|j| serde_json::from_str(j).ok())
-                .unwrap_or_default();
+    let (old_item, gsi_units, lsi_units, vector_bytes) =
+        helpers::with_write_transaction(storage, async {
+            // Evaluate ConditionExpression against existing item
+            if let Some(ref cond_expr) = request.condition_expression {
+                let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
+                let existing_item: HashMap<String, AttributeValue> = existing_json
+                    .as_ref()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or_default();
 
-            let parsed = crate::expressions::condition::parse(cond_expr)
-                .map_err(DynoxideError::ValidationException)?;
-            let result = crate::expressions::condition::evaluate(&parsed, &existing_item, &tracker)
-                .map_err(DynoxideError::ValidationException)?;
-            if !result {
-                let return_item = if request.return_values_on_condition_check_failure.as_deref()
-                    == Some("ALL_OLD")
-                    && !existing_item.is_empty()
-                {
-                    Some(existing_item.clone())
-                } else {
-                    None
-                };
-                return Err(DynoxideError::ConditionalCheckFailedException(
-                    "The conditional request failed".to_string(),
-                    return_item,
-                ));
+                let parsed = crate::expressions::condition::parse(cond_expr)
+                    .map_err(DynoxideError::ValidationException)?;
+                let result =
+                    crate::expressions::condition::evaluate(&parsed, &existing_item, &tracker)
+                        .map_err(DynoxideError::ValidationException)?;
+                if !result {
+                    let return_item = if request.return_values_on_condition_check_failure.as_deref()
+                        == Some("ALL_OLD")
+                        && !existing_item.is_empty()
+                    {
+                        Some(existing_item.clone())
+                    } else {
+                        None
+                    };
+                    return Err(DynoxideError::ConditionalCheckFailedException(
+                        "The conditional request failed".to_string(),
+                        return_item,
+                    ));
+                }
             }
-        }
 
-        // Check for unused expression attribute names/values
-        tracker.check_unused()?;
+            // Check for unused expression attribute names/values
+            tracker.check_unused()?;
 
-        // Delete item (returns old item_json)
-        let old_json = storage.delete_item(&request.table_name, &pk, &sk).await?;
+            // Delete item (returns old item_json)
+            let old_json = storage.delete_item(&request.table_name, &pk, &sk).await?;
 
-        // Parse the old item once, here, for the index capacity delta, the
-        // stream record and the response.
-        let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
+            // Parse the old item once, here, for the index capacity delta, the
+            // stream record and the response.
+            let old_item: Option<Item> =
+                old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
 
-        let target = super::gsi::IndexWrite {
-            table_name: &request.table_name,
-            pk: &pk,
-            sk: &sk,
-            pk_attr: &key_schema.partition_key,
-            sk_attr: key_schema.sort_key.as_deref(),
-        };
+            let target = super::gsi::IndexWrite {
+                table_name: &request.table_name,
+                pk: &pk,
+                sk: &sk,
+                pk_attr: &key_schema.partition_key,
+                sk_attr: key_schema.sort_key.as_deref(),
+                old_item: old_item.as_ref(),
+                capacity_mode: request.return_consumed_capacity.as_deref(),
+            };
 
-        // Maintain GSI tables (inside the transaction)
-        let gsi_units = super::gsi::maintain_gsis_after_delete(
-            storage,
-            &meta,
-            &target,
-            old_item.as_ref(),
-            request.return_consumed_capacity.as_deref(),
-        )
+            // Maintain GSI tables (inside the transaction)
+            let gsi_units = super::gsi::maintain_gsis_after_delete(storage, &meta, &target).await?;
+
+            // Maintain LSI tables (inside the transaction)
+            let lsi_units = super::lsi::maintain_lsis_after_delete(storage, &meta, &target).await?;
+
+            // Maintain vector index shadow tables (inside the transaction)
+            let vector_bytes =
+                super::vector_index::maintain_vector_indexes_after_delete(storage, &meta, &target)
+                    .await?;
+
+            // Record stream event (inside the transaction)
+            if old_item.is_some() {
+                crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None)
+                    .await?;
+            }
+
+            Ok((old_item, gsi_units, lsi_units, vector_bytes))
+        })
         .await?;
-
-        // Maintain LSI tables (inside the transaction)
-        let lsi_units = super::lsi::maintain_lsis_after_delete(
-            storage,
-            &meta,
-            &target,
-            old_item.as_ref(),
-            request.return_consumed_capacity.as_deref(),
-        )
-        .await?;
-
-        // Record stream event (inside the transaction)
-        if old_item.is_some() {
-            crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
-        }
-
-        Ok((old_item, gsi_units, lsi_units))
-    })
-    .await?;
 
     // Handle ReturnValues
     let return_old = request
@@ -385,11 +382,12 @@ pub async fn execute<S: StorageBackend>(
     .await?;
 
     // Calculate consumed capacity from old item size (write for delete)
-    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
+    let consumed_capacity = types::consumed_capacity_with_vector_indexes(
         &request.table_name,
         types::table_write_capacity_units(old_item.as_ref().map(types::item_size), None),
         &gsi_units,
         &lsi_units,
+        &vector_bytes,
         &request.return_consumed_capacity,
     );
 

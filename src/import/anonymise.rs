@@ -48,7 +48,7 @@ pub fn apply_rules(
 
         // Generate the anonymised value.
         // Hash actions are deterministic (same input → same output), so they
-        // don't need the consistency map — skip it entirely to avoid unbounded
+        // don't need the consistency map: skip it entirely to avoid unbounded
         // memory growth on high-cardinality fields.
         let is_deterministic = matches!(rule.action, ValidatedAction::Hash { .. });
         let new_value = if is_consistency_field && !is_deterministic {
@@ -73,7 +73,7 @@ pub fn apply_rules(
         // Warn if targeting a key attribute
         if key_attrs.contains(&field_name) {
             warnings.push(format!(
-                "anonymising key attribute '{}' — potential for collisions",
+                "anonymising key attribute '{}': potential for collisions",
                 field_name
             ));
         }

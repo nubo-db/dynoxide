@@ -74,7 +74,7 @@ pub async fn execute<S: StorageBackend>(
         .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
 
     let params = request.parameters.unwrap_or_default();
-    let page = partiql::executor::execute_page(
+    let run = partiql::executor::execute_page(
         storage,
         &stmt,
         &params,
@@ -85,8 +85,16 @@ pub async fn execute<S: StorageBackend>(
         // A single statement has no preparation pass to share a resolution
         // with, so the executor resolves the table itself, once.
         None,
-    )
-    .await?;
+    );
+    // Base write, index fan-out and stream record are one atomic unit, as they
+    // are on every other write path. Without it a fan-out that failed part way
+    // left the base row committed and the indexes disagreeing with it. A read
+    // opens no transaction: it has nothing to roll back.
+    let page = if matches!(stmt, partiql::parser::Statement::Select { .. }) {
+        run.await?
+    } else {
+        super::helpers::with_write_transaction(storage, run).await?
+    };
     let partiql::executor::StatementPage {
         items,
         size,
@@ -148,11 +156,12 @@ pub async fn execute<S: StorageBackend>(
                 }
             };
         };
-        crate::types::consumed_capacity_with_secondary_indexes(
+        crate::types::consumed_capacity_with_vector_indexes(
             table,
             crate::types::table_write_capacity_units(capacity.old_size, capacity.new_size),
             &capacity.gsi_units,
             &capacity.lsi_units,
+            &capacity.vector_bytes,
             &request.return_consumed_capacity,
         )
     });
@@ -162,4 +171,108 @@ pub async fn execute<S: StorageBackend>(
         next_token,
         consumed_capacity,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+
+    /// Two GSIs, so the fan-out has a second insert to fail on.
+    async fn table_with_two_gsis(storage: &Storage) {
+        let req = serde_json::from_value(serde_json::json!({
+            "TableName": "pq_tx",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g1", "AttributeType": "S"},
+                {"AttributeName": "g2", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "gsi-one",
+                    "KeySchema": [{"AttributeName": "g1", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                },
+                {
+                    "IndexName": "gsi-two",
+                    "KeySchema": [{"AttributeName": "g2", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }
+            ]
+        }))
+        .unwrap();
+        crate::actions::create_table::execute(storage, req)
+            .await
+            .unwrap();
+    }
+
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_string())
+    }
+
+    async fn val_of(storage: &Storage, pk: &str) -> String {
+        let req = crate::actions::get_item::GetItemRequest {
+            table_name: "pq_tx".to_string(),
+            key: [("pk".to_string(), s(pk))].into_iter().collect(),
+            ..Default::default()
+        };
+        let got = crate::actions::get_item::execute(storage, req)
+            .await
+            .unwrap();
+        match got.item.unwrap().get("val").unwrap() {
+            AttributeValue::S(v) => v.clone(),
+            other => panic!("unexpected val: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_fan_out_rolls_the_base_row_back() {
+        // Every other write path wraps its base write and index fan-out in one
+        // transaction. These two did not, so a fan-out that failed part way
+        // left the base row committed and the indexes disagreeing with it, with
+        // nothing to signal it.
+        let storage = Storage::memory().unwrap();
+        table_with_two_gsis(&storage).await;
+
+        let put = crate::actions::put_item::PutItemRequest {
+            table_name: "pq_tx".to_string(),
+            item: [
+                ("pk".to_string(), s("a")),
+                ("g1".to_string(), s("x")),
+                ("g2".to_string(), s("y")),
+                ("val".to_string(), s("before")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        crate::actions::put_item::execute(&storage, put)
+            .await
+            .unwrap();
+        assert_eq!(val_of(&storage, "a").await, "before");
+
+        // Let the first index insert land, fail the second.
+        storage.fail_gsi_insert_after(1);
+        let err = execute(
+            &storage,
+            ExecuteStatementRequest {
+                statement: "UPDATE \"pq_tx\" SET val='after' WHERE pk='a'".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the injected failure must surface");
+        assert!(
+            format!("{err:?}").contains("injected GSI insert failure"),
+            "unexpected error: {err:?}"
+        );
+
+        assert_eq!(
+            val_of(&storage, "a").await,
+            "before",
+            "the base row must roll back with the fan-out that failed"
+        );
+    }
 }

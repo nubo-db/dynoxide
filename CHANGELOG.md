@@ -9,11 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Vector indexes and `SearchVectors`.** `CreateTable` and `UpdateTable` take vector index definitions, `DescribeTable` reports them, the item write paths maintain them, and `SearchVectors` returns the nearest entries to a query vector over `COSINE`, `EUCLIDEAN` or `DOT_PRODUCT`. A search can be scoped by a `SearchSchema` HASH attribute and filtered on `INLINE_FILTER` attributes, and reports `VectorSearchRequestBytes`; a write to a vector-indexed table reports a per-index `VectorIndexes` map under `INDEXES`. Available on the native build, the wasm build, and through the MCP tools, which gain a `search_vectors` tool. Scoring is exact brute-force KNN, so the top-k is the true top-k.
+
+  One divergence worth knowing before writing a readiness check: an index here goes `ACTIVE` immediately and is searchable straight away, where DynamoDB reports `ACTIVE` before the index will answer a search. `docs/compatibility-summary.md` has the detail and a check that works against both.
+
 - The `execute_partiql` MCP tool accepts `ConsistentRead`. Omitting it was harmless while the field only chose a rate; it now also decides whether a select qualified by a GSI is rejected, so an agent had no way to reach either behaviour.
 
 - `BatchExecuteStatement` accepts `ReturnConsumedCapacity` and reports capacity, which it previously had no way to do at all. Per-table entries with index arms, aggregated across the batch. A failed statement is still charged the write it attempted, sized on the larger of the row already stored and the item it carried; a batch in which nothing succeeds reports no capacity, and a table whose statements all failed is omitted entirely. Captured against eu-west-2.
 
 ### Changed
+
+- The wasm surface runs the same pre-deserialisation type checks as the HTTP server, so a mistyped field answers with the captured `SerializationException` on both rather than raw serde text on one. Affects every operation carrying such a check.
 
 - **Breaking (behaviour):** numbers are sized the way DynamoDB sizes them, so consumed capacity moves. Captured byte-exact against eu-west-2 by bisecting the 400KB gate: a number costs one byte, plus `ceil(integer significant digits / 2)` and `ceil(fraction significant digits / 2)`, over the value with leading and trailing zeros trimmed. The old measure was wrong in both directions. It charged for zeros DynamoDB trims, so `0.0000001` was sized at 5 bytes rather than 2; it rounded the halving down where DynamoDB rounds up, so every number with an odd count of significant digits was a byte light; and it never charged for a minus sign, which costs a byte, so every negative number was light too. Both fed consumed capacity on every write, `table_stats`, the query and scan byte budgets, and index capacity, so those figures change. An item sitting on the 400KB boundary can flip either way with it.
 
@@ -31,17 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The four checks cost about 7% on a 25-statement `BatchExecuteStatement`, measured against `958e340`.
 
-- **Breaking (Rust API):** the PartiQL parser's public types moved with the index-qualifier work. Every `partiql::parser::Statement` variant is now `#[non_exhaustive]`, and `Select`, `Update` and `Delete` carry an `index_name`, so a downstream `match` needs a `..` and construction goes through `Default` or deserialisation. `partiql::parser::parse` returns `ParseError` rather than `String`, because which envelope a rejection takes is part of the observable contract and the caller cannot tell from the text. `partiql::parser::CompOp` is a re-export of the condition engine's operator rather than a second enum of the same shape. `partiql::executor::execute_page` takes the statement's `ConsistentRead`, which now decides both the rate a read is charged at and whether a GSI-qualified select is rejected at all. Source-breaking for the crate's public API, so the next release is a minor bump. The DynamoDB wire API and the CLI, server and MCP surfaces are unaffected.
+#### Breaking (Rust API)
 
-- **Breaking (Rust API):** `actions::batch_execute_statement::BatchStatementRequest` is now `#[non_exhaustive]`. It is still short of DynamoDB's shape, lacking `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`, so it will gain fields again and the attribute is there to stop that breaking anyone twice. Library consumers that construct it must build from `Default` and assign, or deserialise it. `BatchExecuteStatementRequest` is deliberately not marked: with `ReturnConsumedCapacity` on it, that type now matches DynamoDB exactly. This is a source-breaking change for the crate's public API, so the next release is a minor bump. The DynamoDB wire API and the CLI/server/MCP surfaces are unaffected.
+The wire API and the CLI, server and MCP surfaces are unaffected by all of these.
 
-- **Breaking (Rust API):** `partiql::parser::WhereClause` is now `#[non_exhaustive]` and carries `wrote_or`, saying whether the clause as written joined anything with `OR`. The flattened group count no longer answers that, because a `NOT` over a conjunction becomes a disjunction under De Morgan, so `UPDATE ... WHERE pk='x' AND NOT (a=1 AND b=2)` used to be refused with a message about an `OR` the statement did not contain. `from_conditions` and `from_groups` are gone with it: both set `wrote_or` by guessing at it, `from_groups` from the group count and `from_conditions` from there being one group, and neither guess survives a `NOT`. Construct one through `from_groups_written`, which takes the answer rather than inferring it.
+- `StorageBackend` gained seven required methods for vector indexes: `create_vector_table`, `drop_vector_table`, `update_vector_index_definitions`, `insert_vector_items`, `delete_vector_item`, `query_vector_candidates` and `vector_items_for_keys`. `VectorItemRow` and `VectorCandidateRow` are new. A backend outside the crate must add all seven.
+- `types::ConsumedCapacity` gained `vector_indexes`, and `actions::index_capacity::WriteCapacity` and `TableCapacity` each gained `vector_bytes`. A struct literal needs `..Default::default()` or the existing constructor.
+- `partiql::parser::Statement` variants are `#[non_exhaustive]`, and `Select`, `Update` and `Delete` carry `index_name`. A downstream `match` needs a `..`.
+- `partiql::parser::WhereClause` is `#[non_exhaustive]` and carries `wrote_or`.
+- `partiql::parser::WhereCondition` is `#[non_exhaustive]` and gained a `NotComparison` variant.
+- `actions::batch_execute_statement::BatchStatementRequest` is `#[non_exhaustive]`. Build it from `Default` and assign, or deserialise it.
+- `partiql::executor::statement_target` is removed. Use `statement_target_in`, which takes a table the caller has already resolved.
+- `partiql::executor::execute_page` takes three further arguments: `consistent_read`, `capacity_mode` and an optional `resolved` table.
+- `partiql::parser::parse` returns `Result<Statement, ParseError>` rather than `Result<Statement, String>`.
+- `partiql::parser::WhereClause::from_conditions` and `from_groups` are removed. Use `from_groups_written`, which also takes whether the clause as written joined anything with `OR`.
+- `partiql::parser::CompOp` is a re-export of `expressions::condition::CompOp` rather than its own enum.
 
-- **Breaking (Rust API):** `partiql::executor::statement_target` is removed. It resolved a statement's table only to read one item key off it and throw the resolution away, and both batch surfaces now resolve the table once for the whole batch and call `statement_target_in` per statement instead. A caller that still wants the old one-shot behaviour can get it from `ResolvedTable::load` followed by `statement_target_in`. `ResolvedTable` is the new public type holding that resolution: a table's metadata, its parsed key schema, and the name it was resolved from, so a resolution handed to a call against another table can be spotted rather than obeyed. It is `#[non_exhaustive]`, so build one through `load`. Source-breaking for the crate's public API; the DynamoDB wire API and the CLI, server and MCP surfaces are unaffected.
-
-- **Breaking (Rust API):** `partiql::parser::WhereCondition` is now `#[non_exhaustive]` and carries a `NotComparison` variant, holding a `NOT` in front of a comparison rather than flipping the operator. The flip is wrong on a row with no such attribute: `a = 'x'` is false there, so `NOT a = 'x'` is true and the row belongs in the result, where `a <> 'x'` compares a value that is not there and drops it. A downstream `match` on the enum needs a wildcard arm. The attribute is there because the parser gains a variant every time it learns a predicate, and each one it gained used to break every caller at once.
-
-- **Breaking (Rust API):** `partiql::executor::execute_page` takes two further arguments beyond the `ConsistentRead` above: the request's `ReturnConsumedCapacity` mode, so a write can skip sizing its indexes when nobody asked what it cost, and an optional `ResolvedTable`, so a batch resolves its table once rather than once per statement. `StatementPage` gains `read_index`, naming the index a `SELECT` was served from, and `base_read_units`, what an LSI reach-back cost on the base table in read units. The struct is `#[non_exhaustive]`, so the two fields are additive; the argument list is not.
 
 ### Fixed
 

@@ -4,12 +4,12 @@ use crate::storage_backend::{BackendError, StorageBackend};
 use crate::streams;
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, LocalSecondaryIndex,
-    Projection, ProjectionType, ProvisionedThroughput,
+    Projection, ProjectionType, ProvisionedThroughput, VectorIndex,
 };
 use serde::{Deserialize, Serialize};
 use web_time::{SystemTime, UNIX_EPOCH};
 
-/// Internal raw deserialization struct — uses serde_json::Value for fields
+/// Internal raw deserialization struct: uses serde_json::Value for fields
 /// that participate in DynamoDB's multi-field constraint validation.
 #[derive(Debug, Default, Deserialize)]
 struct RawRequest {
@@ -23,6 +23,8 @@ struct RawRequest {
     global_secondary_indexes: Option<serde_json::Value>,
     #[serde(rename = "LocalSecondaryIndexes", default)]
     local_secondary_indexes: Option<serde_json::Value>,
+    #[serde(rename = "VectorIndexes", default)]
+    vector_indexes: Option<serde_json::Value>,
     #[serde(rename = "BillingMode", default)]
     billing_mode: Option<String>,
     #[serde(rename = "ProvisionedThroughput", default)]
@@ -41,7 +43,7 @@ struct RawRequest {
     on_demand_throughput: Option<crate::types::OnDemandThroughput>,
 }
 
-/// Public request type — fully validated, typed fields.
+/// Public request type: fully validated, typed fields.
 /// Can be constructed directly (programmatic use) or deserialized from JSON.
 #[derive(Debug, Default)]
 pub struct CreateTableRequest {
@@ -50,6 +52,7 @@ pub struct CreateTableRequest {
     pub attribute_definitions: Vec<AttributeDefinition>,
     pub global_secondary_indexes: Option<Vec<GlobalSecondaryIndex>>,
     pub local_secondary_indexes: Option<Vec<LocalSecondaryIndex>>,
+    pub vector_indexes: Option<Vec<VectorIndex>>,
     pub billing_mode: Option<String>,
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     pub stream_specification: Option<StreamSpecification>,
@@ -182,6 +185,12 @@ pub async fn execute<S: StorageBackend>(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+    let vector_json = request
+        .vector_indexes
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
     let pt_json = request
         .provisioned_throughput
         .as_ref()
@@ -251,6 +260,7 @@ pub async fn execute<S: StorageBackend>(
             deletion_protection_enabled: deletion_protection,
             billing_mode: Some(billing_mode_str),
             on_demand_throughput: on_demand_json.as_deref(),
+            vector_index_definitions: vector_json.as_deref(),
         })
         .await?;
 
@@ -268,6 +278,14 @@ pub async fn execute<S: StorageBackend>(
         for lsi in lsis {
             storage
                 .create_lsi_table(&request.table_name, &lsi.index_name)
+                .await?;
+        }
+    }
+
+    if let Some(ref vixs) = request.vector_indexes {
+        for vix in vixs {
+            storage
+                .create_vector_table(&request.table_name, &vix.index_name)
                 .await?;
         }
     }
@@ -334,6 +352,15 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Vector indexes likewise report CREATING in the CreateTable response;
+    // DescribeTable then reports ACTIVE with Backfilling never present on
+    // this path (captured from real DynamoDB, eu-west-2, 2026-08-11).
+    if let Some(ref mut vixs) = desc.vector_indexes {
+        for vix in vixs {
+            vix.index_status = "CREATING".to_string();
+        }
+    }
+
     // Remove DeletionProtectionEnabled from response if not explicitly set
     // (DynamoDB doesn't include it in basic CreateTable response)
     if request.deletion_protection_enabled.is_none() {
@@ -361,11 +388,14 @@ fn ve(msg: String) -> DynoxideError {
 /// 4. Missing ProvisionedThroughput (default PROVISIONED billing)
 /// 5. Key attribute definition checks ("Invalid KeySchema" / detailed missing-attr message)
 /// 6. Key schema structure (duplicate names, wrong types)
-/// 7. Empty LSI/GSI lists
+/// 7. Empty LSI/GSI/VectorIndexes lists
 /// 8. LSI/GSI structural validation (key schema, projections, duplicates, limits)
-/// 9. Cross-index duplicate names
-/// 10. Attribute definition count mismatch
-/// 11. StreamSpecification consistency (a disabled stream must not set a view type)
+/// 9. Vector index validation (billing-mode gate, per-index structure,
+///    duplicates, count limit, conflicting dimensions)
+/// 10. Cross-index duplicate names (LSI/GSI/vector share one namespace)
+/// 11. Attribute definition count mismatch (SearchSchema attributes join the
+///     used set)
+/// 12. StreamSpecification consistency (a disabled stream must not set a view type)
 fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
     if request.table_name.is_empty() {
         return Err(DynoxideError::ValidationException(
@@ -459,6 +489,16 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
             ));
         }
     }
+    // An empty VectorIndexes list is rejected, not normalised to absent.
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    if let Some(ref vixs) = request.vector_indexes {
+        if vixs.is_empty() {
+            return Err(ve(
+                "One or more parameter values were invalid: List of VectorIndexes is empty"
+                    .to_string(),
+            ));
+        }
+    }
 
     // LSI structural validation
     if let Some(ref lsis) = request.local_secondary_indexes {
@@ -471,19 +511,29 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
         validate_gsi_list(gsis, &request.attribute_definitions, bm).map_err(ve)?;
     }
 
+    // Vector index validation (the empty list was rejected above)
+    if let Some(ref vixs) = request.vector_indexes {
+        let bm = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
+        validate_vector_index_list(vixs, &request.attribute_definitions, bm)?;
+    }
+
     // Cross-index duplicate names (checked before attr def count)
     check_cross_index_duplicates(
         &request.local_secondary_indexes,
         &request.global_secondary_indexes,
+        &request.vector_indexes,
     )
     .map_err(ve)?;
 
-    // Attribute definition count (last of the key/index checks)
+    // Attribute definition count (last of the key/index checks). SearchSchema
+    // attributes count towards the used set, so declaring them does not trip
+    // the exact-match rule.
     validate_attr_def_count(
         &request.key_schema,
         &request.attribute_definitions,
         &request.local_secondary_indexes,
         &request.global_secondary_indexes,
+        &request.vector_indexes,
     )
     .map_err(ve)?;
 
@@ -503,20 +553,127 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
     Ok(())
 }
 
+/// List-level vector index validation, shared by the JSON and programmatic
+/// paths via `validate_typed_request`. All operation-layer messages here are
+/// captured from real DynamoDB (eu-west-2, 2026-08-11); the duplicate-name
+/// form is the classic secondary-index message, captured for vector indexes
+/// too, both same-family and cross-family (eu-west-2 and us-east-1,
+/// 2026-08-12).
+///
+/// Returns the crate `Result` rather than the `Result<(), String>` of the
+/// `validate_lsi_list`/`validate_gsi_list` siblings: `validate_vector_index`
+/// raises typed `DynoxideError`s at source, so there is no string layer to
+/// map through here.
+fn validate_vector_index_list(
+    vixs: &[VectorIndex],
+    defs: &[AttributeDefinition],
+    bm: &str,
+) -> Result<()> {
+    if bm != "PAY_PER_REQUEST" {
+        return Err(ve(
+            "One or more parameter values were invalid: Vector indexes are only supported \
+             for PAY_PER_REQUEST tables"
+                .to_string(),
+        ));
+    }
+
+    for (i, vix) in vixs.iter().enumerate() {
+        crate::validation::validate_vector_index(
+            vix,
+            defs,
+            &format!("vectorIndexes.{}.member", i + 1),
+        )?;
+    }
+
+    // Duplicate index names within the vector list.
+    let mut seen = std::collections::HashSet::new();
+    for vix in vixs {
+        if !seen.insert(&vix.index_name) {
+            return Err(ve(format!(
+                "One or more parameter values were invalid: Duplicate index name: {}",
+                vix.index_name
+            )));
+        }
+    }
+
+    // Count limit (five per table).
+    if vixs.len() > 5 {
+        return Err(ve(
+            "One or more parameter values were invalid: VectorIndex count exceeds the \
+             per-table limit of 5"
+                .to_string(),
+        ));
+    }
+
+    // Two indexes on one vector attribute must agree on dimensions.
+    let mut dims_by_attr: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for vix in vixs {
+        let attr = vix.vector_attribute.attribute_name.as_str();
+        match dims_by_attr.get(attr) {
+            Some(&prev) if prev != vix.dimensions => {
+                return Err(ve(format!(
+                    "One or more parameter values were invalid: Conflicting attribute \
+                     definition for '{attr}'. All VectorIndexes on the same vector attribute \
+                     must use the same dimensions."
+                )));
+            }
+            Some(_) => {}
+            None => {
+                dims_by_attr.insert(attr, vix.dimensions);
+            }
+        }
+    }
+
+    // The vector attribute must not itself be declared in AttributeDefinitions:
+    // it is not a key attribute, and declaring it is rejected outright.
+    // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+    for vix in vixs {
+        let attr = vix.vector_attribute.attribute_name.as_str();
+        if defs.iter().any(|d| d.attribute_name == attr) {
+            return Err(ve(format!(
+                "One or more parameter values were invalid: Conflicting attribute definition \
+                 for '{attr}'. An attribute cannot be defined in AttributeDefinitions when \
+                 used as a VectorAttribute."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Duplicate index names across the LSI, GSI, and vector index families.
+/// LSIs, GSIs, and vector indexes share one name namespace; the classic
+/// duplicate message covers a vector index colliding with either secondary
+/// index family too (captured from real DynamoDB, eu-west-2 and us-east-1,
+/// 2026-08-12). Duplicates within a single family are reported by that
+/// family's own list validation, which runs first.
 fn check_cross_index_duplicates(
     lsis: &Option<Vec<LocalSecondaryIndex>>,
     gsis: &Option<Vec<GlobalSecondaryIndex>>,
+    vixs: &Option<Vec<VectorIndex>>,
 ) -> std::result::Result<(), String> {
-    if let (Some(lsis), Some(gsis)) = (lsis, gsis) {
-        let mut all_names = std::collections::HashSet::new();
+    let mut all_names = std::collections::HashSet::new();
+    if let Some(lsis) = lsis {
         for lsi in lsis {
             all_names.insert(&lsi.index_name);
         }
+    }
+    if let Some(gsis) = gsis {
         for gsi in gsis {
             if !all_names.insert(&gsi.index_name) {
                 return Err(format!(
                     "One or more parameter values were invalid: Duplicate index name: {}",
                     gsi.index_name
+                ));
+            }
+        }
+    }
+    if let Some(vixs) = vixs {
+        for vix in vixs {
+            if !all_names.insert(&vix.index_name) {
+                return Err(format!(
+                    "One or more parameter values were invalid: Duplicate index name: {}",
+                    vix.index_name
                 ));
             }
         }
@@ -569,6 +726,7 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
     collect_ad_errors(&raw.attribute_definitions, &mut errors);
     collect_lsi_errors(&raw.local_secondary_indexes, &mut errors);
     collect_gsi_errors(&raw.global_secondary_indexes, &mut errors);
+    collect_vix_errors(&raw.vector_indexes, &mut errors);
 
     // DynamoDB caps multi-field constraint errors at 10
     errors.truncate(10);
@@ -661,6 +819,12 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()
         .map_err(|e| e.to_string())?;
+    let vector_indexes: Option<Vec<VectorIndex>> = raw
+        .vector_indexes
+        .as_ref()
+        .map(|v| serde_json::from_value(normalise_vix_dimensions(v)))
+        .transpose()
+        .map_err(|e| e.to_string())?;
 
     Ok(CreateTableRequest {
         table_name,
@@ -668,6 +832,7 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
         attribute_definitions,
         global_secondary_indexes,
         local_secondary_indexes,
+        vector_indexes,
         billing_mode: raw.billing_mode,
         provisioned_throughput,
         stream_specification: raw.stream_specification,
@@ -823,7 +988,11 @@ fn collect_lsi_errors(lsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
                     {
                         errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.projection' failed to satisfy constraint: Member must not be null", i + 1));
                     } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
-                        collect_proj_errors(p, &format!("localSecondaryIndexes.{}", i + 1), errors);
+                        collect_proj_errors(
+                            p,
+                            &format!("localSecondaryIndexes.{}.member", i + 1),
+                            errors,
+                        );
                     }
                 }
             }
@@ -853,7 +1022,7 @@ fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
                     } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
                         collect_proj_errors(
                             p,
-                            &format!("globalSecondaryIndexes.{}", i + 1),
+                            &format!("globalSecondaryIndexes.{}.member", i + 1),
                             errors,
                         );
                     }
@@ -889,21 +1058,237 @@ fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
     }
 }
 
+/// Run the `VectorIndexes` request-model constraints and format the envelope
+/// DynamoDB answers with, for a caller that does not arrive through the raw
+/// request's `Deserialize`.
+///
+/// The MCP surface builds its request field by field, so without this it skips
+/// every constraint collected here. Feed it the canonical PascalCase form: the
+/// collectors read the wire spelling, and MCP names its fields in snake_case,
+/// so re-serialising the typed value first is what makes the two agree.
+pub(crate) fn vector_indexes_request_model_error(
+    vix_val: &Option<serde_json::Value>,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    collect_vix_errors(vix_val, &mut errors);
+    errors.truncate(10);
+    if errors.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} validation error{} detected: {}",
+        errors.len(),
+        if errors.len() == 1 { "" } else { "s" },
+        errors.join("; ")
+    ))
+}
+
+/// Request-model constraint errors for `VectorIndexes`, in API-model member
+/// order: indexName, vectorAttribute, searchSchema, projection, dimensions,
+/// distanceFunction. The `Dimensions` lower-bound form is captured from real
+/// DynamoDB (eu-west-2, 2026-08-11); the rest follow the formulaic constraint
+/// pattern the neighbouring collectors pin.
+fn collect_vix_errors(vix_val: &Option<serde_json::Value>, errors: &mut Vec<String>) {
+    let arr = match vix_val.as_ref().and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return,
+    };
+    for (i, elem) in arr.iter().enumerate().take(10) {
+        let obj = match elem.as_object() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        collect_vix_obj_errors(obj, &format!("vectorIndexes.{}.member", i + 1), errors);
+    }
+}
+
+/// Request-model constraint errors for one raw vector index object, shared
+/// with the `UpdateTable` create-action collector: `path` is the object's
+/// member path (`vectorIndexes.N.member` here,
+/// `vectorIndexUpdates.N.member.create` there, the latter captured from real
+/// DynamoDB, eu-west-2 and us-east-1, 2026-08-12).
+pub(crate) fn collect_vix_obj_errors(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if !obj.contains_key("IndexName") || obj.get("IndexName") == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.indexName' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
+        collect_idx_name_errors_at(name, path, errors);
+    }
+    if !obj.contains_key("VectorAttribute")
+        || obj.get("VectorAttribute") == Some(&serde_json::Value::Null)
+    {
+        errors.push(format!(
+            "Value null at '{path}.vectorAttribute' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(va) = obj.get("VectorAttribute").and_then(|v| v.as_object()) {
+        if !va.contains_key("AttributeName")
+            || va.get("AttributeName") == Some(&serde_json::Value::Null)
+        {
+            errors.push(format!(
+                "Value null at '{path}.vectorAttribute.attributeName' failed to satisfy constraint: Member must not be null"
+            ));
+        } else if let Some(name) = va.get("AttributeName").and_then(|v| v.as_str()) {
+            // The API model bounds this at one character, which the AWS CLI
+            // enforces before the request leaves the client. Without it an
+            // empty name was accepted, the index reported ACTIVE, and no item
+            // could ever derive a row, so the index stayed empty for good.
+            if name.is_empty() {
+                errors.push(format!(
+                    "Value '' at '{path}.vectorAttribute.attributeName' failed to satisfy constraint: Member must have length greater than or equal to 1"
+                ));
+            }
+        }
+    }
+    if let Some(schema) = obj.get("SearchSchema").and_then(|v| v.as_array()) {
+        for (j, se) in schema.iter().enumerate().take(10) {
+            let seo = match se.as_object() {
+                Some(seo) => seo,
+                None => continue,
+            };
+            let sidx = j + 1;
+            if !seo.contains_key("AttributeName")
+                || seo.get("AttributeName") == Some(&serde_json::Value::Null)
+            {
+                errors.push(format!(
+                    "Value null at '{path}.searchSchema.{sidx}.member.attributeName' failed to satisfy constraint: Member must not be null"
+                ));
+            }
+            let et = seo.get("SearchSchemaElementType");
+            if et.is_none() || et == Some(&serde_json::Value::Null) {
+                errors.push(format!(
+                    "Value null at '{path}.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must not be null"
+                ));
+            } else if let Some(s) = et.and_then(|v| v.as_str()) {
+                if s != "HASH" && s != "INLINE_FILTER" {
+                    errors.push(format!(
+                        "Value '{s}' at '{path}.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, INLINE_FILTER]"
+                    ));
+                }
+            }
+        }
+    }
+    if !obj.contains_key("Projection") || obj.get("Projection") == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.projection' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
+        collect_proj_errors(p, path, errors);
+    }
+    let dims = obj.get("Dimensions");
+    if dims.is_none() || dims == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.dimensions' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(d) = dims.and_then(truncated_dimensions) {
+        // Fractional values are truncated before validation (captured
+        // from real DynamoDB, eu-west-2 and us-east-1, 2026-08-12), so
+        // the lower bound applies to the truncated value; the upper
+        // bound is enforced later by the typed validator with the bare
+        // operation-layer message.
+        if d < 1 {
+            errors.push(format!(
+                "Value '{d}' at '{path}.dimensions' failed to satisfy constraint: Member must have value greater than or equal to 1"
+            ));
+        }
+    }
+    let df = obj.get("DistanceFunction");
+    if df.is_none() || df == Some(&serde_json::Value::Null) {
+        errors.push(format!(
+            "Value null at '{path}.distanceFunction' failed to satisfy constraint: Member must not be null"
+        ));
+    } else if let Some(s) = df.and_then(|v| v.as_str()) {
+        if s != "COSINE" && s != "DOT_PRODUCT" && s != "EUCLIDEAN" {
+            errors.push(format!(
+                "Value '{s}' at '{path}.distanceFunction' failed to satisfy constraint: Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
+            ));
+        }
+    }
+}
+
+/// Effective integer value of a raw `Dimensions` number, truncating any
+/// fractional part (captured from real DynamoDB, eu-west-2 and us-east-1,
+/// 2026-08-12: Dimensions 3.5 is accepted and DescribeTable reports 3).
+/// Values beyond the i64 range saturate; they are far above the 4096 ceiling
+/// either way. Returns `None` for non-numeric values.
+fn truncated_dimensions(v: &serde_json::Value) -> Option<i64> {
+    if let Some(d) = v.as_i64() {
+        return Some(d);
+    }
+    if v.as_u64().is_some() {
+        // Only reachable for integers above the i64 range.
+        return Some(i64::MAX);
+    }
+    // `as` saturates at the i64 bounds for out-of-range floats.
+    v.as_f64().map(|f| f.trunc() as i64)
+}
+
+/// Normalise raw `Dimensions` values so the typed `u32` parse cannot fail on
+/// any numeric input. Fractional values are truncated (see
+/// [`truncated_dimensions`]); integers above the u32 range clamp to
+/// `u32::MAX`, which is over the 4096 ceiling, so the typed validator then
+/// rejects them with the captured over-range message rather than letting a
+/// raw serde error surface.
+pub(crate) fn normalise_vix_dimensions(vix_val: &serde_json::Value) -> serde_json::Value {
+    let mut val = vix_val.clone();
+    if let Some(arr) = val.as_array_mut() {
+        for elem in arr {
+            if let Some(obj) = elem.as_object_mut() {
+                normalise_vix_dimensions_obj(obj);
+            }
+        }
+    }
+    val
+}
+
+/// Normalise one raw vector index object's `Dimensions` value in place, shared
+/// with the `UpdateTable` create-action path so both parse routes apply the
+/// same truncation and clamping before the typed `u32` parse.
+pub(crate) fn normalise_vix_dimensions_obj(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    // The MCP surface names its fields in snake_case, which `VectorIndex`
+    // accepts by alias, so the normalisation has to recognise both spellings or
+    // an agent would be refused a value a wire client gets truncated.
+    let key = if obj.contains_key("Dimensions") {
+        "Dimensions"
+    } else {
+        "dimensions"
+    };
+    let Some(dims) = obj.get_mut(key) else {
+        return;
+    };
+    if let Some(d) = truncated_dimensions(dims) {
+        *dims = serde_json::Value::from(d.clamp(0, i64::from(u32::MAX)) as u32);
+    }
+}
+
 fn collect_idx_name_errors(name: &str, prefix: &str, idx: usize, errors: &mut Vec<String>) {
+    collect_idx_name_errors_at(name, &format!("{prefix}.{idx}.member"), errors);
+}
+
+/// As [`collect_idx_name_errors`], but taking the full member path directly,
+/// for callers whose path does not follow the `<list>.<idx>.member` shape.
+fn collect_idx_name_errors_at(name: &str, path: &str, errors: &mut Vec<String>) {
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
     {
-        errors.push(format!("Value '{}' at '{}.{}.member.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", name, prefix, idx));
+        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", name, path));
     }
     if name.len() < 3 {
-        errors.push(format!("Value '{}' at '{}.{}.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", name, prefix, idx));
+        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", name, path));
     }
     if name.len() > 255 {
-        errors.push(format!("Value '{}' at '{}.{}.member.indexName' failed to satisfy constraint: Member must have length less than or equal to 255", name, prefix, idx));
+        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must have length less than or equal to 255", name, path));
     }
 }
 
+/// `prefix` is the owning index object's full member path (for example
+/// `globalSecondaryIndexes.1.member`), so callers with a deeper shape can
+/// pass their own.
 fn collect_proj_errors(
     proj: &serde_json::Map<String, serde_json::Value>,
     prefix: &str,
@@ -912,14 +1297,14 @@ fn collect_proj_errors(
     if let Some(pt) = proj.get("ProjectionType") {
         if let Some(s) = pt.as_str() {
             if s != "ALL" && s != "KEYS_ONLY" && s != "INCLUDE" {
-                errors.push(format!("Value '{}' at '{}.member.projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", s, prefix));
+                errors.push(format!("Value '{}' at '{}.projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", s, prefix));
             }
         }
     }
     if let Some(nka) = proj.get("NonKeyAttributes") {
         if let Some(arr) = nka.as_array() {
             if arr.is_empty() {
-                errors.push(format!("Value '[]' at '{}.member.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
+                errors.push(format!("Value '[]' at '{}.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
             }
         }
     }
@@ -1002,6 +1387,7 @@ fn validate_attr_def_count(
     defs: &[AttributeDefinition],
     lsis: &Option<Vec<LocalSecondaryIndex>>,
     gsis: &Option<Vec<GlobalSecondaryIndex>>,
+    vixs: &Option<Vec<VectorIndex>>,
 ) -> std::result::Result<(), String> {
     let mut all_key_attrs = std::collections::HashSet::new();
     for k in ks {
@@ -1018,6 +1404,18 @@ fn validate_attr_def_count(
         for gsi in gsis {
             for k in &gsi.key_schema {
                 all_key_attrs.insert(k.attribute_name.as_str());
+            }
+        }
+    }
+    // SearchSchema attributes must be declared in AttributeDefinitions, so
+    // they join the used set; the vector attribute itself is not a key
+    // attribute and never counts.
+    if let Some(vixs) = vixs {
+        for vix in vixs {
+            if let Some(ref schema) = vix.search_schema {
+                for elem in schema {
+                    all_key_attrs.insert(elem.attribute_name.as_str());
+                }
             }
         }
     }

@@ -174,7 +174,7 @@ fn test_update_ttl_nonexistent_table() {
 }
 
 // -----------------------------------------------------------------------
-// TTL Sweep — expired items deleted
+// TTL Sweep: expired items deleted
 // -----------------------------------------------------------------------
 
 #[test]
@@ -263,7 +263,7 @@ fn test_non_numeric_ttl_not_deleted() {
 }
 
 // -----------------------------------------------------------------------
-// TTL Sweep — stream record generation
+// TTL Sweep: stream record generation
 // -----------------------------------------------------------------------
 
 #[test]

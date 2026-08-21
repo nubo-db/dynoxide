@@ -25,6 +25,7 @@ pub(crate) mod lsi;
 pub mod put_item;
 pub mod query;
 pub mod scan;
+pub mod search_vectors;
 pub mod tag_resource;
 pub mod transact_get_items;
 pub mod transact_write_items;
@@ -32,9 +33,11 @@ pub mod untag_resource;
 pub mod update_item;
 pub mod update_table;
 pub mod update_time_to_live;
+pub(crate) mod vector_index;
 
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, LocalSecondaryIndex, Projection,
+    SearchSchemaElement, VectorAttributeDefinition, VectorIndex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +97,9 @@ pub struct TableDescription {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_secondary_indexes: Option<Vec<LocalSecondaryIndexDescription>>,
+
+    #[serde(rename = "VectorIndexes", skip_serializing_if = "Option::is_none")]
+    pub vector_indexes: Option<Vec<VectorIndexDescription>>,
 
     #[serde(
         rename = "StreamSpecification",
@@ -236,12 +242,45 @@ pub struct LocalSecondaryIndexDescription {
     pub index_size_bytes: Option<i64>,
 }
 
+/// Vector index description (returned in TableDescription).
+///
+/// Field set per the AWS response shape: IndexName, SearchSchema (when
+/// declared), Projection, VectorAttribute, Dimensions, DistanceFunction,
+/// IndexStatus, IndexSizeBytes, ItemCount, IndexArn. `Backfilling` is never
+/// present on the CreateTable path, so it stays `None` here and is only
+/// populated by paths that observe a backfill.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorIndexDescription {
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    #[serde(rename = "SearchSchema", skip_serializing_if = "Option::is_none")]
+    pub search_schema: Option<Vec<SearchSchemaElement>>,
+    #[serde(rename = "Projection")]
+    pub projection: Projection,
+    #[serde(rename = "VectorAttribute")]
+    pub vector_attribute: VectorAttributeDefinition,
+    #[serde(rename = "Dimensions")]
+    pub dimensions: u32,
+    #[serde(rename = "DistanceFunction")]
+    pub distance_function: String,
+    #[serde(rename = "IndexStatus")]
+    pub index_status: String,
+    #[serde(rename = "Backfilling", skip_serializing_if = "Option::is_none")]
+    pub backfilling: Option<bool>,
+    #[serde(rename = "IndexSizeBytes", skip_serializing_if = "Option::is_none")]
+    pub index_size_bytes: Option<i64>,
+    #[serde(rename = "ItemCount", skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<i64>,
+    #[serde(rename = "IndexArn")]
+    pub index_arn: String,
+}
+
 /// Deterministic fallback `TableId` for a table that has no persisted id.
 ///
 /// The primary scheme persists a random v4 UUID assigned at create time (see
 /// `Storage::insert_table_metadata` and the v8 migration's backfill), matching
 /// AWS: stable across reads, and a new id for a dropped-and-recreated table.
-/// This fallback only applies to a row whose stored `table_id` is `None` — for
+/// This fallback only applies to a row whose stored `table_id` is `None`: for
 /// example one written by an older binary into a newer database. It derives a
 /// stable UUID (v5) from the table name and creation timestamp so such a row
 /// still reports a consistent id across reads, rather than the per-call random
@@ -325,6 +364,36 @@ pub(crate) fn build_table_description(
                     projection: lsi.projection,
                     item_count: Some(0),
                     index_size_bytes: Some(0),
+                }
+            })
+            .collect()
+    });
+
+    let vector_index_definitions: Option<Vec<VectorIndex>> = meta
+        .vector_index_definitions
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    // Indexes report ACTIVE immediately, mirroring the GSI posture. The
+    // CreateTable response overrides this to CREATING; DescribeTable never
+    // reports the Backfilling field on the CreateTable path (captured from
+    // real DynamoDB, eu-west-2, 2026-08-11).
+    let vector_indexes = vector_index_definitions.map(|vixs| {
+        vixs.into_iter()
+            .map(|vix| {
+                let idx_arn = streams::index_arn(table_name, &vix.index_name);
+                VectorIndexDescription {
+                    index_name: vix.index_name,
+                    search_schema: vix.search_schema,
+                    projection: vix.projection,
+                    vector_attribute: vix.vector_attribute,
+                    dimensions: vix.dimensions,
+                    distance_function: vix.distance_function,
+                    index_status: "ACTIVE".to_string(),
+                    backfilling: None,
+                    index_size_bytes: Some(0),
+                    item_count: Some(0),
+                    index_arn: idx_arn,
                 }
             })
             .collect()
@@ -469,6 +538,7 @@ pub(crate) fn build_table_description(
         },
         global_secondary_indexes,
         local_secondary_indexes,
+        vector_indexes,
         stream_specification,
         latest_stream_arn,
         latest_stream_label,

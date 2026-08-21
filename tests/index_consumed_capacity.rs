@@ -845,6 +845,56 @@ fn create_through_update_charges_each_index_once() {
 }
 
 #[test]
+fn create_through_update_charges_an_index_the_key_alone_belongs_to() {
+    // The companion to the test above, which sparse membership hides. On a
+    // create-through-update the pre-mutation image is a key-only stand-in, and
+    // handing that to the index fan-out instead of genuine absence turns an
+    // insert into a no-op change. The indexes in `report_table` are keyed on
+    // attributes the stand-in does not carry, so they sparse-skip either way
+    // and report the same figure under both. An index keyed on the table's own
+    // sort key does not: the stand-in is a member, its entry matches the one
+    // the write produces, and the arm vanishes instead of charging the insert.
+    let db = Database::memory().unwrap();
+    let req = serde_json::json!({
+        "TableName": "idx_keyonly",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "by-sk",
+            "KeySchema": [{"AttributeName": "sk", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"}
+        }]
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+
+    let cc = update(
+        &db,
+        "idx_keyonly",
+        serde_json::json!({"pk": {"S": "new"}, "sk": {"S": "1"}}),
+        serde_json::json!({
+            "UpdateExpression": "SET #a = :o",
+            "ExpressionAttributeNames": {"#a": "other"},
+            "ExpressionAttributeValues": {":o": {"S": "v"}}
+        }),
+    );
+
+    assert_eq!(
+        arm(&cc.global_secondary_indexes, "by-sk"),
+        Some(1.0),
+        "a create through update is an insert into the index, not a change from \
+         a key-only image that leaves its entry untouched"
+    );
+}
+
+#[test]
 fn batch_write_sums_index_arms_across_the_batch() {
     let db = report_table();
     let req = serde_json::json!({

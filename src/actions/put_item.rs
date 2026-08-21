@@ -333,123 +333,130 @@ async fn execute_inner<S: StorageBackend>(
     // leaving no torn index. The transaction is unconditional (not just for
     // ConditionExpression) because the atomicity guarantee applies to every
     // single-item write.
-    let (old_item, gsi_units, lsi_units) = helpers::with_write_transaction(storage, async {
-        // Evaluate ConditionExpression against existing item (if any)
-        let old_json = if request.condition_expression.is_some() {
-            let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
-            let existing_item: HashMap<String, AttributeValue> = existing_json
-                .as_ref()
-                .and_then(|j| serde_json::from_str(j).ok())
+    let (old_item, gsi_units, lsi_units, vector_bytes) =
+        helpers::with_write_transaction(storage, async {
+            // Evaluate ConditionExpression against existing item (if any)
+            let old_json = if request.condition_expression.is_some() {
+                let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
+                let existing_item: HashMap<String, AttributeValue> = existing_json
+                    .as_ref()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or_default();
+
+                if let Some(ref cond_expr) = request.condition_expression {
+                    let parsed = crate::expressions::condition::parse(cond_expr)
+                        .map_err(DynoxideError::ValidationException)?;
+                    let result =
+                        crate::expressions::condition::evaluate(&parsed, &existing_item, &tracker)
+                            .map_err(DynoxideError::ValidationException)?;
+                    if !result {
+                        let return_item =
+                            if request.return_values_on_condition_check_failure.as_deref()
+                                == Some("ALL_OLD")
+                                && !existing_item.is_empty()
+                            {
+                                Some(existing_item.clone())
+                            } else {
+                                None
+                            };
+                        return Err(DynoxideError::ConditionalCheckFailedException(
+                            "The conditional request failed".to_string(),
+                            return_item,
+                        ));
+                    }
+                }
+                existing_json
+            } else {
+                None
+            };
+
+            // Check for unused expression attribute names/values
+            tracker.check_unused()?;
+
+            // Serialize item
+            let item_json = serde_json::to_string(&request.item)
+                .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+
+            // Compute hash prefix for parallel scan ordering
+            let hash_prefix = request
+                .item
+                .get(&key_schema.partition_key)
+                .map(crate::storage::compute_hash_prefix)
                 .unwrap_or_default();
 
-            if let Some(ref cond_expr) = request.condition_expression {
-                let parsed = crate::expressions::condition::parse(cond_expr)
-                    .map_err(DynoxideError::ValidationException)?;
-                let result =
-                    crate::expressions::condition::evaluate(&parsed, &existing_item, &tracker)
-                        .map_err(DynoxideError::ValidationException)?;
-                if !result {
-                    let return_item = if request.return_values_on_condition_check_failure.as_deref()
-                        == Some("ALL_OLD")
-                        && !existing_item.is_empty()
-                    {
-                        Some(existing_item.clone())
-                    } else {
-                        None
-                    };
-                    return Err(DynoxideError::ConditionalCheckFailedException(
-                        "The conditional request failed".to_string(),
-                        return_item,
-                    ));
-                }
-            }
-            existing_json
-        } else {
-            None
-        };
+            // Store item (returns old item if it existed)
+            // If we already fetched old_json for condition check, use put_item but ignore its return
+            let old_json = if old_json.is_some() {
+                storage
+                    .put_item_with_hash(
+                        &request.table_name,
+                        &pk,
+                        &sk,
+                        &item_json,
+                        size,
+                        &hash_prefix,
+                    )
+                    .await?;
+                old_json
+            } else {
+                storage
+                    .put_item_with_hash(
+                        &request.table_name,
+                        &pk,
+                        &sk,
+                        &item_json,
+                        size,
+                        &hash_prefix,
+                    )
+                    .await?
+            };
 
-        // Check for unused expression attribute names/values
-        tracker.check_unused()?;
+            // The displaced item, parsed once here for the index capacity delta and
+            // reused for the stream record below.
+            let old_item: Option<Item> =
+                old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
 
-        // Serialize item
-        let item_json = serde_json::to_string(&request.item)
-            .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+            let target = super::gsi::IndexWrite {
+                table_name: &request.table_name,
+                pk: &pk,
+                sk: &sk,
+                pk_attr: &key_schema.partition_key,
+                sk_attr: key_schema.sort_key.as_deref(),
+                old_item: old_item.as_ref(),
+                capacity_mode: request.return_consumed_capacity.as_deref(),
+            };
 
-        // Compute hash prefix for parallel scan ordering
-        let hash_prefix = request
-            .item
-            .get(&key_schema.partition_key)
-            .map(crate::storage::compute_hash_prefix)
-            .unwrap_or_default();
+            // Maintain GSI tables (inside the transaction)
+            let gsi_units =
+                super::gsi::maintain_gsis_after_write(storage, &meta, &target, &request.item)
+                    .await?;
 
-        // Store item (returns old item if it existed)
-        // If we already fetched old_json for condition check, use put_item but ignore its return
-        let old_json = if old_json.is_some() {
-            storage
-                .put_item_with_hash(
-                    &request.table_name,
-                    &pk,
-                    &sk,
-                    &item_json,
-                    size,
-                    &hash_prefix,
-                )
-                .await?;
-            old_json
-        } else {
-            storage
-                .put_item_with_hash(
-                    &request.table_name,
-                    &pk,
-                    &sk,
-                    &item_json,
-                    size,
-                    &hash_prefix,
-                )
-                .await?
-        };
+            // Maintain LSI tables (inside the transaction)
+            let lsi_units =
+                super::lsi::maintain_lsis_after_write(storage, &meta, &target, &request.item)
+                    .await?;
 
-        // The displaced item, parsed once here for the index capacity delta and
-        // reused for the stream record below.
-        let old_item: Option<Item> = old_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-
-        let target = super::gsi::IndexWrite {
-            table_name: &request.table_name,
-            pk: &pk,
-            sk: &sk,
-            pk_attr: &key_schema.partition_key,
-            sk_attr: key_schema.sort_key.as_deref(),
-        };
-
-        // Maintain GSI tables (inside the transaction)
-        let gsi_units = super::gsi::maintain_gsis_after_write(
-            storage,
-            &meta,
-            &target,
-            old_item.as_ref(),
-            &request.item,
-            request.return_consumed_capacity.as_deref(),
-        )
-        .await?;
-
-        // Maintain LSI tables (inside the transaction)
-        let lsi_units = super::lsi::maintain_lsis_after_write(
-            storage,
-            &meta,
-            &target,
-            old_item.as_ref(),
-            &request.item,
-            request.return_consumed_capacity.as_deref(),
-        )
-        .await?;
-
-        // Record stream event (inside the transaction)
-        crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), Some(&request.item))
+            // Maintain vector index shadow tables (inside the transaction)
+            let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
+                storage,
+                &meta,
+                &target,
+                &request.item,
+            )
             .await?;
 
-        Ok((old_item, gsi_units, lsi_units))
-    })
-    .await?;
+            // Record stream event (inside the transaction)
+            crate::streams::record_stream_event(
+                storage,
+                &meta,
+                old_item.as_ref(),
+                Some(&request.item),
+            )
+            .await?;
+
+            Ok((old_item, gsi_units, lsi_units, vector_bytes))
+        })
+        .await?;
 
     // Handle ReturnValues
     let return_old = request
@@ -475,11 +482,12 @@ async fn execute_inner<S: StorageBackend>(
     )
     .await?;
 
-    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
+    let consumed_capacity = types::consumed_capacity_with_vector_indexes(
         &request.table_name,
         types::table_write_capacity_units(old_item.as_ref().map(types::item_size), Some(size)),
         &gsi_units,
         &lsi_units,
+        &vector_bytes,
         &request.return_consumed_capacity,
     );
 

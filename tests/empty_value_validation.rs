@@ -132,7 +132,7 @@ fn test_update_item_accept_empty_string() {
     item.insert("name".to_string(), AttributeValue::S("hello".to_string()));
     put_item(&db, item).unwrap();
 
-    // Update to set an empty string — should succeed
+    // Update to set an empty string: should succeed
     let mut key = HashMap::new();
     key.insert("pk".to_string(), AttributeValue::S("key1".to_string()));
     let mut expr_values = HashMap::new();

@@ -123,7 +123,7 @@ fn test_insert_failure_rolls_back_entire_transaction() {
     assert_eq!(
         items.len(),
         0,
-        "No items should exist — entire transaction rolled back"
+        "No items should exist: entire transaction rolled back"
     );
 }
 

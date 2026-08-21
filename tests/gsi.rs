@@ -1099,7 +1099,7 @@ fn test_gsi_scan_pagination_returns_all_items() {
             None => break,
         }
 
-        assert!(pages <= 10, "too many pages — pagination may be looping");
+        assert!(pages <= 10, "too many pages: pagination may be looping");
     }
 
     assert_eq!(
@@ -1176,7 +1176,7 @@ fn test_gsi_scan_pagination_with_filter() {
             None => break,
         }
 
-        assert!(pages <= 20, "too many pages — pagination may be looping");
+        assert!(pages <= 20, "too many pages: pagination may be looping");
     }
 
     assert_eq!(

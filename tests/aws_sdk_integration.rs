@@ -229,7 +229,7 @@ async fn test_batch_operations() {
         .await
         .unwrap();
 
-    // BatchWriteItem — put 5 items
+    // BatchWriteItem: put 5 items
     use aws_sdk_dynamodb::types::{PutRequest, WriteRequest};
 
     let write_requests: Vec<WriteRequest> = (0..5)
@@ -253,7 +253,7 @@ async fn test_batch_operations() {
         .await
         .expect("BatchWriteItem should succeed");
 
-    // BatchGetItem — fetch 3 of them
+    // BatchGetItem: fetch 3 of them
     use aws_sdk_dynamodb::types::KeysAndAttributes;
 
     let keys_and_attrs = KeysAndAttributes::builder()
@@ -313,7 +313,7 @@ async fn test_condition_expressions() {
         .await
         .unwrap();
 
-    // Put with condition (should succeed — item doesn't exist yet)
+    // Put with condition (should succeed: item doesn't exist yet)
     client
         .put_item()
         .table_name("Conditions")
@@ -324,7 +324,7 @@ async fn test_condition_expressions() {
         .await
         .expect("Conditional put should succeed");
 
-    // Put again with same condition — should fail
+    // Put again with same condition: should fail
     let err = client
         .put_item()
         .table_name("Conditions")

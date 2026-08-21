@@ -404,6 +404,141 @@ pub fn validate_gsi(
     Ok(())
 }
 
+/// Validate a single vector index definition.
+///
+/// `member_path` is the request-model path of the index's member, threaded
+/// into the formulaic constraint messages: CreateTable passes
+/// `vectorIndexes.N.member` with the entry's real 1-based position, and
+/// UpdateTable passes `vectorIndexUpdates.1.member.create` (a call carries at
+/// most one create action). The UpdateTable path shape is captured from real
+/// DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+///
+/// `request_definitions` must be the AttributeDefinitions declared in the
+/// current request: SearchSchema attributes must be (re)declared there. The
+/// vector attribute itself must NOT be declared in AttributeDefinitions (it
+/// is not a key attribute; the list-level validation in CreateTable rejects
+/// a request that declares it there).
+pub fn validate_vector_index(
+    vix: &crate::types::VectorIndex,
+    request_definitions: &[AttributeDefinition],
+    member_path: &str,
+) -> Result<()> {
+    // Index name length (request-model constraint; minimum length 3)
+    if vix.index_name.len() < 3 {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at '{member_path}.indexName' \
+             failed to satisfy constraint: Member must have length greater than or equal to 3",
+            vix.index_name
+        )));
+    }
+    if vix.index_name.len() > 255 {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at '{member_path}.indexName' \
+             failed to satisfy constraint: Member must have length less than or equal to 255",
+            vix.index_name
+        )));
+    }
+
+    // Index name character set (same as table names)
+    if !vix
+        .index_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at '{member_path}.indexName' \
+             failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+            vix.index_name
+        )));
+    }
+
+    // Distance function enum (request-model constraint form)
+    match vix.distance_function.as_str() {
+        "COSINE" | "DOT_PRODUCT" | "EUCLIDEAN" => {}
+        other => {
+            return Err(DynoxideError::ValidationException(format!(
+                "1 validation error detected: Value '{other}' at \
+                 '{member_path}.distanceFunction' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
+            )));
+        }
+    }
+
+    // Dimensions bounds. The 0 case rejects earlier at the request-model
+    // layer on the JSON path; this bare form covers the upper bound and the
+    // programmatic path. Captured from real DynamoDB (eu-west-2, 2026-08-11).
+    if vix.dimensions < 1 || vix.dimensions > 4096 {
+        return Err(DynoxideError::ValidationException(
+            "One or more parameter values were invalid: Number of dimensions must be between \
+             1 and 4096 inclusive."
+                .to_string(),
+        ));
+    }
+
+    // Projection structure
+    validate_projection(&vix.projection, &vix.index_name)?;
+
+    // SearchSchema element types and AttributeDefinitions membership. The
+    // missing-definition message is captured from real DynamoDB (eu-west-2,
+    // 2026-08-11).
+    if let Some(ref schema) = vix.search_schema {
+        for (elem_idx, elem) in schema.iter().enumerate() {
+            let elem_position = elem_idx + 1;
+            match elem.search_schema_element_type.as_str() {
+                "HASH" | "INLINE_FILTER" => {}
+                other => {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "1 validation error detected: Value '{other}' at \
+                         '{member_path}.searchSchema.{elem_position}.member.searchSchemaElementType' \
+                         failed to satisfy constraint: Member must satisfy enum value set: \
+                         [HASH, INLINE_FILTER]"
+                    )));
+                }
+            }
+            if !request_definitions
+                .iter()
+                .any(|d| d.attribute_name == elem.attribute_name)
+            {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: One element in SearchSchema \
+                     is not defined in attribute definitions"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // At most one HASH element per SearchSchema; the reported value is
+        // the actual HASH count. Captured from real DynamoDB (eu-west-2 and
+        // us-east-1, 2026-08-12).
+        let hash_count = schema
+            .iter()
+            .filter(|e| e.search_schema_element_type == "HASH")
+            .count();
+        if hash_count > 1 {
+            return Err(DynoxideError::ValidationException(format!(
+                "One or more parameter values were invalid: Value '{hash_count}' at \
+                 'SearchSchema' failed to satisfy constraint: Member must have HASH count \
+                 less than or equal to 1"
+            )));
+        }
+
+        // No attribute may appear twice in one SearchSchema. Captured from
+        // real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
+        let mut seen = std::collections::HashSet::new();
+        for elem in schema {
+            if !seen.insert(elem.attribute_name.as_str()) {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: SearchSchema contains a \
+                     duplicate AttributeName"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a Projection (for GSI or LSI).
 ///
 /// DynamoDB checks:

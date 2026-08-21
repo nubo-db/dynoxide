@@ -400,7 +400,7 @@ async fn execute_within_transaction<S: StorageBackend>(
                     item,
                 });
 
-                // Fill remaining slots with None and stop — don't execute
+                // Fill remaining slots with None and stop: don't execute
                 // statements that will be rolled back.
                 for _ in responses.len()..parsed.len() {
                     responses.push(ItemResponse { item: None });

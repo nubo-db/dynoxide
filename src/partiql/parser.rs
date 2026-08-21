@@ -281,9 +281,9 @@ pub struct SetClause {
 pub enum SetValue {
     /// A simple value (literal or parameter).
     Simple(PartiqlValue),
-    /// `path + value` — add the value to the attribute at path.
+    /// `path + value`: add the value to the attribute at path.
     Add(String, PartiqlValue),
-    /// `path - value` — subtract the value from the attribute at path.
+    /// `path - value`: subtract the value from the attribute at path.
     Sub(String, PartiqlValue),
     /// `list_append(path, value)` or `list_append(value, path)`.
     ListAppend(PartiqlValue, PartiqlValue),
@@ -324,7 +324,7 @@ impl WhereClause {
     }
 }
 
-/// A single condition in a WHERE clause — either a comparison or a function call.
+/// A single condition in a WHERE clause: either a comparison or a function call.
 ///
 /// Non-exhaustive, like `WhereClause` and `Statement`. The parser gains variants
 /// as it learns predicates, and each one it gained used to break every
@@ -373,7 +373,7 @@ pub struct Condition {
 /// narrow enough that it cannot happen again by accident.
 pub use crate::expressions::condition::CompOp;
 
-/// A value in a PartiQL expression — either a literal or a parameter placeholder.
+/// A value in a PartiQL expression: either a literal or a parameter placeholder.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartiqlValue {
     Literal(AttributeValue),
@@ -617,7 +617,7 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
                 // If first is an unquoted identifier that was mistakenly parsed as something
                 // else, we need to handle it. But identifiers in SET RHS would have been
                 // consumed as unknown tokens and errored. We'll handle the common case
-                // where parse_value can't parse an identifier — see below.
+                // where parse_value can't parse an identifier: see below.
                 _ => {
                     return Err(
                         "Expected attribute path on left side of '+' expression".to_string()
@@ -1306,7 +1306,7 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
                 PartiqlValue::Literal(av) => avs.push(av),
                 PartiqlValue::Parameter(_) => {
                     // Can't build a static list with parameters in it at parse time.
-                    // For now, return an error — a more complete solution would
+                    // For now, return an error: a more complete solution would
                     // defer resolution.
                     return Err(
                         "Parameter placeholders inside list literals are not yet supported"
@@ -1378,7 +1378,7 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
         _ => {}
     }
 
-    // Bare identifier — treat as a string (attribute name reference in SET expressions)
+    // Bare identifier: treat as a string (attribute name reference in SET expressions)
     // This handles cases like `SET x = x + 1` where `x` on the RHS is an identifier.
     if tok
         .chars()
@@ -1675,7 +1675,7 @@ fn parse_item_value_partiql(t: &mut Tokenizer, depth: usize) -> Result<PartiqlVa
     if tok == "{" {
         // Parse nested map with partiql-aware parser
         let inner = parse_item_literal_partiql(t, depth + 1)?;
-        // Check if all values are literals — if so, collapse to a single Literal
+        // Check if all values are literals: if so, collapse to a single Literal
         let mut map = HashMap::new();
         for (k, v) in inner {
             match v {
@@ -1984,7 +1984,7 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
             continue;
         }
 
-        // Unknown character — report an error rather than silently skipping
+        // Unknown character: report an error rather than silently skipping
         return Err(format!("Unexpected character: '{}'", chars[i]));
     }
 

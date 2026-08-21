@@ -7,7 +7,7 @@
 //! - **File-backed databases**: snapshots stored as `.db` files in
 //!   `<db_parent>/.dynoxide/snapshots/`.
 //! - **In-memory databases**: snapshots held as in-memory SQLite connections.
-//!   Same lifecycle as the database — die with the process, no filesystem
+//!   Same lifecycle as the database: die with the process, no filesystem
 //!   side-effects.
 
 use crate::Database;
@@ -215,7 +215,7 @@ fn check_disk_space(dir: &Path, db_size: u64) -> crate::errors::Result<()> {
 /// For file-backed databases, creates a `.db` file via VACUUM INTO.
 /// For in-memory databases, creates a backup connection held in process memory.
 ///
-/// Enforces a global snapshot limit — when the limit is reached, auto-snapshots
+/// Enforces a global snapshot limit: when the limit is reached, auto-snapshots
 /// are evicted first, then the oldest manual snapshots.
 pub fn create_snapshot(db: &Database, name: Option<&str>) -> crate::errors::Result<SnapshotInfo> {
     let snapshot_name = match name {
@@ -483,7 +483,7 @@ pub fn delete_snapshot(db: &Database, name: &str) -> crate::errors::Result<()> {
 
 /// Metadata about a snapshot.
 ///
-/// Does not expose filesystem paths — agents work with snapshot names only.
+/// Does not expose filesystem paths: agents work with snapshot names only.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct SnapshotInfo {
     pub name: String,
@@ -544,7 +544,7 @@ fn prune_file_snapshots(dir: &Path) {
         auto_snapshots.drain(..to_remove);
     }
 
-    // 2. Prune total beyond global limit — evict auto first, then manual
+    // 2. Prune total beyond global limit: evict auto first, then manual
     let total = auto_snapshots.len() + manual_snapshots.len();
     if total >= MAX_TOTAL_SNAPSHOTS {
         let mut to_remove = total - MAX_TOTAL_SNAPSHOTS + 1; // +1 to make room
@@ -581,7 +581,7 @@ fn prune_in_memory_store(store: &mut HashMap<String, InMemorySnapshot>) {
         }
     }
 
-    // 2. Prune total beyond global limit — auto first, then manual
+    // 2. Prune total beyond global limit: auto first, then manual
     if store.len() >= MAX_TOTAL_SNAPSHOTS {
         let mut auto_entries: Vec<(String, u64)> = store
             .iter()

@@ -694,7 +694,7 @@ fn test_c10_execute_transaction_insert_duplicate_rolls_back() {
     assert_eq!(
         items.len(),
         0,
-        "Transaction should have rolled back — 'new_item' should not exist"
+        "Transaction should have rolled back - 'new_item' should not exist"
     );
 }
 
@@ -768,7 +768,7 @@ fn test_ne_on_missing_attribute_returns_true() {
     let resp = db.get_item(serde_json::from_value(req).unwrap()).unwrap();
     assert!(resp.item.is_some(), "item should have been created");
 
-    // OR with <> and < on missing attributes — OR should short-circuit
+    // OR with <> and < on missing attributes - OR should short-circuit
     let req: serde_json::Value = serde_json::json!({
         "TableName": "ne-missing",
         "Item": {"pk": {"S": "item2"}, "status": {"S": "new"}},

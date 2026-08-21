@@ -249,3 +249,160 @@ fn report_metadata_reads_for_a_single_statement() {
     );
     assert_eq!(counts.key_schema_parses, 1, "and parse its key schema once");
 }
+
+// --- index definitions parsed on a TTL sweep -------------------------------
+
+const TTL_TABLE: &str = "counts_ttl";
+const TTL_STREAM_TABLE: &str = "counts_ttl_stream";
+
+/// A table with a GSI and an LSI, TTL enabled on `exp`.
+fn ttl_table() -> Database {
+    ttl_table_named(TTL_TABLE, false)
+}
+
+/// As [`ttl_table`], optionally with a stream, which is the path that reaches
+/// `extract_keys` and so the one where a per-item key schema parse can hide.
+fn ttl_table_streamed() -> Database {
+    ttl_table_named(TTL_STREAM_TABLE, true)
+}
+
+fn ttl_table_named(name: &str, stream: bool) -> Database {
+    let db = Database::memory().unwrap();
+    let mut create = serde_json::json!({
+            "TableName": name,
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi-all",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi-all",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+    });
+    // Only when asked for: a view type alongside a disabled stream is rejected.
+    if stream {
+        create["StreamSpecification"] =
+            serde_json::json!({"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"});
+    }
+    db.create_table(serde_json::from_value(create).unwrap())
+        .unwrap();
+    db.update_time_to_live(
+        serde_json::from_value(serde_json::json!({
+            "TableName": name,
+            "TimeToLiveSpecification": {"Enabled": true, "AttributeName": "exp"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    db
+}
+
+fn put_expired_in(db: &Database, table: &str, sk: &str) {
+    db.put_item(
+        serde_json::from_value(serde_json::json!({
+            "TableName": table,
+            "Item": {
+                "pk": {"S": "p"}, "sk": {"S": sk},
+                "gsiPk": {"S": "g"}, "lsiSk": {"S": sk},
+                // Long past, so the sweep takes it.
+                "exp": {"N": "1000000000"}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn report_index_definition_parses_on_a_ttl_sweep() {
+    // A sweep is precisely the case where many items expire together, because a
+    // shared TTL is how they got there. The definitions belong to the table, so
+    // the count must not follow the number of items.
+    let _meter = meter();
+
+    let few = {
+        let db = ttl_table();
+        for i in 0..2 {
+            put_expired_in(&db, TTL_TABLE, &format!("s{i}"));
+        }
+        measure(|| assert_eq!(db.sweep_ttl().unwrap(), 2))
+    };
+    let many = {
+        let db = ttl_table();
+        for i in 0..20 {
+            put_expired_in(&db, TTL_TABLE, &format!("s{i}"));
+        }
+        measure(|| assert_eq!(db.sweep_ttl().unwrap(), 20))
+    };
+
+    println!(
+        "ttl sweep,  2 expired items : {} index definition sets parsed",
+        few.index_defs_parses
+    );
+    println!(
+        "ttl sweep, 20 expired items : {} index definition sets parsed",
+        many.index_defs_parses
+    );
+
+    // Ten times the items must not mean ten times the parsing. Before the
+    // definitions were hoisted out of the per-item loop it was exactly that:
+    // two families parsed per item, so 4 against 40.
+    assert_eq!(
+        few.index_defs_parses, many.index_defs_parses,
+        "index definition parses must not scale with the number of expired items"
+    );
+}
+
+#[test]
+fn report_key_schema_parses_on_a_streamed_ttl_sweep() {
+    // A stream-enabled sweep records a REMOVE per expired item, and the key
+    // extraction behind it took the schema as JSON, so it deserialised once per
+    // item while the sweep already held the parsed form. The index definition
+    // count above cannot see this: its table has no stream.
+    let _meter = meter();
+
+    let few = {
+        let db = ttl_table_streamed();
+        for i in 0..2 {
+            put_expired_in(&db, TTL_STREAM_TABLE, &format!("s{i}"));
+        }
+        measure(|| assert_eq!(db.sweep_ttl().unwrap(), 2))
+    };
+    let many = {
+        let db = ttl_table_streamed();
+        for i in 0..20 {
+            put_expired_in(&db, TTL_STREAM_TABLE, &format!("s{i}"));
+        }
+        measure(|| assert_eq!(db.sweep_ttl().unwrap(), 20))
+    };
+
+    println!(
+        "streamed ttl sweep,  2 expired items : {} key schemas parsed",
+        few.key_schema_parses
+    );
+    println!(
+        "streamed ttl sweep, 20 expired items : {} key schemas parsed",
+        many.key_schema_parses
+    );
+
+    assert_eq!(
+        few.key_schema_parses, many.key_schema_parses,
+        "key schema parses must not scale with the number of expired items"
+    );
+}

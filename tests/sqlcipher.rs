@@ -176,7 +176,7 @@ fn encrypted_database_file_is_not_readable_as_plaintext() {
         put_test_item(&db, "user#1", "PROFILE");
     }
 
-    // Read the raw file bytes — should not contain plaintext
+    // Read the raw file bytes: should not contain plaintext
     let bytes = std::fs::read(&path).unwrap();
     let content = String::from_utf8_lossy(&bytes);
     assert!(

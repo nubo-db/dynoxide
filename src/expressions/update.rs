@@ -870,7 +870,7 @@ fn parse_set_operand(stream: &mut TokenStream) -> Result<SetOperand, String> {
                         orig_name
                     ));
                 }
-                // Rewind — not a function call, treat as path
+                // Rewind: not a function call, treat as path
                 stream.set_pos(saved_pos);
             }
         }
@@ -1087,7 +1087,7 @@ mod tests {
         apply(&mut item, &expr, &tracker).unwrap();
         assert_eq!(item["hits"], AttributeValue::N("0".into()));
 
-        // Apply again — existing value should be preserved
+        // Apply again: existing value should be preserved
         let tracker2 = make_tracker(&no_names, &av);
         apply(&mut item, &expr, &tracker2).unwrap();
         assert_eq!(item["hits"], AttributeValue::N("0".into()));

@@ -138,6 +138,22 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
             .unwrap_or(target_part)
             .trim();
 
+        // The i32-modelled members leak the raw serde-style rejection,
+        // position suffix included: "invalid type: floating point `3.5`,
+        // expected i32 at line 1 column N", captured from real DynamoDB
+        // (eu-west-2 and us-east-1, 2026-08-13).
+        //
+        // That capture is of `SearchVectors`' `TopK`, which is the only
+        // i32-modelled request member in the crate, so the type is a safe
+        // stand-in for the field today. Serde does not name the field in this
+        // message, so there is nothing narrower to match on. Anyone modelling a
+        // second member as i32 has to check that AWS leaks it the same way
+        // rather than inheriting this by the type alone; every other member of
+        // this shape is mapped, not passed through.
+        if target == "i32" {
+            return msg.to_string();
+        }
+
         return map_type_mismatch(source_part.trim(), target);
     }
 
@@ -336,6 +352,11 @@ fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
         "GlobalSecondaryIndexUpdate" | "GlobalSecondaryIndexUpdateRaw" => {
             Some("com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndexUpdate")
         }
+        "VectorIndex" => Some("com.amazonaws.dynamodb.v20120810.VectorIndex"),
+        "VectorAttributeDefinition" => {
+            Some("com.amazonaws.dynamodb.v20120810.VectorAttributeDefinition")
+        }
+        "SearchSchemaElement" => Some("com.amazonaws.dynamodb.v20120810.SearchSchemaElement"),
         "Tag" | "TagRaw" => Some("com.amazonaws.dynamodb.v20120810.Tag"),
         _ => None,
     }

@@ -2,7 +2,7 @@
 //!
 //! Provides background expiry of items with expired TTL attributes.
 
-use crate::actions::{gsi, lsi};
+use crate::actions::{gsi, lsi, vector_index};
 use crate::errors::Result;
 use crate::storage_backend::StorageBackend;
 use crate::streams;
@@ -29,6 +29,14 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
         // Parsed once per table: the index fan-out needs the table key attribute
         // names to rebuild each expired item's projected index entries.
         let key_schema = crate::actions::helpers::parse_key_schema(meta)?;
+        // The index definitions likewise, for the reason BatchWriteItem hoists
+        // the same four: the meta-accepting forms deserialise the JSON on every
+        // call, and a sweep is the case where many items expire at once,
+        // because a shared TTL is how they got there.
+        let gsi_defs = gsi::parse_gsi_defs(meta)?;
+        let lsi_defs = lsi::parse_lsi_defs(meta)?;
+        let vector_defs = vector_index::parse_vector_defs(meta)?;
+        let attr_defs = vector_index::parse_attr_defs(meta)?;
 
         // Scan all items in the table
         let mut exclusive_start_pk: Option<String> = None;
@@ -70,29 +78,28 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                             sk,
                             pk_attr: &key_schema.partition_key,
                             sk_attr: key_schema.sort_key.as_deref(),
+                            old_item: Some(&item),
+                            capacity_mode: None,
                         };
                         // A TTL deletion has no caller to report capacity to, so
                         // it asks for none and the fan-out skips sizing the
                         // indexes rather than sizing them for a discarded map.
-                        let _ = gsi::maintain_gsis_after_delete(
+                        let _ =
+                            gsi::maintain_gsis_after_delete_with_defs(storage, &gsi_defs, &target)
+                                .await?;
+                        let _ =
+                            lsi::maintain_lsis_after_delete_with_defs(storage, &lsi_defs, &target)
+                                .await?;
+                        let _ = vector_index::maintain_vector_indexes_after_delete_with_defs(
                             storage,
-                            meta,
+                            &vector_defs,
+                            &attr_defs,
                             &target,
-                            Some(&item),
-                            None,
-                        )
-                        .await?;
-                        let _ = lsi::maintain_lsis_after_delete(
-                            storage,
-                            meta,
-                            &target,
-                            Some(&item),
-                            None,
                         )
                         .await?;
                         // Generate stream REMOVE record with TTL service identity
                         if meta.stream_enabled {
-                            record_ttl_stream_event(storage, meta, &item).await?;
+                            record_ttl_stream_event(storage, meta, &key_schema, &item).await?;
                         }
                         Ok(())
                     })
@@ -136,6 +143,7 @@ fn is_expired(item: &Item, ttl_attr: &str, now_epoch_secs: u64) -> bool {
 async fn record_ttl_stream_event<S: StorageBackend>(
     storage: &S,
     meta: &crate::storage::TableMetadata,
+    key_schema: &crate::actions::helpers::KeySchema,
     old_item: &Item,
 ) -> Result<()> {
     let view_type = meta
@@ -143,7 +151,7 @@ async fn record_ttl_stream_event<S: StorageBackend>(
         .as_deref()
         .unwrap_or("NEW_AND_OLD_IMAGES");
 
-    let keys = streams::extract_keys(old_item, &meta.key_schema);
+    let keys = streams::extract_keys_with_schema(old_item, key_schema);
     let keys_json = serde_json::to_string(&keys).unwrap_or_default();
 
     let old_image_json = match view_type {

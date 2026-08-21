@@ -99,7 +99,7 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                         .await?;
                         // Generate stream REMOVE record with TTL service identity
                         if meta.stream_enabled {
-                            record_ttl_stream_event(storage, meta, &item).await?;
+                            record_ttl_stream_event(storage, meta, &key_schema, &item).await?;
                         }
                         Ok(())
                     })
@@ -143,6 +143,7 @@ fn is_expired(item: &Item, ttl_attr: &str, now_epoch_secs: u64) -> bool {
 async fn record_ttl_stream_event<S: StorageBackend>(
     storage: &S,
     meta: &crate::storage::TableMetadata,
+    key_schema: &crate::actions::helpers::KeySchema,
     old_item: &Item,
 ) -> Result<()> {
     let view_type = meta
@@ -150,7 +151,7 @@ async fn record_ttl_stream_event<S: StorageBackend>(
         .as_deref()
         .unwrap_or("NEW_AND_OLD_IMAGES");
 
-    let keys = streams::extract_keys(old_item, &meta.key_schema);
+    let keys = streams::extract_keys_with_schema(old_item, key_schema);
     let keys_json = serde_json::to_string(&keys).unwrap_or_default();
 
     let old_image_json = match view_type {

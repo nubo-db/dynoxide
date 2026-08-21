@@ -277,10 +277,10 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Arm a forced failure on the nth GSI insert, counting from one, so a
-    /// write fails part way through its index fan-out. Nothing else can
+    /// Let `successes` GSI inserts through, then fail every one after that, so
+    /// a write fails part way through its index fan-out. Nothing else can
     /// produce that: a fan-out either runs to completion or the whole write
-    /// was rejected before it started.
+    /// was rejected before it started. Pass 0 to fail the first insert.
     #[cfg(test)]
     pub(crate) fn fail_gsi_insert_after(&self, successes: u32) {
         *self.gsi_insert_fault.borrow_mut() = Some(successes);

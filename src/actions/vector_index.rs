@@ -21,6 +21,9 @@ use std::collections::HashMap;
 
 /// Parse vector index definitions from table metadata.
 pub fn parse_vector_defs(meta: &TableMetadata) -> Result<Vec<VectorIndex>> {
+    if meta.vector_index_definitions.is_some() {
+        crate::bench_counters::record(&crate::bench_counters::INDEX_DEFS_PARSES);
+    }
     match meta.vector_index_definitions.as_ref() {
         Some(json) => serde_json::from_str(json)
             .map_err(|e| DynoxideError::InternalServerError(format!("Bad vector index JSON: {e}"))),

@@ -29,6 +29,14 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
         // Parsed once per table: the index fan-out needs the table key attribute
         // names to rebuild each expired item's projected index entries.
         let key_schema = crate::actions::helpers::parse_key_schema(meta)?;
+        // The index definitions likewise, for the reason BatchWriteItem hoists
+        // the same four: the meta-accepting forms deserialise the JSON on every
+        // call, and a sweep is the case where many items expire at once,
+        // because a shared TTL is how they got there.
+        let gsi_defs = gsi::parse_gsi_defs(meta)?;
+        let lsi_defs = lsi::parse_lsi_defs(meta)?;
+        let vector_defs = vector_index::parse_vector_defs(meta)?;
+        let attr_defs = vector_index::parse_attr_defs(meta)?;
 
         // Scan all items in the table
         let mut exclusive_start_pk: Option<String> = None;
@@ -76,10 +84,17 @@ pub async fn sweep_expired_items<S: StorageBackend>(storage: &S) -> Result<usize
                         // A TTL deletion has no caller to report capacity to, so
                         // it asks for none and the fan-out skips sizing the
                         // indexes rather than sizing them for a discarded map.
-                        let _ = gsi::maintain_gsis_after_delete(storage, meta, &target).await?;
-                        let _ = lsi::maintain_lsis_after_delete(storage, meta, &target).await?;
-                        let _ = vector_index::maintain_vector_indexes_after_delete(
-                            storage, meta, &target,
+                        let _ =
+                            gsi::maintain_gsis_after_delete_with_defs(storage, &gsi_defs, &target)
+                                .await?;
+                        let _ =
+                            lsi::maintain_lsis_after_delete_with_defs(storage, &lsi_defs, &target)
+                                .await?;
+                        let _ = vector_index::maintain_vector_indexes_after_delete_with_defs(
+                            storage,
+                            &vector_defs,
+                            &attr_defs,
+                            &target,
                         )
                         .await?;
                         // Generate stream REMOVE record with TTL service identity

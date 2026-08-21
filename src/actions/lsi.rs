@@ -38,6 +38,9 @@ pub fn lsi_to_def(lsi: &LocalSecondaryIndex) -> Result<LsiDef> {
 
 /// Parse LSI definitions from table metadata.
 pub fn parse_lsi_defs(meta: &TableMetadata) -> Result<Vec<LsiDef>> {
+    if meta.lsi_definitions.is_some() {
+        crate::bench_counters::record(&crate::bench_counters::INDEX_DEFS_PARSES);
+    }
     let lsis: Vec<LocalSecondaryIndex> = match meta.lsi_definitions.as_ref() {
         Some(json) => serde_json::from_str(json)
             .map_err(|e| DynoxideError::InternalServerError(format!("Bad LSI JSON: {e}")))?,

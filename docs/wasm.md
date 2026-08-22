@@ -12,9 +12,11 @@ It's a preview. The wasm build is scored by the same conformance suite that back
 
 Vector search is the same engine as native: exact brute-force KNN, the same `f32` storage, the same scoring and the same tie break, so a query answers identically either side. The candidate load for a search is a single bridge crossing rather than one per entry. A database persisted before the vector column existed is migrated on open, so an OPFS database created by an older build keeps working and gains the surface.
 
-One fidelity note on what *is* supported: adding a GSI or a vector index is synchronous. The new index is immediately `ACTIVE` and immediately usable, where AWS reports it `CREATING` and backfills in the background. The backfilled data matches; only the lifecycle is compressed. This is the same behaviour as the native build.
+One fidelity note on what *is* supported: adding a GSI is synchronous. The new index is immediately `ACTIVE` and immediately usable, where AWS reports it `CREATING` and backfills in the background. The backfilled data matches; only the lifecycle is compressed. This is the same behaviour as the native build.
 
-Do not use this to build a readiness check. A vector index on real DynamoDB reports `ACTIVE` before it will answer a search, and the `Backfilling` field disappears rather than turning `false`, so the obvious wait conditions either pass too early or never finish. Neither shows up here. `docs/compatibility-summary.md` has the detail and a check that works on both.
+A vector index added through `UpdateTable` is different: it reports `CREATING` first, refuses searches for a window that outlasts its own `ACTIVE`, and holds off a `DeleteTable` while it creates. The backfill still runs synchronously, so the data is complete before the window opens; the window reproduces the lifecycle rather than the work, and its durations are tens of seconds rather than AWS's minutes. A vector index created as part of `CreateTable` reports `ACTIVE` at once, on both.
+
+That window is what makes a naive readiness check fail here rather than only against AWS. A vector index on real DynamoDB reports `ACTIVE` before it will answer a search, and the `Backfilling` field disappears rather than turning `false`, so the obvious wait conditions either pass too early or never finish. `docs/compatibility-summary.md` has the detail and a check that works on both.
 
 The engine runs in a Web Worker (OPFS's synchronous file handles are Worker-only), and the page talks to it over a message channel. It needs no special server headers (no COOP/COEP cross-origin isolation), so it works on ordinary static hosting.
 

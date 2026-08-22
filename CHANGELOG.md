@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Vector indexes and `SearchVectors`.** `CreateTable` and `UpdateTable` take vector index definitions, `DescribeTable` reports them, the item write paths maintain them, and `SearchVectors` returns the nearest entries to a query vector over `COSINE`, `EUCLIDEAN` or `DOT_PRODUCT`. A search can be scoped by a `SearchSchema` HASH attribute and filtered on `INLINE_FILTER` attributes, and reports `VectorSearchRequestBytes`; a write to a vector-indexed table reports a per-index `VectorIndexes` map under `INDEXES`. Available on the native build, the wasm build, and through the MCP tools, which gain a `search_vectors` tool. Scoring is exact brute-force KNN, so the top-k is the true top-k.
 
-  One divergence worth knowing before writing a readiness check: an index here goes `ACTIVE` immediately and is searchable straight away, where DynamoDB reports `ACTIVE` before the index will answer a search. `docs/compatibility-summary.md` has the detail and a check that works against both.
+  An index added to a live table through `UpdateTable` walks a creation lifecycle rather than arriving ready: it reports `CREATING` with `Backfilling` present, refuses a search with `Cannot search backfilling vector index: <name>` for a window that outlasts its own `ACTIVE`, and holds off a `DeleteTable` while it creates. That reproduces the shape DynamoDB has, including the trap that `ACTIVE` arrives before the index will answer, so a readiness check written against Dynoxide behaves the way it will against the real thing. The durations are not AWS's: the backfill is synchronous here and the window is tens of seconds rather than minutes. An index created as part of `CreateTable` is `ACTIVE` and searchable at once, on both. `docs/compatibility-summary.md` has the detail and a check that works against both.
 
 - The `execute_partiql` MCP tool accepts `ConsistentRead`. Omitting it was harmless while the field only chose a rate; it now also decides whether a select qualified by a GSI is rejected, so an agent had no way to reach either behaviour.
 
@@ -47,6 +47,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - `partiql::parser::WhereClause` is `#[non_exhaustive]` and carries `wrote_or`.
 - `partiql::parser::WhereCondition` is `#[non_exhaustive]` and gained a `NotComparison` variant.
 - `actions::batch_execute_statement::BatchStatementRequest` is `#[non_exhaustive]`. Build it from `Default` and assign, or deserialise it.
+- `actions::describe_table::execute`, `delete_table::execute`, `update_table::execute` and `search_vectors::execute` take a further `&actions::vector_lifecycle::VectorIndexLifecycle`, which is where the vector index creation lifecycle lives. `Database` owns one and passes its own; a caller driving the actions directly can construct one with `VectorIndexLifecycle::new()`.
+- `wasm_api::DispatchContext::new` takes a `&VectorIndexLifecycle` alongside the token caches, so a dispatch reports and enforces the lifecycle the way the native surfaces do.
 - `partiql::executor::statement_target` is removed. Use `statement_target_in`, which takes a table the caller has already resolved.
 - `partiql::executor::execute_page` takes three further arguments: `consistent_read`, `capacity_mode` and an optional `resolved` table.
 - `partiql::parser::parse` returns `Result<Statement, ParseError>` rather than `Result<Statement, String>`.

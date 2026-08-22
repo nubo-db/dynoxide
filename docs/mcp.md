@@ -122,6 +122,8 @@ With a OneTable data model for single-table designs:
 
 An agent can create a vector index and search it without a wire client. `create_table` takes `vector_indexes`, `update_table` takes `vector_index_updates` to add or remove one, `describe_table` reports them alongside the GSIs, and `search_vectors` runs the search.
 
+An index added to a live table through `update_table` is not searchable straight away. The first `search_vectors` against it answers `Cannot search backfilling vector index: <name>`, and it keeps answering that for a window that outlasts the `ACTIVE` `describe_table` reports, so waiting for the status is not enough. Retry the search and treat the refusal as "not yet". The table itself cannot be dropped during that window either. An index created as part of `create_table` is searchable at once and needs none of this.
+
 The search is exact brute-force KNN over the whole index, so the top-k it returns is the true top-k. `COSINE` and `EUCLIDEAN` score as distances, where a self match is 0; `DOT_PRODUCT` scores as a similarity and can be negative. The vector attribute is left out of results unless a projection expression names it and the index projects it. A table carrying a vector index has to be `PAY_PER_REQUEST`.
 
 The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would.

@@ -109,31 +109,52 @@ the ones worth knowing.
 | **`SearchVectors` (COSINE, EUCLIDEAN, DOT_PRODUCT)** | Supported |
 | **Per-vector-index ConsumedCapacity (INDEXES mode)** | Supported |
 
-A vector index goes `ACTIVE` immediately and is searchable the moment it says
-so. Real DynamoDB is slower and, more importantly, shaped differently, so read
-this one carefully before you write a readiness check against it.
+A vector index added to a live table walks a creation lifecycle, the same shape
+AWS walks but nothing like the same length. A vector index created as part of
+`CreateTable` reports `ACTIVE` at once, which is what AWS does too.
 
-On AWS the index passes through `CREATING` with `Backfilling: true`, and when it
-reaches `ACTIVE` the `Backfilling` field is not set to `false`, it disappears.
-A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling` is `false`"
-therefore never comes true. Neither does waiting for the field at all against
-Dynoxide, where it is never set.
+An index added through `UpdateTable` passes through three phases:
 
-The sharper trap is that `ACTIVE` arrives early on AWS. The index reports
-`ACTIVE` before it will answer a search, by minutes: an index added to a
-25-item table took roughly a quarter of an hour after `ACTIVE` before it stopped
-refusing searches. Dynoxide has no such gap, so a readiness check that polls for
-`ACTIVE` and searches immediately passes here every time and fails against the
-real thing. If you need one that works on both, search in a retry loop and treat
-the refusal as "not yet" rather than trusting the status.
+| Phase | `IndexStatus` | `Backfilling` | `SearchVectors` |
+|---|---|---|---|
+| Creating | `CREATING` | present | `Cannot search backfilling vector index: <name>` |
+| Active, not yet searchable | `ACTIVE` | absent | the same refusal |
+| Searchable | `ACTIVE` | absent | served |
+
+The base table reports `ACTIVE` throughout, so a table waiter is the wrong gate
+for a search. The table also cannot be dropped while the index is creating:
+`DeleteTable` answers `ResourceInUseException` with `Cannot delete table while
+indexes are being created, updated, or deleted.` for as long as the index is in
+the first phase. An `UpdateTable` that deletes a still-creating index is
+accepted, which is how you cancel one.
+
+When the index reaches `ACTIVE` the `Backfilling` field is not set to `false`,
+it disappears. A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling`
+is `false`" therefore never comes true, here or on AWS.
+
+The sharper trap is the middle row: `ACTIVE` arrives before the index will
+answer. On AWS it arrives early by minutes, an index added to a 25-item table
+taking roughly a quarter of an hour after `ACTIVE` before it stopped refusing
+searches. Dynoxide reproduces the gap so a readiness check that polls for
+`ACTIVE` and searches immediately fails here the way it fails against the real
+thing. Search in a retry loop and treat the refusal as "not yet" rather than
+trusting the status.
+
+**The durations are not AWS's.** Dynoxide's windows are tens of seconds, chosen
+to be observable rather than to match anything; AWS's are minutes, and vary with
+the table. The shape and the ordering are what carry over, never the magnitude.
+The backfill itself is synchronous here, so the data behind the index is
+complete before the window opens; the wait reproduces the lifecycle, not the
+work.
 
 The behaviour above, and where AWS's own documentation contradicts it, is
 written up in [what the DynamoDB vector search docs get
 wrong](https://martinhicks.dev/articles/dynamodb-vector-search-docs-get-wrong).
 
-The errors that only arise while an index is still filling are unreachable here
-for the same reason. Adding a GSI is compressed the same way, with the same
-consequence.
+Adding a GSI is still compressed: the new index is `ACTIVE` and queryable the
+moment `UpdateTable` returns, and `Backfilling` is never reported for it. The
+errors that only arise while a GSI is still filling are unreachable here for
+that reason.
 
 Vector search is exact brute-force KNN rather than an approximate index. At
 emulator and embedded scale that reaches a correct answer faster than building

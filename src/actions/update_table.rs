@@ -234,13 +234,11 @@ fn collect_vix_update_errors(val: &serde_json::Value, errors: &mut Vec<String>) 
     }
 }
 
-/// Parse the raw `VectorIndexUpdates` JSON into typed updates, normalising
-/// each create action's `Dimensions` the way the CreateTable path does so a
-/// fractional or over-range value cannot fail the typed `u32` parse.
 /// Run the `VectorIndexUpdates` request-model constraints and format the
 /// envelope, for a caller that does not arrive through the raw request's
 /// `Deserialize`. Feed it the canonical wire spelling; see the CreateTable
 /// sibling for why.
+#[cfg(feature = "mcp-server")]
 pub(crate) fn vector_index_updates_request_model_error(val: &serde_json::Value) -> Option<String> {
     let mut errors = Vec::new();
     collect_vix_update_errors(val, &mut errors);
@@ -256,6 +254,10 @@ pub(crate) fn vector_index_updates_request_model_error(val: &serde_json::Value) 
     ))
 }
 
+/// Parse the raw `VectorIndexUpdates` JSON into typed updates, normalising
+/// each create action's `Dimensions` the way the CreateTable path does so a
+/// fractional or over-range value cannot fail the typed `u32` parse.
+///
 /// Shared with the MCP surface, so an agent's update is parsed by the same code
 /// as a wire client's and the two cannot disagree about what a create action
 /// accepts.

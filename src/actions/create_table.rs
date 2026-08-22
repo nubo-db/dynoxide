@@ -1066,6 +1066,7 @@ fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
 /// every constraint collected here. Feed it the canonical PascalCase form: the
 /// collectors read the wire spelling, and MCP names its fields in snake_case,
 /// so re-serialising the typed value first is what makes the two agree.
+#[cfg(feature = "mcp-server")]
 pub(crate) fn vector_indexes_request_model_error(
     vix_val: &Option<serde_json::Value>,
 ) -> Option<String> {

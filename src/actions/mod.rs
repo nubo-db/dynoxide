@@ -34,6 +34,10 @@ pub mod update_item;
 pub mod update_table;
 pub mod update_time_to_live;
 pub(crate) mod vector_index;
+// Public because the four actions that take a `VectorIndexLifecycle` are
+// themselves public, the way `TokenCaches` is public for the transactional
+// ones. Only the handle is exposed; the phase derivation stays internal.
+pub mod vector_lifecycle;
 
 use crate::types::{
     AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, LocalSecondaryIndex, Projection,
@@ -294,10 +298,17 @@ fn table_id_for(table_name: &str, created_at: i64) -> String {
 }
 
 /// Helper: Build a TableDescription from stored metadata.
+///
+/// `vector_phases` carries where each vector index sits in its creation
+/// lifecycle, resolved once by the caller. Taking it as an input rather than
+/// reading it here is what stops two responses describing the same table at
+/// the same instant from disagreeing: an `UpdateTable` touching a GSI while a
+/// vector index is creating returns a full table description too.
 pub(crate) fn build_table_description(
     meta: &crate::storage::TableMetadata,
     item_count: Option<i64>,
     table_size_bytes: Option<i64>,
+    vector_phases: &vector_lifecycle::VectorIndexPhases,
 ) -> TableDescription {
     use crate::streams;
 
@@ -374,14 +385,15 @@ pub(crate) fn build_table_description(
         .as_ref()
         .and_then(|s| serde_json::from_str(s).ok());
 
-    // Indexes report ACTIVE immediately, mirroring the GSI posture. The
-    // CreateTable response overrides this to CREATING; DescribeTable never
-    // reports the Backfilling field on the CreateTable path (captured from
-    // real DynamoDB, eu-west-2, 2026-08-11).
+    // Status and Backfilling both come from the index's lifecycle phase, so an
+    // index created with its table reports ACTIVE with the field absent (the
+    // CreateTable path, captured from real DynamoDB, eu-west-2, 2026-08-11)
+    // while one added to a live table walks CREATING first.
     let vector_indexes = vector_index_definitions.map(|vixs| {
         vixs.into_iter()
             .map(|vix| {
                 let idx_arn = streams::index_arn(table_name, &vix.index_name);
+                let phase = vector_phases.get(&vix.index_name);
                 VectorIndexDescription {
                     index_name: vix.index_name,
                     search_schema: vix.search_schema,
@@ -389,8 +401,8 @@ pub(crate) fn build_table_description(
                     vector_attribute: vix.vector_attribute,
                     dimensions: vix.dimensions,
                     distance_function: vix.distance_function,
-                    index_status: "ACTIVE".to_string(),
-                    backfilling: None,
+                    index_status: phase.index_status().to_string(),
+                    backfilling: phase.backfilling(),
                     index_size_bytes: Some(0),
                     item_count: Some(0),
                     index_arn: idx_arn,

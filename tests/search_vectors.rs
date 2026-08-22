@@ -11,7 +11,9 @@
 //! absorbs floating-point rounding.
 
 use dynoxide::actions::search_vectors::{SearchVectorsRequest, SearchVectorsResponse};
+use dynoxide::actions::vector_lifecycle::VectorIndexLifecycle;
 use dynoxide::storage::Storage;
+use dynoxide::storage_backend::ManualClock;
 use serde_json::json;
 
 async fn create_table(storage: &Storage, req: serde_json::Value) {
@@ -29,12 +31,24 @@ async fn put_item(storage: &Storage, table: &str, item: serde_json::Value) {
         .unwrap();
 }
 
+/// Search against a lifecycle nothing has armed, which is every index
+/// provisioned through CreateTable.
 async fn search(
     storage: &Storage,
     req: serde_json::Value,
 ) -> dynoxide::Result<SearchVectorsResponse> {
+    search_with(storage, &VectorIndexLifecycle::new(), req).await
+}
+
+/// As [`search`], but reading a caller-held lifecycle, so an index added
+/// through UpdateTable is still inside its creation window.
+async fn search_with(
+    storage: &Storage,
+    lifecycle: &VectorIndexLifecycle,
+    req: serde_json::Value,
+) -> dynoxide::Result<SearchVectorsResponse> {
     let req: SearchVectorsRequest = serde_json::from_value(req).unwrap();
-    dynoxide::actions::search_vectors::execute(storage, req).await
+    dynoxide::actions::search_vectors::execute(storage, req, lifecycle).await
 }
 
 /// Unwrap a request-model rejection raised inside serde deserialisation.
@@ -367,7 +381,12 @@ async fn equal_scores_order_by_primary_key_across_repeated_calls() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tie_order_is_identical_between_backfill_and_incremental_builds() {
-    let storage = Storage::memory().unwrap();
+    // The backfilled index arrives through UpdateTable, so it opens a creation
+    // window a search is refused for. The clock is driven rather than waited
+    // on, and the comparison is between two searchable indexes.
+    let clock = ManualClock::new(1_700_000_000);
+    let storage = Storage::memory().unwrap().with_clock(clock.arc());
+    let lifecycle = VectorIndexLifecycle::new();
 
     // Incremental: index exists first, items written through maintenance.
     create_table(
@@ -409,9 +428,10 @@ async fn tie_order_is_identical_between_backfill_and_incremental_builds() {
             }}]
         }))
         .unwrap();
-    dynoxide::actions::update_table::execute(&storage, update)
+    dynoxide::actions::update_table::execute(&storage, update, &lifecycle)
         .await
         .unwrap();
+    clock.tick(std::time::Duration::from_secs(60));
 
     let query = |table: &str| {
         json!({
@@ -419,8 +439,16 @@ async fn tie_order_is_identical_between_backfill_and_incremental_builds() {
             "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 10
         })
     };
-    let incremental = scores(&search(&storage, query("VecInc")).await.unwrap());
-    let backfilled = scores(&search(&storage, query("VecBack")).await.unwrap());
+    let incremental = scores(
+        &search_with(&storage, &lifecycle, query("VecInc"))
+            .await
+            .unwrap(),
+    );
+    let backfilled = scores(
+        &search_with(&storage, &lifecycle, query("VecBack"))
+            .await
+            .unwrap(),
+    );
     assert_eq!(incremental, backfilled);
     let order: Vec<&str> = incremental.iter().map(|(pk, _)| pk.as_str()).collect();
     assert_eq!(order, ["a", "b", "c"]);
@@ -1899,5 +1927,191 @@ async fn four_thousand_ninety_six_dimension_vectors_search() {
     assert_eq!(
         scores(&resp),
         vec![("a".to_string(), 0.0), ("b".to_string(), 1.0)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The creation window an UpdateTable index opens
+//
+// An index added to a live table refuses a search for the whole of its
+// creation window, and keeps refusing for a period after DescribeTable reports
+// it ACTIVE (captured eu-west-2, 2026-08-11). The clock is driven rather than
+// waited on.
+// ---------------------------------------------------------------------------
+
+/// A table seeded with five items and an index added afterwards, so the index
+/// is inside its creation window when this returns.
+async fn table_with_an_index_added_afterwards(
+    storage: &Storage,
+    lifecycle: &VectorIndexLifecycle,
+    table: &str,
+) {
+    create_table(
+        storage,
+        json!({
+            "TableName": table,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    )
+    .await;
+    for i in 0..5 {
+        put_item(
+            storage,
+            table,
+            json!({
+                "pk": {"S": format!("item-{i}")},
+                "embedding": {"L": n_vec(&[&i.to_string(), "1", "0"])}
+            }),
+        )
+        .await;
+    }
+    let update: dynoxide::actions::update_table::UpdateTableRequest =
+        serde_json::from_value(json!({
+            "TableName": table,
+            "VectorIndexUpdates": [{"Create": {
+                "IndexName": "vix", "VectorAttribute": {"AttributeName": "embedding"},
+                "Dimensions": 3, "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }))
+        .unwrap();
+    dynoxide::actions::update_table::execute(storage, update, lifecycle)
+        .await
+        .unwrap();
+}
+
+fn query(table: &str) -> serde_json::Value {
+    json!({
+        "TableName": table, "IndexName": "vix",
+        "SearchVector": n_vec(&["1", "1", "0"]), "TopK": 5
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_search_refuses_for_the_whole_creation_window_then_returns_every_item() {
+    let clock = ManualClock::new(1_700_000_000);
+    let storage = Storage::memory().unwrap().with_clock(clock.arc());
+    let lifecycle = VectorIndexLifecycle::new();
+    table_with_an_index_added_afterwards(&storage, &lifecycle, "VecWindow").await;
+
+    // While the index reports CREATING.
+    let err = search_with(&storage, &lifecycle, query("VecWindow"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, dynoxide::DynoxideError::ValidationException(_)),
+        "expected a ValidationException, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Cannot search backfilling vector index: vix"
+    );
+
+    // And after it reports ACTIVE, which is the trap a poll-until-ACTIVE
+    // readiness check falls into on AWS.
+    clock.tick(std::time::Duration::from_secs(20));
+    let err = search_with(&storage, &lifecycle, query("VecWindow"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Cannot search backfilling vector index: vix"
+    );
+
+    // The first search that succeeds carries every seeded item, never a
+    // partial view.
+    clock.tick(std::time::Duration::from_secs(20));
+    let resp = search_with(&storage, &lifecycle, query("VecWindow"))
+        .await
+        .unwrap();
+    assert_eq!(scores(&resp).len(), 5);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_index_that_does_not_exist_still_answers_its_own_message() {
+    let clock = ManualClock::new(1_700_000_000);
+    let storage = Storage::memory().unwrap().with_clock(clock.arc());
+    let lifecycle = VectorIndexLifecycle::new();
+    table_with_an_index_added_afterwards(&storage, &lifecycle, "VecMissing").await;
+
+    let err = search_with(
+        &storage,
+        &lifecycle,
+        json!({
+            "TableName": "VecMissing", "IndexName": "absent",
+            "SearchVector": n_vec(&["1", "1", "0"]), "TopK": 5
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "The table does not have the specified index: absent"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_index_created_with_its_table_is_searchable_immediately() {
+    let storage = Storage::memory().unwrap();
+    let lifecycle = VectorIndexLifecycle::new();
+    create_distance_fixture(&storage, "VecNow").await;
+
+    let resp = search_with(
+        &storage,
+        &lifecycle,
+        json!({
+            "TableName": "VecNow", "IndexName": "cosine",
+            "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 4
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scores(&resp).len(), 4);
+}
+
+/// Where the refusal sits relative to the vector and SearchSchema checks is
+/// uncaptured, so this pins the choice rather than a captured behaviour: the
+/// refusal comes first, matching the operation's other resource-state answers
+/// rather than its input validation.
+#[tokio::test(flavor = "current_thread")]
+async fn a_malformed_search_against_a_creating_index_reports_the_refusal_first() {
+    let clock = ManualClock::new(1_700_000_000);
+    let storage = Storage::memory().unwrap().with_clock(clock.arc());
+    let lifecycle = VectorIndexLifecycle::new();
+    table_with_an_index_added_afterwards(&storage, &lifecycle, "VecMalformed").await;
+
+    let err = search_with(
+        &storage,
+        &lifecycle,
+        json!({
+            "TableName": "VecMalformed", "IndexName": "vix",
+            "SearchVector": n_vec(&["1", "0"]), "TopK": 5
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Cannot search backfilling vector index: vix"
+    );
+
+    // Past the window the same request reports the dimension mismatch, so the
+    // refusal is masking that answer rather than replacing it.
+    clock.tick(std::time::Duration::from_secs(60));
+    let err = search_with(
+        &storage,
+        &lifecycle,
+        json!({
+            "TableName": "VecMalformed", "IndexName": "vix",
+            "SearchVector": n_vec(&["1", "0"]), "TopK": 5
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("dimension"),
+        "expected the dimension mismatch, got {err}"
     );
 }

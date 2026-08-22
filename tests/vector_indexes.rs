@@ -11,7 +11,9 @@ use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::delete_table::DeleteTableRequest;
 use dynoxide::actions::describe_table::DescribeTableRequest;
 use dynoxide::actions::update_table::{UpdateTableRequest, VectorIndexUpdate};
+use dynoxide::actions::vector_lifecycle::VectorIndexLifecycle;
 use dynoxide::storage::Storage;
+use dynoxide::storage_backend::ManualClock;
 use dynoxide::types::{
     AttributeDefinition, KeySchemaElement, KeyType, Projection, ProjectionType,
     ScalarAttributeType, SearchSchemaElement, VectorAttributeDefinition, VectorIndex,
@@ -848,14 +850,7 @@ async fn vector_index_coexists_with_gsi_and_lsi() {
     assert!(physical_table_exists(&storage, "Mixed::vector::vix"));
 
     // Metadata for all three coexists in the description.
-    let desc = dynoxide::actions::describe_table::execute(
-        &storage,
-        DescribeTableRequest {
-            table_name: "Mixed".to_string(),
-        },
-    )
-    .await
-    .unwrap();
+    let desc = describe_raw(&storage, "Mixed").await;
     assert_eq!(
         desc.table.global_secondary_indexes.as_ref().unwrap().len(),
         1
@@ -881,6 +876,7 @@ async fn delete_drops_vector_shadow_tables_and_recreate_succeeds() {
         DeleteTableRequest {
             table_name: "Cycle".to_string(),
         },
+        &VectorIndexLifecycle::new(),
     )
     .await
     .unwrap();
@@ -896,14 +892,7 @@ async fn delete_drops_vector_shadow_tables_and_recreate_succeeds() {
         .await
         .unwrap();
     assert!(physical_table_exists(&storage, "Cycle::vector::vix"));
-    let desc = dynoxide::actions::describe_table::execute(
-        &storage,
-        DescribeTableRequest {
-            table_name: "Cycle".to_string(),
-        },
-    )
-    .await
-    .unwrap();
+    let desc = describe_raw(&storage, "Cycle").await;
     let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
     assert_eq!(vix.index_status, "ACTIVE");
 }
@@ -977,12 +966,50 @@ async fn put_raw_item(storage: &Storage, table: &str, item: serde_json::Value) {
         .unwrap();
 }
 
+/// Drive one UpdateTable against a lifecycle nothing else can see, for a test
+/// about what the call does rather than about the creation window it opens.
 async fn update_table_raw(
     storage: &Storage,
     req: serde_json::Value,
 ) -> dynoxide::Result<dynoxide::actions::update_table::UpdateTableResponse> {
+    update_table_raw_with(storage, &VectorIndexLifecycle::new(), req).await
+}
+
+/// As [`update_table_raw`], but against a caller-held lifecycle, so a later
+/// describe, search, or delete sees the window this call opens.
+async fn update_table_raw_with(
+    storage: &Storage,
+    lifecycle: &VectorIndexLifecycle,
+    req: serde_json::Value,
+) -> dynoxide::Result<dynoxide::actions::update_table::UpdateTableResponse> {
     let req: UpdateTableRequest = serde_json::from_value(req).unwrap();
-    dynoxide::actions::update_table::execute(storage, req).await
+    dynoxide::actions::update_table::execute(storage, req, lifecycle).await
+}
+
+/// Describe a table straight through the action, against a lifecycle nothing
+/// has armed.
+async fn describe_raw(
+    storage: &Storage,
+    table: &str,
+) -> dynoxide::actions::describe_table::DescribeTableResponse {
+    describe_raw_with(storage, &VectorIndexLifecycle::new(), table).await
+}
+
+/// As [`describe_raw`], but reading a caller-held lifecycle.
+async fn describe_raw_with(
+    storage: &Storage,
+    lifecycle: &VectorIndexLifecycle,
+    table: &str,
+) -> dynoxide::actions::describe_table::DescribeTableResponse {
+    dynoxide::actions::describe_table::execute(
+        storage,
+        DescribeTableRequest {
+            table_name: table.to_string(),
+        },
+        lifecycle,
+    )
+    .await
+    .unwrap()
 }
 
 fn shadow_row_count(storage: &Storage, shadow_table: &str) -> i64 {
@@ -998,7 +1025,9 @@ fn shadow_row_count(storage: &Storage, shadow_table: &str) -> i64 {
 
 #[tokio::test(flavor = "current_thread")]
 async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
-    let storage = Storage::memory().unwrap();
+    let clock = ManualClock::new(1_700_000_000);
+    let storage = Storage::memory().unwrap().with_clock(clock.arc());
+    let lifecycle = VectorIndexLifecycle::new();
     create_plain_ppr_table(&storage, "VecFill").await;
 
     // One valid vector, plus one of each invalid shape a live write would
@@ -1053,8 +1082,9 @@ async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
     .await;
     put_raw_item(&storage, "VecFill", json!({"pk": {"S": "no-vector"}})).await;
 
-    let resp = update_table_raw(
+    let resp = update_table_raw_with(
         &storage,
+        &lifecycle,
         json!({
             "TableName": "VecFill",
             "VectorIndexUpdates": [{"Create": vix_json("vix")}]
@@ -1083,17 +1113,17 @@ async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
     assert_eq!(table_pk, "S:valid");
     assert_eq!(vector_json, "[1.0,2.0,3.0]");
 
-    // DescribeTable reports ACTIVE immediately, with Backfilling absent from
-    // the serialised description (dynoxide never reports the field; backfill
-    // is synchronous).
-    let desc = dynoxide::actions::describe_table::execute(
-        &storage,
-        DescribeTableRequest {
-            table_name: "VecFill".to_string(),
-        },
-    )
-    .await
-    .unwrap();
+    // The index the call just added is still creating, so DescribeTable
+    // reports CREATING with Backfilling present.
+    let desc = describe_raw_with(&storage, &lifecycle, "VecFill").await;
+    let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "CREATING");
+    assert_eq!(vix.backfilling, Some(true));
+
+    // Past the window it reports ACTIVE, and Backfilling leaves the serialised
+    // description rather than turning false.
+    clock.tick(std::time::Duration::from_secs(60));
+    let desc = describe_raw_with(&storage, &lifecycle, "VecFill").await;
     let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
     assert_eq!(vix.index_status, "ACTIVE");
     let body = serde_json::to_string(&desc).unwrap();
@@ -1414,14 +1444,7 @@ async fn update_table_deletes_vector_index_leaving_base_table_and_gsis_untouched
     assert!(physical_table_exists(&storage, "VecDrop::gsi::gsi1"));
     assert!(physical_table_exists(&storage, "VecDrop::lsi::lsi1"));
 
-    let desc = dynoxide::actions::describe_table::execute(
-        &storage,
-        DescribeTableRequest {
-            table_name: "VecDrop".to_string(),
-        },
-    )
-    .await
-    .unwrap();
+    let desc = describe_raw(&storage, "VecDrop").await;
     assert!(desc.table.vector_indexes.is_none());
     assert_eq!(
         desc.table.global_secondary_indexes.as_ref().unwrap().len(),
@@ -1752,7 +1775,17 @@ fn fifth_vector_index_via_update_table_accepted_at_the_boundary() {
     let desc = describe(&db, "VecFour");
     let vixs = desc.table.vector_indexes.as_ref().unwrap();
     assert_eq!(vixs.len(), 5);
-    assert!(vixs.iter().all(|v| v.index_status == "ACTIVE"));
+
+    // One description, two lifecycles: the four created with the table are
+    // ACTIVE with no Backfilling, the fifth is inside the window UpdateTable
+    // opened.
+    for vix in vixs.iter().filter(|v| v.index_name != "vix-4") {
+        assert_eq!(vix.index_status, "ACTIVE", "{}", vix.index_name);
+        assert_eq!(vix.backfilling, None, "{}", vix.index_name);
+    }
+    let added = vixs.iter().find(|v| v.index_name == "vix-4").unwrap();
+    assert_eq!(added.index_status, "CREATING");
+    assert_eq!(added.backfilling, Some(true));
 }
 
 #[test]
@@ -2855,7 +2888,7 @@ async fn a_lowercase_action_key_does_not_bypass_the_wire_guards() {
     }))
     .expect("the lowercase key deserialises, carrying no recognised action");
 
-    let err = dynoxide::actions::update_table::execute(&storage, req)
+    let err = dynoxide::actions::update_table::execute(&storage, req, &VectorIndexLifecycle::new())
         .await
         .expect_err("an unrecognised action is refused, not applied unvalidated");
     assert!(
@@ -2864,12 +2897,7 @@ async fn a_lowercase_action_key_does_not_bypass_the_wire_guards() {
     );
 
     // And nothing was created behind it.
-    let desc = dynoxide::actions::describe_table::execute(
-        &storage,
-        serde_json::from_value(json!({"TableName": "WireCase"})).unwrap(),
-    )
-    .await
-    .unwrap();
+    let desc = describe_raw(&storage, "WireCase").await;
     let names: Vec<String> = desc
         .table
         .vector_indexes
@@ -4097,5 +4125,302 @@ fn create_table_negative_dimensions_reports_the_value_as_given() {
     assert!(
         err.contains("Value '-1' at 'vectorIndexes.1.member.dimensions'"),
         "the raw value is what gets echoed: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The creation lifecycle of an index added to a live table
+//
+// Real DynamoDB puts an index added through UpdateTable through a visible
+// CREATING phase, reports the base table ACTIVE beside it, and refuses to drop
+// the table underneath it (captured eu-west-2, 2026-08-11 and 2026-08-21).
+// These drive the clock rather than waiting on it.
+// ---------------------------------------------------------------------------
+
+/// An engine whose clock a test drives, so a creation window can be crossed
+/// without waiting.
+fn db_with_manual_clock(clock: &ManualClock) -> Database {
+    Database::memory_with_clock(clock.arc()).unwrap()
+}
+
+/// A live table with five items and a vector index added afterwards, which
+/// leaves the index inside its creation window.
+fn table_with_an_index_added_afterwards(db: &Database, table: &str) {
+    db.create_table(parse(json!({
+        "TableName": table,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    })))
+    .unwrap();
+    for i in 0..5 {
+        db.put_item(
+            serde_json::from_value(json!({
+                "TableName": table,
+                "Item": {
+                    "pk": {"S": format!("item-{i}")},
+                    "embedding": {"L": [{"N": i.to_string()}, {"N": "1"}, {"N": "0"}]}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    add_vector_index(db, table, "vix");
+}
+
+fn add_vector_index(db: &Database, table: &str, index: &str) {
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": table,
+        "VectorIndexUpdates": [{"Create": vix_json(index)}]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+}
+
+fn delete_vector_index(db: &Database, table: &str, index: &str) -> dynoxide::Result<()> {
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": table,
+        "VectorIndexUpdates": [{"Delete": {"IndexName": index}}]
+    }))
+    .unwrap();
+    db.update_table(req).map(|_| ())
+}
+
+fn only_vix(db: &Database, table: &str) -> dynoxide::actions::VectorIndexDescription {
+    describe(db, table)
+        .table
+        .vector_indexes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|v| v.index_name == "vix")
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn the_table_reports_active_while_the_index_it_is_adding_reports_creating() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecLive");
+
+    // Table and index come from one description, or a transition between two
+    // calls would make the pairing meaningless.
+    let desc = describe(&db, "VecLive");
+    assert_eq!(desc.table.table_status, "ACTIVE");
+    let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "CREATING");
+    assert_eq!(vix.backfilling, Some(true));
+
+    // Past the window the field leaves the description rather than turning
+    // false, which is why a readiness check written as `Backfilling == false`
+    // never fires.
+    clock.tick(std::time::Duration::from_secs(60));
+    let desc = describe(&db, "VecLive");
+    assert_eq!(desc.table.table_status, "ACTIVE");
+    let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "ACTIVE");
+    assert_eq!(vix.backfilling, None);
+    let body = serde_json::to_string(&desc).unwrap();
+    assert!(
+        !body.contains("Backfilling"),
+        "Backfilling should be absent once ACTIVE, got: {body}"
+    );
+}
+
+#[test]
+fn an_unrelated_update_reports_the_creating_index_in_its_own_response() {
+    // An UpdateTable touching something else is accepted while a vector index
+    // is creating, and it returns a full table description. That description
+    // has to agree with the one DescribeTable gives at the same instant.
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecOther");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecOther",
+        "DeletionProtectionEnabled": true
+    }))
+    .unwrap();
+    let resp = db.update_table(req).unwrap();
+    let vix = &resp.table_description.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "CREATING");
+    assert_eq!(vix.backfilling, Some(true));
+    assert_eq!(only_vix(&db, "VecOther").index_status, "CREATING");
+}
+
+#[test]
+fn the_table_cannot_be_deleted_while_its_index_is_creating() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecHold");
+
+    let err = db
+        .delete_table(DeleteTableRequest {
+            table_name: "VecHold".to_string(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, dynoxide::DynoxideError::ResourceInUseException(_)),
+        "expected a ResourceInUseException, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Cannot delete table while indexes are being created, updated, or deleted."
+    );
+}
+
+#[test]
+fn the_refusal_survives_any_number_of_describes() {
+    // The documented readiness pattern polls DescribeTable until ACTIVE, which
+    // is unbounded. A refusal that ran out after a fixed number of looks would
+    // pass a conformance test only because the test broke on its first poll.
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecPoll");
+
+    for _ in 0..50 {
+        assert_eq!(only_vix(&db, "VecPoll").index_status, "CREATING");
+        let err = db
+            .delete_table(DeleteTableRequest {
+                table_name: "VecPoll".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cannot delete table while indexes are being created, updated, or deleted."
+        );
+    }
+}
+
+#[test]
+fn the_table_deletes_once_the_index_has_finished_creating() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecFree");
+
+    clock.tick(std::time::Duration::from_secs(60));
+    let resp = db
+        .delete_table(DeleteTableRequest {
+            table_name: "VecFree".to_string(),
+        })
+        .unwrap();
+    assert_eq!(resp.table_description.table_status, "DELETING");
+}
+
+#[test]
+fn a_table_with_no_vector_indexes_deletes_unaffected() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    db.create_table(parse(json!({
+        "TableName": "VecNone",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "BillingMode": "PAY_PER_REQUEST"
+    })))
+    .unwrap();
+
+    db.delete_table(DeleteTableRequest {
+        table_name: "VecNone".to_string(),
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_protected_table_answers_deletion_protection_rather_than_the_creating_index() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecGuard");
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecGuard",
+        "DeletionProtectionEnabled": true
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let err = db
+        .delete_table(DeleteTableRequest {
+            table_name: "VecGuard".to_string(),
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("protected against deletion"),
+        "expected the deletion-protection message, got {err}"
+    );
+}
+
+#[test]
+fn dropping_a_table_leaves_no_lifecycle_entry_behind() {
+    // A table recreated under the same name, with an index of the same name
+    // created alongside it, must be searchable at once: the entry the dropped
+    // table left would otherwise hold it inside a window it never entered.
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecReuse");
+    clock.tick(std::time::Duration::from_secs(60));
+    db.delete_table(DeleteTableRequest {
+        table_name: "VecReuse".to_string(),
+    })
+    .unwrap();
+
+    db.create_table(parse(base_request("VecReuse", json!([vix_json("vix")]))))
+        .unwrap();
+    let vix = only_vix(&db, "VecReuse");
+    assert_eq!(vix.index_status, "ACTIVE");
+    assert_eq!(vix.backfilling, None);
+}
+
+#[test]
+fn cancelling_a_creating_index_clears_its_state_and_frees_the_table() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecCancel");
+    assert_eq!(only_vix(&db, "VecCancel").index_status, "CREATING");
+
+    delete_vector_index(&db, "VecCancel", "vix").unwrap();
+
+    let desc = describe(&db, "VecCancel");
+    assert!(desc.table.vector_indexes.is_none());
+    assert_eq!(desc.table.table_status, "ACTIVE");
+
+    // Deletable straight away, with no wait: without the disarm the entry the
+    // cancelled index left would keep refusing.
+    db.delete_table(DeleteTableRequest {
+        table_name: "VecCancel".to_string(),
+    })
+    .unwrap();
+}
+
+#[test]
+fn deleting_an_index_that_has_finished_creating_still_works() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecSettled");
+    clock.tick(std::time::Duration::from_secs(60));
+
+    delete_vector_index(&db, "VecSettled", "vix").unwrap();
+    assert!(describe(&db, "VecSettled").table.vector_indexes.is_none());
+}
+
+#[test]
+fn two_creates_in_one_call_still_answer_the_one_online_action_limit() {
+    let clock = ManualClock::new(1_700_000_000);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecLimit");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecLimit",
+        "VectorIndexUpdates": [
+            {"Create": vix_json("vix2")},
+            {"Create": vix_json("vix3")}
+        ]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table"
     );
 }

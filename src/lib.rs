@@ -119,6 +119,8 @@ pub use storage_backend::BackendError;
 pub use storage_backend::WasmBridgeBackend;
 pub use types::{AttributeValue, ConversionError, Item};
 
+use actions::vector_lifecycle::VectorIndexLifecycle;
+
 /// Options for `Database::import_items()`.
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
@@ -525,6 +527,7 @@ pub const WASM_PREVIEW: bool = false;
 pub struct Database<S = RusqliteBackend> {
     inner: Arc<Mutex<S>>,
     tokens: Arc<TokenCaches>,
+    vector_lifecycle: Arc<VectorIndexLifecycle>,
 }
 
 /// Serialises backend access on the backend-neutral build. On wasm this is an
@@ -556,6 +559,7 @@ use std::sync::Mutex as BackendMutex;
 pub struct Database<S> {
     inner: Arc<BackendMutex<S>>,
     tokens: Arc<TokenCaches>,
+    vector_lifecycle: Arc<VectorIndexLifecycle>,
 }
 
 // Hand-written so cloning never requires `S: Clone`; only the `Arc`s clone.
@@ -564,6 +568,7 @@ impl<S> Clone for Database<S> {
         Self {
             inner: Arc::clone(&self.inner),
             tokens: Arc::clone(&self.tokens),
+            vector_lifecycle: Arc::clone(&self.vector_lifecycle),
         }
     }
 }
@@ -576,6 +581,7 @@ impl Database<RusqliteBackend> {
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
+            vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
     }
 
@@ -611,6 +617,7 @@ impl Database<RusqliteBackend> {
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
+            vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
     }
 
@@ -620,6 +627,22 @@ impl Database<RusqliteBackend> {
         Ok(Self {
             inner: Arc::new(Mutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
+            vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
+        })
+    }
+
+    /// Open an in-memory database reading time from `clock`.
+    ///
+    /// The counterpart to [`storage::Storage::with_clock`] for a caller that
+    /// only has a `Database`: an integration test outside `src/` can hand in a
+    /// [`ManualClock`](storage_backend::ManualClock) and drive the vector index
+    /// creation lifecycle without waiting on real time.
+    pub fn memory_with_clock(clock: Arc<dyn storage_backend::Clock>) -> Result<Self> {
+        let storage = storage::Storage::memory()?.with_clock(clock);
+        Ok(Self {
+            inner: Arc::new(Mutex::new(storage)),
+            tokens: Arc::new(TokenCaches::new()),
+            vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
     }
 
@@ -664,7 +687,13 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::delete_table::DeleteTableRequest,
     ) -> Result<actions::delete_table::DeleteTableResponse> {
-        self.with_storage(|s| pollster::block_on(actions::delete_table::execute(s, request)))
+        self.with_storage(|s| {
+            pollster::block_on(actions::delete_table::execute(
+                s,
+                request,
+                &self.vector_lifecycle,
+            ))
+        })
     }
 
     /// Describe a DynamoDB table.
@@ -672,7 +701,13 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::describe_table::DescribeTableRequest,
     ) -> Result<actions::describe_table::DescribeTableResponse> {
-        self.with_storage(|s| pollster::block_on(actions::describe_table::execute(s, request)))
+        self.with_storage(|s| {
+            pollster::block_on(actions::describe_table::execute(
+                s,
+                request,
+                &self.vector_lifecycle,
+            ))
+        })
     }
 
     /// Update a DynamoDB table (add/remove GSIs).
@@ -680,7 +715,13 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::update_table::UpdateTableRequest,
     ) -> Result<actions::update_table::UpdateTableResponse> {
-        self.with_storage(|s| pollster::block_on(actions::update_table::execute(s, request)))
+        self.with_storage(|s| {
+            pollster::block_on(actions::update_table::execute(
+                s,
+                request,
+                &self.vector_lifecycle,
+            ))
+        })
     }
 
     /// List DynamoDB tables.
@@ -862,7 +903,13 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::search_vectors::SearchVectorsRequest,
     ) -> Result<actions::search_vectors::SearchVectorsResponse> {
-        self.with_storage(|s| pollster::block_on(actions::search_vectors::execute(s, request)))
+        self.with_storage(|s| {
+            pollster::block_on(actions::search_vectors::execute(
+                s,
+                request,
+                &self.vector_lifecycle,
+            ))
+        })
     }
 
     // -------------------------------------------------------------------
@@ -1181,6 +1228,7 @@ impl Database<WasmBridgeBackend> {
         Ok(Self {
             inner: Arc::new(BackendMutex::new(backend)),
             tokens: Arc::new(TokenCaches::new()),
+            vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
     }
 
@@ -1219,6 +1267,13 @@ impl Database<WasmBridgeBackend> {
         &self.tokens
     }
 
+    /// The vector index creation lifecycle this instance owns, for a dispatch
+    /// that has to report or enforce it. Outlives any single call, so an index
+    /// armed by one dispatch is still creating when the next one looks.
+    pub(crate) fn vector_lifecycle(&self) -> &VectorIndexLifecycle {
+        &self.vector_lifecycle
+    }
+
     /// Create a new DynamoDB table.
     pub async fn create_table(
         &self,
@@ -1234,7 +1289,7 @@ impl Database<WasmBridgeBackend> {
         request: actions::delete_table::DeleteTableRequest,
     ) -> Result<actions::delete_table::DeleteTableResponse> {
         let backend = self.backend().await;
-        actions::delete_table::execute(&*backend, request).await
+        actions::delete_table::execute(&*backend, request, &self.vector_lifecycle).await
     }
 
     /// Describe a DynamoDB table.
@@ -1243,7 +1298,7 @@ impl Database<WasmBridgeBackend> {
         request: actions::describe_table::DescribeTableRequest,
     ) -> Result<actions::describe_table::DescribeTableResponse> {
         let backend = self.backend().await;
-        actions::describe_table::execute(&*backend, request).await
+        actions::describe_table::execute(&*backend, request, &self.vector_lifecycle).await
     }
 
     /// List DynamoDB tables.
@@ -1308,7 +1363,7 @@ impl Database<WasmBridgeBackend> {
         request: actions::search_vectors::SearchVectorsRequest,
     ) -> Result<actions::search_vectors::SearchVectorsResponse> {
         let backend = self.backend().await;
-        actions::search_vectors::execute(&*backend, request).await
+        actions::search_vectors::execute(&*backend, request, &self.vector_lifecycle).await
     }
 }
 

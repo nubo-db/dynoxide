@@ -316,7 +316,15 @@ pub async fn execute<S: StorageBackend>(
             DynoxideError::InternalServerError("Table metadata not found after creation".into())
         })?;
 
-    let mut desc = build_table_description(&meta, Some(0), Some(0));
+    // An index created with its table is never armed: measured in eu-west-2 on
+    // 2026-08-21 it reaches ACTIVE in the same DescribeTable poll as the table,
+    // so there is no window to report and an empty phase set says exactly that.
+    let mut desc = build_table_description(
+        &meta,
+        Some(0),
+        Some(0),
+        &crate::actions::vector_lifecycle::VectorIndexPhases::default(),
+    );
     // CreateTable response shows CREATING status (table is usable immediately
     // but DynamoDB API contract says newly-created tables start as CREATING)
     desc.table_status = "CREATING".to_string();

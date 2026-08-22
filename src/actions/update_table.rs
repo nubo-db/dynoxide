@@ -1,4 +1,5 @@
 use crate::actions::create_table::StreamSpecification;
+use crate::actions::vector_lifecycle::{VectorIndexLifecycle, phases_armed_on};
 use crate::actions::{TableDescription, build_table_description};
 use crate::actions::{gsi, helpers};
 use crate::errors::{DynoxideError, Result};
@@ -304,6 +305,7 @@ pub struct UpdateTableResponse {
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     mut request: UpdateTableRequest,
+    lifecycle: &VectorIndexLifecycle,
 ) -> Result<UpdateTableResponse> {
     // Table name validation is handled in the Deserialize impl
 
@@ -1034,9 +1036,27 @@ pub async fn execute<S: StorageBackend>(
     })
     .await?;
 
+    // Arm and disarm only once the transaction has committed, so a failed
+    // update leaves no index claiming to be creating. A delete disarms whether
+    // or not the index finished creating: cancelling a creating index has to
+    // clear its entry, or DeleteTable's guard keeps refusing on an index that
+    // no longer exists.
+    if let Some(ref updates) = request.vector_index_updates {
+        let now = storage.clock().now_unix_secs_f64();
+        for update in updates {
+            if let Some(ref create) = update.create {
+                lifecycle.arm(&request.table_name, &create.index_name, now);
+            }
+            if let Some(ref delete) = update.delete {
+                lifecycle.disarm(&request.table_name, &delete.index_name);
+            }
+        }
+    }
+
     // Build response from updated metadata
     let updated_meta = helpers::require_table(storage, &request.table_name).await?;
-    let mut desc = build_table_description(&updated_meta, Some(0), Some(0));
+    let vector_phases = phases_armed_on(storage, lifecycle, &request.table_name);
+    let mut desc = build_table_description(&updated_meta, Some(0), Some(0), &vector_phases);
 
     // The UpdateTable response echoes the merged ceilings with any -1 kept
     // verbatim; only DescribeTable afterwards shows the post-removal state.
@@ -1044,27 +1064,13 @@ pub async fn execute<S: StorageBackend>(
         desc.on_demand_throughput = Some(echo);
     }
 
-    // A vector index create reports the table UPDATING and the new index
-    // CREATING in the UpdateTable response; DescribeTable then reports ACTIVE
-    // immediately with Backfilling never present, since backfill ran
-    // synchronously above. The instant-ACTIVE posture mirrors the GSI one and
-    // is the documented divergence from the captured lifecycle walk
-    // (eu-west-2, 2026-08-11), whose response shapes are matched here.
+    // A vector index create reports the table UPDATING (captured eu-west-2,
+    // 2026-08-11). The index's own CREATING comes from the phases above, the
+    // same derivation every later DescribeTable reads, so this response and the
+    // next description cannot disagree.
     if let Some(ref updates) = request.vector_index_updates {
-        let created: std::collections::HashSet<&str> = updates
-            .iter()
-            .filter_map(|u| u.create.as_ref())
-            .map(|c| c.index_name.as_str())
-            .collect();
-        if !created.is_empty() {
+        if updates.iter().any(|u| u.create.is_some()) {
             desc.table_status = "UPDATING".to_string();
-            if let Some(ref mut vixs) = desc.vector_indexes {
-                for vix in vixs {
-                    if created.contains(vix.index_name.as_str()) {
-                        vix.index_status = "CREATING".to_string();
-                    }
-                }
-            }
         }
     }
 

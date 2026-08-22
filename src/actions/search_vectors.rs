@@ -24,6 +24,7 @@ use crate::actions::helpers;
 use crate::actions::vector_index::{
     hash_attr, parse_attr_defs, parse_vector_defs, scalar_type_str,
 };
+use crate::actions::vector_lifecycle::{VectorIndexLifecycle, phase_of_resolved_index};
 use crate::errors::{DynoxideError, Result};
 use crate::expressions;
 use crate::expressions::PathElement;
@@ -426,6 +427,7 @@ fn parse_query_vector(search_vector: &[AttributeValue], vix: &VectorIndex) -> Re
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: SearchVectorsRequest,
+    lifecycle: &VectorIndexLifecycle,
 ) -> Result<SearchVectorsResponse> {
     // Validate table name format before checking existence, mirroring the
     // Query family.
@@ -531,6 +533,22 @@ pub async fn execute<S: StorageBackend>(
             request.index_name
         )));
     };
+
+    // An index added to a live table refuses a search for the whole of its
+    // creation window, and keeps refusing for a period after it reports ACTIVE
+    // (captured eu-west-2, 2026-08-11). Placed after index resolution so an
+    // unknown index still answers its own message, and before the vector and
+    // SearchSchema checks: this ordering against them is uncaptured, and is
+    // chosen to match the operation's other resource-state answers rather than
+    // its input validation.
+    if !phase_of_resolved_index(storage, lifecycle, &request.table_name, &request.index_name)
+        .is_searchable()
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "Cannot search backfilling vector index: {}",
+            request.index_name
+        )));
+    }
 
     let query_vec = parse_query_vector(&request.search_vector, vix)?;
 

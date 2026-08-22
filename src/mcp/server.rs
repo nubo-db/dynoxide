@@ -466,7 +466,7 @@ pub struct UpdateTableParams {
     pub global_secondary_index_updates: Option<serde_json::Value>,
 
     #[schemars(
-        description = "Vector index updates as array of {create} or {delete} objects. A create carries the same shape as a create_table vector index; a delete carries {index_name}. One index per call. A created index is not searchable straight away: it reports index_status CREATING, then ACTIVE while still refusing searches, and the table cannot be deleted until it settles. A delete is accepted at any point, including while it is creating."
+        description = "Vector index updates as array of {create} or {delete} objects. A create carries the same shape as a create_table vector index; a delete carries {index_name}. One index per call. A created index is not searchable straight away: it reports index_status CREATING, then ACTIVE while still refusing searches. The table cannot be deleted while the index reports CREATING, which is the earlier of those two and lifts before searches start working. A delete of the index is accepted at any point, including while it is creating."
     )]
     pub vector_index_updates: Option<serde_json::Value>,
 

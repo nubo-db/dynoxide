@@ -49,6 +49,7 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - `actions::batch_execute_statement::BatchStatementRequest` is `#[non_exhaustive]`. Build it from `Default` and assign, or deserialise it.
 - `actions::describe_table::execute`, `delete_table::execute`, `update_table::execute` and `search_vectors::execute` take a further `&actions::vector_lifecycle::VectorIndexLifecycle`, which is where the vector index creation lifecycle lives. `Database` owns one and passes its own; a caller driving the actions directly can construct one with `VectorIndexLifecycle::new()`.
 - `wasm_api::DispatchContext::new` takes a `&VectorIndexLifecycle` alongside the token caches, so a dispatch reports and enforces the lifecycle the way the native surfaces do.
+- `Database::memory_with_clock` is new: an in-memory engine reading time from a caller-supplied `Clock`, so a test outside the crate can drive the vector index creation window without waiting on it. The window's two thresholds are `actions::vector_lifecycle::ACTIVE_AFTER_SECS` and `SEARCHABLE_AFTER_SECS`.
 - `partiql::executor::statement_target` is removed. Use `statement_target_in`, which takes a table the caller has already resolved.
 - `partiql::executor::execute_page` takes three further arguments: `consistent_read`, `capacity_mode` and an optional `resolved` table.
 - `partiql::parser::parse` returns `Result<Statement, ParseError>` rather than `Result<Statement, String>`.

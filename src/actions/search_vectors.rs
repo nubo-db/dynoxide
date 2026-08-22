@@ -24,7 +24,7 @@ use crate::actions::helpers;
 use crate::actions::vector_index::{
     hash_attr, parse_attr_defs, parse_vector_defs, scalar_type_str,
 };
-use crate::actions::vector_lifecycle::{VectorIndexLifecycle, phase_of_resolved_index};
+use crate::actions::vector_lifecycle::VectorIndexLifecycle;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions;
 use crate::expressions::PathElement;
@@ -541,7 +541,8 @@ pub async fn execute<S: StorageBackend>(
     // SearchSchema checks: this ordering against them is uncaptured, and is
     // chosen to match the operation's other resource-state answers rather than
     // its input validation.
-    if !phase_of_resolved_index(storage, lifecycle, &request.table_name, &request.index_name)
+    if !lifecycle
+        .phase_of_index(storage, &request.table_name, &request.index_name)
         .is_searchable()
     {
         return Err(DynoxideError::ValidationException(format!(

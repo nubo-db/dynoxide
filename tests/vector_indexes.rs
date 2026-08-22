@@ -11,7 +11,9 @@ use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::delete_table::DeleteTableRequest;
 use dynoxide::actions::describe_table::DescribeTableRequest;
 use dynoxide::actions::update_table::{UpdateTableRequest, VectorIndexUpdate};
-use dynoxide::actions::vector_lifecycle::VectorIndexLifecycle;
+use dynoxide::actions::vector_lifecycle::{
+    ACTIVE_AFTER_SECS, SEARCHABLE_AFTER_SECS, VectorIndexLifecycle,
+};
 use dynoxide::storage::Storage;
 use dynoxide::storage_backend::ManualClock;
 use dynoxide::types::{
@@ -22,6 +24,24 @@ use serde_json::json;
 
 fn make_db() -> Database {
     Database::memory().unwrap()
+}
+
+/// The epoch second every lifecycle test starts its clock at. An index armed
+/// while the clock reads this has its window measured from here.
+const ARMED: u64 = 1_700_000_000;
+
+/// Move the clock to where the index reports `ACTIVE` but a search is still
+/// refused, and to past the whole window.
+///
+/// Derived from the thresholds rather than written as a number, so raising or
+/// lowering either one fails these assertions loudly instead of quietly
+/// re-pointing them at the wrong phase.
+fn advance_to_active_not_searchable(clock: &ManualClock) {
+    clock.set(ARMED + ACTIVE_AFTER_SECS as u64 + 1);
+}
+
+fn advance_past_the_window(clock: &ManualClock) {
+    clock.set(ARMED + SEARCHABLE_AFTER_SECS as u64 + 1);
 }
 
 /// A minimal valid vector index definition, mirroring the shape the AWS SDK
@@ -1025,7 +1045,7 @@ fn shadow_row_count(storage: &Storage, shadow_table: &str) -> i64 {
 
 #[tokio::test(flavor = "current_thread")]
 async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let storage = Storage::memory().unwrap().with_clock(clock.arc());
     let lifecycle = VectorIndexLifecycle::new();
     create_plain_ppr_table(&storage, "VecFill").await;
@@ -1122,7 +1142,7 @@ async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
 
     // Past the window it reports ACTIVE, and Backfilling leaves the serialised
     // description rather than turning false.
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
     let desc = describe_raw_with(&storage, &lifecycle, "VecFill").await;
     let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
     assert_eq!(vix.index_status, "ACTIVE");
@@ -1762,7 +1782,11 @@ fn billing_switch_combined_with_delete_of_last_vector_index_rejected() {
 
 #[test]
 fn fifth_vector_index_via_update_table_accepted_at_the_boundary() {
-    let db = make_db();
+    // A manual clock, because the assertion below reads the fifth index's
+    // creation phase and a real one would put a wall-clock deadline on a test
+    // that is about a count limit.
+    let clock = ManualClock::new(ARMED);
+    let db = db_with_manual_clock(&clock);
     let vixs: Vec<serde_json::Value> = (0..4).map(|i| vix_json(&format!("vix-{i}"))).collect();
     db.create_table(parse(base_request("VecFour", json!(vixs))))
         .unwrap();
@@ -4201,7 +4225,7 @@ fn only_vix(db: &Database, table: &str) -> dynoxide::actions::VectorIndexDescrip
 
 #[test]
 fn the_table_reports_active_while_the_index_it_is_adding_reports_creating() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecLive");
 
@@ -4216,7 +4240,7 @@ fn the_table_reports_active_while_the_index_it_is_adding_reports_creating() {
     // Past the window the field leaves the description rather than turning
     // false, which is why a readiness check written as `Backfilling == false`
     // never fires.
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
     let desc = describe(&db, "VecLive");
     assert_eq!(desc.table.table_status, "ACTIVE");
     let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
@@ -4234,7 +4258,7 @@ fn an_unrelated_update_reports_the_creating_index_in_its_own_response() {
     // An UpdateTable touching something else is accepted while a vector index
     // is creating, and it returns a full table description. That description
     // has to agree with the one DescribeTable gives at the same instant.
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecOther");
 
@@ -4252,7 +4276,7 @@ fn an_unrelated_update_reports_the_creating_index_in_its_own_response() {
 
 #[test]
 fn the_table_cannot_be_deleted_while_its_index_is_creating() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecHold");
 
@@ -4276,7 +4300,7 @@ fn the_refusal_survives_any_number_of_describes() {
     // The documented readiness pattern polls DescribeTable until ACTIVE, which
     // is unbounded. A refusal that ran out after a fixed number of looks would
     // pass a conformance test only because the test broke on its first poll.
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecPoll");
 
@@ -4294,13 +4318,46 @@ fn the_refusal_survives_any_number_of_describes() {
     }
 }
 
+/// The delete guard and the search refusal end at different points, and the
+/// documentation says so, so pin it rather than leave a reader to infer that a
+/// successful delete means a search would have worked.
+#[test]
+fn the_delete_guard_lifts_at_active_while_a_search_is_still_refused() {
+    let clock = ManualClock::new(ARMED);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecGap");
+
+    advance_to_active_not_searchable(&clock);
+    assert_eq!(only_vix(&db, "VecGap").index_status, "ACTIVE");
+
+    let err = db
+        .search_vectors(
+            serde_json::from_value(json!({
+                "TableName": "VecGap", "IndexName": "vix",
+                "SearchVector": [{"N": "1"}, {"N": "1"}, {"N": "0"}], "TopK": 5
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Cannot search backfilling vector index: vix"
+    );
+
+    // Deletable all the same: the guard tracks CREATING, not searchability.
+    db.delete_table(DeleteTableRequest {
+        table_name: "VecGap".to_string(),
+    })
+    .unwrap();
+}
+
 #[test]
 fn the_table_deletes_once_the_index_has_finished_creating() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecFree");
 
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
     let resp = db
         .delete_table(DeleteTableRequest {
             table_name: "VecFree".to_string(),
@@ -4311,7 +4368,7 @@ fn the_table_deletes_once_the_index_has_finished_creating() {
 
 #[test]
 fn a_table_with_no_vector_indexes_deletes_unaffected() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     db.create_table(parse(json!({
         "TableName": "VecNone",
@@ -4329,7 +4386,7 @@ fn a_table_with_no_vector_indexes_deletes_unaffected() {
 
 #[test]
 fn a_protected_table_answers_deletion_protection_rather_than_the_creating_index() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecGuard");
     let req: UpdateTableRequest = serde_json::from_value(json!({
@@ -4355,10 +4412,10 @@ fn dropping_a_table_leaves_no_lifecycle_entry_behind() {
     // A table recreated under the same name, with an index of the same name
     // created alongside it, must be searchable at once: the entry the dropped
     // table left would otherwise hold it inside a window it never entered.
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecReuse");
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
     db.delete_table(DeleteTableRequest {
         table_name: "VecReuse".to_string(),
     })
@@ -4373,7 +4430,7 @@ fn dropping_a_table_leaves_no_lifecycle_entry_behind() {
 
 #[test]
 fn cancelling_a_creating_index_clears_its_state_and_frees_the_table() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecCancel");
     assert_eq!(only_vix(&db, "VecCancel").index_status, "CREATING");
@@ -4394,10 +4451,10 @@ fn cancelling_a_creating_index_clears_its_state_and_frees_the_table() {
 
 #[test]
 fn deleting_an_index_that_has_finished_creating_still_works() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecSettled");
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
 
     delete_vector_index(&db, "VecSettled", "vix").unwrap();
     assert!(describe(&db, "VecSettled").table.vector_indexes.is_none());
@@ -4405,7 +4462,7 @@ fn deleting_an_index_that_has_finished_creating_still_works() {
 
 #[test]
 fn two_creates_in_one_call_still_answer_the_one_online_action_limit() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecLimit");
 

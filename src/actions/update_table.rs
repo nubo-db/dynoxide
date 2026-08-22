@@ -1,5 +1,5 @@
 use crate::actions::create_table::StreamSpecification;
-use crate::actions::vector_lifecycle::{VectorIndexLifecycle, phases_armed_on};
+use crate::actions::vector_lifecycle::VectorIndexLifecycle;
 use crate::actions::{TableDescription, build_table_description};
 use crate::actions::{gsi, helpers};
 use crate::errors::{DynoxideError, Result};
@@ -1042,10 +1042,9 @@ pub async fn execute<S: StorageBackend>(
     // clear its entry, or DeleteTable's guard keeps refusing on an index that
     // no longer exists.
     if let Some(ref updates) = request.vector_index_updates {
-        let now = storage.clock().now_unix_secs_f64();
         for update in updates {
             if let Some(ref create) = update.create {
-                lifecycle.arm(&request.table_name, &create.index_name, now);
+                lifecycle.arm(storage, &request.table_name, &create.index_name);
             }
             if let Some(ref delete) = update.delete {
                 lifecycle.disarm(&request.table_name, &delete.index_name);
@@ -1055,7 +1054,7 @@ pub async fn execute<S: StorageBackend>(
 
     // Build response from updated metadata
     let updated_meta = helpers::require_table(storage, &request.table_name).await?;
-    let vector_phases = phases_armed_on(storage, lifecycle, &request.table_name);
+    let vector_phases = lifecycle.phases_armed_on(storage, &request.table_name);
     let mut desc = build_table_description(&updated_meta, Some(0), Some(0), &vector_phases);
 
     // The UpdateTable response echoes the merged ceilings with any -1 kept

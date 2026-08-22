@@ -11,7 +11,9 @@
 //! absorbs floating-point rounding.
 
 use dynoxide::actions::search_vectors::{SearchVectorsRequest, SearchVectorsResponse};
-use dynoxide::actions::vector_lifecycle::VectorIndexLifecycle;
+use dynoxide::actions::vector_lifecycle::{
+    ACTIVE_AFTER_SECS, SEARCHABLE_AFTER_SECS, VectorIndexLifecycle,
+};
 use dynoxide::storage::Storage;
 use dynoxide::storage_backend::ManualClock;
 use serde_json::json;
@@ -78,6 +80,24 @@ fn scores(resp: &SearchVectorsResponse) -> Vec<(String, f64)> {
 
 fn n_vec(ns: &[&str]) -> serde_json::Value {
     json!(ns.iter().map(|n| json!({"N": n})).collect::<Vec<_>>())
+}
+
+/// The epoch second every lifecycle test starts its clock at. An index armed
+/// while the clock reads this has its window measured from here.
+const ARMED: u64 = 1_700_000_000;
+
+/// Move the clock to where the index reports `ACTIVE` but a search is still
+/// refused, and to past the whole window.
+///
+/// Derived from the thresholds rather than written as a number, so raising or
+/// lowering either one fails these assertions loudly instead of quietly
+/// re-pointing them at the wrong phase.
+fn advance_to_active_not_searchable(clock: &ManualClock) {
+    clock.set(ARMED + ACTIVE_AFTER_SECS as u64 + 1);
+}
+
+fn advance_past_the_window(clock: &ManualClock) {
+    clock.set(ARMED + SEARCHABLE_AFTER_SECS as u64 + 1);
 }
 
 /// A table with one index per distance function over the suite's separation
@@ -384,7 +404,7 @@ async fn tie_order_is_identical_between_backfill_and_incremental_builds() {
     // The backfilled index arrives through UpdateTable, so it opens a creation
     // window a search is refused for. The clock is driven rather than waited
     // on, and the comparison is between two searchable indexes.
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let storage = Storage::memory().unwrap().with_clock(clock.arc());
     let lifecycle = VectorIndexLifecycle::new();
 
@@ -431,7 +451,7 @@ async fn tie_order_is_identical_between_backfill_and_incremental_builds() {
     dynoxide::actions::update_table::execute(&storage, update, &lifecycle)
         .await
         .unwrap();
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
 
     let query = |table: &str| {
         json!({
@@ -1991,7 +2011,7 @@ fn query(table: &str) -> serde_json::Value {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_search_refuses_for_the_whole_creation_window_then_returns_every_item() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let storage = Storage::memory().unwrap().with_clock(clock.arc());
     let lifecycle = VectorIndexLifecycle::new();
     table_with_an_index_added_afterwards(&storage, &lifecycle, "VecWindow").await;
@@ -2011,7 +2031,7 @@ async fn a_search_refuses_for_the_whole_creation_window_then_returns_every_item(
 
     // And after it reports ACTIVE, which is the trap a poll-until-ACTIVE
     // readiness check falls into on AWS.
-    clock.tick(std::time::Duration::from_secs(20));
+    advance_to_active_not_searchable(&clock);
     let err = search_with(&storage, &lifecycle, query("VecWindow"))
         .await
         .unwrap_err();
@@ -2022,7 +2042,7 @@ async fn a_search_refuses_for_the_whole_creation_window_then_returns_every_item(
 
     // The first search that succeeds carries every seeded item, never a
     // partial view.
-    clock.tick(std::time::Duration::from_secs(20));
+    advance_past_the_window(&clock);
     let resp = search_with(&storage, &lifecycle, query("VecWindow"))
         .await
         .unwrap();
@@ -2031,7 +2051,7 @@ async fn a_search_refuses_for_the_whole_creation_window_then_returns_every_item(
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_index_that_does_not_exist_still_answers_its_own_message() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let storage = Storage::memory().unwrap().with_clock(clock.arc());
     let lifecycle = VectorIndexLifecycle::new();
     table_with_an_index_added_afterwards(&storage, &lifecycle, "VecMissing").await;
@@ -2077,7 +2097,7 @@ async fn an_index_created_with_its_table_is_searchable_immediately() {
 /// rather than its input validation.
 #[tokio::test(flavor = "current_thread")]
 async fn a_malformed_search_against_a_creating_index_reports_the_refusal_first() {
-    let clock = ManualClock::new(1_700_000_000);
+    let clock = ManualClock::new(ARMED);
     let storage = Storage::memory().unwrap().with_clock(clock.arc());
     let lifecycle = VectorIndexLifecycle::new();
     table_with_an_index_added_afterwards(&storage, &lifecycle, "VecMalformed").await;
@@ -2099,7 +2119,7 @@ async fn a_malformed_search_against_a_creating_index_reports_the_refusal_first()
 
     // Past the window the same request reports the dimension mismatch, so the
     // refusal is masking that answer rather than replacing it.
-    clock.tick(std::time::Duration::from_secs(60));
+    advance_past_the_window(&clock);
     let err = search_with(
         &storage,
         &lifecycle,

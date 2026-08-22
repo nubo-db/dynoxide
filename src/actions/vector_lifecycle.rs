@@ -38,7 +38,7 @@ use std::sync::Mutex;
 /// it needs to be. The conformance suite polls this walk at 1s and 5s against
 /// 300s and 2400s ceilings, so the margin is two orders of magnitude either
 /// side of any poll shape it might adopt.
-pub(crate) const ACTIVE_AFTER_SECS: f64 = 15.0;
+pub const ACTIVE_AFTER_SECS: f64 = 15.0;
 
 /// How long an index added through `UpdateTable` refuses a search for.
 ///
@@ -46,7 +46,7 @@ pub(crate) const ACTIVE_AFTER_SECS: f64 = 15.0;
 /// before it will answer, which is the trap a poll-until-ACTIVE readiness
 /// check falls into on AWS. Reproducing only the first threshold would leave
 /// that check passing here and failing there.
-pub(crate) const SEARCHABLE_AFTER_SECS: f64 = 30.0;
+pub const SEARCHABLE_AFTER_SECS: f64 = 30.0;
 
 /// Where an index sits in the creation lifecycle at one instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +137,11 @@ impl VectorIndexPhases {
 
     /// Whether any index in the set is still creating, which is what a
     /// `DeleteTable` refuses on.
+    ///
+    /// Only meaningful on a set built from the table's own definitions, as
+    /// [`VectorIndexLifecycle::phases_of`] builds one. Asked of an unfiltered
+    /// set it would let a stale entry, for an index the table has since
+    /// dropped, refuse the delete forever.
     pub(crate) fn any_creating(&self) -> bool {
         self.0.values().any(|p| p.is_creating())
     }
@@ -161,56 +166,116 @@ impl VectorIndexLifecycle {
         Self::default()
     }
 
-    /// Record that `index_name` on `table_name` started creating at `now`.
+    /// The armed map, recovering rather than propagating a poisoned lock.
+    ///
+    /// The map holds only `String` and `f64`, so nothing under this lock can
+    /// panic and leave it inconsistent. Treating a poisoning as fatal-but-silent
+    /// would be worse than recovering: every read would fall back to "nothing
+    /// armed", which is exactly the pre-lifecycle behaviour, so an engine would
+    /// quietly stop reporting the window rather than say anything had gone
+    /// wrong.
+    fn armed(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<String, f64>>> {
+        self.armed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record that `index_name` on `table_name` started creating now.
     ///
     /// Re-arming an index that already has an entry restarts its window, which
     /// is what dropping and re-adding an index under the same name should do.
-    pub(crate) fn arm(&self, table_name: &str, index_name: &str, now: f64) {
-        if let Ok(mut guard) = self.armed.lock() {
-            guard
-                .entry(table_name.to_string())
-                .or_default()
-                .insert(index_name.to_string(), now);
-        }
+    pub(crate) fn arm<S: crate::storage_backend::StorageBackend>(
+        &self,
+        storage: &S,
+        table_name: &str,
+        index_name: &str,
+    ) {
+        self.arm_at(table_name, index_name, now(storage));
     }
 
     /// Forget one index, whether or not it finished creating. Cancelling a
     /// still-creating index has to clear its entry or the table it sits on
     /// stays undeletable.
     pub(crate) fn disarm(&self, table_name: &str, index_name: &str) {
-        if let Ok(mut guard) = self.armed.lock() {
-            if let Some(table) = guard.get_mut(table_name) {
-                table.remove(index_name);
-                if table.is_empty() {
-                    guard.remove(table_name);
-                }
+        let mut armed = self.armed();
+        if let Some(table) = armed.get_mut(table_name) {
+            table.remove(index_name);
+            if table.is_empty() {
+                armed.remove(table_name);
             }
         }
     }
 
     /// Forget every index on a table, for the path that drops it.
     pub(crate) fn forget_table(&self, table_name: &str) {
-        if let Ok(mut guard) = self.armed.lock() {
-            guard.remove(table_name);
-        }
+        self.armed().remove(table_name);
+    }
+
+    /// The phase of every index this engine has armed on `table_name`, read at
+    /// the backend's own clock.
+    ///
+    /// Not filtered against the table's definitions. The caller that reports
+    /// these walks the definitions itself and asks by name, so an index the
+    /// table does not define is never looked up, and filtering would buy
+    /// nothing while costing a parse of the definition JSON on every describe.
+    /// For the same reason [`VectorIndexPhases::any_creating`] is not meaningful
+    /// on what this returns.
+    pub(crate) fn phases_armed_on<S: crate::storage_backend::StorageBackend>(
+        &self,
+        storage: &S,
+        table_name: &str,
+    ) -> VectorIndexPhases {
+        self.phases_armed_on_at(table_name, now(storage))
+    }
+
+    /// The phase of each index in `index_names`, for the caller that asks
+    /// whether *any* index is creating rather than about one it can name.
+    ///
+    /// Restricting it to the indexes the table still defines is what stops a
+    /// stale entry, for an index that has since gone, from refusing a
+    /// `DeleteTable`.
+    pub(crate) fn phases_of<'a, S: crate::storage_backend::StorageBackend>(
+        &self,
+        storage: &S,
+        table_name: &str,
+        index_names: impl Iterator<Item = &'a str>,
+    ) -> VectorIndexPhases {
+        self.phases_of_at(table_name, index_names, now(storage))
+    }
+
+    /// The phase of one index the caller has already resolved against the
+    /// table's definitions.
+    ///
+    /// For a path that holds the definition and would otherwise parse the
+    /// table's vector index JSON a second time to ask one question. Resolving
+    /// the name is all [`Self::phases_of`] wants the definitions for, so a
+    /// caller that has already resolved it loses nothing by skipping them.
+    pub(crate) fn phase_of_index<S: crate::storage_backend::StorageBackend>(
+        &self,
+        storage: &S,
+        table_name: &str,
+        index_name: &str,
+    ) -> VectorIndexPhase {
+        phase_of(self.armed_at(table_name, index_name), now(storage))
+    }
+
+    // The clock-free forms below carry the logic, so the unit tests can pin
+    // every edge of it without a backend.
+
+    fn arm_at(&self, table_name: &str, index_name: &str, now: f64) {
+        self.armed()
+            .entry(table_name.to_string())
+            .or_default()
+            .insert(index_name.to_string(), now);
     }
 
     /// When one index was armed, or `None` if it was not.
-    pub(crate) fn armed_at(&self, table_name: &str, index_name: &str) -> Option<f64> {
-        self.armed
-            .lock()
-            .ok()?
-            .get(table_name)?
-            .get(index_name)
-            .copied()
+    fn armed_at(&self, table_name: &str, index_name: &str) -> Option<f64> {
+        self.armed().get(table_name)?.get(index_name).copied()
     }
 
-    /// The phase of every index armed on `table_name` at `now`.
-    pub(crate) fn phases_armed_on(&self, table_name: &str, now: f64) -> VectorIndexPhases {
-        let guard = self.armed.lock().ok();
-        let table = guard.as_ref().and_then(|g| g.get(table_name));
+    fn phases_armed_on_at(&self, table_name: &str, now: f64) -> VectorIndexPhases {
         VectorIndexPhases(
-            table
+            self.armed()
+                .get(table_name)
                 .into_iter()
                 .flatten()
                 .map(|(name, armed_at)| (name.clone(), phase_of(Some(*armed_at), now)))
@@ -218,18 +283,14 @@ impl VectorIndexLifecycle {
         )
     }
 
-    /// The phase of each index named in `index_names` at `now`.
-    ///
-    /// Only indexes the table still defines are considered, so a stale entry
-    /// for an index that no longer exists can never refuse a `DeleteTable`.
-    pub(crate) fn phases<'a>(
+    fn phases_of_at<'a>(
         &self,
         table_name: &str,
         index_names: impl Iterator<Item = &'a str>,
         now: f64,
     ) -> VectorIndexPhases {
-        let guard = self.armed.lock().ok();
-        let table = guard.as_ref().and_then(|g| g.get(table_name));
+        let armed = self.armed();
+        let table = armed.get(table_name);
         VectorIndexPhases(
             index_names
                 .map(|name| {
@@ -241,52 +302,9 @@ impl VectorIndexLifecycle {
     }
 }
 
-/// The phase of every index this engine has armed on `table_name`, read at the
-/// backend's own clock.
-///
-/// Not filtered against the table's definitions. The caller that reports these
-/// walks the definitions itself and asks by name, and an index the table does
-/// not define is never asked about, so filtering would buy nothing and cost a
-/// parse of the definition JSON on every describe.
-pub(crate) fn phases_armed_on<S: crate::storage_backend::StorageBackend>(
-    storage: &S,
-    lifecycle: &VectorIndexLifecycle,
-    table_name: &str,
-) -> VectorIndexPhases {
-    lifecycle.phases_armed_on(table_name, storage.clock().now_unix_secs_f64())
-}
-
-/// The phase of each index in `index_names`, for the caller that asks whether
-/// *any* index is creating rather than about one it can name.
-///
-/// Restricting it to the indexes the table still defines is what stops a stale
-/// entry, for an index that has since gone, from refusing a `DeleteTable`.
-pub(crate) fn phases_of<'a, S: crate::storage_backend::StorageBackend>(
-    storage: &S,
-    lifecycle: &VectorIndexLifecycle,
-    table_name: &str,
-    index_names: impl Iterator<Item = &'a str>,
-) -> VectorIndexPhases {
-    lifecycle.phases(table_name, index_names, storage.clock().now_unix_secs_f64())
-}
-
-/// The phase of one index the caller has already resolved against the table's
-/// definitions.
-///
-/// For a path that holds the definition and would otherwise parse the table's
-/// vector index JSON a second time to ask one question. Resolving the name is
-/// all [`phases_of`] wants the definitions for, so a caller that has already
-/// resolved it loses nothing by skipping them.
-pub(crate) fn phase_of_resolved_index<S: crate::storage_backend::StorageBackend>(
-    storage: &S,
-    lifecycle: &VectorIndexLifecycle,
-    table_name: &str,
-    index_name: &str,
-) -> VectorIndexPhase {
-    phase_of(
-        lifecycle.armed_at(table_name, index_name),
-        storage.clock().now_unix_secs_f64(),
-    )
+/// The backend's own clock, as fractional epoch seconds.
+fn now<S: crate::storage_backend::StorageBackend>(storage: &S) -> f64 {
+    storage.clock().now_unix_secs_f64()
 }
 
 #[cfg(test)]
@@ -358,15 +376,15 @@ mod tests {
     #[test]
     fn reading_does_not_change_what_a_later_read_returns() {
         let lifecycle = VectorIndexLifecycle::new();
-        lifecycle.arm("t", "vix", ARMED);
+        lifecycle.arm_at("t", "vix", ARMED);
 
         for _ in 0..50 {
-            let phases = lifecycle.phases("t", ["vix"].into_iter(), ARMED + 1.0);
+            let phases = lifecycle.phases_of_at("t", ["vix"].into_iter(), ARMED + 1.0);
             assert_eq!(phases.get("vix"), VectorIndexPhase::Creating);
             assert!(phases.any_creating());
         }
 
-        let later = lifecycle.phases("t", ["vix"].into_iter(), ARMED + SEARCHABLE_AFTER_SECS);
+        let later = lifecycle.phases_of_at("t", ["vix"].into_iter(), ARMED + SEARCHABLE_AFTER_SECS);
         assert_eq!(later.get("vix"), VectorIndexPhase::Searchable);
         assert!(!later.any_creating());
     }
@@ -378,17 +396,17 @@ mod tests {
     #[test]
     fn the_unfiltered_set_carries_every_armed_index_on_that_table_alone() {
         let lifecycle = VectorIndexLifecycle::new();
-        lifecycle.arm("t", "a", ARMED);
-        lifecycle.arm("t", "b", ARMED - SEARCHABLE_AFTER_SECS);
-        lifecycle.arm("other", "c", ARMED);
+        lifecycle.arm_at("t", "a", ARMED);
+        lifecycle.arm_at("t", "b", ARMED - SEARCHABLE_AFTER_SECS);
+        lifecycle.arm_at("other", "c", ARMED);
 
-        let phases = lifecycle.phases_armed_on("t", ARMED);
+        let phases = lifecycle.phases_armed_on_at("t", ARMED);
         assert_eq!(phases.get("a"), VectorIndexPhase::Creating);
         assert_eq!(phases.get("b"), VectorIndexPhase::Searchable);
         assert_eq!(phases.get("c"), VectorIndexPhase::Searchable);
         assert!(phases.any_creating());
 
-        let none = lifecycle.phases_armed_on("nothing-armed-here", ARMED);
+        let none = lifecycle.phases_armed_on_at("nothing-armed-here", ARMED);
         assert_eq!(none.get("a"), VectorIndexPhase::Searchable);
         assert!(!none.any_creating());
     }
@@ -396,9 +414,9 @@ mod tests {
     #[test]
     fn an_index_the_table_no_longer_defines_is_not_reported() {
         let lifecycle = VectorIndexLifecycle::new();
-        lifecycle.arm("t", "gone", ARMED);
+        lifecycle.arm_at("t", "gone", ARMED);
 
-        let phases = lifecycle.phases("t", ["still-here"].into_iter(), ARMED + 1.0);
+        let phases = lifecycle.phases_of_at("t", ["still-here"].into_iter(), ARMED + 1.0);
         assert_eq!(phases.get("still-here"), VectorIndexPhase::Searchable);
         assert!(!phases.any_creating());
     }
@@ -406,11 +424,11 @@ mod tests {
     #[test]
     fn disarming_forgets_one_index_and_leaves_its_neighbour() {
         let lifecycle = VectorIndexLifecycle::new();
-        lifecycle.arm("t", "a", ARMED);
-        lifecycle.arm("t", "b", ARMED);
+        lifecycle.arm_at("t", "a", ARMED);
+        lifecycle.arm_at("t", "b", ARMED);
         lifecycle.disarm("t", "a");
 
-        let phases = lifecycle.phases("t", ["a", "b"].into_iter(), ARMED + 1.0);
+        let phases = lifecycle.phases_of_at("t", ["a", "b"].into_iter(), ARMED + 1.0);
         assert_eq!(phases.get("a"), VectorIndexPhase::Searchable);
         assert_eq!(phases.get("b"), VectorIndexPhase::Creating);
     }
@@ -418,23 +436,23 @@ mod tests {
     #[test]
     fn forgetting_a_table_clears_every_index_on_it() {
         let lifecycle = VectorIndexLifecycle::new();
-        lifecycle.arm("t", "a", ARMED);
-        lifecycle.arm("other", "a", ARMED);
+        lifecycle.arm_at("t", "a", ARMED);
+        lifecycle.arm_at("other", "a", ARMED);
         lifecycle.forget_table("t");
 
-        let gone = lifecycle.phases("t", ["a"].into_iter(), ARMED + 1.0);
+        let gone = lifecycle.phases_of_at("t", ["a"].into_iter(), ARMED + 1.0);
         assert_eq!(gone.get("a"), VectorIndexPhase::Searchable);
-        let kept = lifecycle.phases("other", ["a"].into_iter(), ARMED + 1.0);
+        let kept = lifecycle.phases_of_at("other", ["a"].into_iter(), ARMED + 1.0);
         assert_eq!(kept.get("a"), VectorIndexPhase::Creating);
     }
 
     #[test]
     fn re_arming_restarts_the_window() {
         let lifecycle = VectorIndexLifecycle::new();
-        lifecycle.arm("t", "vix", ARMED);
-        lifecycle.arm("t", "vix", ARMED + SEARCHABLE_AFTER_SECS);
+        lifecycle.arm_at("t", "vix", ARMED);
+        lifecycle.arm_at("t", "vix", ARMED + SEARCHABLE_AFTER_SECS);
 
-        let phases = lifecycle.phases(
+        let phases = lifecycle.phases_of_at(
             "t",
             ["vix"].into_iter(),
             ARMED + SEARCHABLE_AFTER_SECS + 1.0,

@@ -1,4 +1,4 @@
-use crate::actions::vector_lifecycle::{VectorIndexLifecycle, phases_of};
+use crate::actions::vector_lifecycle::VectorIndexLifecycle;
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
@@ -95,14 +95,19 @@ pub async fn execute<S: StorageBackend>(
     // protection check so a protected table still answers its own message
     // first. Only indexes the table still defines are considered, so a stale
     // entry for one that has gone cannot refuse a delete.
+    //
+    // Definitions that will not parse read as no indexes, the way every other
+    // reader of this column treats them: build_table_description reports none,
+    // and the drop loop below has always skipped them. A table whose metadata
+    // has become unreadable should stay deletable rather than be pinned by a
+    // guard nothing can now satisfy.
     let vector_indexes: Vec<crate::types::VectorIndex> = meta
         .vector_index_definitions
         .as_ref()
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
-    let vector_phases = phases_of(
+    let vector_phases = lifecycle.phases_of(
         storage,
-        lifecycle,
         &request.table_name,
         vector_indexes.iter().map(|v| v.index_name.as_str()),
     );
@@ -111,6 +116,12 @@ pub async fn execute<S: StorageBackend>(
             "Cannot delete table while indexes are being created, updated, or deleted.".to_string(),
         ));
     }
+
+    // Forget the entries here rather than after the drops below: the guard has
+    // just proved every one of them has settled, so none can affect an answer,
+    // and any of the drops can fail and return early. Left until the end, a
+    // half-finished delete would leak an entry per attempt.
+    lifecycle.forget_table(&request.table_name);
 
     // Drop GSI tables first
     if let Some(ref gsi_json) = meta.gsi_definitions {
@@ -148,12 +159,8 @@ pub async fn execute<S: StorageBackend>(
     // Delete metadata
     storage.delete_table_metadata(&request.table_name).await?;
 
-    // Nothing is left to track once the table has gone, and a long-lived server
-    // would otherwise accumulate an entry per dropped table.
-    lifecycle.forget_table(&request.table_name);
-
-    // Build response with DELETING status. The guard above has already ruled
-    // out a creating index, so every surviving phase reports ACTIVE.
+    // Build response with DELETING status. The guard above ruled out a creating
+    // index, so every phase in the set reports ACTIVE.
     let mut desc = build_table_description(&meta, Some(0), Some(0), &vector_phases);
     desc.table_status = "DELETING".to_string();
 

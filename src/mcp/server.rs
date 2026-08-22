@@ -466,7 +466,7 @@ pub struct UpdateTableParams {
     pub global_secondary_index_updates: Option<serde_json::Value>,
 
     #[schemars(
-        description = "Vector index updates as array of {create} or {delete} objects. A create carries the same shape as a create_table vector index; a delete carries {index_name}. One index per call."
+        description = "Vector index updates as array of {create} or {delete} objects. A create carries the same shape as a create_table vector index; a delete carries {index_name}. One index per call. A created index is not searchable straight away: it reports index_status CREATING, then ACTIVE while still refusing searches, and the table cannot be deleted until it settles. A delete is accepted at any point, including while it is creating."
     )]
     pub vector_index_updates: Option<serde_json::Value>,
 
@@ -1272,7 +1272,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "[READ] Search a vector index for the nearest entries to a query vector. Exact brute-force KNN over the whole index, so the top-k is the true top-k. COSINE and EUCLIDEAN score as distances, where a self match is 0; DOT_PRODUCT scores as a similarity and can be negative. The vector attribute is excluded from results unless a projection_expression names it and the index projects it. Create the index with create_table's vector_indexes."
+        description = "[READ] Search a vector index for the nearest entries to a query vector. Exact brute-force KNN over the whole index, so the top-k is the true top-k. COSINE and EUCLIDEAN score as distances, where a self match is 0; DOT_PRODUCT scores as a similarity and can be negative. The vector attribute is excluded from results unless a projection_expression names it and the index projects it. Create the index with create_table's vector_indexes, which is searchable at once. An index added later through update_table refuses with 'Cannot search backfilling vector index' until it settles, for longer than describe_table reports it CREATING, so retry the search rather than waiting for the status."
     )]
     fn search_vectors(
         &self,
@@ -2515,7 +2515,19 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
                         "distance_function": vix.distance_function,
                         "projection": {"projection_type": vix.projection.projection_type},
                         "item_count": vix.item_count.unwrap_or(0),
+                        // An index added to a live table is not searchable at
+                        // once, so an agent needs the status to know when to
+                        // retry. Without it this view reports every index the
+                        // same and the wait is unwritable.
+                        "index_status": vix.index_status,
                     });
+                    // Absent stays absent here too: the wire drops the field
+                    // once the index is ACTIVE rather than reporting false, and
+                    // a readiness check written against `== false` must fail
+                    // the same way on both surfaces.
+                    if let Some(backfilling) = vix.backfilling {
+                        out["backfilling"] = serde_json::Value::Bool(backfilling);
+                    }
                     if let Some(schema) = schema {
                         out["search_schema"] = serde_json::Value::Array(schema);
                     }

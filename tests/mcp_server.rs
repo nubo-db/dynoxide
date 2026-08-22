@@ -1333,6 +1333,100 @@ fn vector_index_updates_work_in_the_shape_the_tool_documents() {
 }
 
 #[test]
+fn an_index_added_through_mcp_reports_the_wire_s_creation_lifecycle() {
+    // An agent sees the same window a wire client does, because both surfaces
+    // run the same actions against the same engine. Only the refusing half is
+    // asserted here: the server holds a real clock, so the far side of the
+    // window belongs to the in-process tests that can drive one.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "McpVecLife",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "billing_mode": "PAY_PER_REQUEST"
+        }),
+    );
+    call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "McpVecLife",
+            "item": {"pk": {"S": "a"}, "emb": {"L": [{"N": "1"}, {"N": "0"}, {"N": "0"}]}}
+        }),
+    );
+    call_tool(
+        &mut child,
+        3,
+        "update_table",
+        json!({
+            "table_name": "McpVecLife",
+            "vector_index_updates": [{"create": {
+                "index_name": "vix",
+                "vector_attribute": {"attribute_name": "emb"},
+                "projection": {"projection_type": "ALL"},
+                "dimensions": 3,
+                "distance_function": "COSINE"
+            }}]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "describe_table",
+        json!({"table_name": "McpVecLife"}),
+    );
+    let described = tool_content(&resp);
+    assert_eq!(described["status"], "ACTIVE");
+    let vixs = described["vector_indexes"].as_array().cloned().unwrap();
+    assert_eq!(vixs[0]["index_status"], "CREATING");
+    assert_eq!(vixs[0]["backfilling"], json!(true));
+
+    let resp = call_tool(
+        &mut child,
+        5,
+        "search_vectors",
+        json!({
+            "table_name": "McpVecLife",
+            "index_name": "vix",
+            "search_vector": [{"N": "1"}, {"N": "0"}, {"N": "0"}],
+            "top_k": 5
+        }),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let body = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        body.contains("Cannot search backfilling vector index: vix"),
+        "expected the wire's own refusal, got {body}"
+    );
+
+    // Cancelling it clears the window, exactly as it does on the wire.
+    call_tool(
+        &mut child,
+        6,
+        "update_table",
+        json!({
+            "table_name": "McpVecLife",
+            "vector_index_updates": [{"delete": {"index_name": "vix"}}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        7,
+        "delete_table",
+        json!({"table_name": "McpVecLife"}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+}
+
+#[test]
 fn an_index_read_back_can_be_fed_straight_to_create_table() {
     // Cloning a table is the obvious thing an agent does with describe_table,
     // so what it reports has to be what create_table accepts. A flattened

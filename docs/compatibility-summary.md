@@ -109,6 +109,70 @@ the ones worth knowing.
 | **`SearchVectors` (COSINE, EUCLIDEAN, DOT_PRODUCT)** | Supported |
 | **Per-vector-index ConsumedCapacity (INDEXES mode)** | Supported |
 
+### Four things about vector search that will never match AWS
+
+Everything else on this page is either the same as DynamoDB or a bug waiting to
+be fixed. These four are neither. They come from how the two systems are built,
+so no amount of work here will close them, and a conformance test for them would
+have nothing to assert.
+
+Each one can make a test pass locally and fail against AWS.
+
+**1. Dynoxide finds the genuinely nearest vectors. AWS finds roughly the nearest
+ones.**
+
+Dynoxide compares your query against every vector in the index and returns the
+closest. AWS builds an approximate index that skips most of those comparisons so
+it stays fast on very large tables, and skipping comparisons means it can miss a
+close match that was really there.
+
+For the same data and the same query, AWS can return a slightly different set of
+results from dynoxide. Dynoxide will not miss anything. AWS occasionally will.
+
+*What to do:* do not write a test that pins the exact list of results and expect
+it to pass against AWS. Assert the thing you actually care about, such as "the
+item I put in comes back" or "I got five results". Also worth knowing: because
+dynoxide checks every vector, a search costs time in proportion to how many
+there are, so a local table with millions of vectors will be slow in a way AWS
+would not be.
+
+**2. When two results score identically, dynoxide always orders them the same
+way. AWS does not.**
+
+Dynoxide breaks a tie by primary key, so the same query over the same data gives
+the same order every time. AWS makes no such promise. Three identical calls
+against real DynamoDB returned three different orderings.
+
+*What to do:* never depend on the order of results that tie. If you need a
+stable order, sort them yourself after the search. A test that asserts "these
+two came back in this order" will pass here and is not reliable against AWS.
+
+**3. The index creation lifecycle has the same shape here, and nothing like the
+same length.**
+
+The phases, the statuses and the refusals all match. The clock does not.
+Dynoxide runs the whole thing in about half a minute. AWS takes minutes, and how
+many depends on how much data it has to index: a 25-item table took roughly
+seventeen minutes. There is no single duration to copy, because AWS does not
+have one.
+
+*What to do:* never write `sleep(30)` and assume the index is ready. Poll for
+readiness by retrying the search and treating the refusal as "not yet". That
+works against both.
+
+**4. `VectorSearchRequestBytes` is dynoxide's own number, not AWS's.**
+
+AWS bills a search on whatever data it happened to read, and it does not
+reproduce its own figure between identical calls: five identical searches over
+one unchanged index reported 14214, 13903, 14214, 14214 and 14518. Dynoxide
+reports a stable figure sized on the entries it scanned, using the same unit AWS
+uses.
+
+*What to do:* use it to compare one search against another within dynoxide,
+where it is meaningful. Do not compare it to a figure from AWS, and do not
+assert an exact value in a test that also runs against AWS. The write-side
+figure, `VectorWriteRequestBytes`, is captured from real DynamoDB and does match.
+
 A vector index added to a live table walks a creation lifecycle, the same shape
 AWS walks but nothing like the same length. A vector index created as part of
 `CreateTable` reports `ACTIVE` at once, which is what AWS does too.
@@ -172,19 +236,18 @@ moment `UpdateTable` returns, and `Backfilling` is never reported for it. The
 errors that only arise while a GSI is still filling are unreachable here for
 that reason.
 
-Vector search is exact brute-force KNN rather than an approximate index. At
-emulator and embedded scale that reaches a correct answer faster than building
-an ANN structure would, and it removes the recall question entirely: the top-k
-is the true top-k. It also means a search costs time linear in the number of
-indexed entries, so a local table holding millions of vectors is outside what
-this is built for.
+Vector search is exact brute-force KNN rather than an approximate index, which
+is difference 1 above. At emulator and embedded scale that reaches a correct
+answer faster than building an ANN structure would, and it removes the recall
+question entirely: the top-k is the true top-k. It also means a search costs
+time linear in the number of indexed entries, so a local table holding millions
+of vectors is outside what this is built for.
 
 Two scoring details worth knowing. Vectors are stored and compared at `f32`,
 so a value written at full `f64` precision reads back through the index rounded,
 while the base table keeps exactly what was written. And where several entries
-tie on score, Dynoxide breaks the tie deterministically; AWS does not commit to
-an order there, so a tie-dependent assertion will hold here and may not against
-the real thing.
+tie on score, Dynoxide breaks the tie deterministically, which is difference 2
+above.
 
 `SearchVectors` reports `VectorSearchRequestBytes`, and that figure is a
 divergence by construction. Real DynamoDB bills a search on the data it read and

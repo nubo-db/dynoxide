@@ -636,6 +636,100 @@ fn an_unknown_index_is_rejected_without_naming_it() {
 }
 
 #[test]
+fn a_qualifier_naming_a_vector_index_is_refused_by_type_not_by_absence() {
+    // Captured eu-west-2, 2026-08-11: a vector index is not reachable through
+    // PartiQL, and DynamoDB says so by type rather than pretending the index is
+    // not there. Answering "does not have the specified index" would be wrong
+    // twice over, since the index exists and the reason is that no PartiQL read
+    // can address it.
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "pq_vec",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "Projection": {"ProjectionType": "ALL"},
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let msg = error(&db, "SELECT * FROM \"pq_vec\".\"vix\"");
+    assert!(
+        msg.contains("Scan operation not supported on this index type"),
+        "got {msg}"
+    );
+}
+
+#[test]
+fn a_vector_index_is_refused_before_an_unknown_index_is_reported_missing() {
+    // The two rejections must not be confused: a name that is not any index
+    // still reports absence, so the vector arm cannot simply swallow both.
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "pq_vec2",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "Projection": {"ProjectionType": "ALL"},
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let msg = error(&db, "SELECT * FROM \"pq_vec2\".\"nosuchindex\"");
+    assert!(
+        msg.contains("The table does not have the specified index"),
+        "got {msg}"
+    );
+}
+
+#[test]
+fn a_write_naming_a_vector_index_keeps_the_write_rejection() {
+    // A write rejects any index qualifier before it resolves the table, so the
+    // vector refusal must not reach it. The two messages are different and
+    // both captured; this pins the boundary between them.
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "pq_vec3",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "Projection": {"ProjectionType": "ALL"},
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let msg = error(&db, "DELETE FROM \"pq_vec3\".\"vix\" WHERE pk = 'a'");
+    assert!(
+        msg.contains("This operation is not supported on an index"),
+        "got {msg}"
+    );
+}
+
+#[test]
 fn a_qualifier_naming_the_table_is_rejected() {
     // Q13.
     let db = seeded();

@@ -143,7 +143,7 @@ fn build_create_request(
 
 /// Execute the import pipeline into a caller-provided database.
 ///
-/// This is the core import logic — database-agnostic. The caller is
+/// This is the core import logic: database-agnostic. The caller is
 /// responsible for creating the database and any post-import steps
 /// (VACUUM, compression). This makes import usable with both file-backed
 /// and in-memory databases.
@@ -393,7 +393,7 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
         .map_err(|e| ImportError::Database(format!("Failed to create temp file: {e}")))?;
     let tmp_path = tmp_file.path().to_path_buf();
 
-    // Close the temp file handle — Database::new will open it by path.
+    // Close the temp file handle - Database::new will open it by path.
     // Keep the NamedTempFile alive so it cleans up on error.
     let tmp_file = tmp_file.into_temp_path();
 

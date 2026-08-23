@@ -98,7 +98,52 @@ pub fn escape_table_name(name: &str) -> String {
 pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribute_definitions, gsi_definitions, \
      lsi_definitions, stream_enabled, stream_view_type, stream_label, ttl_attribute, ttl_enabled, \
      created_at, table_status, billing_mode, provisioned_throughput, \
-     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id";
+     sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id, \
+     vector_index_definitions";
+
+/// Current schema version, shared by both backends. The native backend stamps
+/// it in `_config` from `Storage::initialize` and drives its versioned
+/// migration chain off it; the wasm backend records it on open (see
+/// [`init_schema_version`]) so future wasm schema changes can migrate
+/// versioned instead of accreting one unconditional ALTER per column.
+pub const SCHEMA_VERSION: &str = "9";
+
+/// Add the `vector_index_definitions` column to `_tables`.
+///
+/// Fresh databases get the column from [`INIT_SCHEMA`]; this ALTER upgrades
+/// databases created before schema version 9. Running it against an
+/// already-upgraded database fails with SQLite's duplicate-column error,
+/// which callers classify with [`is_duplicate_column_error`] and tolerate;
+/// every other failure must propagate.
+pub const ADD_VECTOR_INDEX_DEFINITIONS_COLUMN: &str =
+    "ALTER TABLE _tables ADD COLUMN vector_index_definitions TEXT";
+
+/// The column the ALTER above adds, for a caller checking whether it is needed.
+pub const VECTOR_INDEX_DEFINITIONS_COLUMN: &str = "vector_index_definitions";
+
+/// Column names of `_tables`, for deciding whether a legacy database still
+/// needs the vector column added. `PRAGMA table_info` returns the name second,
+/// so this selects it alone and keeps the caller's indexing obvious.
+pub const TABLES_COLUMN_NAMES: &str = "SELECT name FROM pragma_table_info('_tables')";
+
+/// Whether a SQLite error message reports the duplicate-column failure an
+/// idempotent `ALTER TABLE ... ADD COLUMN` re-run produces. This is the only
+/// failure the column-adding open/migration steps tolerate: anything else is
+/// a real fault and must fail the open rather than leave the column silently
+/// absent.
+pub fn is_duplicate_column_error(message: &str) -> bool {
+    message.contains("duplicate column name")
+}
+
+/// Record the schema version if none is recorded yet (`INSERT OR IGNORE`,
+/// mirroring the native `initialize` step). Never downgrades a version a
+/// newer build has already stamped.
+pub fn init_schema_version(version: &str) -> (String, Vec<SqlParam<'_>>) {
+    (
+        "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),
+        vec![SqlParam::text(version)],
+    )
+}
 
 /// Idempotent schema bootstrap shared by both backends: the metadata, config,
 /// and stream-record tables at the current schema version. Native
@@ -130,7 +175,8 @@ pub const INIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS _config (
                 table_class TEXT,
                 deletion_protection_enabled INTEGER DEFAULT 0,
                 on_demand_throughput TEXT,
-                table_id TEXT
+                table_id TEXT,
+                vector_index_definitions TEXT
             );
 
             CREATE TABLE IF NOT EXISTS _stream_records (
@@ -169,8 +215,9 @@ pub fn insert_table_metadata<'a>(m: &CreateTableMetadata<'a>) -> (String, Vec<Sq
     let sql =
         "INSERT INTO _tables (table_name, key_schema, attribute_definitions, gsi_definitions, \
          lsi_definitions, provisioned_throughput, created_at, sse_specification, table_class, \
-         deletion_protection_enabled, billing_mode, on_demand_throughput, table_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+         deletion_protection_enabled, billing_mode, on_demand_throughput, table_id, \
+         vector_index_definitions) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             .to_string();
     let params = vec![
         SqlParam::text(m.table_name),
@@ -186,6 +233,7 @@ pub fn insert_table_metadata<'a>(m: &CreateTableMetadata<'a>) -> (String, Vec<Sq
         SqlParam::opt_text(m.billing_mode),
         SqlParam::opt_text(m.on_demand_throughput),
         SqlParam::text(table_id),
+        SqlParam::opt_text(m.vector_index_definitions),
     ];
     (sql, params)
 }
@@ -243,6 +291,22 @@ pub fn update_table_metadata<'a>(
         vec![
             SqlParam::text(attribute_definitions),
             SqlParam::opt_text(gsi_definitions),
+            SqlParam::text(table_name),
+        ],
+    )
+}
+
+/// Update a table's vector index definitions. The write the add/delete-vector
+/// path of `UpdateTable` issues; `vector_index_definitions` is `None` (SQL
+/// `NULL`) when no vector indexes remain.
+pub fn update_vector_index_definitions<'a>(
+    table_name: &'a str,
+    vector_index_definitions: Option<&'a str>,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        "UPDATE _tables SET vector_index_definitions = ?1 WHERE table_name = ?2".to_string(),
+        vec![
+            SqlParam::opt_text(vector_index_definitions),
             SqlParam::text(table_name),
         ],
     )
@@ -561,6 +625,158 @@ pub fn delete_lsi_item<'a>(
             escape_table_name(&lsi)
         ),
         vec![SqlParam::text(base_pk), SqlParam::text(base_sk)],
+    )
+}
+
+/// Create a vector index shadow table plus its hash-value index, mirroring
+/// the GSI physical-table convention. The batch drops any existing table of
+/// that name first, so an orphaned shadow table left behind by a partial
+/// failure or an older binary's DeleteTable can neither wedge recreation nor
+/// leak stale rows into the fresh index.
+///
+/// One row per indexed base item, keyed by the base-table primary key:
+/// `hash_value` holds the SearchSchema HASH attribute's value (empty when the
+/// schema declares none), `vector_json` the f32-truncated vector copy,
+/// `filter_json` the INLINE_FILTER attribute values, and `item_json` the
+/// projected item copy.
+pub fn create_vector_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    let escaped = escape_table_name(&vix);
+    let idx = escape_table_name(&format!("{vix}::hash_value"));
+    let sql = format!(
+        "DROP TABLE IF EXISTS \"{escaped}\";
+            CREATE TABLE \"{escaped}\" (
+                table_pk TEXT NOT NULL,
+                table_sk TEXT NOT NULL DEFAULT '',
+                hash_value TEXT NOT NULL DEFAULT '',
+                vector_json TEXT NOT NULL,
+                filter_json TEXT NOT NULL DEFAULT '{{}}',
+                item_json TEXT NOT NULL,
+                entry_bytes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (table_pk, table_sk)
+            );
+            CREATE INDEX IF NOT EXISTS \"{idx}\" ON \"{escaped}\" (hash_value);"
+    );
+    (sql, Vec::new())
+}
+
+/// Insert-or-replace statement for a vector shadow-table row, shared by
+/// single and bulk insert.
+pub fn vector_insert_sql(table_name: &str, index_name: &str) -> String {
+    let vix = format!("{table_name}::vector::{index_name}");
+    format!(
+        "INSERT OR REPLACE INTO \"{}\" (table_pk, table_sk, hash_value, vector_json, filter_json, item_json, entry_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        escape_table_name(&vix)
+    )
+}
+
+/// Bound parameters for one vector shadow-table row, matching
+/// [`vector_insert_sql`].
+pub fn vector_insert_params<'a>(
+    table_pk: &'a str,
+    table_sk: &'a str,
+    hash_value: &'a str,
+    vector_json: &'a str,
+    filter_json: &'a str,
+    item_json: &'a str,
+    entry_bytes: i64,
+) -> Vec<SqlParam<'a>> {
+    vec![
+        SqlParam::text(table_pk),
+        SqlParam::text(table_sk),
+        SqlParam::text(hash_value),
+        SqlParam::text(vector_json),
+        SqlParam::text(filter_json),
+        SqlParam::text(item_json),
+        SqlParam::Integer(entry_bytes),
+    ]
+}
+
+/// Load the projected entries for a set of base-table keys, for the rows a
+/// search actually returns.
+///
+/// The candidate scan deliberately leaves `item_json` behind, because a search
+/// over a large index would otherwise materialise every projected entry only to
+/// score it and drop it. The keys here are the post-`TopK` survivors, so this
+/// reads at most `TopK` rows however many were scanned.
+pub fn vector_items_for_keys<'a>(
+    table_name: &str,
+    index_name: &str,
+    keys: &'a [(String, String)],
+) -> (String, Vec<SqlParam<'a>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    let escaped = escape_table_name(&vix);
+    let placeholders: Vec<String> = (0..keys.len())
+        .map(|i| format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2))
+        .collect();
+    let sql = format!(
+        "SELECT table_pk, table_sk, item_json FROM \"{escaped}\" \
+         WHERE (table_pk, table_sk) IN ({})",
+        placeholders.join(", ")
+    );
+    let mut params = Vec::with_capacity(keys.len() * 2);
+    for (pk, sk) in keys {
+        params.push(SqlParam::text(pk));
+        params.push(SqlParam::text(sk));
+    }
+    (sql, params)
+}
+
+/// Delete a vector shadow-table row by base-table primary key, mirroring
+/// [`delete_gsi_item`].
+pub fn delete_vector_item<'a>(
+    table_name: &str,
+    index_name: &str,
+    table_pk: &'a str,
+    table_sk: &'a str,
+) -> (String, Vec<SqlParam<'a>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    (
+        format!(
+            "DELETE FROM \"{}\" WHERE table_pk = ?1 AND table_sk = ?2",
+            escape_table_name(&vix)
+        ),
+        vec![SqlParam::text(table_pk), SqlParam::text(table_sk)],
+    )
+}
+
+/// Load the candidate rows for a SearchVectors call: every row of the shadow
+/// table, or one partition of it when the index's SearchSchema declares a
+/// HASH element (the caller passes the key-string-encoded operand, matching
+/// the encoding the write path stores in `hash_value`). Ordered by base-table
+/// primary key so equal scores downstream tie-break deterministically
+/// regardless of insertion order.
+pub fn query_vector_candidates<'a>(
+    table_name: &str,
+    index_name: &str,
+    hash_value: Option<&'a str>,
+) -> (String, Vec<SqlParam<'a>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    let escaped = escape_table_name(&vix);
+    match hash_value {
+        Some(hv) => (
+            format!(
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
+                 \"{escaped}\" WHERE hash_value = ?1 ORDER BY table_pk ASC, table_sk ASC"
+            ),
+            vec![SqlParam::text(hv)],
+        ),
+        None => (
+            format!(
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
+                 \"{escaped}\" ORDER BY table_pk ASC, table_sk ASC"
+            ),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Drop a vector index shadow table if it exists.
+pub fn drop_vector_table(table_name: &str, index_name: &str) -> (String, Vec<SqlParam<'static>>) {
+    let vix = format!("{table_name}::vector::{index_name}");
+    (
+        format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&vix)),
+        Vec::new(),
     )
 }
 
@@ -1004,7 +1220,7 @@ mod tests {
         };
         let (sql, params) = insert_table_metadata(&m);
         assert!(sql.starts_with("INSERT INTO _tables"));
-        assert_eq!(params.len(), 13);
+        assert_eq!(params.len(), 14);
         assert_eq!(params[0], SqlParam::text("T"));
         assert_eq!(params[3], SqlParam::Null); // gsi_definitions: None
         assert_eq!(params[6], SqlParam::Integer(7)); // created_at
@@ -1015,6 +1231,7 @@ mod tests {
             SqlParam::Text(id) => assert_eq!(id.len(), 36),
             other => panic!("table_id should be bound as text, got {other:?}"),
         }
+        assert_eq!(params[13], SqlParam::Null); // vector_index_definitions: None
     }
 
     #[test]
@@ -1340,5 +1557,207 @@ mod tests {
                 vec![SqlParam::Integer(0), SqlParam::text("T")],
             )
         );
+    }
+
+    // Vector shadow-table DDL, pinned byte-for-byte like the GSI/LSI builders.
+    #[test]
+    fn create_vector_table_is_pinned() {
+        let (sql, params) = create_vector_table("Docs", "vix");
+        assert_eq!(
+            sql,
+            "DROP TABLE IF EXISTS \"Docs::vector::vix\";
+            CREATE TABLE \"Docs::vector::vix\" (
+                table_pk TEXT NOT NULL,
+                table_sk TEXT NOT NULL DEFAULT '',
+                hash_value TEXT NOT NULL DEFAULT '',
+                vector_json TEXT NOT NULL,
+                filter_json TEXT NOT NULL DEFAULT '{}',
+                item_json TEXT NOT NULL,
+                entry_bytes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (table_pk, table_sk)
+            );
+            CREATE INDEX IF NOT EXISTS \"Docs::vector::vix::hash_value\" ON \"Docs::vector::vix\" (hash_value);"
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn drop_vector_table_is_pinned() {
+        let (sql, params) = drop_vector_table("Docs", "vix");
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"Docs::vector::vix\"");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn create_vector_table_ddl_executes_and_drop_is_idempotent() {
+        // The DDL must be executable as the batch both backends run (the
+        // leading drop is a no-op on a fresh database), and the drop builder
+        // must tolerate an absent table.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let (create_sql, _) = create_vector_table("Docs", "vix");
+        conn.execute_batch(&create_sql).unwrap();
+        conn.execute(
+            "INSERT INTO \"Docs::vector::vix\" (table_pk, table_sk, hash_value, vector_json, filter_json, item_json) \
+             VALUES ('p', '', 't1', '[1.0,0.0,0.0]', '{}', '{}')",
+            [],
+        )
+        .unwrap();
+        let (drop_sql, _) = drop_vector_table("Docs", "vix");
+        conn.execute_batch(&drop_sql).unwrap();
+        // Dropping again is a no-op, matching the GSI/LSI drop builders.
+        conn.execute_batch(&drop_sql).unwrap();
+    }
+
+    #[test]
+    fn vector_insert_builders_are_pinned() {
+        assert_eq!(
+            vector_insert_sql("Docs", "vix"),
+            "INSERT OR REPLACE INTO \"Docs::vector::vix\" (table_pk, table_sk, hash_value, \
+             vector_json, filter_json, item_json, entry_bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        );
+        assert_eq!(
+            vector_insert_params(
+                "p",
+                "s",
+                "S:t1",
+                "[1.0,0.0,0.0]",
+                "{}",
+                "{\"pk\":{\"S\":\"p\"}}",
+                1024,
+            ),
+            vec![
+                SqlParam::text("p"),
+                SqlParam::text("s"),
+                SqlParam::text("S:t1"),
+                SqlParam::text("[1.0,0.0,0.0]"),
+                SqlParam::text("{}"),
+                SqlParam::text("{\"pk\":{\"S\":\"p\"}}"),
+                SqlParam::Integer(1024),
+            ]
+        );
+    }
+
+    #[test]
+    fn query_vector_candidates_is_pinned() {
+        assert_eq!(
+            query_vector_candidates("Docs", "vix", None),
+            (
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
+                 \"Docs::vector::vix\" ORDER BY table_pk ASC, table_sk ASC"
+                    .to_string(),
+                Vec::new(),
+            )
+        );
+        assert_eq!(
+            query_vector_candidates("Docs", "vix", Some("S:t1")),
+            (
+                "SELECT table_pk, table_sk, vector_json, filter_json, entry_bytes FROM \
+                 \"Docs::vector::vix\" WHERE hash_value = ?1 ORDER BY table_pk ASC, \
+                 table_sk ASC"
+                    .to_string(),
+                vec![SqlParam::text("S:t1")],
+            )
+        );
+    }
+
+    #[test]
+    fn scoped_candidate_query_uses_the_hash_value_index() {
+        // The per-partition candidate load must go through the hash_value
+        // index rather than scanning the shadow table, or HASH-scoped
+        // searches degrade to full scans as tables grow.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let (create_sql, _) = create_vector_table("Docs", "vix");
+        conn.execute_batch(&create_sql).unwrap();
+
+        let (sql, _) = query_vector_candidates("Docs", "vix", Some("S:t1"));
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(["S:t1"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX") && d.contains("Docs::vector::vix::hash_value")),
+            "expected an index search on hash_value, got plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn delete_vector_item_is_pinned() {
+        assert_eq!(
+            delete_vector_item("Docs", "vix", "p", "s"),
+            (
+                "DELETE FROM \"Docs::vector::vix\" WHERE table_pk = ?1 AND table_sk = ?2"
+                    .to_string(),
+                vec![SqlParam::text("p"), SqlParam::text("s")],
+            )
+        );
+    }
+
+    #[test]
+    fn update_vector_index_definitions_is_pinned() {
+        assert_eq!(
+            update_vector_index_definitions("T", Some("[{}]")),
+            (
+                "UPDATE _tables SET vector_index_definitions = ?1 WHERE table_name = ?2"
+                    .to_string(),
+                vec![SqlParam::text("[{}]"), SqlParam::text("T")],
+            )
+        );
+        assert_eq!(
+            update_vector_index_definitions("T", None),
+            (
+                "UPDATE _tables SET vector_index_definitions = ?1 WHERE table_name = ?2"
+                    .to_string(),
+                vec![SqlParam::Null, SqlParam::text("T")],
+            )
+        );
+    }
+
+    #[test]
+    fn init_schema_version_is_pinned() {
+        assert_eq!(
+            init_schema_version("9"),
+            (
+                "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)"
+                    .to_string(),
+                vec![SqlParam::text("9")],
+            )
+        );
+    }
+
+    #[test]
+    fn add_vector_column_tolerates_only_duplicate_column_reruns() {
+        // The seam the wasm open path relies on: against a database whose
+        // `_tables` predates the column, the ALTER succeeds; re-running it
+        // fails with the duplicate-column error and nothing else, and the
+        // classifier recognises exactly that failure.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _tables (
+                table_name TEXT PRIMARY KEY,
+                key_schema TEXT NOT NULL,
+                attribute_definitions TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
+            .unwrap();
+
+        let err = conn
+            .execute(ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
+            .unwrap_err();
+        assert!(is_duplicate_column_error(&err.to_string()));
+
+        // A genuine failure (the metadata table missing entirely) must not be
+        // classified as tolerable.
+        let empty = rusqlite::Connection::open_in_memory().unwrap();
+        let err = empty
+            .execute(ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
+            .unwrap_err();
+        assert!(!is_duplicate_column_error(&err.to_string()));
     }
 }

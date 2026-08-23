@@ -11,7 +11,9 @@ use dynoxide::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
     TableStats,
 };
-use dynoxide::storage_backend::{BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend};
+use dynoxide::storage_backend::{
+    BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, VectorCandidateRow, VectorItemRow,
+};
 use dynoxide::types::Tag;
 
 /// A type that satisfies [`StorageBackend`] with `unimplemented!()` bodies.
@@ -64,6 +66,14 @@ impl StorageBackend for TestBackend {
         _table_name: &str,
         _attribute_definitions: &str,
         _gsi_definitions: Option<&str>,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn update_vector_index_definitions(
+        &self,
+        _table_name: &str,
+        _vector_index_definitions: Option<&str>,
     ) -> Result<(), BackendError> {
         unimplemented!()
     }
@@ -169,6 +179,59 @@ impl StorageBackend for TestBackend {
         _table_name: &str,
         _index_name: &str,
     ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn create_vector_table(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn drop_vector_table(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn insert_vector_items(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _rows: &[VectorItemRow],
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn delete_vector_item(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _table_pk: &str,
+        _table_sk: &str,
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
+    async fn query_vector_candidates(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _hash_value: Option<&str>,
+    ) -> Result<Vec<VectorCandidateRow>, BackendError> {
+        unimplemented!()
+    }
+
+    async fn vector_items_for_keys(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError> {
         unimplemented!()
     }
 

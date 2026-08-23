@@ -77,6 +77,15 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<(), BackendError> {
+        Storage::update_vector_index_definitions(self, table_name, vector_index_definitions)
+            .map_err(dyno_to_backend)
+    }
+
     async fn update_provisioned_throughput(
         &self,
         table_name: &str,
@@ -179,6 +188,61 @@ impl StorageBackend for Storage {
         Storage::drop_lsi_table(self, table_name, index_name).map_err(dyno_to_backend)
     }
 
+    async fn create_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        Storage::create_vector_table(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
+    async fn drop_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        Storage::drop_vector_table(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
+    async fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[crate::storage_backend::VectorItemRow],
+    ) -> Result<(), BackendError> {
+        Storage::insert_vector_items(self, table_name, index_name, rows).map_err(dyno_to_backend)
+    }
+
+    async fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
+    ) -> Result<(), BackendError> {
+        Storage::delete_vector_item(self, table_name, index_name, table_pk, table_sk)
+            .map_err(dyno_to_backend)
+    }
+
+    async fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<crate::storage_backend::VectorCandidateRow>, BackendError> {
+        Storage::query_vector_candidates(self, table_name, index_name, hash_value)
+            .map_err(dyno_to_backend)
+    }
+
+    async fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError> {
+        Storage::vector_items_for_keys(self, table_name, index_name, keys).map_err(dyno_to_backend)
+    }
+
     async fn insert_gsi_item(
         &self,
         table_name: &str,
@@ -189,6 +253,8 @@ impl StorageBackend for Storage {
         table_sk: &str,
         item_json: &str,
     ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        self.check_gsi_insert_fault().map_err(dyno_to_backend)?;
         Storage::insert_gsi_item(
             self, table_name, index_name, gsi_pk, gsi_sk, table_pk, table_sk, item_json,
         )

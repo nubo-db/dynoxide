@@ -1,3 +1,4 @@
+use crate::actions::vector_lifecycle::VectorIndexLifecycle;
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
@@ -61,6 +62,7 @@ pub struct DescribeTableResponse {
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: DescribeTableRequest,
+    lifecycle: &VectorIndexLifecycle,
 ) -> Result<DescribeTableResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
@@ -79,7 +81,8 @@ pub async fn execute<S: StorageBackend>(
     let item_count = storage.count_items(&request.table_name).await.ok();
     let table_size_bytes = item_count.map(|_| 0i64); // Approximate; real size tracking is deferred
 
-    let desc = build_table_description(&meta, item_count, table_size_bytes);
+    let vector_phases = lifecycle.phases_armed_on(storage, &request.table_name);
+    let desc = build_table_description(&meta, item_count, table_size_bytes, &vector_phases);
 
     Ok(DescribeTableResponse { table: desc })
 }

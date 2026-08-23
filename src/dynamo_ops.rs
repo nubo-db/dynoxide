@@ -38,6 +38,7 @@ pub const KNOWN_OPERATIONS: &[&str] = &[
     "TagResource",
     "UntagResource",
     "ListTagsOfResource",
+    "SearchVectors",
 ];
 
 /// Whether `op` is a DynamoDB operation dynoxide recognises.

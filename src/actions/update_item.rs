@@ -160,7 +160,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
     }
 }
 
-/// Legacy `AttributeUpdates` entry — one per attribute being modified.
+/// Legacy `AttributeUpdates` entry: one per attribute being modified.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AttributeValueUpdate {
     #[serde(rename = "Action", default = "default_put_action")]
@@ -463,7 +463,7 @@ async fn execute_inner<S: StorageBackend>(
         .as_ref()
         .map(|updates| updates.keys().cloned().collect());
 
-    // Execution tracker — tracking disabled because unused-reference validation was
+    // Execution tracker: tracking disabled because unused-reference validation was
     // already done statically by Tracker 1 (pre-validation block above). This tracker
     // only needs name/value resolution, not usage tracking.
     let tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
@@ -486,6 +486,7 @@ async fn execute_inner<S: StorageBackend>(
         },
         gsi_units,
         lsi_units,
+        vector_bytes,
     ) = helpers::with_write_transaction(storage, async {
         // Fetch existing item (or create empty one for upsert)
         let existing_json = storage.get_item(&request.table_name, &pk, &sk).await?;
@@ -587,7 +588,7 @@ async fn execute_inner<S: StorageBackend>(
         }
 
         // Note: unused expression attribute validation already done in pre-validation
-        // block (Tracker 1). Not repeated here — runtime evaluation may skip branches
+        // block (Tracker 1). Not repeated here: runtime evaluation may skip branches
         // (e.g., if_not_exists short-circuits) which would cause false positives.
 
         // Validate attribute values after update expression applied. This
@@ -654,27 +655,23 @@ async fn execute_inner<S: StorageBackend>(
             sk: &sk,
             pk_attr: &key_schema.partition_key,
             sk_attr: key_schema.sort_key.as_deref(),
+            old_item: prior_image,
+            capacity_mode: request.return_consumed_capacity.as_deref(),
         };
 
         // Maintain GSI tables (inside the transaction)
-        let gsi_units = super::gsi::maintain_gsis_after_write(
-            storage,
-            &meta,
-            &target,
-            prior_image,
-            &item,
-            request.return_consumed_capacity.as_deref(),
-        )
-        .await?;
+        let gsi_units =
+            super::gsi::maintain_gsis_after_write(storage, &meta, &target, &item).await?;
 
         // Maintain LSI tables (inside the transaction)
-        let lsi_units = super::lsi::maintain_lsis_after_write(
-            storage,
-            &meta,
-            &target,
-            prior_image,
-            &item,
-            request.return_consumed_capacity.as_deref(),
+        let lsi_units =
+            super::lsi::maintain_lsis_after_write(storage, &meta, &target, &item).await?;
+
+        // Maintain vector index shadow tables (inside the transaction). A
+        // REMOVE of the vector attribute derives no row, so this de-indexes
+        // the item; restoring the attribute re-indexes it.
+        let vector_bytes = super::vector_index::maintain_vector_indexes_after_write(
+            storage, &meta, &target, &item,
         )
         .await?;
 
@@ -691,6 +688,7 @@ async fn execute_inner<S: StorageBackend>(
             },
             gsi_units,
             lsi_units,
+            vector_bytes,
         ))
     })
     .await?;
@@ -760,11 +758,12 @@ async fn execute_inner<S: StorageBackend>(
     )
     .await?;
 
-    let consumed_capacity = types::consumed_capacity_with_secondary_indexes(
+    let consumed_capacity = types::consumed_capacity_with_vector_indexes(
         &request.table_name,
         types::table_write_capacity_units(old_size, Some(size)),
         &gsi_units,
         &lsi_units,
+        &vector_bytes,
         &request.return_consumed_capacity,
     );
 
@@ -929,7 +928,7 @@ fn extract_updated_attrs(
 /// Collapse an empty projection to `None` so `Attributes` is omitted entirely.
 ///
 /// AWS omits `Attributes` from a `UPDATED_NEW` / `UPDATED_OLD` response when
-/// nothing was projected — for example a REMOVE-only update under `UPDATED_NEW`,
+/// nothing was projected: for example a REMOVE-only update under `UPDATED_NEW`,
 /// where no attribute was set to a new value. Returning `Some({})` instead would
 /// serialise an empty `Attributes` map, which AWS never does.
 fn omit_if_empty(map: HashMap<String, AttributeValue>) -> Option<HashMap<String, AttributeValue>> {

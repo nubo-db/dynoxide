@@ -254,7 +254,7 @@ fn test_transact_get_projection_matching_nothing_omits_item() {
     // AWS omits `Item` entirely when a ProjectionExpression matches no attribute
     // on an otherwise-present item, rather than returning an empty `{}` (or a
     // key-only object). Mirrors the conformance assertion
-    // tests/tier2/transactions/transactGet.test.ts —
+    // tests/tier2/transactions/transactGet.test.ts -
     // "omits Item when the projection matches no attribute on a present item".
     let db = Database::memory().unwrap();
     create_test_table(&db, "Table1");

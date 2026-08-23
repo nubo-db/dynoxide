@@ -119,7 +119,7 @@ pub(crate) fn index_write_units_for(
 /// `BS` are backed by `Vec`, so a derived comparison would call that a change
 /// and charge for it. Lists keep their order, because DynamoDB lists are
 /// ordered.
-fn unchanged(old: &Item, new: &Item) -> bool {
+pub(crate) fn unchanged(old: &Item, new: &Item) -> bool {
     old.len() == new.len()
         && old
             .iter()
@@ -165,6 +165,10 @@ pub struct WriteCapacity {
     pub new_size: Option<usize>,
     pub gsi_units: HashMap<String, f64>,
     pub lsi_units: HashMap<String, f64>,
+    /// Per-vector-index replication bytes. Held apart from the unit maps
+    /// because vector replication is billed on its own axis: the figures never
+    /// reach `CapacityUnits` and never take the transactional factor.
+    pub vector_bytes: HashMap<String, f64>,
 }
 
 impl WriteCapacity {
@@ -187,7 +191,16 @@ impl WriteCapacity {
             new_size,
             gsi_units,
             lsi_units,
+            vector_bytes: HashMap::new(),
         }
+    }
+
+    /// Attach the per-index vector replication bytes the vector fan-out
+    /// returned. Separate from [`WriteCapacity::new`] so the many callers that
+    /// touch no vector index keep their argument list.
+    pub fn with_vector_bytes(mut self, vector_bytes: HashMap<String, f64>) -> Self {
+        self.vector_bytes = vector_bytes;
+        self
     }
 
     /// Build from the images themselves, for callers that do not already hold
@@ -226,6 +239,9 @@ pub struct TableCapacity {
     pub table_units: f64,
     pub gsi_units: HashMap<String, f64>,
     pub lsi_units: HashMap<String, f64>,
+    /// Vector replication bytes, summed like the unit maps but never taking
+    /// the transactional factor and never reaching the table total.
+    pub vector_bytes: HashMap<String, f64>,
 }
 
 /// Shapes one table's entry. The transactional surfaces mirror their units into
@@ -281,11 +297,15 @@ pub(crate) fn per_table_capacity(
             .into_iter()
             .filter_map(|table| {
                 let units = by_table.get(table)?;
-                builder(
-                    table,
-                    units.table_units,
-                    &units.gsi_units,
-                    &units.lsi_units,
+                crate::types::attach_vector_index_capacity(
+                    builder(
+                        table,
+                        units.table_units,
+                        &units.gsi_units,
+                        &units.lsi_units,
+                        mode,
+                    ),
+                    &units.vector_bytes,
                     mode,
                 )
             })
@@ -319,6 +339,9 @@ pub fn aggregate_by_table(
         }
         for (name, units) in &record.lsi_units {
             *entry.lsi_units.entry(name.clone()).or_default() += units;
+        }
+        for (name, bytes) in &record.vector_bytes {
+            *entry.vector_bytes.entry(name.clone()).or_default() += bytes;
         }
     }
 

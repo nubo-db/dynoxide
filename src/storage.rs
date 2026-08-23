@@ -11,8 +11,10 @@ use rusqlite::{Connection, params};
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Current schema version. Stored in the `_config` table for future migrations.
+/// The value itself lives in `sql_builders` so the wasm backend records the
+/// same version on open.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const SCHEMA_VERSION: &str = "8";
+const SCHEMA_VERSION: &str = sql_builders::SCHEMA_VERSION;
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -99,7 +101,7 @@ fn num_to_buffer(num_str: &str) -> Vec<u8> {
     let exp_sum = exponent + append_zero;
     let exp_byte_val = floor_div(exp_sum, 2) - 64;
     if is_negative {
-        // byteArray[0] ^= 0xffffffff — JS bitwise XOR on a number
+        // byteArray[0] ^= 0xffffffff - JS bitwise XOR on a number
         // This effectively does a bitwise NOT on the low byte
         byte_array[0] = (exp_byte_val ^ !0i64) as u8;
     } else {
@@ -220,6 +222,7 @@ pub struct CreateTableMetadata<'a> {
     pub deletion_protection_enabled: bool,
     pub billing_mode: Option<&'a str>,
     pub on_demand_throughput: Option<&'a str>,
+    pub vector_index_definitions: Option<&'a str>,
 }
 
 /// Parameters for query operations (base table or GSI).
@@ -239,7 +242,7 @@ pub struct QueryParams<'a> {
 /// Low-level SQLite storage layer.
 ///
 /// Manages the SQLite connection, metadata tables, and per-DynamoDB-table
-/// data tables. All SQL lives here — higher layers work with Rust types.
+/// data tables. All SQL lives here: higher layers work with Rust types.
 ///
 /// Native-only: this type is the rusqlite-backed backend and is compiled out
 /// of backend-neutral builds (for example `wasm-sqlite`).
@@ -251,6 +254,11 @@ pub struct Storage {
     metadata_cache: RefCell<HashMap<String, TableMetadata>>,
     /// Wall-clock used by stream / TTL paths. Defaults to [`SystemClock`].
     clock: Arc<dyn Clock>,
+    /// Countdown to a forced GSI insert failure, for tests that need a write
+    /// to fail part way through its index fan-out. `None` never fires. Compiled
+    /// out of every build but the crate's own unit tests.
+    #[cfg(test)]
+    gsi_insert_fault: RefCell<Option<u32>>,
 }
 
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
@@ -261,10 +269,37 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize().map_err(Self::maybe_encrypted_error)?;
         Ok(storage)
+    }
+
+    /// Let `successes` GSI inserts through, then fail every one after that, so
+    /// a write fails part way through its index fan-out. Nothing else can
+    /// produce that: a fan-out either runs to completion or the whole write
+    /// was rejected before it started. Pass 0 to fail the first insert.
+    #[cfg(test)]
+    pub(crate) fn fail_gsi_insert_after(&self, successes: u32) {
+        *self.gsi_insert_fault.borrow_mut() = Some(successes);
+    }
+
+    /// Consume one step of the armed countdown, erroring when it reaches zero.
+    #[cfg(test)]
+    pub(crate) fn check_gsi_insert_fault(&self) -> Result<()> {
+        let mut fault = self.gsi_insert_fault.borrow_mut();
+        match fault.as_mut() {
+            Some(0) => Err(crate::errors::DynoxideError::InternalServerError(
+                "injected GSI insert failure".to_string(),
+            )),
+            Some(remaining) => {
+                *remaining -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Replace the [`Clock`] used by the stream and TTL paths. Returns `self`
@@ -311,7 +346,7 @@ impl Storage {
         // Safety: key is validated to be exactly 64 hex characters [0-9a-fA-F]
         // by Database::new_encrypted(), so no injection is possible in the
         // x'...' hex literal format. Note: pragma_update does NOT use parameter
-        // binding for the PRAGMA value — hex validation is the sole injection defense.
+        // binding for the PRAGMA value: hex validation is the sole injection defense.
         let mut pragma_val = format!("x'{key}'");
         conn.pragma_update(None, "key", &pragma_val)?;
         pragma_val.zeroize();
@@ -320,6 +355,8 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
@@ -332,6 +369,8 @@ impl Storage {
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
@@ -379,9 +418,10 @@ impl Storage {
             .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
 
         // Set schema version if not present
+        let (version_sql, version_params) = sql_builders::init_schema_version(SCHEMA_VERSION);
         self.conn.execute(
-            "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)",
-            params![SCHEMA_VERSION],
+            &version_sql,
+            rusqlite::params_from_iter(version_params.iter()),
         )?;
 
         // Run schema migrations
@@ -416,6 +456,9 @@ impl Storage {
         }
         if version < 8 {
             self.migrate_v7_to_v8()?;
+        }
+        if version < 9 {
+            self.migrate_v8_to_v9()?;
         }
 
         Ok(())
@@ -605,6 +648,31 @@ impl Storage {
         Ok(())
     }
 
+    /// Migrate from schema v8 to v9: add a `vector_index_definitions TEXT`
+    /// column to `_tables`.
+    ///
+    /// Only the duplicate-column error (a re-run over a half-applied
+    /// migration whose version stamp did not land) is tolerated; any other
+    /// failure propagates rather than stamping a version whose column is
+    /// silently absent.
+    fn migrate_v8_to_v9(&self) -> Result<()> {
+        if let Err(e) = self
+            .conn
+            .execute(sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
+        {
+            if !sql_builders::is_duplicate_column_error(&e.to_string()) {
+                return Err(e.into());
+            }
+        }
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '9')",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     /// Get a reference to the underlying connection (for transactions, etc.).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -676,6 +744,20 @@ impl Storage {
     ) -> Result<()> {
         let (sql, params) =
             sql_builders::update_table_metadata(table_name, attribute_definitions, gsi_definitions);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        self.metadata_cache.borrow_mut().remove(table_name);
+        Ok(())
+    }
+
+    /// Update vector index definitions for a table; `None` clears the column.
+    pub fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<()> {
+        let (sql, params) =
+            sql_builders::update_vector_index_definitions(table_name, vector_index_definitions);
         self.conn
             .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         self.metadata_cache.borrow_mut().remove(table_name);
@@ -1002,6 +1084,109 @@ impl Storage {
     pub fn create_lsi_table(&self, table_name: &str, index_name: &str) -> Result<()> {
         let (sql, _) = sql_builders::create_lsi_table(table_name, index_name);
         self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Create a vector index shadow table.
+    pub fn create_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
+        let (sql, _) = sql_builders::create_vector_table(table_name, index_name);
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Bulk-insert many rows into one vector shadow table using a single
+    /// cached prepared statement, mirroring [`Self::insert_gsi_items`].
+    pub fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[crate::storage_backend::VectorItemRow],
+    ) -> Result<()> {
+        let sql = sql_builders::vector_insert_sql(table_name, index_name);
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        for row in rows {
+            let params = sql_builders::vector_insert_params(
+                &row.table_pk,
+                &row.table_sk,
+                &row.hash_value,
+                &row.vector_json,
+                &row.filter_json,
+                &row.item_json,
+                row.entry_bytes,
+            );
+            stmt.execute(rusqlite::params_from_iter(params.iter()))?;
+        }
+        Ok(())
+    }
+
+    /// Delete a vector shadow-table row by base table primary key, mirroring
+    /// [`Self::delete_gsi_item`].
+    pub fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
+    ) -> Result<()> {
+        let (sql, params) =
+            sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk);
+        self.conn
+            .prepare_cached(&sql)?
+            .execute(rusqlite::params_from_iter(params.iter()))?;
+        Ok(())
+    }
+
+    /// Load vector shadow-table candidate rows for a search, optionally
+    /// scoped to one SearchSchema HASH value. Ordered by base-table primary
+    /// key (see the builder) so equal scores tie-break deterministically.
+    pub fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<crate::storage_backend::VectorCandidateRow>> {
+        let (sql, params) =
+            sql_builders::query_vector_candidates(table_name, index_name, hash_value);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(crate::storage_backend::VectorCandidateRow {
+                    table_pk: row.get(0)?,
+                    table_sk: row.get(1)?,
+                    vector_json: row.get(2)?,
+                    filter_json: row.get(3)?,
+                    entry_bytes: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Load the projected entries for the keys a search returns.
+    pub fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, params) = sql_builders::vector_items_for_keys(table_name, index_name, keys);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Drop a vector index shadow table.
+    pub fn drop_vector_table(&self, table_name: &str, index_name: &str) -> Result<()> {
+        let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1419,7 +1604,7 @@ impl Storage {
 
     /// Backup the current database to a new in-memory SQLite connection.
     ///
-    /// Used for in-memory snapshot storage — the returned connection holds
+    /// Used for in-memory snapshot storage: the returned connection holds
     /// a complete copy of the database without touching the filesystem.
     pub fn backup_to_memory(&self) -> Result<Connection> {
         let mut dest = Connection::open_in_memory()?;
@@ -1739,6 +1924,9 @@ pub struct TableMetadata {
     /// Stable per-table identifier assigned at create time (#55). `None` only
     /// for rows that predate the v8 migration's backfill.
     pub table_id: Option<String>,
+    /// Vector index definitions as request-shaped JSON, following the
+    /// `gsi_definitions` convention. `None` when the table has none.
+    pub vector_index_definitions: Option<String>,
 }
 
 /// Map a row from the _tables SELECT to a TableMetadata struct.
@@ -1764,6 +1952,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
         deletion_protection_enabled: row.get::<_, i32>(16).unwrap_or(0) != 0,
         on_demand_throughput: row.get(17)?,
         table_id: row.get(18)?,
+        vector_index_definitions: row.get(19)?,
     })
 }
 
@@ -1794,7 +1983,7 @@ mod tests {
     fn test_migrate_v6_to_v7_adds_on_demand_throughput_column() {
         // Issue #44: the on_demand_throughput column must be added to existing
         // on-disk databases through the versioned migration chain, not just the
-        // fresh CREATE — otherwise DescribeTable on a pre-existing table errors.
+        // fresh CREATE: otherwise DescribeTable on a pre-existing table errors.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
 
@@ -1949,6 +2138,90 @@ mod tests {
         let storage2 = Storage::new(&path).unwrap();
         let meta2 = storage2.get_table_metadata("LegacyTable").unwrap().unwrap();
         assert_eq!(meta2.table_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// The v8 -> v9 migration adds the `vector_index_definitions` column, so a
+    /// pre-upgrade database keeps working and its rows read back through
+    /// row_to_metadata with the new column present and NULL.
+    #[test]
+    fn test_migrate_v8_to_v9_adds_vector_index_definitions_column() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build a v8-shape database by hand: _tables with table_id but no
+        // vector_index_definitions, schema_version pinned at 8, one row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE _tables (
+                    table_name TEXT PRIMARY KEY,
+                    key_schema TEXT NOT NULL,
+                    attribute_definitions TEXT NOT NULL,
+                    gsi_definitions TEXT,
+                    lsi_definitions TEXT,
+                    stream_enabled INTEGER DEFAULT 0,
+                    stream_view_type TEXT,
+                    stream_label TEXT,
+                    ttl_attribute TEXT,
+                    ttl_enabled INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                    provisioned_throughput TEXT,
+                    tags TEXT,
+                    sse_specification TEXT,
+                    table_class TEXT,
+                    deletion_protection_enabled INTEGER DEFAULT 0,
+                    on_demand_throughput TEXT,
+                    table_id TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _config (key, value) VALUES ('schema_version', '8')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, created_at, table_id) \
+                 VALUES ('LegacyTable', ?1, ?2, 0, 'fixed-id')",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopening runs the migration chain; v8 -> v9 adds the column.
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The pre-existing row survives and reads back with the new column
+        // present and NULL.
+        let meta = storage.get_table_metadata("LegacyTable").unwrap().unwrap();
+        assert_eq!(meta.table_name, "LegacyTable");
+        assert!(meta.vector_index_definitions.is_none());
+
+        // A bare SELECT of the new column would error if the ALTER had not run.
+        let col: Option<String> = storage
+            .conn()
+            .query_row(
+                "SELECT vector_index_definitions FROM _tables WHERE table_name = 'LegacyTable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(col.is_none());
     }
 
     #[test]

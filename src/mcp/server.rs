@@ -104,6 +104,11 @@ pub struct CreateTableParams {
     )]
     pub local_secondary_indexes: Option<serde_json::Value>,
 
+    #[schemars(
+        description = "Optional vector index definitions as array of {index_name, vector_attribute: {attribute_name}, dimensions, distance_function, projection} objects. distance_function is COSINE, EUCLIDEAN or DOT_PRODUCT. Optional search_schema is an array of {attribute_name, search_schema_element_type} with element type HASH or INLINE_FILTER. A table carrying one must use PAY_PER_REQUEST. Search it with search_vectors."
+    )]
+    pub vector_indexes: Option<serde_json::Value>,
+
     #[schemars(description = "Optional stream specification {stream_enabled, stream_view_type}")]
     pub stream_specification: Option<serde_json::Value>,
 
@@ -228,6 +233,39 @@ pub struct UpdateItemParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchVectorsParams {
+    #[schemars(description = "Name of the table holding the vector index")]
+    pub table_name: String,
+
+    #[schemars(description = "Name of the vector index to search")]
+    pub index_name: String,
+
+    #[schemars(
+        description = "Query vector as an array of DynamoDB numbers, e.g. [{\"N\": \"0.1\"}, {\"N\": \"0.2\"}]. Its length must equal the index's dimensions."
+    )]
+    pub search_vector: serde_json::Value,
+
+    #[schemars(description = "How many nearest entries to return.")]
+    pub top_k: i64,
+
+    #[schemars(
+        description = "Optional equality conditions over the index's SearchSchema attributes, e.g. \"tenant = :t\". Equality only, one condition per attribute, and mandatory when the schema declares a HASH element."
+    )]
+    pub search_condition_expression: Option<String>,
+
+    #[schemars(
+        description = "Optional projection expression. The vector attribute is excluded unless named here and projected by the index."
+    )]
+    pub projection_expression: Option<String>,
+
+    #[schemars(description = "Optional expression attribute name substitutions")]
+    pub expression_attribute_names: Option<std::collections::HashMap<String, String>>,
+
+    #[schemars(description = "Optional expression attribute values as DynamoDB-typed JSON")]
+    pub expression_attribute_values: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct QueryParams {
     #[schemars(description = "Name of the table to query")]
     pub table_name: String,
@@ -426,6 +464,11 @@ pub struct UpdateTableParams {
         description = "GSI updates as array of {Create?: {index_name, key_schema, projection}, Delete?: {index_name}} objects"
     )]
     pub global_secondary_index_updates: Option<serde_json::Value>,
+
+    #[schemars(
+        description = "Vector index updates as array of {create} or {delete} objects. A create carries the same shape as a create_table vector index; a delete carries {index_name}. One index per call. A created index is not searchable straight away: it reports index_status CREATING, then ACTIVE while still refusing searches. The table cannot be deleted while the index reports CREATING, which is the earlier of those two and lifts before searches start working. A delete of the index is refused for a short allocation window after the create, with an answer naming the phase to retry in, and accepted from then on."
+    )]
+    pub vector_index_updates: Option<serde_json::Value>,
 
     #[schemars(description = "Stream specification {stream_enabled, stream_view_type}")]
     pub stream_specification: Option<serde_json::Value>,
@@ -645,6 +688,94 @@ fn parse_optional_dynamo_map(
 // Helper: serialize response to tool result
 // ---------------------------------------------------------------------------
 
+/// Rewrite a `vector_index_updates` value into the wire spelling.
+///
+/// This surface documents snake_case, as the rest of its tools do, while the
+/// shared parser and its guards are case sensitive like DynamoDB. Translating
+/// here rather than loosening the parser keeps a wire client held to the wire
+/// names and still lets an agent write the shape the tool describes. An entry
+/// naming neither action is passed through untouched, so the parser reports it
+/// rather than this dropping it quietly.
+fn canonicalise_vector_index_updates(val: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = val.as_array() else {
+        return val.clone();
+    };
+    serde_json::Value::Array(
+        arr.iter()
+            .map(|entry| {
+                let Some(obj) = entry.as_object() else {
+                    return entry.clone();
+                };
+                let mut out = serde_json::Map::new();
+                // Whatever the action holds is renamed and handed on, null
+                // included: the parser and the collector each have their own
+                // rule for a null or ill-typed action, and both of those match
+                // the wire already. Deciding here instead would answer a type
+                // error where the wire answers that neither action was given.
+                if let Some(c) = obj.get("Create").or_else(|| obj.get("create")) {
+                    out.insert("Create".to_string(), canonicalise_member_names(c));
+                }
+                if let Some(d) = obj.get("Delete").or_else(|| obj.get("delete")) {
+                    out.insert("Delete".to_string(), canonicalise_member_names(d));
+                }
+                if out.is_empty() {
+                    return entry.clone();
+                }
+                serde_json::Value::Object(out)
+            })
+            .collect(),
+    )
+}
+
+/// The wire spelling of a vector index member name, for the members a create
+/// or delete action carries. Anything else is passed through as it arrived.
+///
+/// The names are unique across the shapes a definition nests, so one flat map
+/// applied at every depth cannot collide: `attribute_name` means the same
+/// thing under `VectorAttribute` as under a `SearchSchema` element.
+fn wire_member_name(key: &str) -> &str {
+    match key {
+        "index_name" => "IndexName",
+        "vector_attribute" => "VectorAttribute",
+        "search_schema" => "SearchSchema",
+        "projection" => "Projection",
+        "dimensions" => "Dimensions",
+        "distance_function" => "DistanceFunction",
+        "attribute_name" => "AttributeName",
+        "search_schema_element_type" => "SearchSchemaElementType",
+        "projection_type" => "ProjectionType",
+        "non_key_attributes" => "NonKeyAttributes",
+        other => other,
+    }
+}
+
+/// Rewrite every member name in an action into its wire spelling, at any depth.
+///
+/// A rename and nothing else, so it cannot fail. That matters more than it
+/// looks: the request-model collector reads wire spellings alone, so anything
+/// reaching it in another casing is reported as a null member the caller did in
+/// fact supply. Translating through the typed definition instead left exactly
+/// the values that fail a `u32` parse, a fractional or over-range `dimensions`
+/// among them, to fall through untranslated and be described that way.
+fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(obj) => serde_json::Value::Object(
+            obj.iter()
+                .map(|(k, v)| {
+                    (
+                        wire_member_name(k).to_string(),
+                        canonicalise_member_names(v),
+                    )
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalise_member_names).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Return a tool-level validation error (keeps the agent conversation flowing,
 /// unlike McpError which may abort it).
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
@@ -856,6 +987,38 @@ impl McpServer {
                 ));
             }
         };
+        // Request-model constraints run against the raw values, before any
+        // normalisation, because that is the order the wire path uses and the
+        // collector echoes back what it was given. Normalising first told an
+        // agent its `-1` was a `0`, which is not the string a wire client gets
+        // for the same mistake. Only the member names are rewritten, since the
+        // collector reads the wire spelling and these params are snake_case.
+        let raw_wire_vixs = params
+            .vector_indexes
+            .as_ref()
+            .map(canonicalise_member_names);
+        if let Some(msg) =
+            crate::actions::create_table::vector_indexes_request_model_error(&raw_wire_vixs)
+        {
+            return Ok(tool_validation_error("ValidationException", &msg));
+        }
+        // Then normalised, exactly as the wire path does, so a fractional
+        // dimension count truncates here rather than being refused.
+        let vector_indexes: Option<Vec<crate::types::VectorIndex>> = match params
+            .vector_indexes
+            .as_ref()
+            .map(crate::actions::create_table::normalise_vix_dimensions)
+            .map(serde_json::from_value)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidVectorIndexes",
+                    &format!("Invalid vector_indexes: {e}"),
+                ));
+            }
+        };
         let local_secondary_indexes = match params
             .local_secondary_indexes
             .map(serde_json::from_value)
@@ -932,6 +1095,7 @@ impl McpServer {
             attribute_definitions,
             global_secondary_indexes,
             local_secondary_indexes,
+            vector_indexes,
             stream_specification,
             sse_specification,
             billing_mode: params.billing_mode,
@@ -957,7 +1121,7 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("delete_table") {
             return Ok(err);
         }
-        // Auto-snapshot before destructive operation — failure blocks the delete
+        // Auto-snapshot before destructive operation: failure blocks the delete
         let snap_info = match snapshots::auto_snapshot(&self.db, &params.table_name) {
             Ok(info) => info,
             Err(e) => {
@@ -1103,6 +1267,77 @@ impl McpServer {
         };
         match self.db.update_item(request) {
             Ok(resp) => json_result(&resp),
+            Err(err) => Ok(to_tool_error(err)),
+        }
+    }
+
+    #[tool(
+        description = "[READ] Search a vector index for the nearest entries to a query vector. Exact brute-force KNN over the whole index, so the top-k is the true top-k. COSINE and EUCLIDEAN score as distances, where a self match is 0; DOT_PRODUCT scores as a similarity and can be negative. The vector attribute is excluded from results unless a projection_expression names it and the index projects it. Create the index with create_table's vector_indexes, which is searchable at once. An index added later through update_table refuses with 'Cannot search backfilling vector index' until it settles, for longer than describe_table reports it CREATING, so retry the search rather than waiting for the status."
+    )]
+    fn search_vectors(
+        &self,
+        Parameters(params): Parameters<SearchVectorsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let expression_attribute_values = match parse_optional_dynamo_map(
+            params.expression_attribute_values,
+            "expression_attribute_values",
+            crate::validation::strip_request_validation_tag,
+        ) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+
+        // Built as wire JSON and deserialised through the request's own
+        // `Deserialize`, rather than assembled field by field. That is where
+        // the `topK`, `SearchVector` and `IndexName` bounds live, so building
+        // the struct directly skipped every one of them and answered an agent
+        // with the operation-layer message where a wire client gets the
+        // enveloped member-path constraint. The values go across as given; only
+        // the member names change, because these params are snake_case.
+        let mut wire = serde_json::json!({
+            "TableName": params.table_name,
+            "IndexName": params.index_name,
+            "SearchVector": params.search_vector,
+            "TopK": params.top_k,
+        });
+        let optional: [(&str, Option<serde_json::Value>); 4] = [
+            (
+                "SearchConditionExpression",
+                params
+                    .search_condition_expression
+                    .map(serde_json::Value::from),
+            ),
+            (
+                "ProjectionExpression",
+                params.projection_expression.map(serde_json::Value::from),
+            ),
+            (
+                "ExpressionAttributeNames",
+                params
+                    .expression_attribute_names
+                    .and_then(|v| serde_json::to_value(v).ok()),
+            ),
+            (
+                "ExpressionAttributeValues",
+                expression_attribute_values.and_then(|v| serde_json::to_value(v).ok()),
+            ),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                wire[name] = value;
+            }
+        }
+        let request: crate::actions::search_vectors::SearchVectorsRequest =
+            match parse_json_param(wire, "search_request") {
+                Ok(r) => r,
+                Err(e) => return Ok(e),
+            };
+        match self.db.search_vectors(request) {
+            Ok(resp) => {
+                let json = serde_json::to_value(&resp)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                self.json_result_checked(&json)
+            }
             Err(err) => Ok(to_tool_error(err)),
         }
     }
@@ -1428,7 +1663,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "[WRITE] Create a snapshot of the current database state. Returns the snapshot name for later restoration via restore_snapshot. A global limit of 20 snapshots is enforced — when full, auto-snapshots are evicted first, then the oldest manual snapshots. Note: holds the database lock for the duration of the copy — large databases may briefly block other operations."
+        description = "[WRITE] Create a snapshot of the current database state. Returns the snapshot name for later restoration via restore_snapshot. A global limit of 20 snapshots is enforced, and when it is reached auto-snapshots are evicted first, then the oldest manual ones. This holds the database lock for the duration of the copy, so a large database may briefly block other operations."
     )]
     fn create_snapshot(
         &self,
@@ -1541,6 +1776,39 @@ impl McpServer {
                 ));
             }
         };
+        // Rewritten into the wire spelling before anything reads it. The shared
+        // parser and every guard around it are case sensitive, as DynamoDB is,
+        // so a second spelling accepted down there would reach the parser and
+        // miss the validation. Canonicalising here keeps the wire strict and
+        // still lets an agent write the snake_case this surface documents.
+        let canonical_updates = params
+            .vector_index_updates
+            .as_ref()
+            .map(canonicalise_vector_index_updates);
+        // Request-model constraints first, then the typed parse, which is the
+        // order the raw request's Deserialize runs them in. Reversed, a create
+        // missing a member answers a serde error where the wire names the
+        // member and its path.
+        if let Some(ref canonical) = canonical_updates {
+            if let Some(msg) =
+                crate::actions::update_table::vector_index_updates_request_model_error(canonical)
+            {
+                return Ok(tool_validation_error("ValidationException", &msg));
+            }
+        }
+        let vector_index_updates = match canonical_updates
+            .as_ref()
+            .map(crate::actions::update_table::parse_vector_index_updates)
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(tool_validation_error(
+                    "InvalidVectorIndexUpdates",
+                    &format!("Invalid vector_index_updates: {e}"),
+                ));
+            }
+        };
         let stream_specification = match params
             .stream_specification
             .map(serde_json::from_value)
@@ -1589,6 +1857,7 @@ impl McpServer {
             table_name: params.table_name,
             attribute_definitions,
             global_secondary_index_updates,
+            vector_index_updates,
             stream_specification,
             deletion_protection_enabled: params.deletion_protection_enabled,
             billing_mode: params.billing_mode,
@@ -1978,7 +2247,7 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let base_instructions = "\
             Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. \
-            All data is local — no AWS credentials required.\n\n\
+            All data is local: no AWS credentials required.\n\n\
             ## Getting started\n\
             1. Call `get_database_info` first to see tables, key schemas, and server config.\n\
             2. Use `describe_table` for detailed schema of a specific table.\n\n\
@@ -2208,6 +2477,66 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
         })
         .unwrap_or_default();
 
+    // Vector indexes are summarised on the same terms as the GSIs. Without
+    // this an agent could create one and never see it again, since this view
+    // is the only shape describe_table returns through MCP.
+    let vector_indexes: Vec<serde_json::Value> = desc
+        .vector_indexes
+        .as_ref()
+        .map(|vixs| {
+            vixs.iter()
+                .map(|vix| {
+                    // Absent stays absent. Defaulting to `[]` would be read
+                    // back and fed to create_table as an empty search schema
+                    // the index never carried.
+                    let schema: Option<Vec<serde_json::Value>> =
+                        vix.search_schema.as_ref().map(|elems| {
+                            elems
+                                .iter()
+                                .map(|e| {
+                                    serde_json::json!({
+                                        "attribute_name": e.attribute_name,
+                                        "search_schema_element_type":
+                                            e.search_schema_element_type,
+                                    })
+                                })
+                                .collect()
+                        });
+                    let mut out = serde_json::json!({
+                        "index_name": vix.index_name,
+                        // Shaped as create_table takes it, not flattened to a
+                        // bare name: reading an index back and handing it to
+                        // the create tool is the obvious way to clone a table,
+                        // and a bare string fails to deserialise there.
+                        "vector_attribute": {
+                            "attribute_name": vix.vector_attribute.attribute_name
+                        },
+                        "dimensions": vix.dimensions,
+                        "distance_function": vix.distance_function,
+                        "projection": {"projection_type": vix.projection.projection_type},
+                        "item_count": vix.item_count.unwrap_or(0),
+                        // An index added to a live table is not searchable at
+                        // once, so an agent needs the status to know when to
+                        // retry. Without it this view reports every index the
+                        // same and the wait is unwritable.
+                        "index_status": vix.index_status,
+                    });
+                    // Absent stays absent here too: the wire drops the field
+                    // once the index is ACTIVE rather than reporting false, and
+                    // a readiness check written against `== false` must fail
+                    // the same way on both surfaces.
+                    if let Some(backfilling) = vix.backfilling {
+                        out["backfilling"] = serde_json::Value::Bool(backfilling);
+                    }
+                    if let Some(schema) = schema {
+                        out["search_schema"] = serde_json::Value::Array(schema);
+                    }
+                    out
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let stream_enabled = desc.latest_stream_arn.is_some();
 
     let billing_mode = desc
@@ -2229,6 +2558,7 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
         "item_count": desc.item_count.unwrap_or(0),
         "size_bytes": desc.table_size_bytes.unwrap_or(0),
         "gsis": gsis,
+        "vector_indexes": vector_indexes,
         "stream_enabled": stream_enabled,
         "billing_mode": billing_mode,
         "table_class": table_class,

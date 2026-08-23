@@ -11,7 +11,7 @@ use crate::expressions::{
 use crate::types::AttributeValue;
 use std::collections::HashMap;
 
-/// A parsed projection — list of attribute paths.
+/// A parsed projection: list of attribute paths.
 #[derive(Debug, Clone)]
 pub struct ProjectionExpr {
     pub paths: Vec<Vec<PathElement>>,

@@ -13,7 +13,7 @@
 //! the same the native HTTP server speaks:
 //!
 //! - Success: the action's response struct serialised to DynamoDB JSON
-//!   (`Count`, `ScannedCount`, and — when the request asks for it —
+//!   (`Count`, `ScannedCount`, and, when the request asks for it,
 //!   `ConsumedCapacity` are all present on Query/Scan).
 //! - API error: [`DynoxideError::to_json`], carrying `__type` and a message.
 //! - Unknown or preview-unsupported op: an `UnsupportedOperation` envelope with
@@ -62,22 +62,36 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "ExecuteStatement",
     "BatchExecuteStatement",
     "ExecuteTransaction",
+    "SearchVectors",
 ];
 
-/// The idempotency caches a dispatch needs to honour `ClientRequestToken`.
+/// The session state a dispatch reads: the idempotency caches that honour
+/// `ClientRequestToken`, and the vector index creation lifecycle.
 ///
-/// Borrowed rather than owned, so one engine's caches outlive any single
-/// dispatch. Carries the whole set rather than the one cache in use today, so
-/// adding the remaining transactional operation is a routing change instead of
-/// a signature change.
+/// Borrowed rather than owned, so one engine's state outlives any single
+/// dispatch. Carries the whole set of caches rather than the one in use today,
+/// so adding the remaining transactional operation is a routing change instead
+/// of a signature change.
 pub struct DispatchContext<'a> {
     tokens: &'a crate::TokenCaches,
+    vector_lifecycle: &'a crate::actions::vector_lifecycle::VectorIndexLifecycle,
 }
 
 impl<'a> DispatchContext<'a> {
-    /// Borrow an engine's caches for the span of one dispatch.
-    pub fn new(tokens: &'a crate::TokenCaches) -> Self {
-        Self { tokens }
+    /// Borrow an engine's caches and vector index lifecycle for the span of one
+    /// dispatch.
+    ///
+    /// Both outlive the call: idempotency has to find an earlier call's result,
+    /// and an index added by one dispatch has to still be creating when the
+    /// next one describes or searches it.
+    pub fn new(
+        tokens: &'a crate::TokenCaches,
+        vector_lifecycle: &'a crate::actions::vector_lifecycle::VectorIndexLifecycle,
+    ) -> Self {
+        Self {
+            tokens,
+            vector_lifecycle,
+        }
     }
 }
 
@@ -253,28 +267,57 @@ async fn route<S: StorageBackend>(
         }};
     }
 
-    let result: crate::Result<String> = match op {
-        "CreateTable" => run!(create_table),
-        "DeleteTable" => run!(delete_table),
-        "DescribeTable" => run!(describe_table),
-        "UpdateTable" => run!(update_table),
-        "ListTables" => run!(list_tables),
-        "PutItem" => run!(put_item),
-        "GetItem" => run!(get_item),
-        "DeleteItem" => run!(delete_item),
-        "UpdateItem" => run!(update_item),
-        "Query" => run!(query),
-        "Scan" => run!(scan),
-        "BatchGetItem" => run!(batch_get_item),
-        "BatchWriteItem" => run!(batch_write_item),
-        "TransactGetItems" => run!(transact_get_items),
-        "ExecuteStatement" => run!(execute_statement),
-        "BatchExecuteStatement" => run!(batch_execute_statement),
-        "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
-        other => Err(DynoxideError::InternalServerError(format!(
-            "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
-        ))),
-    };
+    // The four operations that read or write the vector index creation
+    // lifecycle take it from the context, so a browser session walks the same
+    // window a wire client does.
+    macro_rules! run_lifecycle {
+        ($module:ident) => {{
+            match crate::serde_errors::deserialize(request_json) {
+                Ok(request) => {
+                    match actions::$module::execute(backend, request, ctx.vector_lifecycle).await {
+                        Ok(response) => serde_json::to_string(&response)
+                            .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }};
+    }
+
+    // The same pre-deserialisation type checks the HTTP server runs. Request
+    // structs hold several fields as `serde_json::Value`, which accepts any
+    // JSON type, so without this a mistyped field reaches serde and comes back
+    // as raw serde text here while the server answers with the captured
+    // SerializationException. Both surfaces read one implementation so they
+    // cannot drift.
+    let result: crate::Result<String> =
+        match crate::serialization_checks::pre_check_serialization_types(op, request_json) {
+            Err(e) => Err(e),
+            Ok(()) => match op {
+                "CreateTable" => run!(create_table),
+                "DeleteTable" => run_lifecycle!(delete_table),
+                "DescribeTable" => run_lifecycle!(describe_table),
+                "UpdateTable" => run_lifecycle!(update_table),
+                "ListTables" => run!(list_tables),
+                "PutItem" => run!(put_item),
+                "GetItem" => run!(get_item),
+                "DeleteItem" => run!(delete_item),
+                "UpdateItem" => run!(update_item),
+                "Query" => run!(query),
+                "Scan" => run!(scan),
+                "BatchGetItem" => run!(batch_get_item),
+                "BatchWriteItem" => run!(batch_write_item),
+                "TransactGetItems" => run!(transact_get_items),
+                "ExecuteStatement" => run!(execute_statement),
+                "BatchExecuteStatement" => run!(batch_execute_statement),
+                "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
+                "SearchVectors" => run_lifecycle!(search_vectors),
+                other => Err(DynoxideError::InternalServerError(format!(
+                    "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
+                ))),
+            },
+        };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
     // EnvelopedValidation tag for the operation before serialising.
@@ -322,7 +365,7 @@ async fn execute_transaction<S: StorageBackend>(
 // One persistent engine per Worker. the wasm engine is single-threaded, so a
 // thread-local holding the opened database is sufficient and avoids exporting a
 // generic type across the wasm boundary. `WasmDatabase` is `Clone` (only `Arc`s
-// move), so each call clones the handle out of the cell before awaiting — the
+// move), so each call clones the handle out of the cell before awaiting: the
 // `RefCell` borrow never spans an await point.
 // ---------------------------------------------------------------------------
 
@@ -394,7 +437,7 @@ mod engine {
         let backend = db.backend().await;
         dispatch(
             &*backend,
-            &DispatchContext::new(db.token_caches()),
+            &DispatchContext::new(db.token_caches(), db.vector_lifecycle()),
             &op,
             &request_json,
         )
@@ -430,7 +473,7 @@ mod engine {
         };
         let outcome = super::dispatch_http(
             &*backend,
-            &DispatchContext::new(db.token_caches()),
+            &DispatchContext::new(db.token_caches(), db.vector_lifecycle()),
             target.as_deref(),
             &body,
             auth,
@@ -444,7 +487,7 @@ mod engine {
     }
 
     /// The supported-operation list, as a JSON array of op names. The client's
-    /// positive feature-detection path — it hides anything not listed rather
+    /// positive feature-detection path: it hides anything not listed rather
     /// than probing for `UnsupportedOperation` errors.
     #[wasm_bindgen]
     pub fn capabilities() -> String {
@@ -463,23 +506,38 @@ mod tests {
     use super::*;
     use crate::storage::Storage;
 
+    /// The session state one engine instance owns: the idempotency caches and
+    /// the vector index creation lifecycle. Held together so a `_with` helper
+    /// drives two calls through a whole engine rather than half of one.
+    #[derive(Default)]
+    struct EngineState {
+        tokens: crate::TokenCaches,
+        vector_lifecycle: crate::actions::vector_lifecycle::VectorIndexLifecycle,
+    }
+
+    impl EngineState {
+        fn ctx(&self) -> DispatchContext<'_> {
+            DispatchContext::new(&self.tokens, &self.vector_lifecycle)
+        }
+    }
+
     /// Drive one operation against a fresh in-memory native backend. The
     /// dispatch is backend-generic, so this exercises the same routing,
     /// deserialisation, and envelope code the wasm engine runs.
     fn run(backend: &Storage, op: &str, json: &str) -> std::result::Result<String, String> {
-        let tokens = crate::TokenCaches::new();
-        pollster::block_on(dispatch(backend, &DispatchContext::new(&tokens), op, json))
+        let engine = EngineState::default();
+        pollster::block_on(dispatch(backend, &engine.ctx(), op, json))
     }
 
-    /// As [`run`], but against caller-supplied caches, so a test can drive two
-    /// calls through the same idempotency state.
+    /// As [`run`], but against caller-supplied session state, so a test can
+    /// drive two calls through the same engine.
     fn run_with(
         backend: &Storage,
-        tokens: &crate::TokenCaches,
+        engine: &EngineState,
         op: &str,
         json: &str,
     ) -> std::result::Result<String, String> {
-        pollster::block_on(dispatch(backend, &DispatchContext::new(tokens), op, json))
+        pollster::block_on(dispatch(backend, &engine.ctx(), op, json))
     }
 
     const CREATE_MUSIC: &str = r#"{
@@ -661,6 +719,116 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&err).unwrap();
         assert_eq!(v["__type"], "com.dynoxide.wasm#UnsupportedOperation");
         assert!(v["message"].as_str().unwrap().contains("not supported"));
+    }
+
+    #[test]
+    fn search_vectors_is_served_rather_than_refused_as_unsupported() {
+        // The control plane could always create a vector index here, because
+        // the engine logic and the six storage methods are shared with native.
+        // Until the operation was routed, the build reported an index it could
+        // not search: DescribeTable said ACTIVE and SearchVectors answered 501.
+        let backend = Storage::memory().unwrap();
+        let create = r#"{"TableName":"VecW","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+          "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+          "BillingMode":"PAY_PER_REQUEST",
+          "VectorIndexes":[{"IndexName":"vix","VectorAttribute":{"AttributeName":"emb"},
+          "Projection":{"ProjectionType":"ALL"},"Dimensions":3,"DistanceFunction":"COSINE"}]}"#;
+        run(&backend, "CreateTable", create).unwrap();
+        run(
+            &backend,
+            "PutItem",
+            r#"{"TableName":"VecW","Item":{"pk":{"S":"a"},"emb":{"L":[{"N":"1"},{"N":"0"},{"N":"0"}]}}}"#,
+        )
+        .unwrap();
+
+        let body = run(
+            &backend,
+            "SearchVectors",
+            r#"{"TableName":"VecW","IndexName":"vix","SearchVector":[{"N":"1"},{"N":"0"},{"N":"0"}],"TopK":1}"#,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let results = v["SearchResults"].as_array().expect("SearchResults");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["Item"]["pk"]["S"], "a");
+        // COSINE is a distance rather than a similarity, so a self match scores
+        // 0 and an opposite vector scores 2 (captured 2026-08-11). The vector
+        // attribute is excluded from the projection by default.
+        assert_eq!(results[0]["Score"], 0.0);
+        assert!(results[0]["Item"].get("emb").is_none());
+
+        let out = http(&backend, Some("DynamoDB_20120810.SearchVectors"), create);
+        assert_ne!(
+            out.status, 501,
+            "the operation must no longer read as a skip"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_vector_field_is_a_serialization_exception_here_too() {
+        // The checks live in one module both surfaces read, because a request
+        // struct holds several fields as serde_json::Value and serde accepts
+        // any JSON type there. Without the shared pre-check this answered with
+        // raw serde text while the HTTP server answered with the captured
+        // SerializationException, on exactly the fields the vector work added.
+        let backend = Storage::memory().unwrap();
+        let err = run(
+            &backend,
+            "CreateTable",
+            r#"{"TableName":"VecBad","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+              "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+              "BillingMode":"PAY_PER_REQUEST","VectorIndexes":"not-a-list"}"#,
+        )
+        .unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            v["__type"]
+                .as_str()
+                .unwrap()
+                .contains("SerializationException"),
+            "got {v}"
+        );
+        // Raw serde text leaks a byte offset; the captured message never does.
+        let message = v["Message"].as_str().expect("the envelope carries Message");
+        assert_eq!(message, "Unexpected field type");
+        assert!(
+            !message.contains("at line"),
+            "raw serde text leaked instead of the captured message: {v}"
+        );
+    }
+
+    #[test]
+    fn the_vector_control_plane_and_data_plane_agree() {
+        // The pairing that matters: if DescribeTable reflects an index, a
+        // search against it must be answerable. Asserting them together stops
+        // one being wired without the other.
+        let backend = Storage::memory().unwrap();
+        run(
+            &backend,
+            "CreateTable",
+            r#"{"TableName":"VecPair","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+              "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+              "BillingMode":"PAY_PER_REQUEST",
+              "VectorIndexes":[{"IndexName":"vix","VectorAttribute":{"AttributeName":"emb"},
+              "Projection":{"ProjectionType":"ALL"},"Dimensions":3,"DistanceFunction":"COSINE"}]}"#,
+        )
+        .unwrap();
+
+        let d = run(&backend, "DescribeTable", r#"{"TableName":"VecPair"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&d).unwrap();
+        let reflected = v["Table"]["VectorIndexes"][0]["IndexStatus"] == "ACTIVE";
+        assert!(reflected, "the control plane reports the index");
+
+        let searchable = run(
+            &backend,
+            "SearchVectors",
+            r#"{"TableName":"VecPair","IndexName":"vix","SearchVector":[{"N":"1"},{"N":"0"},{"N":"0"}],"TopK":1}"#,
+        )
+        .is_ok();
+        assert_eq!(
+            reflected, searchable,
+            "an index the control plane advertises must be one the data plane can serve"
+        );
     }
 
     #[test]
@@ -899,21 +1067,21 @@ mod tests {
     }
 
     fn http(backend: &Storage, target: Option<&str>, body: &str) -> HttpOutcome {
-        let tokens = crate::TokenCaches::new();
-        http_with(backend, &tokens, target, body)
+        let engine = EngineState::default();
+        http_with(backend, &engine, target, body)
     }
 
-    /// As [`http`], but against caller-supplied caches, so two requests share
-    /// idempotency state the way they do on one engine instance.
+    /// As [`http`], but against caller-supplied session state, so two requests
+    /// share it the way they do on one engine instance.
     fn http_with(
         backend: &Storage,
-        tokens: &crate::TokenCaches,
+        engine: &EngineState,
         target: Option<&str>,
         body: &str,
     ) -> HttpOutcome {
         pollster::block_on(dispatch_http(
             backend,
-            &DispatchContext::new(tokens),
+            &engine.ctx(),
             target,
             body,
             signed_auth(),
@@ -1024,10 +1192,10 @@ mod tests {
         // rejected here exactly as it is over the native server.
         let backend = Storage::memory().unwrap();
         let unsigned = crate::auth_material::AuthMaterial::default();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         let out = pollster::block_on(dispatch_http(
             &backend,
-            &DispatchContext::new(&tokens),
+            &engine.ctx(),
             Some("DynamoDB_20120810.ListTables"),
             "{}",
             unsigned,
@@ -1045,10 +1213,10 @@ mod tests {
         // DynamoDB resolves the operation first, so an unsigned request to an
         // unknown target reports the unknown operation, not the missing token.
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         let out = pollster::block_on(dispatch_http(
             &backend,
-            &DispatchContext::new(&tokens),
+            &engine.ctx(),
             Some("DynamoDB_20120810.NoSuchOp"),
             "{}",
             crate::auth_material::AuthMaterial::default(),
@@ -1485,7 +1653,7 @@ mod tests {
     #[test]
     fn execute_transaction_replays_a_repeated_token_without_reapplying() {
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
         partiql(
             &backend,
@@ -1497,8 +1665,8 @@ mod tests {
             &["UPDATE \"Music\" SET plays = plays + 1 WHERE artist = 'a' AND song = 's1'"],
             Some("same-token"),
         );
-        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
-        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
+        run_with(&backend, &engine, "ExecuteTransaction", &bump).unwrap();
+        run_with(&backend, &engine, "ExecuteTransaction", &bump).unwrap();
 
         assert_eq!(plays(&backend, "s1"), Some(1));
     }
@@ -1506,12 +1674,12 @@ mod tests {
     #[test]
     fn execute_transaction_reuses_a_token_only_for_the_same_statements() {
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
 
         run_with(
             &backend,
-            &tokens,
+            &engine,
             "ExecuteTransaction",
             &transaction(
                 &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's1'}"],
@@ -1522,7 +1690,7 @@ mod tests {
 
         let err = run_with(
             &backend,
-            &tokens,
+            &engine,
             "ExecuteTransaction",
             &transaction(
                 &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 's2'}"],
@@ -1539,7 +1707,7 @@ mod tests {
     #[test]
     fn execute_transaction_replays_when_only_the_capacity_mode_differs() {
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
         partiql(
             &backend,
@@ -1559,10 +1727,10 @@ mod tests {
             body.to_string()
         };
 
-        let first = run_with(&backend, &tokens, "ExecuteTransaction", &with_mode(None)).unwrap();
+        let first = run_with(&backend, &engine, "ExecuteTransaction", &with_mode(None)).unwrap();
         let replay = run_with(
             &backend,
-            &tokens,
+            &engine,
             "ExecuteTransaction",
             &with_mode(Some("TOTAL")),
         )
@@ -1580,7 +1748,7 @@ mod tests {
     #[test]
     fn execute_transaction_replays_the_first_calls_responses() {
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
         partiql(
             &backend,
@@ -1594,8 +1762,8 @@ mod tests {
             &["SELECT * FROM \"Music\" WHERE artist = 'a' AND song = 's1'"],
             Some("read-token"),
         );
-        let first = run_with(&backend, &tokens, "ExecuteTransaction", &read).unwrap();
-        let replay = run_with(&backend, &tokens, "ExecuteTransaction", &read).unwrap();
+        let first = run_with(&backend, &engine, "ExecuteTransaction", &read).unwrap();
+        let replay = run_with(&backend, &engine, "ExecuteTransaction", &read).unwrap();
 
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
         let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
@@ -1606,7 +1774,7 @@ mod tests {
     #[test]
     fn execute_transaction_frees_a_token_whose_transaction_was_cancelled() {
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
         partiql(
             &backend,
@@ -1616,7 +1784,7 @@ mod tests {
 
         let cancelled = run_with(
             &backend,
-            &tokens,
+            &engine,
             "ExecuteTransaction",
             &transaction(
                 &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'taken'}"],
@@ -1633,7 +1801,7 @@ mod tests {
         // rather than replaying the failure or reporting a mismatch.
         run_with(
             &backend,
-            &tokens,
+            &engine,
             "ExecuteTransaction",
             &transaction(
                 &["INSERT INTO \"Music\" VALUE {'artist': 'a', 'song': 'fresh', 'plays': 1}"],
@@ -1649,10 +1817,10 @@ mod tests {
         // The conformance suite drives dispatch_http, so the caches have to
         // reach that binding too, not just the execute() one.
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         http_with(
             &backend,
-            &tokens,
+            &engine,
             Some("DynamoDB_20120810.CreateTable"),
             CREATE_MUSIC,
         );
@@ -1666,7 +1834,7 @@ mod tests {
         for _ in 0..2 {
             let out = http_with(
                 &backend,
-                &tokens,
+                &engine,
                 Some("DynamoDB_20120810.ExecuteTransaction"),
                 &once,
             );
@@ -1678,7 +1846,7 @@ mod tests {
     #[test]
     fn execute_transaction_without_a_token_applies_every_time() {
         let backend = Storage::memory().unwrap();
-        let tokens = crate::TokenCaches::new();
+        let engine = EngineState::default();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
         partiql(
             &backend,
@@ -1690,8 +1858,8 @@ mod tests {
             &["UPDATE \"Music\" SET plays = plays + 1 WHERE artist = 'a' AND song = 's1'"],
             None,
         );
-        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
-        run_with(&backend, &tokens, "ExecuteTransaction", &bump).unwrap();
+        run_with(&backend, &engine, "ExecuteTransaction", &bump).unwrap();
+        run_with(&backend, &engine, "ExecuteTransaction", &bump).unwrap();
 
         assert_eq!(plays(&backend, "s1"), Some(2));
     }

@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-/// DynamoDB AttributeValue — the core type system.
+/// DynamoDB AttributeValue - the core type system.
 ///
 /// Each variant corresponds to a DynamoDB type descriptor:
 /// S (String), N (Number as string), B (Binary), BOOL, NULL,
@@ -15,9 +15,9 @@ use std::fmt;
 pub enum AttributeValue {
     /// String type
     S(String),
-    /// Number type — stored as string per DynamoDB convention
+    /// Number type - stored as string per DynamoDB convention
     N(String),
-    /// Binary type — raw bytes, serialized as base64
+    /// Binary type - raw bytes, serialized as base64
     B(Vec<u8>),
     /// Boolean type
     BOOL(bool),
@@ -25,13 +25,13 @@ pub enum AttributeValue {
     NULL(bool),
     /// String Set
     SS(Vec<String>),
-    /// Number Set — each number stored as string
+    /// Number Set - each number stored as string
     NS(Vec<String>),
-    /// Binary Set — each element is raw bytes
+    /// Binary Set - each element is raw bytes
     BS(Vec<Vec<u8>>),
-    /// List — ordered collection of AttributeValues
+    /// List - ordered collection of AttributeValues
     L(Vec<AttributeValue>),
-    /// Map — key-value pairs
+    /// Map - key-value pairs
     M(HashMap<String, AttributeValue>),
 }
 
@@ -39,7 +39,7 @@ impl AttributeValue {
     /// Calculate the size of this attribute value in bytes,
     /// following DynamoDB's item size calculation rules.
     ///
-    /// This does NOT include the attribute name — the caller
+    /// This does NOT include the attribute name - the caller
     /// is responsible for adding the name's UTF-8 byte length.
     pub fn size(&self) -> usize {
         match self {
@@ -456,7 +456,7 @@ pub fn validate_dynamo_number(
     // But with more digits, exponent can be lower, e.g. 1.0E-130 has (mantissa=[1], exponent=-129)
     // Actually, the smallest representable is 1E-130. In our representation, 1E-130 = 0.1 * 10^-129
     // So exponent = -129 with mantissa [1].
-    // For 1E-131 = 0.1 * 10^-130, exponent = -130 — that's too small.
+    // For 1E-131 = 0.1 * 10^-130, exponent = -130 - that's too small.
     if exponent < -129 {
         return Err(crate::errors::DynoxideError::ValidationException(
             "Number underflow. Attempting to store a number with magnitude smaller than supported range"
@@ -796,6 +796,11 @@ pub struct ConsumedCapacity {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_secondary_indexes: Option<HashMap<String, CapacityDetail>>,
+    /// Per-vector-index replication cost. Reported under `INDEXES` alone, and
+    /// never folded into `capacity_units`: vector replication is billed in
+    /// bytes on its own axis rather than in capacity units.
+    #[serde(rename = "VectorIndexes", skip_serializing_if = "Option::is_none")]
+    pub vector_indexes: Option<HashMap<String, VectorCapacityDetail>>,
 }
 
 /// Per-resource capacity detail.
@@ -807,6 +812,51 @@ pub struct CapacityDetail {
     pub read_capacity_units: Option<f64>,
     #[serde(rename = "WriteCapacityUnits", skip_serializing_if = "Option::is_none")]
     pub write_capacity_units: Option<f64>,
+}
+
+/// One vector index's replication cost for a write.
+///
+/// Vector indexes are billed in bytes rather than capacity units, so this
+/// carries no `CapacityUnits` and the figure never reaches the response's
+/// total. An index a write leaves alone is absent from the map rather than
+/// present and zeroed (captured 2026-08-11, eu-west-2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorCapacityDetail {
+    #[serde(rename = "VectorWriteRequestBytes")]
+    pub vector_write_request_bytes: f64,
+}
+
+/// The `ConsumedCapacity` a `SearchVectors` response carries.
+///
+/// The shape has no `CapacityUnits` and no `TableName`, reads identically under
+/// `TOTAL` and `INDEXES`, and is absent under `NONE` (captured 2026-08-11,
+/// eu-west-2). Despite the field name, real DynamoDB bills the figure on the
+/// data the search read rather than on the request, and does not reproduce it
+/// between identical calls; Dynoxide reports a deterministic stand-in instead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorSearchCapacity {
+    #[serde(rename = "VectorSearchRequestBytes")]
+    pub vector_search_request_bytes: f64,
+}
+
+/// The billable minimum for a vector request, in bytes.
+///
+/// DynamoDB documents a 1KB minimum on vector billing and the capture observed
+/// 1024.0 for a three-dimensional fixture, which is this floor rather than a
+/// constant.
+///
+/// The two axes above the floor are not on the same footing. The write figure
+/// is captured byte-exact (eu-west-2, 2026-08-18): five fixtures from 3 to 512
+/// dimensions fit `4 * dimensions + vector attribute name + item size of the
+/// rest of the projected entry` with no residual, and the tests fail on a
+/// one-byte error. The search figure has no oracle at all, because real
+/// DynamoDB does not reproduce its own, so what Dynoxide reports there is a
+/// deterministic stand-in rather than a match.
+pub const MIN_VECTOR_REQUEST_BYTES: f64 = 1024.0;
+
+/// The billable byte figure for a vector request measuring `bytes`.
+pub fn vector_request_bytes(bytes: usize) -> f64 {
+    (bytes as f64).max(MIN_VECTOR_REQUEST_BYTES)
 }
 
 /// The transactional capacity multiplier. `TransactWriteItems` and
@@ -875,6 +925,19 @@ pub fn read_capacity_units_with_consistency(item_size_bytes: usize, consistent: 
 /// that mean "yes" is written down once.
 pub fn capacity_wanted(mode: Option<&str>) -> bool {
     matches!(mode, Some("TOTAL") | Some("INDEXES"))
+}
+
+/// Whether a `ReturnConsumedCapacity` mode carries the vector write map.
+///
+/// Narrower than [`capacity_wanted`], because the per-index vector map reaches
+/// the wire under `INDEXES` alone (captured 2026-08-11, eu-west-2); `TOTAL`
+/// asks for capacity and still carries no vector fields. The sizing costs a
+/// derivation of the old image per index, so the fan-out asks here and skips
+/// the work rather than doing it and having the response builder drop it. Both
+/// ends read the same predicate so they cannot disagree about which modes mean
+/// yes.
+pub fn vector_capacity_wanted(mode: Option<&str>) -> bool {
+    matches!(mode, Some("INDEXES"))
 }
 
 /// Build a `ConsumedCapacity` for a simple table operation.
@@ -999,6 +1062,67 @@ fn secondary_index_capacity(
         }),
         _ => None,
     }
+}
+
+/// Build a `ConsumedCapacity` carrying the classic index arms and the vector
+/// arm together.
+///
+/// The single mode argument is the point: the classic builder and the vector
+/// attach each need one, and passing them separately leaves a caller free to
+/// build under one mode and attach under another, which would put a
+/// `VectorIndexes` map on a `TOTAL`-shaped response.
+pub fn consumed_capacity_with_vector_indexes(
+    table_name: &str,
+    table_units: f64,
+    gsi_units: &HashMap<String, f64>,
+    lsi_units: &HashMap<String, f64>,
+    vector_bytes: &HashMap<String, f64>,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    attach_vector_index_capacity(
+        consumed_capacity_with_secondary_indexes(
+            table_name,
+            table_units,
+            gsi_units,
+            lsi_units,
+            mode,
+        ),
+        vector_bytes,
+        mode,
+    )
+}
+
+/// Attach per-vector-index write bytes to a capacity report.
+///
+/// Vector replication sits on its own axis, so this never touches
+/// `capacity_units`: the bytes are reported beside the classic arms, not
+/// summed into them. The map appears under `INDEXES` alone, matching the
+/// capture, and an empty `vector_bytes` leaves the response untouched so a
+/// write that changed no vector index reports no map at all rather than an
+/// empty one.
+pub(crate) fn attach_vector_index_capacity(
+    capacity: Option<ConsumedCapacity>,
+    vector_bytes: &HashMap<String, f64>,
+    mode: &Option<String>,
+) -> Option<ConsumedCapacity> {
+    let mut capacity = capacity?;
+    if vector_bytes.is_empty() || !vector_capacity_wanted(mode.as_deref()) {
+        return Some(capacity);
+    }
+    capacity.vector_indexes = Some(
+        vector_bytes
+            .iter()
+            .map(|(name, bytes)| {
+                (
+                    name.clone(),
+                    VectorCapacityDetail {
+                        vector_write_request_bytes: *bytes,
+                    },
+                )
+            })
+            .collect(),
+    );
+    Some(capacity)
 }
 
 /// Build a `ConsumedCapacity` for one table in a transactional read
@@ -1147,7 +1271,7 @@ pub fn transactional_write_capacity(
     }
 }
 
-/// Key schema element — defines a key attribute.
+/// Key schema element - defines a key attribute.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct KeySchemaElement {
     #[serde(rename = "AttributeName", alias = "attribute_name")]
@@ -1164,7 +1288,7 @@ pub enum KeyType {
     RANGE,
 }
 
-/// Attribute definition — declares an attribute's type.
+/// Attribute definition - declares an attribute's type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AttributeDefinition {
     #[serde(rename = "AttributeName", alias = "attribute_name")]
@@ -1236,6 +1360,143 @@ pub struct LocalSecondaryIndex {
     pub key_schema: Vec<KeySchemaElement>,
     #[serde(rename = "Projection", alias = "projection")]
     pub projection: Projection,
+}
+
+/// The vector attribute a vector index is built over. A structure with a
+/// single `AttributeName` member on the wire, not a bare string.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorAttributeDefinition {
+    #[serde(rename = "AttributeName", alias = "attribute_name")]
+    pub attribute_name: String,
+}
+
+/// One element of a vector index's search schema: a `HASH` partition
+/// attribute or an `INLINE_FILTER` attribute.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchSchemaElement {
+    #[serde(rename = "AttributeName", alias = "attribute_name")]
+    pub attribute_name: String,
+    #[serde(
+        rename = "SearchSchemaElementType",
+        alias = "search_schema_element_type"
+    )]
+    pub search_schema_element_type: String,
+}
+
+/// Vector index definition as supplied on CreateTable's `VectorIndexes`.
+///
+/// Serialised verbatim into the `_tables.vector_index_definitions` column,
+/// following the `gsi_definitions` convention.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorIndex {
+    #[serde(rename = "IndexName", alias = "index_name")]
+    pub index_name: String,
+    #[serde(rename = "VectorAttribute", alias = "vector_attribute")]
+    pub vector_attribute: VectorAttributeDefinition,
+    #[serde(
+        rename = "SearchSchema",
+        alias = "search_schema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub search_schema: Option<Vec<SearchSchemaElement>>,
+    #[serde(rename = "Projection", alias = "projection")]
+    pub projection: Projection,
+    #[serde(rename = "Dimensions", alias = "dimensions")]
+    pub dimensions: u32,
+    #[serde(rename = "DistanceFunction", alias = "distance_function")]
+    pub distance_function: String,
+}
+
+/// Why an attribute value is not a valid vector for an index with a given
+/// dimension count. Carries the element-level detail the write-path
+/// validation errors interpolate; the checks run in the order the variants
+/// are listed, so a value can only report one failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorValueError {
+    /// The value is not a List at all.
+    NotAList,
+    /// The list's element count differs from the index's dimensions.
+    WrongDimensions {
+        /// The number of elements actually present.
+        actual: usize,
+    },
+    /// An element is not a Number.
+    ElementNotANumber {
+        /// Zero-based element position.
+        position: usize,
+        /// The element's DynamoDB type descriptor.
+        actual: &'static str,
+    },
+    /// An element does not fit the finite f32 range (out-of-range values
+    /// overflow to infinity on conversion; real DynamoDB rejects them at
+    /// write time, captured eu-west-2 and us-east-1, 2026-08-12).
+    ElementOutOfRange {
+        /// Zero-based element position.
+        position: usize,
+        /// The raw number string as written.
+        value: String,
+    },
+}
+
+/// The f32 values of a vector attribute value, or the element-level reason it
+/// is not a valid vector for an index with `dimensions` elements.
+///
+/// Vector indexes hold f32 copies while the base table keeps full precision
+/// (captured from real DynamoDB, eu-west-2, 2026-08-11), so conversion
+/// happens here, where the index copy is derived. The live write path turns
+/// each error variant into its captured `IndexName:`-suffixed message; the
+/// backfill path discards the detail via [`vector_f32_values`] and
+/// sparse-skips, so the two paths agree on validity by construction.
+pub fn check_vector_f32_values(
+    value: &AttributeValue,
+    dimensions: u32,
+) -> std::result::Result<Vec<f32>, VectorValueError> {
+    let AttributeValue::L(elems) = value else {
+        return Err(VectorValueError::NotAList);
+    };
+    if elems.len() != dimensions as usize {
+        return Err(VectorValueError::WrongDimensions {
+            actual: elems.len(),
+        });
+    }
+    let mut out = Vec::with_capacity(elems.len());
+    for (position, elem) in elems.iter().enumerate() {
+        let AttributeValue::N(n) = elem else {
+            return Err(VectorValueError::ElementNotANumber {
+                position,
+                actual: elem.type_name(),
+            });
+        };
+        // A well-formed DynamoDB number always parses (overflow yields
+        // infinity, not an error); anything non-finite is out of f32 range.
+        match n.parse::<f32>() {
+            Ok(v) if v.is_finite() => out.push(v),
+            _ => {
+                return Err(VectorValueError::ElementOutOfRange {
+                    position,
+                    value: n.clone(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The f32 values of a vector attribute value, or `None` when the value is
+/// not a valid vector for an index with `dimensions` elements. The validity
+/// rule is exactly [`check_vector_f32_values`]'s, with the element-level
+/// detail discarded; the backfill path uses this form to sparse-skip.
+pub fn vector_f32_values(value: &AttributeValue, dimensions: u32) -> Option<Vec<f32>> {
+    check_vector_f32_values(value, dimensions).ok()
+}
+
+/// Serialise an f32 for a vector index's number copy: shortest-decimal via
+/// serde_json's f32 formatter, which always keeps a fractional part ("1"
+/// stores as "1.0", matching how the index copy reads back from real
+/// DynamoDB; captured eu-west-2, 2026-08-11).
+pub fn f32_number_string(v: f32) -> String {
+    serde_json::to_string(&v).unwrap_or_else(|_| "0.0".to_string())
 }
 
 /// Provisioned throughput settings (stored but not enforced).
@@ -1319,7 +1580,7 @@ impl From<&[u8]> for AttributeValue {
     }
 }
 
-// Integer types — all finite, all fit in DynamoDB's number range.
+// Integer types - all finite, all fit in DynamoDB's number range.
 macro_rules! impl_from_integer {
     ($($t:ty),+) => {
         $(

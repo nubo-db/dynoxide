@@ -91,7 +91,7 @@ pub struct ValidatedRule {
 ///
 /// Wraps the raw salt bytes to prevent accidental leakage through
 /// `Debug` formatting (logs, panics, `dbg!()` calls). The salt exists
-/// specifically to prevent rainbow table attacks — `#[derive(Debug)]`
+/// specifically to prevent rainbow table attacks - `#[derive(Debug)]`
 /// on the raw bytes would undo that protection.
 #[derive(Clone)]
 pub struct Salt(Vec<u8>);
@@ -283,9 +283,9 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
 /// Match expressions use DynamoDB ConditionExpression syntax. The following
 /// functions work without expression attribute values:
 ///
-/// - `attribute_exists(path)` — matches if the attribute is present
-/// - `attribute_not_exists(path)` — matches if the attribute is absent
-/// - `attribute_type(path, type)` — matches if the attribute is the given type
+/// - `attribute_exists(path)`: matches if the attribute is present
+/// - `attribute_not_exists(path)`: matches if the attribute is absent
+/// - `attribute_type(path, type)`: matches if the attribute is the given type
 /// - Boolean operators: `AND`, `OR`, `NOT`
 ///
 /// ## Known limitation

@@ -19,7 +19,7 @@ const MAX_DECOMPRESSED_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 const MAX_LINE_LENGTH: usize = 4 * 1024 * 1024;
 
 /// BufReader capacity (256 KB). The default 8 KB is too small for gzip
-/// decompression — larger buffers amortize decoder overhead significantly.
+/// decompression: larger buffers amortize decoder overhead significantly.
 const BUF_READER_CAPACITY: usize = 256 * 1024;
 
 /// Statistics from streaming parse (no items held in memory).

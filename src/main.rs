@@ -1,10 +1,10 @@
 //! Dynoxide CLI binary.
 //!
 //! Supports subcommands:
-//! - `dynoxide` or `dynoxide serve` — start the DynamoDB-compatible HTTP server
-//! - `dynoxide mcp` — start the MCP server (enabled by default)
-//! - `dynoxide import` — import DynamoDB Export data (enabled by default)
-//! - `dynoxide healthcheck` — probe a running server for liveness (used by Docker HEALTHCHECK)
+//! - `dynoxide` or `dynoxide serve`: start the DynamoDB-compatible HTTP server
+//! - `dynoxide mcp`: start the MCP server (enabled by default)
+//! - `dynoxide import`: import DynamoDB Export data (enabled by default)
+//! - `dynoxide healthcheck`: probe a running server for liveness (used by Docker HEALTHCHECK)
 
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 use dynoxide::Database;
@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 // CLI always uses vendored OpenSSL (`encryption` feature), never `encryption-cc`.
-// Do NOT change these guards to `_has-encryption` — that's for the library API only.
+// Do NOT change these guards to `_has-encryption`: that's for the library API only.
 #[cfg(all(feature = "encryption", feature = "http-server"))]
 use zeroize::Zeroizing;
 
@@ -55,7 +55,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     encryption_key_file: Option<PathBuf>,
 
-    /// Schema file (JSON with DescribeTable responses) — scaffolds empty tables on startup
+    /// Schema file (JSON with DescribeTable responses): scaffolds empty tables on startup
     #[cfg(feature = "import")]
     #[arg(long, value_name = "PATH")]
     schema: Option<PathBuf>,
@@ -139,7 +139,7 @@ struct ServeArgs {
     #[arg(long, value_name = "HOST", requires = "mcp")]
     mcp_allowed_host: Vec<String>,
 
-    /// Schema file (JSON with DescribeTable responses) — scaffolds empty tables on startup
+    /// Schema file (JSON with DescribeTable responses): scaffolds empty tables on startup
     #[cfg(feature = "import")]
     #[arg(long, value_name = "PATH")]
     schema: Option<PathBuf>,
@@ -340,7 +340,7 @@ fn after_help_text() -> &'static str {
     }
 }
 
-// Compile error if no CLI feature is enabled — the binary needs at least one.
+// Compile error if no CLI feature is enabled: the binary needs at least one.
 #[cfg(not(any(feature = "http-server", feature = "mcp-server", feature = "import")))]
 compile_error!(
     "At least one of `http-server`, `mcp-server`, or `import` features must be enabled \
@@ -525,7 +525,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let (http_result, mcp_result) = tokio::join!(
             async {
                 let r = dynoxide::server::start(&args.host, args.port, db).await;
-                // HTTP server exited (Ctrl+C) — tell MCP to shut down too
+                // HTTP server exited (Ctrl+C): tell MCP to shut down too
                 mcp_shutdown_clone.cancel();
                 r
             },
@@ -921,7 +921,7 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
     }
 }
 
-/// Import subcommand — async version (when http-server or mcp-server is available).
+/// Import subcommand: async version (when http-server or mcp-server is available).
 /// Supports --serve and --mcp for import-then-serve workflows.
 #[cfg(all(
     feature = "import",
@@ -1022,7 +1022,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Import subcommand — sync version (import feature only, no server features).
+/// Import subcommand: sync version (import feature only, no server features).
 #[cfg(all(
     feature = "import",
     not(feature = "http-server"),

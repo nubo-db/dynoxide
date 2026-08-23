@@ -39,6 +39,7 @@ use crate::storage::{
 use crate::storage_backend::sql_builders::{self, SqlParam};
 use crate::storage_backend::{
     BackendError, BaseItemRow, Clock, GsiItemRow, IndexWriteOp, StorageBackend, SystemClock,
+    VectorCandidateRow, VectorItemRow,
 };
 use crate::types::Tag;
 
@@ -114,6 +115,50 @@ impl WasmBridgeBackend {
         // creates in `initialize`. `INIT_SCHEMA` is a multi-statement batch;
         // the bridge runs each statement in turn.
         bridge_exec(&handle, sql_builders::INIT_SCHEMA, js_sys::Array::new())
+            .await
+            .map_err(js_err)?;
+        // A database persisted before schema version 9 lacks the
+        // `vector_index_definitions` column, and `CREATE TABLE IF NOT EXISTS`
+        // cannot add it, so the column is added with an ALTER on open.
+        //
+        // The ALTER is asked for only when the column is genuinely missing.
+        // `INIT_SCHEMA` above already creates `_tables` with it, so running the
+        // ALTER unconditionally would fail on every open of every database
+        // except a legacy one, leaving the tolerated-error path as the only
+        // path most opens ever take. That is noisy, and it puts the whole open
+        // one error-message rewording away from failing, since the tolerance is
+        // a substring match. Native gates the equivalent migration on the
+        // recorded schema version; the column check is the wasm equivalent and
+        // works before any version has been stamped.
+        let existing = bridge_query(
+            &handle,
+            sql_builders::TABLES_COLUMN_NAMES,
+            js_sys::Array::new(),
+        )
+        .await
+        .map_err(js_err)?;
+        let has_vector_column = js_sys::Array::from(&existing).iter().any(|row| {
+            col_text(&js_sys::Array::from(&row), 0).as_deref()
+                == Some(sql_builders::VECTOR_INDEX_DEFINITIONS_COLUMN)
+        });
+        if !has_vector_column {
+            // A real failure here fails the open: swallowing an OPFS fault
+            // would leave the column absent and every later metadata statement
+            // failing far from the cause.
+            bridge_exec(
+                &handle,
+                sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN,
+                js_sys::Array::new(),
+            )
+            .await
+            .map_err(js_err)?;
+        }
+        // Record the schema version (if none is recorded yet) so future wasm
+        // schema changes can migrate versioned, as the native backend does,
+        // instead of accreting one unconditional ALTER per column.
+        let (version_sql, version_params) =
+            sql_builders::init_schema_version(sql_builders::SCHEMA_VERSION);
+        bridge_exec(&handle, &version_sql, params_to_js(&version_params))
             .await
             .map_err(js_err)?;
         Ok(Self {
@@ -267,6 +312,28 @@ fn index_write_op_sql(op: &IndexWriteOp) -> (String, Vec<SqlParam<'_>>) {
             sql_builders::lsi_insert_sql(table_name, index_name),
             sql_builders::lsi_insert_params(pk, sk, base_pk, base_sk, item_json),
         ),
+        IndexWriteOp::DeleteVector {
+            table_name,
+            index_name,
+            table_pk,
+            table_sk,
+        } => sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk),
+        IndexWriteOp::InsertVector {
+            table_name,
+            index_name,
+            row,
+        } => (
+            sql_builders::vector_insert_sql(table_name, index_name),
+            sql_builders::vector_insert_params(
+                &row.table_pk,
+                &row.table_sk,
+                &row.hash_value,
+                &row.vector_json,
+                &row.filter_json,
+                &row.item_json,
+                row.entry_bytes,
+            ),
+        ),
     }
 }
 
@@ -373,6 +440,7 @@ fn row_to_metadata(row: &js_sys::Array) -> TableMetadata {
         deletion_protection_enabled: col_i64(row, 16) != 0,
         on_demand_throughput: col_text(row, 17),
         table_id: col_text(row, 18),
+        vector_index_definitions: col_text(row, 19),
     }
 }
 
@@ -474,6 +542,16 @@ impl StorageBackend for WasmBridgeBackend {
     ) -> Result<(), BackendError> {
         let (sql, params) =
             sql_builders::update_table_metadata(table_name, attribute_definitions, gsi_definitions);
+        self.exec(&sql, params).await
+    }
+
+    async fn update_vector_index_definitions(
+        &self,
+        table_name: &str,
+        vector_index_definitions: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let (sql, params) =
+            sql_builders::update_vector_index_definitions(table_name, vector_index_definitions);
         self.exec(&sql, params).await
     }
 
@@ -607,6 +685,111 @@ impl StorageBackend for WasmBridgeBackend {
     async fn drop_lsi_table(&self, table_name: &str, index_name: &str) -> Result<(), BackendError> {
         let (sql, params) = sql_builders::drop_lsi_table(table_name, index_name);
         self.exec(&sql, params).await
+    }
+
+    async fn create_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::create_vector_table(table_name, index_name);
+        self.exec(&sql, params).await
+    }
+
+    async fn drop_vector_table(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::drop_vector_table(table_name, index_name);
+        self.exec(&sql, params).await
+    }
+
+    async fn insert_vector_items(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        rows: &[VectorItemRow],
+    ) -> Result<(), BackendError> {
+        // Mirrors insert_gsi_items: build the SQL once, assemble every row's
+        // parameters, and make a single bridge crossing. Atomicity comes from
+        // the caller's open transaction.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let sql = sql_builders::vector_insert_sql(table_name, index_name);
+        let param_rows = rows
+            .iter()
+            .map(|row| {
+                sql_builders::vector_insert_params(
+                    &row.table_pk,
+                    &row.table_sk,
+                    &row.hash_value,
+                    &row.vector_json,
+                    &row.filter_json,
+                    &row.item_json,
+                    row.entry_bytes,
+                )
+            })
+            .collect();
+        self.exec_batch(&sql, param_rows).await
+    }
+
+    async fn delete_vector_item(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        table_pk: &str,
+        table_sk: &str,
+    ) -> Result<(), BackendError> {
+        let (sql, params) =
+            sql_builders::delete_vector_item(table_name, index_name, table_pk, table_sk);
+        self.exec(&sql, params).await
+    }
+
+    async fn query_vector_candidates(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        hash_value: Option<&str>,
+    ) -> Result<Vec<VectorCandidateRow>, BackendError> {
+        let (sql, p) = sql_builders::query_vector_candidates(table_name, index_name, hash_value);
+        let rows = self.query(&sql, p).await?;
+        let mut out = Vec::with_capacity(rows.length() as usize);
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            out.push(VectorCandidateRow {
+                table_pk: col_text(&row, 0).unwrap_or_default(),
+                table_sk: col_text(&row, 1).unwrap_or_default(),
+                vector_json: col_text(&row, 2).unwrap_or_default(),
+                filter_json: col_text(&row, 3).unwrap_or_default(),
+                entry_bytes: col_i64(&row, 4),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn vector_items_for_keys(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, BackendError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, p) = sql_builders::vector_items_for_keys(table_name, index_name, keys);
+        let rows = self.query(&sql, p).await?;
+        let mut out = Vec::with_capacity(rows.length() as usize);
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            out.push((
+                col_text(&row, 0).unwrap_or_default(),
+                col_text(&row, 1).unwrap_or_default(),
+                col_text(&row, 2).unwrap_or_default(),
+            ));
+        }
+        Ok(out)
     }
 
     // --- GSI items -------------------------------------------------------

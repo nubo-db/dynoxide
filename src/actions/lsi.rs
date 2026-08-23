@@ -38,6 +38,9 @@ pub fn lsi_to_def(lsi: &LocalSecondaryIndex) -> Result<LsiDef> {
 
 /// Parse LSI definitions from table metadata.
 pub fn parse_lsi_defs(meta: &TableMetadata) -> Result<Vec<LsiDef>> {
+    if meta.lsi_definitions.is_some() {
+        crate::bench_counters::record(&crate::bench_counters::INDEX_DEFS_PARSES);
+    }
     let lsis: Vec<LocalSecondaryIndex> = match meta.lsi_definitions.as_ref() {
         Some(json) => serde_json::from_str(json)
             .map_err(|e| DynoxideError::InternalServerError(format!("Bad LSI JSON: {e}")))?,
@@ -75,16 +78,25 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
     item: &Item,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let lsi_defs = parse_lsi_defs(meta)?;
+    maintain_lsis_after_write_with_defs(storage, &lsi_defs, target, item).await
+}
+
+/// Defs-accepting form of [`maintain_lsis_after_write`], for callers that
+/// parse the definitions once per batch (BatchWriteItem).
+pub async fn maintain_lsis_after_write_with_defs<S: StorageBackend>(
+    storage: &S,
+    lsi_defs: &[LsiDef],
+    target: &IndexWrite<'_>,
+    item: &Item,
+) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(target.capacity_mode);
     let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
-    for lsi in &lsi_defs {
+    for lsi in lsi_defs {
         // First, remove any existing LSI entry for this base table key
         ops.push(IndexWriteOp::DeleteLsi {
             table_name: target.table_name.to_string(),
@@ -116,7 +128,7 @@ pub async fn maintain_lsis_after_write<S: StorageBackend>(
 
         if want_capacity
             && let Some(units) = super::index_capacity::index_write_units_for(
-                old_item,
+                target.old_item,
                 entry,
                 lsi,
                 target.pk_attr,
@@ -140,15 +152,23 @@ pub async fn maintain_lsis_after_delete<S: StorageBackend>(
     storage: &S,
     meta: &TableMetadata,
     target: &IndexWrite<'_>,
-    old_item: Option<&Item>,
-    capacity_mode: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let want_capacity = crate::types::capacity_wanted(capacity_mode);
     let lsi_defs = parse_lsi_defs(meta)?;
+    maintain_lsis_after_delete_with_defs(storage, &lsi_defs, target).await
+}
+
+/// Defs-accepting form of [`maintain_lsis_after_delete`], for callers that
+/// parse the definitions once per batch (BatchWriteItem).
+pub async fn maintain_lsis_after_delete_with_defs<S: StorageBackend>(
+    storage: &S,
+    lsi_defs: &[LsiDef],
+    target: &IndexWrite<'_>,
+) -> Result<HashMap<String, f64>> {
+    let want_capacity = crate::types::capacity_wanted(target.capacity_mode);
     let mut lsi_units: HashMap<String, f64> = HashMap::new();
     let mut ops: Vec<IndexWriteOp> = Vec::new();
 
-    for lsi in &lsi_defs {
+    for lsi in lsi_defs {
         ops.push(IndexWriteOp::DeleteLsi {
             table_name: target.table_name.to_string(),
             index_name: lsi.index_name.clone(),
@@ -158,7 +178,7 @@ pub async fn maintain_lsis_after_delete<S: StorageBackend>(
 
         if want_capacity
             && let Some(units) = super::index_capacity::index_write_units(
-                old_item,
+                target.old_item,
                 None,
                 lsi,
                 target.pk_attr,

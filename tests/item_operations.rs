@@ -196,7 +196,7 @@ fn test_put_item_return_values_all_old() {
     let db = make_db();
     create_hash_only_table(&db, "Items");
 
-    // First put — no old item
+    // First put: no old item
     let resp = db
         .put_item(PutItemRequest {
             table_name: "Items".to_string(),
@@ -213,7 +213,7 @@ fn test_put_item_return_values_all_old() {
         .unwrap();
     assert!(resp.attributes.is_none());
 
-    // Second put — should get old item back
+    // Second put: should get old item back
     let resp = db
         .put_item(PutItemRequest {
             table_name: "Items".to_string(),

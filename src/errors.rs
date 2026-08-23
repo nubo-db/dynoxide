@@ -74,7 +74,7 @@ pub enum DynoxideError {
     #[error("{0}")]
     DuplicateItemException(String),
 
-    /// Throughput exceeded (stored but not enforced — included for API fidelity).
+    /// Throughput exceeded (stored but not enforced: included for API fidelity).
     #[error("{0}")]
     ProvisionedThroughputExceededException(String),
 

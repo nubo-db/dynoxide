@@ -1,3 +1,4 @@
+use crate::actions::vector_lifecycle::VectorIndexLifecycle;
 use crate::actions::{TableDescription, build_table_description};
 use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
@@ -62,6 +63,7 @@ pub struct DeleteTableResponse {
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: DeleteTableRequest,
+    lifecycle: &VectorIndexLifecycle,
 ) -> Result<DeleteTableResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
@@ -86,6 +88,43 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // A table cannot be dropped underneath an index that is still being
+    // created, and it refuses for as long as the index is creating rather than
+    // for a fixed number of calls: the documented readiness pattern polls
+    // DescribeTable an unbounded number of times. Sits after the deletion
+    // protection check so a protected table still answers its own message
+    // first. Only indexes the table still defines are considered, so a stale
+    // entry for one that has gone cannot refuse a delete.
+    //
+    // Definitions that will not parse read as no indexes, the way every other
+    // reader of this column treats them: build_table_description reports none,
+    // and the drop loop below has always skipped them. A table whose metadata
+    // has become unreadable should stay deletable rather than be pinned by a
+    // guard nothing can now satisfy.
+    let vector_indexes: Vec<crate::types::VectorIndex> = meta
+        .vector_index_definitions
+        .as_ref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+    let vector_phases = lifecycle.phases_of(
+        storage,
+        &request.table_name,
+        vector_indexes.iter().map(|v| v.index_name.as_str()),
+    );
+    if vector_phases.any_creating() {
+        return Err(DynoxideError::ResourceInUseException(
+            "Attempt to change a resource which is still in use: Cannot delete table while \
+             indexes are being created, updated, or deleted."
+                .to_string(),
+        ));
+    }
+
+    // Forget the entries here rather than after the drops below: the guard has
+    // just proved every one of them has settled, so none can affect an answer,
+    // and any of the drops can fail and return early. Left until the end, a
+    // half-finished delete would leak an entry per attempt.
+    lifecycle.forget_table(&request.table_name);
+
     // Drop GSI tables first
     if let Some(ref gsi_json) = meta.gsi_definitions {
         if let Ok(gsis) = serde_json::from_str::<Vec<GlobalSecondaryIndex>>(gsi_json) {
@@ -108,14 +147,23 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Drop vector index shadow tables, from the definitions the guard above
+    // already parsed.
+    for vix in &vector_indexes {
+        storage
+            .drop_vector_table(&request.table_name, &vix.index_name)
+            .await?;
+    }
+
     // Drop data table
     storage.drop_data_table(&request.table_name).await?;
 
     // Delete metadata
     storage.delete_table_metadata(&request.table_name).await?;
 
-    // Build response with DELETING status
-    let mut desc = build_table_description(&meta, Some(0), Some(0));
+    // Build response with DELETING status. The guard above ruled out a creating
+    // index, so every phase in the set reports ACTIVE.
+    let mut desc = build_table_description(&meta, Some(0), Some(0), &vector_phases);
     desc.table_status = "DELETING".to_string();
 
     Ok(DeleteTableResponse {

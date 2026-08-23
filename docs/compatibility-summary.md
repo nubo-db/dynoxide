@@ -53,6 +53,7 @@ the ones worth knowing.
 | **Tags** | TagResource, UntagResource, ListTagsOfResource | Full | Not supported |
 | **Streams** | ListStreams, DescribeStream, GetShardIterator, GetRecords | Full | Full (single-shard) |
 | **PartiQL** | ExecuteStatement, BatchExecuteStatement, ExecuteTransaction | Full | Partial - wrong error code for duplicate INSERT |
+| **Vector search** | SearchVectors | Full (native and wasm) | Not supported |
 
 ### Not Implemented
 
@@ -65,7 +66,7 @@ the ones worth knowing.
 | **Capacity** | DescribeReservedCapacity, DescribeLimits, etc. (5 ops) | Not applicable |
 | **Other** | ContributorInsights, ResourcePolicy, TableReplicas, DescribeEndpoints (9 ops) | Not applicable |
 
-**27 of 27 applicable DynamoDB operations are implemented.** The remaining 39 operations are cloud-infrastructure features with no meaningful local equivalent.
+**28 of 28 applicable DynamoDB operations are implemented**, including `SearchVectors` and the vector index surface on `CreateTable`, `UpdateTable` and `DescribeTable`. The remaining 39 operations are cloud-infrastructure features with no meaningful local equivalent.
 
 ---
 
@@ -101,6 +102,171 @@ the ones worth knowing.
 | **LSI Query routing** | Supported |
 | **LSI Scan routing** | Supported |
 | **Per-LSI ConsumedCapacity (INDEXES mode)** | Supported |
+| **Vector index on CreateTable** | Supported |
+| **Vector index add/remove via UpdateTable** | Supported (with backfill) |
+| **Vector index projection ALL / KEYS_ONLY / INCLUDE** | Supported |
+| **SearchSchema HASH scoping and INLINE_FILTER** | Supported |
+| **`SearchVectors` (COSINE, EUCLIDEAN, DOT_PRODUCT)** | Supported |
+| **Per-vector-index ConsumedCapacity (INDEXES mode)** | Supported |
+
+### Four things about vector search that will never match AWS
+
+Everything else on this page is either the same as DynamoDB or a bug waiting to
+be fixed. These four are neither. They come from how the two systems are built,
+so no amount of work here will close them, and a conformance test for them would
+have nothing to assert.
+
+Each one can make a test pass locally and fail against AWS.
+
+**1. Dynoxide finds the genuinely nearest vectors. AWS finds roughly the nearest
+ones.**
+
+Dynoxide compares your query against every vector in the index and returns the
+closest. AWS builds an approximate index that skips most of those comparisons so
+it stays fast on very large tables, and skipping comparisons means it can miss a
+close match that was really there.
+
+For the same data and the same query, AWS can return a slightly different set of
+results from dynoxide. Dynoxide will not miss anything. AWS occasionally will.
+
+*What to do:* do not write a test that pins the exact list of results and expect
+it to pass against AWS. Assert the thing you actually care about, such as "the
+item I put in comes back" or "I got five results". Also worth knowing: because
+dynoxide checks every vector, a search costs time in proportion to how many
+there are, so a local table with millions of vectors will be slow in a way AWS
+would not be.
+
+**2. When two results score identically, dynoxide always orders them the same
+way. AWS does not.**
+
+Dynoxide breaks a tie by primary key, so the same query over the same data gives
+the same order every time. AWS makes no such promise. Three identical calls
+against real DynamoDB returned three different orderings.
+
+*What to do:* never depend on the order of results that tie. If you need a
+stable order, sort them yourself after the search. A test that asserts "these
+two came back in this order" will pass here and is not reliable against AWS.
+
+**3. The index creation lifecycle has the same shape here, and nothing like the
+same length.**
+
+The phases, the statuses and the refusals all match. The clock does not.
+Dynoxide runs the whole thing in about half a minute. AWS takes minutes, and how
+many depends on how much data it has to index: a 25-item table took roughly
+seventeen minutes. There is no single duration to copy, because AWS does not
+have one.
+
+*What to do:* never write `sleep(30)` and assume the index is ready. Poll for
+readiness by retrying the search and treating the refusal as "not yet". That
+works against both.
+
+**4. `VectorSearchRequestBytes` is dynoxide's own number, not AWS's.**
+
+AWS bills a search on whatever data it happened to read, and it does not
+reproduce its own figure between identical calls: five identical searches over
+one unchanged index reported 14214, 13903, 14214, 14214 and 14518. Dynoxide
+reports a stable figure sized on the entries it scanned, using the same unit AWS
+uses.
+
+*What to do:* use it to compare one search against another within dynoxide,
+where it is meaningful. Do not compare it to a figure from AWS, and do not
+assert an exact value in a test that also runs against AWS. The write-side
+figure, `VectorWriteRequestBytes`, is captured from real DynamoDB and does match.
+
+A vector index added to a live table walks a creation lifecycle, the same shape
+AWS walks but nothing like the same length. A vector index created as part of
+`CreateTable` reports `ACTIVE` at once, which is what AWS does too.
+
+An index added through `UpdateTable` passes through four phases:
+
+| Phase | `TableStatus` | `IndexStatus` | `Backfilling` | `SearchVectors` | `Delete` of the index |
+|---|---|---|---|---|---|
+| Allocating | `UPDATING` | `CREATING` | `false` | `Cannot search backfilling vector index: <name>` | refused |
+| Backfilling | `ACTIVE` | `CREATING` | `true` | the same refusal | accepted |
+| Active, not searchable | `ACTIVE` | `ACTIVE` | absent | the same refusal | accepted |
+| Searchable | `ACTIVE` | `ACTIVE` | absent | served | accepted |
+
+The base table is `ACTIVE` for all but the first phase, and that phase is the
+short one, so a table waiter looks like the right gate for a search long before
+it is one.
+
+Cancelling a create is not available immediately. While the index is
+allocating, an `UpdateTable` that deletes it answers `ResourceInUseException`
+with `Attempt to change a resource which is still in use: Index creation is in
+resource allocation phase. Retry deletion during backfilling phase or when the
+index is active.` The answer names the phase to wait for.
+
+The table cannot be dropped while the index is creating, meaning for both of
+those first two phases. `DeleteTable` answers `ResourceInUseException` with
+`Attempt to change a resource which is still in use: Cannot delete table while
+indexes are being created, updated, or deleted.`
+
+The one online index limit is per table rather than per call, so a second index
+cannot start creating while the first still is, whether the two arrive in one
+`UpdateTable` or in separate ones: both answer `Subscriber limit exceeded: Only
+1 online index can be created or deleted simultaneously per table`. The action
+that does get through is a delete of the creating index itself, which is how you
+cancel one.
+
+When the index reaches `ACTIVE` the `Backfilling` field is not set to `false`,
+it disappears. A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling`
+is `false`" therefore never comes true, here or on AWS.
+
+The sharper trap is the third row: `ACTIVE` arrives before the index will
+answer. On AWS it arrives early by minutes, an index added to a 25-item table
+taking roughly a quarter of an hour after `ACTIVE` before it stopped refusing
+searches. Dynoxide reproduces the gap so a readiness check that polls for
+`ACTIVE` and searches immediately fails here the way it fails against the real
+thing. Search in a retry loop and treat the refusal as "not yet" rather than
+trusting the status.
+
+**The durations are not AWS's.** Dynoxide's windows are tens of seconds, chosen
+to be observable rather than to match anything; AWS's are minutes, and vary with
+the table. The shape and the ordering are what carry over, never the magnitude.
+The backfill itself is synchronous here, so the data behind the index is
+complete before the window opens; the wait reproduces the lifecycle, not the
+work.
+
+The behaviour above, and where AWS's own documentation contradicts it, is
+written up in [what the DynamoDB vector search docs get
+wrong](https://martinhicks.dev/articles/dynamodb-vector-search-docs-get-wrong).
+
+Adding a GSI is still compressed: the new index is `ACTIVE` and queryable the
+moment `UpdateTable` returns, and `Backfilling` is never reported for it. The
+errors that only arise while a GSI is still filling are unreachable here for
+that reason.
+
+Vector search is exact brute-force KNN rather than an approximate index, which
+is difference 1 above. At emulator and embedded scale that reaches a correct
+answer faster than building an ANN structure would, and it removes the recall
+question entirely: the top-k is the true top-k. It also means a search costs
+time linear in the number of indexed entries, so a local table holding millions
+of vectors is outside what this is built for.
+
+Two scoring details worth knowing. Vectors are stored and compared at `f32`,
+so a value written at full `f64` precision reads back through the index rounded,
+while the base table keeps exactly what was written. And where several entries
+tie on score, Dynoxide breaks the tie deterministically, which is difference 2
+above.
+
+`SearchVectors` reports `VectorSearchRequestBytes`, and that figure is a
+divergence by construction. Real DynamoDB bills a search on the data it read and
+does not reproduce its own number between identical calls; five identical
+searches over one unchanged index reported 14214, 13903, 14214, 14214 and 14518.
+Dynoxide reports a deterministic figure sized on the entries the search scanned,
+using the same measure a write is captured against. The unit is therefore the
+captured one, but the quantity is still Dynoxide's own and not a figure to
+compare against AWS. Each entry's size is computed once when it is written and
+stored with it, so asking a search for capacity costs nothing extra. The write
+axis is the captured one: a write's
+`VectorWriteRequestBytes` is `4 * dimensions` plus the vector attribute's name
+plus the item size of the rest of the projected entry, held to a 1KB floor, and
+matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.
+
+A vector index is not reachable through PartiQL, matching AWS: naming one in a
+`"table"."index"` qualifier answers `Scan operation not supported on this index
+type`. PartiQL reads of the base table return the vector attribute like any
+other attribute.
 
 Index write capacity is charged against the change to what an index stores, as
 DynamoDB does, rather than against the item the write leaves behind. A write that

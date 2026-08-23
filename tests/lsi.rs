@@ -234,7 +234,7 @@ fn test_query_lsi_returns_correct_sort_order() {
     put_order(&db, "user1", "2024-01-02", "A-status", "200");
     put_order(&db, "user1", "2024-01-03", "B-status", "300");
 
-    // Query all user1 items via LSI — should be sorted by Status
+    // Query all user1 items via LSI: should be sorted by Status
     let req: serde_json::Value = serde_json::json!({
         "TableName": "Orders",
         "IndexName": "StatusIndex",
@@ -381,7 +381,7 @@ fn test_sparse_lsi_item_without_lsi_sk_not_in_index() {
     });
     db.put_item(serde_json::from_value(req).unwrap()).unwrap();
 
-    // Query LSI — should return nothing
+    // Query LSI: should return nothing
     let query_req: serde_json::Value = serde_json::json!({
         "TableName": "Orders",
         "IndexName": "StatusIndex",

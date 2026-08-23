@@ -64,6 +64,6 @@ fn arc_clock_handles_share_state() {
 #[test]
 fn database_default_uses_system_clock() {
     // Smoke test: Database::memory() boots with the SystemClock default.
-    // No assertion on the exact time — just that nothing panics on the path.
+    // No assertion on the exact time: just that nothing panics on the path.
     let _db = Database::memory().expect("Database::memory should succeed");
 }

@@ -322,7 +322,7 @@ fn test_batch_write_keyless_put_rejected_with_400() {
     // rejects it with a 400 ValidationException. The duplicate-detection pass
     // previously reached extract_key_strings before validating keys, surfacing
     // a 500 InternalServerError. Mirrors the conformance assertion
-    // tests/tier1/batchWriteItem/validation.test.ts —
+    // tests/tier1/batchWriteItem/validation.test.ts, which asserts it
     // "rejects a key-less item with a 400 ValidationException, not a 500".
     let db = setup_db();
     let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
@@ -556,7 +556,7 @@ fn test_batch_write_exceeds_16mb_aggregate() {
     }))
     .unwrap();
 
-    // Should succeed — 25 * 300KB ≈ 7.5MB, under 16MB
+    // Should succeed - 25 * 300KB ≈ 7.5MB, under 16MB
     db.batch_write_item(req).unwrap();
 }
 

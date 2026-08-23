@@ -192,7 +192,7 @@ fn restore_from_replaces_in_memory_db() {
     put_item(&db, "Original", "item#3");
     assert_eq!(db.table_count().unwrap(), 2);
 
-    // Restore from snapshot — should revert to original state
+    // Restore from snapshot: should revert to original state
     db.restore_from(snapshot_path.to_str().unwrap()).unwrap();
 
     assert_eq!(db.table_count().unwrap(), 1);
@@ -240,7 +240,7 @@ fn restore_from_invalidates_metadata_cache() {
     put_item(&db, "Table2", "item#1");
     put_item(&db, "Table3", "item#1");
 
-    // Restore — Table2 and Table3 no longer exist
+    // Restore - Table2 and Table3 no longer exist
     db.restore_from(snapshot_path.to_str().unwrap()).unwrap();
 
     // Operations on Table2 should fail (table doesn't exist)

@@ -4291,7 +4291,8 @@ fn the_table_cannot_be_deleted_while_its_index_is_creating() {
     );
     assert_eq!(
         err.to_string(),
-        "Cannot delete table while indexes are being created, updated, or deleted."
+        "Attempt to change a resource which is still in use: Cannot delete table while \
+         indexes are being created, updated, or deleted."
     );
 }
 
@@ -4313,7 +4314,8 @@ fn the_refusal_survives_any_number_of_describes() {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Cannot delete table while indexes are being created, updated, or deleted."
+            "Attempt to change a resource which is still in use: Cannot delete table while \
+         indexes are being created, updated, or deleted."
         );
     }
 }
@@ -4458,6 +4460,77 @@ fn deleting_an_index_that_has_finished_creating_still_works() {
 
     delete_vector_index(&db, "VecSettled", "vix").unwrap();
     assert!(describe(&db, "VecSettled").table.vector_indexes.is_none());
+}
+
+/// The limit is per table, not per call: a second index cannot start creating
+/// while the first still is, however the two calls are split. Captured against
+/// eu-west-2 on 2026-08-23, which is what settled this; before that the limit
+/// only ever counted a single request's actions.
+#[test]
+fn a_second_create_in_its_own_call_answers_the_one_online_action_limit() {
+    let clock = ManualClock::new(ARMED);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecSecond");
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "VecSecond",
+        "VectorIndexUpdates": [{"Create": vix_json("vix2")}]
+    }))
+    .unwrap();
+    let err = db.update_table(req).unwrap_err();
+    assert!(
+        matches!(err, dynoxide::DynoxideError::LimitExceededException(_)),
+        "expected a LimitExceededException, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table"
+    );
+
+    // Once the first has settled the second is accepted, so the limit tracks
+    // the window rather than latching.
+    advance_past_the_window(&clock);
+    add_vector_index(&db, "VecSecond", "vix2");
+    assert_eq!(
+        describe(&db, "VecSecond")
+            .table
+            .vector_indexes
+            .as_ref()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// A delete is an online index action too, so it is refused for the same
+/// reason unless it is the creating index being cancelled.
+#[test]
+fn deleting_a_different_index_while_one_creates_answers_the_limit() {
+    let clock = ManualClock::new(ARMED);
+    let db = db_with_manual_clock(&clock);
+    db.create_table(parse(base_request("VecBoth", json!([vix_json("settled")]))))
+        .unwrap();
+    add_vector_index(&db, "VecBoth", "creating");
+
+    let err = delete_vector_index(&db, "VecBoth", "settled").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+         simultaneously per table"
+    );
+
+    // Cancelling the creating index itself is the action that gets through.
+    delete_vector_index(&db, "VecBoth", "creating").unwrap();
+    assert_eq!(
+        describe(&db, "VecBoth")
+            .table
+            .vector_indexes
+            .as_ref()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

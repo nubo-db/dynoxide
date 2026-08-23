@@ -113,7 +113,9 @@ pub async fn execute<S: StorageBackend>(
     );
     if vector_phases.any_creating() {
         return Err(DynoxideError::ResourceInUseException(
-            "Cannot delete table while indexes are being created, updated, or deleted.".to_string(),
+            "Attempt to change a resource which is still in use: Cannot delete table while \
+             indexes are being created, updated, or deleted."
+                .to_string(),
         ));
     }
 

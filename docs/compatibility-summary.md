@@ -123,10 +123,16 @@ An index added through `UpdateTable` passes through three phases:
 
 The base table reports `ACTIVE` throughout, so a table waiter is the wrong gate
 for a search. The table also cannot be dropped while the index is creating:
-`DeleteTable` answers `ResourceInUseException` with `Cannot delete table while
-indexes are being created, updated, or deleted.` for as long as the index is in
-the first phase. An `UpdateTable` that deletes a still-creating index is
-accepted, which is how you cancel one.
+`DeleteTable` answers `ResourceInUseException` with `Attempt to change a
+resource which is still in use: Cannot delete table while indexes are being
+created, updated, or deleted.` for as long as the index is in the first phase.
+
+The one online index limit is per table rather than per call, so a second index
+cannot start creating while the first still is, whether the two arrive in one
+`UpdateTable` or in separate ones: both answer `Subscriber limit exceeded: Only
+1 online index can be created or deleted simultaneously per table`. The action
+that does get through is a delete of the creating index itself, which is how you
+cancel one.
 
 When the index reaches `ACTIVE` the `Backfilling` field is not set to `false`,
 it disappears. A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling`

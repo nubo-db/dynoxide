@@ -302,6 +302,11 @@ pub struct UpdateTableResponse {
     pub table_description: TableDescription,
 }
 
+/// The online-index limit's message, shared by the per-call and per-table arms
+/// because DynamoDB answers both with the same bytes.
+const ONE_ONLINE_INDEX: &str = "Subscriber limit exceeded: Only 1 online index can be created or deleted \
+     simultaneously per table";
+
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     mut request: UpdateTableRequest,
@@ -639,11 +644,34 @@ pub async fn execute<S: StorageBackend>(
         // its own count here.
         if updates.len() > 1 {
             return Err(DynoxideError::LimitExceededException(
-                "Subscriber limit exceeded: Only 1 online index can be created or \
-                 deleted simultaneously per table"
-                    .to_string(),
+                ONE_ONLINE_INDEX.to_string(),
             ));
         }
+        // The limit is per table, not per call. A second online index action is
+        // refused while one is still creating even when it arrives in its own
+        // UpdateTable, carrying the same message (captured eu-west-2,
+        // 2026-08-23: a create of a second index and a delete of a third both
+        // answered this while the first was still CREATING). The one action
+        // that gets through is a delete of the creating index itself, which is
+        // how a create is cancelled.
+        //
+        // Only indexes the table still defines are consulted, so a stale entry
+        // for one that has gone cannot wedge every later update.
+        let creating = lifecycle.phases_of(
+            storage,
+            &request.table_name,
+            current_vixs.iter().map(|v| v.index_name.as_str()),
+        );
+        let cancels_the_creating_index = updates
+            .first()
+            .and_then(|u| u.delete.as_ref())
+            .is_some_and(|d| creating.get(&d.index_name).is_creating());
+        if !updates.is_empty() && creating.any_creating() && !cancels_the_creating_index {
+            return Err(DynoxideError::LimitExceededException(
+                ONE_ONLINE_INDEX.to_string(),
+            ));
+        }
+
         for update in updates {
             if let Some(ref create) = update.create {
                 // Vector indexes only exist on PAY_PER_REQUEST tables; the

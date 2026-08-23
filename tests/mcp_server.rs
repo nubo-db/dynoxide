@@ -1309,8 +1309,13 @@ fn vector_index_updates_work_in_the_shape_the_tool_documents() {
     assert_eq!(vixs.len(), 1, "create through the documented shape");
     assert_eq!(vixs[0]["index_name"], "vix");
 
-    // Remove it in the documented shape.
-    call_tool(
+    // Remove it in the documented shape. The index is still allocating, so the
+    // engine answers the phase refusal rather than removing it, and that answer
+    // is what proves the shape parsed: a delete that carried no recognised
+    // action is refused for having no action at all, naming neither the table
+    // nor the index. Removal itself is pinned in the wire tests, where the
+    // clock can be driven past the phase instead of waited out.
+    let resp = call_tool(
         &mut child,
         4,
         "update_table",
@@ -1319,17 +1324,12 @@ fn vector_index_updates_work_in_the_shape_the_tool_documents() {
             "vector_index_updates": [{"delete": {"index_name": "vix"}}]
         }),
     );
-    let resp = call_tool(
-        &mut child,
-        5,
-        "describe_table",
-        json!({"table_name": "McpVecUpd"}),
+    assert!(is_tool_error(&resp), "{resp}");
+    let body = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        body.contains("Table: McpVecUpd Index: vix"),
+        "the delete shape should have parsed and reached the phase check, got {body}"
     );
-    let vixs = tool_content(&resp)["vector_indexes"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(vixs.is_empty(), "delete through the documented shape");
 }
 
 #[test]
@@ -1384,10 +1384,17 @@ fn an_index_added_through_mcp_reports_the_wire_s_creation_lifecycle() {
         json!({"table_name": "McpVecLife"}),
     );
     let described = tool_content(&resp);
-    assert_eq!(described["status"], "ACTIVE");
     let vixs = described["vector_indexes"].as_array().cloned().unwrap();
     assert_eq!(vixs[0]["index_status"], "CREATING");
-    assert_eq!(vixs[0]["backfilling"], json!(true));
+    // Present, either way round: which side of the allocation boundary this
+    // lands on is a real clock's business, and both halves are pinned against a
+    // driven one in the wire tests. The field being there at all is the parity
+    // claim, since the flattened view used to omit it entirely.
+    assert!(
+        vixs[0]["backfilling"].is_boolean(),
+        "expected Backfilling reported while CREATING, got {}",
+        described
+    );
 
     let resp = call_tool(
         &mut child,
@@ -1407,23 +1414,22 @@ fn an_index_added_through_mcp_reports_the_wire_s_creation_lifecycle() {
         "expected the wire's own refusal, got {body}"
     );
 
-    // Cancelling it clears the window, exactly as it does on the wire.
-    call_tool(
-        &mut child,
-        6,
-        "update_table",
-        json!({
-            "table_name": "McpVecLife",
-            "vector_index_updates": [{"delete": {"index_name": "vix"}}]
-        }),
-    );
+    // And the table cannot be dropped underneath it, with the wire's own
+    // envelope. Cancelling and the far side of the window need the clock
+    // driven, so they stay with the wire tests rather than being waited out
+    // here.
     let resp = call_tool(
         &mut child,
-        7,
+        6,
         "delete_table",
         json!({"table_name": "McpVecLife"}),
     );
-    assert!(!is_tool_error(&resp), "{resp}");
+    assert!(is_tool_error(&resp), "{resp}");
+    let body = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        body.contains("Cannot delete table while indexes are being created, updated, or deleted."),
+        "expected the wire's own refusal, got {body}"
+    );
 }
 
 #[test]

@@ -662,14 +662,28 @@ pub async fn execute<S: StorageBackend>(
             &request.table_name,
             current_vixs.iter().map(|v| v.index_name.as_str()),
         );
-        let cancels_the_creating_index = updates
-            .first()
-            .and_then(|u| u.delete.as_ref())
-            .is_some_and(|d| creating.get(&d.index_name).is_creating());
+        let targeted = updates.first().and_then(|u| u.delete.as_ref());
+        let cancels_the_creating_index =
+            targeted.is_some_and(|d| creating.get(&d.index_name).is_creating());
         if !updates.is_empty() && creating.any_creating() && !cancels_the_creating_index {
             return Err(DynoxideError::LimitExceededException(
                 ONE_ONLINE_INDEX.to_string(),
             ));
+        }
+
+        // Cancelling is only available once the index is past allocating.
+        // DynamoDB refuses the delete before that and says which phase to
+        // retry in, so the wait is discoverable from the answer rather than
+        // something a caller has to know (captured eu-west-2, 2026-08-23).
+        if let Some(delete) = targeted {
+            if !creating.get(&delete.index_name).accepts_delete() {
+                return Err(DynoxideError::ResourceInUseException(format!(
+                    "Attempt to change a resource which is still in use: Index creation is \
+                     in resource allocation phase. Retry deletion during backfilling phase \
+                     or when the index is active. Table: {} Index: {}",
+                    request.table_name, delete.index_name
+                )));
+            }
         }
 
         for update in updates {
@@ -1092,9 +1106,12 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // A vector index create reports the table UPDATING (captured eu-west-2,
-    // 2026-08-11). The index's own CREATING comes from the phases above, the
-    // same derivation every later DescribeTable reads, so this response and the
-    // next description cannot disagree.
+    // 2026-08-11). The description above already says so, because a just-armed
+    // index is allocating and that is what holds the table there; this states
+    // it outright so the response does not depend on how the allocation window
+    // is tuned. Everything else in the answer, the index's own CREATING
+    // included, comes from the phases, which every later DescribeTable reads
+    // too, so this response and the next description cannot disagree.
     if let Some(ref updates) = request.vector_index_updates {
         if updates.iter().any(|u| u.create.is_some()) {
             desc.table_status = "UPDATING".to_string();

@@ -29,6 +29,16 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// How long an index added through `UpdateTable` spends allocating resources
+/// before it starts backfilling.
+///
+/// `CREATING` is two phases on AWS, not one. For the first of them the table
+/// reports `UPDATING`, `Backfilling` reports `false`, and a `Delete` of the
+/// index is refused outright; DynamoDB says so in as many words, telling you to
+/// retry during backfilling. Measured at roughly thirty seconds in eu-west-2 on
+/// 2026-08-23; compressed here for the same reason the other windows are.
+pub const BACKFILLING_AFTER_SECS: f64 = 5.0;
+
 /// How long an index added through `UpdateTable` reports `CREATING` before it
 /// reports `ACTIVE`.
 ///
@@ -51,8 +61,14 @@ pub const SEARCHABLE_AFTER_SECS: f64 = 30.0;
 /// Where an index sits in the creation lifecycle at one instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VectorIndexPhase {
-    /// Reports `CREATING` with `Backfilling` present; searches refuse.
-    Creating,
+    /// Allocating resources. The table reports `UPDATING`, the index
+    /// `CREATING` with `Backfilling` false, searches refuse, and the index
+    /// cannot be dropped yet.
+    Allocating,
+    /// Backfilling. The table is back to `ACTIVE`, the index still reports
+    /// `CREATING` with `Backfilling` true, searches refuse, and the index can
+    /// now be dropped, which is how a create is cancelled.
+    Backfilling,
     /// Reports `ACTIVE` with `Backfilling` absent; searches still refuse.
     ActiveNotSearchable,
     /// Reports `ACTIVE` with `Backfilling` absent; searches are served.
@@ -63,17 +79,17 @@ impl VectorIndexPhase {
     /// The `IndexStatus` string this phase reports.
     pub(crate) fn index_status(self) -> &'static str {
         match self {
-            Self::Creating => "CREATING",
+            Self::Allocating | Self::Backfilling => "CREATING",
             Self::ActiveNotSearchable | Self::Searchable => "ACTIVE",
         }
     }
 
     /// The `Backfilling` field this phase reports, `None` meaning the field is
-    /// absent rather than `false`. Real DynamoDB reports `false` briefly before
-    /// `true` while creating; only presence is reproduced here.
+    /// absent rather than `false`.
     pub(crate) fn backfilling(self) -> Option<bool> {
         match self {
-            Self::Creating => Some(true),
+            Self::Allocating => Some(false),
+            Self::Backfilling => Some(true),
             Self::ActiveNotSearchable | Self::Searchable => None,
         }
     }
@@ -84,9 +100,23 @@ impl VectorIndexPhase {
     }
 
     /// Whether the index still counts as being created, which is what holds a
-    /// `DeleteTable` off.
+    /// `DeleteTable` off. True for both halves of `CREATING`.
     pub(crate) fn is_creating(self) -> bool {
-        matches!(self, Self::Creating)
+        matches!(self, Self::Allocating | Self::Backfilling)
+    }
+
+    /// Whether this phase holds the base table at `UPDATING`. Only the
+    /// allocating half does; the table is back to `ACTIVE` for the backfill,
+    /// which is the state a readiness check should be written against.
+    pub(crate) fn holds_table_updating(self) -> bool {
+        matches!(self, Self::Allocating)
+    }
+
+    /// Whether an `UpdateTable` may drop this index. Refused while it is
+    /// allocating, which is what makes cancelling a create a two-step wait
+    /// rather than something you can do the instant the create returns.
+    pub(crate) fn accepts_delete(self) -> bool {
+        !matches!(self, Self::Allocating)
     }
 }
 
@@ -100,15 +130,17 @@ impl VectorIndexPhase {
 /// incremental.
 ///
 /// A clock that has gone backwards since arming yields a negative elapsed and
-/// so reports `Creating`, which is the same answer as an index armed this
+/// so reports `Allocating`, which is the same answer as an index armed this
 /// instant.
 pub(crate) fn phase_of(armed_at: Option<f64>, now: f64) -> VectorIndexPhase {
     let Some(armed_at) = armed_at else {
         return VectorIndexPhase::Searchable;
     };
     let elapsed = now - armed_at;
-    if elapsed < ACTIVE_AFTER_SECS {
-        VectorIndexPhase::Creating
+    if elapsed < BACKFILLING_AFTER_SECS {
+        VectorIndexPhase::Allocating
+    } else if elapsed < ACTIVE_AFTER_SECS {
+        VectorIndexPhase::Backfilling
     } else if elapsed < SEARCHABLE_AFTER_SECS {
         VectorIndexPhase::ActiveNotSearchable
     } else {
@@ -133,6 +165,12 @@ impl VectorIndexPhases {
             .get(index_name)
             .copied()
             .unwrap_or(VectorIndexPhase::Searchable)
+    }
+
+    /// Whether any index in the set is still allocating, which is what holds
+    /// the base table at `UPDATING`.
+    pub(crate) fn any_holding_table_updating(&self) -> bool {
+        self.0.values().any(|p| p.holds_table_updating())
     }
 
     /// Whether any index in the set is still creating, which is what a
@@ -314,13 +352,27 @@ mod tests {
     const ARMED: f64 = 1_700_000_000.0;
 
     #[test]
-    fn below_the_active_threshold_reports_creating_and_refuses_a_search() {
+    fn while_allocating_the_table_updates_and_the_index_refuses_everything() {
+        let phase = phase_of(Some(ARMED), ARMED + BACKFILLING_AFTER_SECS - 0.001);
+        assert_eq!(phase, VectorIndexPhase::Allocating);
+        assert_eq!(phase.index_status(), "CREATING");
+        assert_eq!(phase.backfilling(), Some(false));
+        assert!(!phase.is_searchable());
+        assert!(phase.is_creating());
+        assert!(phase.holds_table_updating());
+        assert!(!phase.accepts_delete());
+    }
+
+    #[test]
+    fn while_backfilling_the_table_is_active_and_the_index_takes_a_delete() {
         let phase = phase_of(Some(ARMED), ARMED + ACTIVE_AFTER_SECS - 0.001);
-        assert_eq!(phase, VectorIndexPhase::Creating);
+        assert_eq!(phase, VectorIndexPhase::Backfilling);
         assert_eq!(phase.index_status(), "CREATING");
         assert_eq!(phase.backfilling(), Some(true));
         assert!(!phase.is_searchable());
         assert!(phase.is_creating());
+        assert!(!phase.holds_table_updating());
+        assert!(phase.accepts_delete());
     }
 
     #[test]
@@ -331,6 +383,8 @@ mod tests {
         assert_eq!(phase.backfilling(), None);
         assert!(!phase.is_searchable());
         assert!(!phase.is_creating());
+        assert!(!phase.holds_table_updating());
+        assert!(phase.accepts_delete());
     }
 
     #[test]
@@ -346,6 +400,10 @@ mod tests {
     /// exactly on one resolves to the later phase.
     #[test]
     fn exactly_on_a_threshold_resolves_to_the_later_phase() {
+        assert_eq!(
+            phase_of(Some(ARMED), ARMED + BACKFILLING_AFTER_SECS),
+            VectorIndexPhase::Backfilling
+        );
         assert_eq!(
             phase_of(Some(ARMED), ARMED + ACTIVE_AFTER_SECS),
             VectorIndexPhase::ActiveNotSearchable
@@ -369,7 +427,7 @@ mod tests {
     fn a_clock_that_went_backwards_reads_as_just_armed() {
         assert_eq!(
             phase_of(Some(ARMED), ARMED - 60.0),
-            VectorIndexPhase::Creating
+            VectorIndexPhase::Allocating
         );
     }
 
@@ -380,7 +438,7 @@ mod tests {
 
         for _ in 0..50 {
             let phases = lifecycle.phases_of_at("t", ["vix"].into_iter(), ARMED + 1.0);
-            assert_eq!(phases.get("vix"), VectorIndexPhase::Creating);
+            assert_eq!(phases.get("vix"), VectorIndexPhase::Allocating);
             assert!(phases.any_creating());
         }
 
@@ -401,7 +459,7 @@ mod tests {
         lifecycle.arm_at("other", "c", ARMED);
 
         let phases = lifecycle.phases_armed_on_at("t", ARMED);
-        assert_eq!(phases.get("a"), VectorIndexPhase::Creating);
+        assert_eq!(phases.get("a"), VectorIndexPhase::Allocating);
         assert_eq!(phases.get("b"), VectorIndexPhase::Searchable);
         assert_eq!(phases.get("c"), VectorIndexPhase::Searchable);
         assert!(phases.any_creating());
@@ -430,7 +488,7 @@ mod tests {
 
         let phases = lifecycle.phases_of_at("t", ["a", "b"].into_iter(), ARMED + 1.0);
         assert_eq!(phases.get("a"), VectorIndexPhase::Searchable);
-        assert_eq!(phases.get("b"), VectorIndexPhase::Creating);
+        assert_eq!(phases.get("b"), VectorIndexPhase::Allocating);
     }
 
     #[test]
@@ -443,7 +501,7 @@ mod tests {
         let gone = lifecycle.phases_of_at("t", ["a"].into_iter(), ARMED + 1.0);
         assert_eq!(gone.get("a"), VectorIndexPhase::Searchable);
         let kept = lifecycle.phases_of_at("other", ["a"].into_iter(), ARMED + 1.0);
-        assert_eq!(kept.get("a"), VectorIndexPhase::Creating);
+        assert_eq!(kept.get("a"), VectorIndexPhase::Allocating);
     }
 
     #[test]
@@ -457,6 +515,6 @@ mod tests {
             ["vix"].into_iter(),
             ARMED + SEARCHABLE_AFTER_SECS + 1.0,
         );
-        assert_eq!(phases.get("vix"), VectorIndexPhase::Creating);
+        assert_eq!(phases.get("vix"), VectorIndexPhase::Allocating);
     }
 }

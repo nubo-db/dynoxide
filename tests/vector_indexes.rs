@@ -12,7 +12,7 @@ use dynoxide::actions::delete_table::DeleteTableRequest;
 use dynoxide::actions::describe_table::DescribeTableRequest;
 use dynoxide::actions::update_table::{UpdateTableRequest, VectorIndexUpdate};
 use dynoxide::actions::vector_lifecycle::{
-    ACTIVE_AFTER_SECS, SEARCHABLE_AFTER_SECS, VectorIndexLifecycle,
+    ACTIVE_AFTER_SECS, BACKFILLING_AFTER_SECS, SEARCHABLE_AFTER_SECS, VectorIndexLifecycle,
 };
 use dynoxide::storage::Storage;
 use dynoxide::storage_backend::ManualClock;
@@ -36,6 +36,12 @@ const ARMED: u64 = 1_700_000_000;
 /// Derived from the thresholds rather than written as a number, so raising or
 /// lowering either one fails these assertions loudly instead of quietly
 /// re-pointing them at the wrong phase.
+/// Move the clock past resource allocation and into the backfill, which is
+/// where the table is back to `ACTIVE` and the index will take a `Delete`.
+fn advance_to_backfilling(clock: &ManualClock) {
+    clock.set(ARMED + BACKFILLING_AFTER_SECS as u64 + 1);
+}
+
 fn advance_to_active_not_searchable(clock: &ManualClock) {
     clock.set(ARMED + ACTIVE_AFTER_SECS as u64 + 1);
 }
@@ -1133,8 +1139,15 @@ async fn update_table_creates_vector_index_and_backfills_only_valid_items() {
     assert_eq!(table_pk, "S:valid");
     assert_eq!(vector_json, "[1.0,2.0,3.0]");
 
-    // The index the call just added is still creating, so DescribeTable
-    // reports CREATING with Backfilling present.
+    // The index the call just added is still allocating, so DescribeTable
+    // reports CREATING with Backfilling false.
+    let desc = describe_raw_with(&storage, &lifecycle, "VecFill").await;
+    let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "CREATING");
+    assert_eq!(vix.backfilling, Some(false));
+
+    // Backfilling turns true once it starts, still under CREATING.
+    clock.set(ARMED + BACKFILLING_AFTER_SECS as u64 + 1);
     let desc = describe_raw_with(&storage, &lifecycle, "VecFill").await;
     let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
     assert_eq!(vix.index_status, "CREATING");
@@ -1796,6 +1809,7 @@ fn fifth_vector_index_via_update_table_accepted_at_the_boundary() {
     }))
     .unwrap();
     db.update_table(req).unwrap();
+    advance_to_backfilling(&clock);
     let desc = describe(&db, "VecFour");
     let vixs = desc.table.vector_indexes.as_ref().unwrap();
     assert_eq!(vixs.len(), 5);
@@ -4231,6 +4245,19 @@ fn the_table_reports_active_while_the_index_it_is_adding_reports_creating() {
 
     // Table and index come from one description, or a transition between two
     // calls would make the pairing meaningless.
+    //
+    // Allocating first: the table is held at UPDATING and Backfilling reports
+    // false, which is the phase a fast poller catches.
+    let desc = describe(&db, "VecLive");
+    assert_eq!(desc.table.table_status, "UPDATING");
+    let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
+    assert_eq!(vix.index_status, "CREATING");
+    assert_eq!(vix.backfilling, Some(false));
+
+    // Then the backfill, which is the long half: the table is back to ACTIVE
+    // beside a still-creating index, and that pairing is the state a readiness
+    // check has to be written against.
+    advance_to_backfilling(&clock);
     let desc = describe(&db, "VecLive");
     assert_eq!(desc.table.table_status, "ACTIVE");
     let vix = &desc.table.vector_indexes.as_ref().unwrap()[0];
@@ -4261,6 +4288,7 @@ fn an_unrelated_update_reports_the_creating_index_in_its_own_response() {
     let clock = ManualClock::new(ARMED);
     let db = db_with_manual_clock(&clock);
     table_with_an_index_added_afterwards(&db, "VecOther");
+    advance_to_backfilling(&clock);
 
     let req: UpdateTableRequest = serde_json::from_value(json!({
         "TableName": "VecOther",
@@ -4437,6 +4465,7 @@ fn cancelling_a_creating_index_clears_its_state_and_frees_the_table() {
     table_with_an_index_added_afterwards(&db, "VecCancel");
     assert_eq!(only_vix(&db, "VecCancel").index_status, "CREATING");
 
+    advance_to_backfilling(&clock);
     delete_vector_index(&db, "VecCancel", "vix").unwrap();
 
     let desc = describe(&db, "VecCancel");
@@ -4449,6 +4478,33 @@ fn cancelling_a_creating_index_clears_its_state_and_frees_the_table() {
         table_name: "VecCancel".to_string(),
     })
     .unwrap();
+}
+
+/// Cancelling a create is not available the instant the create returns:
+/// DynamoDB refuses while the index is allocating and names the phase to retry
+/// in. Captured eu-west-2, 2026-08-23.
+#[test]
+fn an_index_still_allocating_refuses_the_delete_that_cancels_it() {
+    let clock = ManualClock::new(ARMED);
+    let db = db_with_manual_clock(&clock);
+    table_with_an_index_added_afterwards(&db, "VecAlloc");
+
+    let err = delete_vector_index(&db, "VecAlloc", "vix").unwrap_err();
+    assert!(
+        matches!(err, dynoxide::DynoxideError::ResourceInUseException(_)),
+        "expected a ResourceInUseException, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Attempt to change a resource which is still in use: Index creation is in resource \
+         allocation phase. Retry deletion during backfilling phase or when the index is \
+         active. Table: VecAlloc Index: vix"
+    );
+
+    // The answer names the phase to wait for, and waiting for it works.
+    advance_to_backfilling(&clock);
+    delete_vector_index(&db, "VecAlloc", "vix").unwrap();
+    assert!(describe(&db, "VecAlloc").table.vector_indexes.is_none());
 }
 
 #[test]
@@ -4520,7 +4576,9 @@ fn deleting_a_different_index_while_one_creates_answers_the_limit() {
          simultaneously per table"
     );
 
-    // Cancelling the creating index itself is the action that gets through.
+    // Cancelling the creating index itself is the action that gets through,
+    // once it is past allocating.
+    advance_to_backfilling(&clock);
     delete_vector_index(&db, "VecBoth", "creating").unwrap();
     assert_eq!(
         describe(&db, "VecBoth")

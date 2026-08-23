@@ -411,6 +411,16 @@ pub(crate) fn build_table_description(
             .collect()
     });
 
+    // A vector index allocating resources holds the base table at UPDATING;
+    // it returns to ACTIVE for the backfill, which is the far longer half and
+    // the state a readiness check should be written against (captured
+    // eu-west-2, 2026-08-23).
+    let table_status = if vector_phases.any_holding_table_updating() {
+        "UPDATING".to_string()
+    } else {
+        meta.table_status.clone()
+    };
+
     let billing_mode = meta.billing_mode.clone();
 
     let provisioned_throughput = if let Some(pt_json) = &meta.provisioned_throughput {
@@ -527,7 +537,7 @@ pub(crate) fn build_table_description(
                 .unwrap_or_else(|| table_id_for(&meta.table_name, meta.created_at)),
         ),
         table_arn: streams::table_arn(table_name),
-        table_status: meta.table_status.clone(),
+        table_status,
         key_schema,
         attribute_definitions,
         creation_date_time: Some(meta.created_at as f64),

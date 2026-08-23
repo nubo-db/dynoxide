@@ -113,19 +113,29 @@ A vector index added to a live table walks a creation lifecycle, the same shape
 AWS walks but nothing like the same length. A vector index created as part of
 `CreateTable` reports `ACTIVE` at once, which is what AWS does too.
 
-An index added through `UpdateTable` passes through three phases:
+An index added through `UpdateTable` passes through four phases:
 
-| Phase | `IndexStatus` | `Backfilling` | `SearchVectors` |
-|---|---|---|---|
-| Creating | `CREATING` | present | `Cannot search backfilling vector index: <name>` |
-| Active, not yet searchable | `ACTIVE` | absent | the same refusal |
-| Searchable | `ACTIVE` | absent | served |
+| Phase | `TableStatus` | `IndexStatus` | `Backfilling` | `SearchVectors` | `Delete` of the index |
+|---|---|---|---|---|---|
+| Allocating | `UPDATING` | `CREATING` | `false` | `Cannot search backfilling vector index: <name>` | refused |
+| Backfilling | `ACTIVE` | `CREATING` | `true` | the same refusal | accepted |
+| Active, not searchable | `ACTIVE` | `ACTIVE` | absent | the same refusal | accepted |
+| Searchable | `ACTIVE` | `ACTIVE` | absent | served | accepted |
 
-The base table reports `ACTIVE` throughout, so a table waiter is the wrong gate
-for a search. The table also cannot be dropped while the index is creating:
-`DeleteTable` answers `ResourceInUseException` with `Attempt to change a
-resource which is still in use: Cannot delete table while indexes are being
-created, updated, or deleted.` for as long as the index is in the first phase.
+The base table is `ACTIVE` for all but the first phase, and that phase is the
+short one, so a table waiter looks like the right gate for a search long before
+it is one.
+
+Cancelling a create is not available immediately. While the index is
+allocating, an `UpdateTable` that deletes it answers `ResourceInUseException`
+with `Attempt to change a resource which is still in use: Index creation is in
+resource allocation phase. Retry deletion during backfilling phase or when the
+index is active.` The answer names the phase to wait for.
+
+The table cannot be dropped while the index is creating, meaning for both of
+those first two phases. `DeleteTable` answers `ResourceInUseException` with
+`Attempt to change a resource which is still in use: Cannot delete table while
+indexes are being created, updated, or deleted.`
 
 The one online index limit is per table rather than per call, so a second index
 cannot start creating while the first still is, whether the two arrive in one
@@ -138,7 +148,7 @@ When the index reaches `ACTIVE` the `Backfilling` field is not set to `false`,
 it disappears. A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling`
 is `false`" therefore never comes true, here or on AWS.
 
-The sharper trap is the middle row: `ACTIVE` arrives before the index will
+The sharper trap is the third row: `ACTIVE` arrives before the index will
 answer. On AWS it arrives early by minutes, an index added to a 25-item table
 taking roughly a quarter of an hour after `ACTIVE` before it stopped refusing
 searches. Dynoxide reproduces the gap so a readiness check that polls for

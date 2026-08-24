@@ -78,7 +78,7 @@ If you would rather behaviour held still:
   across the whole major line and does receive conformance fixes.
 - **Cargo:** `=1.0.0`, or rely on your lockfile.
 
-`npm install dynoxide` writes `^1.0.0` for you. If you want the narrower range,
+`npm install dynoxide` writes a caret range for you. If you want the narrower range,
 ask for it explicitly.
 
 ## The browser engine
@@ -86,8 +86,10 @@ ask for it explicitly.
 `@dynoxide/wasm-engine` is versioned with everything else and covered by the
 same rules.
 
-It is a scored target in the conformance suite and passes tier 1 in full. Two
-exclusions are worth knowing before you rely on it:
+It is a scored target in the conformance suite. Current results are published
+alongside every other target and are not quoted here, because a figure written
+into this page is stale by the next release. Two exclusions are structural, and
+worth knowing before you rely on it:
 
 - **Unimplemented operations.** `TransactWriteItems`, streams, tags and TTL are
   not implemented. The suite skips them rather than failing them, so they do not

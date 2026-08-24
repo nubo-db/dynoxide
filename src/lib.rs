@@ -1,6 +1,6 @@
 //! # Dynoxide
 //!
-//! A lightweight, embeddable DynamoDB emulator backed by SQLite.
+//! An embeddable DynamoDB emulator backed by SQLite.
 //!
 //! ```rust
 //! use dynoxide::Database;

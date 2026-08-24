@@ -12,12 +12,18 @@ COPY dist/${TARGETARCH}/dynoxide /usr/local/bin/dynoxide
 # Ownership marker for the MCP registry. Must match the `name` in server.json;
 # the registry reads this label off the published image to verify the OCI
 # package belongs to io.github.nubo-db/dynoxide.
-LABEL io.modelcontextprotocol.server.name="io.github.nubo-db/dynoxide"
+LABEL io.modelcontextprotocol.server.name="io.github.nubo-db/dynoxide" \
+      org.opencontainers.image.title="Dynoxide" \
+      org.opencontainers.image.description="DynamoDB emulator that starts in milliseconds. A drop-in for amazon/dynamodb-local, with no JVM." \
+      org.opencontainers.image.source="https://github.com/nubo-db/dynoxide" \
+      org.opencontainers.image.url="https://dynoxide.dev" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.vendor="Martin Hicks"
 
 WORKDIR /data
 
 # 8000: DynamoDB HTTP API (started by the default CMD).
-# 19280: MCP Streamable-HTTP transport. Opt-in, not started by default — override
+# 19280: MCP Streamable-HTTP transport. Opt-in, not started by default - override
 # CMD with `serve --mcp --mcp-host 0.0.0.0` and supply a bearer token via
 # DYNOXIDE_MCP_AUTH_TOKEN (a non-loopback MCP bind refuses to boot without one).
 # See the README "MCP over HTTP in Docker" section. EXPOSE is metadata only; it

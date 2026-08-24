@@ -1,6 +1,6 @@
 # Dynoxide
 
-A fast, lightweight DynamoDB emulator backed by SQLite. Drop-in replacement for [DynamoDB Local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html) and [dynalite](https://github.com/mhart/dynalite). No Docker, no JVM.
+A DynamoDB emulator backed by SQLite, verified against real AWS by a public conformance suite. A single static binary that starts in milliseconds, with no runtime or database to install.
 
 ## Install
 

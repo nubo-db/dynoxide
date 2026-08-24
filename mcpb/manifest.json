@@ -1,8 +1,8 @@
 {
   "manifest_version": "0.3",
   "name": "dynoxide",
-  "version": "0.11.1",
-  "description": "DynamoDB-compatible database engine with an MCP server exposing 34 DynamoDB tools.",
+  "version": "1.0.0",
+  "description": "A DynamoDB emulator with an MCP server exposing 35 DynamoDB tools to coding agents.",
   "author": {
     "name": "Martin Hicks",
     "url": "https://dynoxide.dev"

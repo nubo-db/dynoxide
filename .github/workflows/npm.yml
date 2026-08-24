@@ -75,10 +75,14 @@ jobs:
             --release-url "https://github.com/nubo-db/dynoxide/releases/download/$PUBLISH_TAG"
 
   # The browser engine package (@dynoxide/wasm-engine) is built from source
-  # here, since wasm is architecture-independent. It rides its own preview track:
-  # the wasm path is not conformance-tested. The `-preview` version string, not a
-  # dist-tag, marks it a preview; it publishes to `latest` (npm's mandatory tag)
-  # like a normal release. Published via OIDC trusted publishing (no token), so its
+  # here, since wasm is architecture-independent. It ships at the release version,
+  # in lockstep with every other artifact. It previously rode a separate preview
+  # track on the stated criterion that the wasm path was not conformance-tested;
+  # that criterion is met (dynoxide-wasm is a scored conformance target passing
+  # tier 1 in full, excluding the operations it does not implement and the OPFS
+  # path the suite's shim does not exercise), so the track ended and the
+  # `-preview` suffix with it. See docs/versioning.md.
+  # Published via OIDC trusted publishing (no token), so its
   # trusted publisher must be configured on npmjs.com first; the very first publish
   # is bootstrapped manually, and the idempotent guard below then skips that
   # already-published version. This job runs independently of the native `publish`
@@ -129,22 +133,28 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          # The engine rides its own preview track, versioned independently of the
-          # crate: it always ships as <crate-base>-preview, never a plain stable
-          # version. BASE strips any prerelease suffix off the tag, so a stable
-          # v0.11.0 tag yields an engine version of 0.11.0-preview.
-          BASE="${VERSION%%-*}"
+          # The engine ships at the release version, in lockstep with every other
+          # artifact. It previously rode a separate preview track as
+          # <crate-base>-preview; that track ended when the wasm path graduated.
+          # NPM_TAG keeps a prerelease off the `latest` dist-tag: npm refuses a
+          # bare publish of a prerelease and does not default a tag, so the value
+          # is passed explicitly at publish time either way.
+          case "$VERSION" in
+            *-*) NPM_TAG="next" ;;
+            *)   NPM_TAG="latest" ;;
+          esac
           # Defence in depth: the tag regex above already guarantees a non-empty
           # version, but assert it before these values reach the skip check and the
           # publish. An empty engine version would make the `npm view ...@` probe
           # match the whole package and silently skip the publish.
-          if [ -z "$VERSION" ] || [ -z "$BASE" ]; then
+          if [ -z "$VERSION" ] || [ -z "$NPM_TAG" ]; then
             echo "::error::could not derive a version from tag '$TAG'"
             exit 1
           fi
           {
             echo "version=$VERSION"
-            echo "engine_version=${BASE}-preview"
+            echo "engine_version=$VERSION"
+            echo "npm_tag=$NPM_TAG"
           } >> "$GITHUB_OUTPUT"
 
       # Idempotent: skip if this version is already on npm (the manual bootstrap
@@ -181,32 +191,32 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # build-wasm.sh stamps manifest.engineVersion from Cargo.toml verbatim,
-          # which release.yml validate has already pinned to the full tag version,
-          # so the manifest must equal VERSION. A mismatch means Cargo.toml was not
-          # bumped to the release version. The published package layers the -preview
-          # suffix on top of this (see the stamp step); the manifest tracks the
-          # crate version, which is what this guards.
+          # This is the manual-dispatch path's version guard, and it is the only one
+          # that path has. build-wasm.sh stamps manifest.engineVersion from
+          # Cargo.toml verbatim, so on a TAG release, where release.yml validate has
+          # already pinned Cargo.toml to the tag, this check is redundant with
+          # validate. On a workflow_dispatch run validate never executes, while the
+          # checkout below uses `ref: inputs.tag` -- so a tag whose Cargo.toml
+          # disagrees is caught here and nowhere else. Do not delete it as dead
+          # code on the strength of the tag path alone.
           MANIFEST_VERSION=$(node -p "require('./npm/wasm-engine/manifest.json').engineVersion")
           if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
             echo "::error::engine manifest version ($MANIFEST_VERSION) != release version ($VERSION); is Cargo.toml bumped to $VERSION?"
             exit 1
           fi
 
-      # Publish to `latest`. The `-preview` version string is the only preview
-      # marker; OIDC publishing can only set the tag it publishes to, so we do not
-      # maintain a separate `preview` dist-tag that would drift from `latest`, and
-      # a normal `npm install @dynoxide/wasm-engine` gets the current preview. The
-      # tag is passed explicitly because npm refuses a bare publish of a prerelease
-      # version ("You must specify a tag using --tag"); it does not default one.
-      # When the wasm path graduates (conformance-tested), drop the `-preview`
-      # suffix in "Determine version" and this still lands on `latest`.
+      # The dist-tag is computed in "Determine version": `latest` for a release,
+      # `next` for a prerelease. It is passed explicitly because npm refuses a bare
+      # publish of a prerelease version ("You must specify a tag using --tag") and
+      # does not default one. Publishing a prerelease to `latest` would hand it to
+      # every `npm install @dynoxide/wasm-engine`, which is why the value is derived
+      # from the version rather than hardcoded.
       - name: Publish (dry-run)
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/wasm-engine
-        run: npm publish --dry-run --access public --provenance --tag latest
+        run: npm publish --dry-run --access public --provenance --tag "${{ steps.version.outputs.npm_tag }}"
 
       - name: Publish to npm
         if: steps.published.outputs.skip == 'false'
         working-directory: npm/wasm-engine
-        run: npm publish --access public --provenance --tag latest
+        run: npm publish --access public --provenance --tag "${{ steps.version.outputs.npm_tag }}"

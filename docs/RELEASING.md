@@ -23,9 +23,14 @@ schedule. Versioning follows [SemVer](https://semver.org).
    one-click maintainer approval, then publish to crates.io, update the
    Homebrew tap, publish the npm packages, and push the Docker image.
 
-The approval gate between the GitHub Release and any external publish means
-a release can still be aborted after the artefacts are built but before
-anything reaches crates.io, Homebrew, npm, or any container registry.
+The approval gate sits between the GitHub Release and the registry publishes,
+so a release can still be aborted before anything reaches crates.io, Homebrew,
+npm, or any container registry.
+
+It does not cover the GitHub Release itself. That is created before the pause,
+and its artefacts are downloadable as soon as it exists, which is how the
+composite action resolves `version: latest`. Aborting at the gate leaves the
+GitHub Release in place; delete or mark it a draft if that matters.
 
 ## Verifying a release
 

@@ -49,7 +49,7 @@ Dynoxide is continuously verified against real DynamoDB by **Parity Suite**, the
 
 Disclosure: Dynoxide and Parity Suite are maintained by the same person. The suite scores Dynoxide on the same public matrix it runs against every other engine, and the results and test code are open.
 
-This covers the native build. The [WebAssembly](#webassembly-preview) build is scored as its own row: it passes every test it implements, with a far higher skip count than any other target because several operations are still missing.
+This covers the native build. The [WebAssembly](#webassembly) build is scored as its own row: it passes every test it implements, with a far higher skip count than any other target because several operations are still missing.
 
 ### How It Compares
 
@@ -88,7 +88,7 @@ Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, C
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
 - [Import CLI](https://github.com/nubo-db/dynoxide/blob/main/docs/import.md) - loading data, table filtering, and anonymisation
-- [WebAssembly (preview)](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) - the browser build and embed contract
+- [WebAssembly](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) - the browser build and embed contract
 - [Using as a Rust library](https://github.com/nubo-db/dynoxide/blob/main/docs/library.md) - embedded mode and feature flags
 - [Compatibility](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md) - operation, expression, and PartiQL coverage versus DynamoDB
 - [Releasing](https://github.com/nubo-db/dynoxide/blob/main/docs/RELEASING.md) - release cadence and process

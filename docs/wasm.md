@@ -1,14 +1,14 @@
-# WebAssembly (preview)
+# WebAssembly
 
 Dynoxide compiles to `wasm32-unknown-unknown` and runs in the browser. The same engine that backs the native build runs against the official [@sqlite.org/sqlite-wasm](https://github.com/sqlite/sqlite-wasm) build of SQLite over a wasm-bindgen bridge, with the database persisted to [OPFS](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) (the origin private file system).
 
 Both backends issue the same SQL. The native and wasm code share one set of query builders, so a query fixed on one is fixed on both.
 
-It's a preview. The wasm build is scored by the same conformance suite that backs the native build and passes every test it implements - 865 passed, 0 failed, 133 skipped, measured locally on 28 July 2026; the published row refreshes with the next suite run. The skip count is far higher than any other target because several operations are still missing, so read the row as "correct on what it implements" rather than as a like-for-like comparison. A build made with `--no-default-features --features wasm-sqlite` exposes `dynoxide::WASM_BACKEND` (`true`) so you can tell which path you're on.
+The wasm build is a scored target in the same conformance suite that backs the native build; current results are published alongside every other target. Its skip count is far higher than any other target because several operations are still missing, so read the row as "correct on what it implements" rather than as a like-for-like comparison. `docs/versioning.md` names what the suite does and does not exercise. A build made with `--no-default-features --features wasm-sqlite` exposes `dynoxide::WASM_BACKEND` (`true`) so you can tell which path you're on.
 
 **What works:** create and delete tables, describe and list them, update tables (add or delete a GSI, with existing rows backfilled into the new index, and change provisioned throughput, billing mode, table class, on-demand throughput, and deletion protection), put, get, delete, and update items, query, scan, the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), and PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`, including `RETURNING` and `ClientRequestToken` idempotency), over base tables and both secondary index types (GSI and LSI), and vector indexes with `SearchVectors` over all three distance functions. Index maintenance is atomic with the base write, same as native, vector shadow tables included. One caveat on PartiQL writes: they record a stream event when the table has a stream enabled, and the wasm build cannot enable one, so that path is unreachable rather than supported.
 
-**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table. `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats, and bulk import return a preview "not yet implemented" error. Those four blocks are the whole of the conformance skip count.
+**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table. `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats, and bulk import return a typed "not yet implemented" error. Those four blocks are the whole of the conformance skip count.
 
 Vector search is the same engine as native: exact brute-force KNN, the same `f32` storage, the same scoring and the same tie break, so a query answers identically either side. The candidate load for a search is a single bridge crossing rather than one per entry. A database persisted before the vector column existed is migrated on open, so an OPFS database created by an older build keeps working and gains the surface.
 
@@ -126,7 +126,7 @@ Two things about it are load-bearing rather than incidental:
   this path does not exercise OPFS; the browser specs under `tests/browser`
   cover persistence, and this covers the DynamoDB surface.
 
-An operation the preview does not implement returns HTTP 501 with an
+An operation the wasm build does not implement returns HTTP 501 with an
 `UnsupportedOperation` envelope, so a conformance runner can tell "out of scope"
 from "implemented and wrong" without guessing. An implemented operation can
 return the same envelope for a specific unsupported field (`CreateTable` or
@@ -151,5 +151,5 @@ const { Items } = await client.execute("Query", { /* ... */ });
 
 `new EngineClient()` with no arguments resolves the Worker next to the package, and the Worker resolves the `.wasm` next to itself, so a bundler that copies the package's files - or a plain static deploy of them - needs no configuration. Serving the assets from a CDN or another origin? Pass `assetBase` (the directory they sit in) or `workerUrl` (the exact Worker URL).
 
-The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. It's a preview, like the rest of the wasm build; `npm install @dynoxide/wasm-engine` gets it (the version carries `-preview`), or pin the exact version.
+The package also exports `EngineError` (the typed rejection, carrying the engine's `__type` on `.type`) and `CONTRACT_VERSION`. The client checks that version against the engine on boot and fails loudly on a mismatch, so a pinned consumer never mis-reads a newer engine. Hosting matches `dist/`: a secure context, no COOP/COEP, a CSP that allows `'wasm-unsafe-eval'`, and `.wasm` served as `application/wasm`. `npm install @dynoxide/wasm-engine` gets the current release, or pin the exact version.
 

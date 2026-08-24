@@ -500,20 +500,23 @@ pub type NativeDatabase = Database<RusqliteBackend>;
 #[cfg(feature = "wasm-sqlite")]
 pub type WasmDatabase = Database<WasmBridgeBackend>;
 
-/// Build-visible preview marker for the wasm-sqlite backend.
+/// Build-visible discriminator for the wasm-sqlite backend.
 ///
 /// `true` when built with `--no-default-features --features wasm-sqlite`,
-/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI, and
-/// PartiQL, and passes the conformance cases for all of them, but it still
-/// leaves several operations unimplemented. Consumers can read this constant to
-/// tell whether the artifact they hold is the fully conformant native build or
-/// the wasm preview.
+/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI and
+/// PartiQL and passes the conformance cases for all of them, but it leaves
+/// several operations unimplemented (`TransactWriteItems`, streams, tags, TTL).
+/// Read this constant to tell which build you hold; see `docs/versioning.md`
+/// for what each one covers.
+///
+/// This names the build path rather than a maturity level, so it stays correct
+/// as the wasm backend matures.
 #[cfg(feature = "wasm-sqlite")]
-pub const WASM_PREVIEW: bool = true;
-/// Build-visible preview marker for the wasm-sqlite backend. See the
+pub const WASM_BACKEND: bool = true;
+/// Build-visible discriminator for the wasm-sqlite backend. See the
 /// `wasm-sqlite` variant for details.
 #[cfg(not(feature = "wasm-sqlite"))]
-pub const WASM_PREVIEW: bool = false;
+pub const WASM_BACKEND: bool = false;
 
 /// The main entry point for the DynamoDB emulator.
 ///

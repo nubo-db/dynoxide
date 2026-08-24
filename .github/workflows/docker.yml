@@ -26,6 +26,10 @@ jobs:
     name: Publish Docker image
     if: github.repository == 'nubo-db/dynoxide'
     runs-on: ubuntu-latest
+    # Manual dispatch publishes to the container registries exactly as a tagged release does,
+    # so it takes the same approval gate. Without this the recovery path is a
+    # way to publish with no review.
+    environment: production-publish
     timeout-minutes: 20
 
     permissions:

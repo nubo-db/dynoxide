@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-24
+
+Every artifact moves to 1.0.0 together: the crate, the npm CLI wrapper and its
+platform binaries, the browser engine, the container images and the MCP registry
+entry. `docs/versioning.md` states what that number promises, what forces a
+major, and how conformance fixes are versioned from here.
+
+The browser engine drops its `-preview` suffix and joins the shared version. Its
+conformance coverage is unchanged by that; `docs/versioning.md` names what the
+suite does and does not exercise.
+
+### Behaviour changes
+
+Read this section before upgrading. This release corrects a large number of
+divergences from DynamoDB, and a test that had come to depend on the old answer
+will fail. Grouped by what you will actually experience.
+
+**A write can now modify data it previously did not.** These three share one
+cause: PartiQL `UPDATE` and `DELETE` evaluate their `WHERE` clause through the
+same matcher as `SELECT`, so a change to predicate handling changes which rows a
+write touches.
+
+- A predicate on a set, list, map, binary or null attribute compares by value
+  instead of never matching. A conditional write on any of those types could
+  never fire before and now fires.
+- A negated comparison keeps the rows its attribute is missing from. `NOT a='x'`
+  skipped rows with no `a` and now matches them, so a write carrying that
+  predicate reaches a wider row set.
+- Parenthesised grouping and bare `NOT` now parse. `WHERE (a='1')` was a parse
+  error, so a write carrying it did nothing; it now executes. Unlike the two
+  above, the old behaviour was a visible error rather than a silent no-op.
+
+**Requests that used to be accepted are now rejected**, matching DynamoDB. A
+test sending one of these and expecting success fails immediately: the
+`UpdateItem` item-size ceiling; the PartiQL 400KB item-size limit;
+`ReturnConsumedCapacity` outside `INDEXES`, `TOTAL` and `NONE`; two
+`BatchExecuteStatement` and `ExecuteTransaction` request shapes; five rejections
+on index-qualified PartiQL `SELECT`; a `SELECT` in `BatchExecuteStatement` that
+does not name the primary key or that names an index; ordering comparisons
+against operands with no ordering; an index-qualified `SELECT` inside
+`ExecuteTransaction`.
+
+One runs the other way and is worth knowing: an ordering comparison against an
+unorderable operand used to answer no rows and now rejects the statement, so a
+conditional write of that shape fails visibly instead of silently doing nothing.
+
+**Consumed capacity figures move.** Any test asserting exact `ConsumedCapacity`
+values will need updating. Index writes are charged on the change to what the
+index stores rather than on the finished item, LSI writes are charged at all,
+table arms are sized on the larger of an item's before and after images,
+transactional and PartiQL surfaces report per-index figures under `INDEXES`,
+PartiQL reads are charged on rows walked rather than rows returned, and LSI
+base-table reads are charged on bytes moved rather than a flat half unit.
+
+**Results change without an error.** A PartiQL `SELECT` is served from the index
+its `FROM` clause names, so sparse membership and projection now apply; an LSI
+serves a projection naming an attribute it does not carry by reading the base
+item, where it used to return rows of empty objects.
+
+**Crashes became errors.** An unterminated quoted name and a deeply nested
+statement are rejected rather than aborting the process, and `wasm-sqlite`
+alongside the default features now fails with a message that explains itself.
+
+Every individual change is listed in the sections below, and
+`docs/compatibility-summary.md` carries the cumulative behaviour-change record.
+
 ### Added
 
 - **Vector indexes and `SearchVectors`.** `CreateTable` and `UpdateTable` take vector index definitions, `DescribeTable` reports them, the item write paths maintain them, and `SearchVectors` returns the nearest entries to a query vector over `COSINE`, `EUCLIDEAN` or `DOT_PRODUCT`. A search can be scoped by a `SearchSchema` HASH attribute and filtered on `INLINE_FILTER` attributes, and reports `VectorSearchRequestBytes`; a write to a vector-indexed table reports a per-index `VectorIndexes` map under `INDEXES`. Available on the native build, the wasm build, and through the MCP tools, which gain a `search_vectors` tool. Scoring is exact brute-force KNN, so the top-k is the true top-k.

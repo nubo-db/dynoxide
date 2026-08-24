@@ -23,6 +23,10 @@ jobs:
   publish:
     name: Publish npm packages
     runs-on: ubuntu-latest
+    # Manual dispatch publishes to npm exactly as a tagged release does,
+    # so it takes the same approval gate. Without this the recovery path is a
+    # way to publish with no review.
+    environment: production-publish
     timeout-minutes: 15
 
     steps:

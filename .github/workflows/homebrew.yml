@@ -18,6 +18,10 @@ jobs:
   update-formula:
     name: Update Homebrew tap
     runs-on: ubuntu-latest
+    # Manual dispatch publishes to the Homebrew tap exactly as a tagged release does,
+    # so it takes the same approval gate. Without this the recovery path is a
+    # way to publish with no review.
+    environment: production-publish
 
     steps:
       - uses: actions/checkout@v5

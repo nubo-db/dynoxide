@@ -119,7 +119,7 @@ across patches, and `dynoxide:1` floats across the whole 1.x line. `:1` receives
 conformance fixes, which change behaviour within a major; `:1.0` does not. See
 `docs/versioning.md`.
 
-The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/h4s0n6a2/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
+The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
 
 If you override `CMD` to bind to a different port, set the healthcheck target with environment variables so the container's `HEALTHCHECK` follows:
 

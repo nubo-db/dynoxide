@@ -73,9 +73,16 @@ jobs:
         id: msrv
         run: |
           set -euo pipefail
-          VERSION=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          # Match a quoted literal version rather than splitting the field on
+          # quotes. `rust-version.workspace = true` has no quote to split on, so
+          # a `cut` would pass the whole line through as a toolchain name and
+          # fail later somewhere unrelated. The `|| true` matters too: under
+          # `pipefail` a grep that matches nothing would abort the step before
+          # the check below could report why.
+          VERSION=$(grep -m1 -oE '^rust-version[[:space:]]*=[[:space:]]*"[0-9]+(\.[0-9]+){1,2}"' Cargo.toml \
+            | grep -oE '[0-9]+(\.[0-9]+){1,2}' || true)
           if [ -z "$VERSION" ]; then
-            echo "::error::no rust-version found in Cargo.toml"
+            echo "::error::Cargo.toml declares no literal rust-version to check against"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -89,11 +96,15 @@ jobs:
       # Dev-dependencies are out of scope on purpose: they never reach a
       # consumer, so one raising its own floor does not break this promise.
       # These two shapes are what `cargo add` and `cargo install` compile.
+      #
+      # `--locked` is the point of the job: without it the resolver may pick
+      # different versions than the lockfile ships, and the check would pass
+      # against a dependency set no consumer gets.
       - name: Check default features
-        run: cargo check
+        run: cargo check --locked
 
       - name: Check minimal library
-        run: cargo check --no-default-features --features native-sqlite --lib
+        run: cargo check --locked --no-default-features --features native-sqlite --lib
 
   lint:
     name: Lint

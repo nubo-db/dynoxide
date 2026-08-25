@@ -271,7 +271,7 @@ async fn execute_inner<S: StorageBackend>(
     if request.update_expression.is_none()
         && let Some(ref updates) = request.attribute_updates
     {
-        for (attr_name, update) in updates {
+        for update in updates.values() {
             let action = update.action.to_uppercase();
             if update.value.is_none() && action != "DELETE" {
                 return Err(DynoxideError::ValidationException(
@@ -313,19 +313,31 @@ async fn execute_inner<S: StorageBackend>(
                     )));
                 }
             }
-            let _ = attr_name; // suppress unused warning
         }
     }
 
+    // Read once and used twice: the validation immediately below and the
+    // conversion further down, either side of the expression checks between,
+    // none of which touch `expected` or `condition_expression`.
+    //
+    // The two uses do not share a condition. Validation additionally requires
+    // no UpdateExpression, conversion does not, so that guard stays on the
+    // validation rather than moving up here.
+    let expected: Option<HashMap<String, helpers::ExpectedCondition>> =
+        if request.condition_expression.is_none() {
+            request
+                .expected
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        } else {
+            None
+        };
+
     // Validate legacy Expected parameter
-    if request.condition_expression.is_none()
-        && request.update_expression.is_none()
-        && let Some(ref expected_val) = request.expected
-        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
-            expected_val.clone(),
-        )
+    if request.update_expression.is_none()
+        && let Some(ref expected) = expected
     {
-        helpers::validate_expected_conditions(&expected)?;
+        helpers::validate_expected_conditions(expected)?;
     }
 
     // Validate empty UpdateExpression
@@ -398,19 +410,15 @@ async fn execute_inner<S: StorageBackend>(
     }
 
     // Convert legacy Expected parameter to ConditionExpression if no expression is set
-    if request.condition_expression.is_none()
-        && let Some(ref expected_val) = request.expected
-        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
-            expected_val.clone(),
-        )
+    if let Some(ref expected) = expected
         && !expected.is_empty()
     {
         let (cond_expr, values) = helpers::convert_expected_to_condition(
-            &expected,
+            expected,
             request.conditional_operator.as_deref(),
         )?;
         if !cond_expr.is_empty() {
-            let names = helpers::expected_attr_names(&expected);
+            let names = helpers::expected_attr_names(expected);
             request.condition_expression = Some(cond_expr);
             let expr_values = request
                 .expression_attribute_values

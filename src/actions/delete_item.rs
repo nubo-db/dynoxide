@@ -202,7 +202,9 @@ pub async fn execute<S: StorageBackend>(
         })?;
     }
 
-    // Validate legacy Expected parameter BEFORE checking table existence
+    // Validate the legacy Expected parameter BEFORE checking table existence,
+    // then convert it to a ConditionExpression. Both steps read the same map,
+    // so it is deserialised once rather than once per step.
     if request.condition_expression.is_none()
         && let Some(ref expected_val) = request.expected
         && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
@@ -210,32 +212,24 @@ pub async fn execute<S: StorageBackend>(
         )
     {
         helpers::validate_expected_conditions(&expected)?;
-    }
 
-    // Convert legacy Expected parameter to ConditionExpression if no expression is set
-    // (validation already done above, this is the actual conversion)
-    if request.condition_expression.is_none()
-        && let Some(ref expected_val) = request.expected
-        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
-            expected_val.clone(),
-        )
-        && !expected.is_empty()
-    {
-        let (cond_expr, values) = helpers::convert_expected_to_condition(
-            &expected,
-            request.conditional_operator.as_deref(),
-        )?;
-        if !cond_expr.is_empty() {
-            let names = helpers::expected_attr_names(&expected);
-            request.condition_expression = Some(cond_expr);
-            let expr_values = request
-                .expression_attribute_values
-                .get_or_insert_with(HashMap::new);
-            expr_values.extend(values);
-            let expr_names = request
-                .expression_attribute_names
-                .get_or_insert_with(HashMap::new);
-            expr_names.extend(names);
+        if !expected.is_empty() {
+            let (cond_expr, values) = helpers::convert_expected_to_condition(
+                &expected,
+                request.conditional_operator.as_deref(),
+            )?;
+            if !cond_expr.is_empty() {
+                let names = helpers::expected_attr_names(&expected);
+                request.condition_expression = Some(cond_expr);
+                let expr_values = request
+                    .expression_attribute_values
+                    .get_or_insert_with(HashMap::new);
+                expr_values.extend(values);
+                let expr_names = request
+                    .expression_attribute_names
+                    .get_or_insert_with(HashMap::new);
+                expr_names.extend(names);
+            }
         }
     }
 

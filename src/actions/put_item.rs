@@ -240,16 +240,25 @@ async fn execute_inner<S: StorageBackend>(
         }
     }
 
+    // Read once and use on both sides of the table lookup: the validation just
+    // below, which has to run before the table is checked, and the conversion
+    // after it. Nothing between the two touches `expected` or
+    // `condition_expression`.
+    let expected: Option<HashMap<String, helpers::ExpectedCondition>> =
+        if request.condition_expression.is_none() {
+            request
+                .expected
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        } else {
+            None
+        };
+
     // Validate legacy Expected parameter BEFORE checking table existence
     // (DynamoDB validates request parameters before checking table)
-    if request.condition_expression.is_none()
-        && let Some(ref expected_val) = request.expected
-        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
-            expected_val.clone(),
-        )
-    {
+    if let Some(ref expected) = expected {
         // Validate Expected conditions (ComparisonOperator, Value, Exists conflicts)
-        helpers::validate_expected_conditions(&expected)?;
+        helpers::validate_expected_conditions(expected)?;
     }
 
     // Validate item size BEFORE checking table existence
@@ -265,19 +274,15 @@ async fn execute_inner<S: StorageBackend>(
     let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Convert legacy Expected parameter to ConditionExpression if no expression is set
-    if request.condition_expression.is_none()
-        && let Some(ref expected_val) = request.expected
-        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
-            expected_val.clone(),
-        )
+    if let Some(ref expected) = expected
         && !expected.is_empty()
     {
         let (cond_expr, values) = helpers::convert_expected_to_condition(
-            &expected,
+            expected,
             request.conditional_operator.as_deref(),
         )?;
         if !cond_expr.is_empty() {
-            let names = helpers::expected_attr_names(&expected);
+            let names = helpers::expected_attr_names(expected);
             request.condition_expression = Some(cond_expr);
             let expr_values = request
                 .expression_attribute_values

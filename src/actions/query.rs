@@ -587,13 +587,6 @@ pub async fn execute<S: StorageBackend>(
         let mut index_key_attrs = Vec::new();
         if request.index_name.is_some() {
             // Index keys that are not also table keys
-            if !effective_key_attrs
-                .iter()
-                .any(|k| k == &table_key_schema.partition_key)
-            {
-                // This shouldn't normally happen for query, but just in case
-            }
-            // Check all effective key attrs for non-scalar access
             for k in &effective_key_attrs {
                 if ![table_key_schema.partition_key.clone()]
                     .iter()

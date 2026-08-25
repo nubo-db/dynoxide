@@ -238,7 +238,9 @@ mod private {
 /// functions take it as a bound, so it can be named and used as a bound from
 /// anywhere. Its method set tracks engine features rather than a stable
 /// interface, so closing it to outside impls keeps adding one out of the
-/// versioning contract. `docs/versioning.md` carries the reasoning.
+/// versioning contract. The [versioning policy] carries the reasoning.
+///
+/// [versioning policy]: https://github.com/nubo-db/dynoxide/blob/main/docs/versioning.md
 ///
 /// Method signatures mirror [`Storage`](crate::storage::Storage)'s public
 /// surface 1:1, with three mechanical transformations:

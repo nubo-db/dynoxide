@@ -66,6 +66,19 @@ To republish after a release, bump `version` in `mcpb/manifest.json`, rebuild,
 and re-run the publish command. The server already exists, so it goes straight
 to the new release.
 
+**A published server is not a listed one.** The CLI publishes with visibility
+set to unlisted, so the server deploys and is reachable by direct link while
+never appearing in search. Turn it off under Settings, General, "Unlisted" in
+the Smithery web UI. This is a one-time change per server, not per release, and
+it is worth checking after the first publish because nothing in the CLI output
+says the listing is hidden.
+
+The listing's own metadata comes from the manifest, which is why
+`mcpb/manifest.json` carries `homepage`, `documentation`, `support`,
+`repository`, `icon`, `license` and `long_description` on top of the fields the
+bundle needs to run. Without them Smithery falls back to its own defaults, and
+the server page ends up pointing at `smithery.ai` and a placeholder repo.
+
 ## Glama (glama.ai)
 
 One-off, and it needs your GitHub OAuth. `glama.json` at the repo root names the

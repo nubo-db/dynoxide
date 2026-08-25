@@ -1,12 +1,24 @@
 {
   "manifest_version": "0.3",
   "name": "dynoxide",
+  "display_name": "Dynoxide",
   "version": "1.0.0",
   "description": "A DynamoDB emulator with an MCP server exposing 35 DynamoDB tools to coding agents.",
+  "long_description": "A DynamoDB emulator that starts in milliseconds, giving coding agents a real local DynamoDB to work against.\n\n**35 tools** covering tables, items, query and scan, batch and transactional writes, PartiQL, secondary indexes, TTL and vector search. Snapshot and restore let an agent set up a fixture, experiment against it, and roll back.\n\nRuns as a single native binary backed by SQLite, with no JVM or Docker required. Verified against real AWS by a public conformance suite.",
   "author": {
     "name": "Martin Hicks",
     "url": "https://dynoxide.dev"
   },
+  "homepage": "https://dynoxide.dev",
+  "documentation": "https://dynoxide.dev/docs/mcp",
+  "support": "https://github.com/nubo-db/dynoxide/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nubo-db/dynoxide.git"
+  },
+  "icon": "https://dynoxide.dev/icon-512.png",
+  "keywords": ["dynamodb", "aws", "emulator", "sqlite", "testing"],
+  "license": "MIT OR Apache-2.0",
   "server": {
     "type": "binary",
     "entry_point": "npx",

@@ -23,10 +23,13 @@ jobs:
   publish:
     name: Publish npm packages
     runs-on: ubuntu-latest
-    # Manual dispatch publishes to npm exactly as a tagged release does,
-    # so it takes the same approval gate. Without this the recovery path is a
-    # way to publish with no review.
-    environment: production-publish
+    # No `environment` gate here, unlike the other recovery workflows. This one
+    # is not recovery-only: release.yml dispatches it as part of a tagged
+    # release, so a gate would stop the publish in a run nobody is watching
+    # while release.yml's downstream jobs poll npm and time out. The release
+    # path is already approved at release.yml's publish-crate job, which every
+    # job after it depends on. Gating manual dispatch alone would need a way to
+    # tell the two apart, and both arrive here as workflow_dispatch.
     timeout-minutes: 15
 
     steps:

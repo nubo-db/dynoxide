@@ -5,21 +5,26 @@
 //! the trait and any future impls. A companion `wasm32-unknown-unknown`
 //! `cargo check` job is the cross-platform sibling.
 //!
-//! [`StorageBackend`]: dynoxide::storage_backend::StorageBackend
+//! It sits inside the crate rather than under `tests/` because the trait is
+//! sealed, so the stub needs a `Sealed` impl that only this crate can write.
+//!
+//! [`StorageBackend`]: super::StorageBackend
 
-use dynoxide::storage::{
+use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
     TableStats,
 };
-use dynoxide::storage_backend::{
+use crate::storage_backend::{
     BackendError, BaseItemRow, Clock, GsiItemRow, StorageBackend, VectorCandidateRow, VectorItemRow,
 };
-use dynoxide::types::Tag;
+use crate::types::Tag;
 
 /// A type that satisfies [`StorageBackend`] with `unimplemented!()` bodies.
 ///
 /// Catches missing methods, signature drift, and basic type-fit issues.
 pub struct TestBackend;
+
+impl super::private::Sealed for TestBackend {}
 
 impl StorageBackend for TestBackend {
     fn clock(&self) -> &dyn Clock {

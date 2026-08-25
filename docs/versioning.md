@@ -40,6 +40,22 @@ and this is the reason it would happen.
 | MSRV raise | minor |
 | Dependency bump with no surface change | patch |
 
+## The storage backend seam
+
+`storage_backend::StorageBackend` is public, because `Database<S>` is generic
+over it and the wasm dispatch functions take it as a bound. It is also sealed:
+only Dynoxide's own backends implement it.
+
+That is deliberate. The trait is the seam between the engine and its SQLite
+backends, and its method set tracks what the engine can do rather than a
+stable interface. Vector index support added seven methods to it in one
+release. Were it open, each of those would have been a break, and an engine
+growing its own storage layer would reach a new major every few months.
+
+So adding a method to it is not a break, and the trait keeps pace with the
+engine inside 1.x. You can name it and use it as a bound; you cannot implement
+it. If third-party backends ever earn their place, unsealing is a minor.
+
 ## Conformance fixes are the exception
 
 Dynoxide exists to behave like DynamoDB. Where it does not, that is a bug, and

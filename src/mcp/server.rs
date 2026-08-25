@@ -898,22 +898,22 @@ impl McpServer {
     fn json_result_checked(&self, value: &serde_json::Value) -> Result<CallToolResult, McpError> {
         let serialized =
             serde_json::to_vec(value).map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        if let Some(max_bytes) = self.config.max_size_bytes {
-            if serialized.len() > max_bytes {
-                let error_json = serde_json::json!({
-                    "error_type": "ResponseSizeLimitExceeded",
-                    "message": format!(
-                        "Response size ({} bytes) exceeds --max-size-bytes limit ({} bytes). \
-                         Use a smaller `limit` parameter or add a projection_expression to reduce response size.",
-                        serialized.len(),
-                        max_bytes
-                    ),
-                    "retryable": false,
-                });
-                return Ok(CallToolResult::error(vec![Content::text(
-                    error_json.to_string(),
-                )]));
-            }
+        if let Some(max_bytes) = self.config.max_size_bytes
+            && serialized.len() > max_bytes
+        {
+            let error_json = serde_json::json!({
+                "error_type": "ResponseSizeLimitExceeded",
+                "message": format!(
+                    "Response size ({} bytes) exceeds --max-size-bytes limit ({} bytes). \
+                     Use a smaller `limit` parameter or add a projection_expression to reduce response size.",
+                    serialized.len(),
+                    max_bytes
+                ),
+                "retryable": false,
+            });
+            return Ok(CallToolResult::error(vec![Content::text(
+                error_json.to_string(),
+            )]));
         }
         // SAFETY: serde_json::to_vec always produces valid UTF-8
         let text = unsafe { String::from_utf8_unchecked(serialized) };
@@ -1618,23 +1618,21 @@ impl McpServer {
                 });
 
                 // Add partition_key and sort_key from key schema
-                if let Some(meta) = t.metadata {
-                    if let Ok(serde_json::Value::Array(ks)) =
+                if let Some(meta) = t.metadata
+                    && let Ok(serde_json::Value::Array(ks)) =
                         serde_json::from_str::<serde_json::Value>(&meta.key_schema)
-                    {
-                        for elem in &ks {
-                            let name = elem.get("AttributeName").and_then(|v| v.as_str());
-                            let key_type = elem.get("KeyType").and_then(|v| v.as_str());
-                            match (name, key_type) {
-                                (Some(n), Some("HASH")) => {
-                                    entry["partition_key"] =
-                                        serde_json::Value::String(n.to_string());
-                                }
-                                (Some(n), Some("RANGE")) => {
-                                    entry["sort_key"] = serde_json::Value::String(n.to_string());
-                                }
-                                _ => {}
+                {
+                    for elem in &ks {
+                        let name = elem.get("AttributeName").and_then(|v| v.as_str());
+                        let key_type = elem.get("KeyType").and_then(|v| v.as_str());
+                        match (name, key_type) {
+                            (Some(n), Some("HASH")) => {
+                                entry["partition_key"] = serde_json::Value::String(n.to_string());
                             }
+                            (Some(n), Some("RANGE")) => {
+                                entry["sort_key"] = serde_json::Value::String(n.to_string());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1789,12 +1787,11 @@ impl McpServer {
         // order the raw request's Deserialize runs them in. Reversed, a create
         // missing a member answers a serde error where the wire names the
         // member and its path.
-        if let Some(ref canonical) = canonical_updates {
-            if let Some(msg) =
+        if let Some(ref canonical) = canonical_updates
+            && let Some(msg) =
                 crate::actions::update_table::vector_index_updates_request_model_error(canonical)
-            {
-                return Ok(tool_validation_error("ValidationException", &msg));
-            }
+        {
+            return Ok(tool_validation_error("ValidationException", &msg));
         }
         let vector_index_updates = match canonical_updates
             .as_ref()
@@ -2566,13 +2563,13 @@ fn flatten_table_description(desc: &crate::actions::TableDescription) -> serde_j
 
     // Capacity settings only appear in the mode they belong to: zeroed
     // provisioned throughput on an on-demand table is noise, not signal.
-    if billing_mode == "PROVISIONED" {
-        if let Some(ref pt) = desc.provisioned_throughput {
-            flat["provisioned_throughput"] = serde_json::json!({
-                "read_capacity_units": pt.read_capacity_units,
-                "write_capacity_units": pt.write_capacity_units,
-            });
-        }
+    if billing_mode == "PROVISIONED"
+        && let Some(ref pt) = desc.provisioned_throughput
+    {
+        flat["provisioned_throughput"] = serde_json::json!({
+            "read_capacity_units": pt.read_capacity_units,
+            "write_capacity_units": pt.write_capacity_units,
+        });
     }
     if let Some(ref odt) = desc.on_demand_throughput {
         flat["on_demand_throughput"] = serde_json::json!({

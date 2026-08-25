@@ -268,10 +268,10 @@ async fn execute_inner<S: StorageBackend>(
                     if let Some(v) = item.get(&key_schema.partition_key) {
                         keys.insert(key_schema.partition_key.clone(), v.clone());
                     }
-                    if let Some(ref sk_name) = key_schema.sort_key {
-                        if let Some(v) = item.get(sk_name) {
-                            keys.insert(sk_name.clone(), v.clone());
-                        }
+                    if let Some(ref sk_name) = key_schema.sort_key
+                        && let Some(v) = item.get(sk_name)
+                    {
+                        keys.insert(sk_name.clone(), v.clone());
                     }
                     serde_json::to_string(&keys).unwrap_or_default()
                 };

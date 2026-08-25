@@ -136,12 +136,12 @@ pub async fn execute<S: StorageBackend>(
         }
 
         // Empty ProjectionExpression
-        if let Some(ref pe) = keys_and_attrs.projection_expression {
-            if pe.is_empty() {
-                return Err(DynoxideError::ValidationException(
-                    "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
-                ));
-            }
+        if let Some(ref pe) = keys_and_attrs.projection_expression
+            && pe.is_empty()
+        {
+            return Err(DynoxideError::ValidationException(
+                "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+            ));
         }
 
         // Duplicate AttributesToGet check (must come before duplicate keys check)

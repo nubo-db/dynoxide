@@ -60,10 +60,10 @@ pub async fn execute<S: StorageBackend>(
         .collect();
 
     // Apply ExclusiveStartStreamArn pagination
-    if let Some(ref start_arn) = request.exclusive_start_stream_arn {
-        if let Some(pos) = summaries.iter().position(|s| &s.stream_arn == start_arn) {
-            summaries = summaries.split_off(pos + 1);
-        }
+    if let Some(ref start_arn) = request.exclusive_start_stream_arn
+        && let Some(pos) = summaries.iter().position(|s| &s.stream_arn == start_arn)
+    {
+        summaries = summaries.split_off(pos + 1);
     }
 
     // Apply limit

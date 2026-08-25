@@ -96,47 +96,46 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         }
 
         // Select enum
-        if let Some(ref sel) = raw.select {
-            if ![
+        if let Some(ref sel) = raw.select
+            && ![
                 "ALL_ATTRIBUTES",
                 "ALL_PROJECTED_ATTRIBUTES",
                 "COUNT",
                 "SPECIFIC_ATTRIBUTES",
             ]
             .contains(&sel.as_str())
-            {
-                errors.push(format!(
+        {
+            errors.push(format!(
                     "Value '{}' at 'select' failed to satisfy constraint: \
                      Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
                     sel
                 ));
-            }
         }
 
         // Limit must be >= 1.
         // AWS DynamoDB's Scan message diverges from Query: Scan keeps the rejected
         // value and lowercases 'limit', whereas Query omits the value and uses
         // capital 'Limit'. Do not collapse these into a shared helper.
-        if let Some(limit) = raw.limit {
-            if limit == 0 {
-                errors.push(
-                    "Value '0' at 'limit' failed to satisfy constraint: \
+        if let Some(limit) = raw.limit
+            && limit == 0
+        {
+            errors.push(
+                "Value '0' at 'limit' failed to satisfy constraint: \
                      Member must have value greater than or equal to 1"
-                        .to_string(),
-                );
-            }
+                    .to_string(),
+            );
         }
 
         // Segment must be >= 0. (Segment vs TotalSegments and the TotalSegments
         // range are checked in execute().)
-        if let Some(segment) = raw.segment {
-            if segment < 0 {
-                errors.push(format!(
-                    "Value '{}' at 'segment' failed to satisfy constraint: \
+        if let Some(segment) = raw.segment
+            && segment < 0
+        {
+            errors.push(format!(
+                "Value '{}' at 'segment' failed to satisfy constraint: \
                      Member must have value greater than or equal to 0",
-                    segment
-                ));
-            }
+                segment
+            ));
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -238,29 +237,24 @@ pub async fn execute<S: StorageBackend>(
     };
 
     // Convert legacy ScanFilter to FilterExpression if no expression is set
-    if request.filter_expression.is_none() {
-        if let Some(ref sf_val) = request.scan_filter {
-            if let Ok(sf) =
-                serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(sf_val.clone())
-            {
-                if !sf.is_empty() {
-                    let converted = helpers::convert_filter_conditions(
-                        &sf,
-                        request.conditional_operator.as_deref(),
-                    )?;
-                    if !converted.expression.is_empty() {
-                        request.filter_expression = Some(converted.expression);
-                        let expr_values = request
-                            .expression_attribute_values
-                            .get_or_insert_with(HashMap::new);
-                        expr_values.extend(converted.attribute_values);
-                        let expr_names = request
-                            .expression_attribute_names
-                            .get_or_insert_with(HashMap::new);
-                        expr_names.extend(converted.attribute_names);
-                    }
-                }
-            }
+    if request.filter_expression.is_none()
+        && let Some(ref sf_val) = request.scan_filter
+        && let Ok(sf) =
+            serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(sf_val.clone())
+        && !sf.is_empty()
+    {
+        let converted =
+            helpers::convert_filter_conditions(&sf, request.conditional_operator.as_deref())?;
+        if !converted.expression.is_empty() {
+            request.filter_expression = Some(converted.expression);
+            let expr_values = request
+                .expression_attribute_values
+                .get_or_insert_with(HashMap::new);
+            expr_values.extend(converted.attribute_values);
+            let expr_names = request
+                .expression_attribute_names
+                .get_or_insert_with(HashMap::new);
+            expr_names.extend(converted.attribute_names);
         }
     }
 
@@ -329,12 +323,12 @@ pub async fn execute<S: StorageBackend>(
             }
         }
     }
-    if let Some(ref proj_expr_str) = request.projection_expression {
-        if proj_expr_str.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref proj_expr_str) = request.projection_expression
+        && proj_expr_str.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+        ));
     }
 
     // SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet
@@ -349,20 +343,19 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // A ProjectionExpression is only valid with Select = SPECIFIC_ATTRIBUTES.
-    if request.projection_expression.is_some() {
-        if let Some(select) = request.select.as_deref() {
-            if select != "SPECIFIC_ATTRIBUTES" {
-                // AWS phrases COUNT as "only the Count"; other values use the literal.
-                let target = if select == "COUNT" {
-                    "only the Count"
-                } else {
-                    select
-                };
-                return Err(DynoxideError::ValidationException(format!(
-                    "Cannot specify the ProjectionExpression when choosing to get {target}"
-                )));
-            }
-        }
+    if request.projection_expression.is_some()
+        && let Some(select) = request.select.as_deref()
+        && select != "SPECIFIC_ATTRIBUTES"
+    {
+        // AWS phrases COUNT as "only the Count"; other values use the literal.
+        let target = if select == "COUNT" {
+            "only the Count"
+        } else {
+            select
+        };
+        return Err(DynoxideError::ValidationException(format!(
+            "Cannot specify the ProjectionExpression when choosing to get {target}"
+        )));
     }
 
     // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
@@ -439,24 +432,22 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Check ALL_ATTRIBUTES on global index (between index key check and table key check)
-    if let Some(ref index_name) = request.index_name {
-        if !is_lsi {
-            if let Some(ref select) = request.select {
-                if select == "ALL_ATTRIBUTES" {
-                    // Check if index projection is ALL
-                    let gsi_defs = super::gsi::parse_gsi_defs(&meta)?;
-                    if let Some(gsi) = gsi_defs.iter().find(|g| g.index_name == *index_name) {
-                        if gsi.projection_type != crate::types::ProjectionType::ALL {
-                            return Err(DynoxideError::ValidationException(format!(
-                                "One or more parameter values were invalid: \
+    if let Some(ref index_name) = request.index_name
+        && !is_lsi
+        && let Some(ref select) = request.select
+        && select == "ALL_ATTRIBUTES"
+    {
+        // Check if index projection is ALL
+        let gsi_defs = super::gsi::parse_gsi_defs(&meta)?;
+        if let Some(gsi) = gsi_defs.iter().find(|g| g.index_name == *index_name)
+            && gsi.projection_type != crate::types::ProjectionType::ALL
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "One or more parameter values were invalid: \
                                  Select type ALL_ATTRIBUTES is not supported for global secondary index {} \
                                  because its projection type is not ALL",
-                                index_name
-                            )));
-                        }
-                    }
-                }
-            }
+                index_name
+            )));
         }
     }
 
@@ -560,10 +551,10 @@ pub async fn execute<S: StorageBackend>(
             if !base_key_attrs.contains(&effective_pk) {
                 index_key_attrs.push(effective_pk.clone());
             }
-            if let Some(ref sk) = effective_sk {
-                if !base_key_attrs.contains(sk) {
-                    index_key_attrs.push(sk.clone());
-                }
+            if let Some(ref sk) = effective_sk
+                && !base_key_attrs.contains(sk)
+            {
+                index_key_attrs.push(sk.clone());
             }
         }
         if let Some((attr, is_index)) = expressions::condition::check_non_scalar_key_access(
@@ -624,10 +615,10 @@ pub async fn execute<S: StorageBackend>(
         if !key_attrs.contains(&table_key_schema.partition_key) {
             key_attrs.push(table_key_schema.partition_key.clone());
         }
-        if let Some(ref sk) = table_key_schema.sort_key {
-            if !key_attrs.contains(sk) {
-                key_attrs.push(sk.clone());
-            }
+        if let Some(ref sk) = table_key_schema.sort_key
+            && !key_attrs.contains(sk)
+        {
+            key_attrs.push(sk.clone());
         }
     }
 
@@ -706,34 +697,31 @@ pub async fn execute<S: StorageBackend>(
             if let Some(pk_val) = item.get(&effective_pk) {
                 key.insert(effective_pk.clone(), pk_val.clone());
             }
-            if let Some(ref sk_name) = effective_sk {
-                if let Some(sk_val) = item.get(sk_name) {
-                    key.insert(sk_name.clone(), sk_val.clone());
-                }
+            if let Some(ref sk_name) = effective_sk
+                && let Some(sk_val) = item.get(sk_name)
+            {
+                key.insert(sk_name.clone(), sk_val.clone());
             }
             // For LSI scans, add the table sort key if different from the index sort key
-            if is_lsi {
-                if let Some(tsk) = table_key_schema.sort_key.as_deref() {
-                    if !key.contains_key(tsk) {
-                        if let Some(v) = item.get(tsk) {
-                            key.insert(tsk.to_string(), v.clone());
-                        }
-                    }
-                }
+            if is_lsi
+                && let Some(tsk) = table_key_schema.sort_key.as_deref()
+                && !key.contains_key(tsk)
+                && let Some(v) = item.get(tsk)
+            {
+                key.insert(tsk.to_string(), v.clone());
             }
             // For GSI scans, add the base table primary key (pk and sk)
             if is_gsi_scan {
-                if !key.contains_key(&table_key_schema.partition_key) {
-                    if let Some(v) = item.get(&table_key_schema.partition_key) {
-                        key.insert(table_key_schema.partition_key.clone(), v.clone());
-                    }
+                if !key.contains_key(&table_key_schema.partition_key)
+                    && let Some(v) = item.get(&table_key_schema.partition_key)
+                {
+                    key.insert(table_key_schema.partition_key.clone(), v.clone());
                 }
-                if let Some(ref tsk) = table_key_schema.sort_key {
-                    if !key.contains_key(tsk) {
-                        if let Some(v) = item.get(tsk) {
-                            key.insert(tsk.clone(), v.clone());
-                        }
-                    }
+                if let Some(ref tsk) = table_key_schema.sort_key
+                    && !key.contains_key(tsk)
+                    && let Some(v) = item.get(tsk)
+                {
+                    key.insert(tsk.clone(), v.clone());
                 }
             }
             key

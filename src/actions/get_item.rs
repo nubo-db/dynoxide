@@ -70,14 +70,14 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
         }
 
         // AttributesToGet length check
-        if let Some(ref atg) = raw.attributes_to_get {
-            if atg.is_empty() {
-                errors.push(
-                    "Value '[]' at 'attributesToGet' failed to satisfy constraint: \
+        if let Some(ref atg) = raw.attributes_to_get
+            && atg.is_empty()
+        {
+            errors.push(
+                "Value '[]' at 'attributesToGet' failed to satisfy constraint: \
                      Member must have length greater than or equal to 1"
-                        .to_string(),
-                );
-            }
+                    .to_string(),
+            );
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -141,12 +141,12 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Validate empty ProjectionExpression
-    if let Some(ref pe) = request.projection_expression {
-        if pe.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref pe) = request.projection_expression
+        && pe.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+        ));
     }
 
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;

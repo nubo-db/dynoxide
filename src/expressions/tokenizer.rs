@@ -417,12 +417,11 @@ pub fn check_redundant_parens(tokens: &[(Token, TokenSpan)]) -> Result<(), Strin
         // Redundant when the outer group's entire content is a single
         // parenthesised group: the token after the outer `(` is itself `(`
         // and its match sits immediately before the outer `)`.
-        if matches!(toks.get(i + 1), Some(Token::LParen)) {
-            if let Some(inner_close) = match_close(i + 1) {
-                if inner_close == outer_close - 1 {
-                    return Err("The expression has redundant parentheses;".to_string());
-                }
-            }
+        if matches!(toks.get(i + 1), Some(Token::LParen))
+            && let Some(inner_close) = match_close(i + 1)
+            && inner_close == outer_close - 1
+        {
+            return Err("The expression has redundant parentheses;".to_string());
         }
     }
     Ok(())

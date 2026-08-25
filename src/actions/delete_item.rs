@@ -84,27 +84,26 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
         }
 
         // ReturnValues enum
-        if let Some(ref rv) = raw.return_values {
-            if !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
-            {
-                errors.push(format!(
-                    "Value '{}' at 'returnValues' failed to satisfy constraint: \
+        if let Some(ref rv) = raw.return_values
+            && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
+        {
+            errors.push(format!(
+                "Value '{}' at 'returnValues' failed to satisfy constraint: \
                      Member must satisfy enum value set: \
                      [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-                    rv
-                ));
-            }
+                rv
+            ));
         }
 
         // ReturnItemCollectionMetrics enum
-        if let Some(ref ricm) = raw.return_item_collection_metrics {
-            if !["SIZE", "NONE"].contains(&ricm.as_str()) {
-                errors.push(format!(
-                    "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
+        if let Some(ref ricm) = raw.return_item_collection_metrics
+            && !["SIZE", "NONE"].contains(&ricm.as_str())
+        {
+            errors.push(format!(
+                "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
                      Member must satisfy enum value set: [SIZE, NONE]",
-                    ricm
-                ));
-            }
+                ricm
+            ));
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -175,12 +174,12 @@ pub async fn execute<S: StorageBackend>(
     crate::validation::validate_key_attribute_values(&request.key)?;
 
     // Validate empty ConditionExpression
-    if let Some(ref ce) = request.condition_expression {
-        if ce.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid ConditionExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref ce) = request.condition_expression
+        && ce.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid ConditionExpression: The expression can not be empty;".to_string(),
+        ));
     }
 
     // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.) before table lookup
@@ -204,44 +203,39 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Validate legacy Expected parameter BEFORE checking table existence
-    if request.condition_expression.is_none() {
-        if let Some(ref expected_val) = request.expected {
-            if let Ok(expected) = serde_json::from_value::<
-                HashMap<String, helpers::ExpectedCondition>,
-            >(expected_val.clone())
-            {
-                helpers::validate_expected_conditions(&expected)?;
-            }
-        }
+    if request.condition_expression.is_none()
+        && let Some(ref expected_val) = request.expected
+        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
+            expected_val.clone(),
+        )
+    {
+        helpers::validate_expected_conditions(&expected)?;
     }
 
     // Convert legacy Expected parameter to ConditionExpression if no expression is set
     // (validation already done above, this is the actual conversion)
-    if request.condition_expression.is_none() {
-        if let Some(ref expected_val) = request.expected {
-            if let Ok(expected) = serde_json::from_value::<
-                HashMap<String, helpers::ExpectedCondition>,
-            >(expected_val.clone())
-            {
-                if !expected.is_empty() {
-                    let (cond_expr, values) = helpers::convert_expected_to_condition(
-                        &expected,
-                        request.conditional_operator.as_deref(),
-                    )?;
-                    if !cond_expr.is_empty() {
-                        let names = helpers::expected_attr_names(&expected);
-                        request.condition_expression = Some(cond_expr);
-                        let expr_values = request
-                            .expression_attribute_values
-                            .get_or_insert_with(HashMap::new);
-                        expr_values.extend(values);
-                        let expr_names = request
-                            .expression_attribute_names
-                            .get_or_insert_with(HashMap::new);
-                        expr_names.extend(names);
-                    }
-                }
-            }
+    if request.condition_expression.is_none()
+        && let Some(ref expected_val) = request.expected
+        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
+            expected_val.clone(),
+        )
+        && !expected.is_empty()
+    {
+        let (cond_expr, values) = helpers::convert_expected_to_condition(
+            &expected,
+            request.conditional_operator.as_deref(),
+        )?;
+        if !cond_expr.is_empty() {
+            let names = helpers::expected_attr_names(&expected);
+            request.condition_expression = Some(cond_expr);
+            let expr_values = request
+                .expression_attribute_values
+                .get_or_insert_with(HashMap::new);
+            expr_values.extend(values);
+            let expr_names = request
+                .expression_attribute_names
+                .get_or_insert_with(HashMap::new);
+            expr_names.extend(names);
         }
     }
 
@@ -274,10 +268,10 @@ pub async fn execute<S: StorageBackend>(
 
     // Pre-register all expression references statically so check_unused sees
     // every :value and #name, even those in short-circuited AND/OR branches.
-    if let Some(ref cond_expr) = request.condition_expression {
-        if let Ok(parsed) = crate::expressions::condition::parse(cond_expr) {
-            tracker.track_condition_expr(&parsed);
-        }
+    if let Some(ref cond_expr) = request.condition_expression
+        && let Ok(parsed) = crate::expressions::condition::parse(cond_expr)
+    {
+        tracker.track_condition_expr(&parsed);
     }
 
     // Wrap the condition check, base delete and the GSI/LSI fan-out in a single

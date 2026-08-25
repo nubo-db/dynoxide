@@ -426,6 +426,19 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+          # These repeat the Dockerfile's LABEL block on purpose. This action
+          # emits its own defaults derived from the GitHub repo (title from the
+          # repo name, description from the repo blurb, vendor from the owner),
+          # they reach the build as `--label` arguments, and a command-line
+          # label beats a Dockerfile one for the same key. Without this the
+          # Dockerfile's labels apply to a local `docker build` and never to a
+          # published image. Keep the two in step.
+          labels: |
+            org.opencontainers.image.title=Dynoxide
+            org.opencontainers.image.description=DynamoDB emulator that starts in milliseconds. A drop-in for amazon/dynamodb-local, with no JVM.
+            org.opencontainers.image.url=https://dynoxide.dev
+            org.opencontainers.image.vendor=Martin Hicks
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
 
       - name: Build and push to GHCR
         id: build

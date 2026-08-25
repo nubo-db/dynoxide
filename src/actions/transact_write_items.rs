@@ -126,7 +126,7 @@ pub(crate) struct CachedWrite {
 
 /// Run a transactional write.
 ///
-/// Callers driving idempotency want [`execute_cached`], which also hands back
+/// Callers driving idempotency want `execute_cached`, which also hands back
 /// the sizes a replay is billed against.
 pub async fn execute<S: StorageBackend>(
     storage: &S,

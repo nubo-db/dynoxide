@@ -3,7 +3,7 @@
 //! Defines the [`StorageBackend`] trait that decouples Dynoxide's data layer
 //! from a specific SQLite binding. The native [`rusqlite`]-backed
 //! [`Storage`](crate::storage::Storage) implements the trait, and the
-//! `wasm-sqlite` build adds [`wasm_backend::WasmBridgeBackend`], which runs the
+//! `wasm-sqlite` build adds `wasm_backend::WasmBridgeBackend`, which runs the
 //! same SQL against a JS SQLite database over a wasm-bindgen bridge. Both
 //! backends issue identical SQL because they share the builders in
 //! [`sql_builders`].
@@ -252,7 +252,7 @@ mod private {
 ///
 /// The trait is not consumed dynamically today. The native
 /// [`Storage`](crate::storage::Storage) and the wasm
-/// [`WasmBridgeBackend`](wasm_backend::WasmBridgeBackend) each implement it
+/// `WasmBridgeBackend` each implement it
 /// monomorphically.
 ///
 /// The `#[allow(async_fn_in_trait)]` reflects the monomorphic-only consumption
@@ -416,9 +416,9 @@ pub trait StorageBackend: private::Sealed {
     ///
     /// Batch-shaped so a backend can amortise per-row round-trips, mirroring
     /// [`insert_gsi_items`](Self::insert_gsi_items). Used by the vector index
-    /// backfill path, and by the default [`apply_index_writes`]
-    /// (Self::apply_index_writes) with a one-row slice for live-write
-    /// maintenance.
+    /// backfill path, and by the default
+    /// [`apply_index_writes`](Self::apply_index_writes) with a one-row slice
+    /// for live-write maintenance.
     async fn insert_vector_items(
         &self,
         table_name: &str,

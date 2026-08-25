@@ -29,7 +29,7 @@ pub(crate) const HASH_BUCKETS: u32 = 4096;
 /// Uses `MD5("Outliers" + key_bytes)` where `key_bytes` depends on the
 /// attribute type:
 /// - `S`: UTF-8 bytes of the string
-/// - `N`: Oracle packed BCD encoding via [`num_to_buffer`]
+/// - `N`: Oracle packed BCD encoding via `num_to_buffer`
 /// - `B`: raw binary bytes
 ///
 /// This matches dynalite's `hashPrefix` function.

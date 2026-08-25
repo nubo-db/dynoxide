@@ -123,6 +123,7 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - `partiql::executor::statement_target` is removed. Use `statement_target_in`, which takes a table the caller has already resolved.
 - `partiql::executor::execute_page` takes three further arguments: `consistent_read`, `capacity_mode` and an optional `resolved` table.
 - `partiql::parser::parse` returns `Result<Statement, ParseError>` rather than `Result<Statement, String>`.
+- `WASM_PREVIEW` is renamed `WASM_BACKEND`. It named a maturity level on a build that is no longer a preview, and 1.0.0 freezes the constant into the version contract, so renaming it later would have cost a major. The value and meaning are unchanged: `true` under `wasm-sqlite`, `false` otherwise.
 - `partiql::parser::WhereClause::from_conditions` and `from_groups` are removed. Use `from_groups_written`, which also takes whether the clause as written joined anything with `OR`.
 - `partiql::parser::CompOp` is a re-export of `expressions::condition::CompOp` rather than its own enum.
 

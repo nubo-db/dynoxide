@@ -411,7 +411,7 @@ fn clear_claim<T>(cache: &Mutex<TokenCache<T>>, token: &str, claimed_at: Instant
     Ok(())
 }
 
-/// [`run_idempotent`] for a caller that cannot block.
+/// `run_idempotent` for a caller that cannot block.
 ///
 /// Takes a future rather than a closure, because the wasm engine awaits real
 /// bridge promises. That rules out holding the cache lock across the call, so
@@ -921,7 +921,7 @@ impl Database<RusqliteBackend> {
 
     /// Execute a transactional write (up to 100 actions, all-or-nothing).
     ///
-    /// Honours `ClientRequestToken` idempotency via [`run_idempotent`]: a
+    /// Honours `ClientRequestToken` idempotency via `run_idempotent`: a
     /// same-token, same-items call within the expiry window replays the stored
     /// result (reported as transactional read capacity) without re-applying the
     /// writes.
@@ -1041,11 +1041,11 @@ impl Database<RusqliteBackend> {
 
     /// Execute PartiQL statements transactionally (all-or-nothing).
     ///
-    /// Honours `ClientRequestToken` idempotency via [`run_idempotent`], the same
+    /// Honours `ClientRequestToken` idempotency via `run_idempotent`, the same
     /// way as [`transact_write_items`](Self::transact_write_items): a same-token,
     /// same-statements call within the expiry window replays the stored result
     /// without re-applying the statements. The cache is separate from the
-    /// `TransactWriteItems` one (see [`ExecuteTransactionTokenCache`]).
+    /// `TransactWriteItems` one (see `ExecuteTransactionTokenCache`).
     pub fn execute_transaction(
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,

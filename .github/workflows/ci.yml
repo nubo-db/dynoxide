@@ -126,6 +126,23 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      # The script existed but no workflow called it, so the stale version pins
+      # and leftover preview wording it looks for could reach a release with
+      # nothing objecting. Needs no toolchain; it rides here because this job
+      # is already the home for checks that must pass rather than inform.
+      - name: Check for stale version pins and preview wording in docs
+        run: scripts/check-stale-docs.sh
+
+      # Nothing built the docs, so broken intra-doc links accumulated unseen:
+      # ten of them, half pointing at private items and half at cfg-gated ones
+      # absent from the default build docs.rs renders. They degrade the
+      # published API docs rather than failing the build, which is exactly why
+      # nobody noticed.
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --lib
+
   benchmark-scripts:
     name: Benchmark script tests
     runs-on: ubuntu-latest

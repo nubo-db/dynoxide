@@ -158,17 +158,16 @@ fn run_vector_write_validation(
 
     for vix in &vixs {
         let vector_attr = vix.vector_attribute.attribute_name.as_str();
-        if let Some(val) = item.get(vector_attr) {
-            if changed(vector_attr, val) {
-                if let Err(e) = crate::types::check_vector_f32_values(val, vix.dimensions) {
-                    return Err(DynoxideError::ValidationException(vector_value_message(
-                        &e,
-                        vector_attr,
-                        vix.dimensions,
-                        &vix.index_name,
-                    )));
-                }
-            }
+        if let Some(val) = item.get(vector_attr)
+            && changed(vector_attr, val)
+            && let Err(e) = crate::types::check_vector_f32_values(val, vix.dimensions)
+        {
+            return Err(DynoxideError::ValidationException(vector_value_message(
+                &e,
+                vector_attr,
+                vix.dimensions,
+                &vix.index_name,
+            )));
         }
 
         let Some(schema) = vix.search_schema.as_ref() else {
@@ -320,22 +319,22 @@ pub(crate) fn derive_vector_row(
     let mut filter_map = serde_json::Map::new();
     if let Some(ref schema) = vix.search_schema {
         for elem in schema {
-            if elem.search_schema_element_type == "INLINE_FILTER" {
-                if let Some(v) = item.get(&elem.attribute_name) {
-                    // A filter value whose type differs from the declared
-                    // AttributeDefinitions type is rejected by a live write
-                    // (captured eu-west-2 and us-east-1, 2026-08-13), so
-                    // backfill skips the whole row, matching the HASH
-                    // mismatch treatment above.
-                    if mismatched_attr_def(attr_defs, &elem.attribute_name, v).is_some() {
-                        return Ok(None);
-                    }
-                    filter_map.insert(
-                        elem.attribute_name.clone(),
-                        serde_json::to_value(v)
-                            .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?,
-                    );
+            if elem.search_schema_element_type == "INLINE_FILTER"
+                && let Some(v) = item.get(&elem.attribute_name)
+            {
+                // A filter value whose type differs from the declared
+                // AttributeDefinitions type is rejected by a live write
+                // (captured eu-west-2 and us-east-1, 2026-08-13), so
+                // backfill skips the whole row, matching the HASH
+                // mismatch treatment above.
+                if mismatched_attr_def(attr_defs, &elem.attribute_name, v).is_some() {
+                    return Ok(None);
                 }
+                filter_map.insert(
+                    elem.attribute_name.clone(),
+                    serde_json::to_value(v)
+                        .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?,
+                );
             }
         }
     }
@@ -421,10 +420,10 @@ fn build_vector_index_item(
             if let Some(v) = item.get(pk_attr) {
                 projected.insert(pk_attr.to_string(), v.clone());
             }
-            if let Some(sk) = sk_attr {
-                if let Some(v) = item.get(sk) {
-                    projected.insert(sk.to_string(), v.clone());
-                }
+            if let Some(sk) = sk_attr
+                && let Some(v) = item.get(sk)
+            {
+                projected.insert(sk.to_string(), v.clone());
             }
             // SearchSchema attributes
             if let Some(ref schema) = vix.search_schema {
@@ -436,14 +435,14 @@ fn build_vector_index_item(
             }
             // Non-key attributes (INCLUDE only), the vector attribute as its
             // f32 copy when named
-            if projection_type == ProjectionType::INCLUDE {
-                if let Some(ref attrs) = vix.projection.non_key_attributes {
-                    for attr in attrs {
-                        if attr == vector_attr {
-                            projected.insert(attr.clone(), f32_value.clone());
-                        } else if let Some(v) = item.get(attr) {
-                            projected.insert(attr.clone(), v.clone());
-                        }
+            if projection_type == ProjectionType::INCLUDE
+                && let Some(ref attrs) = vix.projection.non_key_attributes
+            {
+                for attr in attrs {
+                    if attr == vector_attr {
+                        projected.insert(attr.clone(), f32_value.clone());
+                    } else if let Some(v) = item.get(attr) {
+                        projected.insert(attr.clone(), v.clone());
                     }
                 }
             }

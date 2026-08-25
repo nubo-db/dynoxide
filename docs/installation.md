@@ -52,11 +52,37 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "0.12", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "1.0", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "0.12", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "1.0", default-features = false, features = ["encryption"] }
 ```
+
+## Upgrading to 1.0.0
+
+The largest behaviour change the project has shipped. Unlike the 0.12.x and
+0.9.x notes below, this one affects anyone running the binary, not just library
+consumers. [CHANGELOG.md](../CHANGELOG.md) groups the full list under Behaviour
+changes; the shapes to expect are:
+
+**Running the binary or the container?** Requests that used to be accepted are
+now rejected, matching DynamoDB: item-size ceilings on `UpdateItem` and the
+PartiQL write surfaces, `ReturnConsumedCapacity` validation, and several
+index-qualified PartiQL `SELECT` forms. Consumed capacity figures move, so a
+test asserting exact values needs updating. A PartiQL `UPDATE` or `DELETE` can
+now match rows it previously skipped, because its `WHERE` clause runs through
+the same matcher as `SELECT`.
+
+**Depending on the `dynoxide-rs` crate?** The MSRV is now 1.88. `WASM_PREVIEW`
+is renamed `WASM_BACKEND`. `storage_backend::StorageBackend` is sealed, so it
+can still be named and used as a bound but no longer implemented outside the
+crate. Several public types gained fields and became `#[non_exhaustive]`, and a
+few signatures changed; the changelog's Breaking (Rust API) section lists each
+one.
+
+**Pinning.** Behaviour moves inside 1.x, because conformance fixes ship as
+minors. [versioning.md](versioning.md) explains the trade and how to pin
+narrower if you would rather it held still.
 
 ## Upgrading to 0.12.x
 
@@ -89,7 +115,7 @@ became `#[non_exhaustive]`:
 ## GitHub Actions
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v0.12.0
+- uses: nubo-db/dynoxide/action@v1.0.0
   with:
     snapshot-url: https://example.com/test-data.db.zst  # optional
     port: 8000
@@ -114,7 +140,12 @@ docker run --rm -p 8000:8000 \
   serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
 ```
 
-The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/h4s0n6a2/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
+Image tags follow the version: `dynoxide:1.0.0` is exact, `dynoxide:1.0` floats
+across patches, and `dynoxide:1` floats across the whole 1.x line. `:1` receives
+conformance fixes, which change behaviour within a major; `:1.0` does not. See
+`docs/versioning.md`.
+
+The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
 
 If you override `CMD` to bind to a different port, set the healthcheck target with environment variables so the container's `HEALTHCHECK` follows:
 
@@ -123,6 +154,14 @@ docker run -e DYNOXIDE_HEALTHCHECK_PORT=9000 ghcr.io/nubo-db/dynoxide serve --po
 ```
 
 `DYNOXIDE_HEALTHCHECK_HOST` and `DYNOXIDE_HEALTHCHECK_PORT` are documented public surface and will not be renamed in a patch or minor release.
+
+The container probes itself every 250ms until it first reports healthy, then
+every 30 seconds. Dynoxide boots in milliseconds, so that first probe is
+normally the only quick one and waiting on the healthcheck rather than polling
+the port resolves in well under a second. The ten second start period is
+headroom for a loaded host rather than a window a healthy container uses.
+Needs Docker Engine 25.0 or newer. See [Testcontainers](testcontainers.md) for
+how to wait on it from a test suite.
 
 ### Running as nonroot
 

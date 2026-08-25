@@ -23,11 +23,25 @@ async fn setup() -> (Client, SocketAddr) {
     });
 
     let creds = Credentials::new("fake", "fake", None, None, "test");
+    // `build_http` is `#[doc(hidden)]` upstream, so it carries no stability
+    // promise and an SDK bump inside the caret range could remove it. That
+    // shows up as this file failing to compile, which is a loud failure in a
+    // dev-dependency rather than a silent one, so it is preferred to pinning
+    // the SDK and missing its fixes.
+    //
+    // Plain HTTP, to match the endpoint. Left unset, the SDK builds its default
+    // HTTPS connector, which loads the operating system's trust store the first
+    // time a client selects it. That made this file fail on machines where the
+    // native roots cannot be read, with `TrustStore configured to enable native
+    // roots but no valid root certificates parsed`, on a connection that is
+    // never encrypted. The roots are cached in a `LazyLock`, so the first
+    // failure takes every test in the binary with it.
     let config = aws_sdk_dynamodb::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .endpoint_url(format!("http://{addr}"))
         .credentials_provider(creds)
+        .http_client(aws_smithy_http_client::Builder::new().build_http())
         .build();
 
     let client = Client::from_conf(config);

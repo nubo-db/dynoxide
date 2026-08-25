@@ -1,7 +1,7 @@
 {
   "name": "dynoxide",
   "version": "0.0.0-development",
-  "description": "Embedded DynamoDB-compatible engine. Drop-in dynalite replacement.",
+  "description": "A DynamoDB emulator for testing and CI. A single static binary that starts in milliseconds, verified against real AWS.",
   "mcpName": "io.github.nubo-db/dynoxide",
   "author": "Martin Hicks",
   "license": "(MIT OR Apache-2.0)",
@@ -17,7 +17,10 @@
     "testing",
     "database",
     "emulator",
-    "dynamodb-emulator"
+    "dynamodb-emulator",
+    "localstack",
+    "aws",
+    "mcp"
   ],
   "engines": {
     "node": ">=16"

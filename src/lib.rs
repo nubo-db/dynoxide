@@ -1,6 +1,6 @@
 //! # Dynoxide
 //!
-//! A lightweight, embeddable DynamoDB emulator backed by SQLite.
+//! An embeddable DynamoDB emulator backed by SQLite.
 //!
 //! ```rust
 //! use dynoxide::Database;
@@ -411,7 +411,7 @@ fn clear_claim<T>(cache: &Mutex<TokenCache<T>>, token: &str, claimed_at: Instant
     Ok(())
 }
 
-/// [`run_idempotent`] for a caller that cannot block.
+/// `run_idempotent` for a caller that cannot block.
 ///
 /// Takes a future rather than a closure, because the wasm engine awaits real
 /// bridge promises. That rules out holding the cache lock across the call, so
@@ -500,20 +500,23 @@ pub type NativeDatabase = Database<RusqliteBackend>;
 #[cfg(feature = "wasm-sqlite")]
 pub type WasmDatabase = Database<WasmBridgeBackend>;
 
-/// Build-visible preview marker for the wasm-sqlite backend.
+/// Build-visible discriminator for the wasm-sqlite backend.
 ///
 /// `true` when built with `--no-default-features --features wasm-sqlite`,
-/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI, and
-/// PartiQL, and passes the conformance cases for all of them, but it still
-/// leaves several operations unimplemented. Consumers can read this constant to
-/// tell whether the artifact they hold is the fully conformant native build or
-/// the wasm preview.
+/// `false` otherwise. The wasm backend covers CRUD, query, scan, GSI/LSI and
+/// PartiQL and passes the conformance cases for all of them, but it leaves
+/// several operations unimplemented (`TransactWriteItems`, streams, tags, TTL).
+/// Read this constant to tell which build you hold; see `docs/versioning.md`
+/// for what each one covers.
+///
+/// This names the build path rather than a maturity level, so it stays correct
+/// as the wasm backend matures.
 #[cfg(feature = "wasm-sqlite")]
-pub const WASM_PREVIEW: bool = true;
-/// Build-visible preview marker for the wasm-sqlite backend. See the
+pub const WASM_BACKEND: bool = true;
+/// Build-visible discriminator for the wasm-sqlite backend. See the
 /// `wasm-sqlite` variant for details.
 #[cfg(not(feature = "wasm-sqlite"))]
-pub const WASM_PREVIEW: bool = false;
+pub const WASM_BACKEND: bool = false;
 
 /// The main entry point for the DynamoDB emulator.
 ///
@@ -918,7 +921,7 @@ impl Database<RusqliteBackend> {
 
     /// Execute a transactional write (up to 100 actions, all-or-nothing).
     ///
-    /// Honours `ClientRequestToken` idempotency via [`run_idempotent`]: a
+    /// Honours `ClientRequestToken` idempotency via `run_idempotent`: a
     /// same-token, same-items call within the expiry window replays the stored
     /// result (reported as transactional read capacity) without re-applying the
     /// writes.
@@ -1038,11 +1041,11 @@ impl Database<RusqliteBackend> {
 
     /// Execute PartiQL statements transactionally (all-or-nothing).
     ///
-    /// Honours `ClientRequestToken` idempotency via [`run_idempotent`], the same
+    /// Honours `ClientRequestToken` idempotency via `run_idempotent`, the same
     /// way as [`transact_write_items`](Self::transact_write_items): a same-token,
     /// same-statements call within the expiry window replays the stored result
     /// without re-applying the statements. The cache is separate from the
-    /// `TransactWriteItems` one (see [`ExecuteTransactionTokenCache`]).
+    /// `TransactWriteItems` one (see `ExecuteTransactionTokenCache`).
     pub fn execute_transaction(
         &self,
         request: actions::execute_transaction::ExecuteTransactionRequest,

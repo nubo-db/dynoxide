@@ -395,10 +395,10 @@ fn run_index_key_validation(
         let Some(val) = item.get(&entry.attr) else {
             continue; // absent -> sparse, not an error
         };
-        if let Some(before) = before {
-            if before.get(&entry.attr) == Some(val) {
-                continue; // unchanged by this update
-            }
+        if let Some(before) = before
+            && before.get(&entry.attr) == Some(val)
+        {
+            continue; // unchanged by this update
         }
         if let Some(violation) = check_index_key_value(val, &entry.declared) {
             violations.push((entry.index_name.clone(), entry.attr.clone(), violation));
@@ -1102,14 +1102,14 @@ pub async fn build_item_collection_metrics<S: StorageBackend>(
 
     // Include LSI table sizes - DynamoDB's 10GB item collection limit applies
     // to the aggregate across base table and all LSIs.
-    if let Some(ref lsi_json) = meta.lsi_definitions {
-        if let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json) {
-            for lsi in &lsis {
-                let lsi_size = storage
-                    .get_lsi_partition_size(table_name, &lsi.index_name, pk_str)
-                    .await?;
-                partition_bytes += lsi_size;
-            }
+    if let Some(ref lsi_json) = meta.lsi_definitions
+        && let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json)
+    {
+        for lsi in &lsis {
+            let lsi_size = storage
+                .get_lsi_partition_size(table_name, &lsi.index_name, pk_str)
+                .await?;
+            partition_bytes += lsi_size;
         }
     }
 
@@ -1167,10 +1167,10 @@ pub fn convert_expected_to_condition(
             // Helper: get the single comparison value from either AttributeValueList
             // (first element) or Value. DynamoDB allows both with ComparisonOperator.
             let single_val = || -> Option<crate::types::AttributeValue> {
-                if let Some(ref avl) = cond.attribute_value_list {
-                    if avl.len() == 1 {
-                        return Some(avl[0].clone());
-                    }
+                if let Some(ref avl) = cond.attribute_value_list
+                    && avl.len() == 1
+                {
+                    return Some(avl[0].clone());
                 }
                 cond.value.clone()
             };
@@ -1486,35 +1486,34 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
             }
 
             // AttributeValueList values must be of the same type
-            if let Some(ref avl) = cond.attribute_value_list {
-                if avl.len() > 1 {
-                    let first_type = std::mem::discriminant(&avl[0]);
-                    if avl
-                        .iter()
-                        .skip(1)
-                        .any(|v| std::mem::discriminant(v) != first_type)
-                    {
-                        return Err(DynoxideError::ValidationException(
-                            "One or more parameter values were invalid: \
+            if let Some(ref avl) = cond.attribute_value_list
+                && avl.len() > 1
+            {
+                let first_type = std::mem::discriminant(&avl[0]);
+                if avl
+                    .iter()
+                    .skip(1)
+                    .any(|v| std::mem::discriminant(v) != first_type)
+                {
+                    return Err(DynoxideError::ValidationException(
+                        "One or more parameter values were invalid: \
                              AttributeValues inside AttributeValueList must be of same type"
-                                .to_string(),
-                        ));
-                    }
+                            .to_string(),
+                    ));
                 }
             }
 
             // BETWEEN order validation
-            if op == "BETWEEN" && arg_count == 2 {
-                if let Some(ref avl) = cond.attribute_value_list {
-                    if compare_attribute_values_for_between(&avl[0], &avl[1])
-                        == std::cmp::Ordering::Greater
-                    {
-                        return Err(DynoxideError::ValidationException(
+            if op == "BETWEEN"
+                && arg_count == 2
+                && let Some(ref avl) = cond.attribute_value_list
+                && compare_attribute_values_for_between(&avl[0], &avl[1])
+                    == std::cmp::Ordering::Greater
+            {
+                return Err(DynoxideError::ValidationException(
                             "The BETWEEN condition was provided a range where the lower bound is greater than the upper bound"
                                 .to_string(),
                         ));
-                    }
-                }
             }
         }
 
@@ -1589,11 +1588,11 @@ pub fn convert_key_conditions(
     // Ensure deterministic ordering: partition key first, then remaining keys sorted.
     let mut ordered_keys: Vec<&String> = key_conditions.keys().collect();
     ordered_keys.sort();
-    if let Some(pk) = partition_key_name {
-        if let Some(pos) = ordered_keys.iter().position(|k| k.as_str() == pk) {
-            let removed = ordered_keys.remove(pos);
-            ordered_keys.insert(0, removed);
-        }
+    if let Some(pk) = partition_key_name
+        && let Some(pos) = ordered_keys.iter().position(|k| k.as_str() == pk)
+    {
+        let removed = ordered_keys.remove(pos);
+        ordered_keys.insert(0, removed);
     }
 
     for attr_name in ordered_keys {
@@ -1604,76 +1603,76 @@ pub fn convert_key_conditions(
         let comp_op = cond.comparison_operator.to_uppercase();
         match comp_op.as_str() {
             "EQ" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} = {val_name}"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} = {val_name}"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "LE" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} <= {val_name}"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} <= {val_name}"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "LT" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} < {val_name}"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} < {val_name}"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "GE" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} >= {val_name}"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} >= {val_name}"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "GT" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} > {val_name}"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} > {val_name}"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "BETWEEN" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 2 {
-                        let v1 = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        let v2 = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
-                        values.insert(v1, list[0].clone());
-                        values.insert(v2, list[1].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 2
+                {
+                    let v1 = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    let v2 = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
+                    values.insert(v1, list[0].clone());
+                    values.insert(v2, list[1].clone());
                 }
             }
             "BEGINS_WITH" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":kc_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("begins_with({name_ref}, {val_name})"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":kc_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("begins_with({name_ref}, {val_name})"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             _ => {
@@ -1745,72 +1744,72 @@ pub fn convert_filter_conditions(
                     "GT" => ">",
                     _ => unreachable!(),
                 };
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":qf_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} {op_str} {val_name}"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":qf_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} {op_str} {val_name}"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "BETWEEN" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 2 {
-                        let v1 = format!(":qf_v{val_idx}");
-                        val_idx += 1;
-                        let v2 = format!(":qf_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
-                        values.insert(v1, list[0].clone());
-                        values.insert(v2, list[1].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 2
+                {
+                    let v1 = format!(":qf_v{val_idx}");
+                    val_idx += 1;
+                    let v2 = format!(":qf_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
+                    values.insert(v1, list[0].clone());
+                    values.insert(v2, list[1].clone());
                 }
             }
             "BEGINS_WITH" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":qf_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("begins_with({name_ref}, {val_name})"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":qf_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("begins_with({name_ref}, {val_name})"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "CONTAINS" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":qf_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("contains({name_ref}, {val_name})"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":qf_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("contains({name_ref}, {val_name})"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "NOT_CONTAINS" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if list.len() == 1 {
-                        let val_name = format!(":qf_v{val_idx}");
-                        val_idx += 1;
-                        parts.push(format!("NOT contains({name_ref}, {val_name})"));
-                        values.insert(val_name, list[0].clone());
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && list.len() == 1
+                {
+                    let val_name = format!(":qf_v{val_idx}");
+                    val_idx += 1;
+                    parts.push(format!("NOT contains({name_ref}, {val_name})"));
+                    values.insert(val_name, list[0].clone());
                 }
             }
             "IN" => {
-                if let Some(ref list) = cond.attribute_value_list {
-                    if !list.is_empty() {
-                        let val_names: Vec<String> = list
-                            .iter()
-                            .map(|v| {
-                                let name = format!(":qf_v{val_idx}");
-                                val_idx += 1;
-                                values.insert(name.clone(), v.clone());
-                                name
-                            })
-                            .collect();
-                        parts.push(format!("{name_ref} IN ({})", val_names.join(", ")));
-                    }
+                if let Some(ref list) = cond.attribute_value_list
+                    && !list.is_empty()
+                {
+                    let val_names: Vec<String> = list
+                        .iter()
+                        .map(|v| {
+                            let name = format!(":qf_v{val_idx}");
+                            val_idx += 1;
+                            values.insert(name.clone(), v.clone());
+                            name
+                        })
+                        .collect();
+                    parts.push(format!("{name_ref} IN ({})", val_names.join(", ")));
                 }
             }
             _ => {}
@@ -2048,12 +2047,12 @@ pub fn validate_esk_count_and_index_keys(
                     ));
                 }
             };
-            if let Some(def) = attr_defs.iter().find(|d| d.attribute_name == *attr) {
-                if !attr_value_matches_scalar_type(val, &def.attribute_type) {
-                    return Err(DynoxideError::ValidationException(
-                        "The provided key element does not match the schema".to_string(),
-                    ));
-                }
+            if let Some(def) = attr_defs.iter().find(|d| d.attribute_name == *attr)
+                && !attr_value_matches_scalar_type(val, &def.attribute_type)
+            {
+                return Err(DynoxideError::ValidationException(
+                    "The provided key element does not match the schema".to_string(),
+                ));
             }
         }
     }
@@ -2095,19 +2094,17 @@ pub fn validate_esk_table_keys(
 
     // Check types of table key attributes
     for key_elem in &table_key_schema {
-        if let Some(val) = table_key_subset.get(&key_elem.attribute_name) {
-            if let Some(def) = attr_defs
+        if let Some(val) = table_key_subset.get(&key_elem.attribute_name)
+            && let Some(def) = attr_defs
                 .iter()
                 .find(|d| d.attribute_name == key_elem.attribute_name)
-            {
-                if !attr_value_matches_scalar_type(val, &def.attribute_type) {
-                    return Err(DynoxideError::ValidationException(
-                        "The provided starting key is invalid: \
+            && !attr_value_matches_scalar_type(val, &def.attribute_type)
+        {
+            return Err(DynoxideError::ValidationException(
+                "The provided starting key is invalid: \
                          The provided key element does not match the schema"
-                            .to_string(),
-                    ));
-                }
-            }
+                    .to_string(),
+            ));
         }
     }
 
@@ -2117,23 +2114,22 @@ pub fn validate_esk_table_keys(
 /// Get the key schema elements for a GSI or LSI by index name.
 fn get_index_key_schema(meta: &TableMetadata, index_name: &str) -> Result<Vec<KeySchemaElement>> {
     // Check LSIs first
-    if let Some(ref lsi_json) = meta.lsi_definitions {
-        if let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json) {
-            for lsi in &lsis {
-                if lsi.index_name == index_name {
-                    return Ok(lsi.key_schema.clone());
-                }
+    if let Some(ref lsi_json) = meta.lsi_definitions
+        && let Ok(lsis) = serde_json::from_str::<Vec<crate::types::LocalSecondaryIndex>>(lsi_json)
+    {
+        for lsi in &lsis {
+            if lsi.index_name == index_name {
+                return Ok(lsi.key_schema.clone());
             }
         }
     }
     // Check GSIs
-    if let Some(ref gsi_json) = meta.gsi_definitions {
-        if let Ok(gsis) = serde_json::from_str::<Vec<crate::types::GlobalSecondaryIndex>>(gsi_json)
-        {
-            for gsi in &gsis {
-                if gsi.index_name == index_name {
-                    return Ok(gsi.key_schema.clone());
-                }
+    if let Some(ref gsi_json) = meta.gsi_definitions
+        && let Ok(gsis) = serde_json::from_str::<Vec<crate::types::GlobalSecondaryIndex>>(gsi_json)
+    {
+        for gsi in &gsis {
+            if gsi.index_name == index_name {
+                return Ok(gsi.key_schema.clone());
             }
         }
     }
@@ -2196,12 +2192,12 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
         }
 
         // Type compatibility validation
-        if let Some(arr) = avl {
-            if !arr.is_empty() {
-                let first_type = attr_value_type_name_from_json(&arr[0]);
-                if let Some(type_name) = first_type {
-                    validate_comparison_type_compat(comp_op, type_name)?;
-                }
+        if let Some(arr) = avl
+            && !arr.is_empty()
+        {
+            let first_type = attr_value_type_name_from_json(&arr[0]);
+            if let Some(type_name) = first_type {
+                validate_comparison_type_compat(comp_op, type_name)?;
             }
         }
     }
@@ -2266,42 +2262,42 @@ pub fn validate_filter_conditions_raw(
         };
 
         // Validate AttributeValueList entries
-        if let Some(avl) = cond_obj.get("AttributeValueList") {
-            if let Some(arr) = avl.as_array() {
-                for av_val in arr {
-                    // Try to deserialize each AttributeValue to trigger validation
-                    match serde_json::from_value::<AttributeValue>(av_val.clone()) {
-                        Err(e) => {
-                            let msg = e.to_string();
-                            // Strip the serde position suffix and any internal marker
-                            let inner = crate::serde_errors::clean_serde_message(&msg);
+        if let Some(avl) = cond_obj.get("AttributeValueList")
+            && let Some(arr) = avl.as_array()
+        {
+            for av_val in arr {
+                // Try to deserialize each AttributeValue to trigger validation
+                match serde_json::from_value::<AttributeValue>(av_val.clone()) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // Strip the serde position suffix and any internal marker
+                        let inner = crate::serde_errors::clean_serde_message(&msg);
 
-                            if inner.contains("empty AttributeValue")
-                                || (inner.contains("Supplied AttributeValue")
-                                    && inner.contains("empty"))
-                            {
-                                return Err(DynoxideError::ValidationException(
+                        if inner.contains("empty AttributeValue")
+                            || (inner.contains("Supplied AttributeValue")
+                                && inner.contains("empty"))
+                        {
+                            return Err(DynoxideError::ValidationException(
                                     "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes".to_string()
                                 ));
-                            } else if inner.contains("more than one datatypes") {
-                                return Err(DynoxideError::ValidationException(
-                                    "Supplied AttributeValue has more than one datatypes set, \
+                        } else if inner.contains("more than one datatypes") {
+                            return Err(DynoxideError::ValidationException(
+                                "Supplied AttributeValue has more than one datatypes set, \
                                      must contain exactly one of the supported datatypes"
-                                        .to_string(),
-                                ));
-                            } else if inner.contains("cannot be converted to a numeric value")
-                                || inner.contains("significant digits")
-                                || inner.contains("Number overflow")
-                                || inner.contains("Number underflow")
-                            {
-                                return Err(DynoxideError::ValidationException(inner.to_string()));
-                            }
-                            // Let other errors pass through for now
+                                    .to_string(),
+                            ));
+                        } else if inner.contains("cannot be converted to a numeric value")
+                            || inner.contains("significant digits")
+                            || inner.contains("Number overflow")
+                            || inner.contains("Number underflow")
+                        {
+                            return Err(DynoxideError::ValidationException(inner.to_string()));
                         }
-                        Ok(av) => {
-                            // Validate parsed value (NULL:false, empty sets, duplicates, numbers)
-                            validate_filter_attribute_value(&av)?;
-                        }
+                        // Let other errors pass through for now
+                    }
+                    Ok(av) => {
+                        // Validate parsed value (NULL:false, empty sets, duplicates, numbers)
+                        validate_filter_attribute_value(&av)?;
                     }
                 }
             }

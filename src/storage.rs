@@ -29,7 +29,7 @@ pub(crate) const HASH_BUCKETS: u32 = 4096;
 /// Uses `MD5("Outliers" + key_bytes)` where `key_bytes` depends on the
 /// attribute type:
 /// - `S`: UTF-8 bytes of the string
-/// - `N`: Oracle packed BCD encoding via [`num_to_buffer`]
+/// - `N`: Oracle packed BCD encoding via `num_to_buffer`
 /// - `B`: raw binary bytes
 ///
 /// This matches dynalite's `hashPrefix` function.
@@ -320,15 +320,15 @@ impl Storage {
     /// If a SQLite error is SQLITE_NOTADB, return a clearer error message
     /// suggesting the database may be encrypted.
     fn maybe_encrypted_error(err: DynoxideError) -> DynoxideError {
-        if let DynoxideError::SqliteError(ref sqlite_err) = err {
-            if let Some(rusqlite::ErrorCode::NotADatabase) = sqlite_err.sqlite_error_code() {
-                return DynoxideError::InternalServerError(
-                    "Database file is encrypted or not a valid SQLite database. \
+        if let DynoxideError::SqliteError(ref sqlite_err) = err
+            && let Some(rusqlite::ErrorCode::NotADatabase) = sqlite_err.sqlite_error_code()
+        {
+            return DynoxideError::InternalServerError(
+                "Database file is encrypted or not a valid SQLite database. \
                      If encrypted, enable the `encryption` or `encryption-cc` feature \
                      and use Database::new_encrypted() with the correct key."
-                        .to_string(),
-                );
-            }
+                    .to_string(),
+            );
         }
         err
     }
@@ -532,31 +532,31 @@ impl Storage {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         for (table_name, gsi_json, lsi_json) in &tables {
-            if let Some(json) = gsi_json {
-                if let Ok(gsis) = serde_json::from_str::<Vec<serde_json::Value>>(json) {
-                    for gsi in &gsis {
-                        if let Some(idx) = gsi.get("IndexName").and_then(|v| v.as_str()) {
-                            let gsi_table = escape_table_name(&format!("{table_name}::gsi::{idx}"));
-                            let idx_name =
-                                escape_table_name(&format!("{table_name}::gsi::{idx}::base_key"));
-                            let _ = self.conn.execute_batch(&format!(
+            if let Some(json) = gsi_json
+                && let Ok(gsis) = serde_json::from_str::<Vec<serde_json::Value>>(json)
+            {
+                for gsi in &gsis {
+                    if let Some(idx) = gsi.get("IndexName").and_then(|v| v.as_str()) {
+                        let gsi_table = escape_table_name(&format!("{table_name}::gsi::{idx}"));
+                        let idx_name =
+                            escape_table_name(&format!("{table_name}::gsi::{idx}::base_key"));
+                        let _ = self.conn.execute_batch(&format!(
                                 "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{gsi_table}\" (table_pk, table_sk)"
                             ));
-                        }
                     }
                 }
             }
-            if let Some(json) = lsi_json {
-                if let Ok(lsis) = serde_json::from_str::<Vec<serde_json::Value>>(json) {
-                    for lsi in &lsis {
-                        if let Some(idx) = lsi.get("IndexName").and_then(|v| v.as_str()) {
-                            let lsi_table = escape_table_name(&format!("{table_name}::lsi::{idx}"));
-                            let idx_name =
-                                escape_table_name(&format!("{table_name}::lsi::{idx}::base_key"));
-                            let _ = self.conn.execute_batch(&format!(
+            if let Some(json) = lsi_json
+                && let Ok(lsis) = serde_json::from_str::<Vec<serde_json::Value>>(json)
+            {
+                for lsi in &lsis {
+                    if let Some(idx) = lsi.get("IndexName").and_then(|v| v.as_str()) {
+                        let lsi_table = escape_table_name(&format!("{table_name}::lsi::{idx}"));
+                        let idx_name =
+                            escape_table_name(&format!("{table_name}::lsi::{idx}::base_key"));
+                        let _ = self.conn.execute_batch(&format!(
                                 "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{lsi_table}\" (base_pk, base_sk)"
                             ));
-                        }
                     }
                 }
             }
@@ -659,10 +659,9 @@ impl Storage {
         if let Err(e) = self
             .conn
             .execute(sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
+            && !sql_builders::is_duplicate_column_error(&e.to_string())
         {
-            if !sql_builders::is_duplicate_column_error(&e.to_string()) {
-                return Err(e.into());
-            }
+            return Err(e.into());
         }
 
         self.conn.execute(

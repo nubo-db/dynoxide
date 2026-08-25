@@ -50,14 +50,14 @@ pub async fn execute<S: StorageBackend>(
         })?;
 
     // Validate: cannot enable TTL if it's already enabled with a different attribute
-    if request.time_to_live_specification.enabled && meta.ttl_enabled {
-        if let Some(ref existing_attr) = meta.ttl_attribute {
-            if existing_attr != &request.time_to_live_specification.attribute_name {
-                return Err(DynoxideError::ValidationException(
-                    "TimeToLive is already enabled with a different attribute name".to_string(),
-                ));
-            }
-        }
+    if request.time_to_live_specification.enabled
+        && meta.ttl_enabled
+        && let Some(ref existing_attr) = meta.ttl_attribute
+        && existing_attr != &request.time_to_live_specification.attribute_name
+    {
+        return Err(DynoxideError::ValidationException(
+            "TimeToLive is already enabled with a different attribute name".to_string(),
+        ));
     }
 
     let attr_name = if request.time_to_live_specification.enabled {

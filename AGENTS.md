@@ -32,8 +32,10 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 ## Rust conventions
 
 - Edition: 2024 (declared in `Cargo.toml`).
-- MSRV: 1.85 (declared as `rust-version` in `Cargo.toml`). Do not use
-  features that raise it.
+- MSRV: 1.88 (declared as `rust-version` in `Cargo.toml`). Do not use
+  features that raise it. The `msrv` CI job reads the declared value and
+  compiles against it, so raising the floor is a deliberate edit rather than
+  something a new language feature can do quietly.
 - Formatting: `cargo fmt --check` must pass.
 - Linting: `cargo clippy -- -D warnings` must pass. Warnings are
   errors; fix them rather than silencing.

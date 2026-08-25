@@ -343,18 +343,18 @@ fn parse_single_condition(
     }
 
     // Check for begins_with function
-    if let Some(Token::Identifier(name)) = stream.peek() {
-        if name.to_lowercase() == "begins_with" {
-            stream.next();
-            stream.expect(&Token::LParen)?;
-            let path = parse_raw_path(stream)?;
-            let attr_name = resolve_path_to_name(&path, tracker)?;
-            stream.expect(&Token::Comma)?;
-            let val_ref = expect_value_ref(stream)?;
-            stream.expect(&Token::RParen)?;
-            consume_close_parens(stream, parens)?;
-            return Ok(ParsedCond::BeginsWith(attr_name, val_ref));
-        }
+    if let Some(Token::Identifier(name)) = stream.peek()
+        && name.to_lowercase() == "begins_with"
+    {
+        stream.next();
+        stream.expect(&Token::LParen)?;
+        let path = parse_raw_path(stream)?;
+        let attr_name = resolve_path_to_name(&path, tracker)?;
+        stream.expect(&Token::Comma)?;
+        let val_ref = expect_value_ref(stream)?;
+        stream.expect(&Token::RParen)?;
+        consume_close_parens(stream, parens)?;
+        return Ok(ParsedCond::BeginsWith(attr_name, val_ref));
     }
 
     // Reversed operand order (:val op #attr). AWS accepts the value on the left

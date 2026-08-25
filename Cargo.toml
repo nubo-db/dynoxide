@@ -1,16 +1,16 @@
 [package]
 name = "dynoxide-rs"
-version = "0.13.0"
+version = "1.0.0"
 edition = "2024"
-description = "A lightweight, embeddable DynamoDB emulator backed by SQLite"
+description = "An embeddable DynamoDB emulator backed by SQLite. Starts in under a millisecond, and is verified against real AWS by a public conformance suite."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nubo-db/dynoxide"
 homepage = "https://github.com/nubo-db/dynoxide"
 documentation = "https://docs.rs/dynoxide-rs"
 readme = "README.md"
-keywords = ["dynamodb", "sqlite", "emulator", "aws", "database"]
-categories = ["database", "emulators"]
-rust-version = "1.85"
+keywords = ["dynamodb", "sqlite", "emulator", "aws", "testing"]
+categories = ["database-implementations", "emulators"]
+rust-version = "1.88"
 
 [lib]
 name = "dynoxide"
@@ -44,8 +44,8 @@ import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicati
 # Real wasm SQLite backend. dynoxide compiles to wasm32-unknown-unknown and
 # runs against the official @sqlite.org/sqlite-wasm engine over a wasm-bindgen
 # bridge, persisting to OPFS.
-# Preview: conformant on what it implements, but several operations are still
-# missing (see the conformance note in the README).
+# Conformant on what it implements, but several operations are still missing
+# (see the conformance note in the README).
 wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:async-lock"]
 
 # Browser smoke-test entry point over the wasm-sqlite backend. Opt-in so the
@@ -142,6 +142,11 @@ aws-sdk-dynamodb = { version = "1", default-features = false, features = [
 ] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
+# Already in the tree behind `default-https-client`; named directly so the SDK
+# integration test can hand the client a plain-HTTP connector. Without one the
+# SDK builds its default HTTPS connector and reads the OS trust store, for a
+# test whose endpoint is `http://127.0.0.1`. See tests/aws_sdk_integration.rs.
+aws-smithy-http-client = { version = "1", features = ["default-client"] }
 tempfile = "3.25.0"
 
 # wasm-pack runs wasm-opt on release builds. Enable the wasm features rustc

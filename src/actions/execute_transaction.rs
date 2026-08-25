@@ -62,7 +62,7 @@ pub struct ItemResponse {
 
 /// Run a PartiQL transaction.
 ///
-/// Callers driving idempotency want [`execute_cached`], which also hands back
+/// Callers driving idempotency want `execute_cached`, which also hands back
 /// the sizes a replay is billed against.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
@@ -74,7 +74,7 @@ pub async fn execute<S: StorageBackend>(
 /// Reject a `ReturnConsumedCapacity` outside the enum.
 ///
 /// Called at the entry points ahead of the idempotency cache as well as inside
-/// [`execute_cached`]. A same-token replay never reaches `execute_cached`, and
+/// `execute_cached`. A same-token replay never reaches `execute_cached`, and
 /// the token is keyed on the statements alone, so a second call may carry a
 /// capacity mode the first one never did. A check living only in
 /// `execute_cached` lets that one through. It stays there for callers that reach

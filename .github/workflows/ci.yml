@@ -57,6 +57,72 @@ jobs:
       - name: Test
         run: cargo test --lib
 
+  # `rust-version` is part of the published Rust API contract in
+  # docs/versioning.md, so it is a promise rather than a description. Every
+  # other job runs on stable, which cannot see a language feature that raises
+  # the floor. The toolchain here is read from the manifest rather than pinned
+  # literally, so the check and the promise cannot disagree.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          set -euo pipefail
+          # Match a quoted literal version rather than splitting the field on
+          # quotes. `rust-version.workspace = true` has no quote to split on, so
+          # a `cut` would pass the whole line through as a toolchain name and
+          # fail later somewhere unrelated. The `|| true` matters too: under
+          # `pipefail` a grep that matches nothing would abort the step before
+          # the check below could report why.
+          VERSION=$(grep -m1 -oE '^rust-version[[:space:]]*=[[:space:]]*"[0-9]+(\.[0-9]+){1,2}"' Cargo.toml \
+            | grep -oE '[0-9]+(\.[0-9]+){1,2}' || true)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Cargo.toml declares no literal rust-version to check against"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $VERSION"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      # Dev-dependencies are out of scope on purpose: they never reach a
+      # consumer, so one raising its own floor does not break this promise.
+      # These two shapes are what `cargo add` and `cargo install` compile.
+      #
+      # `--locked` is the point of the job: without it the resolver may pick
+      # different versions than the lockfile ships, and the check would pass
+      # against a dependency set no consumer gets.
+      # Every published shape, not just the default one. The floor last drifted
+      # inside feature-gated code, so checking one combination would leave the
+      # same hole: a construct needing a newer compiler can sit behind
+      # `encryption` or `wasm-sqlite`, compile green on stable here, and break
+      # a consumer building that combination on the declared floor.
+      - name: Check default features
+        run: cargo check --locked
+
+      - name: Check minimal library
+        run: cargo check --locked --no-default-features --features native-sqlite --lib
+
+      - name: Check encryption
+        run: cargo check --locked --no-default-features --features encryption --lib
+
+      - name: Check encrypted-full
+        run: cargo check --locked --no-default-features --features encrypted-full
+
+      - name: Check wasm-sqlite
+        run: |
+          cargo check --locked --target wasm32-unknown-unknown \
+            --no-default-features --features wasm-sqlite --lib
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -76,6 +142,23 @@ jobs:
 
       - name: Format
         run: cargo fmt --check
+
+      # The script existed but no workflow called it, so the stale version pins
+      # and leftover preview wording it looks for could reach a release with
+      # nothing objecting. Needs no toolchain; it rides here because this job
+      # is already the home for checks that must pass rather than inform.
+      - name: Check for stale version pins and preview wording in docs
+        run: scripts/check-stale-docs.sh
+
+      # Nothing built the docs, so broken intra-doc links accumulated unseen:
+      # ten of them, half pointing at private items and half at cfg-gated ones
+      # absent from the default build docs.rs renders. They degrade the
+      # published API docs rather than failing the build, which is exactly why
+      # nobody noticed.
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --lib
 
   benchmark-scripts:
     name: Benchmark script tests
@@ -332,6 +415,16 @@ jobs:
           docker image inspect dynoxide:smoke \
             --format '{{json .Config.ExposedPorts}}' | tee /dev/stderr | grep -q '19280/tcp'
 
+      # The fast start interval is what makes a healthcheck-based container wait
+      # worth recommending, and docs/installation.md quotes the 250ms figure.
+      # Dropping the flag would otherwise surface only as someone's test suite
+      # quietly waiting 30 seconds for a container that booted in milliseconds.
+      - name: Image probes itself quickly while starting
+        run: |
+          docker image inspect dynoxide:smoke \
+            --format '{{json .Config.Healthcheck}}' | tee /dev/stderr \
+            | grep -q '"StartInterval":250000000'
+
       # The documented recipe. The token is a hardcoded throwaway, intentionally
       # inline (not a repository secret): it has no value outside this job. The
       # host-side bind is pinned to 127.0.0.1 so the ports are not reachable on
@@ -348,9 +441,40 @@ jobs:
             serve --host 0.0.0.0 --port 8000 \
                   --mcp --mcp-host 0.0.0.0 --mcp-port 19280
 
-      # Poll the port directly; the container HEALTHCHECK's 30s interval lags a
-      # fast smoke run. GET / is the same liveness probe `dynoxide healthcheck`
-      # uses (an unsigned DynamoDB op would 400 on SigV4 auth).
+      # The image config having a fast start interval is not the same as the
+      # probe inside it working, and docs/testcontainers.md recommends waiting
+      # on the healthcheck. Without this, `dynoxide healthcheck` could regress
+      # (a drifted default port, a moved binary path, an inverted exit code)
+      # and every reader following that advice would hang while CI stayed
+      # green. Five seconds is generous against a quarter-second first probe.
+      - name: Container reports healthy quickly
+        run: |
+          set -uo pipefail
+          # Deliberately not `set -e`: a `docker inspect` against a container
+          # that has gone away must fall through to the diagnostics below
+          # rather than abort the step and print nothing.
+          status=""
+          for _ in $(seq 1 25); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' dynoxide-smoke 2>/dev/null || echo gone)
+            case "$status" in
+              healthy) echo "healthy"; exit 0 ;;
+              unhealthy|gone) break ;;
+            esac
+            sleep 0.2
+          done
+          case "$status" in
+            unhealthy) echo "::error::container reported unhealthy" ;;
+            gone)      echo "::error::container disappeared before reporting healthy" ;;
+            *)         echo "::error::container did not report healthy within 5s (last: ${status:-unknown})" ;;
+          esac
+          docker inspect -f '{{json .State.Health}}' dynoxide-smoke 2>/dev/null || true
+          docker logs dynoxide-smoke 2>&1 || true
+          exit 1
+
+      # Poll the port from outside as well: that is the reachability an SDK
+      # client actually needs, and an in-container probe cannot show it. GET /
+      # is the same liveness probe `dynoxide healthcheck` uses (an unsigned
+      # DynamoDB op would 400 on SigV4 auth).
       - name: DynamoDB reachable on :8000 (R3)
         run: |
           set -euo pipefail

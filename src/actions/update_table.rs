@@ -401,14 +401,14 @@ pub async fn execute<S: StorageBackend>(
             ("MaxReadRequestUnits", odt.max_read_request_units),
             ("MaxWriteRequestUnits", odt.max_write_request_units),
         ];
-        if target_is_provisioned {
-            if let Some((member, _)) = members.iter().find(|(_, v)| v.is_some()) {
-                return Err(DynoxideError::ValidationException(format!(
-                    "One or more parameter values were invalid: {member} for \
+        if target_is_provisioned
+            && let Some((member, _)) = members.iter().find(|(_, v)| v.is_some())
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "One or more parameter values were invalid: {member} for \
                      OnDemandThroughput cannot be specified when the table BillingMode \
                      is PROVISIONED"
-                )));
-            }
+            )));
         }
         // Bounds: members must be at least 1, or exactly -1, which removes
         // the ceiling. Message identical to CreateTable's.
@@ -423,27 +423,28 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Same read/write values check
-    if let Some(ref pt) = request.provisioned_throughput {
-        if let Some(obj) = pt.as_object() {
-            let new_rcu = obj
-                .get("ReadCapacityUnits")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let new_wcu = obj
-                .get("WriteCapacityUnits")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+    if let Some(ref pt) = request.provisioned_throughput
+        && let Some(obj) = pt.as_object()
+    {
+        let new_rcu = obj
+            .get("ReadCapacityUnits")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let new_wcu = obj
+            .get("WriteCapacityUnits")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
-            // Parse current provisioned throughput from metadata
-            let (cur_rcu, cur_wcu) = parse_current_throughput(&meta);
+        // Parse current provisioned throughput from metadata
+        let (cur_rcu, cur_wcu) = parse_current_throughput(&meta);
 
-            let billing_mode_unchanged = request.billing_mode.is_none()
-                || (request.billing_mode.as_deref() == Some("PROVISIONED")
-                    && current_billing_mode == "PROVISIONED");
+        let billing_mode_unchanged = request.billing_mode.is_none()
+            || (request.billing_mode.as_deref() == Some("PROVISIONED")
+                && current_billing_mode == "PROVISIONED");
 
-            if new_rcu == cur_rcu && new_wcu == cur_wcu && billing_mode_unchanged {
-                return Err(DynoxideError::ValidationException(format!(
-                    "The provisioned throughput for the table will not change. \
+        if new_rcu == cur_rcu && new_wcu == cur_wcu && billing_mode_unchanged {
+            return Err(DynoxideError::ValidationException(format!(
+                "The provisioned throughput for the table will not change. \
                      The requested value equals the current value. \
                      Current ReadCapacityUnits provisioned for the table: {}. \
                      Requested ReadCapacityUnits: {}. \
@@ -451,9 +452,8 @@ pub async fn execute<S: StorageBackend>(
                      Requested WriteCapacityUnits: {}. \
                      Refer to the Amazon DynamoDB Developer Guide for current limits \
                      and how to request higher limits.",
-                    cur_rcu, new_rcu, cur_wcu, new_wcu
-                )));
-            }
+                cur_rcu, new_rcu, cur_wcu, new_wcu
+            )));
         }
     }
 
@@ -484,30 +484,30 @@ pub async fn execute<S: StorageBackend>(
     // GSI Update with high capacity on non-existent index
     if let Some(ref updates) = request.global_secondary_index_updates {
         for update in updates {
-            if let Some(ref upd) = update.update {
-                if !current_gsis.iter().any(|g| g.index_name == upd.index_name) {
-                    // DynamoDB returns this specific message for GSI updates on
-                    // non-existent indexes (even with out-of-bounds capacity)
-                    return Err(DynoxideError::ValidationException(
-                        "This operation cannot be performed with given input values. \
+            if let Some(ref upd) = update.update
+                && !current_gsis.iter().any(|g| g.index_name == upd.index_name)
+            {
+                // DynamoDB returns this specific message for GSI updates on
+                // non-existent indexes (even with out-of-bounds capacity)
+                return Err(DynoxideError::ValidationException(
+                    "This operation cannot be performed with given input values. \
                          Please contact DynamoDB service team for more info: \
                          Action Blocked: IndexUpdate"
-                            .to_string(),
-                    ));
-                }
+                        .to_string(),
+                ));
             }
         }
     }
 
     // Check GSI update count limit (DynamoDB allows at most 5 per request)
-    if let Some(ref updates) = request.global_secondary_index_updates {
-        if updates.len() > 5 {
-            return Err(DynoxideError::LimitExceededException(
-                "Subscriber limit exceeded: Only 1 online index can be created or \
+    if let Some(ref updates) = request.global_secondary_index_updates
+        && updates.len() > 5
+    {
+        return Err(DynoxideError::LimitExceededException(
+            "Subscriber limit exceeded: Only 1 online index can be created or \
                  deleted simultaneously per table"
-                    .to_string(),
-            ));
-        }
+                .to_string(),
+        ));
     }
 
     // Merge provided attribute definitions into the existing set. DynamoDB
@@ -621,16 +621,15 @@ pub async fn execute<S: StorageBackend>(
                     request.attribute_definitions.as_deref().unwrap_or(&[]),
                 )?;
             }
-            if let Some(ref delete) = update.delete {
-                if !current_gsis
+            if let Some(ref delete) = update.delete
+                && !current_gsis
                     .iter()
                     .any(|g| g.index_name == delete.index_name)
-                {
-                    return Err(DynoxideError::ResourceNotFoundException(format!(
-                        "Requested resource not found: Table: {} not found",
-                        delete.index_name
-                    )));
-                }
+            {
+                return Err(DynoxideError::ResourceNotFoundException(format!(
+                    "Requested resource not found: Table: {} not found",
+                    delete.index_name
+                )));
             }
         }
     }
@@ -675,15 +674,15 @@ pub async fn execute<S: StorageBackend>(
         // DynamoDB refuses the delete before that and says which phase to
         // retry in, so the wait is discoverable from the answer rather than
         // something a caller has to know (captured eu-west-2, 2026-08-23).
-        if let Some(delete) = targeted {
-            if !creating.get(&delete.index_name).accepts_delete() {
-                return Err(DynoxideError::ResourceInUseException(format!(
-                    "Attempt to change a resource which is still in use: Index creation is \
+        if let Some(delete) = targeted
+            && !creating.get(&delete.index_name).accepts_delete()
+        {
+            return Err(DynoxideError::ResourceInUseException(format!(
+                "Attempt to change a resource which is still in use: Index creation is \
                      in resource allocation phase. Retry deletion during backfilling phase \
                      or when the index is active. Table: {} Index: {}",
-                    request.table_name, delete.index_name
-                )));
-            }
+                request.table_name, delete.index_name
+            )));
         }
 
         for update in updates {
@@ -776,18 +775,17 @@ pub async fn execute<S: StorageBackend>(
                     )));
                 }
             }
-            if let Some(ref delete) = update.delete {
-                if !current_vixs
+            if let Some(ref delete) = update.delete
+                && !current_vixs
                     .iter()
                     .any(|v| v.index_name == delete.index_name)
-                {
-                    // Bare index name, no quoting. Captured from real DynamoDB
-                    // (eu-west-2 and us-east-1, 2026-08-12).
-                    return Err(DynoxideError::ResourceNotFoundException(format!(
-                        "Requested resource not found: Index {} for table {}",
-                        delete.index_name, request.table_name
-                    )));
-                }
+            {
+                // Bare index name, no quoting. Captured from real DynamoDB
+                // (eu-west-2 and us-east-1, 2026-08-12).
+                return Err(DynoxideError::ResourceNotFoundException(format!(
+                    "Requested resource not found: Index {} for table {}",
+                    delete.index_name, request.table_name
+                )));
             }
         }
     }
@@ -1112,10 +1110,10 @@ pub async fn execute<S: StorageBackend>(
     // is tuned. Everything else in the answer, the index's own CREATING
     // included, comes from the phases, which every later DescribeTable reads
     // too, so this response and the next description cannot disagree.
-    if let Some(ref updates) = request.vector_index_updates {
-        if updates.iter().any(|u| u.create.is_some()) {
-            desc.table_status = "UPDATING".to_string();
-        }
+    if let Some(ref updates) = request.vector_index_updates
+        && updates.iter().any(|u| u.create.is_some())
+    {
+        desc.table_status = "UPDATING".to_string();
     }
 
     // DynamoDB returns UPDATING status during throughput changes
@@ -1209,17 +1207,17 @@ fn collect_gsi_update_errors(updates: &[GlobalSecondaryIndexUpdate], errors: &mu
                 let rcu = pt.read_capacity_units;
                 if wcu.is_none() {
                     errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
-                } else if let Some(w) = wcu {
-                    if w < 1 {
-                        errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w, i + 1));
-                    }
+                } else if let Some(w) = wcu
+                    && w < 1
+                {
+                    errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w, i + 1));
                 }
                 if rcu.is_none() {
                     errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
-                } else if let Some(r) = rcu {
-                    if r < 1 {
-                        errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r, i + 1));
-                    }
+                } else if let Some(r) = rcu
+                    && r < 1
+                {
+                    errors.push(format!("Value '{}' at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r, i + 1));
                 }
             } else {
                 errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput' failed to satisfy constraint: Member must not be null", i + 1));
@@ -1237,24 +1235,24 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
     let mut errors = Vec::new();
 
     // Validate ProvisionedThroughput fields
-    if let Some(ref pt) = request.provisioned_throughput {
-        if let Some(obj) = pt.as_object() {
-            let wcu = obj.get("WriteCapacityUnits");
-            let rcu = obj.get("ReadCapacityUnits");
-            if wcu.is_none() || wcu == Some(&serde_json::Value::Null) {
-                errors.push("Value null at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
-            } else if let Some(w) = wcu.and_then(|v| v.as_i64()) {
-                if w < 1 {
-                    errors.push(format!("Value '{}' at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w));
-                }
-            }
-            if rcu.is_none() || rcu == Some(&serde_json::Value::Null) {
-                errors.push("Value null at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
-            } else if let Some(r) = rcu.and_then(|v| v.as_i64()) {
-                if r < 1 {
-                    errors.push(format!("Value '{}' at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r));
-                }
-            }
+    if let Some(ref pt) = request.provisioned_throughput
+        && let Some(obj) = pt.as_object()
+    {
+        let wcu = obj.get("WriteCapacityUnits");
+        let rcu = obj.get("ReadCapacityUnits");
+        if wcu.is_none() || wcu == Some(&serde_json::Value::Null) {
+            errors.push("Value null at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
+        } else if let Some(w) = wcu.and_then(|v| v.as_i64())
+            && w < 1
+        {
+            errors.push(format!("Value '{}' at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w));
+        }
+        if rcu.is_none() || rcu == Some(&serde_json::Value::Null) {
+            errors.push("Value null at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
+        } else if let Some(r) = rcu.and_then(|v| v.as_i64())
+            && r < 1
+        {
+            errors.push(format!("Value '{}' at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r));
         }
     }
 
@@ -1282,26 +1280,28 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
     // Single-error validations (after multi-field)
 
     // BillingMode enum validation
-    if let Some(ref bm) = request.billing_mode {
-        if bm != "PROVISIONED" && bm != "PAY_PER_REQUEST" {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{}' at 'billingMode' \
+    if let Some(ref bm) = request.billing_mode
+        && bm != "PROVISIONED"
+        && bm != "PAY_PER_REQUEST"
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{}' at 'billingMode' \
                  failed to satisfy constraint: Member must satisfy enum value set: \
                  [PROVISIONED, PAY_PER_REQUEST]",
-                bm
-            )));
-        }
+            bm
+        )));
     }
 
     // TableClass enum validation (mirrors CreateTable)
-    if let Some(ref tc) = request.table_class {
-        if tc != "STANDARD" && tc != "STANDARD_INFREQUENT_ACCESS" {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy \
+    if let Some(ref tc) = request.table_class
+        && tc != "STANDARD"
+        && tc != "STANDARD_INFREQUENT_ACCESS"
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy \
                  constraint: Member must satisfy enum value set: \
                  [STANDARD, STANDARD_INFREQUENT_ACCESS]"
-            )));
-        }
+        )));
     }
 
     // BillingMode PAY_PER_REQUEST with ProvisionedThroughput is not allowed
@@ -1317,29 +1317,29 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
     }
 
     // ProvisionedThroughput out-of-bounds
-    if let Some(ref pt) = request.provisioned_throughput {
-        if let Some(obj) = pt.as_object() {
-            let rcu = obj
-                .get("ReadCapacityUnits")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let wcu = obj
-                .get("WriteCapacityUnits")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            const MAX_THROUGHPUT: i64 = 1_000_000_000_000;
-            if rcu > MAX_THROUGHPUT {
-                return Err(DynoxideError::ValidationException(format!(
-                    "Given value {} for ReadCapacityUnits is out of bounds",
-                    rcu
-                )));
-            }
-            if wcu > MAX_THROUGHPUT {
-                return Err(DynoxideError::ValidationException(format!(
-                    "Given value {} for WriteCapacityUnits is out of bounds",
-                    wcu
-                )));
-            }
+    if let Some(ref pt) = request.provisioned_throughput
+        && let Some(obj) = pt.as_object()
+    {
+        let rcu = obj
+            .get("ReadCapacityUnits")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let wcu = obj
+            .get("WriteCapacityUnits")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        const MAX_THROUGHPUT: i64 = 1_000_000_000_000;
+        if rcu > MAX_THROUGHPUT {
+            return Err(DynoxideError::ValidationException(format!(
+                "Given value {} for ReadCapacityUnits is out of bounds",
+                rcu
+            )));
+        }
+        if wcu > MAX_THROUGHPUT {
+            return Err(DynoxideError::ValidationException(format!(
+                "Given value {} for WriteCapacityUnits is out of bounds",
+                wcu
+            )));
         }
     }
 
@@ -1389,13 +1389,13 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
             } else {
                 update.delete.as_ref().map(|d| d.index_name.as_str())
             };
-            if let Some(name) = name {
-                if !seen_names.insert(name.to_string()) {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: Only one global secondary index update per index is allowed simultaneously. Index: {}",
-                        name
-                    )));
-                }
+            if let Some(name) = name
+                && !seen_names.insert(name.to_string())
+            {
+                return Err(DynoxideError::ValidationException(format!(
+                    "One or more parameter values were invalid: Only one global secondary index update per index is allowed simultaneously. Index: {}",
+                    name
+                )));
             }
         }
     }

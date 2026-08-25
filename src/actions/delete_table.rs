@@ -126,24 +126,24 @@ pub async fn execute<S: StorageBackend>(
     lifecycle.forget_table(&request.table_name);
 
     // Drop GSI tables first
-    if let Some(ref gsi_json) = meta.gsi_definitions {
-        if let Ok(gsis) = serde_json::from_str::<Vec<GlobalSecondaryIndex>>(gsi_json) {
-            for gsi in &gsis {
-                storage
-                    .drop_gsi_table(&request.table_name, &gsi.index_name)
-                    .await?;
-            }
+    if let Some(ref gsi_json) = meta.gsi_definitions
+        && let Ok(gsis) = serde_json::from_str::<Vec<GlobalSecondaryIndex>>(gsi_json)
+    {
+        for gsi in &gsis {
+            storage
+                .drop_gsi_table(&request.table_name, &gsi.index_name)
+                .await?;
         }
     }
 
     // Drop LSI tables
-    if let Some(ref lsi_json) = meta.lsi_definitions {
-        if let Ok(lsis) = serde_json::from_str::<Vec<LocalSecondaryIndex>>(lsi_json) {
-            for lsi in &lsis {
-                storage
-                    .drop_lsi_table(&request.table_name, &lsi.index_name)
-                    .await?;
-            }
+    if let Some(ref lsi_json) = meta.lsi_definitions
+        && let Ok(lsis) = serde_json::from_str::<Vec<LocalSecondaryIndex>>(lsi_json)
+    {
+        for lsi in &lsis {
+            storage
+                .drop_lsi_table(&request.table_name, &lsi.index_name)
+                .await?;
         }
     }
 

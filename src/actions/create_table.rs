@@ -107,24 +107,26 @@ pub async fn execute<S: StorageBackend>(
     // Structural validation (runs for both programmatic and JSON paths)
     validate_typed_request(&request)?;
 
-    if let Some(ref bm) = request.billing_mode {
-        if bm != "PROVISIONED" && bm != "PAY_PER_REQUEST" {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{bm}' at 'billingMode' failed to satisfy \
+    if let Some(ref bm) = request.billing_mode
+        && bm != "PROVISIONED"
+        && bm != "PAY_PER_REQUEST"
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{bm}' at 'billingMode' failed to satisfy \
                  constraint: Member must satisfy enum value set: \
                  [PROVISIONED, PAY_PER_REQUEST]"
-            )));
-        }
+        )));
     }
 
-    if let Some(ref tc) = request.table_class {
-        if tc != "STANDARD" && tc != "STANDARD_INFREQUENT_ACCESS" {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy \
+    if let Some(ref tc) = request.table_class
+        && tc != "STANDARD"
+        && tc != "STANDARD_INFREQUENT_ACCESS"
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "1 validation error detected: Value '{tc}' at 'tableClass' failed to satisfy \
                  constraint: Member must satisfy enum value set: \
                  [STANDARD, STANDARD_INFREQUENT_ACCESS]"
-            )));
-        }
+        )));
     }
 
     // OnDemandThroughput is only valid alongside PAY_PER_REQUEST billing, and
@@ -233,13 +235,14 @@ pub async fn execute<S: StorageBackend>(
     // `insert_table_metadata` would leave the table half-created: the client
     // sees an error, retries, and finds ResourceInUseException where the real
     // answer is that the backend cannot honour the request at all.
-    if let Some(ref spec) = request.stream_specification {
-        if spec.stream_enabled && !storage.supports_streams() {
-            return Err(BackendError::Unsupported {
-                capability: "streams",
-            }
-            .into());
+    if let Some(ref spec) = request.stream_specification
+        && spec.stream_enabled
+        && !storage.supports_streams()
+    {
+        return Err(BackendError::Unsupported {
+            capability: "streams",
         }
+        .into());
     }
     if request.tags.as_ref().is_some_and(|tags| !tags.is_empty()) && !storage.supports_tags() {
         return Err(BackendError::Unsupported { capability: "tags" }.into());
@@ -290,23 +293,23 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    if let Some(ref spec) = request.stream_specification {
-        if spec.stream_enabled {
-            let view_type = spec
-                .stream_view_type
-                .as_deref()
-                .unwrap_or("NEW_AND_OLD_IMAGES");
-            let label = streams::generate_stream_label(storage.clock());
-            storage
-                .enable_stream(&request.table_name, view_type, &label)
-                .await?;
-        }
+    if let Some(ref spec) = request.stream_specification
+        && spec.stream_enabled
+    {
+        let view_type = spec
+            .stream_view_type
+            .as_deref()
+            .unwrap_or("NEW_AND_OLD_IMAGES");
+        let label = streams::generate_stream_label(storage.clock());
+        storage
+            .enable_stream(&request.table_name, view_type, &label)
+            .await?;
     }
 
-    if let Some(ref tags) = request.tags {
-        if !tags.is_empty() {
-            storage.set_tags(&request.table_name, tags).await?;
-        }
+    if let Some(ref tags) = request.tags
+        && !tags.is_empty()
+    {
+        storage.set_tags(&request.table_name, tags).await?;
     }
 
     let meta = storage
@@ -481,31 +484,30 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
     validate_key_schema_structure(&request.key_schema).map_err(ve)?;
 
     // Empty LSI/GSI lists (before structural validation and attr count)
-    if let Some(ref lsis) = request.local_secondary_indexes {
-        if lsis.is_empty() {
-            return Err(ve(
-                "One or more parameter values were invalid: List of LocalSecondaryIndexes is empty"
-                    .to_string(),
-            ));
-        }
+    if let Some(ref lsis) = request.local_secondary_indexes
+        && lsis.is_empty()
+    {
+        return Err(ve(
+            "One or more parameter values were invalid: List of LocalSecondaryIndexes is empty"
+                .to_string(),
+        ));
     }
-    if let Some(ref gsis) = request.global_secondary_indexes {
-        if gsis.is_empty() {
-            return Err(ve(
-                "One or more parameter values were invalid: List of GlobalSecondaryIndexes is empty"
-                    .to_string(),
-            ));
-        }
+    if let Some(ref gsis) = request.global_secondary_indexes
+        && gsis.is_empty()
+    {
+        return Err(ve(
+            "One or more parameter values were invalid: List of GlobalSecondaryIndexes is empty"
+                .to_string(),
+        ));
     }
     // An empty VectorIndexes list is rejected, not normalised to absent.
     // Captured from real DynamoDB (eu-west-2 and us-east-1, 2026-08-12).
-    if let Some(ref vixs) = request.vector_indexes {
-        if vixs.is_empty() {
-            return Err(ve(
-                "One or more parameter values were invalid: List of VectorIndexes is empty"
-                    .to_string(),
-            ));
-        }
+    if let Some(ref vixs) = request.vector_indexes
+        && vixs.is_empty()
+    {
+        return Err(ve(
+            "One or more parameter values were invalid: List of VectorIndexes is empty".to_string(),
+        ));
     }
 
     // LSI structural validation
@@ -548,14 +550,15 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
     // StreamSpecification consistency: a disabled stream must not carry a view
     // type. Real DynamoDB rejects the combination, because a view type only has
     // meaning when the stream is enabled.
-    if let Some(ref spec) = request.stream_specification {
-        if !spec.stream_enabled && spec.stream_view_type.is_some() {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: Table is being created with a stream \
+    if let Some(ref spec) = request.stream_specification
+        && !spec.stream_enabled
+        && spec.stream_view_type.is_some()
+    {
+        return Err(DynoxideError::ValidationException(
+            "One or more parameter values were invalid: Table is being created with a stream \
                  disabled, UpdateViewType should not be specified"
-                    .to_string(),
-            ));
-        }
+                .to_string(),
+        ));
     }
 
     Ok(())
@@ -719,14 +722,15 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
 
     let mut errors = Vec::new();
 
-    if let Some(ref bm) = raw.billing_mode {
-        if bm != "PROVISIONED" && bm != "PAY_PER_REQUEST" {
-            errors.push(format!(
-                "Value '{}' at 'billingMode' failed to satisfy constraint: \
+    if let Some(ref bm) = raw.billing_mode
+        && bm != "PROVISIONED"
+        && bm != "PAY_PER_REQUEST"
+    {
+        errors.push(format!(
+            "Value '{}' at 'billingMode' failed to satisfy constraint: \
                  Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]",
-                bm
-            ));
-        }
+            bm
+        ));
     }
 
     collect_pt_errors(&raw.provisioned_throughput, &mut errors);
@@ -759,29 +763,29 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
     }
 
     // ProvisionedThroughput out-of-bounds (after multi-field but before struct checks)
-    if let Some(ref pt) = raw.provisioned_throughput {
-        if let Some(obj) = pt.as_object() {
-            let rcu = obj
-                .get("ReadCapacityUnits")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let wcu = obj
-                .get("WriteCapacityUnits")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            const MAX_THROUGHPUT: i64 = 1_000_000_000_000;
-            if rcu > MAX_THROUGHPUT {
-                return Err(format!(
-                    "Given value {} for ReadCapacityUnits is out of bounds",
-                    rcu
-                ));
-            }
-            if wcu > MAX_THROUGHPUT {
-                return Err(format!(
-                    "Given value {} for WriteCapacityUnits is out of bounds",
-                    wcu
-                ));
-            }
+    if let Some(ref pt) = raw.provisioned_throughput
+        && let Some(obj) = pt.as_object()
+    {
+        let rcu = obj
+            .get("ReadCapacityUnits")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let wcu = obj
+            .get("WriteCapacityUnits")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        const MAX_THROUGHPUT: i64 = 1_000_000_000_000;
+        if rcu > MAX_THROUGHPUT {
+            return Err(format!(
+                "Given value {} for ReadCapacityUnits is out of bounds",
+                rcu
+            ));
+        }
+        if wcu > MAX_THROUGHPUT {
+            return Err(format!(
+                "Given value {} for WriteCapacityUnits is out of bounds",
+                wcu
+            ));
         }
     }
 
@@ -855,24 +859,24 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
 // ---- Multi-field constraint error collectors ----
 
 fn collect_pt_errors(pt_val: &Option<serde_json::Value>, errors: &mut Vec<String>) {
-    if let Some(v) = pt_val {
-        if let Some(obj) = v.as_object() {
-            let wcu = obj.get("WriteCapacityUnits");
-            let rcu = obj.get("ReadCapacityUnits");
-            if wcu.is_none() || wcu == Some(&serde_json::Value::Null) {
-                errors.push("Value null at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
-            } else if let Some(w) = wcu.and_then(|v| v.as_i64()) {
-                if w < 1 {
-                    errors.push(format!("Value '{}' at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w));
-                }
-            }
-            if rcu.is_none() || rcu == Some(&serde_json::Value::Null) {
-                errors.push("Value null at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
-            } else if let Some(r) = rcu.and_then(|v| v.as_i64()) {
-                if r < 1 {
-                    errors.push(format!("Value '{}' at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r));
-                }
-            }
+    if let Some(v) = pt_val
+        && let Some(obj) = v.as_object()
+    {
+        let wcu = obj.get("WriteCapacityUnits");
+        let rcu = obj.get("ReadCapacityUnits");
+        if wcu.is_none() || wcu == Some(&serde_json::Value::Null) {
+            errors.push("Value null at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
+        } else if let Some(w) = wcu.and_then(|v| v.as_i64())
+            && w < 1
+        {
+            errors.push(format!("Value '{}' at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w));
+        }
+        if rcu.is_none() || rcu == Some(&serde_json::Value::Null) {
+            errors.push("Value null at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null".to_string());
+        } else if let Some(r) = rcu.and_then(|v| v.as_i64())
+            && r < 1
+        {
+            errors.push(format!("Value '{}' at 'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r));
         }
     }
 }
@@ -911,10 +915,11 @@ fn collect_ks_elem_errors(elem: &serde_json::Value, idx: usize, errors: &mut Vec
         let kt = obj.get("KeyType");
         if kt.is_none() || kt == Some(&serde_json::Value::Null) {
             errors.push(format!("Value null at 'keySchema.{}.member.keyType' failed to satisfy constraint: Member must not be null", idx));
-        } else if let Some(s) = kt.and_then(|v| v.as_str()) {
-            if s != "HASH" && s != "RANGE" {
-                errors.push(format!("Value '{}' at 'keySchema.{}.member.keyType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, RANGE]", s, idx));
-            }
+        } else if let Some(s) = kt.and_then(|v| v.as_str())
+            && s != "HASH"
+            && s != "RANGE"
+        {
+            errors.push(format!("Value '{}' at 'keySchema.{}.member.keyType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, RANGE]", s, idx));
         }
     }
 }
@@ -957,10 +962,12 @@ fn collect_ad_errors(ad_val: &Option<serde_json::Value>, errors: &mut Vec<String
                         let at = obj.get("AttributeType");
                         if at.is_none() || at == Some(&serde_json::Value::Null) {
                             errors.push(format!("Value null at 'attributeDefinitions.{}.member.attributeType' failed to satisfy constraint: Member must not be null", i + 1));
-                        } else if let Some(s) = at.and_then(|v| v.as_str()) {
-                            if s != "S" && s != "N" && s != "B" {
-                                errors.push(format!("Value '{}' at 'attributeDefinitions.{}.member.attributeType' failed to satisfy constraint: Member must satisfy enum value set: [B, N, S]", s, i + 1));
-                            }
+                        } else if let Some(s) = at.and_then(|v| v.as_str())
+                            && s != "S"
+                            && s != "N"
+                            && s != "B"
+                        {
+                            errors.push(format!("Value '{}' at 'attributeDefinitions.{}.member.attributeType' failed to satisfy constraint: Member must satisfy enum value set: [B, N, S]", s, i + 1));
                         }
                     }
                 }
@@ -970,38 +977,38 @@ fn collect_ad_errors(ad_val: &Option<serde_json::Value>, errors: &mut Vec<String
 }
 
 fn collect_lsi_errors(lsi_val: &Option<serde_json::Value>, errors: &mut Vec<String>) {
-    if let Some(v) = lsi_val {
-        if let Some(arr) = v.as_array() {
-            for (i, elem) in arr.iter().enumerate().take(10) {
-                if let Some(obj) = elem.as_object() {
-                    // Order: indexName, keySchema, projection
-                    if !obj.contains_key("IndexName")
-                        || obj.get("IndexName") == Some(&serde_json::Value::Null)
-                    {
-                        errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.indexName' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
-                        collect_idx_name_errors(name, "localSecondaryIndexes", i + 1, errors);
-                    }
-                    if !obj.contains_key("KeySchema")
-                        || obj.get("KeySchema") == Some(&serde_json::Value::Null)
-                    {
-                        errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(ks) = obj.get("KeySchema").and_then(|v| v.as_array()) {
-                        if ks.is_empty() {
-                            errors.push(format!("Value '[]' at 'localSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1", i + 1));
-                        }
-                    }
-                    if !obj.contains_key("Projection")
-                        || obj.get("Projection") == Some(&serde_json::Value::Null)
-                    {
-                        errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.projection' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
-                        collect_proj_errors(
-                            p,
-                            &format!("localSecondaryIndexes.{}.member", i + 1),
-                            errors,
-                        );
-                    }
+    if let Some(v) = lsi_val
+        && let Some(arr) = v.as_array()
+    {
+        for (i, elem) in arr.iter().enumerate().take(10) {
+            if let Some(obj) = elem.as_object() {
+                // Order: indexName, keySchema, projection
+                if !obj.contains_key("IndexName")
+                    || obj.get("IndexName") == Some(&serde_json::Value::Null)
+                {
+                    errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.indexName' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
+                    collect_idx_name_errors(name, "localSecondaryIndexes", i + 1, errors);
+                }
+                if !obj.contains_key("KeySchema")
+                    || obj.get("KeySchema") == Some(&serde_json::Value::Null)
+                {
+                    errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(ks) = obj.get("KeySchema").and_then(|v| v.as_array())
+                    && ks.is_empty()
+                {
+                    errors.push(format!("Value '[]' at 'localSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1", i + 1));
+                }
+                if !obj.contains_key("Projection")
+                    || obj.get("Projection") == Some(&serde_json::Value::Null)
+                {
+                    errors.push(format!("Value null at 'localSecondaryIndexes.{}.member.projection' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
+                    collect_proj_errors(
+                        p,
+                        &format!("localSecondaryIndexes.{}.member", i + 1),
+                        errors,
+                    );
                 }
             }
         }
@@ -1009,56 +1016,56 @@ fn collect_lsi_errors(lsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
 }
 
 fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<String>) {
-    if let Some(v) = gsi_val {
-        if let Some(arr) = v.as_array() {
-            for (i, elem) in arr.iter().enumerate().take(10) {
-                if let Some(obj) = elem.as_object() {
-                    // Order for GSI: keySchema, projection, indexName
-                    if !obj.contains_key("KeySchema")
-                        || obj.get("KeySchema") == Some(&serde_json::Value::Null)
-                    {
-                        errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(ks) = obj.get("KeySchema").and_then(|v| v.as_array()) {
-                        if ks.is_empty() {
-                            errors.push(format!("Value '[]' at 'globalSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1", i + 1));
+    if let Some(v) = gsi_val
+        && let Some(arr) = v.as_array()
+    {
+        for (i, elem) in arr.iter().enumerate().take(10) {
+            if let Some(obj) = elem.as_object() {
+                // Order for GSI: keySchema, projection, indexName
+                if !obj.contains_key("KeySchema")
+                    || obj.get("KeySchema") == Some(&serde_json::Value::Null)
+                {
+                    errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(ks) = obj.get("KeySchema").and_then(|v| v.as_array())
+                    && ks.is_empty()
+                {
+                    errors.push(format!("Value '[]' at 'globalSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1", i + 1));
+                }
+                if !obj.contains_key("Projection")
+                    || obj.get("Projection") == Some(&serde_json::Value::Null)
+                {
+                    errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.projection' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
+                    collect_proj_errors(
+                        p,
+                        &format!("globalSecondaryIndexes.{}.member", i + 1),
+                        errors,
+                    );
+                }
+                if !obj.contains_key("IndexName")
+                    || obj.get("IndexName") == Some(&serde_json::Value::Null)
+                {
+                    errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.indexName' failed to satisfy constraint: Member must not be null", i + 1));
+                } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
+                    collect_idx_name_errors(name, "globalSecondaryIndexes", i + 1, errors);
+                }
+                // GSI ProvisionedThroughput
+                if let Some(pt) = obj.get("ProvisionedThroughput").and_then(|v| v.as_object()) {
+                    let wcu = pt.get("WriteCapacityUnits");
+                    let rcu = pt.get("ReadCapacityUnits");
+                    if let Some(w) = wcu.and_then(|v| v.as_i64()) {
+                        if w < 1 {
+                            errors.push(format!("Value '{}' at 'globalSecondaryIndexes.{}.member.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w, i + 1));
                         }
+                    } else if wcu.is_none() || wcu == Some(&serde_json::Value::Null) {
+                        errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
                     }
-                    if !obj.contains_key("Projection")
-                        || obj.get("Projection") == Some(&serde_json::Value::Null)
-                    {
-                        errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.projection' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(p) = obj.get("Projection").and_then(|v| v.as_object()) {
-                        collect_proj_errors(
-                            p,
-                            &format!("globalSecondaryIndexes.{}.member", i + 1),
-                            errors,
-                        );
-                    }
-                    if !obj.contains_key("IndexName")
-                        || obj.get("IndexName") == Some(&serde_json::Value::Null)
-                    {
-                        errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.indexName' failed to satisfy constraint: Member must not be null", i + 1));
-                    } else if let Some(name) = obj.get("IndexName").and_then(|v| v.as_str()) {
-                        collect_idx_name_errors(name, "globalSecondaryIndexes", i + 1, errors);
-                    }
-                    // GSI ProvisionedThroughput
-                    if let Some(pt) = obj.get("ProvisionedThroughput").and_then(|v| v.as_object()) {
-                        let wcu = pt.get("WriteCapacityUnits");
-                        let rcu = pt.get("ReadCapacityUnits");
-                        if let Some(w) = wcu.and_then(|v| v.as_i64()) {
-                            if w < 1 {
-                                errors.push(format!("Value '{}' at 'globalSecondaryIndexes.{}.member.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", w, i + 1));
-                            }
-                        } else if wcu.is_none() || wcu == Some(&serde_json::Value::Null) {
-                            errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
+                    if let Some(r) = rcu.and_then(|v| v.as_i64()) {
+                        if r < 1 {
+                            errors.push(format!("Value '{}' at 'globalSecondaryIndexes.{}.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r, i + 1));
                         }
-                        if let Some(r) = rcu.and_then(|v| v.as_i64()) {
-                            if r < 1 {
-                                errors.push(format!("Value '{}' at 'globalSecondaryIndexes.{}.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1", r, i + 1));
-                            }
-                        } else if rcu.is_none() || rcu == Some(&serde_json::Value::Null) {
-                            errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
-                        }
+                    } else if rcu.is_none() || rcu == Some(&serde_json::Value::Null) {
+                        errors.push(format!("Value null at 'globalSecondaryIndexes.{}.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must not be null", i + 1));
                     }
                 }
             }
@@ -1172,12 +1179,13 @@ pub(crate) fn collect_vix_obj_errors(
                 errors.push(format!(
                     "Value null at '{path}.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must not be null"
                 ));
-            } else if let Some(s) = et.and_then(|v| v.as_str()) {
-                if s != "HASH" && s != "INLINE_FILTER" {
-                    errors.push(format!(
+            } else if let Some(s) = et.and_then(|v| v.as_str())
+                && s != "HASH"
+                && s != "INLINE_FILTER"
+            {
+                errors.push(format!(
                         "Value '{s}' at '{path}.searchSchema.{sidx}.member.searchSchemaElementType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, INLINE_FILTER]"
                     ));
-                }
             }
         }
     }
@@ -1210,12 +1218,14 @@ pub(crate) fn collect_vix_obj_errors(
         errors.push(format!(
             "Value null at '{path}.distanceFunction' failed to satisfy constraint: Member must not be null"
         ));
-    } else if let Some(s) = df.and_then(|v| v.as_str()) {
-        if s != "COSINE" && s != "DOT_PRODUCT" && s != "EUCLIDEAN" {
-            errors.push(format!(
+    } else if let Some(s) = df.and_then(|v| v.as_str())
+        && s != "COSINE"
+        && s != "DOT_PRODUCT"
+        && s != "EUCLIDEAN"
+    {
+        errors.push(format!(
                 "Value '{s}' at '{path}.distanceFunction' failed to satisfy constraint: Member must satisfy enum value set: [COSINE, DOT_PRODUCT, EUCLIDEAN]"
             ));
-        }
     }
 }
 
@@ -1303,19 +1313,19 @@ fn collect_proj_errors(
     prefix: &str,
     errors: &mut Vec<String>,
 ) {
-    if let Some(pt) = proj.get("ProjectionType") {
-        if let Some(s) = pt.as_str() {
-            if s != "ALL" && s != "KEYS_ONLY" && s != "INCLUDE" {
-                errors.push(format!("Value '{}' at '{}.projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", s, prefix));
-            }
-        }
+    if let Some(pt) = proj.get("ProjectionType")
+        && let Some(s) = pt.as_str()
+        && s != "ALL"
+        && s != "KEYS_ONLY"
+        && s != "INCLUDE"
+    {
+        errors.push(format!("Value '{}' at '{}.projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", s, prefix));
     }
-    if let Some(nka) = proj.get("NonKeyAttributes") {
-        if let Some(arr) = nka.as_array() {
-            if arr.is_empty() {
-                errors.push(format!("Value '[]' at '{}.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
-            }
-        }
+    if let Some(nka) = proj.get("NonKeyAttributes")
+        && let Some(arr) = nka.as_array()
+        && arr.is_empty()
+    {
+        errors.push(format!("Value '[]' at '{}.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
     }
 }
 

@@ -72,29 +72,29 @@ fn first_invalid_return_enum(
     return_consumed_capacity: Option<&str>,
     return_item_collection_metrics: Option<&str>,
 ) -> Option<String> {
-    if let Some(rv) = return_values {
-        if !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv) {
-            return Some(format!(
-                "Value '{}' at 'returnValues' failed to satisfy constraint: \
+    if let Some(rv) = return_values
+        && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+    {
+        return Some(format!(
+            "Value '{}' at 'returnValues' failed to satisfy constraint: \
                  Member must satisfy enum value set: \
                  [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-                rv
-            ));
-        }
+            rv
+        ));
     }
     if let Some(msg) =
         crate::validation::return_consumed_capacity_rejection(return_consumed_capacity)
     {
         return Some(msg);
     }
-    if let Some(ricm) = return_item_collection_metrics {
-        if !["SIZE", "NONE"].contains(&ricm) {
-            return Some(format!(
-                "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
+    if let Some(ricm) = return_item_collection_metrics
+        && !["SIZE", "NONE"].contains(&ricm)
+    {
+        return Some(format!(
+            "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
                  Member must satisfy enum value set: [SIZE, NONE]",
-                ricm
-            ));
-        }
+            ricm
+        ));
     }
     None
 }
@@ -268,85 +268,94 @@ async fn execute_inner<S: StorageBackend>(
     crate::validation::validate_key_attribute_values(&request.key)?;
 
     // Validate legacy AttributeUpdates parameters
-    if request.update_expression.is_none() {
-        if let Some(ref updates) = request.attribute_updates {
-            for (attr_name, update) in updates {
-                let action = update.action.to_uppercase();
-                if update.value.is_none() && action != "DELETE" {
-                    return Err(DynoxideError::ValidationException(
-                        "One or more parameter values were invalid: \
+    if request.update_expression.is_none()
+        && let Some(ref updates) = request.attribute_updates
+    {
+        for update in updates.values() {
+            let action = update.action.to_uppercase();
+            if update.value.is_none() && action != "DELETE" {
+                return Err(DynoxideError::ValidationException(
+                    "One or more parameter values were invalid: \
                          Only DELETE action is allowed when no attribute value is specified"
-                            .to_string(),
-                    ));
-                }
-                if action == "DELETE" {
-                    if let Some(ref val) = update.value {
-                        let type_name = match val {
-                            AttributeValue::SS(_)
-                            | AttributeValue::NS(_)
-                            | AttributeValue::BS(_) => None,
-                            _ => Some(val.type_name()),
-                        };
-                        if let Some(tn) = type_name {
-                            return Err(DynoxideError::ValidationException(format!(
-                                "One or more parameter values were invalid: \
+                        .to_string(),
+                ));
+            }
+            if action == "DELETE"
+                && let Some(ref val) = update.value
+            {
+                let type_name = match val {
+                    AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_) => None,
+                    _ => Some(val.type_name()),
+                };
+                if let Some(tn) = type_name {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: \
                                  DELETE action with value is not supported for the type {tn}"
-                            )));
-                        }
-                    }
+                    )));
                 }
-                if action == "ADD" {
-                    if let Some(ref val) = update.value {
-                        let allowed = matches!(
-                            val,
-                            AttributeValue::N(_)
-                                | AttributeValue::SS(_)
-                                | AttributeValue::NS(_)
-                                | AttributeValue::BS(_)
-                                | AttributeValue::L(_)
-                        );
-                        if !allowed {
-                            let tn = val.type_name();
-                            return Err(DynoxideError::ValidationException(format!(
-                                "One or more parameter values were invalid: \
+            }
+            if action == "ADD"
+                && let Some(ref val) = update.value
+            {
+                let allowed = matches!(
+                    val,
+                    AttributeValue::N(_)
+                        | AttributeValue::SS(_)
+                        | AttributeValue::NS(_)
+                        | AttributeValue::BS(_)
+                        | AttributeValue::L(_)
+                );
+                if !allowed {
+                    let tn = val.type_name();
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: \
                                  ADD action is not supported for the type {tn}"
-                            )));
-                        }
-                    }
+                    )));
                 }
-                let _ = attr_name; // suppress unused warning
             }
         }
     }
 
+    // Read once and used twice: the validation immediately below and the
+    // conversion further down, either side of the expression checks between,
+    // none of which touch `expected` or `condition_expression`.
+    //
+    // The two uses do not share a condition. Validation additionally requires
+    // no UpdateExpression, conversion does not, so that guard stays on the
+    // validation rather than moving up here.
+    let expected: Option<HashMap<String, helpers::ExpectedCondition>> =
+        if request.condition_expression.is_none() {
+            request
+                .expected
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        } else {
+            None
+        };
+
     // Validate legacy Expected parameter
-    if request.condition_expression.is_none() && request.update_expression.is_none() {
-        if let Some(ref expected_val) = request.expected {
-            if let Ok(expected) = serde_json::from_value::<
-                HashMap<String, helpers::ExpectedCondition>,
-            >(expected_val.clone())
-            {
-                helpers::validate_expected_conditions(&expected)?;
-            }
-        }
+    if request.update_expression.is_none()
+        && let Some(ref expected) = expected
+    {
+        helpers::validate_expected_conditions(expected)?;
     }
 
     // Validate empty UpdateExpression
-    if let Some(ref ue) = request.update_expression {
-        if ue.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid UpdateExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref ue) = request.update_expression
+        && ue.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid UpdateExpression: The expression can not be empty;".to_string(),
+        ));
     }
 
     // Validate empty ConditionExpression
-    if let Some(ref ce) = request.condition_expression {
-        if ce.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid ConditionExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref ce) = request.condition_expression
+        && ce.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid ConditionExpression: The expression can not be empty;".to_string(),
+        ));
     }
 
     // Pre-validate UpdateExpression syntax BEFORE table lookup.
@@ -368,11 +377,11 @@ async fn execute_inner<S: StorageBackend>(
             .map_err(|e| DynoxideError::EnvelopedValidation(wrap_invalid_update_expression(e)))?;
 
         // Also walk the ConditionExpression to track its attribute usage
-        if let Some(ref ce) = request.condition_expression {
-            if let Ok(cond_parsed) = crate::expressions::condition::parse(ce) {
-                crate::expressions::condition::track_references(&cond_parsed, &tracker)
-                    .map_err(DynoxideError::EnvelopedValidation)?;
-            }
+        if let Some(ref ce) = request.condition_expression
+            && let Ok(cond_parsed) = crate::expressions::condition::parse(ce)
+        {
+            crate::expressions::condition::track_references(&cond_parsed, &tracker)
+                .map_err(DynoxideError::EnvelopedValidation)?;
         }
 
         // Check for unused expression attribute names/values
@@ -401,31 +410,24 @@ async fn execute_inner<S: StorageBackend>(
     }
 
     // Convert legacy Expected parameter to ConditionExpression if no expression is set
-    if request.condition_expression.is_none() {
-        if let Some(ref expected_val) = request.expected {
-            if let Ok(expected) = serde_json::from_value::<
-                HashMap<String, helpers::ExpectedCondition>,
-            >(expected_val.clone())
-            {
-                if !expected.is_empty() {
-                    let (cond_expr, values) = helpers::convert_expected_to_condition(
-                        &expected,
-                        request.conditional_operator.as_deref(),
-                    )?;
-                    if !cond_expr.is_empty() {
-                        let names = helpers::expected_attr_names(&expected);
-                        request.condition_expression = Some(cond_expr);
-                        let expr_values = request
-                            .expression_attribute_values
-                            .get_or_insert_with(HashMap::new);
-                        expr_values.extend(values);
-                        let expr_names = request
-                            .expression_attribute_names
-                            .get_or_insert_with(HashMap::new);
-                        expr_names.extend(names);
-                    }
-                }
-            }
+    if let Some(ref expected) = expected
+        && !expected.is_empty()
+    {
+        let (cond_expr, values) = helpers::convert_expected_to_condition(
+            expected,
+            request.conditional_operator.as_deref(),
+        )?;
+        if !cond_expr.is_empty() {
+            let names = helpers::expected_attr_names(expected);
+            request.condition_expression = Some(cond_expr);
+            let expr_values = request
+                .expression_attribute_values
+                .get_or_insert_with(HashMap::new);
+            expr_values.extend(values);
+            let expr_names = request
+                .expression_attribute_names
+                .get_or_insert_with(HashMap::new);
+            expr_names.extend(names);
         }
     }
 
@@ -580,11 +582,11 @@ async fn execute_inner<S: StorageBackend>(
         }
 
         // Apply legacy AttributeUpdates (if no UpdateExpression was provided)
-        if request.update_expression.is_none() {
-            if let Some(ref updates) = request.attribute_updates {
-                apply_attribute_updates(&mut item, updates, &key_schema)?;
-                size_overhead = attribute_updates_size_overhead(updates);
-            }
+        if request.update_expression.is_none()
+            && let Some(ref updates) = request.attribute_updates
+        {
+            apply_attribute_updates(&mut item, updates, &key_schema)?;
+            size_overhead = attribute_updates_size_overhead(updates);
         }
 
         // Note: unused expression attribute validation already done in pre-validation
@@ -909,10 +911,10 @@ fn extract_updated_attrs(
         // coarse-but-correct shape. Pure attribute paths get the granular
         // fragment AWS scopes `UPDATED_NEW` / `UPDATED_OLD` to.
         if resolved.iter().any(|e| matches!(e, PathElement::Index(_))) {
-            if let Some(PathElement::Attribute(top)) = resolved.first() {
-                if let Some(val) = item.get(top) {
-                    result.insert(top.clone(), val.clone());
-                }
+            if let Some(PathElement::Attribute(top)) = resolved.first()
+                && let Some(val) = item.get(top)
+            {
+                result.insert(top.clone(), val.clone());
             }
             continue;
         }

@@ -286,10 +286,10 @@ pub fn discover_export_files(
                     .to_string();
 
                 // Apply table filter
-                if let Some(filter) = table_filter {
-                    if !filter.iter().any(|f| f == &table_name) {
-                        continue;
-                    }
+                if let Some(filter) = table_filter
+                    && !filter.iter().any(|f| f == &table_name)
+                {
+                    continue;
                 }
 
                 let files = collect_data_files(&data_dir)?;

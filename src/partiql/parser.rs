@@ -524,45 +524,45 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     let mut set_clauses = Vec::new();
     let mut remove_paths = Vec::new();
 
-    if let Some(ref tok) = t.peek_token()? {
-        if tok.eq_ignore_ascii_case("SET") {
-            t.next_token()?; // consume SET
-            loop {
-                let path_tok = t.next_token()?.ok_or("Expected attribute path in SET")?;
-                let path = parse_dotted_path_from_token(&path_tok, t)?;
+    if let Some(ref tok) = t.peek_token()?
+        && tok.eq_ignore_ascii_case("SET")
+    {
+        t.next_token()?; // consume SET
+        loop {
+            let path_tok = t.next_token()?.ok_or("Expected attribute path in SET")?;
+            let path = parse_dotted_path_from_token(&path_tok, t)?;
 
-                let eq = t.next_token()?.ok_or("Expected '='")?;
-                if eq != "=" {
-                    return Err(format!("Expected '=' but got '{eq}'").into());
+            let eq = t.next_token()?.ok_or("Expected '='")?;
+            if eq != "=" {
+                return Err(format!("Expected '=' but got '{eq}'").into());
+            }
+
+            let value = parse_set_value(t)?;
+            set_clauses.push(SetClause { path, value });
+
+            match t.peek_token()? {
+                Some(ref s) if s == "," => {
+                    t.next_token()?; // consume comma
                 }
-
-                let value = parse_set_value(t)?;
-                set_clauses.push(SetClause { path, value });
-
-                match t.peek_token()? {
-                    Some(ref s) if s == "," => {
-                        t.next_token()?; // consume comma
-                    }
-                    _ => break,
-                }
+                _ => break,
             }
         }
     }
 
     // Check for REMOVE keyword
-    if let Some(ref tok) = t.peek_token()? {
-        if tok.eq_ignore_ascii_case("REMOVE") {
-            t.next_token()?; // consume REMOVE
-            loop {
-                let path_tok = t.next_token()?.ok_or("Expected attribute path in REMOVE")?;
-                let path = parse_dotted_path_from_token(&path_tok, t)?;
-                remove_paths.push(path);
-                match t.peek_token()? {
-                    Some(ref s) if s == "," => {
-                        t.next_token()?;
-                    }
-                    _ => break,
+    if let Some(ref tok) = t.peek_token()?
+        && tok.eq_ignore_ascii_case("REMOVE")
+    {
+        t.next_token()?; // consume REMOVE
+        loop {
+            let path_tok = t.next_token()?.ok_or("Expected attribute path in REMOVE")?;
+            let path = parse_dotted_path_from_token(&path_tok, t)?;
+            remove_paths.push(path);
+            match t.peek_token()? {
+                Some(ref s) if s == "," => {
+                    t.next_token()?;
                 }
+                _ => break,
             }
         }
     }
@@ -588,19 +588,19 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
 /// or `list_append(a, b)`.
 fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
     // Check for list_append function
-    if let Some(ref tok) = t.peek_token()? {
-        if tok.eq_ignore_ascii_case("list_append") {
-            t.next_token()?; // consume list_append
-            expect_char(t, "(")?;
-            let first = parse_value(t, 0)?;
-            let comma = t.next_token()?.ok_or("Expected ',' in list_append")?;
-            if comma != "," {
-                return Err(format!("Expected ',' but got '{comma}'"));
-            }
-            let second = parse_value(t, 0)?;
-            expect_char(t, ")")?;
-            return Ok(SetValue::ListAppend(first, second));
+    if let Some(ref tok) = t.peek_token()?
+        && tok.eq_ignore_ascii_case("list_append")
+    {
+        t.next_token()?; // consume list_append
+        expect_char(t, "(")?;
+        let first = parse_value(t, 0)?;
+        let comma = t.next_token()?.ok_or("Expected ',' in list_append")?;
+        if comma != "," {
+            return Err(format!("Expected ',' but got '{comma}'"));
         }
+        let second = parse_value(t, 0)?;
+        expect_char(t, ")")?;
+        return Ok(SetValue::ListAppend(first, second));
     }
 
     let first = parse_value(t, 0)?;
@@ -1257,31 +1257,30 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     }
 
     // Set literal: << val1, val2 >>
-    if tok == "<" {
-        if let Some(ref next) = t.peek_token()? {
-            if next == "<" {
-                t.next_token()?; // consume second <
-                let mut elements = Vec::new();
-                loop {
-                    let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
-                    if peek == ">" {
-                        t.next_token()?; // consume first >
-                        // Consume second >
-                        let next_close = t.peek_token()?;
-                        if next_close.as_deref() == Some(">") {
-                            t.next_token()?;
-                        }
-                        break;
-                    }
-                    if peek == "," {
-                        t.next_token()?;
-                        continue;
-                    }
-                    elements.push(parse_value(t, depth + 1)?);
+    if tok == "<"
+        && let Some(ref next) = t.peek_token()?
+        && next == "<"
+    {
+        t.next_token()?; // consume second <
+        let mut elements = Vec::new();
+        loop {
+            let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
+            if peek == ">" {
+                t.next_token()?; // consume first >
+                // Consume second >
+                let next_close = t.peek_token()?;
+                if next_close.as_deref() == Some(">") {
+                    t.next_token()?;
                 }
-                return set_literal_to_value(elements);
+                break;
             }
+            if peek == "," {
+                t.next_token()?;
+                continue;
+            }
+            elements.push(parse_value(t, depth + 1)?);
         }
+        return set_literal_to_value(elements);
     }
 
     // List literal: [val1, val2]
@@ -1354,15 +1353,14 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     }
 
     // Negative number: `-` followed by a numeric token
-    if tok == "-" || tok == "+" {
-        if let Some(ref next) = t.peek_token()? {
-            if next.starts_with(|c: char| c.is_ascii_digit()) {
-                let num = t.next_token()?.unwrap();
-                return Ok(PartiqlValue::Literal(AttributeValue::N(format!(
-                    "{tok}{num}"
-                ))));
-            }
-        }
+    if (tok == "-" || tok == "+")
+        && let Some(ref next) = t.peek_token()?
+        && next.starts_with(|c: char| c.is_ascii_digit())
+    {
+        let num = t.next_token()?.unwrap();
+        return Ok(PartiqlValue::Literal(AttributeValue::N(format!(
+            "{tok}{num}"
+        ))));
     }
 
     // Numeric literal
@@ -1519,30 +1517,29 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
     }
 
     // Set literal: << val1, val2 >>
-    if tok == "<" {
-        if let Some(ref next_tok) = t.peek_token_at(1)? {
-            if next_tok == "<" {
-                t.next_token()?; // consume first <
-                t.next_token()?; // consume second <
-                let mut elements = Vec::new();
-                loop {
-                    let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
-                    if peek == ">" {
-                        t.next_token()?; // consume first >
-                        if t.peek_token()?.as_deref() == Some(">") {
-                            t.next_token()?; // consume second >
-                        }
-                        break;
-                    }
-                    if peek == "," {
-                        t.next_token()?;
-                        continue;
-                    }
-                    elements.push(parse_item_value(t, depth + 1)?);
+    if tok == "<"
+        && let Some(ref next_tok) = t.peek_token_at(1)?
+        && next_tok == "<"
+    {
+        t.next_token()?; // consume first <
+        t.next_token()?; // consume second <
+        let mut elements = Vec::new();
+        loop {
+            let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
+            if peek == ">" {
+                t.next_token()?; // consume first >
+                if t.peek_token()?.as_deref() == Some(">") {
+                    t.next_token()?; // consume second >
                 }
-                return item_value_set_literal(elements);
+                break;
             }
+            if peek == "," {
+                t.next_token()?;
+                continue;
+            }
+            elements.push(parse_item_value(t, depth + 1)?);
         }
+        return item_value_set_literal(elements);
     }
 
     // Scalar value
@@ -1554,13 +1551,12 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
     }
 
     // Negative number: `-` followed by a numeric token
-    if tok == "-" || tok == "+" {
-        if let Some(ref next) = t.peek_token()? {
-            if next.starts_with(|c: char| c.is_ascii_digit()) {
-                let num = t.next_token()?.unwrap();
-                return Ok(AttributeValue::N(format!("{tok}{num}")));
-            }
-        }
+    if (tok == "-" || tok == "+")
+        && let Some(ref next) = t.peek_token()?
+        && next.starts_with(|c: char| c.is_ascii_digit())
+    {
+        let num = t.next_token()?.unwrap();
+        return Ok(AttributeValue::N(format!("{tok}{num}")));
     }
 
     // Number

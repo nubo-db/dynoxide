@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/dynoxide-rs.svg)](https://crates.io/crates/dynoxide-rs) [![docs.rs](https://img.shields.io/docsrs/dynoxide-rs)](https://docs.rs/dynoxide-rs) [![CI](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml/badge.svg)](https://github.com/nubo-db/dynoxide/actions/workflows/ci.yml) [![conformance](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/paritysuite/dynamodb-conformance/main/results/dynoxide.badge.json)](https://paritysuite.org) [![license](https://img.shields.io/crates/l/dynoxide-rs.svg)](#license)
 
-A DynamoDB emulator backed by SQLite. Runs as an HTTP server, an MCP server for coding agents, or embeds directly into Rust and iOS applications as a library.
+A DynamoDB emulator in Rust, backed by SQLite. Runs as an HTTP server or an MCP server for coding agents, embeds into Rust and iOS applications as a library, and compiles to WebAssembly for the browser.
 
 ## Why Dynoxide?
 
@@ -49,7 +49,7 @@ Dynoxide is continuously verified against real DynamoDB by **Parity Suite**, the
 
 Disclosure: Dynoxide and Parity Suite are maintained by the same person. The suite scores Dynoxide on the same public matrix it runs against every other engine, and the results and test code are open.
 
-This covers the native build. The [WebAssembly](#webassembly-preview) build is scored as its own row: it passes every test it implements, with a far higher skip count than any other target because several operations are still missing.
+This covers the native build. The [WebAssembly](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) build is scored as its own row: it passes every test it implements, with a far higher skip count than any other target because several operations are still missing.
 
 ### How It Compares
 
@@ -85,12 +85,14 @@ Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, C
 
 - [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker
 - [HTTP server](https://github.com/nubo-db/dynoxide/blob/main/docs/http-server.md) - running the DynamoDB-compatible HTTP API
+- [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
 - [Import CLI](https://github.com/nubo-db/dynoxide/blob/main/docs/import.md) - loading data, table filtering, and anonymisation
-- [WebAssembly (preview)](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) - the browser build and embed contract
+- [WebAssembly](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) - the browser build and embed contract
 - [Using as a Rust library](https://github.com/nubo-db/dynoxide/blob/main/docs/library.md) - embedded mode and feature flags
 - [Compatibility](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md) - operation, expression, and PartiQL coverage versus DynamoDB
+- [Versioning](https://github.com/nubo-db/dynoxide/blob/main/docs/versioning.md) - what the version number promises and what forces a major
 - [Releasing](https://github.com/nubo-db/dynoxide/blob/main/docs/RELEASING.md) - release cadence and process
 
 ## Supported Operations

@@ -3,7 +3,7 @@
 //! Defines the [`StorageBackend`] trait that decouples Dynoxide's data layer
 //! from a specific SQLite binding. The native [`rusqlite`]-backed
 //! [`Storage`](crate::storage::Storage) implements the trait, and the
-//! `wasm-sqlite` build adds [`wasm_backend::WasmBridgeBackend`], which runs the
+//! `wasm-sqlite` build adds `wasm_backend::WasmBridgeBackend`, which runs the
 //! same SQL against a JS SQLite database over a wasm-bindgen bridge. Both
 //! backends issue identical SQL because they share the builders in
 //! [`sql_builders`].
@@ -37,6 +37,11 @@ pub mod sql_builders;
 pub mod rusqlite_impl;
 #[cfg(feature = "wasm-sqlite")]
 pub mod wasm_backend;
+// Compile-only proof that the trait is satisfiable by a fresh impl. In-crate
+// rather than under `tests/`, because a sealed trait cannot be implemented
+// from outside.
+#[cfg(test)]
+mod trait_compile;
 
 use crate::storage::{
     CreateTableMetadata, DatabaseInfo, QueryParams, ScanParams, StreamRecord, TableMetadata,
@@ -205,7 +210,37 @@ pub enum IndexWriteOp {
     },
 }
 
+/// Restricts [`StorageBackend`] to this crate's own backends.
+///
+/// The trait's method set tracks engine features rather than a stable
+/// interface: vector index support added seven methods to it in a single
+/// release. Sealing keeps that growth out of the versioning contract, because
+/// a trait nothing downstream can implement cannot be broken by a new method.
+/// The trait stays nameable, so [`Database`](crate::Database) and the wasm
+/// dispatch bounds are unaffected.
+///
+/// Unsealing later is a minor, if third-party backends ever earn their place.
+/// Sealing after 1.0.0 would not be, which is why it happens before.
+mod private {
+    pub trait Sealed {}
+
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+    impl Sealed for crate::storage::Storage {}
+
+    #[cfg(feature = "wasm-sqlite")]
+    impl Sealed for super::wasm_backend::WasmBridgeBackend {}
+}
+
 /// Backend-neutral storage interface.
+///
+/// Sealed: implemented by this crate's own backends only. It is public because
+/// [`Database`](crate::Database) is generic over it and the wasm dispatch
+/// functions take it as a bound, so it can be named and used as a bound from
+/// anywhere. Its method set tracks engine features rather than a stable
+/// interface, so closing it to outside impls keeps adding one out of the
+/// versioning contract. The [versioning policy] carries the reasoning.
+///
+/// [versioning policy]: https://github.com/nubo-db/dynoxide/blob/main/docs/versioning.md
 ///
 /// Method signatures mirror [`Storage`](crate::storage::Storage)'s public
 /// surface 1:1, with three mechanical transformations:
@@ -217,14 +252,14 @@ pub enum IndexWriteOp {
 ///
 /// The trait is not consumed dynamically today. The native
 /// [`Storage`](crate::storage::Storage) and the wasm
-/// [`WasmBridgeBackend`](wasm_backend::WasmBridgeBackend) each implement it
+/// `WasmBridgeBackend` each implement it
 /// monomorphically.
 ///
 /// The `#[allow(async_fn_in_trait)]` reflects the monomorphic-only consumption
 /// model. The lint can be revisited if and when `dyn StorageBackend` becomes
 /// a real callsite.
 #[allow(async_fn_in_trait)]
-pub trait StorageBackend {
+pub trait StorageBackend: private::Sealed {
     // -----------------------------------------------------------------------
     // Capabilities
     // -----------------------------------------------------------------------
@@ -381,9 +416,9 @@ pub trait StorageBackend {
     ///
     /// Batch-shaped so a backend can amortise per-row round-trips, mirroring
     /// [`insert_gsi_items`](Self::insert_gsi_items). Used by the vector index
-    /// backfill path, and by the default [`apply_index_writes`]
-    /// (Self::apply_index_writes) with a one-row slice for live-write
-    /// maintenance.
+    /// backfill path, and by the default
+    /// [`apply_index_writes`](Self::apply_index_writes) with a one-row slice
+    /// for live-write maintenance.
     async fn insert_vector_items(
         &self,
         table_name: &str,

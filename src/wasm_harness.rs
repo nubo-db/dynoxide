@@ -1,4 +1,4 @@
-//! Browser smoke-test entry point for the wasm-sqlite backend (preview).
+//! Browser smoke-test entry point for the wasm-sqlite backend.
 //!
 //! Gated behind the `wasm-harness` feature so this scaffolding stays out of the
 //! production `wasm-sqlite` build. [`smoke_test`] runs a create/put/get

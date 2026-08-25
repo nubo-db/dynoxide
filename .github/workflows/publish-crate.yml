@@ -22,6 +22,10 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    # Manual dispatch publishes to crates.io exactly as a tagged release does,
+    # so it takes the same approval gate. Without this the recovery path is a
+    # way to publish with no review.
+    environment: production-publish
 
     steps:
       - uses: actions/checkout@v5

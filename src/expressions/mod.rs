@@ -215,10 +215,10 @@ impl<'a> TrackedExpressionAttributes<'a> {
 
     fn walk_path_elements(&self, path: &[PathElement]) {
         for elem in path {
-            if let PathElement::Attribute(name) = elem {
-                if name.starts_with('#') {
-                    self.used_names.borrow_mut().insert(name.clone());
-                }
+            if let PathElement::Attribute(name) = elem
+                && name.starts_with('#')
+            {
+                self.used_names.borrow_mut().insert(name.clone());
             }
         }
     }

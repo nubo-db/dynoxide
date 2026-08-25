@@ -130,10 +130,10 @@ pub fn evaluate(
                 Some(v) => {
                     for candidate in values {
                         let cv = resolve_operand(candidate, item, tracker)?;
-                        if let Some(c) = cv {
-                            if compare_values(&v, &CompOp::Eq, &c) {
-                                return Ok(true);
-                            }
+                        if let Some(c) = cv
+                            && compare_values(&v, &CompOp::Eq, &c)
+                        {
+                            return Ok(true);
                         }
                     }
                     Ok(false)
@@ -422,14 +422,14 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
 /// Parse an operand (path, value ref, or size function).
 fn parse_operand(stream: &mut TokenStream) -> Result<Operand, String> {
     // Check for size() function
-    if let Some(Token::Identifier(name)) = stream.peek() {
-        if name.to_lowercase() == "size" {
-            stream.next();
-            stream.expect(&Token::LParen)?;
-            let path = parse_raw_path(stream)?;
-            stream.expect(&Token::RParen)?;
-            return Ok(Operand::Size(path));
-        }
+    if let Some(Token::Identifier(name)) = stream.peek()
+        && name.to_lowercase() == "size"
+    {
+        stream.next();
+        stream.expect(&Token::LParen)?;
+        let path = parse_raw_path(stream)?;
+        stream.expect(&Token::RParen)?;
+        return Ok(Operand::Size(path));
     }
 
     match stream.peek() {
@@ -578,12 +578,13 @@ pub(crate) fn compare_values(left: &AttributeValue, op: &CompOp, right: &Attribu
         // Number comparisons: f64 fast-path for common cases, BigDecimal for edge cases
         (AttributeValue::N(a), AttributeValue::N(b)) => {
             // Fast path: f64 is exact for ≤15 significant digits with no scientific notation
-            if can_use_f64(a) && can_use_f64(b) {
-                if let (Ok(fa), Ok(fb)) = (a.parse::<f64>(), b.parse::<f64>()) {
-                    if fa.is_finite() && fb.is_finite() {
-                        return compare_ord(&fa, &fb, op);
-                    }
-                }
+            if can_use_f64(a)
+                && can_use_f64(b)
+                && let (Ok(fa), Ok(fb)) = (a.parse::<f64>(), b.parse::<f64>())
+                && fa.is_finite()
+                && fb.is_finite()
+            {
+                return compare_ord(&fa, &fb, op);
             }
             // Slow path: BigDecimal for 38-digit precision edge cases
             use bigdecimal::BigDecimal;
@@ -769,10 +770,10 @@ fn track_cond_path_refs(
     tracker: &TrackedExpressionAttributes,
 ) -> Result<(), String> {
     for elem in path {
-        if let PathElement::Attribute(name) = elem {
-            if name.starts_with('#') {
-                tracker.resolve_name(name)?;
-            }
+        if let PathElement::Attribute(name) = elem
+            && name.starts_with('#')
+        {
+            tracker.resolve_name(name)?;
         }
     }
     Ok(())
@@ -806,15 +807,14 @@ pub fn validate_operand_semantics(
             Ok(())
         }
         ConditionExpr::BeginsWith(_, prefix) => {
-            if let Operand::ValueRef(vname) = prefix {
-                if let Some(v) = values.as_ref().and_then(|m| m.get(vname.as_str())) {
-                    if !matches!(v, AttributeValue::S(_) | AttributeValue::B(_)) {
-                        return Err(format!(
-                            "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {}",
-                            v.type_name()
-                        ));
-                    }
-                }
+            if let Operand::ValueRef(vname) = prefix
+                && let Some(v) = values.as_ref().and_then(|m| m.get(vname.as_str()))
+                && !matches!(v, AttributeValue::S(_) | AttributeValue::B(_))
+            {
+                return Err(format!(
+                    "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {}",
+                    v.type_name()
+                ));
             }
             Ok(())
         }
@@ -855,29 +855,29 @@ pub fn validate_static(
     match expr {
         ConditionExpr::Between { operand: _, lo, hi } => {
             // Only validate when both bounds are value refs
-            if let (Operand::ValueRef(lo_name), Operand::ValueRef(hi_name)) = (lo, hi) {
-                if let Some(vals) = values {
-                    let lo_val = vals.get(lo_name.as_str());
-                    let hi_val = vals.get(hi_name.as_str());
-                    if let (Some(lo_v), Some(hi_v)) = (lo_val, hi_val) {
-                        // Check same data type
-                        if std::mem::discriminant(lo_v) != std::mem::discriminant(hi_v) {
-                            return Err(format!(
-                                "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; \
+            if let (Operand::ValueRef(lo_name), Operand::ValueRef(hi_name)) = (lo, hi)
+                && let Some(vals) = values
+            {
+                let lo_val = vals.get(lo_name.as_str());
+                let hi_val = vals.get(hi_name.as_str());
+                if let (Some(lo_v), Some(hi_v)) = (lo_val, hi_val) {
+                    // Check same data type
+                    if std::mem::discriminant(lo_v) != std::mem::discriminant(hi_v) {
+                        return Err(format!(
+                            "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; \
                                  lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                                format_av_for_error(lo_v),
-                                format_av_for_error(hi_v),
-                            ));
-                        }
-                        // Check ordering
-                        if compare_values(lo_v, &CompOp::Gt, hi_v) {
-                            return Err(format!(
-                                "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; \
+                            format_av_for_error(lo_v),
+                            format_av_for_error(hi_v),
+                        ));
+                    }
+                    // Check ordering
+                    if compare_values(lo_v, &CompOp::Gt, hi_v) {
+                        return Err(format!(
+                            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; \
                                  lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                                format_av_for_error(lo_v),
-                                format_av_for_error(hi_v),
-                            ));
-                        }
+                            format_av_for_error(lo_v),
+                            format_av_for_error(hi_v),
+                        ));
                     }
                 }
             }
@@ -1199,14 +1199,14 @@ fn collect_path_undefined_refs(
     out: &mut Vec<String>,
 ) {
     for elem in path {
-        if let PathElement::Attribute(name) = elem {
-            if name.starts_with('#') {
-                let defined = attr_names
-                    .as_ref()
-                    .is_some_and(|m| m.contains_key(name.as_str()));
-                if !defined && !out.contains(name) {
-                    out.push(name.clone());
-                }
+        if let PathElement::Attribute(name) = elem
+            && name.starts_with('#')
+        {
+            let defined = attr_names
+                .as_ref()
+                .is_some_and(|m| m.contains_key(name.as_str()));
+            if !defined && !out.contains(name) {
+                out.push(name.clone());
             }
         }
     }

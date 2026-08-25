@@ -102,35 +102,34 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         }
 
         // Select enum
-        if let Some(ref sel) = raw.select {
-            if ![
+        if let Some(ref sel) = raw.select
+            && ![
                 "ALL_ATTRIBUTES",
                 "ALL_PROJECTED_ATTRIBUTES",
                 "COUNT",
                 "SPECIFIC_ATTRIBUTES",
             ]
             .contains(&sel.as_str())
-            {
-                errors.push(format!(
+        {
+            errors.push(format!(
                     "Value '{}' at 'select' failed to satisfy constraint: \
                      Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
                     sel
                 ));
-            }
         }
 
         // Limit must be >= 1.
         // AWS DynamoDB's Query message diverges from Scan: Query omits the rejected
         // value entirely and capitalises 'Limit', whereas Scan keeps the value and
         // lowercases 'limit'. Do not collapse these into a shared helper.
-        if let Some(limit) = raw.limit {
-            if limit == 0 {
-                errors.push(
-                    "Value at 'Limit' failed to satisfy constraint: \
+        if let Some(limit) = raw.limit
+            && limit == 0
+        {
+            errors.push(
+                "Value at 'Limit' failed to satisfy constraint: \
                      Member must have value greater than or equal to 1"
-                        .to_string(),
-                );
-            }
+                    .to_string(),
+            );
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -249,12 +248,12 @@ pub async fn execute<S: StorageBackend>(
     // ---- Validate expression syntax BEFORE table existence ----
     // DynamoDB validates KeyConditionExpression, FilterExpression, and
     // ProjectionExpression syntax before checking if the table exists.
-    if let Some(ref kce) = request.key_condition_expression {
-        if kce.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid KeyConditionExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref kce) = request.key_condition_expression
+        && kce.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid KeyConditionExpression: The expression can not be empty;".to_string(),
+        ));
     }
     if let Some(ref fe) = request.filter_expression {
         if fe.is_empty() {
@@ -288,12 +287,12 @@ pub async fn execute<S: StorageBackend>(
             }
         }
     }
-    if let Some(ref pe) = request.projection_expression {
-        if pe.is_empty() {
-            return Err(DynoxideError::ValidationException(
-                "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
-            ));
-        }
+    if let Some(ref pe) = request.projection_expression
+        && pe.is_empty()
+    {
+        return Err(DynoxideError::ValidationException(
+            "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+        ));
     }
 
     // SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet.
@@ -310,20 +309,19 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // A ProjectionExpression is only valid with Select = SPECIFIC_ATTRIBUTES.
-    if request.projection_expression.is_some() {
-        if let Some(select) = request.select.as_deref() {
-            if select != "SPECIFIC_ATTRIBUTES" {
-                // AWS phrases COUNT as "only the Count"; other values use the literal.
-                let target = if select == "COUNT" {
-                    "only the Count"
-                } else {
-                    select
-                };
-                return Err(DynoxideError::ValidationException(format!(
-                    "Cannot specify the ProjectionExpression when choosing to get {target}"
-                )));
-            }
-        }
+    if request.projection_expression.is_some()
+        && let Some(select) = request.select.as_deref()
+        && select != "SPECIFIC_ATTRIBUTES"
+    {
+        // AWS phrases COUNT as "only the Count"; other values use the literal.
+        let target = if select == "COUNT" {
+            "only the Count"
+        } else {
+            select
+        };
+        return Err(DynoxideError::ValidationException(format!(
+            "Cannot specify the ProjectionExpression when choosing to get {target}"
+        )));
     }
 
     // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
@@ -336,16 +334,16 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // For KeyConditionExpression, validate syntax early too
-    if let Some(ref kce) = request.key_condition_expression {
-        if !kce.is_empty() {
-            // Create a temporary tracker for early syntax validation
-            let temp_tracker = crate::expressions::TrackedExpressionAttributes::new(
-                &request.expression_attribute_names,
-                &request.expression_attribute_values,
-            );
-            if let Err(e) = expressions::key_condition::parse(kce, &temp_tracker) {
-                return Err(DynoxideError::ValidationException(e));
-            }
+    if let Some(ref kce) = request.key_condition_expression
+        && !kce.is_empty()
+    {
+        // Create a temporary tracker for early syntax validation
+        let temp_tracker = crate::expressions::TrackedExpressionAttributes::new(
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        );
+        if let Err(e) = expressions::key_condition::parse(kce, &temp_tracker) {
+            return Err(DynoxideError::ValidationException(e));
         }
     }
 
@@ -372,52 +370,43 @@ pub async fn execute<S: StorageBackend>(
     };
 
     // Convert legacy KeyConditions to KeyConditionExpression if no expression is set
-    if request.key_condition_expression.is_none() {
-        if let Some(ref kc_val) = request.key_conditions {
-            if let Ok(kc) =
-                serde_json::from_value::<HashMap<String, helpers::KeyCondition>>(kc_val.clone())
-            {
-                if !kc.is_empty() {
-                    let converted =
-                        helpers::convert_key_conditions(&kc, Some(&effective_pk_for_kc))?;
-                    request.key_condition_expression = Some(converted.expression);
-                    let expr_values = request
-                        .expression_attribute_values
-                        .get_or_insert_with(HashMap::new);
-                    expr_values.extend(converted.attribute_values);
-                    let expr_names = request
-                        .expression_attribute_names
-                        .get_or_insert_with(HashMap::new);
-                    expr_names.extend(converted.attribute_names);
-                }
-            }
-        }
+    if request.key_condition_expression.is_none()
+        && let Some(ref kc_val) = request.key_conditions
+        && let Ok(kc) =
+            serde_json::from_value::<HashMap<String, helpers::KeyCondition>>(kc_val.clone())
+        && !kc.is_empty()
+    {
+        let converted = helpers::convert_key_conditions(&kc, Some(&effective_pk_for_kc))?;
+        request.key_condition_expression = Some(converted.expression);
+        let expr_values = request
+            .expression_attribute_values
+            .get_or_insert_with(HashMap::new);
+        expr_values.extend(converted.attribute_values);
+        let expr_names = request
+            .expression_attribute_names
+            .get_or_insert_with(HashMap::new);
+        expr_names.extend(converted.attribute_names);
     }
 
     // Convert legacy QueryFilter to FilterExpression if no expression is set
-    if request.filter_expression.is_none() {
-        if let Some(ref qf_val) = request.query_filter {
-            if let Ok(qf) =
-                serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(qf_val.clone())
-            {
-                if !qf.is_empty() {
-                    let converted = helpers::convert_filter_conditions(
-                        &qf,
-                        request.conditional_operator.as_deref(),
-                    )?;
-                    if !converted.expression.is_empty() {
-                        request.filter_expression = Some(converted.expression);
-                        let expr_values = request
-                            .expression_attribute_values
-                            .get_or_insert_with(HashMap::new);
-                        expr_values.extend(converted.attribute_values);
-                        let expr_names = request
-                            .expression_attribute_names
-                            .get_or_insert_with(HashMap::new);
-                        expr_names.extend(converted.attribute_names);
-                    }
-                }
-            }
+    if request.filter_expression.is_none()
+        && let Some(ref qf_val) = request.query_filter
+        && let Ok(qf) =
+            serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(qf_val.clone())
+        && !qf.is_empty()
+    {
+        let converted =
+            helpers::convert_filter_conditions(&qf, request.conditional_operator.as_deref())?;
+        if !converted.expression.is_empty() {
+            request.filter_expression = Some(converted.expression);
+            let expr_values = request
+                .expression_attribute_values
+                .get_or_insert_with(HashMap::new);
+            expr_values.extend(converted.attribute_values);
+            let expr_names = request
+                .expression_attribute_names
+                .get_or_insert_with(HashMap::new);
+            expr_names.extend(converted.attribute_names);
         }
     }
 
@@ -562,78 +551,70 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Check legacy QueryFilter
-    if let Some(ref qf_val) = request.query_filter {
-        if let Some(obj) = qf_val.as_object() {
-            for attr_name in obj.keys() {
-                if effective_key_attrs.contains(attr_name) {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "QueryFilter can only contain non-primary key attributes: \
+    if let Some(ref qf_val) = request.query_filter
+        && let Some(obj) = qf_val.as_object()
+    {
+        for attr_name in obj.keys() {
+            if effective_key_attrs.contains(attr_name) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "QueryFilter can only contain non-primary key attributes: \
                          Primary key attribute: {attr_name}"
-                    )));
-                }
+                )));
             }
         }
     }
 
     // Check FilterExpression for key attribute references (only for user-supplied expressions,
     // not those converted from QueryFilter - QueryFilter is checked separately above)
-    if request.query_filter.is_none() {
-        if let Some(ref fe) = request.filter_expression {
-            if let Ok(parsed_fe) = expressions::condition::parse(fe) {
-                let top_attrs = expressions::condition::extract_top_level_attributes(
-                    &parsed_fe,
-                    &request.expression_attribute_names,
-                );
-                for attr in &top_attrs {
-                    if effective_key_attrs.contains(attr) {
-                        return Err(DynoxideError::ValidationException(format!(
-                            "Filter Expression can only contain non-primary key attributes: \
+    if request.query_filter.is_none()
+        && let Some(ref fe) = request.filter_expression
+        && let Ok(parsed_fe) = expressions::condition::parse(fe)
+    {
+        let top_attrs = expressions::condition::extract_top_level_attributes(
+            &parsed_fe,
+            &request.expression_attribute_names,
+        );
+        for attr in &top_attrs {
+            if effective_key_attrs.contains(attr) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "Filter Expression can only contain non-primary key attributes: \
                              Primary key attribute: {attr}"
-                        )));
-                    }
-                }
-                // Check for non-scalar key access in FilterExpression
-                // Build index key attribute lists
-                let mut index_key_attrs = Vec::new();
-                if request.index_name.is_some() {
-                    // Index keys that are not also table keys
-                    if !effective_key_attrs
-                        .iter()
-                        .any(|k| k == &table_key_schema.partition_key)
-                    {
-                        // This shouldn't normally happen for query, but just in case
-                    }
-                    // Check all effective key attrs for non-scalar access
-                    for k in &effective_key_attrs {
-                        if ![table_key_schema.partition_key.clone()]
-                            .iter()
-                            .chain(table_key_schema.sort_key.iter())
-                            .any(|tk| tk == k)
-                        {
-                            index_key_attrs.push(k.clone());
-                        }
-                    }
-                }
-                let base_key_attrs: Vec<String> = {
-                    let mut v = vec![table_key_schema.partition_key.clone()];
-                    if let Some(ref sk) = table_key_schema.sort_key {
-                        v.push(sk.clone());
-                    }
-                    v
-                };
-                if let Some((attr, is_index)) = expressions::condition::check_non_scalar_key_access(
-                    &parsed_fe,
-                    &request.expression_attribute_names,
-                    &base_key_attrs,
-                    &index_key_attrs,
-                ) {
-                    let prefix = if is_index { "IndexKey" } else { "Key" };
-                    return Err(DynoxideError::ValidationException(format!(
-                        "Key attributes must be scalars; \
-                         list random access '[]' and map lookup '.' are not allowed: {prefix}: {attr}"
-                    )));
+                )));
+            }
+        }
+        // Check for non-scalar key access in FilterExpression
+        // Build index key attribute lists
+        let mut index_key_attrs = Vec::new();
+        if request.index_name.is_some() {
+            // Index keys that are not also table keys
+            for k in &effective_key_attrs {
+                if ![table_key_schema.partition_key.clone()]
+                    .iter()
+                    .chain(table_key_schema.sort_key.iter())
+                    .any(|tk| tk == k)
+                {
+                    index_key_attrs.push(k.clone());
                 }
             }
+        }
+        let base_key_attrs: Vec<String> = {
+            let mut v = vec![table_key_schema.partition_key.clone()];
+            if let Some(ref sk) = table_key_schema.sort_key {
+                v.push(sk.clone());
+            }
+            v
+        };
+        if let Some((attr, is_index)) = expressions::condition::check_non_scalar_key_access(
+            &parsed_fe,
+            &request.expression_attribute_names,
+            &base_key_attrs,
+            &index_key_attrs,
+        ) {
+            let prefix = if is_index { "IndexKey" } else { "Key" };
+            return Err(DynoxideError::ValidationException(format!(
+                "Key attributes must be scalars; \
+                         list random access '[]' and map lookup '.' are not allowed: {prefix}: {attr}"
+            )));
         }
     }
 
@@ -794,10 +775,10 @@ pub async fn execute<S: StorageBackend>(
         if !key_attrs.contains(&table_key_schema.partition_key) {
             key_attrs.push(table_key_schema.partition_key.clone());
         }
-        if let Some(ref sk) = table_key_schema.sort_key {
-            if !key_attrs.contains(sk) {
-                key_attrs.push(sk.clone());
-            }
+        if let Some(ref sk) = table_key_schema.sort_key
+            && !key_attrs.contains(sk)
+        {
+            key_attrs.push(sk.clone());
         }
     }
 
@@ -911,28 +892,25 @@ pub async fn execute<S: StorageBackend>(
         last_evaluated_item.map(|item| {
             let mut key = build_last_evaluated_key(&item, &effective_pk, effective_sk.as_deref());
             // For LSI queries, add the table sort key if different from the index sort key
-            if is_lsi {
-                if let Some(tsk) = table_key_schema.sort_key.as_deref() {
-                    if !key.contains_key(tsk) {
-                        if let Some(v) = item.get(tsk) {
-                            key.insert(tsk.to_string(), v.clone());
-                        }
-                    }
-                }
+            if is_lsi
+                && let Some(tsk) = table_key_schema.sort_key.as_deref()
+                && !key.contains_key(tsk)
+                && let Some(v) = item.get(tsk)
+            {
+                key.insert(tsk.to_string(), v.clone());
             }
             // For GSI queries, add the base table primary key (pk and sk)
             if is_gsi_query {
-                if !key.contains_key(&table_key_schema.partition_key) {
-                    if let Some(v) = item.get(&table_key_schema.partition_key) {
-                        key.insert(table_key_schema.partition_key.clone(), v.clone());
-                    }
+                if !key.contains_key(&table_key_schema.partition_key)
+                    && let Some(v) = item.get(&table_key_schema.partition_key)
+                {
+                    key.insert(table_key_schema.partition_key.clone(), v.clone());
                 }
-                if let Some(ref tsk) = table_key_schema.sort_key {
-                    if !key.contains_key(tsk) {
-                        if let Some(v) = item.get(tsk) {
-                            key.insert(tsk.clone(), v.clone());
-                        }
-                    }
+                if let Some(ref tsk) = table_key_schema.sort_key
+                    && !key.contains_key(tsk)
+                    && let Some(v) = item.get(tsk)
+                {
+                    key.insert(tsk.clone(), v.clone());
                 }
             }
             key
@@ -1010,10 +988,10 @@ fn build_last_evaluated_key(
     if let Some(pk_val) = item.get(pk_name) {
         key.insert(pk_name.to_string(), pk_val.clone());
     }
-    if let Some(sk) = sk_name {
-        if let Some(sk_val) = item.get(sk) {
-            key.insert(sk.to_string(), sk_val.clone());
-        }
+    if let Some(sk) = sk_name
+        && let Some(sk_val) = item.get(sk)
+    {
+        key.insert(sk.to_string(), sk_val.clone());
     }
     key
 }

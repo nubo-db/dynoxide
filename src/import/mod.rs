@@ -480,12 +480,12 @@ fn unwrap_describe_table_shapes(table: &mut serde_json::Value) {
         ("BillingModeSummary", "BillingMode"),
         ("TableClassSummary", "TableClass"),
     ] {
-        if !obj.contains_key(field_key) {
-            if let Some(value) = obj.get(summary_key).and_then(|s| s.get(field_key)) {
-                let value = value.clone();
-                obj.insert(field_key.to_string(), value);
-                billing_mode_hoisted |= field_key == "BillingMode";
-            }
+        if !obj.contains_key(field_key)
+            && let Some(value) = obj.get(summary_key).and_then(|s| s.get(field_key))
+        {
+            let value = value.clone();
+            obj.insert(field_key.to_string(), value);
+            billing_mode_hoisted |= field_key == "BillingMode";
         }
     }
 

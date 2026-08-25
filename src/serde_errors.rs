@@ -300,21 +300,21 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> String {
     // Try to extract column number from "at line N column N"
-    if let Some(col_str) = msg.rsplit("column ").next() {
-        if let Ok(col) = col_str.trim().parse::<usize>() {
-            // Column is 1-based. Look at the character just before the column
-            // to determine what type of value serde encountered.
-            if col > 0 && col <= body.len() {
-                let ch = body.as_bytes()[col - 1];
-                return match ch {
-                    b't' => format!("TRUE_VALUE cannot be converted to {target_type}"),
-                    b'f' => format!("FALSE_VALUE cannot be converted to {target_type}"),
-                    b'0'..=b'9' | b'-' => {
-                        format!("NUMBER_VALUE cannot be converted to {target_type}")
-                    }
-                    _ => format!("TRUE_VALUE cannot be converted to {target_type}"),
-                };
-            }
+    if let Some(col_str) = msg.rsplit("column ").next()
+        && let Ok(col) = col_str.trim().parse::<usize>()
+    {
+        // Column is 1-based. Look at the character just before the column
+        // to determine what type of value serde encountered.
+        if col > 0 && col <= body.len() {
+            let ch = body.as_bytes()[col - 1];
+            return match ch {
+                b't' => format!("TRUE_VALUE cannot be converted to {target_type}"),
+                b'f' => format!("FALSE_VALUE cannot be converted to {target_type}"),
+                b'0'..=b'9' | b'-' => {
+                    format!("NUMBER_VALUE cannot be converted to {target_type}")
+                }
+                _ => format!("TRUE_VALUE cannot be converted to {target_type}"),
+            };
         }
     }
     format!("TRUE_VALUE cannot be converted to {target_type}")

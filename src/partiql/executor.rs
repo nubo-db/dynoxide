@@ -310,13 +310,13 @@ pub async fn execute_page<S: StorageBackend>(
             // DynamoDB permits only RETURNING ALL OLD * on DELETE; the other
             // well-formed variants are rejected with a ValidationException whose
             // message echoes the offending variant.
-            if let Some(variant) = returning {
-                if *variant != ReturningVariant::AllOld {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "Invalid returning clause: RETURNING {} *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
-                        variant.as_sql()
-                    )));
-                }
+            if let Some(variant) = returning
+                && *variant != ReturningVariant::AllOld
+            {
+                return Err(DynoxideError::ValidationException(format!(
+                    "Invalid returning clause: RETURNING {} *. Only RETURNING ALL OLD * is allowed in DELETE statements.",
+                    variant.as_sql()
+                )));
             }
             let (old_item, capacity) = execute_delete(
                 storage,
@@ -2082,10 +2082,10 @@ fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
                 }
             }
             PathSegment::Index(i) => {
-                if let AttributeValue::L(list) = current {
-                    if *i < list.len() {
-                        list.remove(*i);
-                    }
+                if let AttributeValue::L(list) = current
+                    && *i < list.len()
+                {
+                    list.remove(*i);
                 }
             }
         }
@@ -2093,17 +2093,17 @@ fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
     }
     match seg {
         PathSegment::Key(k) => {
-            if let AttributeValue::M(map) = current {
-                if let Some(next) = map.get_mut(*k) {
-                    remove_from_value(next, rest);
-                }
+            if let AttributeValue::M(map) = current
+                && let Some(next) = map.get_mut(*k)
+            {
+                remove_from_value(next, rest);
             }
         }
         PathSegment::Index(i) => {
-            if let AttributeValue::L(list) = current {
-                if let Some(next) = list.get_mut(*i) {
-                    remove_from_value(next, rest);
-                }
+            if let AttributeValue::L(list) = current
+                && let Some(next) = list.get_mut(*i)
+            {
+                remove_from_value(next, rest);
             }
         }
     }
@@ -2200,10 +2200,10 @@ fn matches_conditions(
                         Ok(v) => v,
                         Err(_) => return false,
                     };
-                    if let (AttributeValue::S(s), AttributeValue::S(p)) = (item_val, &prefix) {
-                        if s.starts_with(p.as_str()) {
-                            return false;
-                        }
+                    if let (AttributeValue::S(s), AttributeValue::S(p)) = (item_val, &prefix)
+                        && s.starts_with(p.as_str())
+                    {
+                        return false;
                     }
                 }
             }

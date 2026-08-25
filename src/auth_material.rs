@@ -6,7 +6,7 @@
 //! returns when parts are missing or conflicting.
 //!
 //! This lives outside `server/` because dynoxide now has two HTTP surfaces: the
-//! native axum server and the wasm engine's [`dispatch_http`](crate::wasm_api),
+//! native axum server and the wasm engine's `wasm_api::dispatch_http`,
 //! which is fronted by a transport shim. Both call this, so neither can drift
 //! from the other. Nothing here knows about axum or about wasm.
 

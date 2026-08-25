@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-24
+
+Every artefact moves to 1.0.0 together: the crate, the npm CLI wrapper and its
+platform binaries, the browser engine, the container images and the MCP registry
+entry. `docs/versioning.md` states what that number promises, what forces a
+major, and how conformance fixes are versioned from here.
+
+The browser engine drops its `-preview` suffix and joins the shared version. Its
+conformance coverage is unchanged by that; `docs/versioning.md` names what the
+suite does and does not exercise.
+
+### Behaviour changes
+
+Read this section before upgrading. This release corrects a large number of
+divergences from DynamoDB, and a test that had come to depend on the old answer
+will fail. Grouped by what you will actually experience.
+
+**A write can now modify data it previously did not.** These three share one
+cause: PartiQL `UPDATE` and `DELETE` evaluate their `WHERE` clause through the
+same matcher as `SELECT`, so a change to predicate handling changes which rows a
+write touches.
+
+- A predicate on a set, list, map, binary or null attribute compares by value
+  instead of never matching. A conditional write on any of those types could
+  never fire before and now fires.
+- A negated comparison keeps the rows its attribute is missing from. `NOT a='x'`
+  skipped rows with no `a` and now matches them, so a write carrying that
+  predicate reaches a wider row set.
+- Parenthesised grouping and bare `NOT` now parse. `WHERE (a='1')` was a parse
+  error, so a write carrying it did nothing; it now executes. Unlike the two
+  above, the old behaviour was a visible error rather than a silent no-op.
+
+**Requests that used to be accepted are now rejected**, matching DynamoDB. A
+test sending one of these and expecting success fails immediately: the
+`UpdateItem` item-size ceiling; the PartiQL 400KB item-size limit;
+`ReturnConsumedCapacity` outside `INDEXES`, `TOTAL` and `NONE`; two
+`BatchExecuteStatement` and `ExecuteTransaction` request shapes; five rejections
+on index-qualified PartiQL `SELECT`; a `SELECT` in `BatchExecuteStatement` that
+does not name the primary key or that names an index; ordering comparisons
+against operands with no ordering; an index-qualified `SELECT` inside
+`ExecuteTransaction`.
+
+One runs the other way and is worth knowing: an ordering comparison against an
+unorderable operand used to answer no rows and now rejects the statement, so a
+conditional write of that shape fails visibly instead of silently doing nothing.
+
+**Consumed capacity figures move.** Any test asserting exact `ConsumedCapacity`
+values will need updating. Index writes are charged on the change to what the
+index stores rather than on the finished item, LSI writes are charged at all,
+table arms are sized on the larger of an item's before and after images,
+transactional and PartiQL surfaces report per-index figures under `INDEXES`,
+PartiQL reads are charged on rows walked rather than rows returned, and LSI
+base-table reads are charged on bytes moved rather than a flat half unit.
+
+**Results change without an error.** A PartiQL `SELECT` is served from the index
+its `FROM` clause names, so sparse membership and projection now apply; an LSI
+serves a projection naming an attribute it does not carry by reading the base
+item, where it used to return rows of empty objects.
+
+**Crashes became errors.** An unterminated quoted name and a deeply nested
+statement are rejected rather than aborting the process, and `wasm-sqlite`
+alongside the default features now fails with a message that explains itself.
+
+Every individual change is listed in the sections below, and
+`docs/compatibility-summary.md` carries the cumulative behaviour-change record.
+
 ### Added
 
 - **Vector indexes and `SearchVectors`.** `CreateTable` and `UpdateTable` take vector index definitions, `DescribeTable` reports them, the item write paths maintain them, and `SearchVectors` returns the nearest entries to a query vector over `COSINE`, `EUCLIDEAN` or `DOT_PRODUCT`. A search can be scoped by a `SearchSchema` HASH attribute and filtered on `INLINE_FILTER` attributes, and reports `VectorSearchRequestBytes`; a write to a vector-indexed table reports a per-index `VectorIndexes` map under `INDEXES`. Available on the native build, the wasm build, and through the MCP tools, which gain a `search_vectors` tool. Scoring is exact brute-force KNN, so the top-k is the true top-k.
@@ -18,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BatchExecuteStatement` accepts `ReturnConsumedCapacity` and reports capacity, which it previously had no way to do at all. Per-table entries with index arms, aggregated across the batch. A failed statement is still charged the write it attempted, sized on the larger of the row already stored and the item it carried; a batch in which nothing succeeds reports no capacity, and a table whose statements all failed is omitted entirely. Captured against eu-west-2.
 
 ### Changed
+
+- The declared MSRV is now 1.88, which is what the crate has actually needed since the vector index and PartiQL work landed. `rust-version` had read 1.85 since 0.9.5 with nothing verifying it, so the requirement moved while the declaration stayed put: let chains in the action layer and `rmcp`'s reach into `darling 0.23` both want 1.88, and building 1.0.0 on 1.85 would have failed. Raising the floor also unblocked the let-chain suggestions clippy had been suppressing against the old one, so the shipped tree collapses around a hundred nested conditionals into let chains across the action, expression, PartiQL, MCP and import paths. A CI job now compiles against whatever `rust-version` declares, so raising the floor has to be a deliberate edit.
+
+- **Breaking (Rust API):** `storage_backend::StorageBackend` is sealed. It stays public and can still be named and used as a bound, which is what `Database<S>` and the wasm dispatch functions need, but only Dynoxide's own backends implement it. The trait's method set tracks what the engine can do rather than a stable interface, and vector index support alone added seven methods to it. Left open, each such addition would have been a major. `docs/versioning.md` carries the reasoning; unsealing is a minor if third-party backends ever earn their place.
 
 - The wasm surface runs the same pre-deserialisation type checks as the HTTP server, so a mistyped field answers with the captured `SerializationException` on both rather than raw serde text on one. Affects every operation carrying such a check.
 
@@ -53,6 +123,7 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - `partiql::executor::statement_target` is removed. Use `statement_target_in`, which takes a table the caller has already resolved.
 - `partiql::executor::execute_page` takes three further arguments: `consistent_read`, `capacity_mode` and an optional `resolved` table.
 - `partiql::parser::parse` returns `Result<Statement, ParseError>` rather than `Result<Statement, String>`.
+- `WASM_PREVIEW` is renamed `WASM_BACKEND`. It named a maturity level on a build that is no longer a preview, and 1.0.0 freezes the constant into the version contract, so renaming it later would have cost a major. The value and meaning are unchanged: `true` under `wasm-sqlite`, `false` otherwise.
 - `partiql::parser::WhereClause::from_conditions` and `from_groups` are removed. Use `from_groups_written`, which also takes whether the clause as written joined anything with `OR`.
 - `partiql::parser::CompOp` is a re-export of `expressions::condition::CompOp` rather than its own enum.
 
@@ -563,7 +634,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...v0.12.0
 [0.11.4]: https://github.com/nubo-db/dynoxide/compare/v0.11.3...v0.11.4

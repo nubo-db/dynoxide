@@ -91,6 +91,6 @@ One-off, and it needs your GitHub account. No repo file. Comment on
 - repo: <https://github.com/nubo-db/dynoxide>
 - run: `npx -y dynoxide mcp`
 - transport: stdio (also streamable HTTP via `dynoxide mcp --http`)
-- 34 tools
+- 35 tools
 
 The mcp.so team adds it to the directory from there.

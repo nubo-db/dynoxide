@@ -379,12 +379,11 @@ fn resolve_tracked_path(
 ) -> Vec<PathElement> {
     path.iter()
         .map(|elem| {
-            if let PathElement::Attribute(name) = elem {
-                if name.starts_with('#') {
-                    if let Ok(resolved) = tracker.resolve_name(name) {
-                        return PathElement::Attribute(resolved);
-                    }
-                }
+            if let PathElement::Attribute(name) = elem
+                && name.starts_with('#')
+                && let Ok(resolved) = tracker.resolve_name(name)
+            {
+                return PathElement::Attribute(resolved);
             }
             elem.clone()
         })
@@ -449,10 +448,10 @@ fn track_path_refs(
     tracker: &TrackedExpressionAttributes,
 ) -> Result<(), String> {
     for elem in path {
-        if let PathElement::Attribute(name) = elem {
-            if name.starts_with('#') {
-                tracker.resolve_name(name)?;
-            }
+        if let PathElement::Attribute(name) = elem
+            && name.starts_with('#')
+        {
+            tracker.resolve_name(name)?;
         }
     }
     Ok(())

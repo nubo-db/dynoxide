@@ -126,7 +126,7 @@ pub(crate) struct CachedWrite {
 
 /// Run a transactional write.
 ///
-/// Callers driving idempotency want [`execute_cached`], which also hands back
+/// Callers driving idempotency want `execute_cached`, which also hands back
 /// the sizes a replay is billed against.
 pub async fn execute<S: StorageBackend>(
     storage: &S,
@@ -164,13 +164,12 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     // or missing) is skipped here and reported by the in-loop validation instead (#95).
     let mut seen_targets = HashSet::new();
     for item in items {
-        if let Some(target) = get_item_target(storage, item).await? {
-            if !seen_targets.insert(target) {
-                return Err(DynoxideError::ValidationException(
-                    "Transaction request cannot include multiple operations on one item"
-                        .to_string(),
-                ));
-            }
+        if let Some(target) = get_item_target(storage, item).await?
+            && !seen_targets.insert(target)
+        {
+            return Err(DynoxideError::ValidationException(
+                "Transaction request cannot include multiple operations on one item".to_string(),
+            ));
         }
     }
 
@@ -180,12 +179,12 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     // runs. An update's size is not: it depends on the stored item, and comes
     // back as a cancellation reason instead. Captured against eu-west-2.
     for item in items {
-        if let Some(ref put) = item.put {
-            if types::item_size(&put.item) > types::MAX_ITEM_SIZE {
-                return Err(DynoxideError::ValidationException(
-                    "Item size has exceeded the maximum allowed size".to_string(),
-                ));
-            }
+        if let Some(ref put) = item.put
+            && types::item_size(&put.item) > types::MAX_ITEM_SIZE
+        {
+            return Err(DynoxideError::ValidationException(
+                "Item size has exceeded the maximum allowed size".to_string(),
+            ));
         }
     }
 
@@ -410,10 +409,10 @@ async fn execute_put<S: StorageBackend>(
     );
 
     // Pre-register references statically before runtime evaluation
-    if let Some(ref cond_expr) = put.condition_expression {
-        if let Ok(parsed) = crate::expressions::condition::parse(cond_expr) {
-            tracker.track_condition_expr(&parsed);
-        }
+    if let Some(ref cond_expr) = put.condition_expression
+        && let Ok(parsed) = crate::expressions::condition::parse(cond_expr)
+    {
+        tracker.track_condition_expr(&parsed);
     }
 
     // Evaluate condition if present
@@ -507,10 +506,10 @@ async fn execute_update<S: StorageBackend>(
     );
 
     // Pre-register references statically before runtime evaluation
-    if let Some(ref cond_expr) = update.condition_expression {
-        if let Ok(parsed) = crate::expressions::condition::parse(cond_expr) {
-            tracker.track_condition_expr(&parsed);
-        }
+    if let Some(ref cond_expr) = update.condition_expression
+        && let Ok(parsed) = crate::expressions::condition::parse(cond_expr)
+    {
+        tracker.track_condition_expr(&parsed);
     }
     if let Ok(parsed) = crate::expressions::update::parse(&update.update_expression) {
         tracker.track_update_expr(&parsed);
@@ -638,10 +637,10 @@ async fn execute_delete<S: StorageBackend>(
     );
 
     // Pre-register references statically before runtime evaluation
-    if let Some(ref cond_expr) = delete.condition_expression {
-        if let Ok(parsed) = crate::expressions::condition::parse(cond_expr) {
-            tracker.track_condition_expr(&parsed);
-        }
+    if let Some(ref cond_expr) = delete.condition_expression
+        && let Ok(parsed) = crate::expressions::condition::parse(cond_expr)
+    {
+        tracker.track_condition_expr(&parsed);
     }
 
     // Evaluate condition if present

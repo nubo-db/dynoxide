@@ -10,6 +10,21 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 ---
 
+## Behaviour changes by version
+
+Conformance fixes ship as minor releases, so behaviour moves within a major line. This is the cumulative record: if something answers differently after an upgrade, look here first. `docs/versioning.md` explains the rule and how to pin if you would rather behaviour held still.
+
+### 1.0.0
+
+A large correction pass. Full detail in `CHANGELOG.md`; the shapes that matter:
+
+- **A PartiQL write can now modify data it previously did not.** Predicates on set, list, map, binary and null attributes compare by value instead of never matching; a negated comparison keeps rows its attribute is missing from; parenthesised grouping and bare `NOT` now parse. `UPDATE` and `DELETE` share their `WHERE` matcher with `SELECT`, so all three reach the write paths.
+- **Requests that used to be accepted are now rejected**, matching DynamoDB: item-size ceilings on `UpdateItem` and the PartiQL write surfaces, `ReturnConsumedCapacity` validation, two `BatchExecuteStatement` and `ExecuteTransaction` request shapes, index-qualified PartiQL `SELECT` in several forms, and ordering comparisons against unorderable operands.
+- **Consumed capacity figures move** across index writes, transactional surfaces, PartiQL reads and LSI base-table reads.
+- **Results change without an error**: a PartiQL `SELECT` is served from the index its `FROM` names, and an LSI serves a projection naming an attribute it does not carry.
+
+---
+
 ## Conformance
 
 Dynoxide's DynamoDB compatibility is independently verified by **Parity Suite**, the
@@ -356,7 +371,7 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 
 | Capability | Notes |
 |---|---|
-| MCP server (34 tools, stdio + HTTP) | Exposes all DynamoDB operations as tools for coding agents |
+| MCP server (35 tools, stdio + HTTP) | Exposes all DynamoDB operations as tools for coding agents |
 | Embedded mode (direct Rust API) | `Database::memory()` - no HTTP, no serialisation overhead |
 | Snapshots + auto-snapshot before destructive ops | Point-in-time save/restore for safe experimentation |
 | OneTable data model integration | `--data-model` loads entity schemas for agent context |

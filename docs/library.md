@@ -78,7 +78,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 | `mcp-server` | Yes | Adds MCP server for coding agents (stdio and Streamable HTTP transports). |
 | `import` | Yes | Adds `dynoxide import` CLI for importing DynamoDB Export data with anonymisation. |
 | `cli` | Indirect | Gates the `dynoxide` binary. Pulled in automatically by `http-server`, `mcp-server`, or `import`, so default builds include it; a library-only or `wasm-sqlite` build omits the binary. |
-| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS), a preview. Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See the WASM section. |
+| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS). Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See the WASM section. |
 | `encryption` | No | Bundles SQLCipher + vendored OpenSSL. Adds `Database::new_encrypted()` for encryption at rest. |
 | `encryption-cc` | No | Like `encryption` but uses Apple CommonCrypto instead of bundled OpenSSL. For macOS and iOS builds. |
 | `encrypted-server` | No | Convenience: enables `encryption` + `http-server`. |
@@ -89,7 +89,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 `native-sqlite`, `encryption` and `wasm-sqlite` are **mutually exclusive** - they select different SQLite backends. `wasm-sqlite` additionally excludes the CLI, server and MCP features, which are native-only. Cargo adds the default features to whatever you list, so naming one of these on its own is not enough: `features = ["wasm-sqlite"]` still enables `native-sqlite` and the CLI from the defaults, and the build stops on a `compile_error!` saying so. Always pair a non-default backend with `default-features = false`. To use encryption:
 
 ```toml
-dynoxide-rs = { version = "0.12", default-features = false, features = ["encryption"] }
+dynoxide-rs = { version = "1.0", default-features = false, features = ["encryption"] }
 ```
 
 **Workspace note:** Cargo unifies features across a workspace. If any crate depends on `dynoxide-rs` with default features (getting `native-sqlite`) and another uses `encryption`, both activate and the build fails. Use `default-features = false` on all `dynoxide-rs` dependencies in the workspace.

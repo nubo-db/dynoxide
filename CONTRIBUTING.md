@@ -45,7 +45,7 @@ or behaviour note that motivates the change. Cleaner ergonomics or
 
 ## Local setup
 
-- Rust 2024 edition, MSRV 1.85 (both declared in `Cargo.toml`). Any
+- Rust 2024 edition, MSRV 1.88 (both declared in `Cargo.toml`). Any
   recent stable toolchain that satisfies the MSRV works.
 - `cargo build` to compile, `cargo test` to run the test suite.
 - `cargo fmt --check` and `cargo clippy -- -D warnings` must pass

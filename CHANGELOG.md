@@ -85,6 +85,8 @@ Every individual change is listed in the sections below, and
 
 ### Changed
 
+- The declared MSRV is now 1.88, which is what the crate has actually needed since the vector index and PartiQL work landed. `rust-version` had read 1.85 since 0.9.5 with nothing verifying it, so the requirement moved while the declaration stayed put: twelve `let` chains across the action layer need 1.88, and `rmcp` reaches `darling 0.23`, which needs it as well. Building 1.0.0 on 1.85 would have failed. A CI job now compiles against whatever `rust-version` declares, so raising the floor has to be a deliberate edit.
+
 - The wasm surface runs the same pre-deserialisation type checks as the HTTP server, so a mistyped field answers with the captured `SerializationException` on both rather than raw serde text on one. Affects every operation carrying such a check.
 
 - **Breaking (behaviour):** numbers are sized the way DynamoDB sizes them, so consumed capacity moves. Captured byte-exact against eu-west-2 by bisecting the 400KB gate: a number costs one byte, plus `ceil(integer significant digits / 2)` and `ceil(fraction significant digits / 2)`, over the value with leading and trailing zeros trimmed. The old measure was wrong in both directions. It charged for zeros DynamoDB trims, so `0.0000001` was sized at 5 bytes rather than 2; it rounded the halving down where DynamoDB rounds up, so every number with an odd count of significant digits was a byte light; and it never charged for a minus sign, which costs a byte, so every negative number was light too. Both fed consumed capacity on every write, `table_stats`, the query and scan byte budgets, and index capacity, so those figures change. An item sitting on the 400KB boundary can flip either way with it.

@@ -10,7 +10,7 @@ documentation = "https://docs.rs/dynoxide-rs"
 readme = "README.md"
 keywords = ["dynamodb", "sqlite", "emulator", "aws", "testing"]
 categories = ["database-implementations", "emulators"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [lib]
 name = "dynoxide"

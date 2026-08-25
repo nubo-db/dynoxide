@@ -2,24 +2,15 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Advisories are denied by default. Each ignore below is a dev-dependency-only
-# finding, pinned by the AWS SDK's legacy default TLS stack (hyper 0.14 +
-# rustls 0.21 + rustls-webpki 0.101), which `aws-config` / `aws-sdk-dynamodb`
-# pull in transitively for the integration and conformance tests. None of these
-# crates are compiled into the published crate or the installed binary
-# (confirmed with `cargo tree -e no-dev`). There is no fix by version bump: the
-# latest AWS SDK 1.x still ships this stack by default. The proper fix is to
-# migrate the AWS dev-deps to the modern `default-https-client` (hyper 1.x +
-# rustls 0.23 + aws-lc) under a 2025+ BehaviorVersion. Revisit and remove these
-# entries when that migration lands.
-ignore = [
-    # The only one left. `time` fixed it in 0.3.47, which needs Rust 1.88
-    # against this crate's declared 1.85, so taking the patch would move a
-    # published MSRV to close a dev-only hole. `time` reaches us through the
-    # AWS SDK we test against and is not in the shipped graph, and the attack
-    # needs a malicious RFC 2822 date, which nothing here parses.
-    { id = "RUSTSEC-2026-0009", reason = "time 0.3.45: stack exhaustion parsing a hostile RFC 2822 date. Dev-only via the AWS SDK, not in the published crate or binary. The fix in 0.3.47 requires Rust 1.88 and the crate declares 1.85. Revisit when the MSRV moves." },
-]
+# Advisories are denied by default and nothing is ignored. Keep it that way:
+# an entry here is a hole held open, so prefer a version bump, and record the
+# reason and the condition for removal if one is ever genuinely unavoidable.
+#
+# RUSTSEC-2026-0009 (`time`, stack exhaustion on a hostile RFC 2822 date) sat
+# here while the fix in 0.3.47 needed Rust 1.88 and the crate declared 1.85.
+# The declared MSRV is now 1.88, so `time` moved to a fixed version and the
+# ignore went with it.
+ignore = []
 
 [licenses]
 # Mirrors about.toml's accepted set, plus MPL-2.0 for option-ext (a normal

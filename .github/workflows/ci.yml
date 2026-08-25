@@ -57,6 +57,44 @@ jobs:
       - name: Test
         run: cargo test --lib
 
+  # `rust-version` is part of the published Rust API contract in
+  # docs/versioning.md, so it is a promise rather than a description. Every
+  # other job runs on stable, which cannot see a language feature that raises
+  # the floor. The toolchain here is read from the manifest rather than pinned
+  # literally, so the check and the promise cannot disagree.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          if [ -z "$VERSION" ]; then
+            echo "::error::no rust-version found in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $VERSION"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+
+      # Dev-dependencies are out of scope on purpose: they never reach a
+      # consumer, so one raising its own floor does not break this promise.
+      # These two shapes are what `cargo add` and `cargo install` compile.
+      - name: Check default features
+        run: cargo check
+
+      - name: Check minimal library
+        run: cargo check --no-default-features --features native-sqlite --lib
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

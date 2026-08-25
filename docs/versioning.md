@@ -12,11 +12,16 @@ finished.
 | Contract | Surface |
 |---|---|
 | Rust API | Public types, traits, signatures, feature flags, MSRV |
-| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` header, container entrypoint and port |
+| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` header, container entrypoint and port, the `GET /` health response and the startup line |
 | Browser JS API | The Worker client API and message protocol |
 | Engine behaviour | How the engine answers, across every surface above |
 
 A break in any one of them forces a major on the shared number.
+
+MSRV is the exception inside that list. It is named there because the version
+number describes it, not because every move in it breaks a consumer: raising it
+ships as a minor. Where the two tables could be read against each other, the one
+below is the authority.
 
 That includes a case worth stating plainly because you will meet it: **a change
 to the Rust API bumps the CLI's major**, even though a CLI user never touches
@@ -33,12 +38,33 @@ and this is the reason it would happen.
 | HTTP response shape or error string change | major |
 | Worker message protocol or client API change | major |
 | Container entrypoint or exposed port change | major |
+| `GET /` health status or body change | major |
+| Startup line text, or the stream it goes to | major |
 | Engine behaviour change | major, unless it is a capture-backed conformance fix |
 | Conformance fix, capture-backed | minor |
 | New DynamoDB operation | minor |
 | New feature flag | minor |
 | MSRV raise | minor |
 | Dependency bump with no surface change | patch |
+
+## What a container waits on
+
+Two behaviours are promises rather than descriptions, because tooling outside
+this repository waits on them to decide Dynoxide is up.
+
+`GET /` answers `200` with the body `healthy: dynamodb.us-east-1.amazonaws.com `,
+trailing space included. The region in it comes from a constant rather than the
+address the server bound to, so it does not move with `--host` or `--port`.
+Every other path answers `404`, so a probe aimed at the wrong one fails instead
+of passing by accident.
+
+The startup line reads `Dynoxide listening on http://<host>:<port>` and goes to
+**stderr**. Tracing output goes to stdout, so a log-based wait pointed at the
+wrong stream waits for ever.
+
+`tests/container_contract.rs` holds both. Worth knowing if you change either:
+the container's own `HEALTHCHECK` reads the status line and never the body, so
+without those tests nothing would notice the body change.
 
 ## The storage backend seam
 

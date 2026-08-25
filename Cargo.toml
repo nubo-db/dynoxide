@@ -44,8 +44,8 @@ import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicati
 # Real wasm SQLite backend. dynoxide compiles to wasm32-unknown-unknown and
 # runs against the official @sqlite.org/sqlite-wasm engine over a wasm-bindgen
 # bridge, persisting to OPFS.
-# Preview: conformant on what it implements, but several operations are still
-# missing (see the conformance note in the README).
+# Conformant on what it implements, but several operations are still missing
+# (see the conformance note in the README).
 wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:async-lock"]
 
 # Browser smoke-test entry point over the wasm-sqlite backend. Opt-in so the

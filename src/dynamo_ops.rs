@@ -3,11 +3,11 @@
 //!
 //! Two callers need this list and used to keep their own copies, which drifted:
 //! the HTTP server (to recognise a `X-Amz-Target`) and the wasm engine API (to
-//! phrase the "not supported by the preview" message). Both now derive from
+//! phrase the "not supported by the wasm engine" message). Both now derive from
 //! [`KNOWN_OPERATIONS`], so adding an operation is a one-line edit here.
 
 /// Every DynamoDB operation dynoxide recognises, whether or not a given build
-/// implements it. The wasm preview's *supported* subset lives separately in
+/// implements it. The wasm build's *supported* subset lives separately in
 /// `wasm_api::SUPPORTED_OPS`; this is the wider "is this a real DynamoDB op at
 /// all" set.
 pub const KNOWN_OPERATIONS: &[&str] = &[

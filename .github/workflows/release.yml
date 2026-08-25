@@ -77,6 +77,22 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/extract-changelog.sh "$VERSION" CHANGELOG.md > /dev/null
 
+      # The MCPB bundle is the one versioned artefact nothing stamps: the npm
+      # packages and server.json ship a placeholder that publish rewrites,
+      # while this file is edited by hand. That is why it sat at 0.11.1 while
+      # the crate was at 0.13.0. docs/versioning.md now promises every artefact
+      # carries the same number, so the tag has to enforce it.
+      - name: Check the MCPB manifest version matches the tag
+        env:
+          EXPECTED: ${{ steps.resolve.outputs.version }}
+        run: |
+          ACTUAL=$(jq -r '.version' mcpb/manifest.json)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::mcpb/manifest.json version ($ACTUAL) does not match tag ($EXPECTED). Bump it and re-tag."
+            exit 1
+          fi
+          echo "mcpb/manifest.json version: $ACTUAL"
+
   # -------------------------------------------------------------------
   # Build release binaries for all targets.
   # -------------------------------------------------------------------

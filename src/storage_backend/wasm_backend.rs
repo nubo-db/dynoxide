@@ -16,7 +16,7 @@
 //! therefore exposes `async fn` and never calls `block_on` - the wasm main
 //! thread must not block.
 //!
-//! # Preview status
+//! # Coverage
 //!
 //! This backend covers the CRUD, query, scan, GSI/LSI, and PartiQL surface, and
 //! is verified against the conformance suite for those. Capabilities it does
@@ -480,7 +480,7 @@ fn js_err(e: JsValue) -> BackendError {
     BackendError::Other(format!("sqlite-wasm: {msg}"))
 }
 
-/// A capability this preview backend does not provide. Some are simply not
+/// A capability this backend does not provide. Some are simply not
 /// implemented yet (streams, pending a delivery design; the metadata-mutation,
 /// stats, and bulk paths); TTL needs a background expiry sweep the browser
 /// runtime does not drive. All surface as the typed

@@ -91,6 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
       # Dev-dependencies are out of scope on purpose: they never reach a
@@ -100,11 +101,27 @@ jobs:
       # `--locked` is the point of the job: without it the resolver may pick
       # different versions than the lockfile ships, and the check would pass
       # against a dependency set no consumer gets.
+      # Every published shape, not just the default one. The floor last drifted
+      # inside feature-gated code, so checking one combination would leave the
+      # same hole: a construct needing a newer compiler can sit behind
+      # `encryption` or `wasm-sqlite`, compile green on stable here, and break
+      # a consumer building that combination on the declared floor.
       - name: Check default features
         run: cargo check --locked
 
       - name: Check minimal library
         run: cargo check --locked --no-default-features --features native-sqlite --lib
+
+      - name: Check encryption
+        run: cargo check --locked --no-default-features --features encryption --lib
+
+      - name: Check encrypted-full
+        run: cargo check --locked --no-default-features --features encrypted-full
+
+      - name: Check wasm-sqlite
+        run: |
+          cargo check --locked --target wasm32-unknown-unknown \
+            --no-default-features --features wasm-sqlite --lib
 
   lint:
     name: Lint
@@ -432,18 +449,26 @@ jobs:
       # green. Five seconds is generous against a quarter-second first probe.
       - name: Container reports healthy quickly
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Deliberately not `set -e`: a `docker inspect` against a container
+          # that has gone away must fall through to the diagnostics below
+          # rather than abort the step and print nothing.
+          status=""
           for _ in $(seq 1 25); do
-            status=$(docker inspect -f '{{.State.Health.Status}}' dynoxide-smoke)
+            status=$(docker inspect -f '{{.State.Health.Status}}' dynoxide-smoke 2>/dev/null || echo gone)
             case "$status" in
               healthy) echo "healthy"; exit 0 ;;
-              unhealthy) echo "::error::container reported unhealthy"; break ;;
+              unhealthy|gone) break ;;
             esac
             sleep 0.2
           done
-          echo "::error::container did not report healthy within 5s (last: ${status:-unknown})"
-          docker inspect -f '{{json .State.Health}}' dynoxide-smoke
-          docker logs dynoxide-smoke
+          case "$status" in
+            unhealthy) echo "::error::container reported unhealthy" ;;
+            gone)      echo "::error::container disappeared before reporting healthy" ;;
+            *)         echo "::error::container did not report healthy within 5s (last: ${status:-unknown})" ;;
+          esac
+          docker inspect -f '{{json .State.Health}}' dynoxide-smoke 2>/dev/null || true
+          docker logs dynoxide-smoke 2>&1 || true
           exit 1
 
       # Poll the port from outside as well: that is the reachability an SDK

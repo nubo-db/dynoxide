@@ -1,6 +1,6 @@
 # Versioning
 
-Every Dynoxide artifact carries the same version number: the crate, the npm CLI
+Every Dynoxide artefact carries the same version number: the crate, the npm CLI
 wrapper and its platform binaries, the browser engine, the container images and
 the MCP registry entry. One tag produces one release across all of them.
 

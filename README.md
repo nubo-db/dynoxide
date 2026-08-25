@@ -49,7 +49,7 @@ Dynoxide is continuously verified against real DynamoDB by **Parity Suite**, the
 
 Disclosure: Dynoxide and Parity Suite are maintained by the same person. The suite scores Dynoxide on the same public matrix it runs against every other engine, and the results and test code are open.
 
-This covers the native build. The [WebAssembly](#webassembly) build is scored as its own row: it passes every test it implements, with a far higher skip count than any other target because several operations are still missing.
+This covers the native build. The [WebAssembly](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) build is scored as its own row: it passes every test it implements, with a far higher skip count than any other target because several operations are still missing.
 
 ### How It Compares
 

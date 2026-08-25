@@ -58,6 +58,32 @@ dynoxide-rs = { version = "1.0", default-features = false, features = ["native-s
 # dynoxide-rs = { version = "1.0", default-features = false, features = ["encryption"] }
 ```
 
+## Upgrading to 1.0.0
+
+The largest behaviour change the project has shipped. Unlike the 0.12.x and
+0.9.x notes below, this one affects anyone running the binary, not just library
+consumers. [CHANGELOG.md](../CHANGELOG.md) groups the full list under Behaviour
+changes; the shapes to expect are:
+
+**Running the binary or the container?** Requests that used to be accepted are
+now rejected, matching DynamoDB: item-size ceilings on `UpdateItem` and the
+PartiQL write surfaces, `ReturnConsumedCapacity` validation, and several
+index-qualified PartiQL `SELECT` forms. Consumed capacity figures move, so a
+test asserting exact values needs updating. A PartiQL `UPDATE` or `DELETE` can
+now match rows it previously skipped, because its `WHERE` clause runs through
+the same matcher as `SELECT`.
+
+**Depending on the `dynoxide-rs` crate?** The MSRV is now 1.88. `WASM_PREVIEW`
+is renamed `WASM_BACKEND`. `storage_backend::StorageBackend` is sealed, so it
+can still be named and used as a bound but no longer implemented outside the
+crate. Several public types gained fields and became `#[non_exhaustive]`, and a
+few signatures changed; the changelog's Breaking (Rust API) section lists each
+one.
+
+**Pinning.** Behaviour moves inside 1.x, because conformance fixes ship as
+minors. [versioning.md](versioning.md) explains the trade and how to pin
+narrower if you would rather it held still.
+
 ## Upgrading to 0.12.x
 
 Source-breaking for library consumers only. The DynamoDB wire API and the

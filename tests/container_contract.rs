@@ -189,6 +189,17 @@ enum Attempt {
 fn read_startup_line(port: u16, expected: &str) -> (Attempt, String) {
     let (mut child, mut stderr, mut stdout) = spawn_serve(port);
 
+    // Drain stdout on its own thread rather than after the kill below. Tracing
+    // writes there, so a contributor running with `RUST_LOG=trace` fills the
+    // pipe buffer; the child then blocks on write and never reaches the
+    // `eprintln!` this test waits for, which would read as the startup line
+    // regressing rather than as a stalled pipe.
+    let stdout_thread = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        out
+    });
+
     // Read on a worker thread and time out on the channel. `read_line` blocks
     // until a line arrives, so a deadline checked between reads never fires on
     // the one failure this test exists to catch: a startup line that never
@@ -236,9 +247,9 @@ fn read_startup_line(port: u16, expected: &str) -> (Attempt, String) {
     let _ = child.kill();
     let status = child.wait().ok();
 
-    // Read stdout only once the process is gone, so this cannot block.
-    let mut out = String::new();
-    let _ = stdout.read_to_string(&mut out);
+    // The draining thread ends when the child closes stdout, which the kill
+    // above guarantees.
+    let out = stdout_thread.join().unwrap_or_default();
 
     let attempt = if found {
         Attempt::Found

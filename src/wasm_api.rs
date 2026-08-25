@@ -16,7 +16,7 @@
 //!   (`Count`, `ScannedCount`, and, when the request asks for it,
 //!   `ConsumedCapacity` are all present on Query/Scan).
 //! - API error: [`DynoxideError::to_json`], carrying `__type` and a message.
-//! - Unknown or preview-unsupported op: an `UnsupportedOperation` envelope with
+//! - Unknown or unsupported op: an `UnsupportedOperation` envelope with
 //!   the same `__type`/`message` shape, so a client never has to parse a panic.
 //!
 //! Positive feature detection goes through [`capabilities`], not error probing:
@@ -40,7 +40,7 @@ use crate::storage_backend::StorageBackend;
 /// supported op is additive and non-breaking.
 pub const CONTRACT_VERSION: u32 = 1;
 
-/// Operations the wasm preview engine answers through [`dispatch`]. This is the
+/// Operations the wasm engine answers through [`dispatch`]. This is the
 /// authoritative feature-detection list the client consumes via
 /// [`capabilities`]; anything outside it returns an `UnsupportedOperation`
 /// envelope. Kept in sync with the arms of [`dispatch`].
@@ -185,7 +185,7 @@ pub async fn dispatch_http<S: StorageBackend>(
         return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
     }
 
-    // A known DynamoDB operation the preview does not implement. 501 is what
+    // A known DynamoDB operation the wasm build does not implement. 501 is what
     // makes this land as a skip rather than a failure: the conformance suite's
     // `isUnsupportedFault` accepts the status outright, so the classification
     // does not depend on the message surviving the SDK's error parsing.
@@ -203,13 +203,13 @@ pub async fn dispatch_http<S: StorageBackend>(
 }
 
 /// Build the `UnsupportedOperation` JSON envelope for an op the engine does not
-/// serve (either preview-unsupported or genuinely unknown).
+/// serve (either unsupported or genuinely unknown).
 fn unsupported_envelope(op: &str) -> String {
     // `dynamo_ops::is_known_operation` is the wide "real DynamoDB op" set;
-    // `SUPPORTED_OPS` is the preview's subset. A known-but-unsupported op phrases
+    // `SUPPORTED_OPS` is the wasm build's subset. A known-but-unsupported op phrases
     // differently from a genuinely unknown one.
     let message = if crate::dynamo_ops::is_known_operation(op) {
-        format!("Operation '{op}' is not supported by the wasm preview engine")
+        format!("Operation '{op}' is not supported by the wasm engine")
     } else {
         format!("Unknown operation: '{op}'")
     };
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_preview_op_returns_envelope() {
+    fn unsupported_op_returns_envelope() {
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "UpdateTimeToLive", "{}").unwrap_err();
         let v: serde_json::Value = serde_json::from_str(&err).unwrap();
@@ -1027,7 +1027,7 @@ mod tests {
     // as unimplemented on any of: name `UnknownOperationException`, a message
     // matching /unknown operation|not implemented|unsupported operation|is not
     // supported/i, or HTTP 501. Anything else counts as a conformance failure,
-    // so the preview's unimplemented surface landing as skips depends on these.
+    // so the wasm build's unimplemented surface landing as skips depends on these.
 
     /// The suite's classifier, transcribed. Kept here so a change to the
     /// envelope that would break skip-classification fails locally rather than
@@ -1156,10 +1156,10 @@ mod tests {
         assert!(is_unsupported_fault(out.status, &out.body));
     }
 
-    /// Every real DynamoDB operation the preview does not implement must reach
+    /// Every real DynamoDB operation the wasm build does not implement must reach
     /// the suite as a skip. This is the case the plan calls load-bearing: if
     /// these land in the failed column the published row misrepresents the
-    /// preview.
+    /// wasm build.
     #[test]
     fn http_classifies_every_unimplemented_operation_as_a_skip() {
         let backend = Storage::memory().unwrap();

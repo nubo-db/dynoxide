@@ -23,6 +23,12 @@ async fn setup() -> (Client, SocketAddr) {
     });
 
     let creds = Credentials::new("fake", "fake", None, None, "test");
+    // `build_http` is `#[doc(hidden)]` upstream, so it carries no stability
+    // promise and an SDK bump inside the caret range could remove it. That
+    // shows up as this file failing to compile, which is a loud failure in a
+    // dev-dependency rather than a silent one, so it is preferred to pinning
+    // the SDK and missing its fixes.
+    //
     // Plain HTTP, to match the endpoint. Left unset, the SDK builds its default
     // HTTPS connector, which loads the operating system's trust store the first
     // time a client selects it. That made this file fail on machines where the

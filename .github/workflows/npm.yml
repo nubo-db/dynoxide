@@ -79,7 +79,7 @@ jobs:
 
   # The browser engine package (@dynoxide/wasm-engine) is built from source
   # here, since wasm is architecture-independent. It ships at the release version,
-  # in lockstep with every other artifact. It previously rode a separate preview
+  # in lockstep with every other artefact. It previously rode a separate preview
   # track on the stated criterion that the wasm path was not conformance-tested;
   # that criterion is met (dynoxide-wasm is a scored conformance target passing
   # tier 1 in full, excluding the operations it does not implement and the OPFS
@@ -137,7 +137,7 @@ jobs:
           fi
           VERSION="${TAG#v}"
           # The engine ships at the release version, in lockstep with every other
-          # artifact. It previously rode a separate preview track as
+          # artefact. It previously rode a separate preview track as
           # <crate-base>-preview; that track ended when the wasm path graduated.
           # NPM_TAG keeps a prerelease off the `latest` dist-tag: npm refuses a
           # bare publish of a prerelease and does not default a tag, so the value

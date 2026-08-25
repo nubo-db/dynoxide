@@ -10,7 +10,7 @@ The wasm build is a scored target in the same conformance suite that backs dynox
 npm install @dynoxide/wasm-engine
 ```
 
-The package is versioned in lockstep with every other dynoxide artifact; see `docs/versioning.md` for what that number promises and what the conformance suite does and does not exercise. `npm install @dynoxide/wasm-engine` gets the current release; use `~1.0.0` to hold behaviour still across minors.
+The package is versioned in lockstep with every other dynoxide artefact; see `docs/versioning.md` for what that number promises and what the conformance suite does and does not exercise. `npm install @dynoxide/wasm-engine` gets the current release; use `~1.0.0` to hold behaviour still across minors.
 
 ## Quick start
 
@@ -84,7 +84,7 @@ The engine needs a [secure context](https://developer.mozilla.org/en-US/docs/Web
 
 ## Versioning
 
-`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`. `manifest.engineVersion` is the dynoxide crate version, and the npm package ships at that same version: every dynoxide artifact shares one number. See `docs/versioning.md`.
+`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`. `manifest.engineVersion` is the dynoxide crate version, and the npm package ships at that same version: every dynoxide artefact shares one number. See `docs/versioning.md`.
 
 ## Persistence
 

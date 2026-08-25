@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-08-24
 
-Every artifact moves to 1.0.0 together: the crate, the npm CLI wrapper and its
+Every artefact moves to 1.0.0 together: the crate, the npm CLI wrapper and its
 platform binaries, the browser engine, the container images and the MCP registry
 entry. `docs/versioning.md` states what that number promises, what forces a
 major, and how conformance fixes are versioned from here.
@@ -634,7 +634,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...v0.12.0
 [0.11.4]: https://github.com/nubo-db/dynoxide/compare/v0.11.3...v0.11.4

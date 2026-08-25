@@ -1,0 +1,8 @@
+{
+  "dynoxide_embedded_sequential": 2.9,
+  "dynoxide_embedded_parallel_4": 4.8,
+  "dynoxide_http_sequential": 3.1,
+  "dynoxide_http_parallel_4": 3.6,
+  "dynamodb_local_sequential": 1.0,
+  "dynamodb_local_parallel_4": 1.0
+}

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-08-24
+## [1.0.0] - 2026-08-25
 
 Every artefact moves to 1.0.0 together: the crate, the npm CLI wrapper and its
 platform binaries, the browser engine, the container images and the MCP registry

@@ -943,6 +943,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "aws-smithy-http-client",
  "axum",
  "base64",
  "bigdecimal",

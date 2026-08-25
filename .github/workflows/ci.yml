@@ -381,6 +381,16 @@ jobs:
           docker image inspect dynoxide:smoke \
             --format '{{json .Config.ExposedPorts}}' | tee /dev/stderr | grep -q '19280/tcp'
 
+      # The fast start interval is what makes a healthcheck-based container wait
+      # worth recommending, and docs/installation.md quotes the 250ms figure.
+      # Dropping the flag would otherwise surface only as someone's test suite
+      # quietly waiting 30 seconds for a container that booted in milliseconds.
+      - name: Image probes itself quickly while starting
+        run: |
+          docker image inspect dynoxide:smoke \
+            --format '{{json .Config.Healthcheck}}' | tee /dev/stderr \
+            | grep -q '"StartInterval":250000000'
+
       # The documented recipe. The token is a hardcoded throwaway, intentionally
       # inline (not a repository secret): it has no value outside this job. The
       # host-side bind is pinned to 127.0.0.1 so the ports are not reachable on
@@ -397,9 +407,32 @@ jobs:
             serve --host 0.0.0.0 --port 8000 \
                   --mcp --mcp-host 0.0.0.0 --mcp-port 19280
 
-      # Poll the port directly; the container HEALTHCHECK's 30s interval lags a
-      # fast smoke run. GET / is the same liveness probe `dynoxide healthcheck`
-      # uses (an unsigned DynamoDB op would 400 on SigV4 auth).
+      # The image config having a fast start interval is not the same as the
+      # probe inside it working, and docs/testcontainers.md recommends waiting
+      # on the healthcheck. Without this, `dynoxide healthcheck` could regress
+      # (a drifted default port, a moved binary path, an inverted exit code)
+      # and every reader following that advice would hang while CI stayed
+      # green. Five seconds is generous against a quarter-second first probe.
+      - name: Container reports healthy quickly
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 25); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' dynoxide-smoke)
+            case "$status" in
+              healthy) echo "healthy"; exit 0 ;;
+              unhealthy) echo "::error::container reported unhealthy"; break ;;
+            esac
+            sleep 0.2
+          done
+          echo "::error::container did not report healthy within 5s (last: ${status:-unknown})"
+          docker inspect -f '{{json .State.Health}}' dynoxide-smoke
+          docker logs dynoxide-smoke
+          exit 1
+
+      # Poll the port from outside as well: that is the reachability an SDK
+      # client actually needs, and an in-container probe cannot show it. GET /
+      # is the same liveness probe `dynoxide healthcheck` uses (an unsigned
+      # DynamoDB op would 400 on SigV4 auth).
       - name: DynamoDB reachable on :8000 (R3)
         run: |
           set -euo pipefail

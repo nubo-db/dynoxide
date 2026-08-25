@@ -129,6 +129,14 @@ docker run -e DYNOXIDE_HEALTHCHECK_PORT=9000 ghcr.io/nubo-db/dynoxide serve --po
 
 `DYNOXIDE_HEALTHCHECK_HOST` and `DYNOXIDE_HEALTHCHECK_PORT` are documented public surface and will not be renamed in a patch or minor release.
 
+The container probes itself every 250ms until it first reports healthy, then
+every 30 seconds. Dynoxide boots in milliseconds, so that first probe is
+normally the only quick one and waiting on the healthcheck rather than polling
+the port resolves in well under a second. The ten second start period is
+headroom for a loaded host rather than a window a healthy container uses.
+Needs Docker Engine 25.0 or newer. See [Testcontainers](testcontainers.md) for
+how to wait on it from a test suite.
+
 ### Running as nonroot
 
 For security-conscious operators, opt into a nonroot uid:

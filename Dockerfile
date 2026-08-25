@@ -35,7 +35,17 @@ EXPOSE 8000 19280
 ENV DYNOXIDE_HEALTHCHECK_HOST=127.0.0.1 \
     DYNOXIDE_HEALTHCHECK_PORT=8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# --start-interval only applies before the container first reports healthy, so
+# it is set alongside --start-period. The binary boots in milliseconds, so the
+# first probe lands about a quarter of a second in and the container is healthy
+# from there; the ten second start period is headroom for a loaded runner, not
+# a window it normally uses. That makes a healthcheck-based wait worth using,
+# where the old 5s/30s pairing could cost half a minute.
+#
+# Building this file needs Docker Engine 25.0 or newer. --start-interval is
+# parsed by the Dockerfile frontend, so an older daemon fails the build rather
+# than ignoring the flag.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --start-interval=250ms --retries=3 \
     CMD ["/usr/local/bin/dynoxide", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/dynoxide"]

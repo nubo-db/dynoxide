@@ -43,11 +43,15 @@ pub async fn execute<S: StorageBackend>(
     request: BatchGetItemRequest,
 ) -> Result<BatchGetItemResponse> {
     // Validate RequestItems is not empty.
-    // AWS routes the empty-map case through a separate parameter-required path
-    // rather than the standard "N validation errors detected" envelope.
+    // AWS used to answer the empty-map case with a bespoke parameter-required
+    // sentence. It has since moved BatchGetItem onto the standard validation
+    // envelope, and as of the 2026-09-02 sweep 32 of the 33 regions observed
+    // answer this message; only me-central-1 still returns the old sentence.
+    // BatchWriteItem has not followed, so the sibling operation deliberately
+    // keeps its bespoke sentence rather than matching this one.
     if request.request_items.is_empty() {
         return Err(DynoxideError::ValidationException(
-            "The requestItems parameter is required for BatchGetItem".to_string(),
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),
         ));
     }
 

@@ -74,6 +74,11 @@ pub async fn execute<S: StorageBackend>(
     // Validate RequestItems is not empty.
     // AWS routes the empty-map case through a separate parameter-required path
     // rather than the standard "N validation errors detected" envelope.
+    //
+    // Do not align this with BatchGetItem, which now answers the standard
+    // envelope. The two have diverged: as of the 2026-09-02 sweep 31 of the 33
+    // regions observed still return this sentence for BatchWriteItem, against
+    // 1 of 33 for BatchGetItem. Matching them would break the common case here.
     if request.request_items.is_empty() {
         return Err(DynoxideError::ValidationException(
             "The requestItems parameter is required for BatchWriteItem".to_string(),

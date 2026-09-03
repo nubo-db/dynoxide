@@ -185,6 +185,25 @@ fn test_batch_get_exceeds_100_keys() {
     assert!(msg.contains("RequestItems.Tbl.member.Keys"), "Got: {msg}");
 }
 
+#[test]
+fn test_batch_get_empty_request_items_uses_validation_envelope() {
+    let db = setup_db();
+
+    let req: BatchGetItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {}
+    }))
+    .unwrap();
+
+    let err = db.batch_get_item(req).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains(
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+        ),
+        "Got: {msg}"
+    );
+}
+
 // =============================================================================
 // BatchWriteItem tests
 // =============================================================================
@@ -708,4 +727,24 @@ fn batch_get_allows_uniform_projection_across_tables() {
     }))
     .unwrap();
     assert!(db.batch_get_item(req).is_ok());
+}
+
+#[test]
+fn test_batch_write_empty_request_items_keeps_bespoke_message() {
+    // BatchWriteItem has not followed BatchGetItem onto the validation
+    // envelope, so this sentence is the answer nearly every region gives.
+    // Pinned to stop the two being aligned for consistency's sake.
+    let db = setup_db();
+
+    let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
+        "RequestItems": {}
+    }))
+    .unwrap();
+
+    let err = db.batch_write_item(req).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("The requestItems parameter is required for BatchWriteItem"),
+        "Got: {msg}"
+    );
 }

@@ -1,6 +1,6 @@
 {
   "name": "@dynoxide/wasm-engine",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "The Dynoxide DynamoDB emulator compiled to WebAssembly, with a Web Worker client for running DynamoDB operations in the browser.",
   "author": "Martin Hicks",

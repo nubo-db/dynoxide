@@ -10,7 +10,7 @@ The wasm build is a scored target in the same conformance suite that backs dynox
 npm install @dynoxide/wasm-engine
 ```
 
-The package is versioned in lockstep with every other dynoxide artefact; see `docs/versioning.md` for what that number promises and what the conformance suite does and does not exercise. `npm install @dynoxide/wasm-engine` gets the current release; use `~1.0.0` to hold behaviour still across minors.
+The package is versioned in lockstep with every other dynoxide artefact; see `docs/versioning.md` for what that number promises and what the conformance suite does and does not exercise. `npm install @dynoxide/wasm-engine` gets the current release; use `~1.1.0` to hold behaviour still across minors.
 
 ## Quick start
 

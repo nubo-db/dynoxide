@@ -89,7 +89,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 `native-sqlite`, `encryption` and `wasm-sqlite` are **mutually exclusive** - they select different SQLite backends. `wasm-sqlite` additionally excludes the CLI, server and MCP features, which are native-only. Cargo adds the default features to whatever you list, so naming one of these on its own is not enough: `features = ["wasm-sqlite"]` still enables `native-sqlite` and the CLI from the defaults, and the build stops on a `compile_error!` saying so. Always pair a non-default backend with `default-features = false`. To use encryption:
 
 ```toml
-dynoxide-rs = { version = "1.0", default-features = false, features = ["encryption"] }
+dynoxide-rs = { version = "1.1", default-features = false, features = ["encryption"] }
 ```
 
 **Workspace note:** Cargo unifies features across a workspace. If any crate depends on `dynoxide-rs` with default features (getting `native-sqlite`) and another uses `encryption`, both activate and the build fails. Use `default-features = false` on all `dynoxide-rs` dependencies in the workspace.

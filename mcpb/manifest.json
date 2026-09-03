@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "dynoxide",
   "display_name": "Dynoxide",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A DynamoDB emulator with an MCP server exposing 35 DynamoDB tools to coding agents.",
   "long_description": "A DynamoDB emulator that starts in milliseconds, giving coding agents a real local DynamoDB to work against.\n\n**35 tools** covering tables, items, query and scan, batch and transactional writes, PartiQL, secondary indexes, TTL and vector search. Snapshot and restore let an agent set up a fixture, experiment against it, and roll back.\n\nRuns as a single native binary backed by SQLite, with no JVM or Docker required. Verified against real AWS by a public conformance suite.",
   "author": {

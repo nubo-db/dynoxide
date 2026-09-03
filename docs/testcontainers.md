@@ -11,7 +11,7 @@ If you arrived here from a timeout error, skip to
 
 | | |
 |---|---|
-| Image | `ghcr.io/nubo-db/dynoxide:1.0` |
+| Image | `ghcr.io/nubo-db/dynoxide:1.1` |
 | Port | `8000` |
 | Wait on | `GET /` returning `200` |
 | Command | the image default, `serve --host 0.0.0.0 --port 8000` |
@@ -23,7 +23,7 @@ serve, not just that the socket is open. `docs/versioning.md` names it as part
 of the CLI and wire contract, so it will not move inside 1.x, and
 `tests/container_contract.rs` holds it.
 
-Pin to `:1.0` rather than `:1` for a test fixture. Both float, but `:1` picks up
+Pin to `:1.1` rather than `:1` for a test fixture. Both float, but `:1` picks up
 conformance fixes, which change behaviour within the major on purpose. See
 [installation](installation.md) for the full tag semantics.
 
@@ -33,7 +33,7 @@ conformance fixes, which change behaviour within the major on purpose. See
 
 ```java
 GenericContainer<?> dynoxide = new GenericContainer<>(
-        DockerImageName.parse("ghcr.io/nubo-db/dynoxide:1.0"))
+        DockerImageName.parse("ghcr.io/nubo-db/dynoxide:1.1"))
     .withExposedPorts(8000)
     .waitingFor(Wait.forHttp("/").forPort(8000).forStatusCode(200));
 
@@ -47,7 +47,7 @@ and fails, for the reason in [Troubleshooting](#troubleshooting).
 ### Node
 
 ```ts
-const dynoxide = await new GenericContainer("ghcr.io/nubo-db/dynoxide:1.0")
+const dynoxide = await new GenericContainer("ghcr.io/nubo-db/dynoxide:1.1")
   .withExposedPorts(8000)
   .withWaitStrategy(Wait.forHttp("/", 8000).forStatusCode(200))
   .start();
@@ -58,7 +58,7 @@ const endpoint = `http://${dynoxide.getHost()}:${dynoxide.getMappedPort(8000)}`;
 ### Go
 
 ```go
-ctr, err := testcontainers.Run(ctx, "ghcr.io/nubo-db/dynoxide:1.0",
+ctr, err := testcontainers.Run(ctx, "ghcr.io/nubo-db/dynoxide:1.1",
     testcontainers.WithExposedPorts("8000/tcp"),
     testcontainers.WithWaitStrategy(
         wait.ForHTTP("/").
@@ -76,7 +76,7 @@ as a ready engine.
 
 ```csharp
 var dynoxide = new ContainerBuilder()
-    .WithImage("ghcr.io/nubo-db/dynoxide:1.0")
+    .WithImage("ghcr.io/nubo-db/dynoxide:1.1")
     .WithPortBinding(8000, true)
     .WithWaitStrategy(Wait.ForUnixContainer()
         .UntilHttpRequestIsSucceeded(r => r

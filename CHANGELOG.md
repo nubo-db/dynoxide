@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-03
+
+### Behaviour changes
+
+- **`BatchGetItem` with an empty `RequestItems` map now answers the standard
+  validation envelope** rather than a bespoke sentence: `1 validation error
+  detected: Value at 'RequestItems' failed to satisfy constraint: Member must
+  have length greater than or equal to 1`. AWS moved the operation onto that
+  message in 32 of the 33 regions observed on 2026-09-02. `BatchWriteItem` has
+  not followed and keeps `The requestItems parameter is required for
+  BatchWriteItem`, so the two siblings answer differently on purpose.
+
 ## [1.0.0] - 2026-08-25
 
 Every artefact moves to 1.0.0 together: the crate, the npm CLI wrapper and its
@@ -634,7 +646,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/nubo-db/dynoxide/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/nubo-db/dynoxide/compare/v0.11.4...v0.12.0

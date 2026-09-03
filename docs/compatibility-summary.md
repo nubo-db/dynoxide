@@ -14,6 +14,10 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 Conformance fixes ship as minor releases, so behaviour moves within a major line. This is the cumulative record: if something answers differently after an upgrade, look here first. `docs/versioning.md` explains the rule and how to pin if you would rather behaviour held still.
 
+### 1.1.0
+
+- **`BatchGetItem` with an empty `RequestItems` map answers the standard validation envelope** (`Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1`) in place of a bespoke parameter-required sentence, following AWS. `BatchWriteItem` has not moved and still answers the bespoke sentence, so the two siblings differ.
+
 ### 1.0.0
 
 A large correction pass. Full detail in `CHANGELOG.md`; the shapes that matter:

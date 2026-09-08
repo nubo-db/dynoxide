@@ -1557,4 +1557,98 @@ action = { type = "fake", generator = "safe_email" }
         assert_eq!(pks.len(), 1, "customer and order should share a partition");
         assert!(!pks.iter().next().unwrap().contains("a@x.co"));
     }
+
+    #[test]
+    fn test_a_key_rule_that_does_not_match_an_entity_does_not_block_its_rebuild() {
+        // The sk rule matches only Account items. A User's sk must still be
+        // rebuilt from its template, or the real address survives in the key
+        // while the attribute beside it is anonymised.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@real.co.uk"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@real.co.uk"}}}"#,
+                r#"{"Item": {"_type": {"S": "Account"}, "pk": {"S": "account#acc1"}, "sk": {"S": "account#"}, "id": {"S": "acc1"}, "accountName": {"S": "Acme"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(accountName)"
+path = "sk"
+action = { type = "redact" }
+
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+"#,
+        )
+        .unwrap();
+
+        import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .unwrap();
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let items = scan_all(&db, "App");
+        let user = items
+            .iter()
+            .find(|i| string_attr(i, "_type") == "User")
+            .unwrap();
+
+        let email = string_attr(user, "email");
+        assert_ne!(email, "alice@real.co.uk");
+        assert_eq!(
+            string_attr(user, "sk"),
+            format!("user#{email}"),
+            "sk must be rebuilt: the sk rule never matched this item"
+        );
+
+        // Belt and braces: the real address is nowhere in the output.
+        for item in &items {
+            for value in item.values() {
+                if let dynoxide::AttributeValue::S(s) = value {
+                    assert!(!s.contains("alice@real.co.uk"), "leaked in {s}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_two_entities_with_no_shared_value_import_without_a_consistency_block() {
+        // Both entities present and keyed on the same template, but no
+        // address in common, so there was never a join to lose.
+        let tmp = tempfile::tempdir().unwrap();
+        let unrelated_order = r#"{"Item": {"_type": {"S": "Order"}, "pk": {"S": "CUSTOMER#b@y.co"}, "sk": {"S": "ORDER#1"}, "email": {"S": "b@y.co"}, "orderId": {"S": "1"}}}"#;
+        let summary = shared_key_import(
+            tmp.path(),
+            &[CUSTOMER_ITEM, unrelated_order],
+            FAKE_EMAIL_RULE,
+        )
+        .expect("no shared value means no broken join");
+        assert_eq!(summary.total_items, 2);
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("will not join")),
+            "the risk is still worth stating up front: {:?}",
+            summary.warnings
+        );
+    }
 }

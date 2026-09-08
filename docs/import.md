@@ -181,23 +181,23 @@ both and list `email`, and the order stays in its customer's partition.
 The importer enforces the second half. When two entities build the same key
 from the same template, an anonymised attribute that template reads has to be
 consistency-tracked, or their keys cannot agree. That is a warning when the
-model says it could happen and an error once items of both entities have
-actually been imported:
+model says it could happen, and an error once two entities are actually seen
+carrying the same value for it:
 
 ```
-entity 'Customer' and entity 'Order' were both imported and both build keys
-from 'email', which is not in [consistency] fields, so the same value
-anonymised differently for each and they no longer join.
-Add 'email' to [consistency] fields
+entity 'Customer' and entity 'Order' share a value of 'email', which is not in
+[consistency] fields, so it anonymised differently for each and their keys no
+longer agree. Add 'email' to [consistency] fields
 ```
 
-It fails on the data rather than on the model so that importing one entity's
-slice still works, since there is no join to lose there. Nothing is written on
-the error path, so a failed import leaves no database rather than a broken
-one. Matching on the key and its template, rather than on the attribute name,
-keeps this off entities that merely reuse a name: `account#${id}` and
-`project#${id}` are different entities' own ids and never had a join. An
-attribute no rule rewrites is left alone too, since its keys still agree.
+It fails on the data rather than on the model, so importing one entity's slice
+still works, and so does importing two entities that share no value, since
+neither has a join to lose. Nothing is written on the error path, so a failed
+import leaves no database rather than a broken one. Matching on the key and
+its template, rather than on the attribute name, keeps this off entities that
+merely reuse a name: `account#${id}` and `project#${id}` are different
+entities' own ids and never had a join. An attribute no rule rewrites is left
+alone too, since its keys still agree.
 
 **Use `fake` or `hash` for an attribute a key is built from.** `redact`,
 `null` and `mask` produce the same output for every input, so every item of
@@ -205,9 +205,12 @@ that entity would render an identical key and overwrite the previous one,
 leaving a database with fewer rows than the export. The importer says so
 before it reads any data, and counts the collisions if you go ahead anyway.
 
-**A rule that names a key attribute directly wins.** The key is not rebuilt
-from its template, the rule's value is what gets stored, and the import says
-which key that happened to.
+**A rule that names a key attribute directly wins, on the items it matches.**
+That key is not rebuilt from its template and the rule's value is stored
+instead. It is decided per item, not per entity, because a rule's condition
+may not match every entity that builds the key: a rule on `sk` that only
+matches an `Account` must not stop a `User` rebuilding its own `sk`, or the
+real value survives in the key while the attribute beside it is anonymised.
 
 When `--mcp` is set, `--data-model` also serves as the MCP data model unless
 `--mcp-data-model` is given.

@@ -23,7 +23,7 @@ use crate::schema::{DataModel, EntityDefinition};
 use crate::types::{AttributeValue, Item};
 use crate::validation::{partition_key_name, sort_key_name};
 
-use super::config::{ValidatedAction, ValidatedRule, parse_path};
+use super::config::{ValidatedAction, ValidatedRule, matches_item, parse_path};
 
 /// Rebuilt primary keys are remembered (as hashes) to spot two items
 /// collapsing onto one row. Past this many the check stops, and says so.
@@ -171,8 +171,14 @@ struct AtRisk {
     attribute: String,
     /// Entity indices that build a key from it, in model order.
     entities: Vec<usize>,
-    /// Entity indices actually seen in the data so far.
-    observed: HashSet<usize>,
+    /// Hash of each value seen, against the entity that carried it. A second
+    /// entity carrying a value already seen is the join, observed in the data
+    /// rather than inferred from the model.
+    seen_values: std::collections::HashMap<u64, usize>,
+    /// Entities that were found to share a value with another entity.
+    sharing: HashSet<usize>,
+    /// Set once `seen_values` hit its cap and stopped tracking.
+    capped: bool,
 }
 
 /// Which of an item's keys can be rebuilt after the rules run.
@@ -202,6 +208,13 @@ pub struct KeyDeriver {
     warned_unrenderable: HashSet<(usize, usize)>,
     /// Items that matched no entity, reported once per table.
     unmatched: usize,
+    /// Key attributes some rule rewrites directly. Whether the rule wins is
+    /// decided per item, since its condition may not match every entity that
+    /// builds that key.
+    rule_targeted: HashSet<String>,
+    /// (entity index, key index) pairs where a rule took the key instead of
+    /// its template, reported once.
+    warned_rule_wins: HashSet<(usize, usize)>,
     /// Attribute -> the entities that build a key from it, for attributes
     /// more than one entity keys on that are not consistency-tracked. Their
     /// keys cannot agree, so the entities stop joining.
@@ -279,17 +292,16 @@ impl KeyDeriver {
                     .collect(),
             );
 
-            keys.retain(|key| {
-                let targeted = rule_targets.contains(key.attribute.as_str());
-                if targeted {
+            for key in &keys {
+                if rule_targets.contains(key.attribute.as_str()) {
                     warnings.push(format!(
-                        "a rule targets key attribute '{}' directly, so it is not rebuilt \
-                         from entity '{}' template '{}'; the rule's value is kept as written",
+                        "a rule targets key attribute '{}' directly, so on any item that rule \
+                         matches it is not rebuilt from entity '{}' template '{}' and the \
+                         rule's value is kept as written",
                         key.attribute, entity.name, key.template
                     ));
                 }
-                !targeted
-            });
+            }
 
             for key in &keys {
                 for rule in rules {
@@ -386,7 +398,9 @@ impl KeyDeriver {
                 AtRisk {
                     attribute,
                     entities: entities_using,
-                    observed: HashSet::new(),
+                    seen_values: std::collections::HashMap::new(),
+                    sharing: HashSet::new(),
+                    capped: false,
                 }
             })
             .collect();
@@ -402,8 +416,10 @@ impl KeyDeriver {
                 type_attributes,
                 hash_attribute: hash.map(String::from),
                 range_attribute: range.map(String::from),
+                rule_targeted: rule_targets.iter().map(|s| s.to_string()).collect(),
                 warned_mismatch: HashSet::new(),
                 warned_unrenderable: HashSet::new(),
+                warned_rule_wins: HashSet::new(),
                 unmatched: 0,
                 at_risk,
                 rebuilt_keys: HashSet::new(),
@@ -420,21 +436,36 @@ impl KeyDeriver {
     /// item arrived with. Any key the template does not reproduce is left
     /// alone and reported (once per entity and key). An item that matches no
     /// entity is counted for [`take_unmatched`](Self::take_unmatched).
-    pub fn plan(&mut self, item: &Item, warnings: &mut Vec<String>) -> Option<Rederivation> {
+    pub fn plan(
+        &mut self,
+        item: &Item,
+        rules: &[ValidatedRule],
+        warnings: &mut Vec<String>,
+    ) -> Option<Rederivation> {
         let Some(entity_idx) = self.resolve_entity(item) else {
             self.unmatched += 1;
             return None;
         };
-        for risk in &mut self.at_risk {
-            if risk.entities.contains(&entity_idx) {
-                risk.observed.insert(entity_idx);
-            }
-        }
+        self.note_at_risk_values(entity_idx, item);
 
         let entity = &self.entities[entity_idx];
 
+        let mut rule_wins = Vec::new();
         let mut keys = Vec::new();
         for (idx, key) in entity.keys.iter().enumerate() {
+            // A rule that rewrites this key attribute wins over the template,
+            // but only on the items its condition actually matches. Deciding
+            // that per entity would leave the key unrebuilt on every item the
+            // rule never touches, real value intact.
+            if self.rule_targeted.contains(&key.attribute)
+                && rules.iter().any(|rule| {
+                    rule_target(rule) == Some(key.attribute.as_str()) && matches_item(rule, item)
+                })
+            {
+                rule_wins.push(idx);
+                continue;
+            }
+
             let Some(current) = item.get(&key.attribute) else {
                 // A sparse index key: nothing to rebuild.
                 continue;
@@ -455,10 +486,57 @@ impl KeyDeriver {
             }
         }
 
+        for idx in rule_wins {
+            if self.warned_rule_wins.insert((entity_idx, idx)) {
+                let key = &self.entities[entity_idx].keys[idx];
+                warnings.push(format!(
+                    "entity '{}': a rule rewrote {} directly, so it was not rebuilt from \
+                     template '{}'",
+                    self.entities[entity_idx].name, key.attribute, key.template
+                ));
+            }
+        }
+
         Some(Rederivation {
             entity: entity_idx,
             keys,
         })
+    }
+
+    /// Record this item's values for any at-risk attribute, so a value two
+    /// entities both carry is spotted. Presence of both entities is not
+    /// enough: two entities keyed on the same template with no value in
+    /// common never had a join to lose.
+    fn note_at_risk_values(&mut self, entity_idx: usize, item: &Item) {
+        for risk in &mut self.at_risk {
+            if !risk.entities.contains(&entity_idx) || risk.capped {
+                continue;
+            }
+            let Some(value) = item.get(&risk.attribute) else {
+                continue;
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            match value {
+                AttributeValue::S(s) => s.hash(&mut hasher),
+                AttributeValue::N(n) => n.hash(&mut hasher),
+                _ => continue,
+            }
+            let key = hasher.finish();
+            match risk.seen_values.get(&key) {
+                Some(previous) if *previous != entity_idx => {
+                    risk.sharing.insert(*previous);
+                    risk.sharing.insert(entity_idx);
+                }
+                Some(_) => {}
+                None => {
+                    if risk.seen_values.len() >= MAX_TRACKED_KEYS {
+                        risk.capped = true;
+                        continue;
+                    }
+                    risk.seen_values.insert(key, entity_idx);
+                }
+            }
+        }
     }
 
     /// After the rules run: render every planned key from the item's current
@@ -521,20 +599,22 @@ impl KeyDeriver {
     /// Attributes whose entities have now both turned up in the data, so the
     /// join between them is actually broken rather than merely at risk.
     ///
-    /// Checked once the items have been read rather than up front: the model
-    /// says the two entities *can* collide, but an import holding only one of
-    /// them has no join to lose, and failing there would earn a bypass flag.
+    /// Checked once the items have been read rather than up front, and only
+    /// for a value two entities actually share. The model says the two
+    /// entities *can* collide; an import holding only one of them, or holding
+    /// both with no value in common, has no join to lose, and failing there
+    /// would earn a bypass flag.
     pub fn join_breaks(&self) -> Vec<String> {
         self.at_risk
             .iter()
-            .filter(|risk| risk.observed.len() > 1)
+            .filter(|risk| risk.sharing.len() > 1)
             .map(|risk| {
-                let mut seen: Vec<usize> = risk.observed.iter().copied().collect();
+                let mut seen: Vec<usize> = risk.sharing.iter().copied().collect();
                 seen.sort();
                 format!(
-                    "{} were both imported and both build keys from '{}', which is not in \
-                     [consistency] fields, so the same value anonymised differently for each \
-                     and they no longer join. Add '{}' to [consistency] fields",
+                    "{} share a value of '{}', which is not in [consistency] fields, so it \
+                     anonymised differently for each and their keys no longer agree. \
+                     Add '{}' to [consistency] fields",
                     entity_list(&self.entities, &seen),
                     risk.attribute,
                     risk.attribute
@@ -867,7 +947,7 @@ mod tests {
             ("customerId", "cust1"),
             ("orderNo", "42"),
         ]);
-        let plan = d.plan(&order, &mut item_warnings).unwrap();
+        let plan = d.plan(&order, &[], &mut item_warnings).unwrap();
         assert!(item_warnings.is_empty(), "{item_warnings:?}");
         assert_eq!(plan.keys.len(), 2);
 
@@ -922,7 +1002,7 @@ mod tests {
         let mut warnings = Vec::new();
         let mut user = user();
 
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = d.plan(&user, &[], &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(plan.keys.len(), 3);
 
@@ -959,7 +1039,7 @@ mod tests {
                 ("accountId", "acc1"),
                 ("email", "alice@example.com"),
             ]);
-            let plan = d.plan(&user, &mut warnings).unwrap();
+            let plan = d.plan(&user, &[], &mut warnings).unwrap();
             assert_eq!(plan.keys.len(), 1, "only pk reproduces");
 
             user.insert(
@@ -987,7 +1067,7 @@ mod tests {
         let mut user = user();
         user.remove("gs1pk");
         user.remove("gs1sk");
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = d.plan(&user, &[], &mut warnings).unwrap();
         assert_eq!(plan.keys.len(), 2);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -1005,12 +1085,12 @@ mod tests {
             ("accountId", "acc1"),
             ("email", "alice@example.com"),
         ]);
-        d.plan(&legacy, &mut warnings).unwrap();
+        d.plan(&legacy, &[], &mut warnings).unwrap();
         assert_eq!(warnings.len(), 1);
 
         // Second item: sk on-template, but the rule nulls email so it cannot render.
         let mut user = user();
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = d.plan(&user, &[], &mut warnings).unwrap();
         user.insert("email".to_string(), AttributeValue::NULL(true));
         d.apply(&plan, &mut user, &mut warnings);
 
@@ -1035,15 +1115,15 @@ mod tests {
             ("accountId", "acc1"),
             ("email", "alice@example.com"),
         ]);
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = d.plan(&user, &[], &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "User");
 
         let account = item(&[("pk", "account#acc1"), ("sk", "account#"), ("id", "acc1")]);
-        let plan = d.plan(&account, &mut warnings).unwrap();
+        let plan = d.plan(&account, &[], &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "Account");
 
         let stranger = item(&[("pk", "thing#1"), ("sk", "meta")]);
-        assert!(d.plan(&stranger, &mut warnings).is_none());
+        assert!(d.plan(&stranger, &[], &mut warnings).is_none());
         assert_eq!(d.take_unmatched(), 1);
         assert_eq!(d.take_unmatched(), 0);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -1061,24 +1141,69 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_on_a_key_attribute_wins_over_the_template() {
+    fn a_rule_on_a_key_attribute_wins_on_the_items_it_matches() {
         let rules = [rule("sk", ValidatedAction::Redact)];
         let (mut d, warnings) =
             KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
-        assert_eq!(tracked(&d, 1), vec!["pk", "gs1pk"]);
+        // The key stays tracked: whether the rule wins is an per-item question.
+        assert_eq!(tracked(&d, 1), vec!["pk", "sk", "gs1pk"]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("targets key attribute 'sk' directly"));
 
         let mut item_warnings = Vec::new();
         let mut user = user();
-        let plan = d.plan(&user, &mut item_warnings).unwrap();
+        let plan = d.plan(&user, &rules, &mut item_warnings).unwrap();
         user.insert(
             "sk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
         d.apply(&plan, &mut user, &mut item_warnings);
         assert_eq!(user["sk"], AttributeValue::S("[REDACTED]".to_string()));
-        assert!(item_warnings.is_empty(), "{item_warnings:?}");
+        assert!(
+            item_warnings
+                .iter()
+                .any(|w| w.contains("a rule rewrote sk")),
+            "{item_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_on_a_key_that_does_not_match_this_item_leaves_the_rebuild_alone() {
+        // The rule targets sk but only matches Account items. A User's sk
+        // must still be rebuilt, or the real email survives in the key.
+        let rules = [
+            ValidatedRule {
+                condition: condition::parse("attribute_exists(accountName)").unwrap(),
+                names: None,
+                values: None,
+                path: parse_path("sk").unwrap(),
+                action: ValidatedAction::Redact,
+            },
+            rule(
+                "email",
+                ValidatedAction::Fake {
+                    generator: "safe_email".into(),
+                },
+            ),
+        ];
+        let (mut d, _) = KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
+
+        let mut warnings = Vec::new();
+        let mut user = user();
+        assert!(!user.contains_key("accountName"), "the rule must not match");
+        let plan = d.plan(&user, &rules, &mut warnings).unwrap();
+
+        user.insert(
+            "email".to_string(),
+            AttributeValue::S("fake@example.org".to_string()),
+        );
+        d.apply(&plan, &mut user, &mut warnings);
+
+        assert_eq!(
+            user["sk"],
+            AttributeValue::S("user#fake@example.org".to_string()),
+            "sk must be rebuilt: the sk rule never matched this item"
+        );
     }
 
     #[test]
@@ -1191,7 +1316,7 @@ mod tests {
                 ("sk", "PROFILE"),
                 ("email", &format!("c{n}@x.co")),
             ]);
-            d.plan(&customer, &mut warnings).unwrap();
+            d.plan(&customer, &email_rule(), &mut warnings).unwrap();
         }
 
         assert!(
@@ -1218,7 +1343,7 @@ mod tests {
             ("sk", "PROFILE"),
             ("email", "a@x.co"),
         ]);
-        d.plan(&customer, &mut warnings).unwrap();
+        d.plan(&customer, &email_rule(), &mut warnings).unwrap();
         assert!(d.join_breaks().is_empty(), "one entity so far");
 
         let order = item(&[
@@ -1228,12 +1353,48 @@ mod tests {
             ("email", "a@x.co"),
             ("orderId", "1"),
         ]);
-        d.plan(&order, &mut warnings).unwrap();
+        d.plan(&order, &email_rule(), &mut warnings).unwrap();
 
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
         assert!(breaks[0].contains("entity 'Customer' and entity 'Order'"));
         assert!(breaks[0].contains("Add 'email' to [consistency] fields"));
+    }
+
+    #[test]
+    fn both_entities_with_no_value_in_common_is_not_a_broken_join() {
+        let (mut d, _) = KeyDeriver::new(
+            &shared_key_model(),
+            &request(),
+            &email_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let customer = item(&[
+            ("_type", "Customer"),
+            ("pk", "CUSTOMER#a@x.co"),
+            ("sk", "PROFILE"),
+            ("email", "a@x.co"),
+        ]);
+        d.plan(&customer, &email_rule(), &mut warnings).unwrap();
+
+        // A different address, so these two never joined.
+        let order = item(&[
+            ("_type", "Order"),
+            ("pk", "CUSTOMER#b@y.co"),
+            ("sk", "ORDER#1"),
+            ("email", "b@y.co"),
+            ("orderId", "1"),
+        ]);
+        d.plan(&order, &email_rule(), &mut warnings).unwrap();
+
+        assert!(
+            d.join_breaks().is_empty(),
+            "both entities present but no shared value: {:?}",
+            d.join_breaks()
+        );
     }
 
     #[test]
@@ -1248,7 +1409,7 @@ mod tests {
                 ("accountId", "acc1"),
                 ("email", &format!("u{n}@example.com")),
             ]);
-            let plan = d.plan(&user, &mut warnings).unwrap();
+            let plan = d.plan(&user, &[], &mut warnings).unwrap();
             user.insert(
                 "email".to_string(),
                 AttributeValue::S("[REDACTED]".to_string()),

@@ -312,7 +312,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     let mut warnings = Vec::new();
                     let plan = key_deriver
                         .as_mut()
-                        .and_then(|d| d.plan(&item, &mut warnings));
+                        .and_then(|d| d.plan(&item, &rules, &mut warnings));
                     warnings.extend(anonymise::apply_rules(
                         &mut item,
                         &rules,

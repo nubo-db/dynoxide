@@ -179,22 +179,28 @@ struct EntityKeys {
 /// `[consistency] fields`. Anonymising it independently per item means the
 /// entities' keys disagree and the join between them is lost.
 #[derive(Debug)]
+
 struct AtRisk {
-    /// The attribute path the shared templates read.
-    source: Vec<PathElement>,
-    /// That path written out, for the message.
-    source_name: String,
-    /// Entity indices that build a key from it, in model order.
+    /// The key attribute the shared template builds.
+    key_attribute: String,
+    /// The template itself, for the message.
+    template: String,
+    /// Root field names to put in `[consistency] fields`. Roots, because
+    /// that is what the consistency map is keyed on: advising `contact.email`
+    /// when only `contact` is honoured would send someone in a circle.
+    consistency_roots: Vec<String>,
+    /// Entity indices that build this key from this template, in model order.
     entities: Vec<usize>,
-    /// Original value hash -> (entity that carried it, what it anonymised
-    /// to). A second entity carrying the same original is the join; a
-    /// *different* anonymised result is the join actually breaking. A
-    /// deterministic action such as hash agrees by construction, and a rule
-    /// that matched neither item changes nothing, so both stay quiet.
-    seen_values: std::collections::HashMap<u64, (usize, u64)>,
-    /// Entities found to have anonymised a shared value differently.
+    /// Hash of the whole key value the item arrived with -> every (entity,
+    /// resulting key value) seen for it. Comparing the whole key, rather than
+    /// one attribute it reads, tells a real join from two composite keys that
+    /// merely share a component: `TENANT#a#x` and `TENANT#b#x` never agreed,
+    /// so they have nothing to lose. A deterministic action such as hash
+    /// takes both to the same place and stays quiet.
+    seen_keys: std::collections::HashMap<u64, Vec<(usize, u64)>>,
+    /// Entities found to have taken a shared key to different values.
     diverged: HashSet<usize>,
-    /// Set once `seen_values` hit its cap and stopped tracking.
+    /// Set once `seen_keys` hit its cap and stopped tracking.
     capped: bool,
 }
 
@@ -398,8 +404,13 @@ impl KeyDeriver {
         // unrelated pairs that happen to read an attribute of the same name
         // stay separate: A and B sharing `account#${id}` have nothing to do
         // with C and D sharing `project#${id}`.
-        type RiskKey = (String, String, Vec<PathElement>);
-        let mut shared: Vec<(RiskKey, Vec<usize>)> = Vec::new();
+        // Grouped by the key and its template, so two unrelated pairs that
+        // happen to read an attribute of the same name stay separate: A and B
+        // sharing `account#${id}` have nothing to do with C and D sharing
+        // `project#${id}`.
+        /// (key attribute, template) -> (entities building it, roots needing consistency)
+        type SharedGroups = Vec<((String, String), (Vec<usize>, Vec<String>))>;
+        let mut shared: SharedGroups = Vec::new();
         for (idx, shape) in entity_key_shapes.iter().enumerate() {
             for (attribute, template, sources) in shape {
                 let shared_with_another =
@@ -415,57 +426,68 @@ impl KeyDeriver {
                 if !shared_with_another {
                     continue;
                 }
-                for source in sources {
-                    let Some(PathElement::Attribute(root)) = source.first() else {
-                        continue;
-                    };
-                    // An attribute no rule rewrites keeps its value, so the
-                    // two keys still agree however they were built.
-                    if consistency_fields.contains(root) || !rule_targets.contains(root.as_str()) {
-                        continue;
-                    }
-                    let risk_key = (attribute.clone(), template.clone(), source.clone());
-                    match shared.iter_mut().find(|(k, _)| *k == risk_key) {
-                        Some((_, users)) => {
-                            if !users.contains(&idx) {
-                                users.push(idx);
+                // An attribute no rule rewrites keeps its value, so the two
+                // keys still agree however they were built.
+                let roots: Vec<String> = sources
+                    .iter()
+                    .filter_map(|source| match source.first() {
+                        Some(PathElement::Attribute(root)) => Some(root.clone()),
+                        _ => None,
+                    })
+                    .filter(|root| {
+                        !consistency_fields.contains(root) && rule_targets.contains(root.as_str())
+                    })
+                    .collect();
+                if roots.is_empty() {
+                    continue;
+                }
+                let group = (attribute.clone(), template.clone());
+                match shared.iter_mut().find(|(k, _)| *k == group) {
+                    Some((_, (users, known_roots))) => {
+                        if !users.contains(&idx) {
+                            users.push(idx);
+                        }
+                        for root in roots {
+                            if !known_roots.contains(&root) {
+                                known_roots.push(root);
                             }
                         }
-                        None => shared.push((risk_key, vec![idx])),
                     }
+                    None => shared.push((group, (vec![idx], roots))),
                 }
             }
         }
-        for (_, users) in shared.iter_mut() {
+        for (_, (users, roots)) in shared.iter_mut() {
             users.sort();
+            roots.sort();
         }
-        shared.retain(|(_, users)| users.len() > 1);
-        // Deterministic order for the warnings: key attribute, then
-        // template, then the source path written out.
-        shared.sort_by(|a, b| {
-            (&a.0.0, &a.0.1, path_display(&a.0.2)).cmp(&(&b.0.0, &b.0.1, path_display(&b.0.2)))
-        });
+        shared.retain(|(_, (users, _))| users.len() > 1);
+        shared.sort_by(|a, b| a.0.cmp(&b.0));
 
         let at_risk: Vec<AtRisk> = shared
             .into_iter()
-            .map(|((_, _, source), entities_using)| {
-                let source_name = path_display(&source);
-                warnings.push(format!(
-                    "{} both build keys from '{}', which is not in [consistency] fields: \
-                     if they both appear in this import their keys will not agree and \
-                     the entities will not join",
-                    entity_list(&entities, &entities_using),
-                    source_name
-                ));
-                AtRisk {
-                    source,
-                    source_name,
-                    entities: entities_using,
-                    seen_values: std::collections::HashMap::new(),
-                    diverged: HashSet::new(),
-                    capped: false,
-                }
-            })
+            .map(
+                |((key_attribute, template), (entities_using, consistency_roots))| {
+                    warnings.push(format!(
+                        "{} both build {} from template '{}', which reads {} outside \
+                     [consistency] fields: if they both appear in this import their keys \
+                     will not agree and the entities will not join",
+                        entity_list(&entities, &entities_using),
+                        key_attribute,
+                        template,
+                        quoted_list(&consistency_roots)
+                    ));
+                    AtRisk {
+                        key_attribute,
+                        template,
+                        consistency_roots,
+                        entities: entities_using,
+                        seen_keys: std::collections::HashMap::new(),
+                        diverged: HashSet::new(),
+                        capped: false,
+                    }
+                },
+            )
             .collect();
 
         let mut type_attributes: Vec<String> =
@@ -542,7 +564,7 @@ impl KeyDeriver {
             .iter()
             .enumerate()
             .filter(|(_, risk)| risk.entities.contains(&entity_idx) && !risk.capped)
-            .filter_map(|(idx, risk)| Some((idx, scalar_hash(&resolve_path(item, &risk.source)?)?)))
+            .filter_map(|(idx, risk)| Some((idx, scalar_hash(item.get(&risk.key_attribute)?)?)))
             .collect()
     }
 
@@ -556,25 +578,31 @@ impl KeyDeriver {
             if risk.capped {
                 continue;
             }
-            let Some(now) = resolve_path(item, &risk.source)
-                .as_ref()
-                .and_then(scalar_hash)
-            else {
+            let Some(now) = item.get(&risk.key_attribute).and_then(scalar_hash) else {
                 continue;
             };
-            match risk.seen_values.get(original) {
-                Some((previous_entity, previous_now)) => {
-                    if *previous_entity != plan.entity && *previous_now != now {
-                        risk.diverged.insert(*previous_entity);
-                        risk.diverged.insert(plan.entity);
-                    }
-                }
-                None => {
-                    if risk.seen_values.len() >= MAX_TRACKED_KEYS {
-                        risk.capped = true;
-                        continue;
-                    }
-                    risk.seen_values.insert(*original, (plan.entity, now));
+
+            if !risk.seen_keys.contains_key(original) && risk.seen_keys.len() >= MAX_TRACKED_KEYS {
+                risk.capped = true;
+                continue;
+            }
+            let outcomes = risk.seen_keys.entry(*original).or_default();
+
+            // Every distinct outcome is kept, not just the first, or whether
+            // a break is noticed would depend on the order the export happens
+            // to be in.
+            let mut diverged_with: Vec<usize> = outcomes
+                .iter()
+                .filter(|(entity, result)| *entity != plan.entity && *result != now)
+                .map(|(entity, _)| *entity)
+                .collect();
+            if !outcomes.contains(&(plan.entity, now)) {
+                outcomes.push((plan.entity, now));
+            }
+            if !diverged_with.is_empty() {
+                diverged_with.push(plan.entity);
+                for entity in diverged_with {
+                    risk.diverged.insert(entity);
                 }
             }
         }
@@ -692,12 +720,16 @@ impl KeyDeriver {
             .map(|risk| {
                 let mut seen: Vec<usize> = risk.diverged.iter().copied().collect();
                 seen.sort();
+
                 format!(
-                    "{} anonymised a shared value of '{}' differently, so their keys no longer \
-                     agree and they will not join. Add '{}' to [consistency] fields",
+                    "{} took the same original {} to different values, so their keys no longer \
+                     agree and they will not join. Template '{}' reads {}: add {} to \
+                     [consistency] fields",
                     entity_list(&self.entities, &seen),
-                    risk.source_name,
-                    risk.source_name
+                    risk.key_attribute,
+                    risk.template,
+                    quoted_list(&risk.consistency_roots),
+                    quoted_list(&risk.consistency_roots)
                 )
             })
             .collect()
@@ -752,21 +784,14 @@ impl KeyDeriver {
     }
 }
 
-/// A document path written back out, for a message.
-fn path_display(path: &[PathElement]) -> String {
-    let mut out = String::new();
-    for element in path {
-        match element {
-            PathElement::Attribute(name) => {
-                if !out.is_empty() {
-                    out.push('.');
-                }
-                out.push_str(name);
-            }
-            PathElement::Index(i) => out.push_str(&format!("[{i}]")),
-        }
+/// `'a'`, or `'a' and 'b'`, for a message.
+fn quoted_list(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
     }
-    out
 }
 
 /// Hash a scalar attribute value, or `None` for anything a key cannot hold.
@@ -1608,8 +1633,12 @@ mod tests {
         let (mut d, warnings) =
             KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("'contact.email'")),
-            "the nested path should be named: {warnings:?}"
+            warnings.iter().any(|w| w.contains("${contact.email}")),
+            "the template should be shown: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("reads 'contact'")),
+            "the root is what [consistency] honours: {warnings:?}"
         );
 
         let contact = |email: &str| {
@@ -1630,7 +1659,10 @@ mod tests {
 
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
-        assert!(breaks[0].contains("'contact.email'"), "{breaks:?}");
+        assert!(
+            breaks[0].contains("add 'contact' to [consistency] fields"),
+            "must name the root, which is what the consistency map keys on: {breaks:?}"
+        );
     }
 
     #[test]
@@ -1708,7 +1740,72 @@ mod tests {
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
         assert!(breaks[0].contains("entity 'Customer' and entity 'Order'"));
-        assert!(breaks[0].contains("Add 'email' to [consistency] fields"));
+        assert!(breaks[0].contains("add 'email' to [consistency] fields"));
+    }
+
+    #[test]
+    fn a_break_is_found_whatever_order_the_export_is_in() {
+        // Two Orders share a customer. Only the second is rewritten, and the
+        // Customer arrives last. Keeping just the first outcome per original
+        // would let the Customer match the untouched one and pass.
+        let mut d = shared_key_deriver();
+
+        run_item(&mut d, order_item("a@x.co"), "a@x.co"); // unchanged
+        run_item(&mut d, order_item("a@x.co"), "fake@example.org"); // rewritten
+        run_item(&mut d, customer_item("a@x.co"), "a@x.co"); // unchanged
+
+        let breaks = d.join_breaks();
+        assert_eq!(
+            breaks.len(),
+            1,
+            "the rewritten order lost its customer: {breaks:?}"
+        );
+    }
+
+    #[test]
+    fn two_composite_keys_sharing_only_a_component_never_joined() {
+        // Both entities build pk from TENANT#${tenantId}#${email}. A customer
+        // in one tenant and an order in another share an address but never
+        // shared a partition, so different fakes cost them nothing.
+        let model = model_with(vec![
+            entity(
+                "Customer",
+                "TENANT#${tenantId}#${email}",
+                Some("PROFILE"),
+                None,
+            ),
+            entity(
+                "Order",
+                "TENANT#${tenantId}#${email}",
+                Some("ORDER#${id}"),
+                None,
+            ),
+        ]);
+        let (mut d, _) =
+            KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).unwrap();
+
+        let mut run = |name: &str, tenant: &str, sk: &str, becomes: &str| {
+            let mut it = item(&[
+                ("_type", name),
+                ("pk", &format!("TENANT#{tenant}#a@x.co")),
+                ("sk", sk),
+                ("tenantId", tenant),
+                ("email", "a@x.co"),
+                ("id", "1"),
+            ]);
+            let mut w = Vec::new();
+            let plan = d.plan(&it, &mut w).unwrap();
+            it.insert("email".to_string(), AttributeValue::S(becomes.to_string()));
+            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        };
+        run("Customer", "a", "PROFILE", "fake1@example.com");
+        run("Order", "b", "ORDER#1", "fake2@example.org");
+
+        assert!(
+            d.join_breaks().is_empty(),
+            "different tenants never shared a key: {:?}",
+            d.join_breaks()
+        );
     }
 
     #[test]

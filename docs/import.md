@@ -191,20 +191,28 @@ both and list `email`, and the order stays in its customer's partition.
 The importer enforces the second half. When two entities build the same key
 from the same template, an anonymised attribute that template reads has to be
 consistency-tracked, or their keys cannot agree. That is a warning when the
-model says it could happen, and an error once two entities are seen to
-anonymise the same value differently:
+model says it could happen, and an error once two entities are seen to take
+the same original key to different values:
 
 ```
-entity 'Customer' and entity 'Order' anonymised a shared value of 'email'
-differently, so their keys no longer agree and they will not join.
-Add 'email' to [consistency] fields
+entity 'Customer' and entity 'Order' took the same original pk to different
+values, so their keys no longer agree and they will not join.
+Template 'CUSTOMER#${email}' reads 'email': add 'email' to [consistency] fields
 ```
 
-It fails on what the anonymisation actually produced, rather than on the model
-or on a shared input. Importing one entity's slice still works, so does
-importing two entities that share no value, and so does a deterministic action
-such as `hash`, which gives both entities the same result and keeps them
-joined without any `[consistency]` entry at all. Nothing is written on the error path, so a failed
+It compares the whole key rather than one attribute the template reads, so two
+composite keys that merely share a component are left alone:
+`TENANT#a#${email}` and `TENANT#b#${email}` never agreed and have no join to
+lose. It fails on what the anonymisation actually produced, rather than on the
+model or on a shared input, so importing one entity's slice still works, and
+so does a deterministic action such as `hash`, which takes both entities to
+the same result and keeps them joined without any `[consistency]` entry at
+all. Every outcome for a key is kept rather than the first, so a break is
+found whatever order the export happens to be in.
+
+The field it names is always a top-level one, because that is what
+`[consistency] fields` is keyed on. A template reading `${contact.email}`
+is reported as `contact`. Nothing is written on the error path, so a failed
 import leaves no database rather than a broken one. Matching on the key and
 its template, rather than on the attribute name, keeps this off entities that
 merely reuse a name: `account#${id}` and `project#${id}` are different

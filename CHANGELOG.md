@@ -48,11 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entities agreeing without any `[consistency]` entry. None of those has a
   join to lose, and a check that fires on legitimate use earns a bypass flag. Nothing is persisted on the error path. Matching on the key and
   its template rather than the attribute name keeps it off entities that
-  merely reuse a name, and an attribute no rule rewrites is not at risk.
-  Templates are grouped by the key they build as well as the attribute they
-  read, so two unrelated pairs that happen to read an attribute of the same
-  name stay separate, and a nested source such as `${contact.email}` is
-  followed rather than collapsed to `contact`
+  merely reuse a name, and an attribute no rule rewrites is not at risk. The
+  comparison is on the whole key rather than one attribute its template reads,
+  so two composite keys sharing only a component are left alone, and every
+  outcome for a key is kept rather than the first, so a break is found
+  whatever order the export is in. The field named in the advice is always a
+  top-level one, matching what `[consistency] fields` is keyed on
   ([#202](https://github.com/nubo-db/dynoxide/issues/202)).
 
 ### Fixed

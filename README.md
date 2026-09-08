@@ -66,11 +66,16 @@ LocalStack uses DynamoDB Local internally as its DynamoDB engine, so its startup
 
 ## Quick Start
 
-Install from npm and start a local server:
+Run a local server without installing anything:
+
+```sh
+npx dynoxide --port 8000
+```
+
+Or install it into a project to pin the version, after which `npx dynoxide` uses that copy:
 
 ```sh
 npm install --save-dev dynoxide
-npx dynoxide --port 8000
 ```
 
 Or run it in Docker, a drop-in for `amazon/dynamodb-local`:

@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dynoxide import --data-model <onetable.json>` rebuilds keys from their
+  entity templates after anonymisation. Rules rewrite whole attribute values,
+  so in a single-table design a rule on `email` left the real address inside
+  `pk = "CUSTOMER#<email>"` and every GSI key built from it, while a rule on
+  `pk` itself replaced the whole value and lost the `CUSTOMER#` prefix. With a
+  data model loaded the importer resolves each item's entity, notes which of
+  `pk`, `sk` and the GSI keys are built from a template such as
+  `user#${email}`, applies the rules to the attributes, then renders those keys
+  again from the anonymised values. The prefix survives and key and attribute
+  agree by construction. A key is only rewritten when its template reproduces
+  the value the item arrived with; anything else is left alone and reported
+  once per entity and key, without quoting the value, since removing those
+  values is the point of the run. A rule that names a key attribute directly
+  wins over its template and is reported. A rule that replaces an attribute a
+  key is built from with a constant (`redact`, `null`, `mask`) is reported
+  before any data is read, because every item of that entity would then render
+  the same key and overwrite the last; collisions are counted if the import
+  goes ahead. Templates follow OneTable's own forms, including dotted paths
+  and `${name:length:pad}` sort padding, while an unclosed `${` fails the
+  import rather than leaving a key silently unrebuilt.
+  An import that has rules but no data model now says in its warnings that
+  keys built from attributes keep their original values. `ImportCommand` gains
+  a `data_model` field for library callers
+  ([#201](https://github.com/nubo-db/dynoxide/issues/201)).
+
+### Fixed
+
+- A OneTable schema whose primary key is not literally `pk` / `sk` now parses
+  its primary key templates. The parser read the model attributes named `pk`
+  and `sk` rather than the ones `indexes.primary` names, so a schema keyed on
+  `PK` / `SK` came back with an empty `pk_template`, which reached the MCP
+  data model as well as import.
+- Anonymisation rules take `values` and `names` tables, in the shape of
+  ExpressionAttributeValues and ExpressionAttributeNames, so a match
+  expression can be scoped by key prefix and can reach an attribute whose
+  name is a reserved word: `match = "begins_with(pk, :prefix)"` with
+  `values = { ":prefix" = "USER#" }`, and `#n` with
+  `names = { "#n" = "name" }`. Strings become `S`, integers and floats `N`,
+  booleans `BOOL`. The rules file is validated before any data is read: a
+  reference with nothing behind it, a name or value nothing references, a
+  non-finite float, and an operand of the wrong type for its function all
+  fail there with the messages DynamoDB gives for the equivalent request
+  ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
+
+### Fixed
+
+- `docs/import.md` showed `begins_with(pk, 'USER#')` as a match expression,
+  which the rule parser rejected with a syntax error on the quote. The parser
+  only ever accepted `:name` references, and the code comment said so while
+  the docs promised otherwise. The example now uses the `values` table above
+  ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
+
 ## [1.1.0] - 2026-09-03
 
 ### Behaviour changes

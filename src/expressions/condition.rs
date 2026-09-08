@@ -1019,6 +1019,53 @@ fn check_path_non_scalar(
     }
 }
 
+/// Extract the `:name` value references in a condition expression, sorted and
+/// deduplicated, so a caller can check them against the values it holds.
+pub fn extract_value_refs(expr: &ConditionExpr) -> Vec<String> {
+    let mut refs = Vec::new();
+    collect_value_refs(expr, &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn collect_value_refs(expr: &ConditionExpr, out: &mut Vec<String>) {
+    match expr {
+        ConditionExpr::Comparison { left, right, .. } => {
+            collect_operand_value_ref(left, out);
+            collect_operand_value_ref(right, out);
+        }
+        ConditionExpr::Between { operand, lo, hi } => {
+            collect_operand_value_ref(operand, out);
+            collect_operand_value_ref(lo, out);
+            collect_operand_value_ref(hi, out);
+        }
+        ConditionExpr::In { operand, values } => {
+            collect_operand_value_ref(operand, out);
+            for v in values {
+                collect_operand_value_ref(v, out);
+            }
+        }
+        ConditionExpr::AttributeExists(_) | ConditionExpr::AttributeNotExists(_) => {}
+        ConditionExpr::AttributeType(_, operand) => collect_operand_value_ref(operand, out),
+        ConditionExpr::BeginsWith(a, b) | ConditionExpr::Contains(a, b) => {
+            collect_operand_value_ref(a, out);
+            collect_operand_value_ref(b, out);
+        }
+        ConditionExpr::And(a, b) | ConditionExpr::Or(a, b) => {
+            collect_value_refs(a, out);
+            collect_value_refs(b, out);
+        }
+        ConditionExpr::Not(inner) => collect_value_refs(inner, out),
+    }
+}
+
+fn collect_operand_value_ref(operand: &Operand, out: &mut Vec<String>) {
+    if let Operand::ValueRef(name) = operand {
+        out.push(name.clone());
+    }
+}
+
 /// Extract the top-level attribute names referenced in a condition expression.
 ///
 /// Resolves `#name` references using `expression_attribute_names`.
@@ -1117,6 +1164,16 @@ fn resolve_top_level_path(
         }
         _ => None,
     }
+}
+
+/// Extract the `#alias` name references in a condition expression, sorted
+/// and deduplicated.
+pub fn extract_name_refs(expr: &ConditionExpr) -> Vec<String> {
+    let mut refs = Vec::new();
+    collect_undefined_name_refs(expr, &None, &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 /// Validate that all `#name` references in a condition expression are defined
@@ -1313,6 +1370,20 @@ mod tests {
         let expr = parse("attribute_not_exists(email)").unwrap();
         let item: HashMap<String, AttributeValue> = HashMap::new();
         assert!(evaluate_without_tracking(&expr, &item, &None, &None).unwrap());
+    }
+
+    #[test]
+    fn test_extract_value_refs_walks_every_operand_slot() {
+        let expr = parse(
+            "begins_with(pk, :p) AND (age BETWEEN :lo AND :hi OR NOT tier IN (:a, :p)) \
+             AND attribute_type(x, :t) AND contains(tags, :tag) AND size(n) > :n",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_value_refs(&expr),
+            vec![":a", ":hi", ":lo", ":n", ":p", ":t", ":tag"]
+        );
+        assert!(extract_value_refs(&parse("attribute_exists(pk)").unwrap()).is_empty());
     }
 
     #[test]

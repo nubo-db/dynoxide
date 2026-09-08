@@ -6,15 +6,18 @@
 //! ## Pipeline
 //!
 //! 1. Parse TOML config (validate all rules upfront)
-//! 2. Source table schemas from `--schema <file>`
+//! 2. Source table schemas from `--schema <file>`, and the data model from
+//!    `--data-model <file>` when keys are built from attributes
 //! 3. Create tables in output SQLite database
-//! 4. For each table: read JSON Lines → parse → anonymise → batch insert
+//! 4. For each table: read JSON Lines → parse → anonymise → rebuild templated
+//!    keys → batch insert
 //! 5. VACUUM (compact the SQLite file)
 //! 6. Optionally compress with zstd
 
 pub(crate) mod anonymise;
 pub(crate) mod config;
 pub(crate) mod consistency;
+pub(crate) mod keys;
 pub(crate) mod parser;
 pub(crate) mod schema;
 
@@ -63,6 +66,10 @@ pub struct ImportCommand {
     pub schema: std::path::PathBuf,
     /// Optional anonymisation rules TOML file.
     pub rules: Option<std::path::PathBuf>,
+    /// Optional OneTable schema. With it, keys built from attributes
+    /// (`user#${email}`) are rebuilt from the anonymised attributes after the
+    /// rules run, so the entity prefix survives and key and attribute agree.
+    pub data_model: Option<std::path::PathBuf>,
     /// Optional table name filter (comma-separated).
     pub tables: Option<Vec<String>>,
     /// Optional zstd compression of output (only valid with file output).
@@ -168,6 +175,21 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         .unwrap_or_default();
     let mut consistency_map = ConsistencyMap::new();
 
+    let data_model = match cmd.data_model {
+        Some(ref path) => {
+            let model =
+                crate::schema::onetable::parse_onetable_file(path).map_err(ImportError::Config)?;
+            eprintln!(
+                "Loaded data model: {} ({} entities) from {}",
+                model.schema_format,
+                model.entities.len(),
+                path.display()
+            );
+            Some(model)
+        }
+        None => None,
+    };
+
     // 2. Load table schemas (returns both parsed schemas and raw JSON)
     let (schemas, schema_json) = schema::load_schemas(&cmd.schema)?;
     eprintln!(
@@ -228,9 +250,30 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
 
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
+    if !rules.is_empty() && data_model.is_none() {
+        summary.warnings.push(
+            "rules rewrite attributes only: a key built from an attribute (CUSTOMER#${email}) \
+             keeps its original value. Pass --data-model <onetable.json> to rebuild keys \
+             from entity templates after anonymisation"
+                .to_string(),
+        );
+    }
+
     for (table_name, files) in &export_files {
         let table_schema = schema_map.get(table_name.as_str()).unwrap();
         let key_attrs = extract_key_attrs(&table_schema.create_request);
+        let mut key_deriver = match data_model.as_ref() {
+            Some(model) => {
+                let (deriver, warnings) =
+                    keys::KeyDeriver::new(model, &table_schema.create_request, &rules)
+                        .map_err(|e| ImportError::Config(format!("data model: {e}")))?;
+                for w in warnings {
+                    summary.warnings.push(format!("table '{table_name}': {w}"));
+                }
+                Some(deriver)
+            }
+            None => None,
+        };
 
         let file_count = files.len();
         eprintln!("Importing table '{}' ({} files)...", table_name, file_count);
@@ -259,15 +302,23 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     return;
                 }
 
-                // Apply anonymisation rules
+                // Apply anonymisation rules, then rebuild any key the data
+                // model says is built from the attributes just rewritten
                 if !rules.is_empty() {
-                    let warnings = anonymise::apply_rules(
+                    let mut warnings = Vec::new();
+                    let plan = key_deriver
+                        .as_mut()
+                        .and_then(|d| d.plan(&item, &mut warnings));
+                    warnings.extend(anonymise::apply_rules(
                         &mut item,
                         &rules,
                         &mut consistency_map,
                         &consistency_fields,
                         &key_attrs,
-                    );
+                    ));
+                    if let (Some(deriver), Some(plan)) = (key_deriver.as_mut(), plan) {
+                        deriver.apply(&plan, &mut item, &mut warnings);
+                    }
                     for w in warnings {
                         if !seen_warnings.contains(&w) {
                             seen_warnings.insert(w.clone());
@@ -320,6 +371,36 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 table_bytes += import_result.bytes_imported;
                 pb.set_message(format!("{}: {} items", table_name, table_items));
                 pb.tick();
+            }
+        }
+
+        if let Some(deriver) = key_deriver.as_mut() {
+            let unmatched = deriver.take_unmatched();
+            if unmatched > 0 {
+                summary.warnings.push(format!(
+                    "table '{}': {} items matched no entity in the data model \
+                     (no type attribute, and no entity's key templates reproduce their keys); \
+                     their keys were not rebuilt",
+                    table_name, unmatched
+                ));
+            }
+            let (collisions, capped) = deriver.take_collisions();
+            if collisions > 0 {
+                summary.warnings.push(format!(
+                    "table '{}': {} items rendered the same primary key as an earlier item \
+                     after their keys were rebuilt, and overwrote it; the output holds fewer \
+                     rows than the export. A rule is replacing an attribute a key is built \
+                     from with a constant",
+                    table_name, collisions
+                ));
+            }
+            if capped {
+                summary.warnings.push(format!(
+                    "table '{}': the rebuilt-key collision check stopped after {} keys; \
+                     later collisions in this table were not counted",
+                    table_name,
+                    keys::MAX_TRACKED_KEYS
+                ));
             }
         }
 

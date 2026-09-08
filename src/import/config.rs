@@ -23,9 +23,22 @@ pub struct ImportConfig {
 #[derive(Debug, Deserialize)]
 pub struct RuleConfig {
     /// DynamoDB ConditionExpression syntax to match items.
-    /// e.g. `attribute_exists(email)` or `begins_with(pk, 'USER#')`
+    /// e.g. `attribute_exists(email)` or `begins_with(pk, :prefix)`, with
+    /// `:prefix` supplied through `values`.
     #[serde(rename = "match")]
     pub match_expr: String,
+
+    /// Names for the `#alias` references in `match`, in the shape of
+    /// ExpressionAttributeNames: `names = { "#n" = "name" }`. Needed for
+    /// attributes whose names are reserved words.
+    #[serde(default)]
+    pub names: HashMap<String, String>,
+
+    /// Values for the `:name` references in `match`, in the shape of
+    /// ExpressionAttributeValues: `values = { ":prefix" = "USER#" }`.
+    /// Strings become `S`, integers and floats `N`, booleans `BOOL`.
+    #[serde(default)]
+    pub values: HashMap<String, toml::Value>,
 
     /// Attribute path to transform (supports dot notation: `address.city`).
     pub path: String,
@@ -81,6 +94,10 @@ pub struct ConsistencyConfig {
 pub struct ValidatedRule {
     /// Parsed condition expression.
     pub condition: ConditionExpr,
+    /// Names behind the `#alias` references in `condition`, if it has any.
+    pub names: Option<HashMap<String, String>>,
+    /// Values behind the `:name` references in `condition`, if it has any.
+    pub values: Option<HashMap<String, AttributeValue>>,
     /// Parsed path elements for navigating into items.
     pub path: Vec<crate::expressions::PathElement>,
     /// The action to apply.
@@ -149,6 +166,20 @@ pub fn load_and_validate(
             )
         })?;
 
+        let names = convert_names(&rule.names, i + 1)?;
+        let values = convert_values(&rule.values, i + 1)?;
+        validate_name_refs(&condition, &names, i + 1)?;
+        validate_value_refs(&condition, &values, i + 1)?;
+        condition::validate_static(&condition, &values)
+            .and_then(|()| condition::validate_operand_semantics(&condition, &names, &values))
+            .map_err(|e| {
+                format!(
+                    "Rule {}: invalid match expression '{}': {e}",
+                    i + 1,
+                    rule.match_expr
+                )
+            })?;
+
         let path = parse_path(&rule.path)
             .map_err(|e| format!("Rule {}: invalid path '{}': {e}", i + 1, rule.path))?;
 
@@ -156,6 +187,8 @@ pub fn load_and_validate(
 
         validated.push(ValidatedRule {
             condition,
+            names,
+            values,
             path,
             action,
         });
@@ -164,9 +197,123 @@ pub fn load_and_validate(
     Ok((validated, config.consistency))
 }
 
+/// Check a rule's `names` table: every alias starts with `#`.
+fn convert_names(
+    names: &HashMap<String, String>,
+    rule_num: usize,
+) -> Result<Option<HashMap<String, String>>, String> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    for alias in names.keys() {
+        if !alias.starts_with('#') {
+            return Err(format!(
+                "Rule {rule_num}: name alias '{alias}' must start with '#' (for example \"#n\")"
+            ));
+        }
+    }
+    Ok(Some(names.clone()))
+}
+
+/// Check that `names` and the `#alias` references in the match expression
+/// line up: every reference is defined, and every name is used.
+fn validate_name_refs(
+    condition: &ConditionExpr,
+    names: &Option<HashMap<String, String>>,
+    rule_num: usize,
+) -> Result<(), String> {
+    condition::validate_name_refs(condition, names)
+        .map_err(|e| format!("Rule {rule_num}: {e}. Add it to the rule's names table"))?;
+
+    if let Some(names) = names {
+        let used = crate::expressions::condition::extract_name_refs(condition);
+        let mut unused: Vec<&String> = names.keys().filter(|k| !used.contains(k)).collect();
+        unused.sort();
+        if let Some(alias) = unused.first() {
+            return Err(format!(
+                "Rule {rule_num}: name {alias} is not referenced by the match expression"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Convert a rule's `values` table into attribute values.
+///
+/// Mirrors ExpressionAttributeValues: every name starts with `:`, and only
+/// scalars are accepted, since that is all a match expression can compare.
+fn convert_values(
+    values: &HashMap<String, toml::Value>,
+    rule_num: usize,
+) -> Result<Option<HashMap<String, AttributeValue>>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut converted = HashMap::with_capacity(values.len());
+    for (name, value) in values {
+        if !name.starts_with(':') {
+            return Err(format!(
+                "Rule {rule_num}: value name '{name}' must start with ':' (for example \":prefix\")"
+            ));
+        }
+        let attr = match value {
+            toml::Value::String(s) => AttributeValue::S(s.clone()),
+            toml::Value::Integer(i) => AttributeValue::N(i.to_string()),
+            toml::Value::Float(f) if f.is_finite() => AttributeValue::N(f.to_string()),
+            toml::Value::Float(_) => {
+                return Err(format!(
+                    "Rule {rule_num}: value '{name}' must be a finite number"
+                ));
+            }
+            toml::Value::Boolean(b) => AttributeValue::BOOL(*b),
+            _ => {
+                return Err(format!(
+                    "Rule {rule_num}: value '{name}' must be a string, number or boolean"
+                ));
+            }
+        };
+        converted.insert(name.clone(), attr);
+    }
+    Ok(Some(converted))
+}
+
+/// Check that `values` and the `:name` references in the match expression
+/// line up: every reference is defined, and every value is used. The same
+/// two checks DynamoDB applies to ExpressionAttributeValues.
+fn validate_value_refs(
+    condition: &ConditionExpr,
+    values: &Option<HashMap<String, AttributeValue>>,
+    rule_num: usize,
+) -> Result<(), String> {
+    let refs = condition::extract_value_refs(condition);
+
+    for name in &refs {
+        let defined = values.as_ref().is_some_and(|v| v.contains_key(name));
+        if !defined {
+            return Err(format!(
+                "Rule {rule_num}: match expression references {name} but values does not define it. \
+                 Add values = {{ \"{name}\" = \"...\" }} to the rule"
+            ));
+        }
+    }
+
+    if let Some(values) = values {
+        let mut unused: Vec<&String> = values.keys().filter(|k| !refs.contains(k)).collect();
+        unused.sort();
+        if let Some(name) = unused.first() {
+            return Err(format!(
+                "Rule {rule_num}: value {name} is not referenced by the match expression"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a dot-notation path into PathElements.
 /// Supports: `email`, `address.city`, `items[0].name`
-fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathElement>, String> {
+pub(super) fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathElement>, String> {
     use crate::expressions::PathElement;
 
     if path.is_empty() {
@@ -278,24 +425,17 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
 
 /// Evaluate a match expression against an item.
 ///
-/// ## Supported expressions
+/// Match expressions use DynamoDB ConditionExpression syntax, so anything a
+/// ConditionExpression can say works here: `attribute_exists`,
+/// `attribute_not_exists`, `attribute_type`, `begins_with`, `contains`,
+/// `size`, comparisons, `BETWEEN`, `IN`, and `AND` / `OR` / `NOT`.
 ///
-/// Match expressions use DynamoDB ConditionExpression syntax. The following
-/// functions work without expression attribute values:
-///
-/// - `attribute_exists(path)`: matches if the attribute is present
-/// - `attribute_not_exists(path)`: matches if the attribute is absent
-/// - `attribute_type(path, type)`: matches if the attribute is the given type
-/// - Boolean operators: `AND`, `OR`, `NOT`
-///
-/// ## Known limitation
-///
-/// Functions that require string literal arguments (e.g., `begins_with(pk, 'USER#')`)
-/// are **not supported** because the condition parser expects `:val` expression
-/// attribute value references, not inline string literals. String literal support
-/// is tracked as a follow-up task.
+/// As on DynamoDB, an operand that is not a path is a `:name` reference,
+/// never an inline literal: `begins_with(pk, :prefix)` with the prefix in the
+/// rule's `values` table. A reserved word or an awkward attribute name goes
+/// through the `names` table as `#alias`, as ExpressionAttributeNames would.
 pub fn matches_item(rule: &ValidatedRule, item: &HashMap<String, AttributeValue>) -> bool {
-    crate::expressions::evaluate_without_tracking(&rule.condition, item, &None, &None)
+    crate::expressions::evaluate_without_tracking(&rule.condition, item, &rule.names, &rule.values)
         .unwrap_or(false)
 }
 
@@ -405,6 +545,8 @@ mod tests {
 
         let rule = ValidatedRule {
             condition: crate::expressions::condition::parse("attribute_exists(email)").unwrap(),
+            names: None,
+            values: None,
             path: vec![crate::expressions::PathElement::Attribute(
                 "email".to_string(),
             )],
@@ -413,6 +555,210 @@ mod tests {
         let rule_debug = format!("{:?}", rule);
         assert!(rule_debug.contains("[REDACTED]"));
         assert!(!rule_debug.contains("super"));
+    }
+
+    fn parsed_rule(toml_str: &str) -> Result<ValidatedRule, String> {
+        let config: ImportConfig = toml::from_str(toml_str).map_err(|e| e.to_string())?;
+        let rule = &config.rules[0];
+        let condition = condition::parse(&rule.match_expr).map_err(|e| e.to_string())?;
+        let names = convert_names(&rule.names, 1)?;
+        let values = convert_values(&rule.values, 1)?;
+        validate_name_refs(&condition, &names, 1)?;
+        validate_value_refs(&condition, &values, 1)?;
+        condition::validate_static(&condition, &values)?;
+        condition::validate_operand_semantics(&condition, &names, &values)?;
+        Ok(ValidatedRule {
+            condition,
+            names,
+            values,
+            path: parse_path(&rule.path)?,
+            action: validate_action(&rule.action, 1)?,
+        })
+    }
+
+    #[test]
+    fn test_values_table_feeds_begins_with() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = "USER#" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("USER#1".to_string()));
+        assert!(matches_item(&rule, &item));
+
+        item.insert("pk".to_string(), AttributeValue::S("ORDER#1".to_string()));
+        assert!(!matches_item(&rule, &item));
+    }
+
+    #[test]
+    fn test_values_convert_by_toml_type() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "age > :min AND active = :yes"
+values = { ":min" = 18, ":yes" = true }
+path = "name"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+        let values = rule.values.unwrap();
+        assert_eq!(values[":min"], AttributeValue::N("18".to_string()));
+        assert_eq!(values[":yes"], AttributeValue::BOOL(true));
+    }
+
+    #[test]
+    fn test_values_missing_reference_rejected() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains(":prefix"), "{err}");
+        assert!(err.contains("does not define"), "{err}");
+    }
+
+    #[test]
+    fn test_values_unused_rejected() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(pk)"
+values = { ":prefix" = "USER#" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains(":prefix"), "{err}");
+        assert!(err.contains("not referenced"), "{err}");
+    }
+
+    #[test]
+    fn test_values_name_must_start_with_colon() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { "prefix" = "USER#" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("must start with ':'"), "{err}");
+    }
+
+    #[test]
+    fn test_values_reject_non_finite_floats() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "amount < :max"
+values = { ":max" = inf }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("finite"), "{err}");
+    }
+
+    #[test]
+    fn test_values_of_the_wrong_type_are_rejected_up_front() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = 123 }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("begins_with"), "{err}");
+    }
+
+    #[test]
+    fn test_names_table_reaches_a_reserved_word_attribute() {
+        let rule = parsed_rule(
+            r##"
+[[rules]]
+match = "attribute_exists(#n)"
+names = { "#n" = "name" }
+path = "email"
+action = { type = "redact" }
+"##,
+        )
+        .unwrap();
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), AttributeValue::S("Ada".to_string()));
+        assert!(matches_item(&rule, &item));
+        assert!(!matches_item(&rule, &HashMap::new()));
+    }
+
+    #[test]
+    fn test_names_undefined_or_unused_rejected() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(#n)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("#n"), "{err}");
+
+        let err = parsed_rule(
+            r##"
+[[rules]]
+match = "attribute_exists(pk)"
+names = { "#n" = "name" }
+path = "email"
+action = { type = "redact" }
+"##,
+        )
+        .unwrap_err();
+        assert!(err.contains("not referenced"), "{err}");
+
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(pk)"
+names = { "n" = "name" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("must start with '#'"), "{err}");
+    }
+
+    #[test]
+    fn test_values_reject_non_scalars() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = ["USER#"] }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("string, number or boolean"), "{err}");
     }
 
     #[test]

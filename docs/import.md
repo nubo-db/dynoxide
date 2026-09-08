@@ -52,6 +52,12 @@ path = "email"
 action = { type = "fake", generator = "safe_email" }
 
 [[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = "USER#" }
+path = "fullName"
+action = { type = "fake", generator = "name" }
+
+[[rules]]
 match = "attribute_exists(phone)"
 path = "phone"
 action = { type = "mask", keep_last = 4, mask_char = "*" }
@@ -88,7 +94,102 @@ ANON_SALT=my-secret-salt dynoxide import \
 | `redact` | Replace with `[REDACTED]` |
 | `null` | Replace with NULL |
 
-**Consistency:** Fields listed in `[consistency].fields` produce the same anonymised value across all tables in a single import run. Same input + same salt = same output.
+**Match expressions** use DynamoDB ConditionExpression syntax, so anything a
+ConditionExpression can say works: `attribute_exists`, `attribute_not_exists`,
+`attribute_type`, `begins_with`, `contains`, `size`, comparisons, `BETWEEN`,
+`IN`, and `AND` / `OR` / `NOT`. As on DynamoDB, an operand that is not a path
+is a `:name` reference rather than an inline literal, and the rule's `values`
+table supplies it in the shape of ExpressionAttributeValues. Strings become
+`S`, integers and floats `N`, booleans `BOOL`.
+
+An attribute whose name is a DynamoDB reserved word (`name`, `status`, `type`
+and the rest) goes through a `names` table as `#alias`, exactly as
+ExpressionAttributeNames would:
+
+```toml
+[[rules]]
+match = "begins_with(pk, :prefix) AND attribute_exists(#n)"
+values = { ":prefix" = "USER#" }
+names = { "#n" = "name" }
+path = "name"
+action = { type = "fake", generator = "name" }
+```
+
+The rules file is validated before any data is read. A reference with nothing
+behind it, a name or value nothing references, and an operand of the wrong
+type for its function all fail there, with the same messages DynamoDB gives
+for the equivalent request.
+
+**Consistency:** Fields listed in `[consistency].fields` produce the same anonymised value across all tables in a single import run. Same input + same salt = same output. Consistency is per field: `email` and `contactEmail` holding the same address get different fake values unless both are derived from one attribute, which is what `--data-model` does for keys.
+
+### Single-table designs
+
+Rules rewrite whole attribute values. In a single-table design the sensitive
+value is usually also inside a key, `pk = "CUSTOMER#a.okonkwo@example.co.uk"`,
+and a rule on `email` never touches it. Without a data model the import
+reports this once in its warnings, because the output would otherwise look
+anonymised while every partition key still holds the real address.
+
+Pass the same [OneTable](https://doc.onetable.io/) schema the MCP server uses
+as `--data-model` and the importer rebuilds keys from the anonymised
+attributes:
+
+```sh
+dynoxide import \
+  --source ./export/ \
+  --schema schema.json \
+  --rules rules.toml \
+  --data-model onetable.json \
+  --output anonymised.db
+```
+
+For each item the importer resolves the entity (by the type attribute,
+`_type` by default, or failing that by which entity's key templates reproduce
+the item's keys), notes which of `pk`, `sk` and the GSI keys the entity builds
+from a template such as `user#${email}`, applies the rules to the attributes,
+then renders those keys again. The prefix survives, and the key and the
+attribute agree by construction, so a rule on `email` is all a `User` entity
+needs. Which model attributes hold the primary key comes from the schema's
+`indexes.primary`, the DynamoDB attribute names come from the `--schema` file,
+and GSI keys are matched by index name, so the OneTable index `name` must
+match the DynamoDB index.
+
+Templates follow OneTable's own forms: `${name}`, a dotted path that reaches
+into a map (`${address.city}`), and `${name:length:pad}` sort padding, which
+prefixes the value with `pad` (default `0`) until it is `length` characters.
+An unclosed `${` fails the import rather than leaving a key silently
+unrebuilt.
+
+A key is only rewritten when its template reproduces the value the item
+arrived with. A key the template cannot reproduce, or that names an attribute
+the item does not carry, is left as it is and reported once per entity and
+key. That last case is the one to watch for: an `Order` item whose `pk` holds
+the customer's email but which has no attribute holding that email cannot be
+rebuilt, because there is nothing to derive it from. Give the entity an
+attribute for the value and put it in the template.
+
+**Name that attribute the same on every entity that shares the value, and
+list the name in `[consistency] fields`.** Both halves are load-bearing,
+because consistency is keyed on the attribute name. An `Order` carrying
+`customerEmail` where the `Customer` carries `email` is two namespaces, so
+the same real address anonymises to two different values, both keys rebuild
+correctly, and the order lands in a different partition from its customer.
+The same name in both places with no `[consistency]` entry fails the same
+way, since each item is then anonymised independently. Name it `email` on
+both and list `email`, and the order stays in its customer's partition.
+
+**Use `fake` or `hash` for an attribute a key is built from.** `redact`,
+`null` and `mask` produce the same output for every input, so every item of
+that entity would render an identical key and overwrite the previous one,
+leaving a database with fewer rows than the export. The importer says so
+before it reads any data, and counts the collisions if you go ahead anyway.
+
+**A rule that names a key attribute directly wins.** The key is not rebuilt
+from its template, the rule's value is what gets stored, and the import says
+which key that happened to.
+
+When `--mcp` is set, `--data-model` also serves as the MCP data model unless
+`--mcp-data-model` is given.
 
 ## Options
 

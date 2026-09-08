@@ -86,6 +86,7 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -142,6 +143,7 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -182,6 +184,7 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -234,6 +237,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -315,6 +319,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -379,6 +384,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -411,6 +417,7 @@ fields = ["email"]
             compress: true,
             force: false,
             continue_on_error: false,
+            data_model: None,
         })
         .unwrap();
 
@@ -449,6 +456,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            data_model: None,
         });
 
         assert!(result.is_err());
@@ -959,6 +967,7 @@ fields = ["email"]
                 output: None,
                 schema: schema_file,
                 rules: None,
+                data_model: None,
                 tables: None,
                 compress: false,
                 force: false,
@@ -985,5 +994,446 @@ fields = ["email"]
             })
             .unwrap();
         assert_eq!(scan.count, 2);
+    }
+
+    /// Single-table schema with a GSI1 on gs1pk/gs1sk, matching the OneTable
+    /// fixture in tests/fixtures/onetable-test-schema.json.
+    fn single_table_schema(table_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Table": {
+                "TableName": table_name,
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                    {"AttributeName": "gs1pk", "AttributeType": "S"},
+                    {"AttributeName": "gs1sk", "AttributeType": "S"}
+                ],
+                "GlobalSecondaryIndexes": [
+                    {
+                        "IndexName": "GSI1",
+                        "KeySchema": [
+                            {"AttributeName": "gs1pk", "KeyType": "HASH"},
+                            {"AttributeName": "gs1sk", "KeyType": "RANGE"}
+                        ],
+                        "Projection": {"ProjectionType": "ALL"}
+                    }
+                ]
+            }
+        })
+    }
+
+    fn onetable_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/onetable-test-schema.json")
+    }
+
+    fn scan_all(db: &dynoxide::Database, table: &str) -> Vec<dynoxide::Item> {
+        db.scan(dynoxide::actions::scan::ScanRequest {
+            table_name: table.to_string(),
+            ..Default::default()
+        })
+        .unwrap()
+        .items
+        .unwrap()
+    }
+
+    fn string_attr(item: &dynoxide::Item, name: &str) -> String {
+        match item.get(name) {
+            Some(dynoxide::AttributeValue::S(s)) => s.clone(),
+            other => panic!("{name} should be a string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rule_values_scope_a_match_by_key_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"pk": {"S": "CUSTOMER#1"}, "sk": {"S": "PROFILE"}, "notes": {"S": "customer notes"}}}"#,
+                r#"{"Item": {"pk": {"S": "ORDER#1"}, "sk": {"S": "PROFILE"}, "notes": {"S": "order notes"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = "CUSTOMER#" }
+path = "notes"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap();
+        assert_eq!(summary.total_items, 2);
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        for item in scan_all(&db, "App") {
+            let pk = string_attr(&item, "pk");
+            let notes = string_attr(&item, "notes");
+            if pk.starts_with("CUSTOMER#") {
+                assert_eq!(notes, "[REDACTED]", "rule should reach the customer item");
+            } else {
+                assert_eq!(notes, "order notes", "rule must not reach the order item");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rule_values_must_cover_every_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[r#"{"Item": {"pk": {"S": "CUSTOMER#1"}, "sk": {"S": "PROFILE"}}}"#],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+path = "sk"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let err = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("output.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Rule 1"), "{msg}");
+        assert!(msg.contains(":prefix"), "{msg}");
+    }
+
+    #[test]
+    fn test_data_model_rederives_keys_from_anonymised_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@example.com"}, "gs1pk": {"S": "user#alice@example.com"}, "gs1sk": {"S": "user#"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@example.com"}, "role": {"S": "admin"}}}"#,
+                r#"{"Item": {"_type": {"S": "Account"}, "pk": {"S": "account#acc1"}, "sk": {"S": "account#"}, "id": {"S": "acc1"}, "name": {"S": "Acme"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .unwrap();
+        assert_eq!(summary.total_items, 2);
+        assert!(
+            summary.warnings.is_empty(),
+            "keys that reproduce from their templates warn about nothing: {:?}",
+            summary.warnings
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let items = scan_all(&db, "App");
+        let user = items
+            .iter()
+            .find(|i| string_attr(i, "_type") == "User")
+            .unwrap();
+        let account = items
+            .iter()
+            .find(|i| string_attr(i, "_type") == "Account")
+            .unwrap();
+
+        let email = string_attr(user, "email");
+        assert_ne!(email, "alice@example.com");
+        assert_eq!(string_attr(user, "pk"), "account#acc1");
+        assert_eq!(string_attr(user, "sk"), format!("user#{email}"));
+        assert_eq!(string_attr(user, "gs1pk"), format!("user#{email}"));
+        assert_eq!(string_attr(user, "gs1sk"), "user#");
+
+        assert_eq!(string_attr(account, "pk"), "account#acc1");
+        assert_eq!(string_attr(account, "sk"), "account#");
+        assert_eq!(string_attr(account, "name"), "Acme");
+    }
+
+    #[test]
+    fn test_data_model_leaves_a_key_its_template_does_not_reproduce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        // sk does not follow the User template, so it must be left alone and
+        // reported rather than silently rewritten.
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "legacy-profile"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .unwrap();
+
+        let mismatch = summary
+            .warnings
+            .iter()
+            .find(|w| w.contains("entity 'User'") && w.contains("does not reproduce sk"))
+            .unwrap_or_else(|| panic!("expected a mismatch warning: {:?}", summary.warnings));
+        assert!(
+            !mismatch.contains("legacy-profile"),
+            "a warning must not quote the key value: {mismatch}"
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let user = &scan_all(&db, "App")[0];
+        assert_eq!(string_attr(user, "sk"), "legacy-profile");
+        assert_ne!(string_attr(user, "email"), "alice@example.com");
+    }
+
+    #[test]
+    fn test_rules_without_data_model_warn_that_keys_are_not_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"pk": {"S": "CUSTOMER#alice@example.com"}, "sk": {"S": "PROFILE"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap();
+
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("--data-model")),
+            "expected the keys-not-rewritten notice: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn test_data_model_reports_rows_collapsing_under_a_constant_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@example.com"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@example.com"}}}"#,
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#bob@example.com"}, "accountId": {"S": "acc1"}, "email": {"S": "bob@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .unwrap();
+
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("collapse onto one row")),
+            "expected the up-front constant-action warning: {:?}",
+            summary.warnings
+        );
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("1 items rendered the same primary key")),
+            "expected the collision count: {:?}",
+            summary.warnings
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let items = scan_all(&db, "App");
+        assert_eq!(items.len(), 1);
+        assert_eq!(string_attr(&items[0], "sk"), "user#[REDACTED]");
+    }
+
+    #[test]
+    fn test_data_model_lets_a_rule_on_a_key_win() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@example.com"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(sk)"
+path = "sk"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .unwrap();
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("targets key attribute 'sk' directly")),
+            "{:?}",
+            summary.warnings
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let user = &scan_all(&db, "App")[0];
+        assert_eq!(string_attr(user, "sk"), "[REDACTED]");
     }
 }

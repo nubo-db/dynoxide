@@ -23,7 +23,7 @@ use crate::schema::{DataModel, EntityDefinition};
 use crate::types::{AttributeValue, Item};
 use crate::validation::{partition_key_name, sort_key_name};
 
-use super::config::{ValidatedAction, ValidatedRule, matches_item, parse_path};
+use super::config::{ValidatedAction, ValidatedRule, parse_path};
 
 /// Rebuilt primary keys are remembered (as hashes) to spot two items
 /// collapsing onto one row. Past this many the check stops, and says so.
@@ -160,7 +160,13 @@ impl TemplatedKey {
 struct EntityKeys {
     name: String,
     type_attribute: String,
+    /// Keys with at least one variable: the ones worth rebuilding.
     keys: Vec<TemplatedKey>,
+    /// Every key the entity templates, constant ones included. Used to tell
+    /// entities apart when an item carries no type attribute, where a
+    /// constant `sk = "PROFILE"` is often the only thing separating two
+    /// entities that share a partition template.
+    match_keys: Vec<TemplatedKey>,
 }
 
 /// An attribute more than one entity builds a key from, which is not in
@@ -171,12 +177,14 @@ struct AtRisk {
     attribute: String,
     /// Entity indices that build a key from it, in model order.
     entities: Vec<usize>,
-    /// Hash of each value seen, against the entity that carried it. A second
-    /// entity carrying a value already seen is the join, observed in the data
-    /// rather than inferred from the model.
-    seen_values: std::collections::HashMap<u64, usize>,
-    /// Entities that were found to share a value with another entity.
-    sharing: HashSet<usize>,
+    /// Original value hash -> (entity that carried it, what it anonymised
+    /// to). A second entity carrying the same original is the join; a
+    /// *different* anonymised result is the join actually breaking. A
+    /// deterministic action such as hash agrees by construction, and a rule
+    /// that matched neither item changes nothing, so both stay quiet.
+    seen_values: std::collections::HashMap<u64, (usize, u64)>,
+    /// Entities found to have anonymised a shared value differently.
+    diverged: HashSet<usize>,
     /// Set once `seen_values` hit its cap and stopped tracking.
     capped: bool,
 }
@@ -186,6 +194,9 @@ struct AtRisk {
 pub struct Rederivation {
     entity: usize,
     keys: Vec<usize>,
+    /// (at-risk index, hash of the value this item arrived with), so `apply`
+    /// can see whether two entities anonymised a shared value differently.
+    at_risk_originals: Vec<(usize, u64)>,
 }
 
 /// Rebuilds templated keys for the items of one table.
@@ -208,10 +219,6 @@ pub struct KeyDeriver {
     warned_unrenderable: HashSet<(usize, usize)>,
     /// Items that matched no entity, reported once per table.
     unmatched: usize,
-    /// Key attributes some rule rewrites directly. Whether the rule wins is
-    /// decided per item, since its condition may not match every entity that
-    /// builds that key.
-    rule_targeted: HashSet<String>,
     /// (entity index, key index) pairs where a rule took the key instead of
     /// its template, reported once.
     warned_rule_wins: HashSet<(usize, usize)>,
@@ -256,26 +263,60 @@ impl KeyDeriver {
         let mut entity_key_shapes: Vec<Vec<(String, String, Vec<String>)>> =
             Vec::with_capacity(model.entities.len());
         for entity in &model.entities {
-            let mut keys = Vec::new();
-            push_key(&mut keys, entity, hash, Some(&entity.pk_template))?;
-            push_key(&mut keys, entity, range, entity.sk_template.as_deref())?;
+            let mut match_keys = Vec::new();
+            push_key(&mut match_keys, entity, hash, Some(&entity.pk_template))?;
+            push_key(
+                &mut match_keys,
+                entity,
+                range,
+                entity.sk_template.as_deref(),
+            )?;
 
             for mapping in &entity.gsi_mappings {
                 let Some(gsi) = gsis.iter().find(|g| g.index_name == mapping.index_name) else {
                     continue;
                 };
                 push_key(
-                    &mut keys,
+                    &mut match_keys,
                     entity,
                     partition_key_name(&gsi.key_schema),
                     Some(&mapping.pk_template),
                 )?;
                 push_key(
-                    &mut keys,
+                    &mut match_keys,
                     entity,
                     sort_key_name(&gsi.key_schema),
                     mapping.sk_template.as_deref(),
                 )?;
+            }
+
+            let keys: Vec<TemplatedKey> = match_keys
+                .iter()
+                .filter(|key| {
+                    key.segments
+                        .iter()
+                        .any(|s| matches!(s, Segment::Var { .. }))
+                })
+                .cloned()
+                .collect();
+
+            // A key built from another templated key would have to be
+            // rendered in dependency order, and rendering it first copies the
+            // pre-anonymisation value. Refuse rather than leave that to luck.
+            for key in &keys {
+                for source in key.sources() {
+                    if keys
+                        .iter()
+                        .any(|other| other.attribute == source && other.attribute != key.attribute)
+                    {
+                        return Err(format!(
+                            "entity '{}': template '{}' for {} reads key attribute '{}', which is \
+                             itself built from a template; import cannot order those safely, so \
+                             build both keys from plain attributes instead",
+                            entity.name, key.template, key.attribute, source
+                        ));
+                    }
+                }
             }
 
             // Recorded before the rule-target retain below: this is a
@@ -329,6 +370,7 @@ impl KeyDeriver {
                 name: entity.name.clone(),
                 type_attribute: type_attribute(model, entity),
                 keys,
+                match_keys,
             });
         }
 
@@ -399,7 +441,7 @@ impl KeyDeriver {
                     attribute,
                     entities: entities_using,
                     seen_values: std::collections::HashMap::new(),
-                    sharing: HashSet::new(),
+                    diverged: HashSet::new(),
                     capped: false,
                 }
             })
@@ -416,7 +458,6 @@ impl KeyDeriver {
                 type_attributes,
                 hash_attribute: hash.map(String::from),
                 range_attribute: range.map(String::from),
-                rule_targeted: rule_targets.iter().map(|s| s.to_string()).collect(),
                 warned_mismatch: HashSet::new(),
                 warned_unrenderable: HashSet::new(),
                 warned_rule_wins: HashSet::new(),
@@ -436,36 +477,17 @@ impl KeyDeriver {
     /// item arrived with. Any key the template does not reproduce is left
     /// alone and reported (once per entity and key). An item that matches no
     /// entity is counted for [`take_unmatched`](Self::take_unmatched).
-    pub fn plan(
-        &mut self,
-        item: &Item,
-        rules: &[ValidatedRule],
-        warnings: &mut Vec<String>,
-    ) -> Option<Rederivation> {
+    pub fn plan(&mut self, item: &Item, warnings: &mut Vec<String>) -> Option<Rederivation> {
         let Some(entity_idx) = self.resolve_entity(item) else {
             self.unmatched += 1;
             return None;
         };
-        self.note_at_risk_values(entity_idx, item);
+        let at_risk_originals = self.at_risk_originals(entity_idx, item);
 
         let entity = &self.entities[entity_idx];
 
-        let mut rule_wins = Vec::new();
         let mut keys = Vec::new();
         for (idx, key) in entity.keys.iter().enumerate() {
-            // A rule that rewrites this key attribute wins over the template,
-            // but only on the items its condition actually matches. Deciding
-            // that per entity would leave the key unrebuilt on every item the
-            // rule never touches, real value intact.
-            if self.rule_targeted.contains(&key.attribute)
-                && rules.iter().any(|rule| {
-                    rule_target(rule) == Some(key.attribute.as_str()) && matches_item(rule, item)
-                })
-            {
-                rule_wins.push(idx);
-                continue;
-            }
-
             let Some(current) = item.get(&key.attribute) else {
                 // A sparse index key: nothing to rebuild.
                 continue;
@@ -486,54 +508,49 @@ impl KeyDeriver {
             }
         }
 
-        for idx in rule_wins {
-            if self.warned_rule_wins.insert((entity_idx, idx)) {
-                let key = &self.entities[entity_idx].keys[idx];
-                warnings.push(format!(
-                    "entity '{}': a rule rewrote {} directly, so it was not rebuilt from \
-                     template '{}'",
-                    self.entities[entity_idx].name, key.attribute, key.template
-                ));
-            }
-        }
-
         Some(Rederivation {
             entity: entity_idx,
             keys,
+            at_risk_originals,
         })
     }
 
-    /// Record this item's values for any at-risk attribute, so a value two
-    /// entities both carry is spotted. Presence of both entities is not
-    /// enough: two entities keyed on the same template with no value in
-    /// common never had a join to lose.
-    fn note_at_risk_values(&mut self, entity_idx: usize, item: &Item) {
-        for risk in &mut self.at_risk {
-            if !risk.entities.contains(&entity_idx) || risk.capped {
+    /// The value this item arrived with for each at-risk attribute, hashed.
+    fn at_risk_originals(&self, entity_idx: usize, item: &Item) -> Vec<(usize, u64)> {
+        self.at_risk
+            .iter()
+            .enumerate()
+            .filter(|(_, risk)| risk.entities.contains(&entity_idx) && !risk.capped)
+            .filter_map(|(idx, risk)| Some((idx, scalar_hash(item.get(&risk.attribute)?)?)))
+            .collect()
+    }
+
+    /// After the rules ran: compare what this item's at-risk values became
+    /// against what an earlier item of a different entity made of the same
+    /// original. Two entities that agree, because the action is
+    /// deterministic or because no rule matched, are left alone.
+    fn note_at_risk_results(&mut self, plan: &Rederivation, item: &Item) {
+        for (risk_idx, original) in &plan.at_risk_originals {
+            let risk = &mut self.at_risk[*risk_idx];
+            if risk.capped {
                 continue;
             }
-            let Some(value) = item.get(&risk.attribute) else {
+            let Some(now) = item.get(&risk.attribute).and_then(scalar_hash) else {
                 continue;
             };
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            match value {
-                AttributeValue::S(s) => s.hash(&mut hasher),
-                AttributeValue::N(n) => n.hash(&mut hasher),
-                _ => continue,
-            }
-            let key = hasher.finish();
-            match risk.seen_values.get(&key) {
-                Some(previous) if *previous != entity_idx => {
-                    risk.sharing.insert(*previous);
-                    risk.sharing.insert(entity_idx);
+            match risk.seen_values.get(original) {
+                Some((previous_entity, previous_now)) => {
+                    if *previous_entity != plan.entity && *previous_now != now {
+                        risk.diverged.insert(*previous_entity);
+                        risk.diverged.insert(plan.entity);
+                    }
                 }
-                Some(_) => {}
                 None => {
                     if risk.seen_values.len() >= MAX_TRACKED_KEYS {
                         risk.capped = true;
                         continue;
                     }
-                    risk.seen_values.insert(key, entity_idx);
+                    risk.seen_values.insert(*original, (plan.entity, now));
                 }
             }
         }
@@ -542,11 +559,26 @@ impl KeyDeriver {
     /// After the rules run: render every planned key from the item's current
     /// attributes. A key whose template no longer renders (a rule nulled or
     /// removed an attribute it needs) is left unchanged and reported.
-    pub fn apply(&mut self, plan: &Rederivation, item: &mut Item, warnings: &mut Vec<String>) {
+    pub fn apply(
+        &mut self,
+        plan: &Rederivation,
+        rewritten_by_rules: &HashSet<String>,
+        item: &mut Item,
+        warnings: &mut Vec<String>,
+    ) {
         let entity = &self.entities[plan.entity];
         let mut rebuilt_primary = false;
+        let mut rule_wins = Vec::new();
         for &idx in &plan.keys {
             let key = &entity.keys[idx];
+            // A rule that actually rewrote this key wins over its template.
+            // Taken from what the rules did rather than from what their
+            // conditions predicted: each rule sees the item as the rules
+            // before it left it, so a prediction made up front can be wrong.
+            if rewritten_by_rules.contains(&key.attribute) {
+                rule_wins.push(idx);
+                continue;
+            }
             match render(&key.segments, item) {
                 Some(value) => {
                     item.insert(key.attribute.clone(), AttributeValue::S(value));
@@ -566,9 +598,20 @@ impl KeyDeriver {
                 }
             }
         }
+        for idx in rule_wins {
+            if self.warned_rule_wins.insert((plan.entity, idx)) {
+                let key = &self.entities[plan.entity].keys[idx];
+                warnings.push(format!(
+                    "entity '{}': a rule rewrote {} directly, so it was not rebuilt from \
+                     template '{}'",
+                    self.entities[plan.entity].name, key.attribute, key.template
+                ));
+            }
+        }
         if rebuilt_primary {
             self.note_rebuilt_primary_key(item);
         }
+        self.note_at_risk_results(plan, item);
     }
 
     /// Remember a rebuilt primary key so a later item rendering the same one
@@ -607,14 +650,13 @@ impl KeyDeriver {
     pub fn join_breaks(&self) -> Vec<String> {
         self.at_risk
             .iter()
-            .filter(|risk| risk.sharing.len() > 1)
+            .filter(|risk| risk.diverged.len() > 1)
             .map(|risk| {
-                let mut seen: Vec<usize> = risk.sharing.iter().copied().collect();
+                let mut seen: Vec<usize> = risk.diverged.iter().copied().collect();
                 seen.sort();
                 format!(
-                    "{} share a value of '{}', which is not in [consistency] fields, so it \
-                     anonymised differently for each and their keys no longer agree. \
-                     Add '{}' to [consistency] fields",
+                    "{} anonymised a shared value of '{}' differently, so their keys no longer \
+                     agree and they will not join. Add '{}' to [consistency] fields",
                     entity_list(&self.entities, &seen),
                     risk.attribute,
                     risk.attribute
@@ -656,17 +698,31 @@ impl KeyDeriver {
 
         self.entities.iter().position(|e| {
             let mut present = 0;
-            let all_match = e.keys.iter().all(|key| match item.get(&key.attribute) {
-                None => true,
-                Some(AttributeValue::S(s)) => {
-                    present += 1;
-                    render(&key.segments, item).as_deref() == Some(s.as_str())
-                }
-                Some(_) => false,
-            });
+            let all_match = e
+                .match_keys
+                .iter()
+                .all(|key| match item.get(&key.attribute) {
+                    None => true,
+                    Some(AttributeValue::S(s)) => {
+                        present += 1;
+                        render(&key.segments, item).as_deref() == Some(s.as_str())
+                    }
+                    Some(_) => false,
+                });
             all_match && present > 0
         })
     }
+}
+
+/// Hash a scalar attribute value, or `None` for anything a key cannot hold.
+fn scalar_hash(value: &AttributeValue) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match value {
+        AttributeValue::S(s) => s.hash(&mut hasher),
+        AttributeValue::N(n) => n.hash(&mut hasher),
+        _ => return None,
+    }
+    Some(hasher.finish())
 }
 
 /// "entity 'A' and entity 'B'", for a warning.
@@ -690,7 +746,9 @@ fn rule_target(rule: &ValidatedRule) -> Option<&str> {
     }
 }
 
-/// Track `attribute` when a template exists for it and mentions a variable.
+/// Record `attribute`'s template. Constant templates are kept too: they do
+/// not need rebuilding, but they are often the only thing telling two
+/// entities apart when an item carries no type attribute.
 fn push_key(
     keys: &mut Vec<TemplatedKey>,
     entity: &EntityDefinition,
@@ -702,13 +760,11 @@ fn push_key(
     };
     let segments = parse_template(template)
         .map_err(|e| format!("entity '{}', {attribute}: {e}", entity.name))?;
-    if segments.iter().any(|s| matches!(s, Segment::Var { .. })) {
-        keys.push(TemplatedKey {
-            attribute: attribute.to_string(),
-            template: template.to_string(),
-            segments,
-        });
-    }
+    keys.push(TemplatedKey {
+        attribute: attribute.to_string(),
+        template: template.to_string(),
+        segments,
+    });
     Ok(())
 }
 
@@ -824,6 +880,10 @@ mod tests {
     }
 
     fn no_consistency() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn no_rewrites() -> HashSet<String> {
         HashSet::new()
     }
 
@@ -947,12 +1007,12 @@ mod tests {
             ("customerId", "cust1"),
             ("orderNo", "42"),
         ]);
-        let plan = d.plan(&order, &[], &mut item_warnings).unwrap();
+        let plan = d.plan(&order, &mut item_warnings).unwrap();
         assert!(item_warnings.is_empty(), "{item_warnings:?}");
         assert_eq!(plan.keys.len(), 2);
 
         order.insert("orderNo".to_string(), AttributeValue::S("7".to_string()));
-        d.apply(&plan, &mut order, &mut item_warnings);
+        d.apply(&plan, &no_rewrites(), &mut order, &mut item_warnings);
         assert_eq!(order["sk"], AttributeValue::S("order#00007".to_string()));
     }
 
@@ -1002,7 +1062,7 @@ mod tests {
         let mut warnings = Vec::new();
         let mut user = user();
 
-        let plan = d.plan(&user, &[], &mut warnings).unwrap();
+        let plan = d.plan(&user, &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(plan.keys.len(), 3);
 
@@ -1010,7 +1070,7 @@ mod tests {
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        d.apply(&plan, &mut user, &mut warnings);
+        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
 
         assert_eq!(user["pk"], AttributeValue::S("account#acc1".to_string()));
         assert_eq!(
@@ -1039,14 +1099,14 @@ mod tests {
                 ("accountId", "acc1"),
                 ("email", "alice@example.com"),
             ]);
-            let plan = d.plan(&user, &[], &mut warnings).unwrap();
+            let plan = d.plan(&user, &mut warnings).unwrap();
             assert_eq!(plan.keys.len(), 1, "only pk reproduces");
 
             user.insert(
                 "email".to_string(),
                 AttributeValue::S(format!("fake{n}@example.org")),
             );
-            d.apply(&plan, &mut user, &mut warnings);
+            d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
             assert_eq!(user["sk"], AttributeValue::S("legacy-profile".to_string()));
         }
 
@@ -1067,7 +1127,7 @@ mod tests {
         let mut user = user();
         user.remove("gs1pk");
         user.remove("gs1sk");
-        let plan = d.plan(&user, &[], &mut warnings).unwrap();
+        let plan = d.plan(&user, &mut warnings).unwrap();
         assert_eq!(plan.keys.len(), 2);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -1085,14 +1145,14 @@ mod tests {
             ("accountId", "acc1"),
             ("email", "alice@example.com"),
         ]);
-        d.plan(&legacy, &[], &mut warnings).unwrap();
+        d.plan(&legacy, &mut warnings).unwrap();
         assert_eq!(warnings.len(), 1);
 
         // Second item: sk on-template, but the rule nulls email so it cannot render.
         let mut user = user();
-        let plan = d.plan(&user, &[], &mut warnings).unwrap();
+        let plan = d.plan(&user, &mut warnings).unwrap();
         user.insert("email".to_string(), AttributeValue::NULL(true));
-        d.apply(&plan, &mut user, &mut warnings);
+        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
 
         assert_eq!(
             user["sk"],
@@ -1115,15 +1175,15 @@ mod tests {
             ("accountId", "acc1"),
             ("email", "alice@example.com"),
         ]);
-        let plan = d.plan(&user, &[], &mut warnings).unwrap();
+        let plan = d.plan(&user, &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "User");
 
         let account = item(&[("pk", "account#acc1"), ("sk", "account#"), ("id", "acc1")]);
-        let plan = d.plan(&account, &[], &mut warnings).unwrap();
+        let plan = d.plan(&account, &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "Account");
 
         let stranger = item(&[("pk", "thing#1"), ("sk", "meta")]);
-        assert!(d.plan(&stranger, &[], &mut warnings).is_none());
+        assert!(d.plan(&stranger, &mut warnings).is_none());
         assert_eq!(d.take_unmatched(), 1);
         assert_eq!(d.take_unmatched(), 0);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -1152,12 +1212,14 @@ mod tests {
 
         let mut item_warnings = Vec::new();
         let mut user = user();
-        let plan = d.plan(&user, &rules, &mut item_warnings).unwrap();
+        let plan = d.plan(&user, &mut item_warnings).unwrap();
+        // The rules rewrote sk, so the deriver must leave it alone.
         user.insert(
             "sk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
-        d.apply(&plan, &mut user, &mut item_warnings);
+        let rewritten: HashSet<String> = ["sk".to_string()].into_iter().collect();
+        d.apply(&plan, &rewritten, &mut user, &mut item_warnings);
         assert_eq!(user["sk"], AttributeValue::S("[REDACTED]".to_string()));
         assert!(
             item_warnings
@@ -1191,13 +1253,13 @@ mod tests {
         let mut warnings = Vec::new();
         let mut user = user();
         assert!(!user.contains_key("accountName"), "the rule must not match");
-        let plan = d.plan(&user, &rules, &mut warnings).unwrap();
+        let plan = d.plan(&user, &mut warnings).unwrap();
 
         user.insert(
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        d.apply(&plan, &mut user, &mut warnings);
+        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
 
         assert_eq!(
             user["sk"],
@@ -1316,7 +1378,7 @@ mod tests {
                 ("sk", "PROFILE"),
                 ("email", &format!("c{n}@x.co")),
             ]);
-            d.plan(&customer, &email_rule(), &mut warnings).unwrap();
+            d.plan(&customer, &mut warnings).unwrap();
         }
 
         assert!(
@@ -1327,7 +1389,11 @@ mod tests {
     }
 
     #[test]
-    fn both_entities_turning_up_is_a_broken_join() {
+    fn a_constant_key_template_still_tells_two_entities_apart() {
+        // Customer and Order share a partition template and differ only by a
+        // constant sk. With no type attribute to go on, matching that ignored
+        // constant templates would resolve an Order as a Customer and leave
+        // the Order's sk holding whatever it arrived with.
         let (mut d, _) = KeyDeriver::new(
             &shared_key_model(),
             &request(),
@@ -1337,23 +1403,92 @@ mod tests {
         .unwrap();
         let mut warnings = Vec::new();
 
-        let customer = item(&[
-            ("_type", "Customer"),
+        let mut order = item(&[
             ("pk", "CUSTOMER#a@x.co"),
-            ("sk", "PROFILE"),
+            ("sk", "ORDER#ref-a@x.co"),
             ("email", "a@x.co"),
+            ("orderId", "ref-a@x.co"),
         ]);
-        d.plan(&customer, &email_rule(), &mut warnings).unwrap();
+        assert!(
+            !order.contains_key("_type"),
+            "no discriminator to fall back on"
+        );
+
+        let plan = d.plan(&order, &mut warnings).unwrap();
+        assert_eq!(d.entities[plan.entity].name, "Order");
+
+        order.insert("orderId".to_string(), AttributeValue::S("anon".to_string()));
+        d.apply(&plan, &no_rewrites(), &mut order, &mut warnings);
+        assert_eq!(
+            order["sk"],
+            AttributeValue::S("ORDER#anon".to_string()),
+            "the Order's own sk must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn a_key_built_from_another_templated_key_is_refused() {
+        // pk reads sk, and sk is itself templated. Rendering pk first copies
+        // the pre-anonymisation sk, so refuse rather than order by luck.
+        let model = model_with(vec![entity("User", "${sk}", Some("user#${email}"), None)]);
+        let err =
+            KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).unwrap_err();
+        assert!(err.contains("reads key attribute 'sk'"), "{err}");
+        assert!(err.contains("itself built from a template"), "{err}");
+
+        // A key reading a plain attribute is fine.
+        let model = model_with(vec![entity("User", "user#${email}", Some("profile"), None)]);
+        assert!(KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).is_ok());
+    }
+
+    /// Run one item through the pipeline the way the importer does: plan,
+    /// let the rules rewrite `email` to `becomes`, then apply.
+    fn run_item(d: &mut KeyDeriver, mut item: Item, becomes: &str) {
+        let mut warnings = Vec::new();
+        let plan = d.plan(&item, &mut warnings).unwrap();
+        item.insert("email".to_string(), AttributeValue::S(becomes.to_string()));
+        d.apply(&plan, &no_rewrites(), &mut item, &mut warnings);
+    }
+
+    fn shared_key_deriver() -> KeyDeriver {
+        KeyDeriver::new(
+            &shared_key_model(),
+            &request(),
+            &email_rule(),
+            &no_consistency(),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn customer_item(email: &str) -> Item {
+        item(&[
+            ("_type", "Customer"),
+            ("pk", &format!("CUSTOMER#{email}")),
+            ("sk", "PROFILE"),
+            ("email", email),
+        ])
+    }
+
+    fn order_item(email: &str) -> Item {
+        item(&[
+            ("_type", "Order"),
+            ("pk", &format!("CUSTOMER#{email}")),
+            ("sk", "ORDER#1"),
+            ("email", email),
+            ("orderId", "1"),
+        ])
+    }
+
+    #[test]
+    fn two_entities_anonymising_a_shared_value_differently_is_a_broken_join() {
+        let mut d = shared_key_deriver();
+
+        run_item(&mut d, customer_item("a@x.co"), "fake1@example.com");
         assert!(d.join_breaks().is_empty(), "one entity so far");
 
-        let order = item(&[
-            ("_type", "Order"),
-            ("pk", "CUSTOMER#a@x.co"),
-            ("sk", "ORDER#1"),
-            ("email", "a@x.co"),
-            ("orderId", "1"),
-        ]);
-        d.plan(&order, &email_rule(), &mut warnings).unwrap();
+        // Same original address, a different fake: the join is gone.
+        run_item(&mut d, order_item("a@x.co"), "fake2@example.org");
 
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
@@ -1362,34 +1497,25 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_value_anonymised_the_same_way_still_joins() {
+        // What a deterministic action such as hash does, or the consistency
+        // map, or a rule that matched neither item: same in, same out.
+        let mut d = shared_key_deriver();
+        run_item(&mut d, customer_item("a@x.co"), "same@example.com");
+        run_item(&mut d, order_item("a@x.co"), "same@example.com");
+        assert!(
+            d.join_breaks().is_empty(),
+            "both agreed, so the join survives: {:?}",
+            d.join_breaks()
+        );
+    }
+
+    #[test]
     fn both_entities_with_no_value_in_common_is_not_a_broken_join() {
-        let (mut d, _) = KeyDeriver::new(
-            &shared_key_model(),
-            &request(),
-            &email_rule(),
-            &no_consistency(),
-        )
-        .unwrap();
-        let mut warnings = Vec::new();
-
-        let customer = item(&[
-            ("_type", "Customer"),
-            ("pk", "CUSTOMER#a@x.co"),
-            ("sk", "PROFILE"),
-            ("email", "a@x.co"),
-        ]);
-        d.plan(&customer, &email_rule(), &mut warnings).unwrap();
-
+        let mut d = shared_key_deriver();
+        run_item(&mut d, customer_item("a@x.co"), "fake1@example.com");
         // A different address, so these two never joined.
-        let order = item(&[
-            ("_type", "Order"),
-            ("pk", "CUSTOMER#b@y.co"),
-            ("sk", "ORDER#1"),
-            ("email", "b@y.co"),
-            ("orderId", "1"),
-        ]);
-        d.plan(&order, &email_rule(), &mut warnings).unwrap();
-
+        run_item(&mut d, order_item("b@y.co"), "fake2@example.org");
         assert!(
             d.join_breaks().is_empty(),
             "both entities present but no shared value: {:?}",
@@ -1409,12 +1535,12 @@ mod tests {
                 ("accountId", "acc1"),
                 ("email", &format!("u{n}@example.com")),
             ]);
-            let plan = d.plan(&user, &[], &mut warnings).unwrap();
+            let plan = d.plan(&user, &mut warnings).unwrap();
             user.insert(
                 "email".to_string(),
                 AttributeValue::S("[REDACTED]".to_string()),
             );
-            d.apply(&plan, &mut user, &mut warnings);
+            d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
             assert_eq!(user["sk"], AttributeValue::S("user#[REDACTED]".to_string()));
         }
         assert_eq!(d.take_collisions(), (2, false));

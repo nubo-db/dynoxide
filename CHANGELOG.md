@@ -22,9 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the value the item arrived with; anything else is left alone and reported
   once per entity and key, without quoting the value, since removing those
   values is the point of the run. A rule that names a key attribute directly
-  wins over its template on the items it matches, decided per item rather than
-  per entity so that a rule matching one entity cannot leave another entity's
-  key unrebuilt, and is reported. A rule that replaces an attribute a
+  wins over its template on the items it actually rewrote, taken from what the
+  rules did rather than from what their conditions predicted, and is reported. A rule that replaces an attribute a
   key is built from with a constant (`redact`, `null`, `mask`) is reported
   before any data is read, because every item of that entity would then render
   the same key and overwrite the last; collisions are counted if the import
@@ -43,10 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fake, so nothing in the output says anything is wrong: the only symptom is
   that a query for a customer's orders returns nothing. The model and the
   rules together are enough to warn up front, but the failure waits until two
-  entities are actually seen carrying the same value, so pulling one entity's
-  slice still works, and so does importing two entities that share nothing.
-  Neither has a join to lose, and a check that fires on legitimate use earns a
-  bypass flag. Nothing is persisted on the error path. Matching on the key and
+  entities are seen to anonymise the same value differently. Pulling one
+  entity's slice still works, so does importing two entities that share
+  nothing, and so does a deterministic action such as `hash`, which keeps both
+  entities agreeing without any `[consistency]` entry. None of those has a
+  join to lose, and a check that fires on legitimate use earns a bypass flag. Nothing is persisted on the error path. Matching on the key and
   its template rather than the attribute name keeps it off entities that
   merely reuse a name, and an attribute no rule rewrites is not at risk
   ([#202](https://github.com/nubo-db/dynoxide/issues/202)).

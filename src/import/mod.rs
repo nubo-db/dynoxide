@@ -312,16 +312,17 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     let mut warnings = Vec::new();
                     let plan = key_deriver
                         .as_mut()
-                        .and_then(|d| d.plan(&item, &rules, &mut warnings));
-                    warnings.extend(anonymise::apply_rules(
+                        .and_then(|d| d.plan(&item, &mut warnings));
+                    let (rule_warnings, rewritten) = anonymise::apply_rules(
                         &mut item,
                         &rules,
                         &mut consistency_map,
                         &consistency_fields,
                         &key_attrs,
-                    ));
+                    );
+                    warnings.extend(rule_warnings);
                     if let (Some(deriver), Some(plan)) = (key_deriver.as_mut(), plan) {
-                        deriver.apply(&plan, &mut item, &mut warnings);
+                        deriver.apply(&plan, &rewritten, &mut item, &mut warnings);
                     }
                     for w in warnings {
                         if !seen_warnings.contains(&w) {

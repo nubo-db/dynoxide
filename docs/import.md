@@ -158,7 +158,13 @@ Templates follow OneTable's own forms: `${name}`, a dotted path that reaches
 into a map (`${address.city}`), and `${name:length:pad}` sort padding, which
 prefixes the value with `pad` (default `0`) until it is `length` characters.
 An unclosed `${` fails the import rather than leaving a key silently
-unrebuilt.
+unrebuilt, and so does a key built from another templated key, which could
+only be rendered correctly in dependency order.
+
+An item carrying the type attribute is matched by it. One that does not is
+matched on the shape of its keys, constant templates included, since a
+constant `sk` is often the only thing separating two entities that share a
+partition template.
 
 A key is only rewritten when its template reproduces the value the item
 arrived with. A key the template cannot reproduce, or that names an attribute
@@ -181,18 +187,20 @@ both and list `email`, and the order stays in its customer's partition.
 The importer enforces the second half. When two entities build the same key
 from the same template, an anonymised attribute that template reads has to be
 consistency-tracked, or their keys cannot agree. That is a warning when the
-model says it could happen, and an error once two entities are actually seen
-carrying the same value for it:
+model says it could happen, and an error once two entities are seen to
+anonymise the same value differently:
 
 ```
-entity 'Customer' and entity 'Order' share a value of 'email', which is not in
-[consistency] fields, so it anonymised differently for each and their keys no
-longer agree. Add 'email' to [consistency] fields
+entity 'Customer' and entity 'Order' anonymised a shared value of 'email'
+differently, so their keys no longer agree and they will not join.
+Add 'email' to [consistency] fields
 ```
 
-It fails on the data rather than on the model, so importing one entity's slice
-still works, and so does importing two entities that share no value, since
-neither has a join to lose. Nothing is written on the error path, so a failed
+It fails on what the anonymisation actually produced, rather than on the model
+or on a shared input. Importing one entity's slice still works, so does
+importing two entities that share no value, and so does a deterministic action
+such as `hash`, which gives both entities the same result and keeps them
+joined without any `[consistency]` entry at all. Nothing is written on the error path, so a failed
 import leaves no database rather than a broken one. Matching on the key and
 its template, rather than on the attribute name, keeps this off entities that
 merely reuse a name: `account#${id}` and `project#${id}` are different
@@ -205,12 +213,12 @@ that entity would render an identical key and overwrite the previous one,
 leaving a database with fewer rows than the export. The importer says so
 before it reads any data, and counts the collisions if you go ahead anyway.
 
-**A rule that names a key attribute directly wins, on the items it matches.**
+**A rule that names a key attribute directly wins on the items it rewrote.**
 That key is not rebuilt from its template and the rule's value is stored
-instead. It is decided per item, not per entity, because a rule's condition
-may not match every entity that builds the key: a rule on `sk` that only
-matches an `Account` must not stop a `User` rebuilding its own `sk`, or the
-real value survives in the key while the attribute beside it is anonymised.
+instead. It is decided from what the rules actually did to each item, not
+from which rules looked like they would match, because each rule's condition
+sees the item as the rules before it left it. Deciding otherwise would leave
+a key unrebuilt on items the rule never touched, real value intact.
 
 When `--mcp` is set, `--data-model` also serves as the MCP data model unless
 `--mcp-data-model` is given.

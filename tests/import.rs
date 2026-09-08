@@ -1651,4 +1651,71 @@ action = { type = "fake", generator = "safe_email" }
             summary.warnings
         );
     }
+
+    #[test]
+    fn test_an_item_without_a_type_attribute_resolves_to_its_own_entity() {
+        // Customer and Order share a partition template and differ only by a
+        // constant sk. With no discriminator, resolving the Order as a
+        // Customer would leave its sort key holding the original value.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        let model_file = tmp.path().join("model.json");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"pk": {"S": "CUSTOMER#a@real.co.uk"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
+                r#"{"Item": {"pk": {"S": "CUSTOMER#a@real.co.uk"}, "sk": {"S": "ORDER#ref-a@real.co.uk"}, "email": {"S": "a@real.co.uk"}, "orderId": {"S": "ref-a@real.co.uk"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        shared_key_model(&model_file);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+
+[[rules]]
+match = "attribute_exists(orderId)"
+path = "orderId"
+action = { type = "fake", generator = "word" }
+
+[consistency]
+fields = ["email"]
+"#,
+        )
+        .unwrap();
+
+        import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(model_file),
+        })
+        .unwrap();
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        for item in scan_all(&db, "App") {
+            for value in item.values() {
+                if let dynoxide::AttributeValue::S(s) = value {
+                    assert!(
+                        !s.contains("a@real.co.uk"),
+                        "the original address survived in {s}"
+                    );
+                }
+            }
+        }
+    }
 }

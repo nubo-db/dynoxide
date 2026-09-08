@@ -166,6 +166,10 @@ matched on the shape of its keys, constant templates included, since a
 constant `sk` is often the only thing separating two entities that share a
 partition template.
 
+An index counts when the entity templates either of its keys, so a GSI that
+hashes on a plain attribute such as a tenant id and sorts on
+`user#${email}` still gets its sort key rebuilt.
+
 A key is only rewritten when its template reproduces the value the item
 arrived with. A key the template cannot reproduce, or that names an attribute
 the item does not carry, is left as it is and reported once per entity and

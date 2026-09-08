@@ -143,14 +143,20 @@ struct TemplatedKey {
 }
 
 impl TemplatedKey {
+    /// The attribute paths the template reads, in full, so a nested
+    /// `${contact.email}` is followed rather than collapsed to `contact`.
+    fn source_paths(&self) -> impl Iterator<Item = &Vec<PathElement>> {
+        self.segments.iter().filter_map(|s| match s {
+            Segment::Var { path, .. } => Some(path),
+            Segment::Literal(_) => None,
+        })
+    }
+
     /// Top-level attribute names the template reads.
     fn sources(&self) -> impl Iterator<Item = &str> {
-        self.segments.iter().filter_map(|s| match s {
-            Segment::Var { path, .. } => match path.first() {
-                Some(PathElement::Attribute(name)) => Some(name.as_str()),
-                _ => None,
-            },
-            Segment::Literal(_) => None,
+        self.source_paths().filter_map(|path| match path.first() {
+            Some(PathElement::Attribute(name)) => Some(name.as_str()),
+            _ => None,
         })
     }
 }
@@ -174,7 +180,10 @@ struct EntityKeys {
 /// entities' keys disagree and the join between them is lost.
 #[derive(Debug)]
 struct AtRisk {
-    attribute: String,
+    /// The attribute path the shared templates read.
+    source: Vec<PathElement>,
+    /// That path written out, for the message.
+    source_name: String,
     /// Entity indices that build a key from it, in model order.
     entities: Vec<usize>,
     /// Original value hash -> (entity that carried it, what it anonymised
@@ -260,8 +269,8 @@ impl KeyDeriver {
         let mut warnings = Vec::new();
 
         let mut entities = Vec::with_capacity(model.entities.len());
-        let mut entity_key_shapes: Vec<Vec<(String, String, Vec<String>)>> =
-            Vec::with_capacity(model.entities.len());
+        type KeyShape = (String, String, Vec<Vec<PathElement>>);
+        let mut entity_key_shapes: Vec<Vec<KeyShape>> = Vec::with_capacity(model.entities.len());
         for entity in &model.entities {
             let mut match_keys = Vec::new();
             push_key(&mut match_keys, entity, hash, Some(&entity.pk_template))?;
@@ -327,7 +336,7 @@ impl KeyDeriver {
                         (
                             key.attribute.clone(),
                             key.template.clone(),
-                            key.sources().map(String::from).collect(),
+                            key.source_paths().cloned().collect(),
                         )
                     })
                     .collect(),
@@ -385,38 +394,44 @@ impl KeyDeriver {
         // attribute name alone is what keeps this off entities that merely
         // reuse a name: `account#${id}` and `project#${id}` are different
         // entities' own ids, and never had a join to lose.
-        let mut shared: Vec<(String, Vec<usize>)> = Vec::new();
+        // Grouped by the key and its template as well as the source, so two
+        // unrelated pairs that happen to read an attribute of the same name
+        // stay separate: A and B sharing `account#${id}` have nothing to do
+        // with C and D sharing `project#${id}`.
+        type RiskKey = (String, String, Vec<PathElement>);
+        let mut shared: Vec<(RiskKey, Vec<usize>)> = Vec::new();
         for (idx, shape) in entity_key_shapes.iter().enumerate() {
             for (attribute, template, sources) in shape {
-                let also_built_by: Vec<usize> = entity_key_shapes
-                    .iter()
-                    .enumerate()
-                    .filter(|(other, other_shape)| {
-                        *other != idx
-                            && other_shape
-                                .iter()
-                                .any(|(a, t, _)| a == attribute && t == template)
-                    })
-                    .map(|(other, _)| other)
-                    .collect();
-                if also_built_by.is_empty() {
+                let shared_with_another =
+                    entity_key_shapes
+                        .iter()
+                        .enumerate()
+                        .any(|(other, other_shape)| {
+                            other != idx
+                                && other_shape
+                                    .iter()
+                                    .any(|(a, t, _)| a == attribute && t == template)
+                        });
+                if !shared_with_another {
                     continue;
                 }
                 for source in sources {
+                    let Some(PathElement::Attribute(root)) = source.first() else {
+                        continue;
+                    };
                     // An attribute no rule rewrites keeps its value, so the
                     // two keys still agree however they were built.
-                    if consistency_fields.contains(source)
-                        || !rule_targets.contains(source.as_str())
-                    {
+                    if consistency_fields.contains(root) || !rule_targets.contains(root.as_str()) {
                         continue;
                     }
-                    match shared.iter_mut().find(|(name, _)| name == source) {
+                    let risk_key = (attribute.clone(), template.clone(), source.clone());
+                    match shared.iter_mut().find(|(k, _)| *k == risk_key) {
                         Some((_, users)) => {
                             if !users.contains(&idx) {
                                 users.push(idx);
                             }
                         }
-                        None => shared.push((source.clone(), vec![idx])),
+                        None => shared.push((risk_key, vec![idx])),
                     }
                 }
             }
@@ -425,20 +440,26 @@ impl KeyDeriver {
             users.sort();
         }
         shared.retain(|(_, users)| users.len() > 1);
-        shared.sort_by(|a, b| a.0.cmp(&b.0));
+        // Deterministic order for the warnings: key attribute, then
+        // template, then the source path written out.
+        shared.sort_by(|a, b| {
+            (&a.0.0, &a.0.1, path_display(&a.0.2)).cmp(&(&b.0.0, &b.0.1, path_display(&b.0.2)))
+        });
 
         let at_risk: Vec<AtRisk> = shared
             .into_iter()
-            .map(|(attribute, entities_using)| {
+            .map(|((_, _, source), entities_using)| {
+                let source_name = path_display(&source);
                 warnings.push(format!(
                     "{} both build keys from '{}', which is not in [consistency] fields: \
                      if they both appear in this import their keys will not agree and \
                      the entities will not join",
                     entity_list(&entities, &entities_using),
-                    attribute
+                    source_name
                 ));
                 AtRisk {
-                    attribute,
+                    source,
+                    source_name,
                     entities: entities_using,
                     seen_values: std::collections::HashMap::new(),
                     diverged: HashSet::new(),
@@ -521,7 +542,7 @@ impl KeyDeriver {
             .iter()
             .enumerate()
             .filter(|(_, risk)| risk.entities.contains(&entity_idx) && !risk.capped)
-            .filter_map(|(idx, risk)| Some((idx, scalar_hash(item.get(&risk.attribute)?)?)))
+            .filter_map(|(idx, risk)| Some((idx, scalar_hash(&resolve_path(item, &risk.source)?)?)))
             .collect()
     }
 
@@ -535,7 +556,10 @@ impl KeyDeriver {
             if risk.capped {
                 continue;
             }
-            let Some(now) = item.get(&risk.attribute).and_then(scalar_hash) else {
+            let Some(now) = resolve_path(item, &risk.source)
+                .as_ref()
+                .and_then(scalar_hash)
+            else {
                 continue;
             };
             match risk.seen_values.get(original) {
@@ -629,10 +653,24 @@ impl KeyDeriver {
             .into_iter()
             .flatten()
         {
-            if let Some(AttributeValue::S(s)) = item.get(attribute) {
-                s.hash(&mut hasher);
+            // Type tag as well as value: a numeric key is as much part of the
+            // identity as a string one, and leaving it out reports two
+            // distinct rows as an overwrite.
+            match item.get(attribute) {
+                Some(AttributeValue::S(s)) => {
+                    1u8.hash(&mut hasher);
+                    s.hash(&mut hasher);
+                }
+                Some(AttributeValue::N(n)) => {
+                    2u8.hash(&mut hasher);
+                    n.hash(&mut hasher);
+                }
+                Some(AttributeValue::B(b)) => {
+                    3u8.hash(&mut hasher);
+                    b.hash(&mut hasher);
+                }
+                _ => 0u8.hash(&mut hasher),
             }
-            0u8.hash(&mut hasher);
         }
         if !self.rebuilt_keys.insert(hasher.finish()) {
             self.collisions += 1;
@@ -658,8 +696,8 @@ impl KeyDeriver {
                     "{} anonymised a shared value of '{}' differently, so their keys no longer \
                      agree and they will not join. Add '{}' to [consistency] fields",
                     entity_list(&self.entities, &seen),
-                    risk.attribute,
-                    risk.attribute
+                    risk.source_name,
+                    risk.source_name
                 )
             })
             .collect()
@@ -714,6 +752,23 @@ impl KeyDeriver {
     }
 }
 
+/// A document path written back out, for a message.
+fn path_display(path: &[PathElement]) -> String {
+    let mut out = String::new();
+    for element in path {
+        match element {
+            PathElement::Attribute(name) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(name);
+            }
+            PathElement::Index(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
+    out
+}
+
 /// Hash a scalar attribute value, or `None` for anything a key cannot hold.
 fn scalar_hash(value: &AttributeValue) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -758,6 +813,11 @@ fn push_key(
     let (Some(attribute), Some(template)) = (attribute, template) else {
         return Ok(());
     };
+    if template.is_empty() {
+        // No template at all (a plain attribute key). Nothing to rebuild, and
+        // nothing that could tell one entity from another.
+        return Ok(());
+    }
     let segments = parse_template(template)
         .map_err(|e| format!("entity '{}', {attribute}: {e}", entity.name))?;
     keys.push(TemplatedKey {
@@ -1439,6 +1499,161 @@ mod tests {
         // A key reading a plain attribute is fine.
         let model = model_with(vec![entity("User", "user#${email}", Some("profile"), None)]);
         assert!(KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).is_ok());
+    }
+
+    #[test]
+    fn a_gsi_sort_key_is_rebuilt_when_its_hash_key_is_a_plain_attribute() {
+        // GSI1 hashes on a plain tenantId and sorts on user#${email}. The
+        // sort key still has to be rebuilt, or the address survives in it.
+        let model = model_with(vec![EntityDefinition {
+            name: "User".to_string(),
+            pk_template: "user#${id}".to_string(),
+            sk_template: Some("user#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![GsiMapping {
+                index_name: "GSI1".to_string(),
+                pk_template: String::new(),
+                sk_template: Some("user#${email}".to_string()),
+            }],
+            description: None,
+        }]);
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &[], &no_consistency()).unwrap();
+        assert!(
+            tracked(&d, 0).contains(&"gs1sk"),
+            "the GSI sort key must be tracked: {:?}",
+            tracked(&d, 0)
+        );
+
+        let mut warnings = Vec::new();
+        let mut user = item(&[
+            ("pk", "user#u1"),
+            ("sk", "user#"),
+            ("gs1sk", "user#alice@real.co.uk"),
+            ("id", "u1"),
+            ("email", "alice@real.co.uk"),
+        ]);
+        let plan = d.plan(&user, &mut warnings).unwrap();
+        user.insert(
+            "email".to_string(),
+            AttributeValue::S("fake@example.org".to_string()),
+        );
+        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        assert_eq!(
+            user["gs1sk"],
+            AttributeValue::S("user#fake@example.org".to_string())
+        );
+    }
+
+    #[test]
+    fn unrelated_pairs_reading_the_same_attribute_name_are_separate_risks() {
+        // Account/Team share account#${id}; Project/Task share project#${id}.
+        // Same source name, two unrelated groups, so importing one from each
+        // must not read as a broken join between them.
+        let model = model_with(vec![
+            entity("Account", "account#${id}", Some("account#"), None),
+            entity("Project", "project#${id}", Some("project#"), None),
+            entity("Team", "account#${id}", Some("team#"), None),
+            entity("Task", "project#${id}", Some("task#"), None),
+        ]);
+        let rules = [rule(
+            "id",
+            ValidatedAction::Fake {
+                generator: "word".into(),
+            },
+        )];
+        let (mut d, warnings) =
+            KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+        assert_eq!(warnings.len(), 2, "one per group: {warnings:?}");
+
+        // One entity from each group, sharing an original id.
+        let mut run = |name: &str, pk: &str, sk: &str, becomes: &str| {
+            let mut it = item(&[("_type", name), ("pk", pk), ("sk", sk), ("id", "shared")]);
+            let mut w = Vec::new();
+            let plan = d.plan(&it, &mut w).unwrap();
+            it.insert("id".to_string(), AttributeValue::S(becomes.to_string()));
+            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        };
+        run("Account", "account#shared", "account#", "anon1");
+        run("Project", "project#shared", "project#", "anon2");
+
+        assert!(
+            d.join_breaks().is_empty(),
+            "different groups never joined: {:?}",
+            d.join_breaks()
+        );
+    }
+
+    #[test]
+    fn a_nested_template_source_is_tracked_for_join_breaks() {
+        let model = model_with(vec![
+            entity(
+                "Customer",
+                "CUSTOMER#${contact.email}",
+                Some("PROFILE"),
+                None,
+            ),
+            entity(
+                "Order",
+                "CUSTOMER#${contact.email}",
+                Some("ORDER#${id}"),
+                None,
+            ),
+        ]);
+        let rules = [rule(
+            "contact",
+            ValidatedAction::Fake {
+                generator: "safe_email".into(),
+            },
+        )];
+        let (mut d, warnings) =
+            KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("'contact.email'")),
+            "the nested path should be named: {warnings:?}"
+        );
+
+        let contact = |email: &str| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("email".to_string(), AttributeValue::S(email.to_string()));
+            AttributeValue::M(map)
+        };
+        let mut run = |name: &str, sk: &str, becomes: &str| {
+            let mut it = item(&[("_type", name), ("pk", "CUSTOMER#a@x.co"), ("sk", sk)]);
+            it.insert("contact".to_string(), contact("a@x.co"));
+            let mut w = Vec::new();
+            let plan = d.plan(&it, &mut w).unwrap();
+            it.insert("contact".to_string(), contact(becomes));
+            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        };
+        run("Customer", "PROFILE", "fake1@example.com");
+        run("Order", "ORDER#1", "fake2@example.org");
+
+        let breaks = d.join_breaks();
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+        assert!(breaks[0].contains("'contact.email'"), "{breaks:?}");
+    }
+
+    #[test]
+    fn a_numeric_partition_key_is_part_of_the_collision_fingerprint() {
+        let model = model_with(vec![entity("Row", "${n}", Some("user#${email}"), None)]);
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &[], &no_consistency()).unwrap();
+        let mut warnings = Vec::new();
+
+        // Two rows differing only by a numeric pk: distinct, not a collision.
+        for n in ["1", "2"] {
+            let mut it = Item::new();
+            it.insert("_type".to_string(), AttributeValue::S("Row".to_string()));
+            it.insert("pk".to_string(), AttributeValue::N(n.to_string()));
+            it.insert("n".to_string(), AttributeValue::N(n.to_string()));
+            it.insert(
+                "sk".to_string(),
+                AttributeValue::S("user#a@x.co".to_string()),
+            );
+            it.insert("email".to_string(), AttributeValue::S("a@x.co".to_string()));
+            let plan = d.plan(&it, &mut warnings).unwrap();
+            d.apply(&plan, &no_rewrites(), &mut it, &mut warnings);
+        }
+        assert_eq!(d.take_collisions(), (0, false));
     }
 
     /// Run one item through the pipeline the way the importer does: plan,

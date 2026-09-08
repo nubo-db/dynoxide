@@ -48,11 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entities agreeing without any `[consistency]` entry. None of those has a
   join to lose, and a check that fires on legitimate use earns a bypass flag. Nothing is persisted on the error path. Matching on the key and
   its template rather than the attribute name keeps it off entities that
-  merely reuse a name, and an attribute no rule rewrites is not at risk
+  merely reuse a name, and an attribute no rule rewrites is not at risk.
+  Templates are grouped by the key they build as well as the attribute they
+  read, so two unrelated pairs that happen to read an attribute of the same
+  name stay separate, and a nested source such as `${contact.email}` is
+  followed rather than collapsed to `contact`
   ([#202](https://github.com/nubo-db/dynoxide/issues/202)).
 
 ### Fixed
 
+- A OneTable index whose hash key is a plain attribute no longer loses its
+  sort key template. The parser required a template on the hash attribute and
+  dropped the whole index without one, so a GSI hashing on something like a
+  tenant id and sorting on `user#${email}` disappeared from the model. That
+  reached the MCP data model, and on import it meant the sort key was never
+  rebuilt and kept the value it arrived with. An index the entity templates
+  neither key of is still skipped.
 - A OneTable schema whose primary key is not literally `pk` / `sk` now parses
   its primary key templates. The parser read the model attributes named `pk`
   and `sk` rather than the ones `indexes.primary` names, so a schema keyed on

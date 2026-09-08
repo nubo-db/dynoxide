@@ -211,11 +211,16 @@ fn resolve_gsi_mappings(
     let mut mappings: Vec<GsiMapping> = indexes
         .values()
         .filter_map(|idx_def| {
-            // Check if this model has the hash key attribute with a value template
+            // A model participates in an index when it templates either key.
+            // A hash key that is a plain attribute (a tenant id, say) with a
+            // templated sort key is an ordinary shape, and dropping the whole
+            // index for it would hide the sort key from anything that reads
+            // the model, import included. Its pk_template is then empty.
             let pk_template = attrs
                 .get(&idx_def.hash_attr)
                 .and_then(|v| v.get("value"))
-                .and_then(|v| v.as_str())?;
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             // Check for sort key template (optional)
             let sk_template = idx_def.sort_attr.as_ref().and_then(|sort_attr| {
@@ -225,6 +230,10 @@ fn resolve_gsi_mappings(
                     .and_then(|v| v.as_str())
                     .map(String::from)
             });
+
+            if pk_template.is_empty() && sk_template.is_none() {
+                return None;
+            }
 
             Some(GsiMapping {
                 index_name: idx_def.dynamo_name.clone(),
@@ -242,6 +251,56 @@ fn resolve_gsi_mappings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_index_with_a_plain_hash_key_keeps_its_sort_template() {
+        let model = parse_onetable(
+            r#"{
+                "format": "onetable:1.1.0",
+                "indexes": {
+                    "primary": { "hash": "pk", "sort": "sk" },
+                    "gs1": { "hash": "tenantId", "sort": "gs1sk", "name": "GSI1" }
+                },
+                "models": {
+                    "User": {
+                        "pk": { "type": "string", "value": "user#${id}" },
+                        "sk": { "type": "string", "value": "user#" },
+                        "tenantId": { "type": "string" },
+                        "gs1sk": { "type": "string", "value": "user#${email}" },
+                        "id": { "type": "string" },
+                        "email": { "type": "string" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let gsi = &model.entities[0].gsi_mappings[0];
+        assert_eq!(gsi.index_name, "GSI1");
+        assert_eq!(gsi.pk_template, "", "the hash key is a plain attribute");
+        assert_eq!(gsi.sk_template.as_deref(), Some("user#${email}"));
+    }
+
+    #[test]
+    fn an_index_the_model_does_not_template_at_all_is_skipped() {
+        let model = parse_onetable(
+            r#"{
+                "format": "onetable:1.1.0",
+                "indexes": {
+                    "primary": { "hash": "pk", "sort": "sk" },
+                    "gs1": { "hash": "gs1pk", "sort": "gs1sk", "name": "GSI1" }
+                },
+                "models": {
+                    "User": {
+                        "pk": { "type": "string", "value": "user#${id}" },
+                        "sk": { "type": "string", "value": "user#" },
+                        "id": { "type": "string" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(model.entities[0].gsi_mappings.is_empty());
+    }
 
     #[test]
     fn primary_key_templates_follow_indexes_primary() {

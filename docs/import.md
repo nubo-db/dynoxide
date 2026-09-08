@@ -178,6 +178,27 @@ The same name in both places with no `[consistency]` entry fails the same
 way, since each item is then anonymised independently. Name it `email` on
 both and list `email`, and the order stays in its customer's partition.
 
+The importer enforces the second half. When two entities build the same key
+from the same template, an anonymised attribute that template reads has to be
+consistency-tracked, or their keys cannot agree. That is a warning when the
+model says it could happen and an error once items of both entities have
+actually been imported:
+
+```
+entity 'Customer' and entity 'Order' were both imported and both build keys
+from 'email', which is not in [consistency] fields, so the same value
+anonymised differently for each and they no longer join.
+Add 'email' to [consistency] fields
+```
+
+It fails on the data rather than on the model so that importing one entity's
+slice still works, since there is no join to lose there. Nothing is written on
+the error path, so a failed import leaves no database rather than a broken
+one. Matching on the key and its template, rather than on the attribute name,
+keeps this off entities that merely reuse a name: `account#${id}` and
+`project#${id}` are different entities' own ids and never had a join. An
+attribute no rule rewrites is left alone too, since its keys still agree.
+
 **Use `fake` or `hash` for an attribute a key is built from.** `redact`,
 `null` and `mask` produce the same output for every input, so every item of
 that entity would render an identical key and overwrite the previous one,

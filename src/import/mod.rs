@@ -264,9 +264,13 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         let key_attrs = extract_key_attrs(&table_schema.create_request);
         let mut key_deriver = match data_model.as_ref() {
             Some(model) => {
-                let (deriver, warnings) =
-                    keys::KeyDeriver::new(model, &table_schema.create_request, &rules)
-                        .map_err(|e| ImportError::Config(format!("data model: {e}")))?;
+                let (deriver, warnings) = keys::KeyDeriver::new(
+                    model,
+                    &table_schema.create_request,
+                    &rules,
+                    &consistency_fields,
+                )
+                .map_err(|e| ImportError::Config(format!("data model: {e}")))?;
                 for w in warnings {
                     summary.warnings.push(format!("table '{table_name}': {w}"));
                 }
@@ -384,6 +388,24 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     table_name, unmatched
                 ));
             }
+            // Both entities of a shared key attribute turned up, so the join
+            // between them is broken in the output rather than merely at risk.
+            // Nothing is persisted on the error path, so failing here costs
+            // the run's time, not a half-anonymised database.
+            let join_breaks = deriver.join_breaks();
+            if let Some(first) = join_breaks.first() {
+                return Err(ImportError::Config(format!(
+                    "table '{}': {}{}",
+                    table_name,
+                    first,
+                    if join_breaks.len() > 1 {
+                        format!(" (and {} more)", join_breaks.len() - 1)
+                    } else {
+                        String::new()
+                    }
+                )));
+            }
+
             let (collisions, capped) = deriver.take_collisions();
             if collisions > 0 {
                 summary.warnings.push(format!(

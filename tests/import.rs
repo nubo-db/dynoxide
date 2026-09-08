@@ -1436,4 +1436,125 @@ action = { type = "redact" }
         let user = &scan_all(&db, "App")[0];
         assert_eq!(string_attr(user, "sk"), "[REDACTED]");
     }
+
+    /// A OneTable model where Customer and Order both key on `email`, which
+    /// is what a single-table design does to keep them in one partition.
+    fn shared_key_model(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            r#"{
+                "format": "onetable:1.1.0",
+                "indexes": { "primary": { "hash": "pk", "sort": "sk" } },
+                "params": { "typeField": "_type" },
+                "models": {
+                    "Customer": {
+                        "pk": { "type": "string", "value": "CUSTOMER#${email}" },
+                        "sk": { "type": "string", "value": "PROFILE" },
+                        "email": { "type": "string" }
+                    },
+                    "Order": {
+                        "pk": { "type": "string", "value": "CUSTOMER#${email}" },
+                        "sk": { "type": "string", "value": "ORDER#${orderId}" },
+                        "email": { "type": "string" },
+                        "orderId": { "type": "string" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+    }
+
+    const CUSTOMER_ITEM: &str = r#"{"Item": {"_type": {"S": "Customer"}, "pk": {"S": "CUSTOMER#a@x.co"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@x.co"}}}"#;
+    const ORDER_ITEM: &str = r#"{"Item": {"_type": {"S": "Order"}, "pk": {"S": "CUSTOMER#a@x.co"}, "sk": {"S": "ORDER#1"}, "email": {"S": "a@x.co"}, "orderId": {"S": "1"}}}"#;
+
+    const FAKE_EMAIL_RULE: &str = r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+"#;
+
+    fn shared_key_import(
+        tmp: &std::path::Path,
+        items: &[&str],
+        rules_toml: &str,
+    ) -> Result<import::ImportSummary, import::ImportError> {
+        let source = tmp.join("export");
+        let schema_file = tmp.join("schema.json");
+        let rules_file = tmp.join("rules.toml");
+        let model_file = tmp.join("model.json");
+
+        setup_export_dir(&source, "App", items);
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(&rules_file, rules_toml).unwrap();
+        shared_key_model(&model_file);
+
+        import::run(ImportCommand {
+            source,
+            output: Some(tmp.join("output.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(model_file),
+        })
+    }
+
+    #[test]
+    fn test_shared_key_attribute_without_consistency_fails_once_both_entities_appear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = shared_key_import(tmp.path(), &[CUSTOMER_ITEM, ORDER_ITEM], FAKE_EMAIL_RULE)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entity 'Customer' and entity 'Order'"),
+            "{msg}"
+        );
+        assert!(msg.contains("Add 'email' to [consistency] fields"), "{msg}");
+
+        // Nothing is persisted on the error path.
+        assert!(
+            !tmp.path().join("output.db").exists(),
+            "a failed import must not leave a half-anonymised database"
+        );
+    }
+
+    #[test]
+    fn test_one_entity_alone_imports_without_a_consistency_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let summary = shared_key_import(tmp.path(), &[CUSTOMER_ITEM], FAKE_EMAIL_RULE)
+            .expect("a slice holding one entity has no join to lose");
+        assert_eq!(summary.total_items, 1);
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("will not join")),
+            "the risk is still worth stating up front: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn test_listing_the_shared_attribute_in_consistency_imports_both_entities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = format!(
+            "{FAKE_EMAIL_RULE}\n[consistency]\nfields = [{}]\n",
+            "\"email\""
+        );
+        let summary = shared_key_import(tmp.path(), &[CUSTOMER_ITEM, ORDER_ITEM], &rules).unwrap();
+        assert_eq!(summary.total_items, 2);
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("will not join")),
+            "{:?}",
+            summary.warnings
+        );
+
+        // The order is still in its customer's partition.
+        let db = dynoxide::Database::new(tmp.path().join("output.db").to_str().unwrap()).unwrap();
+        let items = scan_all(&db, "App");
+        let pks: std::collections::HashSet<String> =
+            items.iter().map(|i| string_attr(i, "pk")).collect();
+        assert_eq!(pks.len(), 1, "customer and order should share a partition");
+        assert!(!pks.iter().next().unwrap().contains("a@x.co"));
+    }
 }

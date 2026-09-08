@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys built from attributes keep their original values. `ImportCommand` gains
   a `data_model` field for library callers
   ([#201](https://github.com/nubo-db/dynoxide/issues/201)).
+- An import that would silently break the join between two entities now fails.
+  When two entities build the same key from the same template, an anonymised
+  attribute that template reads has to be in `[consistency] fields` or each
+  entity anonymises it independently and their keys stop agreeing. Every count
+  stays correct, every key stays well formed and every value is genuinely
+  fake, so nothing in the output says anything is wrong: the only symptom is
+  that a query for a customer's orders returns nothing. The model and the
+  rules together are enough to warn up front, but the failure waits until
+  items of both entities have actually been imported, so pulling one entity's
+  slice still works and the check does not earn a bypass flag. Nothing is
+  persisted on the error path. Matching on the key and its template rather
+  than the attribute name keeps it off entities that merely reuse a name, and
+  an attribute no rule rewrites is not at risk
+  ([#202](https://github.com/nubo-db/dynoxide/issues/202)).
 
 ### Fixed
 

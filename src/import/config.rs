@@ -387,6 +387,30 @@ const VALID_GENERATORS: &[&str] = &[
     "last_name",
 ];
 
+/// A secret a rule reads from the environment. Both a hash salt and a fake
+/// seed are only as good as the secret behind them, so an unset variable is
+/// an error and so is an empty one: empty is the shape a missing CI secret
+/// takes, and it would pass through as if it were a value.
+fn required_secret(
+    rule_num: usize,
+    env_var: &str,
+    purpose: &str,
+    why_it_must_be_secret: &str,
+) -> Result<Vec<u8>, String> {
+    let value = std::env::var(env_var).map_err(|_| {
+        format!(
+            "Rule {rule_num}: environment variable '{env_var}' not set (required for {purpose})"
+        )
+    })?;
+    if value.is_empty() {
+        return Err(format!(
+            "Rule {rule_num}: environment variable '{env_var}' is empty. \
+             {why_it_must_be_secret}, so set it to a secret value"
+        ));
+    }
+    Ok(value.into_bytes())
+}
+
 fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAction, String> {
     match action {
         ActionConfig::Fake {
@@ -405,21 +429,13 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
             // reproducible by anyone holding the source data, which is the
             // whole thing the seed is for.
             let seed = match seed_env {
-                Some(env_var) => {
-                    let value = std::env::var(env_var).map_err(|_| {
-                        format!(
-                            "Rule {rule_num}: environment variable '{env_var}' not set (required for the fake seed)"
-                        )
-                    })?;
-                    if value.is_empty() {
-                        return Err(format!(
-                            "Rule {rule_num}: environment variable '{env_var}' is empty. \
-                             The seed is what stops anyone with the original data reproducing \
-                             the anonymised values, so set it to a secret value"
-                        ));
-                    }
-                    Some(Salt::new(value.into_bytes()))
-                }
+                Some(env_var) => Some(Salt::new(required_secret(
+                    rule_num,
+                    env_var,
+                    "the fake seed",
+                    "The seed is what stops anyone with the original data reproducing \
+                     the anonymised values",
+                )?)),
                 None => None,
             };
             Ok(ValidatedAction::Fake {
@@ -447,23 +463,12 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
         }
         ActionConfig::Hash { salt_env } => {
             let salt = match salt_env {
-                Some(env_var) => {
-                    let value = std::env::var(env_var).map_err(|_| {
-                        format!(
-                            "Rule {rule_num}: environment variable '{env_var}' not set (required for hash salt)"
-                        )
-                    })?;
-                    // An empty variable is the shape a missing CI secret takes,
-                    // and it would hash exactly as no salt at all.
-                    if value.is_empty() {
-                        return Err(format!(
-                            "Rule {rule_num}: environment variable '{env_var}' is empty. \
-                             SHA-256 without a salt is trivially reversible via rainbow tables, \
-                             so set it to a secret value"
-                        ));
-                    }
-                    value.into_bytes()
-                }
+                Some(env_var) => required_secret(
+                    rule_num,
+                    env_var,
+                    "hash salt",
+                    "SHA-256 without a salt is trivially reversible via rainbow tables",
+                )?,
                 None => {
                     return Err(format!(
                         "Rule {rule_num}: salt_env is required for hash actions. \
@@ -811,6 +816,22 @@ action = { type = "redact" }
         )
         .unwrap_err();
         assert!(err.contains("finite"), "{err}");
+    }
+
+    #[test]
+    fn test_values_accept_finite_floats_exactly() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "amount < :max"
+values = { ":max" = 3.14 }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+        let values = rule.values.expect("a values table");
+        assert_eq!(values[":max"], AttributeValue::N("3.14".to_string()));
     }
 
     #[test]

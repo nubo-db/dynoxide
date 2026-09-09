@@ -1,7 +1,7 @@
 name: Release
 
 # Tag-triggered release pipeline. Push a v* tag on a commit where:
-#   - Cargo.toml version matches the tag
+#   - VERSION matches the tag
 #   - CHANGELOG.md has a matching ## [X.Y.Z] entry
 #   - CI has gone green
 # then let this workflow do the rest.
@@ -260,6 +260,7 @@ jobs:
             case "$CODE" in
               200)
                 echo "already=true" >> "$GITHUB_OUTPUT"
+                echo "::warning::dynoxide-rs $CRATE is already on crates.io, so the crate is not republished. If src/ changed since it was published, Cargo.toml needed a bump."
                 echo "dynoxide-rs $CRATE is already on crates.io; skipping publication"
                 exit 0
                 ;;
@@ -527,7 +528,12 @@ jobs:
           EXPECTED: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          docker build --load -t dynoxide:probe .
+          # Two flags are load-bearing for --load on this runner, as ci.yml
+          # says: --platform keeps the result to one platform, and
+          # --provenance=false stops buildx attaching an attestation, which
+          # makes even a single-platform result a manifest list the classic
+          # image store cannot load.
+          docker buildx build --provenance=false --platform linux/amd64 --load -t dynoxide:probe .
           actual=$(docker run --rm dynoxide:probe --version | awk '{print $NF}')
           echo "pre-push image reports: $actual"
           if [ "$actual" != "$EXPECTED" ]; then
@@ -645,7 +651,9 @@ jobs:
     name: Publish to MCP registry
     needs: [validate, publish-npm, publish-docker]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Two packages are waited on in turn, up to ten minutes each, before the
+    # registry steps run.
+    timeout-minutes: 30
 
     permissions:
       id-token: write

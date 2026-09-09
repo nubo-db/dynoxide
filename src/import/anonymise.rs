@@ -439,20 +439,31 @@ mod tests {
     fn the_email_suffix_is_a_full_64_bits() {
         // A weaker suffix still produces distinct values across a small
         // sample, so counting uniques cannot establish the width. Read the
-        // suffix instead.
+        // suffix instead: sixteen hex characters, and the high half has to
+        // vary too, because a narrower draw zero-extended into the same
+        // field would print the same sixteen characters with a constant top.
         let s = seed("a-secret");
-        match generate_fake("safe_email", &AttributeValue::S("a@b.c".into()), Some(&s)) {
-            AttributeValue::S(v) => {
-                let (local, _) = v.split_once('@').expect("an address");
-                let suffix = local.rsplit('.').next().expect("a suffix");
-                assert_eq!(suffix.len(), 16, "expected 16 hex characters in {v}");
-                assert!(
-                    suffix.chars().all(|c| c.is_ascii_hexdigit()),
-                    "expected hex in {v}"
-                );
+        let mut high_halves = std::collections::HashSet::new();
+        for n in 0..32 {
+            let original = AttributeValue::S(format!("person{n}@b.c"));
+            match generate_fake("safe_email", &original, Some(&s)) {
+                AttributeValue::S(v) => {
+                    let (local, _) = v.split_once('@').expect("an address");
+                    let suffix = local.rsplit('.').next().expect("a suffix");
+                    assert_eq!(suffix.len(), 16, "expected 16 hex characters in {v}");
+                    assert!(
+                        suffix.chars().all(|c| c.is_ascii_hexdigit()),
+                        "expected hex in {v}"
+                    );
+                    high_halves.insert(suffix[..8].to_string());
+                }
+                other => panic!("expected a string, got {other:?}"),
             }
-            other => panic!("expected a string, got {other:?}"),
         }
+        assert!(
+            high_halves.len() > 1,
+            "the top 32 bits never varied across 32 inputs: {high_halves:?}"
+        );
     }
 
     #[test]

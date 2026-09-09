@@ -53,7 +53,9 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   nothing, and so does a deterministic action such as `hash`, which keeps both
   entities agreeing without any `[consistency]` entry. None of those has a
   join to lose, and a check that fires on legitimate use earns a bypass flag.
-  Nothing is persisted on the error path. The check groups on the key
+  In file mode nothing is persisted on the error path; the library entry
+  point `run_into` writes into a database you supply, so there a failure on
+  a later table leaves the earlier ones in place. The check groups on the key
   attribute rather than the template text, so the ordinary single-table join
   is covered: `CUSTOMER#${email}` and `CUSTOMER#${customerEmail}` build the
   same partition from differently named attributes. It compares the whole key
@@ -61,6 +63,9 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   only a component are left alone, and every outcome for a key is kept rather
   than the first, so a break is found whatever order the export is in. A key
   that was left unrebuilt is not counted, since it has already been reported.
+  An entity whose key source no rule rewrites is compared as well, so an
+  `Order` keyed on an untouched `customerEmail` beside a `Customer` whose
+  `email` was anonymised is reported as the broken join it is.
   The field named in the advice is always a top-level one, matching what
   `[consistency] fields` is keyed on. Past a million distinct keys per
   template the check keeps comparing the keys it holds and reports how many it
@@ -83,7 +88,9 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   values are derived: a map, list or set has no stable byte order to hash, so
   those draw fresh even with a seed set rather than claim a repeatability they
   cannot deliver. Mixing rule shapes on one consistency field is reported,
-  since a seeded rule bypasses the map an unseeded one depends on
+  since a seeded rule bypasses the map an unseeded one depends on. Two seeds
+  on one field, or two hash salts, count as two shapes: each secret is its
+  own derivation, and the message numbers them rather than printing them
   ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
 - Anonymisation rules take `values` and `names` tables, in the shape of
   ExpressionAttributeValues and ExpressionAttributeNames, so a match
@@ -136,9 +143,12 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   Rebuilding can land two source items on one primary key, which is the
   assumption the faster bulk path trades away: it skips the index
   delete-before-insert, so an overwritten row left its old index entry behind
-  and a `Query` on that index answered from a row that no longer existed. An
-  import without `--data-model` takes keys from the export unchanged, cannot
-  collide, and keeps the faster path.
+  and a `Query` on that index answered from a row that no longer existed. A
+  rules file that names a key attribute directly takes the same path. An
+  import whose rules leave every key alone takes its keys from the export
+  unchanged, cannot collide, and keeps the faster path. The collision count
+  includes a rebuilt key landing on an item that matched no entity, whose
+  keys were kept as they arrived.
 
 #### Breaking (Rust API)
 

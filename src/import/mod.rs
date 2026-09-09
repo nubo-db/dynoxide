@@ -256,16 +256,14 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         output_path: cmd.output.clone(),
     };
 
-    // Rebuilding keys can land two source items on one primary key, which is
-    // exactly the assumption `import_items_fresh` trades away: it skips the
-    // GSI delete-before-insert, so an overwritten base row would leave its
-    // old index entry behind and index queries would answer from a row that
-    // no longer exists. Without a data model the keys come straight from the
-    // export and are unique by construction, so the fast path stays.
     // Keys can move two ways: rebuilt from a template, or rewritten by a rule
-    // that names a key attribute. Either can land two items on one primary
-    // key. Neither happens without rules, so a plain import keeps the fast
-    // path that assumes every key is unique.
+    // that names a key attribute. Either can land two source items on one
+    // primary key, which is exactly the assumption `import_items_fresh`
+    // trades away: it skips the GSI delete-before-insert, so an overwritten
+    // base row would leave its old index entry behind and index queries
+    // would answer from a row that no longer exists. Neither happens without
+    // rules, so a plain import keeps the fast path that assumes every key is
+    // unique.
     let key_attr_names: HashSet<String> = schemas
         .iter()
         .flat_map(|s| extract_key_attrs(&s.create_request))
@@ -309,7 +307,15 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     &rules,
                     &consistency_fields,
                 )
-                .map_err(|e| ImportError::Config(format!("data model: {e}")))?;
+                .map_err(|e| {
+                    // The warnings collected so far are part of the
+                    // explanation, and the summary that carries them does
+                    // not survive an error return.
+                    for w in &summary.warnings {
+                        eprintln!("  - {w}");
+                    }
+                    ImportError::Config(format!("data model: {e}"))
+                })?;
                 for w in warnings {
                     summary.warnings.push(format!("table '{table_name}': {w}"));
                 }
@@ -360,8 +366,16 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         &key_attrs,
                     );
                     warnings.extend(rule_warnings);
-                    if let (Some(deriver), Some(plan)) = (key_deriver.as_mut(), plan) {
-                        deriver.apply(&plan, &rewritten, &mut item, &mut warnings);
+                    match (key_deriver.as_mut(), plan) {
+                        (Some(deriver), Some(plan)) => {
+                            deriver.apply(&plan, &rewritten, &mut item, &mut warnings);
+                        }
+                        // An item that matched no entity keeps its keys, but a
+                        // rebuilt key can still land on them, and that row is
+                        // lost like any other. Record it so the overwrite is
+                        // counted rather than invisible.
+                        (Some(deriver), None) => deriver.note_primary_key(&item),
+                        (None, _) => {}
                     }
                     for w in warnings {
                         // Prefixed with the table, both so the reader knows
@@ -433,8 +447,10 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             }
             // Both entities of a shared key attribute turned up, so the join
             // between them is broken in the output rather than merely at risk.
-            // Nothing is persisted on the error path, so failing here costs
-            // the run's time, not a half-anonymised database.
+            // The CLI writes to a temporary file that an error discards, so
+            // failing here costs the run's time, not a half-anonymised
+            // database. `run_into` writes into the caller's database and
+            // leaves earlier tables in place.
             let join_breaks = deriver.join_breaks();
             if let Some(first) = join_breaks.first() {
                 // The warnings collected so far are what explain the failure;
@@ -678,7 +694,10 @@ fn unwrap_describe_table_shapes(table: &mut serde_json::Value) {
 /// Returns one message per offending field. A field is fine when every rule
 /// targeting it uses the same action shape; it is not when a seeded fake sits
 /// beside an unseeded one, or beside a different seed or generator, because
-/// the seeded rule bypasses the map the other one depends on.
+/// the seeded rule bypasses the map the other one depends on. Two seeds, or
+/// two salts, are two shapes as well: the secret is part of the derivation,
+/// so the same input leaves with a different value under each. They are told
+/// apart by position rather than by value, so the message never carries one.
 fn mixed_consistency_rules(
     rules: &[config::ValidatedRule],
     consistency_fields: &HashSet<String>,
@@ -687,15 +706,36 @@ fn mixed_consistency_rules(
 
     let mut messages = Vec::new();
     for field in consistency_fields {
+        let mut secrets: Vec<Vec<u8>> = Vec::new();
+        let mut secret_number = |bytes: &[u8]| -> usize {
+            match secrets.iter().position(|known| known.as_slice() == bytes) {
+                Some(i) => i + 1,
+                None => {
+                    secrets.push(bytes.to_vec());
+                    secrets.len()
+                }
+            }
+        };
         let mut shapes: Vec<String> = rules
             .iter()
             .filter(|rule| {
                 matches!(rule.path.first(), Some(PathElement::Attribute(name)) if name == field)
             })
             .map(|rule| match &rule.action {
-                config::ValidatedAction::Fake { generator, seed } => {
-                    let seeded = if seed.is_some() { "seeded" } else { "unseeded" };
-                    format!("{seeded} fake '{generator}'")
+                config::ValidatedAction::Fake {
+                    generator,
+                    seed: Some(seed),
+                } => {
+                    let n = secret_number(seed.as_bytes());
+                    format!("seeded fake '{generator}' (seed {n})")
+                }
+                config::ValidatedAction::Fake {
+                    generator,
+                    seed: None,
+                } => format!("unseeded fake '{generator}'"),
+                config::ValidatedAction::Hash { salt } => {
+                    let n = secret_number(salt.as_bytes());
+                    format!("hash (salt {n})")
                 }
                 other => format!("{other:?}")
                     .split_whitespace()

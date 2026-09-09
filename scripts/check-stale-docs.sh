@@ -66,13 +66,27 @@ ALLOW='## Upgrading to |is a breaking release'
 # checked against Cargo.toml below.
 CRATE_PIN='dynoxide-rs'
 
-hits=$(grep -rniE "$PATTERN" \
-        README.md README-crate.md docs/ npm/dynoxide/README.md npm/wasm-engine/README.md \
-        --exclude-dir=rfcs --exclude-dir=adr \
-        2>/dev/null \
-      | grep -v '^docs/versioning\.md:' \
-      | grep -vE "${CRATE_PIN}[^\"]*\"[\^~]?[0-9]" \
-      | grep -vE "$ALLOW" || true)
+# The files this check reads. A missing one is an error, not a clean result:
+# grep would report it on stderr and move on, and a check whose inputs can
+# vanish underneath it is a check that can only pass.
+SCANNED=(README.md README-crate.md docs npm/dynoxide/README.md npm/wasm-engine/README.md)
+for path in "${SCANNED[@]}"; do
+  [ -e "$path" ] || { echo "::error::$path is missing, so the docs check cannot run" >&2; exit 2; }
+done
+
+# grep answers 1 for "nothing matched", which is the clean outcome here. Any
+# other non-zero status is grep itself failing, and that has to surface rather
+# than read as clean.
+scan() {
+  local status=0
+  grep -rniE "$1" "${SCANNED[@]}" --exclude-dir=rfcs --exclude-dir=adr || status=$?
+  [ "$status" -le 1 ] || { echo "::error::grep failed with status $status" >&2; exit 2; }
+}
+
+hits=$(scan "$PATTERN" \
+      | { grep -v '^docs/versioning\.md:' || [ $? -eq 1 ]; } \
+      | { grep -vE "${CRATE_PIN}[^\"]*\"[\^~]?[0-9]" || [ $? -eq 1 ]; } \
+      | { grep -vE "$ALLOW" || [ $? -eq 1 ]; })
 
 if [ -n "$hits" ]; then
   echo "Stale product version pin or preview wording (product version is ${CURRENT}):"
@@ -86,13 +100,10 @@ fi
 # is not a pin.
 CRATE_MM="${CRATE%.*}"
 CRATE_MM_RE="${CRATE_MM//./\\.}"
-crate_hits=$(grep -rniE "${CRATE_PIN}[^\"]*\"[\^~]?[0-9]+\\.[0-9]+" \
-        README.md README-crate.md docs/ npm/dynoxide/README.md npm/wasm-engine/README.md \
-        --exclude-dir=rfcs --exclude-dir=adr \
-        2>/dev/null \
-      | grep -v '^docs/versioning\.md:' \
-      | grep -vE "$ALLOW" \
-      | grep -vE "${CRATE_PIN}[^\"]*\"[\^~]?${CRATE_MM_RE}([^0-9]|$)" || true)
+crate_hits=$(scan "${CRATE_PIN}[^\"]*\"[\^~]?[0-9]+\\.[0-9]+" \
+      | { grep -v '^docs/versioning\.md:' || [ $? -eq 1 ]; } \
+      | { grep -vE "$ALLOW" || [ $? -eq 1 ]; } \
+      | { grep -vE "${CRATE_PIN}[^\"]*\"[\^~]?${CRATE_MM_RE}([^0-9]|$)" || [ $? -eq 1 ]; })
 
 if [ -n "$crate_hits" ]; then
   echo "Crate pin does not name the current crate version (crate is ${CRATE}):"

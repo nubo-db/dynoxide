@@ -1944,4 +1944,251 @@ fields = ["email"]
             summary.warnings
         );
     }
+
+    /// A OneTable model where the order keys on the customer's address under
+    /// a different attribute name, which is the ordinary single-table join.
+    fn differently_named_source_model(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            r#"{
+                "format": "onetable:1.1.0",
+                "indexes": { "primary": { "hash": "pk", "sort": "sk" } },
+                "params": { "typeField": "_type" },
+                "models": {
+                    "Customer": {
+                        "pk": { "type": "string", "value": "CUSTOMER#${email}" },
+                        "sk": { "type": "string", "value": "PROFILE" },
+                        "email": { "type": "string" }
+                    },
+                    "Order": {
+                        "pk": { "type": "string", "value": "CUSTOMER#${customerEmail}" },
+                        "sk": { "type": "string", "value": "ORDER#${orderId}" },
+                        "customerEmail": { "type": "string" },
+                        "orderId": { "type": "string" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_a_sibling_keyed_on_an_untouched_attribute_still_breaks_the_join() {
+        // Only the customer's address has a rule. The order keeps
+        // `customerEmail` as it arrived, so its partition still holds the
+        // real address while the customer has moved to a fake one: the join
+        // is broken and personal data is left in a key.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        let model_file = tmp.path().join("model.json");
+        let order = r#"{"Item": {"_type": {"S": "Order"}, "pk": {"S": "CUSTOMER#a@x.co"}, "sk": {"S": "ORDER#1"}, "customerEmail": {"S": "a@x.co"}, "orderId": {"S": "1"}}}"#;
+
+        setup_export_dir(&source, "App", &[CUSTOMER_ITEM, order]);
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(&rules_file, FAKE_EMAIL_RULE).unwrap();
+        differently_named_source_model(&model_file);
+
+        let err = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("output.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(model_file),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entity 'Customer' and entity 'Order'"),
+            "{msg}"
+        );
+        assert!(msg.contains("same attribute name"), "{msg}");
+        assert!(
+            !tmp.path().join("output.db").exists(),
+            "a failed import must not leave a half-anonymised database"
+        );
+    }
+
+    #[test]
+    fn test_a_rebuilt_key_landing_on_an_unmatched_row_is_counted() {
+        // The stranger matches no entity and keeps its keys. The user's sort
+        // key is rebuilt onto exactly those keys, so the stranger's row is
+        // overwritten, and that has to be counted like any other collision.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"pk": {"S": "account#acc1"}, "sk": {"S": "user#[REDACTED]"}, "note": {"S": "no type, no address"}}}"#,
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@example.com"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .unwrap();
+
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("1 items rendered the same primary key")),
+            "the overwritten stranger must be counted: {:?}",
+            summary.warnings
+        );
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        assert_eq!(scan_all(&db, "App").len(), 1, "one row survived");
+    }
+
+    fn mixed_secret_import(tmp: &std::path::Path, rules_toml: &str) -> import::ImportSummary {
+        let source = tmp.join("export");
+        let schema_file = tmp.join("schema.json");
+        let rules_file = tmp.join("rules.toml");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "U#1"}, "sk": {"S": "P"}, "email": {"S": "a@x.co"}, "vip": {"BOOL": true}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(&rules_file, rules_toml).unwrap();
+        import::run(ImportCommand {
+            source,
+            output: Some(tmp.join("out.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_two_seeds_on_a_consistency_field_are_reported() {
+        // Two seeded rules look alike, but the seed is part of the
+        // derivation, so the same address leaves with a different value under
+        // each. The message counts the seeds rather than printing them.
+        // SAFETY: these names are used by this test alone
+        unsafe {
+            std::env::set_var("TEST_TWO_SEEDS_A", "first-secret");
+            std::env::set_var("TEST_TWO_SEEDS_B", "second-secret");
+        }
+        let rules = |second: &str| {
+            format!(
+                r#"
+[[rules]]
+match = "attribute_exists(vip)"
+path = "email"
+action = {{ type = "fake", generator = "safe_email", seed_env = "TEST_TWO_SEEDS_A" }}
+
+[[rules]]
+match = "attribute_not_exists(vip)"
+path = "email"
+action = {{ type = "fake", generator = "safe_email", seed_env = "{second}" }}
+
+[consistency]
+fields = ["email"]
+"#
+            )
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let summary = mixed_secret_import(tmp.path(), &rules("TEST_TWO_SEEDS_B"));
+        let warning = summary
+            .warnings
+            .iter()
+            .find(|w| w.contains("'email'") && w.contains("do not agree"))
+            .unwrap_or_else(|| panic!("expected the mixed-rule warning: {:?}", summary.warnings));
+        assert!(
+            warning.contains("(seed 1)") && warning.contains("(seed 2)"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("secret"),
+            "the seed must not be printed: {warning}"
+        );
+
+        // The same seed twice is one shape, and stays quiet.
+        let tmp = tempfile::tempdir().unwrap();
+        let summary = mixed_secret_import(tmp.path(), &rules("TEST_TWO_SEEDS_A"));
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("do not agree")),
+            "one seed under two names is one derivation: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn test_two_salts_on_a_consistency_field_are_reported() {
+        // SAFETY: these names are used by this test alone
+        unsafe {
+            std::env::set_var("TEST_TWO_SALTS_A", "first-salt");
+            std::env::set_var("TEST_TWO_SALTS_B", "second-salt");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let summary = mixed_secret_import(
+            tmp.path(),
+            r#"
+[[rules]]
+match = "attribute_exists(vip)"
+path = "email"
+action = { type = "hash", salt_env = "TEST_TWO_SALTS_A" }
+
+[[rules]]
+match = "attribute_not_exists(vip)"
+path = "email"
+action = { type = "hash", salt_env = "TEST_TWO_SALTS_B" }
+
+[consistency]
+fields = ["email"]
+"#,
+        );
+        let warning = summary
+            .warnings
+            .iter()
+            .find(|w| w.contains("'email'") && w.contains("do not agree"))
+            .unwrap_or_else(|| panic!("expected the mixed-rule warning: {:?}", summary.warnings));
+        assert!(
+            warning.contains("(salt 1)") && warning.contains("(salt 2)"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("first-salt"),
+            "the salt must not be printed: {warning}"
+        );
+    }
 }

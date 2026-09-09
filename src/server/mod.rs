@@ -103,7 +103,7 @@ fn build_router(db: Database) -> Router {
         ))
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static("x-dynoxide-version"),
-            HeaderValue::from_static(env!("DYNOXIDE_PRODUCT_VERSION")),
+            HeaderValue::from_static(crate::PRODUCT_VERSION),
         ))
         .with_state(db)
 }

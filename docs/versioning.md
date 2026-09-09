@@ -140,6 +140,11 @@ If you would rather behaviour held still:
 - **npm:** `~1.2.0` accepts patches only.
 - **Containers:** `dynoxide:1.2` is pinned to the minor. `dynoxide:1` floats
   across the whole major line and does receive conformance fixes.
+- **Cargo:** `=2.0.0`, or rely on your lockfile. That pins the crate, which is
+  a different number from the product version the binary reports.
+
+`npm install dynoxide` writes a caret range for you. If you want the narrower
+range, ask for it explicitly.
 
 ## Reading the two numbers
 
@@ -154,10 +159,6 @@ find the product release. The crates.io badge in the README shows the crate.
 
 A product release does not always mean a new crate, and a crate release does
 not always mean new binaries.
-- **Cargo:** `=2.0.0`, or rely on your lockfile. That pins the crate, which is a different number from the product version the binary reports.
-
-`npm install dynoxide` writes a caret range for you. If you want the narrower range,
-ask for it explicitly.
 
 ## The browser engine
 

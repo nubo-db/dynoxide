@@ -198,8 +198,16 @@ struct AtRisk {
     /// that is what the consistency map is keyed on: advising `contact.email`
     /// when only `contact` is honoured would send someone in a circle.
     consistency_roots: Vec<String>,
-    /// Entity indices that build this key from this template, in model order.
+    /// Entity indices that build this key from an attribute a rule rewrites,
+    /// in model order. These are the entities the up-front warning names.
     entities: Vec<usize>,
+    /// Entity indices that build the same key from an attribute no rule
+    /// rewrites. Their keys keep the values they arrived with, so they are
+    /// what a rewritten sibling has to keep agreeing with: a `Customer`
+    /// anonymised on `email` beside an `Order` keyed on an untouched
+    /// `customerEmail` is the join that breaks, and it is only found by
+    /// recording what the untouched entity's key stayed as.
+    observers: Vec<usize>,
     /// Hash of the whole key value the item arrived with -> every (entity,
     /// resulting key value) seen for it. Comparing the whole key, rather than
     /// one attribute it reads, tells a real join from two composite keys that
@@ -477,7 +485,7 @@ impl KeyDeriver {
         // cap and starts handing out fresh ones, so a field listed in
         // [consistency] is not a permanent guarantee, and the value check is
         // what notices when it lapses.
-        type SharedGroups = Vec<(String, (Vec<usize>, Vec<String>))>;
+        type SharedGroups = Vec<(String, (Vec<usize>, Vec<String>, Vec<usize>))>;
         let mut shared: SharedGroups = Vec::new();
         for (idx, shape) in entity_key_shapes.iter().enumerate() {
             for (attribute, _template, sources) in shape {
@@ -491,8 +499,10 @@ impl KeyDeriver {
                 if !shared_with_another {
                     continue;
                 }
-                // An attribute no rule rewrites keeps its value, so the two
-                // keys still agree however they were built.
+                // An entity whose sources no rule rewrites keeps its key as
+                // it arrived. It is not at risk itself, but it is what a
+                // rewritten sibling has to keep agreeing with, so it observes
+                // the group rather than joining it.
                 let roots: Vec<String> = sources
                     .iter()
                     .filter_map(|source| match source.first() {
@@ -501,40 +511,57 @@ impl KeyDeriver {
                     })
                     .filter(|root| rule_targets.contains(root.as_str()))
                     .collect();
+                let group = match shared.iter_mut().find(|(k, _)| k == attribute) {
+                    Some((_, group)) => group,
+                    None => {
+                        shared.push((attribute.clone(), (Vec::new(), Vec::new(), Vec::new())));
+                        &mut shared.last_mut().expect("just pushed").1
+                    }
+                };
+                let (users, known_roots, observers) = group;
                 if roots.is_empty() {
+                    if !observers.contains(&idx) {
+                        observers.push(idx);
+                    }
                     continue;
                 }
-                match shared.iter_mut().find(|(k, _)| k == attribute) {
-                    Some((_, (users, known_roots))) => {
-                        if !users.contains(&idx) {
-                            users.push(idx);
-                        }
-                        for root in roots {
-                            if !known_roots.contains(&root) {
-                                known_roots.push(root);
-                            }
-                        }
+                if !users.contains(&idx) {
+                    users.push(idx);
+                }
+                for root in roots {
+                    if !known_roots.contains(&root) {
+                        known_roots.push(root);
                     }
-                    None => shared.push((attribute.clone(), (vec![idx], roots))),
                 }
             }
         }
-        for (_, (users, roots)) in shared.iter_mut() {
+        for (_, (users, roots, observers)) in shared.iter_mut() {
             users.sort();
             roots.sort();
+            observers.sort();
+            observers.retain(|o| !users.contains(o));
         }
-        shared.retain(|(_, (users, _))| users.len() > 1);
+        // A group needs at least one entity a rule puts at risk, and at least
+        // one other entity to disagree with, whether that one is at risk too
+        // or merely keeps the value it arrived with.
+        shared.retain(|(_, (users, _, observers))| {
+            !users.is_empty() && users.len() + observers.len() > 1
+        });
         shared.sort_by(|a, b| a.0.cmp(&b.0));
 
         let at_risk: Vec<AtRisk> = shared
             .into_iter()
-            .map(|(key_attribute, (entities_using, roots))| {
+            .map(|(key_attribute, (entities_using, roots, observers))| {
                 let unlisted: Vec<String> = roots
                     .iter()
                     .filter(|root| !consistency_fields.contains(*root))
                     .cloned()
                     .collect();
-                if !unlisted.is_empty() {
+                // The up-front warning is for two entities a rule puts at
+                // risk. An entity that only observes has nothing to list in
+                // [consistency]; if its sibling diverges from it, the value
+                // check reports that once it is seen.
+                if !unlisted.is_empty() && entities_using.len() > 1 {
                     warnings.push(format!(
                         "{} both build {} from an attribute outside [consistency] fields ({}): \
                          if they both appear in this import their keys may not agree and the \
@@ -548,6 +575,7 @@ impl KeyDeriver {
                     key_attribute,
                     consistency_roots: if unlisted.is_empty() { roots } else { unlisted },
                     entities: entities_using,
+                    observers,
                     seen_keys: std::collections::HashMap::new(),
                     diverged: HashSet::new(),
                     unchecked: 0,
@@ -646,7 +674,7 @@ impl KeyDeriver {
             .iter()
             .enumerate()
             .filter(|(_, risk)| {
-                risk.entities.contains(&entity_idx)
+                (risk.entities.contains(&entity_idx) || risk.observers.contains(&entity_idx))
                     && rebuilt.iter().any(|a| *a == risk.key_attribute)
             })
             .filter_map(|(idx, risk)| Some((idx, scalar_hash(item.get(&risk.key_attribute)?)?)))
@@ -760,8 +788,10 @@ impl KeyDeriver {
     }
 
     /// Remember this item's primary key so a later item landing on the same
-    /// one is counted as a collision.
-    fn note_primary_key(&mut self, item: &Item) {
+    /// one is counted as a collision. `apply` does this for every item it
+    /// rebuilds; the pipeline calls it directly for an item that matched no
+    /// entity, whose keys are kept as they arrived.
+    pub(super) fn note_primary_key(&mut self, item: &Item) {
         if self.collision_check_capped {
             return;
         }
@@ -2020,6 +2050,55 @@ mod tests {
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
         assert!(breaks[0].contains("same attribute name"), "{breaks:?}");
+    }
+
+    #[test]
+    fn a_sibling_whose_source_no_rule_rewrites_still_breaks_the_join() {
+        // Only the customer's address has a rule. The order keys on the same
+        // address under its own name, which nothing rewrites, so its key keeps
+        // the real value while the customer's moves. That is the join breaking
+        // in the most ordinary way, and it is only visible by recording what
+        // the untouched entity's key stayed as.
+        let model = model_with(vec![
+            entity("Customer", "CUSTOMER#${email}", Some("PROFILE"), None),
+            entity(
+                "Order",
+                "CUSTOMER#${customerEmail}",
+                Some("ORDER#${id}"),
+                None,
+            ),
+        ]);
+        let (mut d, warnings) =
+            KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "one entity at risk has nothing to list up front: {warnings:?}"
+        );
+
+        let mut run = |name: &str, source: &str, sk: &str, becomes: Option<&str>| {
+            let mut it = item(&[
+                ("_type", name),
+                ("pk", "CUSTOMER#a@x.co"),
+                ("sk", sk),
+                (source, "a@x.co"),
+                ("id", "1"),
+            ]);
+            let mut w = Vec::new();
+            let plan = d.plan(&it, &mut w).unwrap();
+            if let Some(becomes) = becomes {
+                it.insert(source.to_string(), AttributeValue::S(becomes.to_string()));
+            }
+            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        };
+        run("Customer", "email", "PROFILE", Some("fake1@example.com"));
+        run("Order", "customerEmail", "ORDER#1", None);
+
+        let breaks = d.join_breaks();
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+        assert!(
+            breaks[0].contains("entity 'Customer' and entity 'Order'"),
+            "{breaks:?}"
+        );
     }
 
     #[test]

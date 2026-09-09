@@ -242,8 +242,11 @@ The library entry point `run_into` writes into a database you supply, so
 there a failure on a later table leaves the earlier ones in place. Matching on the key and
 its template, rather than on the attribute name, keeps this off entities that
 merely reuse a name: `account#${id}` and `project#${id}` are different
-entities' own ids and never had a join. An attribute no rule rewrites is left
-alone too, since its keys still agree.
+entities' own ids and never had a join. Two entities neither of whose sources
+a rule rewrites are left alone too, since their keys still agree. One
+rewritten entity beside one that keeps its value is the ordinary break, an
+`Order` still keyed on the real address after its `Customer` has moved, and
+that is reported the same way.
 
 **Prefer `hash`, or a seeded `safe_email`, for an attribute a key is built
 from.** The other actions each go wrong in their own way, and the importer
@@ -280,8 +283,10 @@ can re-derive every one of them. Treat a hashed export as sensitive, not
 anonymous.
 
 `--data-model` therefore imports on the index-maintaining write path rather
-than the faster one that assumes every key is unique. Without it, keys come
-from the export unchanged and cannot collide, so nothing is given up.
+than the faster one that assumes every key is unique, and so does a rules file
+that names a key attribute directly. An import whose rules leave every key
+alone takes its keys from the export unchanged, cannot collide, and keeps the
+faster path.
 
 **A rule that names a key attribute directly wins on the items it rewrote.**
 That key is not rebuilt from its template and the rule's value is stored

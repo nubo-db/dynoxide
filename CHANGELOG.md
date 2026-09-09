@@ -123,54 +123,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the docs promised otherwise. The example now uses the `values` table above
   ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
 
-||||||| 90a93e4
-- **The crate version and the product version are now separate streams.**
-  `VERSION` at the repository root holds the product version and the release
-  tag carries it; `Cargo.toml` holds the crate version and nothing else reads
-  it. Everything a user installs reports the product version, including
-  `dynoxide --version`, the `x-dynoxide-version` and `Server` headers and the
-  MCP server info, all of which previously reported the crate version. A build
-  script supplies it, so `cargo install` and a build from a source archive
-  report the same number as a release build.
+- `fake` rules take an optional `seed_env`, naming an environment variable
+  holding a secret. With it the generated value becomes a function of the
+  original, so the same input gives the same output on every run and an
+  anonymised export committed as a test fixture only changes where the source
+  data changed. Without it the previous per-run randomness stands, so existing
+  rules files are unaffected. A seeded rule does not need its field listed in
+  `[consistency]`, because the derivation already guarantees one input maps to
+  one output. An empty variable is rejected: the seed is what stops anyone
+  holding the original data reproducing the mapping, so it needs to be a
+  randomly generated value rather than a memorable one.
 
-  The reason is that a Rust API change forced a major on the CLI, the npm
-  packages, the browser engine, the container images, the MCPB bundle, the MCP
-  registry entry, the Action and the Homebrew formula, none of whose users
-  touch that API. Beyond the noise, a major strands everyone on the default npm
-  caret and the floating `dynoxide:1` tag, which is the cost
-  `docs/versioning.md` already cites when explaining why conformance fixes ship
-  as minors.
-
-  Note that `cargo install dynoxide-rs --version` now selects the crate
-  version, not the product one. crates.io has its own README explaining that.
-- `scripts/check-versions.sh` validates every version-bearing source against
-  the stream it belongs to, and runs in ordinary PR CI, `test-build`,
-  preflight and release. These checks previously existed only at tag time,
-  when the tag has already been pushed.
+  Two limits are stated rather than glossed. The promise holds for a fixed
+  build, because neither the random stream nor the generator word lists
+  guarantee identical output across dependency upgrades. And only scalar
+  values are derived: a map, list or set has no stable byte order to hash, so
+  those draw fresh even with a seed set rather than claim a repeatability they
+  cannot deliver. Mixing rule shapes on one consistency field is reported,
+  since a seeded rule bypasses the map an unseeded one depends on
+  ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
 
 ### Fixed
 
-- The container image is version-probed before it is pushed to GHCR, not only
-  after. The published probe stays, since it checks what the registry serves.
-- The generated Homebrew formula carries a test block that neither publisher
-  ever ran, so a formula whose binary reported the wrong version could reach
-  the tap unchallenged. Both paths now download the released binary and check
-  it before the tap moves, and the formula's own test compares exactly rather
-  than by substring.
-- The website is no longer notified until both npm packages are live. Waiting
-  on the CLI package alone let a browser publish failure pass unnoticed.
-- Prereleases were broken in three places. The CLI publisher passed no npm
-  dist-tag, and npm refuses a bare prerelease publish, so a prerelease release
-  half-published. The site then waited on `latest`, which a prerelease never
-  reaches. And the GitHub Action rejected prerelease versions outright,
-  making it the only path that could not install a version the project can
-  actually ship.
-- `npm/scripts/publish.sh` refuses a `--version` and `--release-url` that name
-  different tags, which previously let a caller pair a version with an
-  unrelated release's binaries.
-- The npm publish job checks out the tag being published rather than the
-  default branch, so packaging metadata cannot drift from the binaries it
-  ships alongside.
+- Generated email addresses no longer collide at ordinary sizes.
+  `safe_email` drew from roughly nine thousand values, a first name against
+  three `example.` domains, so a few hundred items produced repeats. A repeat
+  is not cosmetic: where the attribute is one a key is built from, two people
+  collapse onto the same key and one row overwrites the other, which was
+  measured at four collisions in three hundred items. Generated addresses now
+  carry a derived suffix in the local part, which keeps them recognisably
+  addresses and takes the space to around 1.7e23. That is a probabilistic
+  bound and not a guarantee, which is why the suffix is a full 64 bits: a
+  shorter one would still give roughly a one in a hundred chance of some
+  duplicate across a million distinct inputs, an ordinary export size. The
+  collision counter stays as the backstop. The other generators keep their
+  pools, so `word`, `first_name` and the rest remain unsuitable for an
+  attribute a key is built from.
+
 ## [1.1.0] - 2026-09-03
 
 ### Behaviour changes

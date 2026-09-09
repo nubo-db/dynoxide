@@ -1427,6 +1427,7 @@ mod tests {
                 "email",
                 ValidatedAction::Fake {
                     generator: "safe_email".into(),
+                    seed: None,
                 },
             ),
         ];
@@ -1464,6 +1465,7 @@ mod tests {
             "email",
             ValidatedAction::Fake {
                 generator: "safe_email".into(),
+                seed: None,
             },
         )];
         let (_, warnings) =
@@ -1486,6 +1488,7 @@ mod tests {
             "email",
             ValidatedAction::Fake {
                 generator: "safe_email".into(),
+                seed: None,
             },
         )]
     }
@@ -1536,6 +1539,7 @@ mod tests {
             "id",
             ValidatedAction::Fake {
                 generator: "word".into(),
+                seed: None,
             },
         )];
         let (_, warnings) = KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
@@ -1682,6 +1686,7 @@ mod tests {
             "id",
             ValidatedAction::Fake {
                 generator: "word".into(),
+                seed: None,
             },
         )];
         let (mut d, warnings) =
@@ -1727,6 +1732,7 @@ mod tests {
             "contact",
             ValidatedAction::Fake {
                 generator: "safe_email".into(),
+                seed: None,
             },
         )];
         let (mut d, warnings) =
@@ -1979,12 +1985,14 @@ mod tests {
                 "email",
                 ValidatedAction::Fake {
                     generator: "safe_email".into(),
+                    seed: None,
                 },
             ),
             rule(
                 "customerEmail",
                 ValidatedAction::Fake {
                     generator: "safe_email".into(),
+                    seed: None,
                 },
             ),
         ];

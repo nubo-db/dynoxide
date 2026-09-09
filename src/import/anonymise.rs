@@ -6,7 +6,7 @@
 use crate::expressions::{resolve_path, set_path};
 use crate::types::{AttributeValue, Item};
 
-use super::config::{ValidatedAction, ValidatedRule, matches_item};
+use super::config::{Salt, ValidatedAction, ValidatedRule, matches_item};
 use super::consistency::ConsistencyMap;
 
 use fake::Fake;
@@ -16,6 +16,8 @@ use fake::faker::internet::en::SafeEmail;
 use fake::faker::lorem::en::{Sentence, Word};
 use fake::faker::name::en::{FirstName, LastName, Name};
 use fake::faker::phone_number::en::PhoneNumber;
+use fake::rand::rngs::StdRng;
+use fake::rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
 /// Apply all matching rules to an item, mutating it in place.
@@ -55,7 +57,13 @@ pub fn apply_rules(
         // Hash actions are deterministic (same input → same output), so they
         // don't need the consistency map: skip it entirely to avoid unbounded
         // memory growth on high-cardinality fields.
-        let is_deterministic = matches!(rule.action, ValidatedAction::Hash { .. });
+        // A seeded fake is a pure function of the input, like hash, so the
+        // consistency map would only duplicate what the derivation already
+        // guarantees and grow unboundedly doing it.
+        let is_deterministic = matches!(
+            rule.action,
+            ValidatedAction::Hash { .. } | ValidatedAction::Fake { seed: Some(_), .. }
+        );
         let new_value = if is_consistency_field && !is_deterministic {
             // Check consistency map first
             if let Some(cached) = consistency_map.get(&field_name, &current_value) {
@@ -108,7 +116,9 @@ fn path_to_field_name(path: &[crate::expressions::PathElement]) -> String {
 /// Generate an anonymised value based on the action type.
 fn generate_value(action: &ValidatedAction, original: &AttributeValue) -> AttributeValue {
     match action {
-        ValidatedAction::Fake { generator } => generate_fake(generator, original),
+        ValidatedAction::Fake { generator, seed } => {
+            generate_fake(generator, original, seed.as_ref())
+        }
         ValidatedAction::Mask {
             keep_last,
             mask_char,
@@ -120,18 +130,29 @@ fn generate_value(action: &ValidatedAction, original: &AttributeValue) -> Attrib
 }
 
 /// Generate fake data based on the generator name.
-fn generate_fake(generator: &str, original: &AttributeValue) -> AttributeValue {
+///
+/// With a seed the value is a function of the original, so the same input
+/// gives the same output on every run and a committed fixture can be
+/// refreshed without churn. Without one each call re-rolls, which is the
+/// original behaviour and why the consistency map exists.
+fn generate_fake(
+    generator: &str,
+    original: &AttributeValue,
+    seed: Option<&Salt>,
+) -> AttributeValue {
+    let mut rng = seeded_rng(generator, original, seed);
+
     // Generate a fake string value
     let fake_string: String = match generator {
-        "safe_email" => SafeEmail().fake(),
-        "name" => Name().fake(),
-        "first_name" => FirstName().fake(),
-        "last_name" => LastName().fake(),
-        "phone_number" => PhoneNumber().fake(),
-        "address" => CityName().fake(), // Simplified to city name
-        "company_name" => CompanyName().fake(),
-        "sentence" => Sentence(3..8).fake(),
-        "word" => Word().fake(),
+        "safe_email" => widen_email(SafeEmail().fake_with_rng(&mut rng), &mut rng),
+        "name" => Name().fake_with_rng(&mut rng),
+        "first_name" => FirstName().fake_with_rng(&mut rng),
+        "last_name" => LastName().fake_with_rng(&mut rng),
+        "phone_number" => PhoneNumber().fake_with_rng(&mut rng),
+        "address" => CityName().fake_with_rng(&mut rng), // Simplified to city name
+        "company_name" => CompanyName().fake_with_rng(&mut rng),
+        "sentence" => Sentence(3..8).fake_with_rng(&mut rng),
+        "word" => Word().fake_with_rng(&mut rng),
         _ => format!("[FAKE:{generator}]"),
     };
 
@@ -140,10 +161,77 @@ fn generate_fake(generator: &str, original: &AttributeValue) -> AttributeValue {
         AttributeValue::S(_) => AttributeValue::S(fake_string),
         AttributeValue::N(_) => {
             // For numbers, generate a random number string
-            let n: u32 = (1000..9999).fake();
+            let n: u32 = (1000..9999).fake_with_rng(&mut rng);
             AttributeValue::N(n.to_string())
         }
         _ => AttributeValue::S(fake_string),
+    }
+}
+
+/// An RNG for one generated value.
+///
+/// Seeded from the original value when a secret is configured, so generation
+/// is a pure function of what went in. The generator name is mixed in too, so
+/// two rules over the same attribute do not produce the same draw.
+fn seeded_rng(generator: &str, original: &AttributeValue, seed: Option<&Salt>) -> StdRng {
+    match seed {
+        Some(seed) => {
+            let mut hasher = Sha256::new();
+            // Length-prefixed, and the value's type tagged. Concatenating the
+            // three fields directly would leave their boundaries ambiguous, so
+            // a seed of "ab" with generator "c" would derive the same value as
+            // a seed of "a" with generator "bc", and the string "123" would
+            // derive the same value as the number 123. Two different
+            // configurations sharing a mapping is not something the output
+            // would ever show you.
+            let mut field = |tag: u8, bytes: &[u8]| {
+                hasher.update([tag]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            };
+            field(b'k', seed.as_bytes());
+            field(b'g', generator.as_bytes());
+            match original {
+                AttributeValue::S(s) => field(b's', s.as_bytes()),
+                AttributeValue::N(n) => field(b'n', n.as_bytes()),
+                AttributeValue::B(b) => field(b'b', b),
+                // Anything else is a map, a list or a set, and their
+                // serialised bytes are not stable: `AttributeValue::M` holds a
+                // HashMap, so one value can serialise two ways and derive two
+                // different pseudonyms. Falling back to entropy is honest
+                // about that, where hashing an unstable encoding would claim a
+                // determinism it does not have.
+                _ => return StdRng::from_entropy(),
+            }
+            let digest = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&digest);
+            StdRng::from_seed(bytes)
+        }
+        None => StdRng::from_entropy(),
+    }
+}
+
+/// Put enough room in the local part that two people do not land on one
+/// address.
+///
+/// `SafeEmail` draws a first name from about three thousand, across three
+/// `example.` domains, so roughly nine thousand values in total. That is small
+/// enough that a few hundred items collide, and a collision on an attribute a
+/// key is built from merges two identities onto one row.
+///
+/// Sixteen hex characters take the space to roughly 1.7e23. That is a
+/// probabilistic bound, not a guarantee: a 32-bit suffix would still give
+/// about a one in a hundred chance of some duplicate across a million
+/// distinct inputs, which is an ordinary export size. The importer's collision
+/// counter stays as the backstop either way, because a merged identity is
+/// silent.
+fn widen_email(address: String, rng: &mut StdRng) -> String {
+    let discriminator: u64 = rng.r#gen();
+    match address.split_once('@') {
+        Some((local, domain)) => format!("{local}.{discriminator:016x}@{domain}"),
+        // Not an address after all; leave it rather than corrupt it.
+        None => address,
     }
 }
 
@@ -285,15 +373,165 @@ mod tests {
         );
     }
 
+    fn seed(bytes: &str) -> Salt {
+        Salt::new(bytes.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn seeded_fake_is_a_function_of_the_input() {
+        let s = seed("a-secret");
+        let alice = AttributeValue::S("alice@example.com".to_string());
+        let bob = AttributeValue::S("bob@example.com".to_string());
+
+        // Same input, same seed, same answer, however many times.
+        let first = generate_fake("safe_email", &alice, Some(&s));
+        for _ in 0..5 {
+            assert_eq!(generate_fake("safe_email", &alice, Some(&s)), first);
+        }
+        // Different input diverges, so identities stay distinct.
+        assert_ne!(generate_fake("safe_email", &bob, Some(&s)), first);
+        // A different secret gives a different mapping entirely.
+        let other = seed("another-secret");
+        assert_ne!(generate_fake("safe_email", &alice, Some(&other)), first);
+    }
+
+    /// The first draw from the derived stream, which is what every generated
+    /// value is a function of.
+    fn derived(generator: &str, original: &AttributeValue, s: &Salt) -> u64 {
+        seeded_rng(generator, original, Some(s)).r#gen()
+    }
+
+    #[test]
+    fn the_derivation_separates_its_fields() {
+        // Tested against seeded_rng rather than generate_fake on purpose: the
+        // generator name also selects the generator, and the original's type
+        // also picks the returned variant, so comparing generated values would
+        // pass whether or not the derivation kept its fields apart.
+        let text = |v: &str| AttributeValue::S(v.into());
+
+        // Length prefixes. With tags but no lengths both of these feed the
+        // hasher the identical byte string
+        // "k" "a" "g" "words" "s" "x" ... run together.
+        assert_ne!(
+            derived("word", &text("gsafe_emailsx"), &seed("a")),
+            derived("safe_email", &text("x"), &seed("agwords")),
+            "field lengths must be part of the input"
+        );
+
+        // Type tags. Without them these hash the same bytes.
+        let s = seed("a-secret");
+        assert_ne!(
+            derived("word", &text("123"), &s),
+            derived("word", &AttributeValue::N("123".into()), &s),
+            "the attribute type is part of the input"
+        );
+
+        // The generator itself must reach the hash, not merely select the
+        // generator function.
+        assert_ne!(
+            derived("word", &text("x"), &s),
+            derived("safe_email", &text("x"), &s),
+            "the generator name is part of the input"
+        );
+    }
+
+    #[test]
+    fn the_email_suffix_is_a_full_64_bits() {
+        // A weaker suffix still produces distinct values across a small
+        // sample, so counting uniques cannot establish the width. Read the
+        // suffix instead.
+        let s = seed("a-secret");
+        match generate_fake("safe_email", &AttributeValue::S("a@b.c".into()), Some(&s)) {
+            AttributeValue::S(v) => {
+                let (local, _) = v.split_once('@').expect("an address");
+                let suffix = local.rsplit('.').next().expect("a suffix");
+                assert_eq!(suffix.len(), 16, "expected 16 hex characters in {v}");
+                assert!(
+                    suffix.chars().all(|c| c.is_ascii_hexdigit()),
+                    "expected hex in {v}"
+                );
+            }
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_value_whose_bytes_are_not_stable_does_not_claim_determinism() {
+        // A map serialises in HashMap order, so hashing it would derive a
+        // different pseudonym for the same value on a different run. Better to
+        // draw fresh than to promise a stability that is not there.
+        let s = seed("a-secret");
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), AttributeValue::S("x".to_string()));
+        map.insert("b".to_string(), AttributeValue::S("y".to_string()));
+        let value = AttributeValue::M(map);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(format!("{:?}", generate_fake("word", &value, Some(&s))));
+        }
+        assert!(
+            seen.len() > 1,
+            "a non-scalar should draw fresh rather than pretend to be deterministic"
+        );
+    }
+
+    #[test]
+    fn unseeded_fake_still_re_rolls() {
+        let alice = AttributeValue::S("alice@example.com".to_string());
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(format!("{:?}", generate_fake("safe_email", &alice, None)));
+        }
+        assert!(seen.len() > 1, "without a seed each call should re-roll");
+    }
+
+    #[test]
+    fn generated_emails_have_room_to_avoid_collisions() {
+        // SafeEmail alone draws from roughly nine thousand values, so a few
+        // hundred items collide and merge two identities onto one key. The
+        // widened local part is what stops that.
+        let s = seed("a-secret");
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..2_000 {
+            let original = AttributeValue::S(format!("person{n}@real.example"));
+            match generate_fake("safe_email", &original, Some(&s)) {
+                AttributeValue::S(v) => {
+                    assert!(v.contains('@'), "still an address: {v}");
+                    assert!(seen.insert(v), "collision within 2000 values");
+                }
+                other => panic!("expected a string, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_address_generator_is_left_exactly_as_the_generator_produced_it() {
+        // Asserting only "no @ in it" would pass for an empty string or for a
+        // word with digits stapled on. Compare against the generator driven by
+        // an identically derived stream instead.
+        let s = seed("a-secret");
+        let original = AttributeValue::S("x".to_string());
+        let expected: String = Word().fake_with_rng(&mut seeded_rng("word", &original, Some(&s)));
+
+        match generate_fake("word", &original, Some(&s)) {
+            AttributeValue::S(w) => {
+                assert_eq!(w, expected, "widening must not touch a non-address")
+            }
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_generate_fake_preserves_type() {
         let result = generate_fake(
             "safe_email",
             &AttributeValue::S("old@example.com".to_string()),
+            None,
         );
-        matches!(result, AttributeValue::S(_));
+        assert!(matches!(result, AttributeValue::S(_)), "got {result:?}");
 
-        let result = generate_fake("name", &AttributeValue::N("42".to_string()));
-        matches!(result, AttributeValue::N(_));
+        let result = generate_fake("name", &AttributeValue::N("42".to_string()), None);
+        assert!(matches!(result, AttributeValue::N(_)), "got {result:?}");
     }
 }

@@ -56,6 +56,10 @@ pub enum ActionConfig {
         /// Generator name: `safe_email`, `name`, `phone_number`, `address`,
         /// `company_name`, `sentence`, `word`, `first_name`, `last_name`.
         generator: String,
+        /// Environment variable holding a secret that makes the generated
+        /// value a function of the original, so the same input gives the same
+        /// output on every run. Without it each run re-rolls.
+        seed_env: Option<String>,
     },
     /// Mask characters, keeping the last N.
     Mask {
@@ -132,9 +136,18 @@ impl std::fmt::Debug for Salt {
 /// A validated action with resolved values (e.g., salt from env).
 #[derive(Debug, Clone)]
 pub enum ValidatedAction {
-    Fake { generator: String },
-    Mask { keep_last: usize, mask_char: char },
-    Hash { salt: Salt },
+    Fake {
+        generator: String,
+        /// Present when `seed_env` was set: makes generation deterministic.
+        seed: Option<Salt>,
+    },
+    Mask {
+        keep_last: usize,
+        mask_char: char,
+    },
+    Hash {
+        salt: Salt,
+    },
     Redact,
     Null,
 }
@@ -376,7 +389,10 @@ const VALID_GENERATORS: &[&str] = &[
 
 fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAction, String> {
     match action {
-        ActionConfig::Fake { generator } => {
+        ActionConfig::Fake {
+            generator,
+            seed_env,
+        } => {
             if !VALID_GENERATORS.contains(&generator.as_str()) {
                 return Err(format!(
                     "Rule {rule_num}: unknown generator '{}'. Valid generators: {}",
@@ -384,8 +400,31 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
                     VALID_GENERATORS.join(", ")
                 ));
             }
+            // An empty variable is the shape an unset CI secret takes, and a
+            // seed anyone can guess makes the mapping from original to fake
+            // reproducible by anyone holding the source data, which is the
+            // whole thing the seed is for.
+            let seed = match seed_env {
+                Some(env_var) => {
+                    let value = std::env::var(env_var).map_err(|_| {
+                        format!(
+                            "Rule {rule_num}: environment variable '{env_var}' not set (required for the fake seed)"
+                        )
+                    })?;
+                    if value.is_empty() {
+                        return Err(format!(
+                            "Rule {rule_num}: environment variable '{env_var}' is empty. \
+                             The seed is what stops anyone with the original data reproducing \
+                             the anonymised values, so set it to a secret value"
+                        ));
+                    }
+                    Some(Salt::new(value.into_bytes()))
+                }
+                None => None,
+            };
             Ok(ValidatedAction::Fake {
                 generator: generator.clone(),
+                seed,
             })
         }
         ActionConfig::Mask {
@@ -510,6 +549,7 @@ mod tests {
     fn test_validate_fake_action() {
         let action = ActionConfig::Fake {
             generator: "safe_email".to_string(),
+            seed_env: None,
         };
         assert!(validate_action(&action, 1).is_ok());
     }
@@ -518,8 +558,66 @@ mod tests {
     fn test_validate_fake_unknown_generator() {
         let action = ActionConfig::Fake {
             generator: "unknown".to_string(),
+            seed_env: None,
         };
         assert!(validate_action(&action, 1).is_err());
+    }
+
+    #[test]
+    fn test_seed_env_is_resolved_and_required_to_be_non_empty() {
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SEED", "a-secret") };
+        let action = ActionConfig::Fake {
+            generator: "safe_email".to_string(),
+            seed_env: Some("DYNOXIDE_TEST_SEED".to_string()),
+        };
+        match validate_action(&action, 1).unwrap() {
+            ValidatedAction::Fake { seed, .. } => assert_eq!(
+                seed.expect("seed should be resolved").as_bytes(),
+                b"a-secret",
+                "the configured seed must reach the action"
+            ),
+            other => panic!("expected Fake, got {other:?}"),
+        }
+
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SEED", "") };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_SEED") };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("not set"), "{err}");
+    }
+
+    #[test]
+    fn test_fake_without_seed_env_has_no_seed() {
+        let action = ActionConfig::Fake {
+            generator: "safe_email".to_string(),
+            seed_env: None,
+        };
+        match validate_action(&action, 1).unwrap() {
+            ValidatedAction::Fake { seed, .. } => assert!(seed.is_none()),
+            other => panic!("expected Fake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_seed_env_parses_from_a_rules_file() {
+        let config: ImportConfig = toml::from_str(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
+"#,
+        )
+        .unwrap();
+        match &config.rules[0].action {
+            ActionConfig::Fake { seed_env, .. } => {
+                assert_eq!(seed_env.as_deref(), Some("SOME_SEED"))
+            }
+            other => panic!("expected Fake, got {other:?}"),
+        }
     }
 
     #[test]

@@ -91,6 +91,7 @@ ANON_SALT=my-secret-salt dynoxide import \
 | `fake` | Replace with generated data (`safe_email`, `name`, `phone_number`, `address`, `company_name`, `sentence`, `word`, `first_name`, `last_name`) |
 | `mask` | Keep last N characters, mask the rest (`keep_last`, `mask_char`) |
 | `hash` | SHA-256 hash with salt from env var (`salt_env`, required) |
+| | `fake` also takes an optional `seed_env`, below |
 | `redact` | Replace with `[REDACTED]` |
 | `null` | Replace with NULL |
 
@@ -292,6 +293,87 @@ a key unrebuilt on items the rule never touched, real value intact.
 
 When `--mcp` is set, `--data-model` also serves as the MCP data model unless
 `--mcp-data-model` is given.
+
+### Making `fake` repeatable
+
+By default `fake` draws a new value every time it runs, so importing the same
+export twice gives two different sets of names and addresses. That is fine for
+a throwaway database and awkward for one committed as a test fixture, where
+every refresh rewrites values that did not change and buries any real
+difference in churn.
+
+Give the rule a `seed_env` and the generated value becomes a function of the
+original:
+
+```toml
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email", seed_env = "ANON_SEED" }
+```
+
+```sh
+ANON_SEED=a-secret-value dynoxide import ...
+```
+
+The same input and the same seed give the same output on every run, so a
+fixture only changes where the source data did. A different seed gives an
+entirely different mapping.
+
+The promise is scoped to a fixed build. The value is produced by a generator
+drawing from a seeded random stream, and neither the stream nor the generator's
+word lists promise to stay identical across upgrades of those dependencies. So
+the same dynoxide gives the same answer every time, and a future dynoxide may
+not. Refresh a fixture in one go rather than expecting values to survive an
+upgrade untouched.
+
+Only scalar values are derived. A map, list or set has no stable byte order to
+hash, so those draw fresh each time even with a seed set, rather than claim a
+repeatability they cannot deliver.
+
+**The seed is a secret, for the same reason the hash salt is.** Anyone holding
+both the original data and the seed can re-run the import and reproduce the
+mapping from real value to fake one, which undoes the anonymisation. Use a
+randomly generated value, not a memorable one: a short or guessable seed can be
+searched offline against a handful of known pairs. An empty variable is
+rejected rather than accepted quietly, since that is the shape an unset CI
+secret takes.
+
+Omitting `seed_env` is not the same risk. Without a seed there is no mapping to
+reproduce, because each run draws fresh. The exposure comes from a seed that
+someone else can obtain or guess.
+
+A seeded rule does not need its field in `[consistency]`. The derivation
+already guarantees one input maps to one output everywhere.
+
+Do not mix rule shapes on one consistency field. A seeded rule derives its
+value and never touches the consistency map, so pairing it with an unseeded
+rule, a different seed or a different generator on the same field means one
+input can leave with two different values depending on which rule matched. The
+import reports it, because nothing in the output would.
+
+### Generated values and collisions
+
+`safe_email` used to produce roughly nine thousand possible addresses, a first
+name against three `example.` domains. That is small enough that a few hundred
+items produce repeats, and a repeat is not cosmetic: if the attribute is one a
+key is built from, two people collapse onto the same key and one row overwrites
+the other.
+
+Generated addresses now carry a derived suffix in the local part, so
+`alice@example.com` becomes something of the form
+`juvenal.3f2a91b8c4d5e6f7@example.com`. It is still an address, and the space
+is around 1.7e23.
+
+That is a probabilistic bound rather than a guarantee. Duplicates become
+likely far sooner than the size of the space suggests, so the number matters:
+a shorter suffix would still give roughly a one in a hundred chance of some
+duplicate across a million distinct inputs, which is an ordinary export. The
+import counts collisions either way, because a merged identity is silent.
+
+The other generators keep their pools. `word`, `first_name` and the rest are
+small, so prefer `hash` or a seeded `safe_email` for anything a key is built
+from.
 
 ## Options
 

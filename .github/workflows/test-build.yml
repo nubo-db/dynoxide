@@ -64,6 +64,14 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cargo zigbuild --release --target ${{ matrix.target }} --features full
 
+      # The release path checks this too, but only once a tag exists. Doing it
+      # here means a wrongly stamped binary fails on the PR that caused it.
+      - name: Check the built binary reports the product version
+        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.archive == 'tar.gz'
+        run: |
+          DYNOXIDE_BIN="target/${{ matrix.target }}/release/dynoxide" \
+            scripts/check-versions.sh "" --built
+
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |

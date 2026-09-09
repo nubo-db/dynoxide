@@ -33,7 +33,13 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # Check out the tag being published, not the default branch. The binaries
+      # come from that tag's release assets, so taking publish.sh and the
+      # package templates from wherever main happens to be would pair a tagged
+      # binary with drifted packaging metadata.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-node@v5
         with:
@@ -168,7 +174,10 @@ jobs:
           ENGINE_VERSION: ${{ steps.version.outputs.engine_version }}
         run: |
           if npm view "@dynoxide/wasm-engine@$ENGINE_VERSION" version >/dev/null 2>&1; then
-            echo "::notice::@dynoxide/wasm-engine@$ENGINE_VERSION already published; skipping."
+            # npm versions are immutable, so a wrong one already published
+            # cannot be repaired by publishing the same number again. Say
+            # plainly what was and was not established.
+            echo "::notice::@dynoxide/wasm-engine@$ENGINE_VERSION already published; skipping. Its contents were not verified: an npm version is immutable, so if it is wrong it needs a new version."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -195,16 +204,16 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           # This is the manual-dispatch path's version guard, and it is the only one
-          # that path has. build-wasm.sh stamps manifest.engineVersion from
-          # Cargo.toml verbatim, so on a TAG release, where release.yml validate has
-          # already pinned Cargo.toml to the tag, this check is redundant with
+          # that path has. build-wasm.sh stamps manifest.engineVersion from the
+          # VERSION file verbatim, so on a TAG release, where release.yml validate
+          # has already pinned VERSION to the tag, this check is redundant with
           # validate. On a workflow_dispatch run validate never executes, while the
-          # checkout below uses `ref: inputs.tag` -- so a tag whose Cargo.toml
+          # checkout below uses `ref: inputs.tag` -- so a tag whose VERSION
           # disagrees is caught here and nowhere else. Do not delete it as dead
           # code on the strength of the tag path alone.
           MANIFEST_VERSION=$(node -p "require('./npm/wasm-engine/manifest.json').engineVersion")
           if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
-            echo "::error::engine manifest version ($MANIFEST_VERSION) != release version ($VERSION); is Cargo.toml bumped to $VERSION?"
+            echo "::error::engine manifest version ($MANIFEST_VERSION) != release version ($VERSION); is VERSION bumped to $VERSION?"
             exit 1
           fi
 

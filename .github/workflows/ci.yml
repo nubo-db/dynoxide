@@ -150,6 +150,12 @@ jobs:
       - name: Check for stale version pins and preview wording in docs
         run: scripts/check-stale-docs.sh
 
+      # Two version streams means more than one file can be left behind. This
+      # is cheap enough to run on every PR, which is the point: the alternative
+      # is finding out at tag time, when the tag is already pushed.
+      - name: Check version sources agree
+        run: scripts/check-versions.sh
+
       # Nothing built the docs, so broken intra-doc links accumulated unseen:
       # ten of them, half pointing at private items and half at cfg-gated ones
       # absent from the default build docs.rs renders. They degrade the

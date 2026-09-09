@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dynoxide import --data-model <onetable.json>` rebuilds keys from their
+  entity templates after anonymisation. Rules rewrite whole attribute values,
+  so in a single-table design a rule on `email` left the real address inside
+  `pk = "CUSTOMER#<email>"` and every GSI key built from it, while a rule on
+  `pk` itself replaced the whole value and lost the `CUSTOMER#` prefix. With a
+  data model loaded the importer resolves each item's entity, notes which of
+  `pk`, `sk` and the GSI keys are built from a template such as
+  `user#${email}`, applies the rules to the attributes, then renders those keys
+  again from the anonymised values. The prefix survives and key and attribute
+  agree by construction. A key is only rewritten when its template reproduces
+  the value the item arrived with; anything else is left alone and reported
+  once per entity and key, without quoting the value, since removing those
+  values is the point of the run. A rule that names a key attribute directly
+  wins over its template on the items it actually rewrote, taken from what the
+  rules did rather than from what their conditions predicted, and is reported. A rule that replaces an attribute a
+  key is built from with a constant (`redact`, `null`, `mask`) is reported
+  before any data is read, because every item of that entity would then render
+  the same key and overwrite the last; collisions are counted if the import
+  goes ahead. Templates follow OneTable's own forms, including dotted paths
+  and `${name:length:pad}` sort padding, while an unclosed `${` fails the
+  import rather than leaving a key silently unrebuilt.
+  An import that has rules but no data model now says in its warnings that
+  keys built from attributes keep their original values
+  ([#201](https://github.com/nubo-db/dynoxide/issues/201)).
+- **Breaking (Rust API):** `ImportCommand` gains a `data_model` field. It is a
+  plain struct with public fields, so every existing struct literal that built
+  one now fails to compile and needs `data_model: None` adding.
+- An import that would silently break the join between two entities now fails.
+  When two entities build the same key from the same template, an anonymised
+  attribute that template reads has to be in `[consistency] fields` or each
+  entity anonymises it independently and their keys stop agreeing. Every count
+  stays correct, every key stays well formed and every value is genuinely
+  fake, so nothing in the output says anything is wrong: the only symptom is
+  that a query for a customer's orders returns nothing. The model and the
+  rules together are enough to warn up front, but the failure waits until two
+  entities are seen to anonymise the same value differently. Pulling one
+  entity's slice still works, so does importing two entities that share
+  nothing, and so does a deterministic action such as `hash`, which keeps both
+  entities agreeing without any `[consistency]` entry. None of those has a
+  join to lose, and a check that fires on legitimate use earns a bypass flag. Nothing is persisted on the error path. Matching on the key and
+  its template rather than the attribute name keeps it off entities that
+  merely reuse a name, and an attribute no rule rewrites is not at risk. The
+  comparison is on the whole key rather than one attribute its template reads,
+  so two composite keys sharing only a component are left alone, and every
+  outcome for a key is kept rather than the first, so a break is found
+  whatever order the export is in. The field named in the advice is always a
+  top-level one, matching what `[consistency] fields` is keyed on. Past a
+  million distinct keys per template the check keeps comparing the keys it
+  holds and reports how many it could not take on, rather than going quiet
+  ([#202](https://github.com/nubo-db/dynoxide/issues/202)).
+- Anonymisation guidance changed: prefer `hash` for an attribute a key is
+  built from. `fake` draws from a small pool (`safe_email` has roughly nine
+  thousand possible values), so a few hundred items already produce repeats
+  and each one merges two identities onto one key; `mask` collides whenever
+  two values share their masked tail; `redact` collapses every item onto one
+  key; and `null` cannot render a key at all, so the most thorough-sounding
+  action is the one that leaves the most personal data in the keys. The
+  up-front warning names the actual consequence per action rather than calling
+  them all collapses, and the collision warning no longer asserts a cause it
+  has not established.
+- A rule `path` that starts with `#` is rejected. It looks like an expression
+  attribute name, the names table does not reach a path, and it previously
+  matched nothing at all, so the rule was silently inert.
+- An empty salt environment variable is rejected. It was accepted and produced
+  plain unsalted SHA-256, which is the shape an unset CI secret takes.
+- A OneTable index the table does not have, and a local secondary index, are
+  both reported rather than skipped in silence. Either left its key holding
+  the value it arrived with, and OneTable defaults an index name to its schema
+  key (`gs1`), which rarely matches the deployed index.
+- The broken-join check groups on the key attribute rather than the template
+  text, so the ordinary single-table join is covered: `CUSTOMER#${email}` and
+  `CUSTOMER#${customerEmail}` build the same partition from differently named
+  attributes. It also no longer counts a key that was left unrebuilt, which
+  turned a documented warning into a failure whose advice could not work.
+- An import that rebuilds keys now maintains secondary indexes on write.
+  Rebuilding can land two source items on one primary key, which is the
+  assumption the faster bulk path trades away: it skips the index
+  delete-before-insert, so an overwritten row left its old index entry behind
+  and a `Query` on that index answered from a row that no longer existed. An
+  import without `--data-model` takes keys from the export unchanged, cannot
+  collide, and keeps the faster path.
+
+### Fixed
+
+- A OneTable index whose hash key is a plain attribute no longer loses its
+  sort key template. The parser required a template on the hash attribute and
+  dropped the whole index without one, so a GSI hashing on something like a
+  tenant id and sorting on `user#${email}` disappeared from the model. That
+  reached the MCP data model, and on import it meant the sort key was never
+  rebuilt and kept the value it arrived with. An index the entity templates
+  neither key of is still skipped.
+- A OneTable schema whose primary key is not literally `pk` / `sk` now parses
+  its primary key templates. The parser read the model attributes named `pk`
+  and `sk` rather than the ones `indexes.primary` names, so a schema keyed on
+  `PK` / `SK` came back with an empty `pk_template`, which reached the MCP
+  data model as well as import.
+- Anonymisation rules take `values` and `names` tables, in the shape of
+  ExpressionAttributeValues and ExpressionAttributeNames, so a match
+  expression can be scoped by key prefix and can reach an attribute whose
+  name is a reserved word: `match = "begins_with(pk, :prefix)"` with
+  `values = { ":prefix" = "USER#" }`, and `#n` with
+  `names = { "#n" = "name" }`. Strings become `S`, integers and floats `N`,
+  booleans `BOOL`. The rules file is validated before any data is read: a
+  reference with nothing behind it, a name or value nothing references, a
+  non-finite float, and an operand of the wrong type for its function all
+  fail there with the messages DynamoDB gives for the equivalent request
+  ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
+
+- `docs/import.md` showed `begins_with(pk, 'USER#')` as a match expression,
+  which the rule parser rejected with a syntax error on the quote. The parser
+  only ever accepted `:name` references, and the code comment said so while
+  the docs promised otherwise. The example now uses the `values` table above
+  ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
+
 ## [1.1.0] - 2026-09-03
 
 ### Behaviour changes

@@ -248,6 +248,12 @@ struct ImportArgs {
     #[arg(long)]
     rules: Option<std::path::PathBuf>,
 
+    /// OneTable schema whose entity key templates rebuild pk, sk and GSI keys after anonymisation
+    ///
+    /// Also serves as the MCP data model when --mcp is set without --mcp-data-model.
+    #[arg(long, value_name = "PATH")]
+    data_model: Option<std::path::PathBuf>,
+
     /// Comma-separated list of table names to import (default: all)
     #[arg(long, value_delimiter = ',')]
     tables: Option<Vec<String>>,
@@ -914,6 +920,7 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
         output: args.output.clone(),
         schema: args.schema.clone(),
         rules: args.rules.clone(),
+        data_model: args.data_model.clone(),
         tables: args.tables.clone(),
         compress: args.compress,
         force: args.force,
@@ -951,7 +958,8 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         if wants_serve && wants_mcp {
             use tokio_util::sync::CancellationToken;
 
-            let mcp_data_model = load_data_model(args.mcp_data_model.as_ref())?;
+            let mcp_data_model =
+                load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
             let mcp_config = dynoxide::mcp::McpConfig {
                 read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
@@ -999,7 +1007,8 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
 
         #[cfg(feature = "mcp-server")]
         if wants_mcp {
-            let mcp_data_model = load_data_model(args.mcp_data_model.as_ref())?;
+            let mcp_data_model =
+                load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
             let mcp_config = dynoxide::mcp::McpConfig {
                 data_model: mcp_data_model,
                 ..Default::default()

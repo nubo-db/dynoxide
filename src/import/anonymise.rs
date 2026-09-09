@@ -20,15 +20,20 @@ use sha2::{Digest, Sha256};
 
 /// Apply all matching rules to an item, mutating it in place.
 ///
-/// Returns a list of warnings (e.g., key attribute collision risks).
+/// Returns the warnings raised (e.g. key attribute collision risks) and the
+/// top-level attributes actually rewritten. The caller needs the second to
+/// know which keys a rule has taken over: predicting it from the rules is
+/// wrong, because each rule's condition sees the item as the rules before it
+/// left it, not as it arrived.
 pub fn apply_rules(
     item: &mut Item,
     rules: &[ValidatedRule],
     consistency_map: &mut ConsistencyMap,
     consistency_fields: &std::collections::HashSet<String>,
     key_attrs: &[String],
-) -> Vec<String> {
+) -> (Vec<String>, std::collections::HashSet<String>) {
     let mut warnings = Vec::new();
+    let mut rewritten = std::collections::HashSet::new();
 
     for rule in rules {
         if !matches_item(rule, item) {
@@ -79,12 +84,17 @@ pub fn apply_rules(
         }
 
         // Apply the new value
-        if let Err(e) = set_path(item, &rule.path, new_value) {
-            warnings.push(format!("failed to set path '{}': {e}", field_name));
+        match set_path(item, &rule.path, new_value) {
+            Ok(()) => {
+                rewritten.insert(field_name);
+            }
+            Err(e) => {
+                warnings.push(format!("failed to set path '{}': {e}", field_name));
+            }
         }
     }
 
-    warnings
+    (warnings, rewritten)
 }
 
 /// Extract the top-level field name from a path.

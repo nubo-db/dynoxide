@@ -56,4 +56,6 @@ dynoxide serve --mcp --mcp-data-model schema.json
 
 ## Important
 
-The data model is context-only. Dynoxide does not validate writes against the schema. The MCP instructions note this explicitly so agents don't assume enforcement.
+The data model is context-only for MCP. Dynoxide does not validate writes against the schema. The MCP instructions note this explicitly so agents don't assume enforcement.
+
+The same file has one active use: `dynoxide import --data-model` rebuilds keys from their entity templates after anonymisation, so a rule on `email` also rewrites `user#${email}`. See [import.md](import.md#single-table-designs).

@@ -16,9 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data changed. Without it the previous per-run randomness stands, so existing
   rules files are unaffected. A seeded rule does not need its field listed in
   `[consistency]`, because the derivation already guarantees one input maps to
-  one output. An empty variable is rejected, as it is for the hash salt and for
-  the same reason: the seed is what stops anyone holding the original data
-  reproducing the mapping
+  one output. An empty variable is rejected: the seed is what stops anyone
+  holding the original data reproducing the mapping, so it needs to be a
+  randomly generated value rather than a memorable one.
+
+  Two limits are stated rather than glossed. The promise holds for a fixed
+  build, because neither the random stream nor the generator word lists
+  guarantee identical output across dependency upgrades. And only scalar
+  values are derived: a map, list or set has no stable byte order to hash, so
+  those draw fresh even with a seed set rather than claim a repeatability they
+  cannot deliver. Mixing rule shapes on one consistency field is reported,
+  since a seeded rule bypasses the map an unseeded one depends on
   ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
 
 ### Fixed
@@ -30,9 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse onto the same key and one row overwrites the other, which was
   measured at four collisions in three hundred items. Generated addresses now
   carry a derived suffix in the local part, which keeps them recognisably
-  addresses and takes the space past a hundred billion. The other generators
-  keep their pools, so `word`, `first_name` and the rest remain unsuitable for
-  an attribute a key is built from.
+  addresses and takes the space to around 1.7e23. That is a probabilistic
+  bound and not a guarantee, which is why the suffix is a full 64 bits: a
+  shorter one would still give roughly a one in a hundred chance of some
+  duplicate across a million distinct inputs, an ordinary export size. The
+  collision counter stays as the backstop. The other generators keep their
+  pools, so `word`, `first_name` and the rest remain unsuitable for an
+  attribute a key is built from.
 
 ## [1.1.0] - 2026-09-03
 

@@ -986,4 +986,111 @@ fields = ["email"]
             .unwrap();
         assert_eq!(scan.count, 2);
     }
+
+    #[test]
+    fn test_mixed_rules_on_a_consistency_field_are_reported() {
+        // A seeded fake derives its value and skips the consistency map, so
+        // pairing it with an unseeded rule on the same field means one input
+        // can leave with two values. Nothing in the output shows that.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "U#1"}, "sk": {"S": "P"}, "email": {"S": "a@x.co"}, "vip": {"BOOL": true}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe { std::env::set_var("TEST_MIXED_SEED", "s3cret") };
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(vip)"
+path = "email"
+action = { type = "fake", generator = "safe_email", seed_env = "TEST_MIXED_SEED" }
+
+[[rules]]
+match = "attribute_not_exists(vip)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+
+[consistency]
+fields = ["email"]
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("out.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+        })
+        .unwrap();
+
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("'email'") && w.contains("do not agree")),
+            "expected the mixed-rule warning: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn test_consistent_rules_on_a_consistency_field_are_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "Users",
+            &[r#"{"Item": {"pk": {"S": "U#1"}, "sk": {"S": "P"}, "email": {"S": "a@x.co"}}}"#],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+
+[consistency]
+fields = ["email"]
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("out.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+        })
+        .unwrap();
+
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("do not agree")),
+            "one rule shape should not warn: {:?}",
+            summary.warnings
+        );
+    }
 }

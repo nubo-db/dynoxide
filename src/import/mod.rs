@@ -168,6 +168,14 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         .unwrap_or_default();
     let mut consistency_map = ConsistencyMap::new();
 
+    // A seeded fake derives its value and does not populate the consistency
+    // map, because it does not need to. That only holds while every rule
+    // writing a given field agrees: mix a seeded rule with an unseeded one, or
+    // two different seeds or generators, and the same input can leave with two
+    // different values depending on which rule matched. Nothing downstream
+    // would show that, so say it here.
+    let mixed = mixed_consistency_rules(&rules, &consistency_fields);
+
     // 2. Load table schemas (returns both parsed schemas and raw JSON)
     let (schemas, schema_json) = schema::load_schemas(&cmd.schema)?;
     eprintln!(
@@ -225,6 +233,10 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         warnings: Vec::new(),
         output_path: cmd.output.clone(),
     };
+
+    for message in mixed {
+        summary.warnings.push(message);
+    }
 
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
@@ -504,6 +516,52 @@ fn unwrap_describe_table_shapes(table: &mut serde_json::Value) {
             }
         }
     }
+}
+
+/// Consistency fields written by rules that do not agree on how they generate.
+///
+/// Returns one message per offending field. A field is fine when every rule
+/// targeting it uses the same action shape; it is not when a seeded fake sits
+/// beside an unseeded one, or beside a different seed or generator, because
+/// the seeded rule bypasses the map the other one depends on.
+fn mixed_consistency_rules(
+    rules: &[config::ValidatedRule],
+    consistency_fields: &HashSet<String>,
+) -> Vec<String> {
+    use crate::expressions::PathElement;
+
+    let mut messages = Vec::new();
+    for field in consistency_fields {
+        let mut shapes: Vec<String> = rules
+            .iter()
+            .filter(|rule| {
+                matches!(rule.path.first(), Some(PathElement::Attribute(name)) if name == field)
+            })
+            .map(|rule| match &rule.action {
+                config::ValidatedAction::Fake { generator, seed } => {
+                    let seeded = if seed.is_some() { "seeded" } else { "unseeded" };
+                    format!("{seeded} fake '{generator}'")
+                }
+                other => format!("{other:?}")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("action")
+                    .to_lowercase(),
+            })
+            .collect();
+        shapes.sort();
+        shapes.dedup();
+        if shapes.len() > 1 {
+            messages.push(format!(
+                "'{field}' is in [consistency] fields but its rules do not agree on how they \
+                 generate ({}). A seeded fake derives its value and does not use the consistency \
+                 map, so mixing it with anything else can give one input two different values",
+                shapes.join(", ")
+            ));
+        }
+    }
+    messages.sort();
+    messages
 }
 
 /// Extract key attribute names from a CreateTableRequest.

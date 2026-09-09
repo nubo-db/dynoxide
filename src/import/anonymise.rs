@@ -185,10 +185,13 @@ fn seeded_rng(generator: &str, original: &AttributeValue, seed: Option<&Salt>) -
                 AttributeValue::S(s) => field(b's', s.as_bytes()),
                 AttributeValue::N(n) => field(b'n', n.as_bytes()),
                 AttributeValue::B(b) => field(b'b', b),
-                other => {
-                    let json = serde_json::to_string(other).unwrap_or_default();
-                    field(b'j', json.as_bytes());
-                }
+                // Anything else is a map, a list or a set, and their
+                // serialised bytes are not stable: `AttributeValue::M` holds a
+                // HashMap, so one value can serialise two ways and derive two
+                // different pseudonyms. Falling back to entropy is honest
+                // about that, where hashing an unstable encoding would claim a
+                // determinism it does not have.
+                _ => return StdRng::from_entropy(),
             }
             let digest = hasher.finalize();
             let mut bytes = [0u8; 32];
@@ -205,13 +208,18 @@ fn seeded_rng(generator: &str, original: &AttributeValue, seed: Option<&Salt>) -
 /// `SafeEmail` draws a first name from about three thousand, across three
 /// `example.` domains, so roughly nine thousand values in total. That is small
 /// enough that a few hundred items collide, and a collision on an attribute a
-/// key is built from merges two identities onto one row. Eight hex characters
-/// take it past a hundred billion, which is not a guarantee but is far past
-/// the point where it happens in practice.
+/// key is built from merges two identities onto one row.
+///
+/// Sixteen hex characters take the space to roughly 1.7e23. That is a
+/// probabilistic bound, not a guarantee: a 32-bit suffix would still give
+/// about a one in a hundred chance of some duplicate across a million
+/// distinct inputs, which is an ordinary export size. The importer's collision
+/// counter stays as the backstop either way, because a merged identity is
+/// silent.
 fn widen_email(address: String, rng: &mut StdRng) -> String {
-    let discriminator: u32 = rng.r#gen();
+    let discriminator: u64 = rng.r#gen();
     match address.split_once('@') {
-        Some((local, domain)) => format!("{local}.{discriminator:08x}@{domain}"),
+        Some((local, domain)) => format!("{local}.{discriminator:016x}@{domain}"),
         // Not an address after all; leave it rather than corrupt it.
         None => address,
     }
@@ -389,20 +397,72 @@ mod tests {
         // generator name also selects the generator, and the original's type
         // also picks the returned variant, so comparing generated values would
         // pass whether or not the derivation kept its fields apart.
+        let text = |v: &str| AttributeValue::S(v.into());
 
-        // Without length prefixes both of these hash "ab" + "word" + "x".
+        // Length prefixes. With tags but no lengths both of these feed the
+        // hasher the identical byte string
+        // "k" "a" "g" "words" "s" "x" ... run together.
         assert_ne!(
-            derived("word", &AttributeValue::S("x".into()), &seed("ab")),
-            derived("bword", &AttributeValue::S("x".into()), &seed("a")),
-            "seed and generator boundaries must be unambiguous"
+            derived("word", &text("gsafe_emailsx"), &seed("a")),
+            derived("safe_email", &text("x"), &seed("agwords")),
+            "field lengths must be part of the input"
         );
 
-        // Without a type tag these hash the same bytes.
+        // Type tags. Without them these hash the same bytes.
         let s = seed("a-secret");
         assert_ne!(
-            derived("word", &AttributeValue::S("123".into()), &s),
+            derived("word", &text("123"), &s),
             derived("word", &AttributeValue::N("123".into()), &s),
             "the attribute type is part of the input"
+        );
+
+        // The generator itself must reach the hash, not merely select the
+        // generator function.
+        assert_ne!(
+            derived("word", &text("x"), &s),
+            derived("safe_email", &text("x"), &s),
+            "the generator name is part of the input"
+        );
+    }
+
+    #[test]
+    fn the_email_suffix_is_a_full_64_bits() {
+        // A weaker suffix still produces distinct values across a small
+        // sample, so counting uniques cannot establish the width. Read the
+        // suffix instead.
+        let s = seed("a-secret");
+        match generate_fake("safe_email", &AttributeValue::S("a@b.c".into()), Some(&s)) {
+            AttributeValue::S(v) => {
+                let (local, _) = v.split_once('@').expect("an address");
+                let suffix = local.rsplit('.').next().expect("a suffix");
+                assert_eq!(suffix.len(), 16, "expected 16 hex characters in {v}");
+                assert!(
+                    suffix.chars().all(|c| c.is_ascii_hexdigit()),
+                    "expected hex in {v}"
+                );
+            }
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_value_whose_bytes_are_not_stable_does_not_claim_determinism() {
+        // A map serialises in HashMap order, so hashing it would derive a
+        // different pseudonym for the same value on a different run. Better to
+        // draw fresh than to promise a stability that is not there.
+        let s = seed("a-secret");
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), AttributeValue::S("x".to_string()));
+        map.insert("b".to_string(), AttributeValue::S("y".to_string()));
+        let value = AttributeValue::M(map);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(format!("{:?}", generate_fake("word", &value, Some(&s))));
+        }
+        assert!(
+            seen.len() > 1,
+            "a non-scalar should draw fresh rather than pretend to be deterministic"
         );
     }
 
@@ -436,11 +496,18 @@ mod tests {
     }
 
     #[test]
-    fn a_non_address_generator_is_not_mangled_by_widening() {
+    fn a_non_address_generator_is_left_exactly_as_the_generator_produced_it() {
+        // Asserting only "no @ in it" would pass for an empty string or for a
+        // word with digits stapled on. Compare against the generator driven by
+        // an identically derived stream instead.
         let s = seed("a-secret");
-        let v = generate_fake("word", &AttributeValue::S("x".to_string()), Some(&s));
-        match v {
-            AttributeValue::S(w) => assert!(!w.contains('@'), "word should stay a word: {w}"),
+        let original = AttributeValue::S("x".to_string());
+        let expected: String = Word().fake_with_rng(&mut seeded_rng("word", &original, Some(&s)));
+
+        match generate_fake("word", &original, Some(&s)) {
+            AttributeValue::S(w) => {
+                assert_eq!(w, expected, "widening must not touch a non-address")
+            }
             other => panic!("expected a string, got {other:?}"),
         }
     }
@@ -452,9 +519,9 @@ mod tests {
             &AttributeValue::S("old@example.com".to_string()),
             None,
         );
-        matches!(result, AttributeValue::S(_));
+        assert!(matches!(result, AttributeValue::S(_)), "got {result:?}");
 
         let result = generate_fake("name", &AttributeValue::N("42".to_string()), None);
-        matches!(result, AttributeValue::N(_));
+        assert!(matches!(result, AttributeValue::N(_)), "got {result:?}");
     }
 }

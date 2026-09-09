@@ -88,10 +88,9 @@ ANON_SALT=my-secret-salt dynoxide import \
 
 | Action | Description |
 |--------|-------------|
-| `fake` | Replace with generated data (`safe_email`, `name`, `phone_number`, `address`, `company_name`, `sentence`, `word`, `first_name`, `last_name`) |
+| `fake` | Replace with generated data (`safe_email`, `name`, `phone_number`, `address`, `company_name`, `sentence`, `word`, `first_name`, `last_name`). Takes an optional `seed_env`, below |
 | `mask` | Keep last N characters, mask the rest (`keep_last`, `mask_char`) |
 | `hash` | SHA-256 hash with salt from env var (`salt_env`, required) |
-| | `fake` also takes an optional `seed_env`, below |
 | `redact` | Replace with `[REDACTED]` |
 | `null` | Replace with NULL |
 
@@ -246,14 +245,14 @@ merely reuse a name: `account#${id}` and `project#${id}` are different
 entities' own ids and never had a join. An attribute no rule rewrites is left
 alone too, since its keys still agree.
 
-**Prefer `hash` for an attribute a key is built from.** The other actions all
-go wrong in their own way, and the importer names which before it reads any
-data:
+**Prefer `hash`, or a seeded `safe_email`, for an attribute a key is built
+from.** The other actions each go wrong in their own way, and the importer
+warns about the three that collapse before it reads any data:
 
 | Action | What it does to a key built from it |
 |---|---|
 | `hash` | Same input gives the same output, so keys agree and rows stay distinct. The safe choice. |
-| `fake` | Draws from a small pool. `safe_email` has about nine thousand possible values, so a few hundred people already produce repeats, and each repeat merges two identities onto one key. |
+| `fake` | Depends on the generator. `safe_email` carries a derived suffix, so repeats are unlikely at ordinary sizes (a probabilistic bound, covered under [Generated values and collisions](#generated-values-and-collisions)). `word`, `first_name` and the rest draw from small pools, so a few hundred people already produce repeats, and each repeat merges two identities onto one key. Without a `seed_env` every entity also draws independently, so a value two entities share has to be in `[consistency] fields` or they stop joining. |
 | `mask` | Two values that share their last few characters mask to the same text, so they collide too. |
 | `redact` | Every item renders the same key and overwrites the last. |
 | `null` | The key cannot render at all, so every item keeps the value it arrived with. The most thorough-sounding action leaves the most personal data in the keys. |
@@ -354,13 +353,13 @@ import reports it, because nothing in the output would.
 
 ### Generated values and collisions
 
-`safe_email` used to produce roughly nine thousand possible addresses, a first
-name against three `example.` domains. That is small enough that a few hundred
-items produce repeats, and a repeat is not cosmetic: if the attribute is one a
-key is built from, two people collapse onto the same key and one row overwrites
-the other.
+On its own the `safe_email` generator has roughly nine thousand possible
+addresses, a first name against three `example.` domains. That is small enough
+that a few hundred items produce repeats, and a repeat is not cosmetic: if the
+attribute is one a key is built from, two people collapse onto the same key and
+one row overwrites the other.
 
-Generated addresses now carry a derived suffix in the local part, so
+Generated addresses therefore carry a derived suffix in the local part, so
 `alice@example.com` becomes something of the form
 `juvenal.3f2a91b8c4d5e6f7@example.com`. It is still an address, and the space
 is around 1.7e23.

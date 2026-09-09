@@ -473,9 +473,10 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     "table '{}': {} items rendered the same primary key as an earlier item and \
                      overwrote it, so the output holds fewer rows than the export. Either a \
                      rule is replacing an attribute a key is built from with a constant, or a \
-                     fake generator is drawing the same value twice: its output space is small \
-                     enough that repeats are ordinary at a few hundred items, so prefer hash \
-                     for an attribute a key is built from",
+                     fake generator is drawing the same value twice: every generator except \
+                     safe_email draws from a pool small enough that repeats are ordinary at a \
+                     few hundred items, so prefer hash or a seeded safe_email for an attribute \
+                     a key is built from",
                     table_name, collisions
                 ));
             }

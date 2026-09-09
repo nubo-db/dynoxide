@@ -91,13 +91,30 @@ jobs:
                 bin.install "dynoxide"
               end
               test do
-                assert_match version.to_s, shell_output("#{bin}/dynoxide --version")
+                assert_equal "dynoxide #{version}", shell_output("#{bin}/dynoxide --version").strip
               end
             end
           FORMULA
           echo "Generated formula:"
           cat formula.rb
           
+      # Same pre-push check as the release path: the formula's own test block
+      # is never executed by this workflow either.
+      - name: Check the released binary reports the formula's version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/nubo-db/dynoxide/releases/download/v${VERSION}"
+          curl -fsSL "${BASE}/dynoxide-x86_64-unknown-linux-musl.tar.gz" -o probe.tar.gz
+          tar xzf probe.tar.gz
+          actual="$(./dynoxide --version | tr -d '\r')"
+          echo "released binary reports: $actual"
+          if [ "$actual" != "dynoxide $VERSION" ]; then
+            echo "::error::released binary reports '$actual', formula would declare $VERSION. Not updating the tap."
+            exit 1
+          fi
+
       - name: Push formula to tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

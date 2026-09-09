@@ -117,7 +117,17 @@ pub use storage::{DatabaseInfo, TableInfoEntry, TableMetadata, TableStats};
 pub use storage_backend::BackendError;
 #[cfg(feature = "wasm-sqlite")]
 pub use storage_backend::WasmBridgeBackend;
+
 pub use types::{AttributeValue, ConversionError, Item};
+
+/// The product version: what `dynoxide --version`, the HTTP headers and the
+/// MCP server report, and what the CLI, containers, browser engine and npm
+/// packages are released under.
+///
+/// Deliberately not the crate version. The crate moves on its own stream for
+/// Rust API changes, which a CLI or container user never consumes. See
+/// `docs/versioning.md`.
+pub const PRODUCT_VERSION: &str = env!("DYNOXIDE_PRODUCT_VERSION");
 
 use actions::vector_lifecycle::VectorIndexLifecycle;
 

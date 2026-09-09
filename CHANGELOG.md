@@ -123,6 +123,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the docs promised otherwise. The example now uses the `values` table above
   ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
 
+||||||| 90a93e4
+- **The crate version and the product version are now separate streams.**
+  `VERSION` at the repository root holds the product version and the release
+  tag carries it; `Cargo.toml` holds the crate version and nothing else reads
+  it. Everything a user installs reports the product version, including
+  `dynoxide --version`, the `x-dynoxide-version` and `Server` headers and the
+  MCP server info, all of which previously reported the crate version. A build
+  script supplies it, so `cargo install` and a build from a source archive
+  report the same number as a release build.
+
+  The reason is that a Rust API change forced a major on the CLI, the npm
+  packages, the browser engine, the container images, the MCPB bundle, the MCP
+  registry entry, the Action and the Homebrew formula, none of whose users
+  touch that API. Beyond the noise, a major strands everyone on the default npm
+  caret and the floating `dynoxide:1` tag, which is the cost
+  `docs/versioning.md` already cites when explaining why conformance fixes ship
+  as minors.
+
+  Note that `cargo install dynoxide-rs --version` now selects the crate
+  version, not the product one. crates.io has its own README explaining that.
+- `scripts/check-versions.sh` validates every version-bearing source against
+  the stream it belongs to, and runs in ordinary PR CI, `test-build`,
+  preflight and release. These checks previously existed only at tag time,
+  when the tag has already been pushed.
+
+### Fixed
+
+- The container image is version-probed before it is pushed to GHCR, not only
+  after. The published probe stays, since it checks what the registry serves.
+- The generated Homebrew formula carries a test block that neither publisher
+  ever ran, so a formula whose binary reported the wrong version could reach
+  the tap unchallenged. Both paths now download the released binary and check
+  it before the tap moves, and the formula's own test compares exactly rather
+  than by substring.
+- The website is no longer notified until both npm packages are live. Waiting
+  on the CLI package alone let a browser publish failure pass unnoticed.
+- Prereleases were broken in three places. The CLI publisher passed no npm
+  dist-tag, and npm refuses a bare prerelease publish, so a prerelease release
+  half-published. The site then waited on `latest`, which a prerelease never
+  reaches. And the GitHub Action rejected prerelease versions outright,
+  making it the only path that could not install a version the project can
+  actually ship.
+- `npm/scripts/publish.sh` refuses a `--version` and `--release-url` that name
+  different tags, which previously let a caller pair a version with an
+  unrelated release's binaries.
+- The npm publish job checks out the tag being published rather than the
+  default branch, so packaging metadata cannot drift from the binaries it
+  ships alongside.
 ## [1.1.0] - 2026-09-03
 
 ### Behaviour changes

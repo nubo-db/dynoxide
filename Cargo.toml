@@ -1,13 +1,13 @@
 [package]
 name = "dynoxide-rs"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
 description = "An embeddable DynamoDB emulator backed by SQLite. Starts in under a millisecond, and is verified against real AWS by a public conformance suite."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nubo-db/dynoxide"
 homepage = "https://github.com/nubo-db/dynoxide"
 documentation = "https://docs.rs/dynoxide-rs"
-readme = "README.md"
+readme = "README-crate.md"
 keywords = ["dynamodb", "sqlite", "emulator", "aws", "testing"]
 categories = ["database-implementations", "emulators"]
 rust-version = "1.88"

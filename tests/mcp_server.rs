@@ -105,6 +105,11 @@ fn test_initialize() {
     let resp = init_mcp(&mut child);
 
     assert_eq!(resp["result"]["serverInfo"]["name"], "dynoxide");
+    assert_eq!(
+        resp["result"]["serverInfo"]["version"],
+        dynoxide::PRODUCT_VERSION,
+        "MCP reports the product version, not the crate version"
+    );
     assert!(resp["result"]["capabilities"]["tools"].is_object());
     assert!(
         resp["result"]["instructions"]

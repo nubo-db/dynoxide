@@ -63,9 +63,12 @@ runs:
           exit 1
         fi
 
-        # Validate version format (vX.Y.Z or "latest")
-        if [ "$VERSION" != "latest" ] && ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "::error::Invalid version: '$VERSION'. Must be 'latest' or vX.Y.Z (e.g., v0.9.1)."
+        # Validate version format (vX.Y.Z, optionally with a prerelease
+        # suffix, or "latest"). The release pipeline can publish a prerelease,
+        # so rejecting one here made this the only path that could not install
+        # a version the project had actually shipped.
+        if [ "$VERSION" != "latest" ] && ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "::error::Invalid version: '$VERSION'. Must be 'latest' or vX.Y.Z, optionally with a -prerelease suffix (e.g., v1.2.0 or v1.2.0-rc.1)."
           exit 1
         fi
 

@@ -23,8 +23,9 @@ use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
+
     name = "dynoxide",
-    version,
+    version = dynoxide::PRODUCT_VERSION,
     about = "A fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite",
     after_help = after_help_text(),
     args_conflicts_with_subcommands = true,

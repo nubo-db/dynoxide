@@ -85,10 +85,63 @@ ANON_SALT=my-secret-salt dynoxide import \
 | `fake` | Replace with generated data (`safe_email`, `name`, `phone_number`, `address`, `company_name`, `sentence`, `word`, `first_name`, `last_name`) |
 | `mask` | Keep last N characters, mask the rest (`keep_last`, `mask_char`) |
 | `hash` | SHA-256 hash with salt from env var (`salt_env`, required) |
+| | `fake` also takes an optional `seed_env`, below |
 | `redact` | Replace with `[REDACTED]` |
 | `null` | Replace with NULL |
 
 **Consistency:** Fields listed in `[consistency].fields` produce the same anonymised value across all tables in a single import run. Same input + same salt = same output.
+
+### Making `fake` repeatable
+
+By default `fake` draws a new value every time it runs, so importing the same
+export twice gives two different sets of names and addresses. That is fine for
+a throwaway database and awkward for one committed as a test fixture, where
+every refresh rewrites values that did not change and buries any real
+difference in churn.
+
+Give the rule a `seed_env` and the generated value becomes a function of the
+original:
+
+```toml
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email", seed_env = "ANON_SEED" }
+```
+
+```sh
+ANON_SEED=a-secret-value dynoxide import ...
+```
+
+The same input and the same seed give the same output on every run, so a
+fixture only changes where the source data did. A different seed gives an
+entirely different mapping.
+
+**The seed is a secret, for the same reason the hash salt is.** Without it,
+anyone holding the original data could re-run the import and reproduce the
+mapping from real value to fake one, which undoes the anonymisation. An empty
+variable is rejected rather than accepted quietly, since that is the shape an
+unset CI secret takes.
+
+A seeded rule does not need its field in `[consistency]`. The derivation
+already guarantees one input maps to one output everywhere.
+
+### Generated values and collisions
+
+`safe_email` used to produce roughly nine thousand possible addresses, a first
+name against three `example.` domains. That is small enough that a few hundred
+items produce repeats, and a repeat is not cosmetic: if the attribute is one a
+key is built from, two people collapse onto the same key and one row overwrites
+the other.
+
+Generated addresses now carry a derived suffix in the local part, so
+`alice@example.com` becomes something of the form
+`juvenal.3f2a91b8@example.com`. It is still an address, and there is enough
+room that repeats do not happen at any realistic size.
+
+The other generators keep their pools. `word`, `first_name` and the rest are
+small, so prefer `hash` or a seeded `safe_email` for anything a key is built
+from.
 
 ## Options
 

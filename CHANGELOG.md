@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `fake` rules take an optional `seed_env`, naming an environment variable
+  holding a secret. With it the generated value becomes a function of the
+  original, so the same input gives the same output on every run and an
+  anonymised export committed as a test fixture only changes where the source
+  data changed. Without it the previous per-run randomness stands, so existing
+  rules files are unaffected. A seeded rule does not need its field listed in
+  `[consistency]`, because the derivation already guarantees one input maps to
+  one output. An empty variable is rejected, as it is for the hash salt and for
+  the same reason: the seed is what stops anyone holding the original data
+  reproducing the mapping
+  ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
+
+### Fixed
+
+- Generated email addresses no longer collide at ordinary sizes.
+  `safe_email` drew from roughly nine thousand values, a first name against
+  three `example.` domains, so a few hundred items produced repeats. A repeat
+  is not cosmetic: where the attribute is one a key is built from, two people
+  collapse onto the same key and one row overwrites the other, which was
+  measured at four collisions in three hundred items. Generated addresses now
+  carry a derived suffix in the local part, which keeps them recognisably
+  addresses and takes the space past a hundred billion. The other generators
+  keep their pools, so `word`, `first_name` and the rest remain unsuitable for
+  an attribute a key is built from.
+
 ## [1.1.0] - 2026-09-03
 
 ### Behaviour changes

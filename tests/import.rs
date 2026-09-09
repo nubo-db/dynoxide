@@ -1010,7 +1010,9 @@ fields = ["email"]
                     {"AttributeName": "pk", "AttributeType": "S"},
                     {"AttributeName": "sk", "AttributeType": "S"},
                     {"AttributeName": "gs1pk", "AttributeType": "S"},
-                    {"AttributeName": "gs1sk", "AttributeType": "S"}
+                    {"AttributeName": "gs1sk", "AttributeType": "S"},
+                    {"AttributeName": "gs2pk", "AttributeType": "S"},
+                    {"AttributeName": "gs2sk", "AttributeType": "S"}
                 ],
                 "GlobalSecondaryIndexes": [
                     {
@@ -1020,6 +1022,14 @@ fields = ["email"]
                             {"AttributeName": "gs1sk", "KeyType": "RANGE"}
                         ],
                         "Projection": {"ProjectionType": "ALL"}
+                    },
+                    {
+                        "IndexName": "GSI2",
+                        "KeySchema": [
+                            {"AttributeName": "gs2pk", "KeyType": "HASH"},
+                            {"AttributeName": "gs2sk", "KeyType": "RANGE"}
+                        ],
+                        "Projection": {"ProjectionType": "KEYS_ONLY"}
                     }
                 ]
             }
@@ -1365,7 +1375,7 @@ action = { type = "redact" }
             summary
                 .warnings
                 .iter()
-                .any(|w| w.contains("collapse onto one row")),
+                .any(|w| w.contains("overwrites the last")),
             "expected the up-front constant-action warning: {:?}",
             summary.warnings
         );
@@ -1717,5 +1727,112 @@ fields = ["email"]
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_a_rebuilt_key_collision_across_batches_leaves_no_stale_index_row() {
+        // Two items in separate export files collapse onto one primary key
+        // once their redacted email is rebuilt into it, but keep distinct GSI
+        // keys. The overwritten item's index row must go with it, or a GSI
+        // query answers from a base row that no longer exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        let model_file = tmp.path().join("model.json");
+
+        let data_dir = source.join("App").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        for (file, email, order) in [
+            ("00000000.json", "a@x.co", "1"),
+            ("00000001.json", "b@y.co", "2"),
+        ] {
+            std::fs::write(
+                data_dir.join(file),
+                format!(
+                    r#"{{"Item": {{"_type": {{"S": "Order"}}, "pk": {{"S": "CUSTOMER#{email}"}}, "sk": {{"S": "ORDER"}}, "gs1pk": {{"S": "ORDER#{order}"}}, "gs1sk": {{"S": "ORDER"}}, "email": {{"S": "{email}"}}, "orderId": {{"S": "{order}"}}}}}}"#
+                ) + "\n",
+            )
+            .unwrap();
+        }
+
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &model_file,
+            r#"{
+                "format": "onetable:1.1.0",
+                "indexes": {
+                    "primary": { "hash": "pk", "sort": "sk" },
+                    "gs1": { "hash": "gs1pk", "sort": "gs1sk", "name": "GSI1" }
+                },
+                "params": { "typeField": "_type" },
+                "models": {
+                    "Order": {
+                        "pk": { "type": "string", "value": "CUSTOMER#${email}" },
+                        "sk": { "type": "string", "value": "ORDER" },
+                        "gs1pk": { "type": "string", "value": "ORDER#${orderId}" },
+                        "gs1sk": { "type": "string", "value": "ORDER" },
+                        "email": { "type": "string" },
+                        "orderId": { "type": "string" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(model_file),
+        })
+        .unwrap();
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("rendered the same primary key")),
+            "the collapse should still be reported: {:?}",
+            summary.warnings
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let base = scan_all(&db, "App");
+        assert_eq!(base.len(), 1, "the two collapsed onto one row");
+
+        let indexed = db
+            .scan(dynoxide::actions::scan::ScanRequest {
+                table_name: "App".to_string(),
+                index_name: Some("GSI1".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .items
+            .unwrap();
+        assert_eq!(
+            indexed.len(),
+            1,
+            "the overwritten item's index row must go with it, got {indexed:?}"
+        );
+        assert_eq!(
+            string_attr(&indexed[0], "gs1pk"),
+            string_attr(&base[0], "gs1pk")
+        );
     }
 }

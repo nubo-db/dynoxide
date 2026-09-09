@@ -325,6 +325,15 @@ pub(super) fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathEleme
         if part.is_empty() {
             return Err("empty path segment".to_string());
         }
+        // A rule path names a real attribute. `#alias` is a match-expression
+        // idea, and the names table does not reach here, so accepting one
+        // would leave a rule that quietly matches nothing.
+        if part.starts_with('#') {
+            return Err(format!(
+                "'{part}' is an expression attribute name; a path names the attribute itself, \
+                 so write the attribute's own name here"
+            ));
+        }
 
         // Handle array indexing: `items[0]`
         if let Some(bracket_pos) = part.find('[') {
@@ -400,11 +409,21 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
         ActionConfig::Hash { salt_env } => {
             let salt = match salt_env {
                 Some(env_var) => {
-                    std::env::var(env_var).map_err(|_| {
+                    let value = std::env::var(env_var).map_err(|_| {
                         format!(
                             "Rule {rule_num}: environment variable '{env_var}' not set (required for hash salt)"
                         )
-                    })?.into_bytes()
+                    })?;
+                    // An empty variable is the shape a missing CI secret takes,
+                    // and it would hash exactly as no salt at all.
+                    if value.is_empty() {
+                        return Err(format!(
+                            "Rule {rule_num}: environment variable '{env_var}' is empty. \
+                             SHA-256 without a salt is trivially reversible via rainbow tables, \
+                             so set it to a secret value"
+                        ));
+                    }
+                    value.into_bytes()
                 }
                 None => {
                     return Err(format!(
@@ -658,6 +677,27 @@ action = { type = "redact" }
         )
         .unwrap_err();
         assert!(err.contains("must start with ':'"), "{err}");
+    }
+
+    #[test]
+    fn test_path_rejects_an_expression_attribute_name() {
+        let err = parse_path("#n").unwrap_err();
+        assert!(err.contains("names the attribute itself"), "{err}");
+        assert!(parse_path("name").is_ok());
+    }
+
+    #[test]
+    fn test_empty_salt_is_rejected() {
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe { std::env::set_var("DYNOXIDE_TEST_EMPTY_SALT", "") };
+        let action = ActionConfig::Hash {
+            salt_env: Some("DYNOXIDE_TEST_EMPTY_SALT".to_string()),
+        };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        unsafe { std::env::set_var("DYNOXIDE_TEST_EMPTY_SALT", "s3cret") };
+        assert!(validate_action(&action, 1).is_ok());
     }
 
     #[test]

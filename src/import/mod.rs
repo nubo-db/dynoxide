@@ -248,6 +248,33 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         output_path: cmd.output.clone(),
     };
 
+    // Rebuilding keys can land two source items on one primary key, which is
+    // exactly the assumption `import_items_fresh` trades away: it skips the
+    // GSI delete-before-insert, so an overwritten base row would leave its
+    // old index entry behind and index queries would answer from a row that
+    // no longer exists. Without a data model the keys come straight from the
+    // export and are unique by construction, so the fast path stays.
+    // Keys can move two ways: rebuilt from a template, or rewritten by a rule
+    // that names a key attribute. Either can land two items on one primary
+    // key. Neither happens without rules, so a plain import keeps the fast
+    // path that assumes every key is unique.
+    let key_attr_names: HashSet<String> = schemas
+        .iter()
+        .flat_map(|s| extract_key_attrs(&s.create_request))
+        .collect();
+    let rules_touch_a_key = rules.iter().any(|rule| match rule.path.first() {
+        Some(crate::expressions::PathElement::Attribute(name)) => key_attr_names.contains(name),
+        _ => false,
+    });
+    let rebuilds_keys = !rules.is_empty() && (data_model.is_some() || rules_touch_a_key);
+    let insert_items = |table: &str, batch: Vec<crate::types::Item>| {
+        if rebuilds_keys {
+            db.import_items(table, batch, ImportOptions::default())
+        } else {
+            db.import_items_fresh(table, batch, ImportOptions::default())
+        }
+    };
+
     let mut seen_warnings: HashSet<String> = HashSet::new();
 
     if !rules.is_empty() && data_model.is_none() {
@@ -325,8 +352,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         deriver.apply(&plan, &rewritten, &mut item, &mut warnings);
                     }
                     for w in warnings {
-                        if !seen_warnings.contains(&w) {
-                            seen_warnings.insert(w.clone());
+                        // Prefixed with the table, both so the reader knows
+                        // where it came from and so the cross-table dedupe
+                        // below cannot swallow table B's copy of a warning
+                        // table A already raised.
+                        let w = format!("table '{table_name}': {w}");
+                        if seen_warnings.insert(w.clone()) {
                             summary.warnings.push(w);
                         }
                     }
@@ -336,7 +367,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 // Flush batch when full
                 if batch.len() >= BATCH_SIZE {
                     let chunk = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-                    match db.import_items_fresh(table_name, chunk, ImportOptions::default()) {
+                    match insert_items(table_name, chunk) {
                         Ok(result) => {
                             table_items += result.items_imported;
                             table_bytes += result.bytes_imported;
@@ -369,8 +400,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
 
             // Flush remaining items
             if !batch.is_empty() {
-                let import_result = db
-                    .import_items_fresh(table_name, batch, ImportOptions::default())
+                let import_result = insert_items(table_name, batch)
                     .map_err(|e| format!("Failed to import items into '{}': {e}", table_name))?;
                 table_items += import_result.items_imported;
                 table_bytes += import_result.bytes_imported;
@@ -395,6 +425,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             // the run's time, not a half-anonymised database.
             let join_breaks = deriver.join_breaks();
             if let Some(first) = join_breaks.first() {
+                // The warnings collected so far are what explain the failure;
+                // returning without them leaves the operator with a verdict
+                // and no evidence.
+                for w in &summary.warnings {
+                    eprintln!("  - {w}");
+                }
                 return Err(ImportError::Config(format!(
                     "table '{}': {}{}",
                     table_name,
@@ -407,13 +443,27 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 )));
             }
 
+            let unchecked = deriver.unchecked_join_keys();
+            if unchecked > 0 {
+                summary.warnings.push(format!(
+                    "table '{}': the join check stopped taking on new keys after {}, so {} \
+                     were never checked; a broken join among those would not have been \
+                     caught. Keys seen before the cap were still checked",
+                    table_name,
+                    keys::MAX_TRACKED_KEYS,
+                    unchecked
+                ));
+            }
+
             let (collisions, capped) = deriver.take_collisions();
             if collisions > 0 {
                 summary.warnings.push(format!(
-                    "table '{}': {} items rendered the same primary key as an earlier item \
-                     after their keys were rebuilt, and overwrote it; the output holds fewer \
-                     rows than the export. A rule is replacing an attribute a key is built \
-                     from with a constant",
+                    "table '{}': {} items rendered the same primary key as an earlier item and \
+                     overwrote it, so the output holds fewer rows than the export. Either a \
+                     rule is replacing an attribute a key is built from with a constant, or a \
+                     fake generator is drawing the same value twice: its output space is small \
+                     enough that repeats are ordinary at a few hundred items, so prefer hash \
+                     for an attribute a key is built from",
                     table_name, collisions
                 ));
             }

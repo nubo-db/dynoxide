@@ -31,9 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `${name:length:pad}` sort padding, while an unclosed `${` fails the
   import rather than leaving a key silently unrebuilt.
   An import that has rules but no data model now says in its warnings that
-  keys built from attributes keep their original values. `ImportCommand` gains
-  a `data_model` field for library callers
+  keys built from attributes keep their original values
   ([#201](https://github.com/nubo-db/dynoxide/issues/201)).
+- **Breaking (Rust API):** `ImportCommand` gains a `data_model` field. It is a
+  plain struct with public fields, so every existing struct literal that built
+  one now fails to compile and needs `data_model: None` adding.
 - An import that would silently break the join between two entities now fails.
   When two entities build the same key from the same template, an anonymised
   attribute that template reads has to be in `[consistency] fields` or each
@@ -53,8 +55,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so two composite keys sharing only a component are left alone, and every
   outcome for a key is kept rather than the first, so a break is found
   whatever order the export is in. The field named in the advice is always a
-  top-level one, matching what `[consistency] fields` is keyed on
+  top-level one, matching what `[consistency] fields` is keyed on. Past a
+  million distinct keys per template the check keeps comparing the keys it
+  holds and reports how many it could not take on, rather than going quiet
   ([#202](https://github.com/nubo-db/dynoxide/issues/202)).
+- Anonymisation guidance changed: prefer `hash` for an attribute a key is
+  built from. `fake` draws from a small pool (`safe_email` has roughly nine
+  thousand possible values), so a few hundred items already produce repeats
+  and each one merges two identities onto one key; `mask` collides whenever
+  two values share their masked tail; `redact` collapses every item onto one
+  key; and `null` cannot render a key at all, so the most thorough-sounding
+  action is the one that leaves the most personal data in the keys. The
+  up-front warning names the actual consequence per action rather than calling
+  them all collapses, and the collision warning no longer asserts a cause it
+  has not established.
+- A rule `path` that starts with `#` is rejected. It looks like an expression
+  attribute name, the names table does not reach a path, and it previously
+  matched nothing at all, so the rule was silently inert.
+- An empty salt environment variable is rejected. It was accepted and produced
+  plain unsalted SHA-256, which is the shape an unset CI secret takes.
+- A OneTable index the table does not have, and a local secondary index, are
+  both reported rather than skipped in silence. Either left its key holding
+  the value it arrived with, and OneTable defaults an index name to its schema
+  key (`gs1`), which rarely matches the deployed index.
+- The broken-join check groups on the key attribute rather than the template
+  text, so the ordinary single-table join is covered: `CUSTOMER#${email}` and
+  `CUSTOMER#${customerEmail}` build the same partition from differently named
+  attributes. It also no longer counts a key that was left unrebuilt, which
+  turned a documented warning into a failure whose advice could not work.
+- An import that rebuilds keys now maintains secondary indexes on write.
+  Rebuilding can land two source items on one primary key, which is the
+  assumption the faster bulk path trades away: it skips the index
+  delete-before-insert, so an overwritten row left its old index entry behind
+  and a `Query` on that index answered from a row that no longer existed. An
+  import without `--data-model` takes keys from the export unchanged, cannot
+  collide, and keeps the faster path.
 
 ### Fixed
 
@@ -81,8 +116,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-finite float, and an operand of the wrong type for its function all
   fail there with the messages DynamoDB gives for the equivalent request
   ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
-
-### Fixed
 
 - `docs/import.md` showed `begins_with(pk, 'USER#')` as a match expression,
   which the rule parser rejected with a syntax error on the quote. The parser

@@ -29,6 +29,11 @@ use super::config::{ValidatedAction, ValidatedRule, parse_path};
 /// collapsing onto one row. Past this many the check stops, and says so.
 pub(super) const MAX_TRACKED_KEYS: usize = 1_000_000;
 
+/// Longest `${name:length:pad}` padding a key is allowed to ask for. A key is
+/// capped at 2048 bytes, so anything past this is a typo rather than intent,
+/// and rendering it would look like a hang.
+const MAX_PAD_LENGTH: usize = 4096;
+
 /// One piece of a `${name}` template.
 #[derive(Debug, Clone, PartialEq)]
 enum Segment {
@@ -54,9 +59,6 @@ struct Padding {
 impl Padding {
     fn apply(&self, value: &str) -> String {
         let mut out = value.to_string();
-        if self.fill.is_empty() {
-            return out;
-        }
         while out.chars().count() < self.length {
             out.insert_str(0, &self.fill);
         }
@@ -91,10 +93,19 @@ fn parse_template(template: &str) -> Result<Vec<Segment>, String> {
                          the form is '${{name:length:pad}}'"
                     )
                 })?;
-                Some(Padding {
-                    length,
-                    fill: parts.next().unwrap_or("0").to_string(),
-                })
+                if length > MAX_PAD_LENGTH {
+                    return Err(format!(
+                        "template '{template}': a pad length of {length} is beyond the {MAX_PAD_LENGTH} \
+                         a key can usefully hold"
+                    ));
+                }
+                // OneTable treats an empty pad character as "0" (`pad || '0'`),
+                // and an empty one would also never reach the length.
+                let fill = match parts.next() {
+                    Some("") | None => "0".to_string(),
+                    Some(fill) => fill.to_string(),
+                };
+                Some(Padding { length, fill })
             }
             None => None,
         };
@@ -183,8 +194,6 @@ struct EntityKeys {
 struct AtRisk {
     /// The key attribute the shared template builds.
     key_attribute: String,
-    /// The template itself, for the message.
-    template: String,
     /// Root field names to put in `[consistency] fields`. Roots, because
     /// that is what the consistency map is keyed on: advising `contact.email`
     /// when only `contact` is honoured would send someone in a circle.
@@ -197,11 +206,25 @@ struct AtRisk {
     /// merely share a component: `TENANT#a#x` and `TENANT#b#x` never agreed,
     /// so they have nothing to lose. A deterministic action such as hash
     /// takes both to the same place and stays quiet.
-    seen_keys: std::collections::HashMap<u64, Vec<(usize, u64)>>,
+    seen_keys: std::collections::HashMap<u64, Vec<Outcome>>,
     /// Entities found to have taken a shared key to different values.
     diverged: HashSet<usize>,
-    /// Set once `seen_keys` hit its cap and stopped tracking.
-    capped: bool,
+    /// Keys that went unchecked after the cap.
+    unchecked: usize,
+}
+
+/// What one entity made of one original key value.
+///
+/// A summary rather than every value: many items of one entity sharing a
+/// customer key would otherwise keep a row each, and be rescanned per item.
+/// The first result, plus whether that entity ever produced a second, is
+/// enough to spot a disagreement with another entity.
+#[derive(Debug, Clone, Copy)]
+struct Outcome {
+    entity: usize,
+    first: u64,
+    /// This entity produced more than one distinct result for the key.
+    multiple: bool,
 }
 
 /// Which of an item's keys can be rebuilt after the rules run.
@@ -273,6 +296,22 @@ impl KeyDeriver {
 
         let rule_targets: HashSet<&str> = rules.iter().filter_map(rule_target).collect();
         let mut warnings = Vec::new();
+        let mut unmatched_indexes: HashSet<String> = HashSet::new();
+
+        // A local secondary index never reaches the model: OneTable declares
+        // one with a sort key and no hash, and the parser keeps only indexes
+        // that name a hash attribute. Say so rather than leave its sort key
+        // quietly holding the value it arrived with.
+        if let Some(lsis) = request.local_secondary_indexes.as_deref()
+            && !lsis.is_empty()
+        {
+            warnings.push(format!(
+                "table '{}' has {} local secondary index(es); their sort keys are not rebuilt \
+                 from templates and keep the values they arrive with",
+                request.table_name,
+                lsis.len()
+            ));
+        }
 
         let mut entities = Vec::with_capacity(model.entities.len());
         type KeyShape = (String, String, Vec<Vec<PathElement>>);
@@ -289,6 +328,18 @@ impl KeyDeriver {
 
             for mapping in &entity.gsi_mappings {
                 let Some(gsi) = gsis.iter().find(|g| g.index_name == mapping.index_name) else {
+                    // OneTable defaults an index's name to its schema key
+                    // ("gs1"), which rarely matches the deployed index
+                    // ("GSI1"). Silently skipping would leave that index's
+                    // key holding whatever it arrived with.
+                    if unmatched_indexes.insert(mapping.index_name.clone()) {
+                        warnings.push(format!(
+                            "the data model has an index '{}' that table '{}' does not: its keys \
+                             are not rebuilt and keep the values they arrive with. Set the \
+                             OneTable index's \"name\" to the DynamoDB index name",
+                            mapping.index_name, request.table_name
+                        ));
+                    }
                     continue;
                 };
                 push_key(
@@ -364,20 +415,38 @@ impl KeyDeriver {
                     let Some(target) = rule_target(rule) else {
                         continue;
                     };
-                    let collapses = match rule.action {
-                        ValidatedAction::Redact | ValidatedAction::Null => "every",
-                        ValidatedAction::Mask { .. } => "most",
+
+                    if !key.sources().any(|source| source == target) {
+                        continue;
+                    }
+                    let consequence = match rule.action {
+                        // NULL is not a string, so the template cannot render
+                        // at all and the key keeps the value it arrived with.
+                        // That is the opposite of collapsing, and worse.
+                        ValidatedAction::Null => format!(
+                            "no item of that entity can rebuild {}, so every one of them keeps \
+                             the key value it arrived with. Use fake or hash instead",
+                            key.attribute
+                        ),
+                        ValidatedAction::Redact => format!(
+                            "every item of that entity renders the same {} and overwrites the \
+                             last, leaving fewer rows than the export. Use fake or hash instead",
+                            key.attribute
+                        ),
+                        // Masking keeps the last few characters, so two
+                        // different values often mask to the same thing.
+                        ValidatedAction::Mask { .. } => format!(
+                            "items of that entity whose '{target}' masks to the same text render \
+                             the same {} and overwrite each other. Use fake or hash instead",
+                            key.attribute
+                        ),
                         ValidatedAction::Fake { .. } | ValidatedAction::Hash { .. } => continue,
                     };
-                    if key.sources().any(|source| source == target) {
-                        warnings.push(format!(
-                            "a rule replaces '{target}' with a constant, and entity '{}' builds \
-                             {} from template '{}': {collapses} item of that entity would render \
-                             the same key and collapse onto one row. Use fake or hash for an \
-                             attribute a key is built from",
-                            entity.name, key.attribute, key.template
-                        ));
-                    }
+                    warnings.push(format!(
+                        "a rule rewrites '{target}', which entity '{}' builds {} from via \
+                         template '{}': {consequence}",
+                        entity.name, key.attribute, key.template
+                    ));
                 }
             }
 
@@ -389,39 +458,35 @@ impl KeyDeriver {
             });
         }
 
-        // Two entities that build the *same* key attribute from the *same*
-        // template are asserting their keys agree, which is how a
-        // single-table design keeps a customer and its orders in one
-        // partition. If a rule rewrites an attribute that template reads and
-        // it is not consistency-tracked, each entity anonymises it
-        // independently and the two stop agreeing.
+        // Two entities that build the same key attribute are asserting their
+        // keys can agree, which is how a single-table design keeps a customer
+        // and its orders in one partition. If a rule rewrites an attribute
+        // one of those templates reads, each entity anonymises it
+        // independently and the two can stop agreeing.
         //
-        // Matching on the (attribute, template) pair rather than on the
-        // attribute name alone is what keeps this off entities that merely
-        // reuse a name: `account#${id}` and `project#${id}` are different
-        // entities' own ids, and never had a join to lose.
-        // Grouped by the key and its template as well as the source, so two
-        // unrelated pairs that happen to read an attribute of the same name
-        // stay separate: A and B sharing `account#${id}` have nothing to do
-        // with C and D sharing `project#${id}`.
-        // Grouped by the key and its template, so two unrelated pairs that
-        // happen to read an attribute of the same name stay separate: A and B
-        // sharing `account#${id}` have nothing to do with C and D sharing
-        // `project#${id}`.
-        /// (key attribute, template) -> (entities building it, roots needing consistency)
-        type SharedGroups = Vec<((String, String), (Vec<usize>, Vec<String>))>;
+        // Grouping on the key attribute alone, not on the template text, is
+        // deliberate: the canonical join is `CUSTOMER#${id}` against
+        // `CUSTOMER#${customerId}`, two different templates that produce the
+        // same partition. Requiring identical text would miss it. Unrelated
+        // entities that merely share a key name cost nothing here, because
+        // what is actually compared later is the key *value* an item arrived
+        // with, and `account#acc1` never equalled `project#p1`.
+        //
+        // Consistency-tracked roots are tracked too, and only excused from
+        // the warning. The consistency map stops taking new values at its own
+        // cap and starts handing out fresh ones, so a field listed in
+        // [consistency] is not a permanent guarantee, and the value check is
+        // what notices when it lapses.
+        type SharedGroups = Vec<(String, (Vec<usize>, Vec<String>))>;
         let mut shared: SharedGroups = Vec::new();
         for (idx, shape) in entity_key_shapes.iter().enumerate() {
-            for (attribute, template, sources) in shape {
+            for (attribute, _template, sources) in shape {
                 let shared_with_another =
                     entity_key_shapes
                         .iter()
                         .enumerate()
                         .any(|(other, other_shape)| {
-                            other != idx
-                                && other_shape
-                                    .iter()
-                                    .any(|(a, t, _)| a == attribute && t == template)
+                            other != idx && other_shape.iter().any(|(a, _, _)| a == attribute)
                         });
                 if !shared_with_another {
                     continue;
@@ -434,15 +499,12 @@ impl KeyDeriver {
                         Some(PathElement::Attribute(root)) => Some(root.clone()),
                         _ => None,
                     })
-                    .filter(|root| {
-                        !consistency_fields.contains(root) && rule_targets.contains(root.as_str())
-                    })
+                    .filter(|root| rule_targets.contains(root.as_str()))
                     .collect();
                 if roots.is_empty() {
                     continue;
                 }
-                let group = (attribute.clone(), template.clone());
-                match shared.iter_mut().find(|(k, _)| *k == group) {
+                match shared.iter_mut().find(|(k, _)| k == attribute) {
                     Some((_, (users, known_roots))) => {
                         if !users.contains(&idx) {
                             users.push(idx);
@@ -453,7 +515,7 @@ impl KeyDeriver {
                             }
                         }
                     }
-                    None => shared.push((group, (vec![idx], roots))),
+                    None => shared.push((attribute.clone(), (vec![idx], roots))),
                 }
             }
         }
@@ -466,28 +528,31 @@ impl KeyDeriver {
 
         let at_risk: Vec<AtRisk> = shared
             .into_iter()
-            .map(
-                |((key_attribute, template), (entities_using, consistency_roots))| {
+            .map(|(key_attribute, (entities_using, roots))| {
+                let unlisted: Vec<String> = roots
+                    .iter()
+                    .filter(|root| !consistency_fields.contains(*root))
+                    .cloned()
+                    .collect();
+                if !unlisted.is_empty() {
                     warnings.push(format!(
-                        "{} both build {} from template '{}', which reads {} outside \
-                     [consistency] fields: if they both appear in this import their keys \
-                     will not agree and the entities will not join",
+                        "{} both build {} from an attribute outside [consistency] fields ({}): \
+                         if they both appear in this import their keys may not agree and the \
+                         entities will not join",
                         entity_list(&entities, &entities_using),
                         key_attribute,
-                        template,
-                        quoted_list(&consistency_roots)
+                        quoted_list(&unlisted)
                     ));
-                    AtRisk {
-                        key_attribute,
-                        template,
-                        consistency_roots,
-                        entities: entities_using,
-                        seen_keys: std::collections::HashMap::new(),
-                        diverged: HashSet::new(),
-                        capped: false,
-                    }
-                },
-            )
+                }
+                AtRisk {
+                    key_attribute,
+                    consistency_roots: if unlisted.is_empty() { roots } else { unlisted },
+                    entities: entities_using,
+                    seen_keys: std::collections::HashMap::new(),
+                    diverged: HashSet::new(),
+                    unchecked: 0,
+                }
+            })
             .collect();
 
         let mut type_attributes: Vec<String> =
@@ -525,7 +590,6 @@ impl KeyDeriver {
             self.unmatched += 1;
             return None;
         };
-        let at_risk_originals = self.at_risk_originals(entity_idx, item);
 
         let entity = &self.entities[entity_idx];
 
@@ -551,6 +615,18 @@ impl KeyDeriver {
             }
         }
 
+        // Only a key that will actually be rebuilt takes part in the join
+        // check. One left holding its original value has already been
+        // reported as a template that does not reproduce, and that is the
+        // accurate diagnostic: comparing it against an entity that did
+        // rebuild would call it a broken join and advise [consistency],
+        // which cannot fix an attribute the item does not carry.
+        let rebuilt: Vec<&str> = keys
+            .iter()
+            .map(|idx| entity.keys[*idx].attribute.as_str())
+            .collect();
+        let at_risk_originals = self.at_risk_originals(entity_idx, item, &rebuilt);
+
         Some(Rederivation {
             entity: entity_idx,
             keys,
@@ -558,12 +634,21 @@ impl KeyDeriver {
         })
     }
 
-    /// The value this item arrived with for each at-risk attribute, hashed.
-    fn at_risk_originals(&self, entity_idx: usize, item: &Item) -> Vec<(usize, u64)> {
+    /// The key value this item arrived with, for each at-risk group whose key
+    /// this item will actually rebuild.
+    fn at_risk_originals(
+        &self,
+        entity_idx: usize,
+        item: &Item,
+        rebuilt: &[&str],
+    ) -> Vec<(usize, u64)> {
         self.at_risk
             .iter()
             .enumerate()
-            .filter(|(_, risk)| risk.entities.contains(&entity_idx) && !risk.capped)
+            .filter(|(_, risk)| {
+                risk.entities.contains(&entity_idx)
+                    && rebuilt.iter().any(|a| *a == risk.key_attribute)
+            })
             .filter_map(|(idx, risk)| Some((idx, scalar_hash(item.get(&risk.key_attribute)?)?)))
             .collect()
     }
@@ -575,35 +660,45 @@ impl KeyDeriver {
     fn note_at_risk_results(&mut self, plan: &Rederivation, item: &Item) {
         for (risk_idx, original) in &plan.at_risk_originals {
             let risk = &mut self.at_risk[*risk_idx];
-            if risk.capped {
-                continue;
-            }
             let Some(now) = item.get(&risk.key_attribute).and_then(scalar_hash) else {
                 continue;
             };
 
-            if !risk.seen_keys.contains_key(original) && risk.seen_keys.len() >= MAX_TRACKED_KEYS {
-                risk.capped = true;
-                continue;
-            }
-            let outcomes = risk.seen_keys.entry(*original).or_default();
-
-            // Every distinct outcome is kept, not just the first, or whether
-            // a break is noticed would depend on the order the export happens
-            // to be in.
-            let mut diverged_with: Vec<usize> = outcomes
-                .iter()
-                .filter(|(entity, result)| *entity != plan.entity && *result != now)
-                .map(|(entity, _)| *entity)
-                .collect();
-            if !outcomes.contains(&(plan.entity, now)) {
-                outcomes.push((plan.entity, now));
-            }
-            if !diverged_with.is_empty() {
-                diverged_with.push(plan.entity);
-                for entity in diverged_with {
-                    risk.diverged.insert(entity);
+            // A key already recorded is still compared after the cap. Only a
+            // key never seen before goes unchecked, and that is counted so
+            // the run can say the check was partial rather than clean.
+            if !risk.seen_keys.contains_key(original) {
+                if risk.seen_keys.len() >= MAX_TRACKED_KEYS {
+                    risk.unchecked += 1;
+                    continue;
                 }
+                risk.seen_keys.insert(*original, Vec::new());
+            }
+            let outcomes = risk.seen_keys.get_mut(original).expect("just inserted");
+
+            match outcomes.iter_mut().find(|o| o.entity == plan.entity) {
+                Some(mine) => mine.multiple |= mine.first != now,
+                None => outcomes.push(Outcome {
+                    entity: plan.entity,
+                    first: now,
+                    multiple: false,
+                }),
+            }
+
+            // Two entities disagree when their results differ, or when either
+            // produced more than one result, since one of those must differ
+            // from what the other produced.
+            let mut diverged: Vec<usize> = Vec::new();
+            for (i, a) in outcomes.iter().enumerate() {
+                for b in outcomes.iter().skip(i + 1) {
+                    if a.first != b.first || a.multiple || b.multiple {
+                        diverged.push(a.entity);
+                        diverged.push(b.entity);
+                    }
+                }
+            }
+            for entity in diverged {
+                risk.diverged.insert(entity);
             }
         }
     }
@@ -619,7 +714,6 @@ impl KeyDeriver {
         warnings: &mut Vec<String>,
     ) {
         let entity = &self.entities[plan.entity];
-        let mut rebuilt_primary = false;
         let mut rule_wins = Vec::new();
         for &idx in &plan.keys {
             let key = &entity.keys[idx];
@@ -634,9 +728,6 @@ impl KeyDeriver {
             match render(&key.segments, item) {
                 Some(value) => {
                     item.insert(key.attribute.clone(), AttributeValue::S(value));
-                    rebuilt_primary |= Some(key.attribute.as_str())
-                        == self.hash_attribute.as_deref()
-                        || Some(key.attribute.as_str()) == self.range_attribute.as_deref();
                 }
                 None => {
                     if self.warned_unrenderable.insert((plan.entity, idx)) {
@@ -660,15 +751,17 @@ impl KeyDeriver {
                 ));
             }
         }
-        if rebuilt_primary {
-            self.note_rebuilt_primary_key(item);
-        }
+
+        // Every item's primary key is recorded, not only a rebuilt one: a
+        // rebuilt key can land on a row that was left alone, and counting
+        // only rebuilds would miss the row that got overwritten.
+        self.note_primary_key(item);
         self.note_at_risk_results(plan, item);
     }
 
-    /// Remember a rebuilt primary key so a later item rendering the same one
-    /// is counted as a collision.
-    fn note_rebuilt_primary_key(&mut self, item: &Item) {
+    /// Remember this item's primary key so a later item landing on the same
+    /// one is counted as a collision.
+    fn note_primary_key(&mut self, item: &Item) {
         if self.collision_check_capped {
             return;
         }
@@ -723,16 +816,20 @@ impl KeyDeriver {
 
                 format!(
                     "{} took the same original {} to different values, so their keys no longer \
-                     agree and they will not join. Template '{}' reads {}: add {} to \
-                     [consistency] fields",
+                     agree and they will not join. Give both entities the same attribute name \
+                     for that value and add {} to [consistency] fields",
                     entity_list(&self.entities, &seen),
                     risk.key_attribute,
-                    risk.template,
-                    quoted_list(&risk.consistency_roots),
                     quoted_list(&risk.consistency_roots)
                 )
             })
             .collect()
+    }
+
+    /// Keys the join check could not take on after its cap, so the caller
+    /// can say the check was partial rather than clean.
+    pub fn unchecked_join_keys(&self) -> usize {
+        self.at_risk.iter().map(|risk| risk.unchecked).sum()
     }
 
     /// Number of items since the last call that matched no entity.
@@ -1360,7 +1457,7 @@ mod tests {
             KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
         // sk and gs1pk of User both build from email
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].contains("collapse onto one row"));
+        assert!(warnings[0].contains("overwrites the last"), "{warnings:?}");
         assert!(warnings[0].contains("'email'"));
 
         let rules = [rule(
@@ -1570,10 +1667,11 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_pairs_reading_the_same_attribute_name_are_separate_risks() {
-        // Account/Team share account#${id}; Project/Task share project#${id}.
-        // Same source name, two unrelated groups, so importing one from each
-        // must not read as a broken join between them.
+    fn unrelated_pairs_reading_the_same_attribute_name_never_shared_a_key() {
+        // Account/Team build account#${id}; Project/Task build project#${id}.
+        // They share a key attribute and a source name, so they warn together,
+        // but their key *values* never matched, so importing one from each
+        // must not read as a broken join.
         let model = model_with(vec![
             entity("Account", "account#${id}", Some("account#"), None),
             entity("Project", "project#${id}", Some("project#"), None),
@@ -1588,7 +1686,8 @@ mod tests {
         )];
         let (mut d, warnings) =
             KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
-        assert_eq!(warnings.len(), 2, "one per group: {warnings:?}");
+        // One group per key attribute; the four entities all build pk.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
 
         // One entity from each group, sharing an original id.
         let mut run = |name: &str, pk: &str, sk: &str, becomes: &str| {
@@ -1633,11 +1732,7 @@ mod tests {
         let (mut d, warnings) =
             KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("${contact.email}")),
-            "the template should be shown: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("reads 'contact'")),
+            warnings.iter().any(|w| w.contains("('contact')")),
             "the root is what [consistency] honours: {warnings:?}"
         );
 
@@ -1806,6 +1901,245 @@ mod tests {
             "different tenants never shared a key: {:?}",
             d.join_breaks()
         );
+    }
+
+    #[test]
+    fn one_entity_repeating_a_key_keeps_a_bounded_summary() {
+        // Many orders share one customer key and each gets its own fake, so
+        // keeping every outcome would grow without limit and be rescanned
+        // per item. One summary row per entity is enough.
+        let mut d = shared_key_deriver();
+        for n in 0..50 {
+            run_item(
+                &mut d,
+                order_item("a@x.co"),
+                &format!("fake{n}@example.org"),
+            );
+        }
+
+        let outcomes: usize = d
+            .at_risk
+            .iter()
+            .map(|r| r.seen_keys.values().map(Vec::len).sum::<usize>())
+            .sum();
+        assert_eq!(outcomes, 1, "one row per entity per key, not per item");
+        assert!(
+            d.join_breaks().is_empty(),
+            "one entity disagreeing with itself is not a cross-entity break: {:?}",
+            d.join_breaks()
+        );
+
+        // The customer still finds the disagreement.
+        run_item(&mut d, customer_item("a@x.co"), "different@example.com");
+        assert_eq!(d.join_breaks().len(), 1);
+    }
+
+    #[test]
+    fn keys_seen_before_the_cap_are_still_checked_after_it() {
+        let mut d = shared_key_deriver();
+        // Record the customer, then fill the map to its cap.
+        run_item(&mut d, customer_item("a@x.co"), "fake1@example.com");
+        for risk in &mut d.at_risk {
+            while risk.seen_keys.len() < MAX_TRACKED_KEYS {
+                let filler = risk.seen_keys.len() as u64 + 1_000_000;
+                risk.seen_keys.insert(filler, Vec::new());
+            }
+        }
+
+        // A brand new key cannot be taken on, and is counted.
+        run_item(&mut d, order_item("b@y.co"), "fake2@example.org");
+        assert!(d.unchecked_join_keys() > 0, "the new key went unchecked");
+
+        // The key recorded before the cap is still compared.
+        run_item(&mut d, order_item("a@x.co"), "different@example.org");
+        assert_eq!(
+            d.join_breaks().len(),
+            1,
+            "a key seen before the cap must still be checked: {:?}",
+            d.join_breaks()
+        );
+    }
+
+    #[test]
+    fn a_join_across_two_different_templates_is_still_seen() {
+        // The canonical single-table join: the customer keys on its own
+        // address, the order keys on the customer's. Different template text,
+        // same partition. Matching on the text would miss it entirely.
+        let model = model_with(vec![
+            entity("Customer", "CUSTOMER#${email}", Some("PROFILE"), None),
+            entity(
+                "Order",
+                "CUSTOMER#${customerEmail}",
+                Some("ORDER#${id}"),
+                None,
+            ),
+        ]);
+        let rules = [
+            rule(
+                "email",
+                ValidatedAction::Fake {
+                    generator: "safe_email".into(),
+                },
+            ),
+            rule(
+                "customerEmail",
+                ValidatedAction::Fake {
+                    generator: "safe_email".into(),
+                },
+            ),
+        ];
+        let (mut d, warnings) =
+            KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("entity 'Customer' and entity 'Order'"));
+
+        let mut run = |name: &str, source: &str, sk: &str, becomes: &str| {
+            let mut it = item(&[
+                ("_type", name),
+                ("pk", "CUSTOMER#a@x.co"),
+                ("sk", sk),
+                (source, "a@x.co"),
+                ("id", "1"),
+            ]);
+            let mut w = Vec::new();
+            let plan = d.plan(&it, &mut w).unwrap();
+            it.insert(source.to_string(), AttributeValue::S(becomes.to_string()));
+            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        };
+        run("Customer", "email", "PROFILE", "fake1@example.com");
+        run("Order", "customerEmail", "ORDER#1", "fake2@example.org");
+
+        let breaks = d.join_breaks();
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+        assert!(breaks[0].contains("same attribute name"), "{breaks:?}");
+    }
+
+    #[test]
+    fn a_key_left_unrebuilt_is_not_reported_as_a_broken_join() {
+        // The documented shape: an Order holds its customer's key but carries
+        // no address of its own, so its pk cannot be rebuilt. That is a
+        // mismatch warning, not a join failure, and [consistency] could not
+        // fix it because there is nothing on the Order to anonymise.
+        let mut d = shared_key_deriver();
+
+        run_item(&mut d, customer_item("a@x.co"), "fake1@example.com");
+
+        let mut order = item(&[
+            ("_type", "Order"),
+            ("pk", "CUSTOMER#a@x.co"),
+            ("sk", "ORDER#1"),
+            ("orderId", "1"),
+        ]);
+        assert!(!order.contains_key("email"), "nothing to rebuild pk from");
+        let mut warnings = Vec::new();
+        let plan = d.plan(&order, &mut warnings).unwrap();
+        d.apply(&plan, &no_rewrites(), &mut order, &mut warnings);
+
+        assert!(
+            warnings.iter().any(|w| w.contains("does not reproduce pk")),
+            "the accurate diagnostic still fires: {warnings:?}"
+        );
+        assert!(
+            d.join_breaks().is_empty(),
+            "an unrebuilt key is not a divergence: {:?}",
+            d.join_breaks()
+        );
+        assert_eq!(
+            order["pk"],
+            AttributeValue::S("CUSTOMER#a@x.co".to_string())
+        );
+    }
+
+    #[test]
+    fn an_index_the_table_does_not_have_is_reported() {
+        let model = model_with(vec![EntityDefinition {
+            name: "User".to_string(),
+            pk_template: "user#${id}".to_string(),
+            sk_template: Some("user#".to_string()),
+            type_attribute: None,
+            // OneTable's default name for the index, which the table calls GSI1.
+            gsi_mappings: vec![GsiMapping {
+                index_name: "gs1".to_string(),
+                pk_template: String::new(),
+                sk_template: Some("user#${email}".to_string()),
+            }],
+            description: None,
+        }]);
+        let (_, warnings) = KeyDeriver::new(&model, &request(), &[], &no_consistency()).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("index 'gs1' that table 'App' does not")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_secondary_index_is_reported_as_not_rebuilt() {
+        let mut request = request();
+        request.local_secondary_indexes = Some(
+            serde_json::from_value(serde_json::json!([{
+                "IndexName": "LSI1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "ls1sk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]))
+            .unwrap(),
+        );
+        let (_, warnings) = KeyDeriver::new(&model(), &request, &[], &no_consistency()).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("local secondary index") && w.contains("not rebuilt")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn null_on_a_key_source_is_reported_as_retaining_not_collapsing() {
+        let rules = [rule("email", ValidatedAction::Null)];
+        let (_, warnings) =
+            KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
+        assert!(!warnings.is_empty());
+        for w in &warnings {
+            assert!(
+                w.contains("keeps the key value it arrived with"),
+                "null retains, it does not collapse: {w}"
+            );
+            assert!(!w.contains("overwrites the last"), "{w}");
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_key_landing_on_an_untouched_row_is_a_collision() {
+        // An item that matches no entity keeps its key and is invisible to a
+        // collision set that only records rebuilds, so the row it loses goes
+        // uncounted.
+        let mut d = deriver();
+        let mut warnings = Vec::new();
+
+        let stranger = item(&[("pk", "account#acc1"), ("sk", "user#[REDACTED]")]);
+        assert!(
+            d.plan(&stranger, &mut warnings).is_none(),
+            "matches nothing"
+        );
+        d.note_primary_key(&stranger);
+
+        let mut user = user();
+        let plan = d.plan(&user, &mut warnings).unwrap();
+        user.insert(
+            "email".to_string(),
+            AttributeValue::S("[REDACTED]".to_string()),
+        );
+        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        assert_eq!(
+            user["sk"],
+            AttributeValue::S("user#[REDACTED]".to_string()),
+            "the rebuilt key lands on the stranger's"
+        );
+        assert_eq!(d.take_collisions().0, 1);
     }
 
     #[test]

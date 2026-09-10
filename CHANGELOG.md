@@ -14,6 +14,27 @@ gained a field. Nothing else a user installs changes major: the CLI, the npm
 packages, the browser engine, the container image, the MCPB bundle, the Action
 and the Homebrew formula all carry 1.2.0. See the version split below.
 
+### Behaviour changes
+
+- **`hash` rules now derive their value with HMAC-SHA256 keyed on the salt,
+  where before it was `SHA256(salt || value)`. Every hashed value changes.**
+  Importing the same export under the same salt gives different pseudonyms
+  from a 1.1.0 import, so a dataset anonymised by an older version will not
+  join against one anonymised by this release. Re-import both sides, and
+  rotate the salt while you are in there. Prefixing left the salt and the
+  value sharing one byte string with no boundary, so a salt of `ab` over a
+  value `cd` derived what a salt of `a` derived over `bcd`, and it inherited
+  SHA-256's length extension. Keying the salt keeps the two apart. The value
+  is now tagged with its DynamoDB type and length-prefixed on the same terms
+  as a seeded `fake`, so the string `"123"` and the number `123` no longer
+  land on one pseudonym.
+- **`salt_env` and `seed_env` now require at least 16 bytes.** An empty
+  variable was already rejected, since that is the shape an unset CI secret
+  takes. A short one fails the same way but looks deliberate, so nothing
+  would ever prompt you to look at it, and the values people reach for by
+  reflex are all inside a wordlist. Generate one with
+  `openssl rand -base64 24`.
+
 ### Added
 
 - `dynoxide import --data-model <onetable.json>` rebuilds keys from their

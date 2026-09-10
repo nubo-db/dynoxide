@@ -952,6 +952,7 @@ dependencies = [
  "directories",
  "fake",
  "flate2",
+ "hmac",
  "indicatif",
  "js-sys",
  "libc",

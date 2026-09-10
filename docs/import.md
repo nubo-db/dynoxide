@@ -77,7 +77,7 @@ fields = ["userId", "email"]
 ```
 
 ```sh
-ANON_SALT=my-secret-salt dynoxide import \
+ANON_SALT="$(openssl rand -base64 24)" dynoxide import \
   --source ./export/ \
   --schema schema.json \
   --rules rules.toml \
@@ -90,7 +90,7 @@ ANON_SALT=my-secret-salt dynoxide import \
 |--------|-------------|
 | `fake` | Replace with generated data (`safe_email`, `name`, `phone_number`, `address`, `company_name`, `sentence`, `word`, `first_name`, `last_name`). Takes an optional `seed_env`, below |
 | `mask` | Keep last N characters, mask the rest (`keep_last`, `mask_char`) |
-| `hash` | SHA-256 hash with salt from env var (`salt_env`, required) |
+| `hash` | HMAC-SHA256 keyed on a salt from an env var (`salt_env`, required, 16 bytes or more) |
 | `redact` | Replace with `[REDACTED]` |
 | `null` | Replace with NULL |
 
@@ -265,13 +265,23 @@ index entries go with it, so the output stays internally consistent even when
 rows are lost.
 
 **The salt is the security property, not a formality.** `hash` is required to
-take one because an unsalted SHA-256 of a low-entropy value is trivially
+take one because an unkeyed digest of a low-entropy value is trivially
 reversible: an attacker with the hashed output hashes a wordlist of plausible
 email addresses and matches them off, recovering the originals without ever
 touching your data. The salt is what makes that wordlist useless, so it needs
-to be an actual secret. `ANON_SALT=test` gives you the reversibility back. An
-empty variable is rejected outright, since that is the shape an unset CI
-secret takes and it would produce plain unsalted hashes with no error.
+to be an actual secret. `ANON_SALT=test` gives you the reversibility back.
+
+Both halves of that are enforced. An empty variable is rejected, since that is
+the shape an unset CI secret takes and it would otherwise pass through as if it
+were a value. So is anything shorter than 16 bytes, which fails in exactly the
+same way but looks deliberate, so nothing would ever prompt you to look at it.
+The same floor applies to a `fake` rule's `seed_env`, which is a secret on the
+same terms. Generate one with `openssl rand -base64 24`.
+
+The salt is used as an HMAC-SHA256 key rather than a prefix, so it never shares
+a byte string with the value it protects. The value is tagged with its
+DynamoDB type and length-prefixed, which means the string `"123"` and the
+number `123` pseudonymise to different values rather than silently merging.
 
 Keep the salt somewhere the anonymised output does not go. Anyone holding both
 can re-derive every original value.
@@ -317,7 +327,7 @@ action = { type = "fake", generator = "safe_email", seed_env = "ANON_SEED" }
 ```
 
 ```sh
-ANON_SEED=a-secret-value dynoxide import ...
+ANON_SEED="$(openssl rand -base64 24)" dynoxide import ...
 ```
 
 The same input and the same seed give the same output on every run, so a

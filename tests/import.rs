@@ -295,7 +295,7 @@ action = { type = "redact" }
         );
 
         // SAFETY: single-threaded test, no concurrent env reads
-        unsafe { std::env::set_var("TEST_HASH_SALT", "test-salt-value") };
+        unsafe { std::env::set_var("TEST_HASH_SALT", "test-salt-value-0123456789") };
         std::fs::write(
             &rules_file,
             r#"
@@ -1855,7 +1855,7 @@ action = { type = "redact" }
         );
         create_schema_file(&schema_file, &[simple_table_schema("Users")]);
         // SAFETY: single-threaded test, no concurrent env reads
-        unsafe { std::env::set_var("TEST_MIXED_SEED", "s3cret") };
+        unsafe { std::env::set_var("TEST_MIXED_SEED", "mixed-seed-0123456789") };
         std::fs::write(
             &rules_file,
             r#"
@@ -2070,7 +2070,7 @@ action = { type = "redact" }
         assert_eq!(scan_all(&db, "App").len(), 1, "one row survived");
     }
 
-    fn mixed_secret_import(tmp: &std::path::Path, rules_toml: &str) -> import::ImportSummary {
+    fn mixed_rule_import(tmp: &std::path::Path, rules_toml: &str) -> import::ImportSummary {
         let source = tmp.join("export");
         let schema_file = tmp.join("schema.json");
         let rules_file = tmp.join("rules.toml");
@@ -2104,8 +2104,8 @@ action = { type = "redact" }
         // each. The message counts the seeds rather than printing them.
         // SAFETY: these names are used by this test alone
         unsafe {
-            std::env::set_var("TEST_TWO_SEEDS_A", "first-secret");
-            std::env::set_var("TEST_TWO_SEEDS_B", "second-secret");
+            std::env::set_var("TEST_TWO_SEEDS_A", "seed-alpha-0123456789");
+            std::env::set_var("TEST_TWO_SEEDS_B", "seed-bravo-0123456789");
         }
         let rules = |second: &str| {
             format!(
@@ -2127,7 +2127,7 @@ fields = ["email"]
         };
 
         let tmp = tempfile::tempdir().unwrap();
-        let summary = mixed_secret_import(tmp.path(), &rules("TEST_TWO_SEEDS_B"));
+        let summary = mixed_rule_import(tmp.path(), &rules("TEST_TWO_SEEDS_B"));
         let warning = summary
             .warnings
             .iter()
@@ -2138,13 +2138,13 @@ fields = ["email"]
             "{warning}"
         );
         assert!(
-            !warning.contains("secret"),
-            "the seed must not be printed: {warning}"
+            !warning.contains("seed-alpha") && !warning.contains("seed-bravo"),
+            "neither seed must be printed: {warning}"
         );
 
         // The same seed twice is one shape, and stays quiet.
         let tmp = tempfile::tempdir().unwrap();
-        let summary = mixed_secret_import(tmp.path(), &rules("TEST_TWO_SEEDS_A"));
+        let summary = mixed_rule_import(tmp.path(), &rules("TEST_TWO_SEEDS_A"));
         assert!(
             !summary.warnings.iter().any(|w| w.contains("do not agree")),
             "one seed under two names is one derivation: {:?}",
@@ -2156,11 +2156,11 @@ fields = ["email"]
     fn test_two_salts_on_a_consistency_field_are_reported() {
         // SAFETY: these names are used by this test alone
         unsafe {
-            std::env::set_var("TEST_TWO_SALTS_A", "first-salt");
-            std::env::set_var("TEST_TWO_SALTS_B", "second-salt");
+            std::env::set_var("TEST_TWO_SALTS_A", "salt-alpha-0123456789");
+            std::env::set_var("TEST_TWO_SALTS_B", "salt-bravo-0123456789");
         }
         let tmp = tempfile::tempdir().unwrap();
-        let summary = mixed_secret_import(
+        let summary = mixed_rule_import(
             tmp.path(),
             r#"
 [[rules]]
@@ -2187,8 +2187,8 @@ fields = ["email"]
             "{warning}"
         );
         assert!(
-            !warning.contains("first-salt"),
-            "the salt must not be printed: {warning}"
+            !warning.contains("salt-alpha") && !warning.contains("salt-bravo"),
+            "neither salt must be printed: {warning}"
         );
     }
 }

@@ -39,7 +39,7 @@ encrypted-server = ["encryption", "http-server"]
 encrypted-server-cc = ["encryption-cc", "http-server"]
 encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
 mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle", "dep:socket2", "dep:windows-sys"]
-import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
+import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:hmac", "dep:zeroize", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
 # Real wasm SQLite backend. dynoxide compiles to wasm32-unknown-unknown and
 # runs against the official @sqlite.org/sqlite-wasm engine over a wasm-bindgen
@@ -52,7 +52,7 @@ wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "de
 # `#[wasm_bindgen]` harness export stays out of the production wasm build.
 wasm-harness = ["wasm-sqlite"]
 
-# Backward-compatible alias — identical to default features
+# Backward-compatible alias - identical to default features
 full = ["native-sqlite", "http-server", "mcp-server", "import"]
 
 [dependencies]
@@ -98,6 +98,7 @@ subtle = { version = "2", optional = true }
 toml = { version = "0.8", optional = true }
 fake = { version = "3", features = ["derive"], optional = true }
 sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 flate2 = { version = "1", optional = true }
 indicatif = { version = "0.18", optional = true }
 zstd = { version = "0.13", optional = true }

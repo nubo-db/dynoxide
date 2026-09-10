@@ -9,6 +9,11 @@ use crate::types::{AttributeValue, Item};
 use super::config::{Salt, ValidatedAction, ValidatedRule, matches_item};
 use super::consistency::ConsistencyMap;
 
+use hmac::{Hmac, Mac};
+
+/// The MAC behind `hash` rules. See [`hash_value`].
+type HmacSha256 = Hmac<Sha256>;
+
 use fake::Fake;
 use fake::faker::address::en::CityName;
 use fake::faker::company::en::CompanyName;
@@ -278,21 +283,35 @@ fn mask_value(original: &AttributeValue, keep_last: usize, mask_char: char) -> A
     }
 }
 
-/// Hash a value using SHA-256 with optional salt.
+/// Pseudonymise a value with HMAC-SHA256 keyed on the salt.
+///
+/// HMAC rather than `SHA256(salt || value)`, on the same reasoning as
+/// [`seeded_rng`]. A plain prefix leaves the salt and the value sharing one
+/// byte string with no boundary, so a salt of `ab` over a value `cd` derives
+/// what a salt of `a` derives over `bcd`, and the construction inherits
+/// SHA-256's length extension. Keying the salt keeps the two apart. The
+/// value is tagged and length-prefixed for the same reason the seed path
+/// does it: without a tag the string `123` and the number `123` pseudonymise
+/// to one value, and nothing in the output would ever show you that two
+/// attributes had been merged.
 fn hash_value(original: &AttributeValue, salt: &[u8]) -> AttributeValue {
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
+    let mut mac =
+        HmacSha256::new_from_slice(salt).expect("HMAC-SHA256 accepts a key of any length");
+    let mut field = |tag: u8, bytes: &[u8]| {
+        mac.update(&[tag]);
+        mac.update(&(bytes.len() as u64).to_be_bytes());
+        mac.update(bytes);
+    };
     match original {
-        AttributeValue::S(s) => hasher.update(s.as_bytes()),
-        AttributeValue::N(n) => hasher.update(n.as_bytes()),
-        AttributeValue::B(b) => hasher.update(b),
+        AttributeValue::S(s) => field(b's', s.as_bytes()),
+        AttributeValue::N(n) => field(b'n', n.as_bytes()),
+        AttributeValue::B(b) => field(b'b', b),
         _ => {
             let json = serde_json::to_string(original).unwrap_or_default();
-            hasher.update(json.as_bytes());
+            field(b'j', json.as_bytes());
         }
     }
-    let hash = hasher.finalize();
-    let hex = hex_encode(&hash);
+    let hex = hex_encode(&mac.finalize().into_bytes());
 
     AttributeValue::S(hex)
 }
@@ -359,6 +378,47 @@ mod tests {
         let v1 = hash_value(&AttributeValue::S("hello".to_string()), b"salt1");
         let v2 = hash_value(&AttributeValue::S("hello".to_string()), b"salt2");
         assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn test_salt_and_value_do_not_share_a_boundary() {
+        // Under SHA256(salt || value) these two hash the same bytes, so one
+        // salt's output is another salt's output over a different value.
+        // Keying the salt is what separates them.
+        let shifted = hash_value(&AttributeValue::S("cd".to_string()), b"ab");
+        let other = hash_value(&AttributeValue::S("bcd".to_string()), b"a");
+        assert_ne!(
+            shifted, other,
+            "the salt must not run into the value as one byte string"
+        );
+    }
+
+    #[test]
+    fn test_string_and_number_pseudonymise_differently() {
+        // Without a type tag `S("123")` and `N("123")` are the same bytes, so
+        // two attributes merge onto one pseudonym and nothing in the output
+        // says so.
+        let s = hash_value(&AttributeValue::S("123".to_string()), b"a-salt-long-enough");
+        let n = hash_value(&AttributeValue::N("123".to_string()), b"a-salt-long-enough");
+        assert_ne!(s, n, "type must be part of the derivation");
+    }
+
+    #[test]
+    fn test_hash_value_is_hmac_sha256_of_the_tagged_value() {
+        // Pins the construction itself, so a future edit that quietly returns
+        // to a prefixed hash fails here rather than silently repseudonymising
+        // every hashed column.
+        let salt = b"a-salt-long-enough";
+        let mut expected = <HmacSha256 as Mac>::new_from_slice(salt).unwrap();
+        expected.update(b"s");
+        expected.update(&(5u64).to_be_bytes());
+        expected.update(b"hello");
+        let expected = hex_encode(&expected.finalize().into_bytes());
+
+        assert_eq!(
+            hash_value(&AttributeValue::S("hello".to_string()), salt),
+            AttributeValue::S(expected)
+        );
     }
 
     #[test]

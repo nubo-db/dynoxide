@@ -68,7 +68,7 @@ pub enum ActionConfig {
         #[serde(default = "default_mask_char")]
         mask_char: String,
     },
-    /// One-way SHA-256 hash with salt from environment variable.
+    /// One-way HMAC-SHA256 keyed on a salt from an environment variable.
     Hash {
         /// Environment variable name containing the salt.
         salt_env: Option<String>,
@@ -114,12 +114,18 @@ pub struct ValidatedRule {
 /// `Debug` formatting (logs, panics, `dbg!()` calls). The salt exists
 /// specifically to prevent rainbow table attacks - `#[derive(Debug)]`
 /// on the raw bytes would undo that protection.
+///
+/// The bytes are zeroized on drop. Redacting `Debug` covers what gets
+/// printed; it says nothing about what stays in freed heap memory, and a
+/// salt is cloned into every rule that names it and held for the whole
+/// import run, so several copies outlive their last use. The same binary
+/// already treats `DYNOXIDE_ENCRYPTION_KEY` this way.
 #[derive(Clone)]
-pub struct Salt(Vec<u8>);
+pub struct Salt(zeroize::Zeroizing<Vec<u8>>);
 
 impl Salt {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(zeroize::Zeroizing::new(bytes))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -387,10 +393,20 @@ const VALID_GENERATORS: &[&str] = &[
     "last_name",
 ];
 
+/// The shortest secret a rule will accept, in bytes.
+///
+/// A salt or a seed only works while it cannot be guessed, and the values
+/// people reach for by reflex - `test`, `salt`, a project name - are all
+/// inside a wordlist an attacker would try before breakfast. Rejecting the
+/// empty string catches an unset CI secret; it does nothing about a short
+/// one, which fails in exactly the same way and looks deliberate.
+const MIN_SECRET_LEN: usize = 16;
+
 /// A secret a rule reads from the environment. Both a hash salt and a fake
 /// seed are only as good as the secret behind them, so an unset variable is
-/// an error and so is an empty one: empty is the shape a missing CI secret
-/// takes, and it would pass through as if it were a value.
+/// an error, so is an empty one - empty is the shape a missing CI secret
+/// takes, and it would pass through as if it were a value - and so is one
+/// too short to survive a wordlist.
 fn required_secret(
     rule_num: usize,
     env_var: &str,
@@ -406,6 +422,15 @@ fn required_secret(
         return Err(format!(
             "Rule {rule_num}: environment variable '{env_var}' is empty. \
              {why_it_must_be_secret}, so set it to a secret value"
+        ));
+    }
+    if value.len() < MIN_SECRET_LEN {
+        return Err(format!(
+            "Rule {rule_num}: environment variable '{env_var}' is {} bytes, and at least \
+             {MIN_SECRET_LEN} are required for {purpose}. {why_it_must_be_secret}, and a \
+             short value is guessable in the time it takes to read this. Generate one with \
+             `openssl rand -base64 24`",
+            value.len()
         ));
     }
     Ok(value.into_bytes())
@@ -467,13 +492,14 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
                     rule_num,
                     env_var,
                     "hash salt",
-                    "SHA-256 without a salt is trivially reversible via rainbow tables",
+                    "An unkeyed digest of a low-entropy value is trivially reversible via rainbow tables",
                 )?,
                 None => {
                     return Err(format!(
                         "Rule {rule_num}: salt_env is required for hash actions. \
-                         SHA-256 without a salt is trivially reversible via rainbow tables. \
-                         Set salt_env to an environment variable containing a secret salt value."
+                         An unkeyed digest of a low-entropy value is trivially reversible via \
+                         rainbow tables. Set salt_env to an environment variable containing a \
+                         secret salt value."
                     ));
                 }
             };
@@ -571,7 +597,7 @@ mod tests {
     #[test]
     fn test_seed_env_is_resolved_and_required_to_be_non_empty() {
         // SAFETY: single-threaded test, no concurrent env reads
-        unsafe { std::env::set_var("DYNOXIDE_TEST_SEED", "a-secret") };
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SEED", "a-seed-long-enough") };
         let action = ActionConfig::Fake {
             generator: "safe_email".to_string(),
             seed_env: Some("DYNOXIDE_TEST_SEED".to_string()),
@@ -579,7 +605,7 @@ mod tests {
         match validate_action(&action, 1).unwrap() {
             ValidatedAction::Fake { seed, .. } => assert_eq!(
                 seed.expect("seed should be resolved").as_bytes(),
-                b"a-secret",
+                b"a-seed-long-enough",
                 "the configured seed must reach the action"
             ),
             other => panic!("expected Fake, got {other:?}"),
@@ -664,6 +690,16 @@ action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
         let action_debug = format!("{:?}", action);
         assert!(action_debug.contains("[REDACTED]"));
         assert!(!action_debug.contains("super"));
+
+        // A seeded fake holds its seed in the same wrapper, so it redacts on
+        // the same terms as a hash salt.
+        let seeded = ValidatedAction::Fake {
+            generator: "safe_email".to_string(),
+            seed: Some(Salt::new(b"super-secret-value".to_vec())),
+        };
+        let seeded_debug = format!("{:?}", seeded);
+        assert!(seeded_debug.contains("[REDACTED]"));
+        assert!(!seeded_debug.contains("super"));
 
         let rule = ValidatedRule {
             condition: crate::expressions::condition::parse("attribute_exists(email)").unwrap(),
@@ -799,8 +835,59 @@ action = { type = "redact" }
         let err = validate_action(&action, 1).unwrap_err();
         assert!(err.contains("is empty"), "{err}");
 
-        unsafe { std::env::set_var("DYNOXIDE_TEST_EMPTY_SALT", "s3cret") };
+        unsafe { std::env::set_var("DYNOXIDE_TEST_EMPTY_SALT", "a-salt-long-enough") };
         assert!(validate_action(&action, 1).is_ok());
+    }
+
+    #[test]
+    fn test_short_salt_is_rejected() {
+        // Empty catches an unset CI secret. A short salt is the other half:
+        // it looks deliberate and fails the same way, so it is rejected on
+        // its own terms with its own message.
+        // SAFETY: this name is used by this test alone
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SALT", "hunter2") };
+        let action = ActionConfig::Hash {
+            salt_env: Some("DYNOXIDE_TEST_SHORT_SALT".to_string()),
+        };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(
+            err.contains("7 bytes"),
+            "the message names the length: {err}"
+        );
+        assert!(err.contains("at least 16"), "{err}");
+        assert!(
+            !err.contains("is empty"),
+            "a short salt is not an empty one: {err}"
+        );
+        assert!(
+            !err.contains("hunter2"),
+            "the message must not quote the value: {err}"
+        );
+
+        // One byte under is still under; one byte over is accepted.
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SALT", "123456789012345") };
+        assert!(validate_action(&action, 1).is_err(), "15 bytes is short");
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SALT", "1234567890123456") };
+        assert!(validate_action(&action, 1).is_ok(), "16 bytes is enough");
+
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_SHORT_SALT") };
+    }
+
+    #[test]
+    fn test_short_seed_is_rejected_on_the_same_terms_as_a_salt() {
+        // SAFETY: this name is used by this test alone
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SEED", "seed") };
+        let action = ActionConfig::Fake {
+            generator: "safe_email".to_string(),
+            seed_env: Some("DYNOXIDE_TEST_SHORT_SEED".to_string()),
+        };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("at least 16"), "{err}");
+
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SEED", "1234567890123456") };
+        assert!(validate_action(&action, 1).is_ok());
+
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_SHORT_SEED") };
     }
 
     #[test]

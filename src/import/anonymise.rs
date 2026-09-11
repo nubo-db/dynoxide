@@ -28,7 +28,10 @@ use sha2::{Digest, Sha256};
 /// Apply all matching rules to an item, mutating it in place.
 ///
 /// Returns the warnings raised (e.g. key attribute collision risks) and the
-/// top-level attributes actually rewritten. The caller needs the second to
+/// top-level attributes actually rewritten. Values a `mask` rule left as they
+/// arrived are counted into `mask_passthroughs`, keyed by attribute, since the
+/// output alone cannot tell a short value that was skipped from one that was
+/// never personal. The caller needs the second to
 /// know which keys a rule has taken over: predicting it from the rules is
 /// wrong, because each rule's condition sees the item as the rules before it
 /// left it, not as it arrived.
@@ -38,9 +41,13 @@ pub fn apply_rules(
     consistency_map: &mut ConsistencyMap,
     consistency_fields: &std::collections::HashSet<String>,
     key_attrs: &[String],
+    mask_passthroughs: &mut std::collections::HashMap<String, usize>,
 ) -> (Vec<String>, std::collections::HashSet<String>) {
     let mut warnings = Vec::new();
     let mut rewritten = std::collections::HashSet::new();
+    // Attributes already counted as kept whole for this item, so two mask
+    // rules over one attribute report one item rather than two.
+    let mut counted_whole: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for rule in rules {
         if !matches_item(rule, item) {
@@ -65,10 +72,17 @@ pub fn apply_rules(
         // A seeded fake is a pure function of the input, like hash, so the
         // consistency map would only duplicate what the derivation already
         // guarantees and grow unboundedly doing it.
-        let is_deterministic = matches!(
-            rule.action,
-            ValidatedAction::Hash { .. } | ValidatedAction::Fake { seed: Some(_), .. }
-        );
+        // `hash` derives from a canonical encoding, so it is a function of the
+        // value for every type. A seeded `fake` only derives from a scalar:
+        // `seeded_rng` draws from entropy for a map, list or set rather than
+        // claim a repeatability it cannot deliver, so for those the
+        // consistency map is the only thing keeping two items agreeing and
+        // skipping it would quietly give one input two values.
+        let is_deterministic = match &rule.action {
+            ValidatedAction::Hash { .. } => true,
+            ValidatedAction::Fake { seed: Some(_), .. } => is_scalar(&current_value),
+            _ => false,
+        };
         let new_value = if is_consistency_field && !is_deterministic {
             // Check consistency map first
             if let Some(cached) = consistency_map.get(&field_name, &current_value) {
@@ -87,6 +101,27 @@ pub fn apply_rules(
         } else {
             generate_value(&rule.action, &current_value)
         };
+
+        // A mask keeps the last few characters, so a value no longer than that
+        // comes back whole. Nothing in the output says so: the column looks
+        // masked because most of it is, and the short rows are the ones most
+        // likely to be a code or an initial that still identifies someone.
+        //
+        // Read the condition rather than compare the values. A long value that
+        // already begins with the mask character masks to itself and would
+        // read as short, and two mask rules on one attribute would each count
+        // the same item once, so the count is per item and attribute.
+        if let ValidatedAction::Mask { keep_last, .. } = &rule.action {
+            let kept_whole = match &current_value {
+                AttributeValue::S(s) => s.chars().count() <= *keep_last,
+                AttributeValue::N(n) => n.len() <= *keep_last,
+                // Every other type comes back as it arrived.
+                _ => true,
+            };
+            if kept_whole && counted_whole.insert(field_name.clone()) {
+                *mask_passthroughs.entry(field_name.clone()).or_insert(0) += 1;
+            }
+        }
 
         // Warn if targeting a key attribute
         if key_attrs.contains(&field_name) {
@@ -171,6 +206,18 @@ fn generate_fake(
         }
         _ => AttributeValue::S(fake_string),
     }
+}
+
+/// Whether a value is one `seeded_rng` can derive from.
+///
+/// A map, list or set is not: it has no single byte order, so a derivation over
+/// it would not be a function of the value. See [`canonical_bytes`], which
+/// gives one to the surfaces that need it.
+fn is_scalar(value: &AttributeValue) -> bool {
+    matches!(
+        value,
+        AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+    )
 }
 
 /// An RNG for one generated value.
@@ -297,23 +344,89 @@ fn mask_value(original: &AttributeValue, keep_last: usize, mask_char: char) -> A
 fn hash_value(original: &AttributeValue, salt: &[u8]) -> AttributeValue {
     let mut mac =
         HmacSha256::new_from_slice(salt).expect("HMAC-SHA256 accepts a key of any length");
-    let mut field = |tag: u8, bytes: &[u8]| {
-        mac.update(&[tag]);
-        mac.update(&(bytes.len() as u64).to_be_bytes());
-        mac.update(bytes);
-    };
-    match original {
-        AttributeValue::S(s) => field(b's', s.as_bytes()),
-        AttributeValue::N(n) => field(b'n', n.as_bytes()),
-        AttributeValue::B(b) => field(b'b', b),
-        _ => {
-            let json = serde_json::to_string(original).unwrap_or_default();
-            field(b'j', json.as_bytes());
-        }
-    }
+    mac.update(&canonical_bytes(original));
     let hex = hex_encode(&mac.finalize().into_bytes());
 
     AttributeValue::S(hex)
+}
+
+/// Encode an attribute value as a canonical, type-tagged, length-prefixed byte
+/// string. Two values encode alike exactly when they are the same value.
+///
+/// Every field carries its tag and its length, so the boundary between two
+/// fields can never be read as part of either, and the string `"123"` never
+/// encodes as the number `123`.
+///
+/// Order is the part that needs care. `AttributeValue::M` holds a `HashMap`,
+/// whose iteration order differs between two instances of the same map, so
+/// encoding one by serialising it directly gives a single value two encodings,
+/// and anything derived from those bytes stops being a function of the value.
+/// Map entries are sorted by key and set members are sorted before they are
+/// written. A list keeps the order it arrived in, because there the order is
+/// part of the value rather than an artefact of the container.
+pub(super) fn canonical_bytes(value: &AttributeValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    absorb(&mut out, value);
+    out
+}
+
+fn absorb(out: &mut Vec<u8>, value: &AttributeValue) {
+    fn field(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+        out.push(tag);
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    fn header(out: &mut Vec<u8>, tag: u8, members: usize) {
+        out.push(tag);
+        out.extend_from_slice(&(members as u64).to_be_bytes());
+    }
+
+    match value {
+        AttributeValue::S(s) => field(out, b's', s.as_bytes()),
+        AttributeValue::N(n) => field(out, b'n', n.as_bytes()),
+        AttributeValue::B(b) => field(out, b'b', b),
+        AttributeValue::BOOL(b) => field(out, b'o', &[u8::from(*b)]),
+        AttributeValue::NULL(n) => field(out, b'z', &[u8::from(*n)]),
+        AttributeValue::SS(members) => {
+            let mut sorted: Vec<&String> = members.iter().collect();
+            sorted.sort();
+            header(out, b'P', sorted.len());
+            for member in sorted {
+                field(out, b's', member.as_bytes());
+            }
+        }
+        AttributeValue::NS(members) => {
+            let mut sorted: Vec<&String> = members.iter().collect();
+            sorted.sort();
+            header(out, b'Q', sorted.len());
+            for member in sorted {
+                field(out, b'n', member.as_bytes());
+            }
+        }
+        AttributeValue::BS(members) => {
+            let mut sorted: Vec<&Vec<u8>> = members.iter().collect();
+            sorted.sort();
+            header(out, b'R', sorted.len());
+            for member in sorted {
+                field(out, b'b', member);
+            }
+        }
+        AttributeValue::L(members) => {
+            header(out, b'l', members.len());
+            for member in members {
+                absorb(out, member);
+            }
+        }
+        AttributeValue::M(entries) => {
+            let mut sorted: Vec<(&String, &AttributeValue)> = entries.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            header(out, b'm', sorted.len());
+            for (name, member) in sorted {
+                field(out, b'k', name.as_bytes());
+                absorb(out, member);
+            }
+        }
+    }
 }
 
 /// Simple hex encoding (avoids pulling in the `hex` crate).
@@ -390,6 +503,120 @@ mod tests {
         assert_ne!(
             shifted, other,
             "the salt must not run into the value as one byte string"
+        );
+    }
+
+    #[test]
+    fn test_hash_is_stable_over_a_map() {
+        // AttributeValue::M holds a HashMap, and two instances of one value
+        // iterate in different orders. Hashing a serialisation of that order
+        // gave every item its own pseudonym, so a hashed map attribute joined
+        // against nothing, including itself.
+        let entries = || {
+            let mut m = std::collections::HashMap::new();
+            for k in [
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+            ] {
+                m.insert(k.to_string(), AttributeValue::S(format!("{k}-value")));
+            }
+            AttributeValue::M(m)
+        };
+        let salt = b"a-salt-long-enough";
+        assert_eq!(
+            hash_value(&entries(), salt),
+            hash_value(&entries(), salt),
+            "one map value must give one pseudonym"
+        );
+    }
+
+    #[test]
+    fn test_hash_is_stable_over_a_nested_map() {
+        // The map may be behind a list, where the outer container is ordered
+        // and only the inner one is not.
+        let nested = || {
+            let mut inner = std::collections::HashMap::new();
+            for k in ["one", "two", "three", "four", "five", "six"] {
+                inner.insert(k.to_string(), AttributeValue::N("1".to_string()));
+            }
+            AttributeValue::L(vec![
+                AttributeValue::S("first".to_string()),
+                AttributeValue::M(inner),
+            ])
+        };
+        let salt = b"a-salt-long-enough";
+        assert_eq!(hash_value(&nested(), salt), hash_value(&nested(), salt));
+    }
+
+    #[test]
+    fn test_hash_is_stable_over_a_set_whatever_order_it_arrives_in() {
+        // A DynamoDB set is unordered, so two exports of one value can list
+        // its members either way round.
+        let salt = b"a-salt-long-enough";
+        let forwards = AttributeValue::SS(vec!["a".to_string(), "b".to_string()]);
+        let backwards = AttributeValue::SS(vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(hash_value(&forwards, salt), hash_value(&backwards, salt));
+    }
+
+    #[test]
+    fn test_a_list_keeps_the_order_it_arrived_in() {
+        // Unlike a set, a list's order is part of the value, so two orders are
+        // two values and must not share a pseudonym.
+        let salt = b"a-salt-long-enough";
+        let forwards = AttributeValue::L(vec![
+            AttributeValue::S("a".to_string()),
+            AttributeValue::S("b".to_string()),
+        ]);
+        let backwards = AttributeValue::L(vec![
+            AttributeValue::S("b".to_string()),
+            AttributeValue::S("a".to_string()),
+        ]);
+        assert_ne!(hash_value(&forwards, salt), hash_value(&backwards, salt));
+    }
+
+    #[test]
+    fn test_canonical_encoding_keeps_neighbouring_fields_apart() {
+        // The same boundary problem the salt had, one level down: without a
+        // length on each field, a key "ab" over a value "c" writes the bytes a
+        // key "a" over a value "bc" writes.
+        let one = |k: &str, v: &str| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(k.to_string(), AttributeValue::S(v.to_string()));
+            AttributeValue::M(m)
+        };
+        assert_ne!(
+            canonical_bytes(&one("ab", "c")),
+            canonical_bytes(&one("a", "bc"))
+        );
+    }
+
+    #[test]
+    fn test_containers_of_the_same_members_encode_apart() {
+        // A list and a set of one member are different values, and so are an
+        // empty map and an empty list.
+        let member = || AttributeValue::S("x".to_string());
+        assert_ne!(
+            canonical_bytes(&AttributeValue::L(vec![member()])),
+            canonical_bytes(&AttributeValue::SS(vec!["x".to_string()]))
+        );
+        assert_ne!(
+            canonical_bytes(&AttributeValue::M(std::collections::HashMap::new())),
+            canonical_bytes(&AttributeValue::L(Vec::new()))
+        );
+        assert_ne!(
+            canonical_bytes(&AttributeValue::BOOL(false)),
+            canonical_bytes(&AttributeValue::NULL(true))
+        );
+    }
+
+    #[test]
+    fn test_hash_over_binary_is_stable_and_distinct() {
+        let salt = b"a-salt-long-enough";
+        let bytes = AttributeValue::B(vec![0x00, 0xff, 0x10]);
+        assert_eq!(hash_value(&bytes, salt), hash_value(&bytes, salt));
+        assert_ne!(
+            hash_value(&bytes, salt),
+            hash_value(&AttributeValue::S("\u{0}\u{ff}\u{10}".to_string()), salt),
+            "binary must not land on the string of the same characters"
         );
     }
 

@@ -296,9 +296,23 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         );
     }
 
+    if rules_touch_a_key && data_model.is_none() {
+        summary.warnings.push(
+            "a rule rewrites a key attribute directly, and without a data model nothing \
+             counts what that costs: two items whose rewritten key comes out the same land \
+             on one row and the later one replaces the earlier. Overwrites are only counted \
+             when --data-model is given, so the item count below will not show what was lost"
+                .to_string(),
+        );
+    }
+
     for (table_name, files) in &export_files {
         let table_schema = schema_map.get(table_name.as_str()).unwrap();
         let key_attrs = extract_key_attrs(&table_schema.create_request);
+        // Values a mask rule left whole, by attribute. Bounded by the number
+        // of masked attributes, not by item count.
+        let mut mask_passthroughs: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut key_deriver = match data_model.as_ref() {
             Some(model) => {
                 let (deriver, warnings) = keys::KeyDeriver::new(
@@ -364,6 +378,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         &mut consistency_map,
                         &consistency_fields,
                         &key_attrs,
+                        &mut mask_passthroughs,
                     );
                     warnings.extend(rule_warnings);
                     match (key_deriver.as_mut(), plan) {
@@ -504,6 +519,16 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     keys::MAX_TRACKED_KEYS
                 ));
             }
+        }
+
+        let mut left_whole: Vec<(&String, &usize)> = mask_passthroughs.iter().collect();
+        left_whole.sort();
+        for (attribute, count) in left_whole {
+            summary.warnings.push(format!(
+                "table '{table_name}': {count} items kept '{attribute}' as it arrived because \
+                 the value was no shorter than the characters the mask keeps, so those rows \
+                 carry the original value"
+            ));
         }
 
         pb.finish_with_message(format!(
@@ -706,12 +731,15 @@ fn mixed_consistency_rules(
 
     let mut messages = Vec::new();
     for field in consistency_fields {
-        let mut secrets: Vec<Vec<u8>> = Vec::new();
+        // Numbering has to tell two secrets apart, not keep them. Holding the
+        // copies in the same wrapper as the original means they are wiped on
+        // drop like every other copy of a salt or a seed.
+        let mut secrets: Vec<zeroize::Zeroizing<Vec<u8>>> = Vec::new();
         let mut secret_number = |bytes: &[u8]| -> usize {
             match secrets.iter().position(|known| known.as_slice() == bytes) {
                 Some(i) => i + 1,
                 None => {
-                    secrets.push(bytes.to_vec());
+                    secrets.push(zeroize::Zeroizing::new(bytes.to_vec()));
                     secrets.len()
                 }
             }

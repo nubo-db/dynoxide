@@ -90,7 +90,7 @@ ANON_SALT="$(openssl rand -base64 24)" dynoxide import \
 |--------|-------------|
 | `fake` | Replace with generated data (`safe_email`, `name`, `phone_number`, `address`, `company_name`, `sentence`, `word`, `first_name`, `last_name`). Takes an optional `seed_env`, below |
 | `mask` | Keep last N characters, mask the rest (`keep_last`, `mask_char`) |
-| `hash` | HMAC-SHA256 keyed on a salt from an env var (`salt_env`, required, 16 bytes or more) |
+| `hash` | HMAC-SHA256 keyed on a salt from an env var (`salt_env`, required, 16 bytes or more), over a canonical encoding of the value, so a map, list or set hashes as stably as a string |
 | `redact` | Replace with `[REDACTED]` |
 | `null` | Replace with NULL |
 
@@ -205,8 +205,10 @@ both and list `email`, and the order stays in its customer's partition.
 The importer enforces the second half. When two entities build the same key
 from the same template, an anonymised attribute that template reads has to be
 consistency-tracked, or their keys cannot agree. That is a warning when the
-model says it could happen, and an error once two entities are seen to take
-the same original key to different values:
+model says it could happen, and an error once the anonymisation is seen to take
+one original key to two different values. That is usually two entities
+disagreeing, but one entity is enough on its own: many rows sharing a
+partition, each drawing its own fake, leave that partition split the same way.
 
 ```
 entity 'Customer' and entity 'Order' took the same original pk to different
@@ -341,9 +343,11 @@ the same dynoxide gives the same answer every time, and a future dynoxide may
 not. Refresh a fixture in one go rather than expecting values to survive an
 upgrade untouched.
 
-Only scalar values are derived. A map, list or set has no stable byte order to
-hash, so those draw fresh each time even with a seed set, rather than claim a
-repeatability they cannot deliver.
+Only scalar values are derived. A seeded `fake` draws fresh for a map, list or
+set rather than claim a repeatability it cannot deliver, so those still go
+through `[consistency] fields` if two items holding the same one have to agree.
+`hash` does derive from them, over a canonical encoding that sorts a map's
+entries by key and a set's members before reading them.
 
 **The seed is a secret, for the same reason the hash salt is.** Anyone holding
 both the original data and the seed can re-run the import and reproduce the

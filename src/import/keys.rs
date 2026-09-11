@@ -29,10 +29,11 @@ use super::config::{ValidatedAction, ValidatedRule, parse_path};
 /// collapsing onto one row. Past this many the check stops, and says so.
 pub(super) const MAX_TRACKED_KEYS: usize = 1_000_000;
 
-/// Longest `${name:length:pad}` padding a key is allowed to ask for. A key is
-/// capped at 2048 bytes, so anything past this is a typo rather than intent,
-/// and rendering it would look like a hang.
-const MAX_PAD_LENGTH: usize = 4096;
+/// Longest `${name:length:pad}` padding a key is allowed to ask for. DynamoDB
+/// caps a partition key at 2048 bytes and every character costs at least one,
+/// so a longer pad cannot produce a key the table would accept, and asking for
+/// one is a typo rather than intent.
+const MAX_PAD_LENGTH: usize = 2048;
 
 /// One piece of a `${name}` template.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,11 +58,43 @@ struct Padding {
 }
 
 impl Padding {
+    /// Pad to `length` characters, matching JavaScript's `padStart`, which is
+    /// what OneTable itself renders with.
+    ///
+    /// The fill repeats and is then cut to the exact shortfall, so a
+    /// multi-character fill lands on `length` rather than overshooting it.
+    /// Prepending the fill whole until the value was long enough rendered
+    /// `${orderId:4:00}` over `7` as `00007` where OneTable gives `0007`, and
+    /// a key the template cannot reproduce is left unrebuilt, keeping the
+    /// value it arrived with. The single-character default hid that.
     fn apply(&self, value: &str) -> String {
-        let mut out = value.to_string();
-        while out.chars().count() < self.length {
-            out.insert_str(0, &self.fill);
+        if self.fill.is_empty() {
+            return value.to_string();
         }
+        // Counted in UTF-16 code units, because that is what JavaScript's
+        // `length` counts and the model was written against it: a character
+        // outside the basic plane is two units there and one `char` here, so
+        // counting chars pads an emoji one short of what OneTable renders.
+        // The fill is still cycled by character, so a fill that is itself
+        // astral and a shortfall that is odd cannot be split the way
+        // JavaScript would; a fill outside the basic plane is not a shape
+        // OneTable's numeric padding produces.
+        let have = value.encode_utf16().count();
+        if have >= self.length {
+            return value.to_string();
+        }
+        let shortfall = self.length - have;
+        let mut out = String::new();
+        let mut units = 0usize;
+        for c in self.fill.chars().cycle() {
+            let width = c.len_utf16();
+            if units + width > shortfall {
+                break;
+            }
+            out.push(c);
+            units += width;
+        }
+        out.push_str(value);
         out
     }
 }
@@ -194,6 +227,10 @@ struct EntityKeys {
 struct AtRisk {
     /// The key attribute the shared template builds.
     key_attribute: String,
+    /// Whether this key groups rows with each other, which only a partition
+    /// key does. One entity splitting its own sort key across two partitions
+    /// breaks nothing, so the single-entity check below reads this first.
+    groups_rows: bool,
     /// Root field names to put in `[consistency] fields`. Roots, because
     /// that is what the consistency map is keyed on: advising `contact.email`
     /// when only `contact` is honoured would send someone in a circle.
@@ -301,6 +338,21 @@ impl KeyDeriver {
         let hash = partition_key_name(&request.key_schema);
         let range = sort_key_name(&request.key_schema);
         let gsis = request.global_secondary_indexes.as_deref().unwrap_or(&[]);
+
+        // Which key attributes group rows with each other. Only a partition
+        // key does: rows sharing one come back from a single query, so an
+        // entity that takes one original partition to two values has broken
+        // that grouping by itself. A sort key orders rows inside a partition
+        // it does not define, so one entity splitting its own sort key values
+        // costs nothing when those rows sit in different partitions, and
+        // treating it as a break would fail imports that never had a join to
+        // lose. Two entities disagreeing on a sort key is still a break, and
+        // is still caught, because there the rows do share a partition.
+        let mut partition_keys: HashSet<&str> = HashSet::new();
+        partition_keys.extend(hash);
+        for gsi in gsis {
+            partition_keys.extend(partition_key_name(&gsi.key_schema));
+        }
 
         let rule_targets: HashSet<&str> = rules.iter().filter_map(rule_target).collect();
         let mut warnings = Vec::new();
@@ -519,7 +571,14 @@ impl KeyDeriver {
                     }
                 };
                 let (users, known_roots, observers) = group;
-                if roots.is_empty() {
+                // A rule naming the key attribute itself rewrites the whole
+                // key, which puts the entity at risk exactly as a rule on one
+                // of the template's sources does. Reading only the sources put
+                // it among the observers, and a group with no user at all is
+                // dropped below, so the one shape that rewrites the most of a
+                // key was the shape that went unchecked.
+                let rewrites_key_directly = rule_targets.contains(attribute.as_str());
+                if roots.is_empty() && !rewrites_key_directly {
                     if !observers.contains(&idx) {
                         observers.push(idx);
                     }
@@ -572,6 +631,7 @@ impl KeyDeriver {
                     ));
                 }
                 AtRisk {
+                    groups_rows: partition_keys.contains(key_attribute.as_str()),
                     key_attribute,
                     consistency_roots: if unlisted.is_empty() { roots } else { unlisted },
                     entities: entities_using,
@@ -702,6 +762,7 @@ impl KeyDeriver {
                 }
                 risk.seen_keys.insert(*original, Vec::new());
             }
+            let groups_rows = risk.groups_rows;
             let outcomes = risk.seen_keys.get_mut(original).expect("just inserted");
 
             match outcomes.iter_mut().find(|o| o.entity == plan.entity) {
@@ -718,6 +779,15 @@ impl KeyDeriver {
             // from what the other produced.
             let mut diverged: Vec<usize> = Vec::new();
             for (i, a) in outcomes.iter().enumerate() {
+                // An entity that took one original key to more than one result
+                // has already broken the join between the rows that shared it,
+                // whether or not a second entity is in the group. The pairwise
+                // pass below cannot see that, because it never pairs an entity
+                // with itself, so a single entity's own split was recorded on
+                // the outcome and then dropped.
+                if a.multiple && groups_rows {
+                    diverged.push(a.entity);
+                }
                 for b in outcomes.iter().skip(i + 1) {
                     if a.first != b.first || a.multiple || b.multiple {
                         diverged.push(a.entity);
@@ -839,18 +909,43 @@ impl KeyDeriver {
     pub fn join_breaks(&self) -> Vec<String> {
         self.at_risk
             .iter()
-            .filter(|risk| risk.diverged.len() > 1)
+            .filter(|risk| !risk.diverged.is_empty())
             .map(|risk| {
                 let mut seen: Vec<usize> = risk.diverged.iter().copied().collect();
                 seen.sort();
 
+                // A rule naming the key attribute itself reads no template
+                // source, so there is no root to list and [consistency] has
+                // nothing to hold. Saying "add  to [consistency] fields" sends
+                // the reader looking for a field name that was never there.
+                let repair = if risk.consistency_roots.is_empty() {
+                    "Use a deterministic action such as hash, so one original key always \
+                     renders one new key"
+                        .to_string()
+                } else {
+                    format!(
+                        "Add {} to [consistency] fields, or use a deterministic action such \
+                         as hash",
+                        quoted_list(&risk.consistency_roots)
+                    )
+                };
+
+                if seen.len() == 1 {
+                    return format!(
+                        "{} took one original {} to more than one value, so rows that shared a \
+                         partition no longer share one and a query for them comes back with \
+                         part of what it held. {repair}",
+                        entity_list(&self.entities, &seen),
+                        risk.key_attribute,
+                    );
+                }
+
                 format!(
                     "{} took the same original {} to different values, so their keys no longer \
                      agree and they will not join. Give both entities the same attribute name \
-                     for that value and add {} to [consistency] fields",
+                     for that value. {repair}",
                     entity_list(&self.entities, &seen),
                     risk.key_attribute,
-                    quoted_list(&risk.consistency_roots)
                 )
             })
             .collect()
@@ -1791,7 +1886,7 @@ mod tests {
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
         assert!(
-            breaks[0].contains("add 'contact' to [consistency] fields"),
+            breaks[0].contains("Add 'contact' to [consistency] fields"),
             "must name the root, which is what the consistency map keys on: {breaks:?}"
         );
     }
@@ -1826,6 +1921,40 @@ mod tests {
         let plan = d.plan(&item, &mut warnings).unwrap();
         item.insert("email".to_string(), AttributeValue::S(becomes.to_string()));
         d.apply(&plan, &no_rewrites(), &mut item, &mut warnings);
+    }
+
+    #[test]
+    fn padding_matches_javascript_pad_start() {
+        // OneTable renders these in JavaScript, so `padStart` is the oracle.
+        // Every expectation below was taken from node rather than reasoned
+        // out. The old implementation prepended the fill whole and stopped
+        // once it was long enough, so a multi-character fill overshot and the
+        // rendered key stopped matching the model; a key the template cannot
+        // reproduce is left alone, keeping the value it arrived with.
+        let cases = [
+            ("7", 4, "0", "0007"),
+            ("7", 4, "00", "0007"),
+            ("xx", 5, "ab", "abaxx"),
+            ("42", 6, "-*", "-*-*42"),
+            ("abc", 2, "0", "abc"),
+            ("", 3, "xyz", "xyz"),
+            ("日本", 4, "0", "00日本"),
+            // Counted in UTF-16 units, as JavaScript counts them: this
+            // emoji is two there and one `char` here.
+            ("\u{1F600}", 4, "0", "00\u{1F600}"),
+            ("a\u{1F600}", 4, "0", "0a\u{1F600}"),
+        ];
+        for (value, length, fill, want) in cases {
+            let pad = Padding {
+                length,
+                fill: fill.to_string(),
+            };
+            assert_eq!(
+                pad.apply(value),
+                want,
+                "padStart({value:?}, {length}, {fill:?})"
+            );
+        }
     }
 
     fn shared_key_deriver() -> KeyDeriver {
@@ -1871,7 +2000,7 @@ mod tests {
         let breaks = d.join_breaks();
         assert_eq!(breaks.len(), 1, "{breaks:?}");
         assert!(breaks[0].contains("entity 'Customer' and entity 'Order'"));
-        assert!(breaks[0].contains("add 'email' to [consistency] fields"));
+        assert!(breaks[0].contains("Add 'email' to [consistency] fields"));
     }
 
     #[test]
@@ -1959,10 +2088,22 @@ mod tests {
             .map(|r| r.seen_keys.values().map(Vec::len).sum::<usize>())
             .sum();
         assert_eq!(outcomes, 1, "one row per entity per key, not per item");
+
+        // Fifty orders arrived under one customer partition and left under
+        // fifty, so the rows that shared a partition no longer do. No second
+        // entity is needed for that to be a broken join, and the summary row
+        // above is what carries it: the outcome records the split, so the
+        // check reads it rather than only comparing one entity against another.
+        let breaks = d.join_breaks();
+        assert_eq!(
+            breaks.len(),
+            1,
+            "an entity that splits its own partition has broken a join: {breaks:?}"
+        );
         assert!(
-            d.join_breaks().is_empty(),
-            "one entity disagreeing with itself is not a cross-entity break: {:?}",
-            d.join_breaks()
+            breaks[0].contains("took one original"),
+            "the message should name the split rather than a disagreement \
+             between two entities: {breaks:?}"
         );
 
         // The customer still finds the disagreement.

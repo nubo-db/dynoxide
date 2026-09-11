@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-09-09
+## [1.2.0] - 2026-09-11
 
 The crate moves to `dynoxide-rs` 2.0.0 in this release, because `ImportCommand`
 gained a field. Nothing else a user installs changes major: the CLI, the npm
@@ -28,6 +28,23 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   is now tagged with its DynamoDB type and length-prefixed on the same terms
   as a seeded `fake`, so the string `"123"` and the number `123` no longer
   land on one pseudonym.
+- **`hash` now derives a map, list or set from a canonical encoding**, where
+  before it hashed `serde_json` output. `AttributeValue::M` holds a hash map,
+  whose iteration order differs between two instances of the same value, so a
+  hashed map attribute gave every item its own pseudonym and joined against
+  nothing, including itself. Map entries are now sorted by key and set members
+  sorted before they are read, and every field carries its type and length.
+  Scalar values are unaffected and hash exactly as they did earlier in this
+  release. The same encoding now keys the consistency map, so a map-valued
+  consistency field finds the entry it wrote.
+- **The consistency map now keeps types apart.** It keyed on the bare text, so
+  the string `"42"` and the number `42` shared one entry and the second to
+  arrive was anonymised to whatever the first became. A comment claimed a type
+  tag the code never wrote.
+- **A seeded `fake` on a map, list or set no longer bypasses the consistency
+  map.** It was classed as deterministic alongside `hash`, but its derivation
+  falls back to entropy for those types, so setting `seed_env` made such a
+  field strictly less consistent than leaving it unset.
 - **`salt_env` and `seed_env` now require at least 16 bytes.** An empty
   variable was already rejected, since that is the shape an unset CI secret
   takes. A short one fails the same way but looks deliberate, so nothing
@@ -37,6 +54,19 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
 
 ### Added
 
+- `${name:length:pad}` padding now matches OneTable's own rendering for a
+  multi-character pad. The fill was prepended whole until the value was long
+  enough, so `${orderId:4:00}` rendered `7` as `00007` where OneTable gives
+  `0007`, and a key whose template cannot reproduce the value it arrived with
+  is left unrebuilt, keeping the original. The single-character default was
+  unaffected, which is why it went unnoticed. Lengths are counted in UTF-16
+  code units, as JavaScript counts them.
+- An import now says when a `mask` rule left values as they arrived, counted
+  per attribute. A mask keeps the last few characters, so a value no longer
+  than that comes back whole, and nothing in the output said so.
+- An import now says when a rule rewrites a key attribute directly and no data
+  model is loaded. Two items whose rewritten key comes out the same land on one
+  row, and overwrites are only counted when `--data-model` is given.
 - `dynoxide import --data-model <onetable.json>` rebuilds keys from their
   entity templates after anonymisation. Rules rewrite whole attribute values,
   so in a single-table design a rule on `email` left the real address inside
@@ -61,17 +91,21 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   silently unrebuilt. An import that has rules but no data model now says in
   its warnings that keys built from attributes keep their original values
   ([#201](https://github.com/nubo-db/dynoxide/issues/201)).
-- An import that would silently break the join between two entities now fails.
+- An import that would silently break a join now fails, whether the break is
+  between two entities or inside one.
   When two entities build the same key from the same template, an anonymised
   attribute that template reads has to be in `[consistency] fields` or each
   entity anonymises it independently and their keys stop agreeing. Every count
   stays correct, every key stays well formed and every value is genuinely
   fake, so nothing in the output says anything is wrong: the only symptom is
   that a query for a customer's orders returns nothing. The model and the
-  rules together are enough to warn up front, but the failure waits until two
-  entities are seen to anonymise the same value differently. Pulling one
-  entity's slice still works, so does importing two entities that share
-  nothing, and so does a deterministic action such as `hash`, which keeps both
+  rules together are enough to warn up front, but the failure waits until the
+  anonymisation is seen to take one original value to two results. That holds
+  within a single entity too: many rows sharing one partition, each drawing
+  its own fake, leave that partition split as surely as two entities
+  disagreeing. Pulling one entity's slice still works, since there each row
+  carries its own value and nothing splits, so does importing two entities
+  that share nothing, and so does a deterministic action such as `hash`, which keeps both
   entities agreeing without any `[consistency]` entry. None of those has a
   join to lose, and a check that fires on legitimate use earns a bypass flag.
   In file mode nothing is persisted on the error path; the library entry

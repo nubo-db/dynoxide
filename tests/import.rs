@@ -1522,7 +1522,7 @@ action = { type = "fake", generator = "safe_email" }
             msg.contains("entity 'Customer' and entity 'Order'"),
             "{msg}"
         );
-        assert!(msg.contains("add 'email' to [consistency] fields"), "{msg}");
+        assert!(msg.contains("Add 'email' to [consistency] fields"), "{msg}");
 
         // Nothing is persisted on the error path.
         assert!(

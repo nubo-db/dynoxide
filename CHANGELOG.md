@@ -72,6 +72,13 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   `openssl rand -base64 24`.
 
 ### Added
+- An import now says when one entity split a sort key of its own. Rows share a
+  sort value for reasons that are not relationships, so this is reported rather
+  than fatal: two people of one name under one tenant shared it and were never
+  related. Splitting a partition still fails the import, because rows that came
+  back from one query no longer do.
+- An import now says when a rule rewrites an index key attribute directly. No
+  row is lost, but rows an index returned together are moved apart.
 - An import now says when a rule did nothing. A rule that matched no item, or
   that matched items none of which carried its path, is reported per rule with
   its number and path. A misspelt path or a match expression that fits none of

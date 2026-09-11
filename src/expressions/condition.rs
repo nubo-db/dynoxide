@@ -1460,6 +1460,32 @@ mod tests {
     }
 
     #[test]
+    fn contains_matches_a_number_set_by_value_not_spelling() {
+        // A rules file is written by hand, so it supplies whichever spelling
+        // the author typed. Comparing the text meant a set holding `1.0` did
+        // not contain `1`, the rule did not fire, and the value it was there
+        // to remove stayed in the output.
+        let expr = parse("contains(scores, :n)").unwrap();
+        let item = make_item(&[("scores", AttributeValue::NS(vec!["1.0".into(), "2".into()]))]);
+        for spelling in ["1", "1.0", "1.00", "0.1e1"] {
+            let av = vals(&[(":n", AttributeValue::N(spelling.into()))]);
+            assert!(
+                evaluate_without_tracking(&expr, &item, &None, &av).unwrap(),
+                "the set holds this number, spelled {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_still_says_no_to_a_number_the_set_does_not_hold() {
+        // The other direction, so the comparison above is not simply true.
+        let expr = parse("contains(scores, :n)").unwrap();
+        let item = make_item(&[("scores", AttributeValue::NS(vec!["1.0".into(), "2".into()]))]);
+        let av = vals(&[(":n", AttributeValue::N("3".into()))]);
+        assert!(!evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
     fn test_size_function() {
         let expr = parse("size(label) > :len").unwrap();
         let item = make_item(&[("label", AttributeValue::S("Alice".into()))]);

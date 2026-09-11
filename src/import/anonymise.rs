@@ -421,11 +421,21 @@ fn absorb(out: &mut Vec<u8>, value: &AttributeValue) {
         // normalises on write, so encoding the spelling the export happened to
         // use would give one value two pseudonyms and break the join between
         // a row that wrote it one way and a row that wrote it the other.
-        AttributeValue::N(n) => field(
-            out,
-            b'n',
-            crate::types::normalize_dynamo_number(n).as_bytes(),
-        ),
+        //
+        // Only a value DynamoDB would actually accept, though. The import
+        // parser does not validate an `N`, and normalising maps everything it
+        // cannot read to "0", so `abc`, `NaN` and an empty string would all
+        // encode as zero and three people would share one pseudonym. Anything
+        // that is not a number keeps its own bytes under its own tag, which is
+        // both honest and injective.
+        AttributeValue::N(n) => match crate::types::validate_dynamo_number(n) {
+            Ok(()) => field(
+                out,
+                b'n',
+                crate::types::normalize_dynamo_number(n).as_bytes(),
+            ),
+            Err(_) => field(out, b'x', n.as_bytes()),
+        },
         AttributeValue::B(b) => field(out, b'b', b),
         AttributeValue::BOOL(b) => field(out, b'o', &[u8::from(*b)]),
         AttributeValue::NULL(n) => field(out, b'z', &[u8::from(*n)]),
@@ -441,7 +451,10 @@ fn absorb(out: &mut Vec<u8>, value: &AttributeValue) {
         AttributeValue::NS(members) => {
             let mut sorted: Vec<String> = members
                 .iter()
-                .map(|m| crate::types::normalize_dynamo_number(m))
+                .map(|m| match crate::types::validate_dynamo_number(m) {
+                    Ok(()) => crate::types::normalize_dynamo_number(m),
+                    Err(_) => m.clone(),
+                })
                 .collect();
             sorted.sort();
             sorted.dedup();
@@ -703,6 +716,55 @@ mod tests {
             hash_value(&AttributeValue::N("1".to_string()), salt),
             hash_value(&AttributeValue::N("2".to_string()), salt),
             "but two numbers stay two"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_number_keeps_its_own_pseudonym() {
+        // The import parser does not check that an `N` holds a number, and
+        // normalising maps everything unreadable to "0". Encoding through it
+        // unguarded put every malformed value on the pseudonym for zero, so
+        // three people with three different broken values became one person.
+        let salt = b"a-salt-long-enough";
+        let zero = hash_value(&AttributeValue::N("0".to_string()), salt);
+        for bad in ["abc", "NaN", "", "not-a-number", "1.2.3"] {
+            assert_ne!(
+                hash_value(&AttributeValue::N(bad.to_string()), salt),
+                zero,
+                "N({bad:?}) must not land on the pseudonym for zero"
+            );
+        }
+        assert_ne!(
+            hash_value(&AttributeValue::N("abc".to_string()), salt),
+            hash_value(&AttributeValue::N("NaN".to_string()), salt),
+            "and two different broken values stay two"
+        );
+    }
+
+    #[test]
+    fn an_exponent_dynamodb_would_reject_is_not_expanded() {
+        // The expansion walks the exponent a character at a time, so an
+        // exponent outside DynamoDB's own range turns nine characters of
+        // export into gigabytes of string, once per item.
+        let started = std::time::Instant::now();
+        let out = crate::types::normalize_dynamo_number("1e-2000000000");
+        assert!(
+            out.len() < 64,
+            "an unacceptable exponent must not be expanded: got {} chars",
+            out.len()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "and it must not take a second to decide that"
+        );
+    }
+
+    #[test]
+    fn a_binary_set_is_a_set_too() {
+        let salt = b"a-salt-long-enough";
+        assert_eq!(
+            hash_value(&AttributeValue::BS(vec![vec![1, 2]]), salt),
+            hash_value(&AttributeValue::BS(vec![vec![1, 2], vec![1, 2]]), salt)
         );
     }
 

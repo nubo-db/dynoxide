@@ -219,8 +219,13 @@ struct EntityKeys {
     match_keys: Vec<TemplatedKey>,
 }
 
-/// An attribute more than one entity builds a key from, which is not in
-/// `[consistency] fields`. Anonymising it independently per item means the
+/// A key attribute at least one entity builds from something a rule rewrites.
+///
+/// One entity is enough: an entity that takes one original key to two values
+/// has split the rows that shared it without any sibling's help. Roots already
+/// listed in `[consistency] fields` are tracked too rather than excused, since
+/// the map stops taking new values at its cap and starts handing out fresh
+/// ones, and the value check is what notices when that happens. Anonymising it independently per item means the
 /// entities' keys disagree and the join between them is lost.
 #[derive(Debug)]
 
@@ -256,6 +261,10 @@ struct AtRisk {
     seen_keys: std::collections::HashMap<u64, Vec<Outcome>>,
     /// Entities found to have taken a shared key to different values.
     diverged: HashSet<usize>,
+    /// Entities that split a key of their own which only orders rows inside a
+    /// partition it does not define. Reported rather than fatal: rows share a
+    /// sort value for reasons that are not relationships.
+    split_alone: HashSet<usize>,
     /// Keys that went unchecked after the cap.
     unchecked: usize,
 }
@@ -299,6 +308,9 @@ pub struct KeyDeriver {
     /// a value, reported once so a whole table of off-template items
     /// produces one warning rather than one per item.
     warned_mismatch: HashMap<(usize, usize), usize>,
+    /// Key attributes a rule names directly, so `plan` can tell a template
+    /// that failed from a key the rules were always going to replace.
+    rule_targets: HashSet<String>,
     /// (entity index, key index) pairs that could not be rendered after the
     /// rules ran, reported once.
     warned_unrenderable: HashMap<(usize, usize), usize>,
@@ -665,6 +677,7 @@ impl KeyDeriver {
                     observers,
                     seen_keys: std::collections::HashMap::new(),
                     diverged: HashSet::new(),
+                    split_alone: HashSet::new(),
                     unchecked: 0,
                 }
             })
@@ -682,6 +695,7 @@ impl KeyDeriver {
                 hash_attribute: hash.map(String::from),
                 range_attribute: range.map(String::from),
                 warned_mismatch: HashMap::new(),
+                rule_targets: rule_targets.iter().map(|a| (*a).to_string()).collect(),
                 warned_unrenderable: HashMap::new(),
                 warned_rule_wins: HashSet::new(),
                 unmatched: 0,
@@ -720,6 +734,12 @@ impl KeyDeriver {
             };
             if reproduced {
                 keys.push(idx);
+            } else if self.rule_targets.contains(&key.attribute) {
+                // A rule names this key directly, so whatever its template
+                // would have rendered is beside the point: the rule's value
+                // replaces it. Counting it among the keys that kept their
+                // original would claim real data survived a rule that removed
+                // it. The "a rule rewrote {key} directly" warning covers it.
             } else {
                 let seen = self.warned_mismatch.entry((entity_idx, idx)).or_insert(0);
                 *seen += 1;
@@ -788,7 +808,8 @@ impl KeyDeriver {
                 risk.grouped_by
                     .iter()
                     .filter_map(|attribute| {
-                        group_hash(Some(item.get(attribute)?), key).map(|h| (idx, h))
+                        let value = item.get(attribute)?;
+                        group_hash(Some((attribute.as_str(), value)), key).map(|h| (idx, h))
                     })
                     .collect()
             })
@@ -816,6 +837,7 @@ impl KeyDeriver {
                 }
                 risk.seen_keys.insert(*original, Vec::new());
             }
+            let groups_rows = risk.grouped_by.is_empty();
             let outcomes = risk.seen_keys.get_mut(original).expect("just inserted");
 
             match outcomes.iter_mut().find(|o| o.entity == plan.entity) {
@@ -831,15 +853,26 @@ impl KeyDeriver {
             // produced more than one result, since one of those must differ
             // from what the other produced.
             let mut diverged: Vec<usize> = Vec::new();
+            let mut split_alone: Vec<usize> = Vec::new();
             for (i, a) in outcomes.iter().enumerate() {
                 // An entity that took one original key to more than one result
-                // has already broken the join between the rows that shared it,
-                // whether or not a second entity is in the group. The pairwise
-                // pass below cannot see that, because it never pairs an entity
-                // with itself, so a single entity's own split was recorded on
-                // the outcome and then dropped.
+                // has split the rows that shared it, and the pairwise pass
+                // below cannot see that because it never pairs an entity with
+                // itself. What that split costs depends on the key. Losing a
+                // partition means rows that came back from one query no longer
+                // do, so it fails the import. Losing a shared sort value
+                // inside a partition is weaker, and rows share one for
+                // reasons that are not relationships: two people called John
+                // Smith sat under one tenant share `NAME#John Smith` and were
+                // never related. Failing on that blocks a legitimate export,
+                // and the only way past would be to drop --data-model, which
+                // turns key rebuilding off and ships the real values.
                 if a.multiple {
-                    diverged.push(a.entity);
+                    if groups_rows {
+                        diverged.push(a.entity);
+                    } else {
+                        split_alone.push(a.entity);
+                    }
                 }
                 for b in outcomes.iter().skip(i + 1) {
                     if a.first != b.first || a.multiple || b.multiple {
@@ -850,6 +883,9 @@ impl KeyDeriver {
             }
             for entity in diverged {
                 risk.diverged.insert(entity);
+            }
+            for entity in split_alone {
+                risk.split_alone.insert(entity);
             }
         }
     }
@@ -1010,20 +1046,55 @@ impl KeyDeriver {
             .collect()
     }
 
+    /// Entities that split a sort key of their own. Not a broken join on its
+    /// own, because rows share a sort value for reasons that are not
+    /// relationships, but worth saying: a query matching that value used to
+    /// return them together and no longer does.
+    pub fn sort_key_splits(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .at_risk
+            .iter()
+            .filter(|risk| !risk.split_alone.is_empty())
+            .map(|risk| {
+                let mut seen: Vec<usize> = risk.split_alone.iter().copied().collect();
+                seen.sort();
+                format!(
+                    "{} took one original {} to more than one value. Those rows stay in their \
+                     partitions, so nothing is lost from a query on the partition, but a query \
+                     matching that {} exactly used to return them together and will not now",
+                    entity_list(&self.entities, &seen),
+                    risk.key_attribute,
+                    risk.key_attribute
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// How many items kept a key the model could not rebuild, by entity and
     /// key. These are the values the run exists to remove, so the count is the
     /// difference between one stray row and a whole table left as it arrived.
     pub fn take_unrebuilt(&mut self) -> Vec<(String, String, usize)> {
-        let mut out: Vec<(String, String, usize)> = self
+        // Both maps describe one outcome, a key left holding the value it
+        // arrived with, so an entity and key in both is one fact with two
+        // causes rather than two facts. Summed, not listed twice.
+        let mut totals: HashMap<(usize, usize), usize> = HashMap::new();
+        for (id, count) in self
             .warned_mismatch
             .iter()
             .chain(self.warned_unrenderable.iter())
+        {
+            *totals.entry(*id).or_insert(0) += count;
+        }
+        let mut out: Vec<(String, String, usize)> = totals
+            .into_iter()
             .map(|((entity, key), count)| {
-                let entity = &self.entities[*entity];
+                let entity = &self.entities[entity];
                 (
                     entity.name.clone(),
-                    entity.keys[*key].attribute.clone(),
-                    *count,
+                    entity.keys[key].attribute.clone(),
+                    count,
                 )
             })
             .collect();
@@ -1107,10 +1178,15 @@ fn quoted_list(names: &[String]) -> String {
 /// table, so rows sharing a sort value there are in different partitions and
 /// have no join to lose, while a GSI sort key is not unique and rows really
 /// can share one inside a partition.
-fn group_hash(grouping: Option<&AttributeValue>, key: &AttributeValue) -> Option<u64> {
+fn group_hash(grouping: Option<(&str, &AttributeValue)>, key: &AttributeValue) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    if let Some(grouping) = grouping {
-        scalar_hash(grouping)?.hash(&mut hasher);
+    if let Some((attribute, value)) = grouping {
+        // The attribute name, not only its value. Two indexes can hold the
+        // same partition string for unrelated reasons, and absorbing the value
+        // alone put them in one bucket, where a split in either read as a
+        // disagreement across both.
+        attribute.hash(&mut hasher);
+        scalar_hash(value)?.hash(&mut hasher);
     }
     scalar_hash(key)?.hash(&mut hasher);
     Some(hasher.finish())
@@ -1122,7 +1198,13 @@ fn scalar_hash(value: &AttributeValue) -> Option<u64> {
         AttributeValue::S(s) => s.hash(&mut hasher),
         // Numbers are hashed on the form the engine stores, so a key written
         // `1` and a key written `1.0` are one key here as they are there.
-        AttributeValue::N(n) => crate::types::normalize_dynamo_number(n).hash(&mut hasher),
+        // Only where DynamoDB would accept the number: normalising maps
+        // anything it cannot read to "0", which would put unrelated keys in
+        // one bucket.
+        AttributeValue::N(n) => match crate::types::validate_dynamo_number(n) {
+            Ok(()) => crate::types::normalize_dynamo_number(n).hash(&mut hasher),
+            Err(_) => n.hash(&mut hasher),
+        },
         // DynamoDB allows a binary key. Returning None dropped those items
         // from the check entirely, so a genuine split inside a binary
         // partition shipped with nothing said.
@@ -1270,6 +1352,42 @@ mod tests {
                 ],
                 "Projection": {"ProjectionType": "ALL"}
             }]
+        }))
+        .unwrap()
+    }
+
+    fn two_index_request() -> CreateTableRequest {
+        serde_json::from_value(serde_json::json!({
+            "TableName": "App",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gs1pk", "AttributeType": "S"},
+                {"AttributeName": "gs1sk", "AttributeType": "S"},
+                {"AttributeName": "gs2pk", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "GSI1",
+                    "KeySchema": [
+                        {"AttributeName": "gs1pk", "KeyType": "HASH"},
+                        {"AttributeName": "gs1sk", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                },
+                {
+                    "IndexName": "GSI2",
+                    "KeySchema": [
+                        {"AttributeName": "gs2pk", "KeyType": "HASH"},
+                        {"AttributeName": "gs1sk", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                }
+            ]
         }))
         .unwrap()
     }
@@ -2222,13 +2340,20 @@ mod tests {
             "fake2",
         );
 
-        let breaks = d.join_breaks();
-        assert_eq!(
-            breaks.len(),
-            1,
-            "rows sharing a GSI partition and sort value were split: {breaks:?}"
+        // Reported, not fatal. Rows share a sort value for reasons that are
+        // not relationships: two people of one name under one tenant share
+        // `CODE#...` and were never related, so failing the import here would
+        // block a legitimate export and the only way past is to drop the data
+        // model, which ships the real values.
+        assert!(
+            d.join_breaks().is_empty(),
+            "a sort key split is not a broken partition: {:?}",
+            d.join_breaks()
         );
-        assert!(breaks[0].contains("took one original gs1sk"), "{breaks:?}");
+        let splits = d.sort_key_splits();
+        assert_eq!(splits.len(), 1, "but it is worth saying: {splits:?}");
+        assert!(splits[0].contains("took one original gs1sk"), "{splits:?}");
+        assert!(splits[0].contains("entity 'Event'"), "{splits:?}");
     }
 
     #[test]
@@ -2262,6 +2387,142 @@ mod tests {
             d.join_breaks().is_empty(),
             "different partitions never shared a group: {:?}",
             d.join_breaks()
+        );
+        assert!(
+            d.sort_key_splits().is_empty(),
+            "and nothing was split, so there is nothing to report: {:?}",
+            d.sort_key_splits()
+        );
+    }
+
+    #[test]
+    fn unrebuilt_keys_are_counted_per_entity_and_key() {
+        // One warning, a real number behind it. Reporting "at least one item"
+        // read the same whether one stray row or the whole table kept the
+        // value it arrived with, and those keys hold what the run exists to
+        // remove.
+        let (mut d, _) = KeyDeriver::new(&model(), &request(), &[], &no_consistency()).unwrap();
+
+        // Three users whose pk the template cannot reproduce.
+        for n in 0..3 {
+            let mut warnings = Vec::new();
+            let it = item(&[
+                ("_type", "User"),
+                ("pk", &format!("somethingelse#{n}")),
+                ("sk", "user#"),
+                ("email", "a@x.co"),
+            ]);
+            let _ = d.plan(&it, &mut warnings);
+        }
+
+        let counts = d.take_unrebuilt();
+        assert!(!counts.is_empty(), "the keys were not rebuilt");
+        for (entity, key, count) in &counts {
+            assert_eq!(
+                *count, 3,
+                "every one of the three items kept {entity}'s {key}: {counts:?}"
+            );
+        }
+
+        // One row per (entity, key). The two causes, a template that does not
+        // reproduce and a key that cannot render after the rules, describe the
+        // same outcome and used to be listed twice with two partial counts.
+        let mut pairs: Vec<(&String, &String)> = counts.iter().map(|(e, k, _)| (e, k)).collect();
+        let before = pairs.len();
+        pairs.sort();
+        pairs.dedup();
+        assert_eq!(
+            pairs.len(),
+            before,
+            "one row per entity and key: {counts:?}"
+        );
+
+        assert!(
+            d.take_unrebuilt().is_empty(),
+            "taking clears, so a second table does not re-report the first"
+        );
+    }
+
+    #[test]
+    fn two_people_who_merely_share_a_sort_value_do_not_fail_the_import() {
+        // The over-fire direction. Rows land on one sort value for reasons
+        // that are not relationships, so aborting here would block a
+        // legitimate export and the only way past is to drop --data-model,
+        // which turns key rebuilding off and ships the real values. The guard
+        // being useful depends on it not crying wolf.
+        let (mut d, _) = KeyDeriver::new(
+            &lone_code_model(),
+            &request(),
+            &code_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
+
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e1", "t1", "same"),
+            "code",
+            "fake1",
+        );
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e2", "t1", "same"),
+            "code",
+            "fake2",
+        );
+
+        assert!(
+            d.join_breaks().is_empty(),
+            "a shared sort value is not a shared partition: {:?}",
+            d.join_breaks()
+        );
+    }
+
+    #[test]
+    fn two_indexes_holding_the_same_partition_string_are_separate_groups() {
+        // Two GSIs whose partition values spell the same thing. Bucketing on
+        // the value alone put them in one group, so a split under one index
+        // read as a disagreement across both and failed an import that had
+        // nothing wrong with it.
+        let model = model_with(vec![EntityDefinition {
+            name: "Event".to_string(),
+            pk_template: "EVENT#${id}".to_string(),
+            sk_template: Some("EVENT#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![
+                GsiMapping {
+                    index_name: "GSI1".to_string(),
+                    pk_template: "T#${tenant}".to_string(),
+                    sk_template: Some("CODE#${code}".to_string()),
+                },
+                GsiMapping {
+                    index_name: "GSI2".to_string(),
+                    pk_template: "T#${region}".to_string(),
+                    sk_template: Some("CODE#${code}".to_string()),
+                },
+            ],
+            description: None,
+        }]);
+        let (d, _) = KeyDeriver::new(
+            &model,
+            &two_index_request(),
+            &code_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
+
+        // Both indexes' partitions are tracked for the shared sort attribute,
+        // rather than only the first one found.
+        let groupings = d
+            .at_risk
+            .iter()
+            .find(|r| r.key_attribute == "gs1sk")
+            .map(|r| r.grouped_by.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            groupings.len(),
+            2,
+            "a sort key shared by two indexes has two groupings: {groupings:?}"
         );
     }
 

@@ -245,6 +245,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     // 5. Enable bulk-loading PRAGMAs (safe: fresh DB, can re-import on crash)
     db.enable_bulk_loading()
         .map_err(|e| format!("Failed to enable bulk loading: {e}"))?;
+    // `run_into` writes into a database the caller supplied and goes on using,
+    // so however this returns, their connection must not be left on
+    // `synchronous = OFF`. There are several error exits between here and the
+    // end, and restoring at each one by hand is how four of them were missed.
+    let _restore_pragmas = BulkLoading { db };
 
     // 6. Import data for each table
     let mut summary = ImportSummary {
@@ -309,6 +314,23 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         );
     }
 
+    let index_key_names: HashSet<String> = schemas
+        .iter()
+        .flat_map(|s| index_key_attrs(&s.create_request))
+        .collect();
+    let rules_touch_an_index_key = rules.iter().any(|rule| match rule.path.first() {
+        Some(crate::expressions::PathElement::Attribute(name)) => index_key_names.contains(name),
+        _ => false,
+    });
+    if rules_touch_an_index_key && data_model.is_none() {
+        summary.warnings.push(
+            "a rule rewrites an index key attribute directly. No row is lost, but rows that \
+             an index returned together are moved apart, and without a data model nothing \
+             checks whether they still belong together"
+                .to_string(),
+        );
+    }
+
     if rules_touch_a_key && data_model.is_none() {
         summary.warnings.push(
             "a rule rewrites a key attribute directly, and without a data model nothing \
@@ -331,7 +353,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         // deriver would collect model-versus-schema warnings and then never
         // be asked to plan a single item. Reporting those reads as diagnostics
         // about work the run did, and it did none.
-        let mut key_deriver = match data_model.as_ref().filter(|_| !rules.is_empty()) {
+        let mut key_deriver = match data_model.as_ref() {
             Some(model) => {
                 let (deriver, warnings) = keys::KeyDeriver::new(
                     model,
@@ -497,7 +519,6 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 // goes on using, so the bulk-loading PRAGMAs have to come off
                 // on the way out. Leaving `synchronous = OFF` on someone
                 // else's connection trades their durability for our import.
-                let _ = db.disable_bulk_loading();
                 return Err(ImportError::Config(format!(
                     "table '{}': {}{}",
                     table_name,
@@ -508,6 +529,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         String::new()
                     }
                 )));
+            }
+
+            for message in deriver.sort_key_splits() {
+                summary
+                    .warnings
+                    .push(format!("table '{table_name}': {message}"));
             }
 
             for (entity, key, count) in deriver.take_unrebuilt() {
@@ -522,9 +549,9 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             if unchecked > 0 {
                 summary.warnings.push(format!(
                     "table '{}': the join check stopped taking on new keys once a group \
-                     reached {}, so {} items were never compared; a broken join among those \
-                     would not have been caught. Items whose key was seen before the cap \
-                     were still checked",
+                     reached {}, so {} key comparisons were skipped; a broken join among \
+                     those would not have been caught. Keys seen before the cap were still \
+                     compared",
                     table_name,
                     keys::MAX_TRACKED_KEYS,
                     unchecked
@@ -597,7 +624,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         let number = index + 1;
         let path = rules
             .get(index)
-            .map(|r| anonymise::path_to_field_name(&r.path))
+            .map(|r| crate::expressions::format_path_for_error(&r.path))
             .unwrap_or_default();
         if work.matched == 0 {
             summary.warnings.push(format!(
@@ -611,13 +638,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                  the path '{path}'. The attribute it names is absent from this data",
                 work.matched
             ));
-        } else if work.path_missing > 0 {
-            summary.warnings.push(format!(
-                "rule {number} (path '{path}') matched {} items but {} of them did not carry \
-                 that attribute, so those kept the values they arrived with",
-                work.matched, work.path_missing
-            ));
         }
+        // No branch for "matched some items that did not carry the path": a
+        // match broader than the path is the shape this page documents, so
+        // most correct rules would raise it on every run and the warnings
+        // would stop being read.
     }
 
     // 7. Restore normal PRAGMAs (important if DB will be served after import)
@@ -854,28 +879,53 @@ fn mixed_consistency_rules(
 }
 
 /// Extract key attribute names from a CreateTableRequest.
+/// Puts the database's ordinary PRAGMAs back however the import leaves.
+struct BulkLoading<'a> {
+    db: &'a Database,
+}
+
+impl Drop for BulkLoading<'_> {
+    fn drop(&mut self) {
+        let _ = self.db.disable_bulk_loading();
+    }
+}
+
+/// The table's own key attributes.
+///
+/// The primary key only. Both callers are about one row replacing another, and
+/// only the primary key can do that: rewriting an index key moves a row within
+/// that index without losing it. Widening this to index keys made the
+/// write-path choice and the collision warning describe a loss that cannot
+/// happen. [`index_key_attrs`] carries the index keys for the callers that
+/// want those instead.
 fn extract_key_attrs(request: &crate::actions::create_table::CreateTableRequest) -> Vec<String> {
-    // Every index's keys, not just the table's. A rule naming a GSI key
-    // attribute rewrites that index's grouping exactly as a rule on `pk`
-    // rewrites the table's, and reading only the base schema meant neither
-    // the write-path choice nor the warning noticed.
-    let mut names: Vec<String> = request
+    request
         .key_schema
         .iter()
         .map(|ks| ks.attribute_name.clone())
-        .collect();
+        .collect()
+}
+
+/// Key attributes belonging to an index rather than the table.
+///
+/// Rewriting one of these does not lose a row, but it does move the row within
+/// that index, so a query over it stops finding what it found.
+fn index_key_attrs(request: &crate::actions::create_table::CreateTableRequest) -> Vec<String> {
+    let base = extract_key_attrs(request);
+    let mut names = Vec::new();
+    let mut push = |name: &String| {
+        if !base.contains(name) && !names.contains(name) {
+            names.push(name.clone());
+        }
+    };
     for gsi in request.global_secondary_indexes.as_deref().unwrap_or(&[]) {
         for ks in &gsi.key_schema {
-            if !names.contains(&ks.attribute_name) {
-                names.push(ks.attribute_name.clone());
-            }
+            push(&ks.attribute_name);
         }
     }
     for lsi in request.local_secondary_indexes.as_deref().unwrap_or(&[]) {
         for ks in &lsi.key_schema {
-            if !names.contains(&ks.attribute_name) {
-                names.push(ks.attribute_name.clone());
-            }
+            push(&ks.attribute_name);
         }
     }
     names

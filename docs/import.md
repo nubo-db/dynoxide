@@ -212,8 +212,29 @@ partition, each drawing its own fake, leave that partition split the same way.
 
 ```
 entity 'Customer' and entity 'Order' took the same original pk to different
-values, so their keys no longer agree and they will not join.
-Template 'CUSTOMER#${email}' reads 'email': add 'email' to [consistency] fields
+values, so their keys no longer agree and they will not join. Give both
+entities the same attribute name for that value. Add 'email' to
+[consistency] fields, or use a deterministic action such as hash
+```
+
+One entity splitting a partition of its own fails the same way:
+
+```
+entity 'Order' took one original pk to more than one value, so rows that
+shared a partition no longer share one and a query for them comes back with
+part of what it held. Add 'email' to [consistency] fields, or use a
+deterministic action such as hash
+```
+
+Splitting a **sort** key is reported rather than fatal, because rows share a
+sort value for reasons that are not relationships. Two people of one name under
+one tenant share `NAME#...` and were never related, so failing the import there
+would block a legitimate export:
+
+```
+entity 'Order' took one original gs1sk to more than one value. Those rows stay
+in their partitions, so nothing is lost from a query on the partition, but a
+query matching that gs1sk exactly used to return them together and will not now
 ```
 
 It groups on the key attribute rather than the template text, so the ordinary

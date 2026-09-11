@@ -28,6 +28,25 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   is now tagged with its DynamoDB type and length-prefixed on the same terms
   as a seeded `fake`, so the string `"123"` and the number `123` no longer
   land on one pseudonym.
+- **The join check now examines a key that only one entity builds.** It formed
+  a comparison group only where two entities templated the same key attribute,
+  so the commonest single-table shape, one entity building the customer
+  partition and nothing else building it, went unexamined however badly an
+  anonymisation split it. It now also covers a constant key template a rule
+  rewrites directly, a binary key value, and every index a sort key sorts
+  rather than the first one found.
+- **One DynamoDB number is now one value however it is spelled.** `1`, `1.0`
+  and `0.1e1` are one number and the engine normalises on write, but the
+  pseudonym came from whichever spelling the export used, so two rows holding
+  one number took two pseudonyms and stopped joining. A duplicated set member
+  no longer changes a set's pseudonym either. A `contains` match against a
+  number set compares numerically for the same reason: a set holding `1.0` did
+  not contain `1`, so a rule that should have fired did not and the value it
+  was there to remove stayed put.
+- **`fake` on a numeric attribute now draws from the full 64-bit range**, where
+  it drew four digits. That is 8,999 values, so a few hundred items repeated
+  and each repeat merged two identities onto one key. The email generator was
+  widened earlier in this release for the same reason.
 - **`hash` now derives a map, list or set from a canonical encoding**, where
   before it hashed `serde_json` output. `AttributeValue::M` holds a hash map,
   whose iteration order differs between two instances of the same value, so a
@@ -53,6 +72,22 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   `openssl rand -base64 24`.
 
 ### Added
+- An import now says when a rule did nothing. A rule that matched no item, or
+  that matched items none of which carried its path, is reported per rule with
+  its number and path. A misspelt path or a match expression that fits none of
+  the data otherwise produced a run with a full item count, no warnings and an
+  exit code of 0, while every value the rule was pointed at stayed as it was.
+- The unrebuilt-key warnings now carry a count. "Template does not reproduce"
+  and "cannot rebuild after the rules ran" were the only warnings with no
+  magnitude, so one stray row read exactly like a whole table left as it
+  arrived. Those keys hold the values the run exists to remove.
+- `docs/import.md` now states what the join check cannot see: a key that
+  embeds a parent id rather than repeating it, a relationship the data model
+  does not describe, anything past the per-group cap, and a key that is not a
+  string, number or binary. A clean run was easy to read as proof that every
+  relationship survived.
+- An import now says when a data model was given with no rules, rather than
+  reporting model-versus-schema diagnostics for work it never did.
 
 - `${name:length:pad}` padding now matches OneTable's own rendering for a
   multi-character pad. The fill was prepended whole until the value was long

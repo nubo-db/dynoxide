@@ -25,6 +25,18 @@ use fake::rand::rngs::StdRng;
 use fake::rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
+/// What one rule did across an import, so the run can report a rule that did
+/// nothing rather than let a misspelt path read as a clean pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RuleWork {
+    /// Items whose match expression the rule accepted.
+    pub matched: usize,
+    /// Matched items that did not carry the rule's path.
+    pub path_missing: usize,
+    /// Items the rule actually rewrote.
+    pub rewrote: usize,
+}
+
 /// Apply all matching rules to an item, mutating it in place.
 ///
 /// Returns the warnings raised (e.g. key attribute collision risks) and the
@@ -42,6 +54,7 @@ pub fn apply_rules(
     consistency_fields: &std::collections::HashSet<String>,
     key_attrs: &[String],
     mask_passthroughs: &mut std::collections::HashMap<String, usize>,
+    rule_work: &mut [RuleWork],
 ) -> (Vec<String>, std::collections::HashSet<String>) {
     let mut warnings = Vec::new();
     let mut rewritten = std::collections::HashSet::new();
@@ -49,14 +62,23 @@ pub fn apply_rules(
     // rules over one attribute report one item rather than two.
     let mut counted_whole: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for rule in rules {
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        // What each rule actually did, so a run can say when one did nothing.
+        // A rules file is the operator's statement of what is sensitive here;
+        // a rule that never fires means that statement was not carried out,
+        // and without this the run looks identical to one that worked.
+        let work = rule_work
+            .get_mut(rule_idx)
+            .expect("one entry per rule, sized by the caller");
         if !matches_item(rule, item) {
             continue;
         }
+        work.matched += 1;
 
         // Resolve the current value at the path
         let current_value = resolve_path(item, &rule.path);
         if current_value.is_none() {
+            work.path_missing += 1;
             continue; // Path doesn't exist in this item, skip
         }
         let current_value = current_value.unwrap();
@@ -115,8 +137,12 @@ pub fn apply_rules(
             let kept_whole = match &current_value {
                 AttributeValue::S(s) => s.chars().count() <= *keep_last,
                 AttributeValue::N(n) => n.len() <= *keep_last,
-                // Every other type comes back as it arrived.
-                _ => true,
+                // Every other type is replaced wholesale with mask characters
+                // rather than returned, so nothing of it is kept. Counting
+                // those would report that real data survived a rule that had
+                // in fact removed all of it, which is the wrong direction for
+                // a warning whose whole purpose is to say what got through.
+                _ => false,
             };
             if kept_whole && counted_whole.insert(field_name.clone()) {
                 *mask_passthroughs.entry(field_name.clone()).or_insert(0) += 1;
@@ -134,6 +160,10 @@ pub fn apply_rules(
         // Apply the new value
         match set_path(item, &rule.path, new_value) {
             Ok(()) => {
+                rule_work
+                    .get_mut(rule_idx)
+                    .expect("one entry per rule")
+                    .rewrote += 1;
                 rewritten.insert(field_name);
             }
             Err(e) => {
@@ -146,7 +176,7 @@ pub fn apply_rules(
 }
 
 /// Extract the top-level field name from a path.
-fn path_to_field_name(path: &[crate::expressions::PathElement]) -> String {
+pub(super) fn path_to_field_name(path: &[crate::expressions::PathElement]) -> String {
     match path.first() {
         Some(crate::expressions::PathElement::Attribute(name)) => name.clone(),
         _ => String::new(),
@@ -200,8 +230,12 @@ fn generate_fake(
     match original {
         AttributeValue::S(_) => AttributeValue::S(fake_string),
         AttributeValue::N(_) => {
-            // For numbers, generate a random number string
-            let n: u32 = (1000..9999).fake_with_rng(&mut rng);
+            // Four digits is 8,999 values, so a few hundred items already
+            // repeat and each repeat merges two identities onto one key. The
+            // email path was widened for exactly this reason; a number needs
+            // the same room. Magnitude is not preserved either way, since the
+            // draw already replaced it.
+            let n: u64 = rng.r#gen();
             AttributeValue::N(n.to_string())
         }
         _ => AttributeValue::S(fake_string),
@@ -383,29 +417,43 @@ fn absorb(out: &mut Vec<u8>, value: &AttributeValue) {
 
     match value {
         AttributeValue::S(s) => field(out, b's', s.as_bytes()),
-        AttributeValue::N(n) => field(out, b'n', n.as_bytes()),
+        // DynamoDB stores 1, 1.0 and 0.1e1 as one number, and the engine
+        // normalises on write, so encoding the spelling the export happened to
+        // use would give one value two pseudonyms and break the join between
+        // a row that wrote it one way and a row that wrote it the other.
+        AttributeValue::N(n) => field(
+            out,
+            b'n',
+            crate::types::normalize_dynamo_number(n).as_bytes(),
+        ),
         AttributeValue::B(b) => field(out, b'b', b),
         AttributeValue::BOOL(b) => field(out, b'o', &[u8::from(*b)]),
         AttributeValue::NULL(n) => field(out, b'z', &[u8::from(*n)]),
         AttributeValue::SS(members) => {
             let mut sorted: Vec<&String> = members.iter().collect();
             sorted.sort();
+            sorted.dedup();
             header(out, b'P', sorted.len());
             for member in sorted {
                 field(out, b's', member.as_bytes());
             }
         }
         AttributeValue::NS(members) => {
-            let mut sorted: Vec<&String> = members.iter().collect();
+            let mut sorted: Vec<String> = members
+                .iter()
+                .map(|m| crate::types::normalize_dynamo_number(m))
+                .collect();
             sorted.sort();
+            sorted.dedup();
             header(out, b'Q', sorted.len());
-            for member in sorted {
+            for member in &sorted {
                 field(out, b'n', member.as_bytes());
             }
         }
         AttributeValue::BS(members) => {
             let mut sorted: Vec<&Vec<u8>> = members.iter().collect();
             sorted.sort();
+            sorted.dedup();
             header(out, b'R', sorted.len());
             for member in sorted {
                 field(out, b'b', member);
@@ -503,6 +551,196 @@ mod tests {
         assert_ne!(
             shifted, other,
             "the salt must not run into the value as one byte string"
+        );
+    }
+
+    /// A rule over `path` whose condition matches every item.
+    fn test_rule(path: &str, action: ValidatedAction) -> ValidatedRule {
+        ValidatedRule {
+            condition: crate::expressions::condition::parse(
+                "attribute_not_exists(__no_item_has_this__)",
+            )
+            .expect("a condition true of every item"),
+            names: None,
+            values: None,
+            path: crate::import::config::parse_path(path).expect("a valid path"),
+            action,
+        }
+    }
+
+    fn item_with_email() -> Item {
+        let mut m = Item::new();
+        m.insert(
+            "email".to_string(),
+            AttributeValue::S("real@example.com".to_string()),
+        );
+        m
+    }
+
+    fn work_for(rules: &[ValidatedRule]) -> Vec<RuleWork> {
+        vec![RuleWork::default(); rules.len()]
+    }
+
+    fn apply_for_test(
+        item: &mut Item,
+        rules: &[ValidatedRule],
+        work: &mut [RuleWork],
+        passthroughs: &mut std::collections::HashMap<String, usize>,
+    ) {
+        apply_rules(
+            item,
+            rules,
+            &mut ConsistencyMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            passthroughs,
+            work,
+        );
+    }
+
+    #[test]
+    fn a_rule_whose_path_is_absent_records_no_work() {
+        // The shape a misspelt path takes. Without a count the run prints a
+        // full item total, raises nothing, and exits 0 having anonymised
+        // nothing at all.
+        let rules = [test_rule("emial", ValidatedAction::Redact)];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = item_with_email();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(work[0].matched, 1, "the rule still matched the item");
+        assert_eq!(work[0].path_missing, 1, "but the attribute is not there");
+        assert_eq!(work[0].rewrote, 0, "so nothing was rewritten");
+        assert_eq!(
+            it.get("email"),
+            Some(&AttributeValue::S("real@example.com".to_string())),
+            "the real value is untouched, which is the whole problem"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_fires_records_the_work_it_did() {
+        // The other direction: the counter has to stay quiet on a rule that
+        // worked, or every run would carry the warning and it would be read
+        // as noise.
+        let rules = [test_rule("email", ValidatedAction::Redact)];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = item_with_email();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(work[0].matched, 1);
+        assert_eq!(work[0].path_missing, 0);
+        assert_eq!(work[0].rewrote, 1);
+    }
+
+    #[test]
+    fn a_mask_that_kept_a_short_value_is_counted_once_per_item() {
+        // Two mask rules over one attribute are one item's worth of exposure,
+        // not two.
+        let short = || {
+            let mut m = Item::new();
+            m.insert("code".to_string(), AttributeValue::S("ab".to_string()));
+            m
+        };
+        let mask = || ValidatedAction::Mask {
+            keep_last: 4,
+            mask_char: '*',
+        };
+        let rules = [test_rule("code", mask()), test_rule("code", mask())];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = short();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(
+            passthroughs.get("code"),
+            Some(&1),
+            "one item kept its value, however many rules looked at it"
+        );
+    }
+
+    #[test]
+    fn a_mask_over_a_map_is_not_a_passthrough() {
+        // mask replaces a map wholesale with mask characters, so nothing of
+        // it survives. Counting it said real data got through when none did.
+        let rules = [test_rule(
+            "profile",
+            ValidatedAction::Mask {
+                keep_last: 4,
+                mask_char: '*',
+            },
+        )];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = Item::new();
+        let mut inner = std::collections::HashMap::new();
+        inner.insert("a".to_string(), AttributeValue::S("secret".to_string()));
+        it.insert("profile".to_string(), AttributeValue::M(inner));
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(
+            passthroughs.get("profile"),
+            None,
+            "the map was replaced, so nothing was kept as it arrived"
+        );
+    }
+
+    #[test]
+    fn one_number_has_one_encoding_however_it_is_spelled() {
+        // DynamoDB stores 1, 1.0 and 0.1e1 as one number and the engine
+        // normalises on write, so two spellings must not take two pseudonyms.
+        let salt = b"a-salt-long-enough";
+        for other in ["1.0", "01", "0.1e1", "1.00"] {
+            assert_eq!(
+                hash_value(&AttributeValue::N("1".to_string()), salt),
+                hash_value(&AttributeValue::N(other.to_string()), salt),
+                "N(\"1\") and N({other:?}) are one number"
+            );
+        }
+        assert_ne!(
+            hash_value(&AttributeValue::N("1".to_string()), salt),
+            hash_value(&AttributeValue::N("2".to_string()), salt),
+            "but two numbers stay two"
+        );
+    }
+
+    #[test]
+    fn a_set_is_a_set_whatever_the_export_repeated() {
+        // AttributeValue::SS is a Vec, so a hand-written or rewritten export
+        // can carry a duplicate DynamoDB would have rejected. One logical set
+        // must not take two pseudonyms.
+        let salt = b"a-salt-long-enough";
+        assert_eq!(
+            hash_value(&AttributeValue::SS(vec!["a".into()]), salt),
+            hash_value(&AttributeValue::SS(vec!["a".into(), "a".into()]), salt)
+        );
+        assert_eq!(
+            hash_value(&AttributeValue::NS(vec!["1".into()]), salt),
+            hash_value(&AttributeValue::NS(vec!["1".into(), "1.0".into()]), salt),
+            "and two spellings of one number are one member"
+        );
+    }
+
+    #[test]
+    fn a_generated_number_has_room_not_to_collide() {
+        // The four-digit draw this replaced held 8,999 values, so a few
+        // hundred items already repeated and each repeat merged two
+        // identities onto one key. Counting uniques over a sample that small
+        // would pass for the old generator too, so read the width instead.
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..2000 {
+            let original = AttributeValue::N(n.to_string());
+            if let AttributeValue::N(drawn) = generate_fake("word", &original, None) {
+                seen.insert(drawn);
+            }
+        }
+        assert_eq!(seen.len(), 2000, "2000 draws must not repeat");
+        assert!(
+            seen.iter().any(|d| d.len() > 10),
+            "a u64 draw has to reach past ten digits sometimes: the old \
+             four-digit range never could"
         );
     }
 

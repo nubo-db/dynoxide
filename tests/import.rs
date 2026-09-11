@@ -2191,4 +2191,103 @@ fields = ["email"]
             "neither salt must be printed: {warning}"
         );
     }
+
+    /// Two users, a rules file, and an output nobody should trust.
+    fn run_with_rule(rule_toml: &str) -> dynoxide::import::ImportSummary {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "alice@real.co.uk"}}}"#,
+                r#"{"Item": {"pk": {"S": "USER#2"}, "sk": {"S": "PROFILE"}, "email": {"S": "bob@real.co.uk"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(&rules_file, rule_toml).unwrap();
+
+        import::run(ImportCommand {
+            source,
+            output: Some(output),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_misspelt_path_is_reported_rather_than_passing_for_a_clean_run() {
+        // The whole failure this warning exists for: the run reports a full
+        // item count and exits 0, while every address it was pointed at is
+        // still in the output.
+        let summary = run_with_rule(
+            r#"
+    [[rules]]
+    match = "attribute_exists(pk)"
+    path = "emial"
+    action = { type = "redact" }
+    "#,
+        );
+
+        assert_eq!(summary.total_items, 2, "the import still succeeded");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("rule 1") && w.contains("rewrote none of them")),
+            "a rule that rewrote nothing must say so: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn a_match_expression_that_fits_nothing_is_reported() {
+        let summary = run_with_rule(
+            r#"
+    [[rules]]
+    match = "attribute_exists(no_such_attribute)"
+    path = "email"
+    action = { type = "redact" }
+    "#,
+        );
+
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("rule 1") && w.contains("matched no item")),
+            "a rule that matched nothing must say so: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn a_rule_that_did_its_job_says_nothing() {
+        // The other direction. A warning that fires on every ordinary run is
+        // a warning nobody reads.
+        let summary = run_with_rule(
+            r#"
+    [[rules]]
+    match = "attribute_exists(email)"
+    path = "email"
+    action = { type = "redact" }
+    "#,
+        );
+
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("rule 1")),
+            "a rule that worked must stay quiet: {:?}",
+            summary.warnings
+        );
+    }
 }

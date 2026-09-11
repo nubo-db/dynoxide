@@ -184,7 +184,15 @@ pub fn evaluate(
                     Ok(set.contains(&elem))
                 }
                 (Some(AttributeValue::NS(set)), Some(AttributeValue::N(elem))) => {
-                    Ok(set.contains(&elem))
+                    // One DynamoDB number has many spellings, and a rules file
+                    // written by hand supplies whichever one the author typed.
+                    // Comparing the text meant a set holding `1.0` did not
+                    // contain `1`, so a rule that should have matched did not,
+                    // and the value it was there to remove stayed put.
+                    let wanted = crate::types::normalize_dynamo_number(&elem);
+                    Ok(set
+                        .iter()
+                        .any(|member| crate::types::normalize_dynamo_number(member) == wanted))
                 }
                 (Some(AttributeValue::BS(set)), Some(AttributeValue::B(elem))) => {
                     Ok(set.contains(&elem))
@@ -1281,6 +1289,44 @@ fn can_use_f64(s: &str) -> bool {
     // If total digits ≤ 15, the number fits exactly in f64.
     let digit_count = s.bytes().filter(|b| b.is_ascii_digit()).count();
     digit_count <= 15
+}
+
+#[cfg(test)]
+mod name_ref_tests {
+    use super::*;
+
+    #[test]
+    fn extract_name_refs_walks_every_expression_shape() {
+        // The twin of extract_value_refs, added for the same purpose and
+        // never tested. A shape it forgets to walk means an alias used only
+        // there reads as unused, and the rule is rejected for a reason that
+        // is not true.
+        let cases = [
+            ("attribute_exists(#a)", vec!["#a"]),
+            ("#a = :v", vec!["#a"]),
+            ("NOT attribute_exists(#a)", vec!["#a"]),
+            ("#a = :v AND #b = :w", vec!["#a", "#b"]),
+            ("#a = :v OR (#b = :w AND #c = :x)", vec!["#a", "#b", "#c"]),
+            ("begins_with(#a, :v)", vec!["#a"]),
+            ("contains(#a, :v)", vec!["#a"]),
+            ("attribute_type(#a, :v)", vec!["#a"]),
+            ("size(#a) > :v", vec!["#a"]),
+            ("#a BETWEEN :v AND :w", vec!["#a"]),
+            ("#a IN (:v, :w)", vec!["#a"]),
+        ];
+        for (expr, want) in cases {
+            let parsed = parse(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
+            let got = extract_name_refs(&parsed);
+            let want: Vec<String> = want.into_iter().map(str::to_string).collect();
+            assert_eq!(got, want, "{expr}");
+        }
+    }
+
+    #[test]
+    fn an_expression_with_no_aliases_yields_none() {
+        let parsed = parse("attribute_exists(email)").unwrap();
+        assert!(extract_name_refs(&parsed).is_empty());
+    }
 }
 
 #[cfg(test)]

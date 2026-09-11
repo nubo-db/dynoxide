@@ -235,16 +235,45 @@ The field it names is always a top-level one, because that is what
 `[consistency] fields` is keyed on. A template reading `${contact.email}`
 is reported as `contact`.
 
+### What the check cannot see
+
+It compares the key values two rows arrived with, so it only finds a break
+where rows shared a key value and stopped sharing one. That leaves shapes it
+is blind to, and they fail the way everything else here fails, which is
+quietly. Read this before treating a clean run as proof the relationships
+survived.
+
+- **A key built by embedding rather than repeating.** An adjacency-list or
+  hierarchical design where a child's sort key carries its parent's id as a
+  prefix, `ORDER#${customerId}#${orderId}`, never produces two rows holding
+  the same key value, so no two rows are ever compared. The relationship is
+  real and the check cannot see it. Put the embedded attribute in
+  `[consistency] fields`, or use `hash` for it, and do not rely on the check
+  to tell you.
+- **A relationship the data model does not describe.** Only attributes an
+  entity's templates name are tracked. A join your application makes by
+  reading one attribute and querying another is invisible here.
+- **Anything past the cap.** The check holds a million distinct keys per
+  group. Past that it keeps checking the keys it already has and reports how
+  many it could not take on, so the run tells you the check was partial, but
+  a break among the ones it skipped is not found.
+- **A key whose value is not a string, a number or binary.** Those are not
+  compared, and the collision counter is what notices if they pile up.
+
+A warning is not a failure. Only a break the check actually observes stops
+the import; everything else on this page is reported and the run still exits
+0, including keys that kept the values they arrived with. Read the warnings.
+
 The check holds a million distinct keys per template. Past that it keeps
 checking the keys it already has and says how many it could not take on, so
 a very large import is told its check was partial rather than left to look
 clean. In file mode nothing is written on the
 error path, so a failed import leaves no database rather than a broken one.
 The library entry point `run_into` writes into a database you supply, so
-there a failure on a later table leaves the earlier ones in place. Matching on the key and
-its template, rather than on the attribute name, keeps this off entities that
-merely reuse a name: `account#${id}` and `project#${id}` are different
-entities' own ids and never had a join. Two entities neither of whose sources
+there a failure on a later table leaves the earlier ones in place. Entities that merely reuse a
+key name cost nothing, because what is compared is the whole key value an item
+arrived with: `account#${id}` and `project#${id}` are different entities' own
+ids, and `account#a1` never equalled `project#p1`. Two entities neither of whose sources
 a rule rewrites are left alone too, since their keys still agree. One
 rewritten entity beside one that keeps its value is the ordinary break, an
 `Order` still keyed on the real address after its `Customer` has moved, and

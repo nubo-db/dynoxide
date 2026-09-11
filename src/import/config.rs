@@ -715,6 +715,62 @@ action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
         assert!(!rule_debug.contains("super"));
     }
 
+    #[test]
+    fn a_name_the_match_expression_never_uses_is_rejected() {
+        // An unused alias is almost always a rename half-done: the table was
+        // updated and the expression was not, so the rule still matches on
+        // the old attribute and quietly covers nothing.
+        let err = parsed_rule(
+            r##"
+[[rules]]
+match = "attribute_exists(#a)"
+path = "email"
+action = { type = "redact" }
+names = { "#a" = "email", "#b" = "phone" }
+"##,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("#b") && err.contains("is not referenced"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_value_the_match_expression_never_uses_is_rejected() {
+        let err = parsed_rule(
+            r##"
+[[rules]]
+match = "email = :a"
+path = "email"
+action = { type = "redact" }
+values = { ":a" = "x", ":b" = "y" }
+"##,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(":b") && err.contains("is not referenced"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_name_and_value_being_used_is_accepted() {
+        // The other direction, so the check above is not simply rejecting
+        // every rule that carries a table at all.
+        parsed_rule(
+            r##"
+[[rules]]
+match = "#a = :a"
+path = "email"
+action = { type = "redact" }
+names = { "#a" = "email" }
+values = { ":a" = "x" }
+"##,
+        )
+        .expect("a rule that uses everything it declares is valid");
+    }
+
     fn parsed_rule(toml_str: &str) -> Result<ValidatedRule, String> {
         let config: ImportConfig = toml::from_str(toml_str).map_err(|e| e.to_string())?;
         let rule = &config.rules[0];

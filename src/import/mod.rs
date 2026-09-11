@@ -286,6 +286,19 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     }
 
     let mut seen_warnings: HashSet<String> = HashSet::new();
+    // Across every table, not per table: a rule can legitimately touch nothing
+    // in one table and every item of the next, so only the whole run can say
+    // that a rule did nothing at all.
+    let mut rule_work: Vec<anonymise::RuleWork> = vec![Default::default(); rules.len()];
+
+    if rules.is_empty() && data_model.is_some() {
+        summary.warnings.push(
+            "a data model was given but no rules, so nothing was anonymised and no key was \
+             rebuilt. The model is only used to re-render keys after a rule has changed an \
+             attribute one is built from"
+                .to_string(),
+        );
+    }
 
     if !rules.is_empty() && data_model.is_none() {
         summary.warnings.push(
@@ -313,7 +326,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         // of masked attributes, not by item count.
         let mut mask_passthroughs: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        let mut key_deriver = match data_model.as_ref() {
+        // A data model with no rules has nothing to rebuild from: keys are
+        // only re-rendered after an anonymisation moved something, so the
+        // deriver would collect model-versus-schema warnings and then never
+        // be asked to plan a single item. Reporting those reads as diagnostics
+        // about work the run did, and it did none.
+        let mut key_deriver = match data_model.as_ref().filter(|_| !rules.is_empty()) {
             Some(model) => {
                 let (deriver, warnings) = keys::KeyDeriver::new(
                     model,
@@ -379,6 +397,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         &consistency_fields,
                         &key_attrs,
                         &mut mask_passthroughs,
+                        &mut rule_work,
                     );
                     warnings.extend(rule_warnings);
                     match (key_deriver.as_mut(), plan) {
@@ -474,6 +493,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 for w in &summary.warnings {
                     eprintln!("  - {w}");
                 }
+                // `run_into` writes into a database the caller supplied and
+                // goes on using, so the bulk-loading PRAGMAs have to come off
+                // on the way out. Leaving `synchronous = OFF` on someone
+                // else's connection trades their durability for our import.
+                let _ = db.disable_bulk_loading();
                 return Err(ImportError::Config(format!(
                     "table '{}': {}{}",
                     table_name,
@@ -486,12 +510,21 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 )));
             }
 
+            for (entity, key, count) in deriver.take_unrebuilt() {
+                summary.warnings.push(format!(
+                    "table '{table_name}': entity '{entity}' kept the original {key} on \
+                     {count} items, because its template could not rebuild them. Those keys \
+                     still hold the values the export arrived with"
+                ));
+            }
+
             let unchecked = deriver.unchecked_join_keys();
             if unchecked > 0 {
                 summary.warnings.push(format!(
-                    "table '{}': the join check stopped taking on new keys after {}, so {} \
-                     were never checked; a broken join among those would not have been \
-                     caught. Keys seen before the cap were still checked",
+                    "table '{}': the join check stopped taking on new keys once a group \
+                     reached {}, so {} items were never compared; a broken join among those \
+                     would not have been caught. Items whose key was seen before the cap \
+                     were still checked",
                     table_name,
                     keys::MAX_TRACKED_KEYS,
                     unchecked
@@ -552,6 +585,39 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         summary.total_items += table_items;
         summary.total_bytes += table_bytes;
         summary.total_skipped += table_skipped;
+    }
+
+    // A rules file is the operator's statement of which attributes hold
+    // personal data. A rule that never fired means that statement was not
+    // carried out, and nothing else in the output says so: the item count is
+    // full, no warning is raised, and the run exits 0. A misspelt path or a
+    // match expression that fits none of the data both take exactly that
+    // shape, which is why this is reported per rule rather than in aggregate.
+    for (index, work) in rule_work.iter().enumerate() {
+        let number = index + 1;
+        let path = rules
+            .get(index)
+            .map(|r| anonymise::path_to_field_name(&r.path))
+            .unwrap_or_default();
+        if work.matched == 0 {
+            summary.warnings.push(format!(
+                "rule {number} (path '{path}') matched no item in any table, so nothing was \
+                 anonymised by it. Check the match expression, and check the path is spelled \
+                 the way the export spells it"
+            ));
+        } else if work.rewrote == 0 {
+            summary.warnings.push(format!(
+                "rule {number} matched {} items but rewrote none of them: not one carried \
+                 the path '{path}'. The attribute it names is absent from this data",
+                work.matched
+            ));
+        } else if work.path_missing > 0 {
+            summary.warnings.push(format!(
+                "rule {number} (path '{path}') matched {} items but {} of them did not carry \
+                 that attribute, so those kept the values they arrived with",
+                work.matched, work.path_missing
+            ));
+        }
     }
 
     // 7. Restore normal PRAGMAs (important if DB will be served after import)
@@ -789,11 +855,30 @@ fn mixed_consistency_rules(
 
 /// Extract key attribute names from a CreateTableRequest.
 fn extract_key_attrs(request: &crate::actions::create_table::CreateTableRequest) -> Vec<String> {
-    request
+    // Every index's keys, not just the table's. A rule naming a GSI key
+    // attribute rewrites that index's grouping exactly as a rule on `pk`
+    // rewrites the table's, and reading only the base schema meant neither
+    // the write-path choice nor the warning noticed.
+    let mut names: Vec<String> = request
         .key_schema
         .iter()
         .map(|ks| ks.attribute_name.clone())
-        .collect()
+        .collect();
+    for gsi in request.global_secondary_indexes.as_deref().unwrap_or(&[]) {
+        for ks in &gsi.key_schema {
+            if !names.contains(&ks.attribute_name) {
+                names.push(ks.attribute_name.clone());
+            }
+        }
+    }
+    for lsi in request.local_secondary_indexes.as_deref().unwrap_or(&[]) {
+        for ks in &lsi.key_schema {
+            if !names.contains(&ks.attribute_name) {
+                names.push(ks.attribute_name.clone());
+            }
+        }
+    }
+    names
 }
 
 /// Compress a file with zstd, removing the original.

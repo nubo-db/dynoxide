@@ -227,11 +227,12 @@ struct EntityKeys {
 struct AtRisk {
     /// The key attribute the shared template builds.
     key_attribute: String,
-    /// The attribute whose value decides which rows this key groups with,
-    /// when this key does not group by itself. `None` for a partition key,
-    /// which is its own grouping; the partition attribute for a sort key,
-    /// which only orders rows inside a partition it does not define.
-    grouped_by: Option<String>,
+    /// The attributes whose values decide which rows this key groups with,
+    /// when it does not group by itself. Empty for a partition key, which is
+    /// its own grouping. One entry per index a sort key sorts, because each
+    /// index groups rows differently and each is a join that can break on its
+    /// own.
+    grouped_by: Vec<String>,
     /// Root field names to put in `[consistency] fields`. Roots, because
     /// that is what the consistency map is keyed on: advising `contact.email`
     /// when only `contact` is honoured would send someone in a circle.
@@ -297,10 +298,10 @@ pub struct KeyDeriver {
     /// (entity index, key index) pairs whose template failed to reproduce
     /// a value, reported once so a whole table of off-template items
     /// produces one warning rather than one per item.
-    warned_mismatch: HashSet<(usize, usize)>,
+    warned_mismatch: HashMap<(usize, usize), usize>,
     /// (entity index, key index) pairs that could not be rendered after the
     /// rules ran, reported once.
-    warned_unrenderable: HashSet<(usize, usize)>,
+    warned_unrenderable: HashMap<(usize, usize), usize>,
     /// Items that matched no entity, reported once per table.
     unmatched: usize,
     /// (entity index, key index) pairs where a rule took the key instead of
@@ -354,16 +355,23 @@ impl KeyDeriver {
         for gsi in gsis {
             partition_keys.extend(partition_key_name(&gsi.key_schema));
         }
-        let mut grouped_by: HashMap<&str, &str> = HashMap::new();
+        // One attribute can sort more than one index, and each index is its
+        // own grouping with its own join to lose. Keeping only the first
+        // partition found compared rows against one index and left a split
+        // inside any other index unexamined.
+        let mut grouped_by: HashMap<&str, Vec<&str>> = HashMap::new();
         if let (Some(range), Some(hash)) = (range, hash) {
-            grouped_by.insert(range, hash);
+            grouped_by.entry(range).or_default().push(hash);
         }
         for gsi in gsis {
             if let (Some(sort), Some(part)) = (
                 sort_key_name(&gsi.key_schema),
                 partition_key_name(&gsi.key_schema),
             ) {
-                grouped_by.entry(sort).or_insert(part);
+                let partitions = grouped_by.entry(sort).or_default();
+                if !partitions.contains(&part) {
+                    partitions.push(part);
+                }
             }
         }
         grouped_by.retain(|attribute, _| !partition_keys.contains(attribute));
@@ -430,12 +438,20 @@ impl KeyDeriver {
                 )?;
             }
 
+            // A key with no `${...}` in it is not rebuilt, because there is
+            // nothing in it to rebuild from. It is still a key a rule naming
+            // the attribute directly can rewrite, though, and two entities
+            // sharing a constant partition such as `TENANT#` are as joined as
+            // two sharing a templated one. Keeping those here lets the join
+            // check see them; `plan` still only rebuilds a key that has a
+            // variable to render.
             let keys: Vec<TemplatedKey> = match_keys
                 .iter()
                 .filter(|key| {
                     key.segments
                         .iter()
                         .any(|s| matches!(s, Segment::Var { .. }))
+                        || rule_targets.contains(key.attribute.as_str())
                 })
                 .cloned()
                 .collect();
@@ -555,16 +571,6 @@ impl KeyDeriver {
         let mut shared: SharedGroups = Vec::new();
         for (idx, shape) in entity_key_shapes.iter().enumerate() {
             for (attribute, _template, sources) in shape {
-                let shared_with_another =
-                    entity_key_shapes
-                        .iter()
-                        .enumerate()
-                        .any(|(other, other_shape)| {
-                            other != idx && other_shape.iter().any(|(a, _, _)| a == attribute)
-                        });
-                if !shared_with_another {
-                    continue;
-                }
                 // An entity whose sources no rule rewrites keeps its key as
                 // it arrived. It is not at risk itself, but it is what a
                 // rewritten sibling has to keep agreeing with, so it observes
@@ -614,12 +620,12 @@ impl KeyDeriver {
             observers.sort();
             observers.retain(|o| !users.contains(o));
         }
-        // A group needs at least one entity a rule puts at risk, and at least
-        // one other entity to disagree with, whether that one is at risk too
-        // or merely keeps the value it arrived with.
-        shared.retain(|(_, (users, _, observers))| {
-            !users.is_empty() && users.len() + observers.len() > 1
-        });
+        // A group needs one entity a rule puts at risk. It does not need a
+        // second entity to disagree with: an entity that takes one original
+        // key to two values has already split the rows that shared it, and
+        // requiring a sibling meant the commonest single-table shape, where
+        // only one entity templates a key, was never checked at all.
+        shared.retain(|(_, (users, _, _))| !users.is_empty());
         shared.sort_by(|a, b| a.0.cmp(&b.0));
 
         let at_risk: Vec<AtRisk> = shared
@@ -647,9 +653,14 @@ impl KeyDeriver {
                 AtRisk {
                     grouped_by: grouped_by
                         .get(key_attribute.as_str())
-                        .map(|a| (*a).to_string()),
+                        .map(|parts| parts.iter().map(|a| (*a).to_string()).collect())
+                        .unwrap_or_default(),
                     key_attribute,
-                    consistency_roots: if unlisted.is_empty() { roots } else { unlisted },
+                    // Only the roots the rules file has NOT already listed.
+                    // Falling back to every root told an operator to add
+                    // fields they had added, which reads as the advice not
+                    // working rather than as the map having lapsed.
+                    consistency_roots: unlisted,
                     entities: entities_using,
                     observers,
                     seen_keys: std::collections::HashMap::new(),
@@ -670,8 +681,8 @@ impl KeyDeriver {
                 type_attributes,
                 hash_attribute: hash.map(String::from),
                 range_attribute: range.map(String::from),
-                warned_mismatch: HashSet::new(),
-                warned_unrenderable: HashSet::new(),
+                warned_mismatch: HashMap::new(),
+                warned_unrenderable: HashMap::new(),
                 warned_rule_wins: HashSet::new(),
                 unmatched: 0,
                 at_risk,
@@ -709,13 +720,18 @@ impl KeyDeriver {
             };
             if reproduced {
                 keys.push(idx);
-            } else if self.warned_mismatch.insert((entity_idx, idx)) {
-                warnings.push(format!(
-                    "entity '{}': template '{}' does not reproduce {} on at least one item \
-                     (the attributes it names are missing, not scalars, or the key was \
-                     built differently); such keys are left unchanged",
-                    entity.name, key.template, key.attribute
-                ));
+            } else {
+                let seen = self.warned_mismatch.entry((entity_idx, idx)).or_insert(0);
+                *seen += 1;
+                if *seen == 1 {
+                    warnings.push(format!(
+                        "entity '{}': template '{}' does not reproduce {} (the attributes it \
+                         names are missing, not scalars, or the key was built differently); \
+                         such keys are left unchanged, and the count is reported once the \
+                         table has been read",
+                        entity.name, key.template, key.attribute
+                    ));
+                }
             }
         }
 
@@ -753,17 +769,28 @@ impl KeyDeriver {
                 (risk.entities.contains(&entity_idx) || risk.observers.contains(&entity_idx))
                     && rebuilt.iter().any(|a| *a == risk.key_attribute)
             })
-            .filter_map(|(idx, risk)| {
+            .flat_map(|(idx, risk)| {
                 // A sort key needs its partition to say which rows it was
-                // grouped with. An item not carrying that attribute cannot be
-                // shown to have shared a group with anything, so it is left
-                // out rather than compared against rows it may never have sat
-                // beside.
-                let grouping = match &risk.grouped_by {
-                    Some(attribute) => Some(item.get(attribute)?),
-                    None => None,
+                // grouped with, and it may sort several indexes, each its own
+                // grouping. An item not carrying one of those attributes
+                // cannot be shown to have shared that group, so that grouping
+                // is left out rather than compared against rows it may never
+                // have sat beside.
+                let Some(key) = item.get(&risk.key_attribute) else {
+                    return Vec::new();
                 };
-                Some((idx, group_hash(grouping, item.get(&risk.key_attribute)?)?))
+                if risk.grouped_by.is_empty() {
+                    return group_hash(None, key)
+                        .map(|h| (idx, h))
+                        .into_iter()
+                        .collect();
+                }
+                risk.grouped_by
+                    .iter()
+                    .filter_map(|attribute| {
+                        group_hash(Some(item.get(attribute)?), key).map(|h| (idx, h))
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -854,11 +881,17 @@ impl KeyDeriver {
                     item.insert(key.attribute.clone(), AttributeValue::S(value));
                 }
                 None => {
-                    if self.warned_unrenderable.insert((plan.entity, idx)) {
+                    let seen = self
+                        .warned_unrenderable
+                        .entry((plan.entity, idx))
+                        .or_insert(0);
+                    *seen += 1;
+                    if *seen == 1 {
                         warnings.push(format!(
                             "entity '{}': cannot rebuild {} from template '{}' after the rules \
                              ran (an attribute it needs is no longer a string or number); \
-                             the original key value is left in place",
+                             the original key value is left in place, and the count is \
+                             reported once the table has been read",
                             entity.name, key.attribute, key.template
                         ));
                     }
@@ -977,6 +1010,29 @@ impl KeyDeriver {
             .collect()
     }
 
+    /// How many items kept a key the model could not rebuild, by entity and
+    /// key. These are the values the run exists to remove, so the count is the
+    /// difference between one stray row and a whole table left as it arrived.
+    pub fn take_unrebuilt(&mut self) -> Vec<(String, String, usize)> {
+        let mut out: Vec<(String, String, usize)> = self
+            .warned_mismatch
+            .iter()
+            .chain(self.warned_unrenderable.iter())
+            .map(|((entity, key), count)| {
+                let entity = &self.entities[*entity];
+                (
+                    entity.name.clone(),
+                    entity.keys[*key].attribute.clone(),
+                    *count,
+                )
+            })
+            .collect();
+        out.sort();
+        self.warned_mismatch.clear();
+        self.warned_unrenderable.clear();
+        out
+    }
+
     /// Keys the join check could not take on after its cap, so the caller
     /// can say the check was partial rather than clean.
     pub fn unchecked_join_keys(&self) -> usize {
@@ -1064,7 +1120,13 @@ fn scalar_hash(value: &AttributeValue) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     match value {
         AttributeValue::S(s) => s.hash(&mut hasher),
-        AttributeValue::N(n) => n.hash(&mut hasher),
+        // Numbers are hashed on the form the engine stores, so a key written
+        // `1` and a key written `1.0` are one key here as they are there.
+        AttributeValue::N(n) => crate::types::normalize_dynamo_number(n).hash(&mut hasher),
+        // DynamoDB allows a binary key. Returning None dropped those items
+        // from the check entirely, so a genuine split inside a binary
+        // partition shipped with nothing said.
+        AttributeValue::B(b) => b.hash(&mut hasher),
         _ => return None,
     }
     Some(hasher.finish())
@@ -1557,8 +1619,21 @@ mod tests {
             KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
         // The key stays tracked: whether the rule wins is an per-item question.
         assert_eq!(tracked(&d, 1), vec!["pk", "sk", "gs1pk"]);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("targets key attribute 'sk' directly"));
+        // Both entities are warned about, including the one whose sk template
+        // is a constant. A rule naming the attribute overwrites that constant
+        // just as it overwrites a rendered one, so the key stops saying what
+        // the model says it says.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.contains("targets key attribute 'sk' directly")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("'Account'")),
+            "the constant template must be named too: {warnings:?}"
+        );
 
         let mut item_warnings = Vec::new();
         let mut user = user();
@@ -2005,14 +2080,134 @@ mod tests {
         ])
     }
 
+    /// One entity, alone, templating a GSI partition key from `email`.
+    fn lone_entity_model() -> DataModel {
+        model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![GsiMapping {
+                index_name: "GSI1".to_string(),
+                pk_template: "CUSTOMER#${email}".to_string(),
+                sk_template: Some("ORDER#${id}".to_string()),
+            }],
+            description: None,
+        }])
+    }
+
+    fn lone_item(id: &str, email: &str) -> Item {
+        item(&[
+            ("pk", &format!("ORDER#{id}")),
+            ("sk", "ORDER#"),
+            ("gs1pk", &format!("CUSTOMER#{email}")),
+            ("gs1sk", &format!("ORDER#{id}")),
+            ("id", id),
+            ("email", email),
+        ])
+    }
+
+    #[test]
+    fn the_only_entity_that_templates_a_key_is_still_checked() {
+        // The commonest single-table shape: one entity builds the customer
+        // partition and nothing else does. The check used to require a second
+        // entity templating the same attribute before it formed a group at
+        // all, so this shape, which is most of the real ones, went unexamined
+        // however badly it was split.
+        let (mut d, _) = KeyDeriver::new(
+            &lone_entity_model(),
+            &request(),
+            &email_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
+
+        run_item_on(
+            &mut d,
+            lone_item("o1", "a@x.co"),
+            "email",
+            "fake1@example.org",
+        );
+        run_item_on(
+            &mut d,
+            lone_item("o2", "a@x.co"),
+            "email",
+            "fake2@example.org",
+        );
+
+        let breaks = d.join_breaks();
+        assert_eq!(
+            breaks.len(),
+            1,
+            "two orders arrived in one customer partition and left in two: {breaks:?}"
+        );
+        assert!(breaks[0].contains("entity 'Order'"), "{breaks:?}");
+        assert!(breaks[0].contains("took one original gs1pk"), "{breaks:?}");
+    }
+
+    #[test]
+    fn a_lone_entity_whose_rows_never_shared_a_key_is_left_alone() {
+        // The same lone entity, but each order belongs to a different
+        // customer, so nothing was grouped and nothing is lost. This is what
+        // stops the relaxed gate turning every anonymised import into an error.
+        let (mut d, _) = KeyDeriver::new(
+            &lone_entity_model(),
+            &request(),
+            &email_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
+
+        run_item_on(
+            &mut d,
+            lone_item("o1", "a@x.co"),
+            "email",
+            "fake1@example.org",
+        );
+        run_item_on(
+            &mut d,
+            lone_item("o2", "b@x.co"),
+            "email",
+            "fake2@example.org",
+        );
+
+        assert!(
+            d.join_breaks().is_empty(),
+            "different customers never shared a partition: {:?}",
+            d.join_breaks()
+        );
+    }
+
+    /// One entity, alone, sorting a GSI on `CODE#${code}`.
+    fn lone_code_model() -> DataModel {
+        model_with(vec![EntityDefinition {
+            name: "Event".to_string(),
+            pk_template: "EVENT#${id}".to_string(),
+            sk_template: Some("EVENT#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![GsiMapping {
+                index_name: "GSI1".to_string(),
+                pk_template: "TENANT#${tenant}".to_string(),
+                sk_template: Some("CODE#${code}".to_string()),
+            }],
+            description: None,
+        }])
+    }
+
     #[test]
     fn one_entity_splitting_a_gsi_sort_key_inside_one_partition_is_a_break() {
         // A GSI sort key is not unique, so two rows really can share one
         // inside a partition, and a range query over that index returns them
         // together. Splitting them breaks that, and no second entity has to
-        // be present for it to happen.
-        let (mut d, _) =
-            KeyDeriver::new(&code_model(), &request(), &code_rule(), &no_consistency()).unwrap();
+        // be present for it to happen: the model here has exactly one, so the
+        // assertion cannot be satisfied by a sibling forming the group.
+        let (mut d, _) = KeyDeriver::new(
+            &lone_code_model(),
+            &request(),
+            &code_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
 
         run_item_on(
             &mut d,
@@ -2042,8 +2237,13 @@ mod tests {
         // they were never returned together and there is no join to lose.
         // Reading the sort value alone called this a break and failed an
         // import that had nothing wrong with it.
-        let (mut d, _) =
-            KeyDeriver::new(&code_model(), &request(), &code_rule(), &no_consistency()).unwrap();
+        let (mut d, _) = KeyDeriver::new(
+            &lone_code_model(),
+            &request(),
+            &code_rule(),
+            &no_consistency(),
+        )
+        .unwrap();
 
         run_item_on(
             &mut d,

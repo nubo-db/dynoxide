@@ -103,7 +103,10 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   anonymisation is seen to take one original value to two results. That holds
   within a single entity too: many rows sharing one partition, each drawing
   its own fake, leave that partition split as surely as two entities
-  disagreeing. Pulling one entity's slice still works, since there each row
+  disagreeing. Rows are only compared when they actually shared a group, so a
+  sort key is read together with the partition that groups it: on a base table
+  that pairing is unique and nothing is claimed, while a GSI sort key is not
+  unique and rows really can share one inside a partition. Pulling one entity's slice still works, since there each row
   carries its own value and nothing splits, so does importing two entities
   that share nothing, and so does a deterministic action such as `hash`, which keeps both
   entities agreeing without any `[consistency]` entry. None of those has a

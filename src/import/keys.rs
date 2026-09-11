@@ -14,7 +14,7 @@
 //! the data never silently rewrites a key. Warnings never quote a key's
 //! value: the whole point of the run is that those values leave.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::actions::create_table::CreateTableRequest;
@@ -227,10 +227,11 @@ struct EntityKeys {
 struct AtRisk {
     /// The key attribute the shared template builds.
     key_attribute: String,
-    /// Whether this key groups rows with each other, which only a partition
-    /// key does. One entity splitting its own sort key across two partitions
-    /// breaks nothing, so the single-entity check below reads this first.
-    groups_rows: bool,
+    /// The attribute whose value decides which rows this key groups with,
+    /// when this key does not group by itself. `None` for a partition key,
+    /// which is its own grouping; the partition attribute for a sort key,
+    /// which only orders rows inside a partition it does not define.
+    grouped_by: Option<String>,
     /// Root field names to put in `[consistency] fields`. Roots, because
     /// that is what the consistency map is keyed on: advising `contact.email`
     /// when only `contact` is honoured would send someone in a circle.
@@ -339,20 +340,33 @@ impl KeyDeriver {
         let range = sort_key_name(&request.key_schema);
         let gsis = request.global_secondary_indexes.as_deref().unwrap_or(&[]);
 
-        // Which key attributes group rows with each other. Only a partition
-        // key does: rows sharing one come back from a single query, so an
-        // entity that takes one original partition to two values has broken
-        // that grouping by itself. A sort key orders rows inside a partition
-        // it does not define, so one entity splitting its own sort key values
-        // costs nothing when those rows sit in different partitions, and
-        // treating it as a break would fail imports that never had a join to
-        // lose. Two entities disagreeing on a sort key is still a break, and
-        // is still caught, because there the rows do share a partition.
+        // What groups rows with each other, per key attribute. A partition key
+        // groups by itself: rows sharing one come back from a single query. A
+        // sort key only orders rows inside a partition it does not define, so
+        // two rows sharing a sort value are grouped only when they share that
+        // partition as well, and the join check has to read both. Comparing a
+        // sort value alone calls two rows a group when they were never in one
+        // place, and splitting them then reads as a join break that never
+        // existed. An attribute that is a partition key anywhere groups by
+        // itself, whatever else it sorts.
         let mut partition_keys: HashSet<&str> = HashSet::new();
         partition_keys.extend(hash);
         for gsi in gsis {
             partition_keys.extend(partition_key_name(&gsi.key_schema));
         }
+        let mut grouped_by: HashMap<&str, &str> = HashMap::new();
+        if let (Some(range), Some(hash)) = (range, hash) {
+            grouped_by.insert(range, hash);
+        }
+        for gsi in gsis {
+            if let (Some(sort), Some(part)) = (
+                sort_key_name(&gsi.key_schema),
+                partition_key_name(&gsi.key_schema),
+            ) {
+                grouped_by.entry(sort).or_insert(part);
+            }
+        }
+        grouped_by.retain(|attribute, _| !partition_keys.contains(attribute));
 
         let rule_targets: HashSet<&str> = rules.iter().filter_map(rule_target).collect();
         let mut warnings = Vec::new();
@@ -631,7 +645,9 @@ impl KeyDeriver {
                     ));
                 }
                 AtRisk {
-                    groups_rows: partition_keys.contains(key_attribute.as_str()),
+                    grouped_by: grouped_by
+                        .get(key_attribute.as_str())
+                        .map(|a| (*a).to_string()),
                     key_attribute,
                     consistency_roots: if unlisted.is_empty() { roots } else { unlisted },
                     entities: entities_using,
@@ -737,7 +753,18 @@ impl KeyDeriver {
                 (risk.entities.contains(&entity_idx) || risk.observers.contains(&entity_idx))
                     && rebuilt.iter().any(|a| *a == risk.key_attribute)
             })
-            .filter_map(|(idx, risk)| Some((idx, scalar_hash(item.get(&risk.key_attribute)?)?)))
+            .filter_map(|(idx, risk)| {
+                // A sort key needs its partition to say which rows it was
+                // grouped with. An item not carrying that attribute cannot be
+                // shown to have shared a group with anything, so it is left
+                // out rather than compared against rows it may never have sat
+                // beside.
+                let grouping = match &risk.grouped_by {
+                    Some(attribute) => Some(item.get(attribute)?),
+                    None => None,
+                };
+                Some((idx, group_hash(grouping, item.get(&risk.key_attribute)?)?))
+            })
             .collect()
     }
 
@@ -762,7 +789,6 @@ impl KeyDeriver {
                 }
                 risk.seen_keys.insert(*original, Vec::new());
             }
-            let groups_rows = risk.groups_rows;
             let outcomes = risk.seen_keys.get_mut(original).expect("just inserted");
 
             match outcomes.iter_mut().find(|o| o.entity == plan.entity) {
@@ -785,7 +811,7 @@ impl KeyDeriver {
                 // pass below cannot see that, because it never pairs an entity
                 // with itself, so a single entity's own split was recorded on
                 // the outcome and then dropped.
-                if a.multiple && groups_rows {
+                if a.multiple {
                     diverged.push(a.entity);
                 }
                 for b in outcomes.iter().skip(i + 1) {
@@ -1017,6 +1043,23 @@ fn quoted_list(names: &[String]) -> String {
 }
 
 /// Hash a scalar attribute value, or `None` for anything a key cannot hold.
+/// Which rows a key value is grouped with, as one hash.
+///
+/// For a partition key that is the value itself. For a sort key it is the
+/// partition value and the sort value together, because two rows only share a
+/// group when they share both: `pk` and `sk` are unique together on a base
+/// table, so rows sharing a sort value there are in different partitions and
+/// have no join to lose, while a GSI sort key is not unique and rows really
+/// can share one inside a partition.
+fn group_hash(grouping: Option<&AttributeValue>, key: &AttributeValue) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Some(grouping) = grouping {
+        scalar_hash(grouping)?.hash(&mut hasher);
+    }
+    scalar_hash(key)?.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 fn scalar_hash(value: &AttributeValue) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     match value {
@@ -1923,6 +1966,134 @@ mod tests {
         d.apply(&plan, &no_rewrites(), &mut item, &mut warnings);
     }
 
+    /// Two entities that both sort a GSI on `CODE#${code}`, hashed on tenant.
+    fn code_model() -> DataModel {
+        let entity = |name: &str, prefix: &str| EntityDefinition {
+            name: name.to_string(),
+            pk_template: format!("{prefix}#${{id}}"),
+            sk_template: Some(format!("{prefix}#")),
+            type_attribute: None,
+            gsi_mappings: vec![GsiMapping {
+                index_name: "GSI1".to_string(),
+                pk_template: "TENANT#${tenant}".to_string(),
+                sk_template: Some("CODE#${code}".to_string()),
+            }],
+            description: None,
+        };
+        model_with(vec![entity("Event", "EVENT"), entity("Alert", "ALERT")])
+    }
+
+    fn code_rule() -> [ValidatedRule; 1] {
+        [rule(
+            "code",
+            ValidatedAction::Fake {
+                generator: "safe_email".into(),
+                seed: None,
+            },
+        )]
+    }
+
+    fn code_item(prefix: &str, id: &str, tenant: &str, code: &str) -> Item {
+        item(&[
+            ("pk", &format!("{prefix}#{id}")),
+            ("sk", &format!("{prefix}#")),
+            ("gs1pk", &format!("TENANT#{tenant}")),
+            ("gs1sk", &format!("CODE#{code}")),
+            ("id", id),
+            ("tenant", tenant),
+            ("code", code),
+        ])
+    }
+
+    #[test]
+    fn one_entity_splitting_a_gsi_sort_key_inside_one_partition_is_a_break() {
+        // A GSI sort key is not unique, so two rows really can share one
+        // inside a partition, and a range query over that index returns them
+        // together. Splitting them breaks that, and no second entity has to
+        // be present for it to happen.
+        let (mut d, _) =
+            KeyDeriver::new(&code_model(), &request(), &code_rule(), &no_consistency()).unwrap();
+
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e1", "t1", "c1"),
+            "code",
+            "fake1",
+        );
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e2", "t1", "c1"),
+            "code",
+            "fake2",
+        );
+
+        let breaks = d.join_breaks();
+        assert_eq!(
+            breaks.len(),
+            1,
+            "rows sharing a GSI partition and sort value were split: {breaks:?}"
+        );
+        assert!(breaks[0].contains("took one original gs1sk"), "{breaks:?}");
+    }
+
+    #[test]
+    fn one_entity_splitting_a_sort_key_across_partitions_is_not_a_break() {
+        // The same split, but the rows sit in different GSI partitions, so
+        // they were never returned together and there is no join to lose.
+        // Reading the sort value alone called this a break and failed an
+        // import that had nothing wrong with it.
+        let (mut d, _) =
+            KeyDeriver::new(&code_model(), &request(), &code_rule(), &no_consistency()).unwrap();
+
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e1", "t1", "c1"),
+            "code",
+            "fake1",
+        );
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e2", "t2", "c1"),
+            "code",
+            "fake2",
+        );
+
+        assert!(
+            d.join_breaks().is_empty(),
+            "different partitions never shared a group: {:?}",
+            d.join_breaks()
+        );
+    }
+
+    #[test]
+    fn two_entities_sharing_a_gsi_partition_and_sort_value_still_break() {
+        // The cross-entity case the check already covered, now that the
+        // bucket carries the partition too.
+        let (mut d, _) =
+            KeyDeriver::new(&code_model(), &request(), &code_rule(), &no_consistency()).unwrap();
+
+        run_item_on(
+            &mut d,
+            code_item("EVENT", "e1", "t1", "c1"),
+            "code",
+            "fake1",
+        );
+        run_item_on(
+            &mut d,
+            code_item("ALERT", "a1", "t1", "c1"),
+            "code",
+            "fake2",
+        );
+
+        let breaks = d.join_breaks();
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+        assert!(
+            breaks[0].contains("entity 'Alert' and entity 'Event'")
+                || breaks[0].contains("entity 'Event' and entity 'Alert'"),
+            "{breaks:?}"
+        );
+    }
+
     #[test]
     fn padding_matches_javascript_pad_start() {
         // OneTable renders these in JavaScript, so `padStart` is the oracle.
@@ -1955,6 +2126,16 @@ mod tests {
                 "padStart({value:?}, {length}, {fill:?})"
             );
         }
+    }
+
+    fn run_item_on(d: &mut KeyDeriver, mut item: Item, attribute: &str, becomes: &str) {
+        let mut warnings = Vec::new();
+        let plan = d.plan(&item, &mut warnings).unwrap();
+        item.insert(
+            attribute.to_string(),
+            AttributeValue::S(becomes.to_string()),
+        );
+        d.apply(&plan, &no_rewrites(), &mut item, &mut warnings);
     }
 
     fn shared_key_deriver() -> KeyDeriver {

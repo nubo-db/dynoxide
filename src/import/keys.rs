@@ -14,7 +14,7 @@
 //! the data never silently rewrites a key. Warnings never quote a key's
 //! value: the whole point of the run is that those values leave.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::actions::create_table::CreateTableRequest;
@@ -311,6 +311,9 @@ struct Outcome {
 pub struct Rederivation {
     entity: usize,
     keys: Vec<usize>,
+    /// Keys a rule names directly and the template did not reproduce, so
+    /// `apply` can count the ones the rule then left alone.
+    rule_owned: Vec<usize>,
     /// Scalar values of the rule-target attributes as the item arrived, so
     /// `apply` can see whether a key the model never templated still holds
     /// one after the rules replaced it.
@@ -356,6 +359,16 @@ pub struct KeyDeriver {
     /// (entity index, key index) pairs where a rule took the key instead of
     /// its template, reported once.
     warned_rule_wins: HashSet<(usize, usize)>,
+    /// (entity index, key index) pairs a rule names but passed by on some
+    /// item, with no template to fall back on. Reported once, counted
+    /// throughout.
+    warned_rule_skipped: HashMap<(usize, usize), usize>,
+    /// Indexes the model declares that the table does not have, so `apply`
+    /// can count the items whose untemplated keys those are likely to be.
+    unmatched_model_indexes: Vec<String>,
+    /// Key attribute -> items carrying it that no entity templates, counted
+    /// only while `unmatched_model_indexes` says the model meant to.
+    untemplated_index_keys: BTreeMap<String, usize>,
     /// Sets of entities that all reproduced some untyped item's keys,
     /// reported once per set.
     warned_ambiguous: HashSet<Vec<usize>>,
@@ -369,6 +382,9 @@ pub struct KeyDeriver {
     collisions: usize,
     /// Set once `rebuilt_keys` hit its cap and stopped tracking.
     collision_check_capped: bool,
+    /// Set once the cap has been reported, so `take_notices` says it once
+    /// while the flag above keeps gating the check.
+    collision_cap_reported: bool,
 }
 
 impl KeyDeriver {
@@ -466,9 +482,7 @@ impl KeyDeriver {
         // quietly holding the value it arrived with.
         // A warning rather than an exposure: the model says nothing about an
         // LSI, so nothing says its sort key embeds an attribute a rule
-        // touches. An index the model does describe but the table lacks is
-        // different, and stays an exposure below, because there the model
-        // itself claims those keys are built from attributes.
+        // touches.
         if let Some(lsis) = request.local_secondary_indexes.as_deref()
             && !lsis.is_empty()
         {
@@ -499,13 +513,16 @@ impl KeyDeriver {
                     // ("GSI1"). Silently skipping would leave that index's
                     // key holding whatever it arrived with.
                     if unmatched_indexes.insert(mapping.index_name.clone()) {
-                        // The model itself says this index's keys are built
-                        // from attributes, so their keeping the values they
-                        // arrived with is an observed survival, not a guess.
-                        warnings.push(Notice::exposure(format!(
-                            "the data model has an index '{}' that the table does not: its \
-                             keys are not rebuilt and keep the values they arrive with. Set \
-                             the OneTable index's \"name\" to the DynamoDB index name",
+                        // A caution here, before any item is read: the model
+                        // claims this index's keys are built from attributes,
+                        // but which of the table's keys it meant, and whether
+                        // any item carries them, is only known once the items
+                        // have been seen. `apply` counts those, and
+                        // `take_notices` raises the exposure on the count.
+                        warnings.push(Notice::caution(format!(
+                            "the data model has an index '{}' that the table does not, so \
+                             nothing rebuilds its keys. Set the OneTable index's \"name\" to \
+                             the DynamoDB index name",
                             mapping.index_name
                         )));
                     }
@@ -782,6 +799,14 @@ impl KeyDeriver {
                 rebuilt_keys: HashSet::new(),
                 collisions: 0,
                 collision_check_capped: false,
+                collision_cap_reported: false,
+                warned_rule_skipped: HashMap::new(),
+                unmatched_model_indexes: {
+                    let mut names: Vec<String> = unmatched_indexes.into_iter().collect();
+                    names.sort();
+                    names
+                },
+                untemplated_index_keys: BTreeMap::new(),
             },
             warnings,
         ))
@@ -823,6 +848,7 @@ impl KeyDeriver {
         let entity = &self.entities[entity_idx];
 
         let mut keys = Vec::new();
+        let mut rule_owned = Vec::new();
         let mut rewritten_directly: Vec<&str> = Vec::new();
         for (idx, key) in entity.keys.iter().enumerate() {
             let Some(current) = item.get(&key.attribute) else {
@@ -844,7 +870,10 @@ impl KeyDeriver {
                 // It still has a join to lose, though: two entities that
                 // arrived sharing this key and leave it to an unseeded rule
                 // split exactly as a rebuilt key would, so it is compared.
+                // And if the rule's condition passes this item by, nothing
+                // touches the key at all; `apply` counts that case.
                 rewritten_directly.push(key.attribute.as_str());
+                rule_owned.push(idx);
             } else {
                 let seen = self.warned_mismatch.entry((entity_idx, idx)).or_insert(0);
                 *seen += 1;
@@ -898,6 +927,7 @@ impl KeyDeriver {
         Some(Rederivation {
             entity: entity_idx,
             keys,
+            rule_owned,
             originals,
             at_risk_originals,
         })
@@ -1074,25 +1104,64 @@ impl KeyDeriver {
             }
         }
 
+        // A key a rule names and the template did not reproduce, which the
+        // rule then passed by: its condition did not match this item, so
+        // nothing has touched the key and it holds the value it arrived
+        // with. Counted with the keys a template could not rebuild, since
+        // that is what it is; the caution says why this one was missed.
+        for &idx in &plan.rule_owned {
+            let key = &self.entities[plan.entity].keys[idx];
+            if rewritten_by_rules.contains(&key.attribute) {
+                continue;
+            }
+            let seen = self
+                .warned_rule_skipped
+                .entry((plan.entity, idx))
+                .or_insert(0);
+            *seen += 1;
+            if *seen == 1 {
+                warnings.push(Notice::caution(format!(
+                    "entity '{}': a rule names {} but its condition passed at least one item \
+                     by, and template '{}' does not reproduce that key; such keys are left \
+                     unchanged, and the count is reported once the table has been read",
+                    self.entities[plan.entity].name, key.attribute, key.template
+                )));
+            }
+        }
+
         // A key the model gives this entity no template for is not rebuilt,
         // and nothing above looked at it. If a value a rule just replaced is
         // still sitting inside it, that is real data in a key on a run that
         // would otherwise report success. Judged on what is seen in the key,
         // not on the index existing.
-        let survivals: Vec<String> = {
-            let entity = &self.entities[plan.entity];
-            self.schema_keys
-                .iter()
-                .filter(|key| !entity.match_keys.iter().any(|k| &k.attribute == *key))
-                .filter(|key| match item.get(key.as_str()) {
-                    Some(AttributeValue::S(value)) => plan.originals.iter().any(|(attr, old)| {
-                        rewritten_by_rules.contains(attr) && holds_as_component(value, old)
-                    }),
-                    _ => false,
-                })
-                .cloned()
-                .collect()
-        };
+        let entity = &self.entities[plan.entity];
+        let untemplated: Vec<&String> = self
+            .schema_keys
+            .iter()
+            .filter(|key| !entity.match_keys.iter().any(|k| &k.attribute == *key))
+            .filter(|key| item.contains_key(key.as_str()))
+            .collect();
+        // The model declared an index the table lacks, and this item carries
+        // a key no entity templates: that key is in all likelihood the one
+        // the model meant, and it was not rebuilt. Now it has been seen.
+        if !self.unmatched_model_indexes.is_empty() {
+            for key in &untemplated {
+                *self
+                    .untemplated_index_keys
+                    .entry((*key).clone())
+                    .or_insert(0) += 1;
+            }
+        }
+        let survivals: Vec<String> = untemplated
+            .into_iter()
+            .filter(|key| match item.get(key.as_str()) {
+                Some(AttributeValue::S(value)) => plan.originals.iter().any(|(attr, old)| {
+                    rewritten_by_rules.contains(attr) && holds_as_component(value, old)
+                }),
+                _ => false,
+            })
+            .cloned()
+            .collect();
         for key in survivals {
             let seen = self.survived.entry((plan.entity, key.clone())).or_insert(0);
             *seen += 1;
@@ -1147,6 +1216,16 @@ impl KeyDeriver {
                  template could not rebuild them. Those keys still hold the values the \
                  export arrived with"
             )));
+        }
+        if !self.unmatched_model_indexes.is_empty() {
+            let indexes = quoted_list(&self.unmatched_model_indexes);
+            for (key, count) in std::mem::take(&mut self.untemplated_index_keys) {
+                out.push(Notice::exposure(format!(
+                    "{count} items carry {key}, which no entity's templates build, while the \
+                     data model declares index {indexes} that the table does not have; \
+                     those keys were not rebuilt and hold the values they arrived with"
+                )));
+            }
         }
 
         for message in self.sort_key_splits() {
@@ -1327,14 +1406,16 @@ impl KeyDeriver {
     /// key. These are the values the run exists to remove, so the count is the
     /// difference between one stray row and a whole table left as it arrived.
     fn take_unrebuilt(&mut self) -> Vec<(String, String, usize)> {
-        // Both maps describe one outcome, a key left holding the value it
-        // arrived with, so an entity and key in both is one fact with two
-        // causes rather than two facts. Summed, not listed twice.
+        // All three maps describe one outcome, a key left holding the value
+        // it arrived with, so an entity and key in more than one is one fact
+        // with several causes rather than several facts. Summed, not listed
+        // twice.
         let mut totals: HashMap<(usize, usize), usize> = HashMap::new();
         for (id, count) in self
             .warned_mismatch
             .iter()
             .chain(self.warned_unrenderable.iter())
+            .chain(self.warned_rule_skipped.iter())
         {
             *totals.entry(*id).or_insert(0) += count;
         }
@@ -1352,6 +1433,7 @@ impl KeyDeriver {
         out.sort();
         self.warned_mismatch.clear();
         self.warned_unrenderable.clear();
+        self.warned_rule_skipped.clear();
         out
     }
 
@@ -1371,12 +1453,12 @@ impl KeyDeriver {
 
     /// Rebuilt items whose primary key repeated an earlier rebuilt key, and
     /// whether the check stopped early because the table was too large to
-    /// track in full.
+    /// track in full. The cap is reported once; the flag that records it
+    /// stays set, because it is also what stops the check taking on keys.
     fn take_collisions(&mut self) -> (usize, bool) {
-        (
-            std::mem::take(&mut self.collisions),
-            self.collision_check_capped,
-        )
+        let cap_to_report = self.collision_check_capped && !self.collision_cap_reported;
+        self.collision_cap_reported |= cap_to_report;
+        (std::mem::take(&mut self.collisions), cap_to_report)
     }
 
     /// Find the item's entity: by its type attribute first, otherwise the
@@ -1430,15 +1512,26 @@ fn quoted_list(names: &[String]) -> String {
 }
 
 /// Hash a scalar attribute value, or `None` for anything a key cannot hold.
-/// Whether `key` carries `value` as a whole `#`-separated component.
+/// Whether `key` carries `value` as a whole component.
 ///
-/// Keys in this style are built from components joined with `#`, so a value
-/// a rule replaced shows up in one as a component: `CUSTOMER#alice@x` holds
-/// `alice@x`. Matching anywhere in the string instead would report
-/// `ORDER#1042` as holding a replaced `42`, and an exposure that fires on a
-/// coincidence is one people learn to wave through.
+/// Keys in this style are components joined by a delimiter, `#` most often
+/// but `|`, `:` and `_` are all in use, so a value a rule replaced shows up
+/// as a run of the key bounded by delimiters or by the key's ends:
+/// `CUSTOMER#alice@x` and `CUSTOMER|alice@x` both hold `alice@x`. A boundary
+/// is any character that is not a letter or digit, so no one delimiter has
+/// to be guessed and a value that itself contains `#` is still found.
+/// Matching anywhere in the string instead would report `ORDER#1042` as
+/// holding a replaced `42`, and an exposure that fires on a coincidence is
+/// one people learn to wave through.
 fn holds_as_component(key: &str, value: &str) -> bool {
-    !value.is_empty() && (key == value || key.split('#').any(|component| component == value))
+    if value.is_empty() {
+        return false;
+    }
+    key.match_indices(value).any(|(start, _)| {
+        let before = key[..start].chars().next_back();
+        let after = key[start + value.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 /// Which rows a key value is grouped with, as one hash.
@@ -2788,6 +2881,19 @@ mod tests {
         assert_eq!(split.concern, Concern::Caution);
 
         assert!(d.take_notices().is_empty(), "taking clears");
+
+        // The collision cap is reported once, and stays set: it is also what
+        // stops the check taking on keys, so taking must not clear it.
+        d.collision_check_capped = true;
+        let notices = d.take_notices();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("collision check stopped")),
+            "{notices:?}"
+        );
+        assert!(d.take_notices().is_empty(), "the cap is said once");
+        assert!(d.collision_check_capped, "and the check stays capped");
     }
 
     #[test]
@@ -3077,12 +3183,132 @@ mod tests {
     #[test]
     fn a_value_has_to_sit_in_the_key_as_a_component_to_count() {
         // id=42 was replaced. ORDER#1042 merely contains the digits; it does
-        // not hold the id. STATUS#42 does.
+        // not hold the id. STATUS#42 does, and so does a key that joins its
+        // components with something other than '#'.
         assert!(!holds_as_component("ORDER#1042", "42"));
+        assert!(!holds_as_component("ID42", "42"));
         assert!(holds_as_component("STATUS#42", "42"));
         assert!(holds_as_component("CUSTOMER#alice@x", "alice@x"));
+        assert!(holds_as_component("CUSTOMER|alice@x", "alice@x"));
+        assert!(holds_as_component("CUSTOMER:alice@x", "alice@x"));
+        assert!(holds_as_component("CUSTOMER_alice@x", "alice@x"));
         assert!(holds_as_component("alice@x", "alice@x"));
+        // A value that itself contains the delimiter is still one component.
+        assert!(holds_as_component("TENANT#a#b#PROFILE", "a#b"));
         assert!(!holds_as_component("CUSTOMER#alice@x", ""));
+    }
+
+    #[test]
+    fn a_key_joined_with_another_delimiter_still_counts_as_a_survival() {
+        // The same untemplated key as above, joined with '|'. Splitting on
+        // '#' alone found nothing here, and the real address stayed in the
+        // key on a run that exited 0.
+        let model = model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let (mut d, _) =
+            KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).unwrap();
+        let mut rewritten = HashSet::new();
+        rewritten.insert("email".to_string());
+
+        let mut it = item(&[
+            ("pk", "ORDER#o1"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "CUSTOMER|alice@real.co.uk"),
+            ("id", "o1"),
+            ("email", "alice@real.co.uk"),
+        ]);
+        let mut warnings = Vec::new();
+        let plan = d.plan(&it, &mut warnings).unwrap();
+        it.insert(
+            "email".to_string(),
+            AttributeValue::S("fake@example.org".to_string()),
+        );
+        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        assert_eq!(
+            d.take_key_survivals(),
+            vec![("Order".to_string(), "gs1pk".to_string(), 1)]
+        );
+
+        // And the coincidence is still left alone: id o1 was replaced, and
+        // ORDER#o10 does not hold it.
+        let mut it = item(&[
+            ("pk", "ORDER#o1"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "ORDER#o10"),
+            ("id", "o1"),
+            ("email", "alice@real.co.uk"),
+        ]);
+        let (mut d, _) = KeyDeriver::new(
+            &model,
+            &request(),
+            &[rule("id", ValidatedAction::Redact)],
+            &no_consistency(),
+        )
+        .unwrap();
+        let plan = d.plan(&it, &mut warnings).unwrap();
+        it.insert(
+            "id".to_string(),
+            AttributeValue::S("[REDACTED]".to_string()),
+        );
+        let mut rewritten = HashSet::new();
+        rewritten.insert("id".to_string());
+        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        assert!(d.take_key_survivals().is_empty());
+    }
+
+    #[test]
+    fn a_rule_owned_key_the_rule_passed_by_is_counted_as_unrebuilt() {
+        // A rule names pk, so the template's failure to reproduce it was
+        // excused: the rule would replace it. On an item the rule's condition
+        // did not match, nothing replaced it, and the key kept its original.
+        let rules = [rule("pk", ValidatedAction::Redact)];
+        let (mut d, _) = KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
+        let it = item(&[
+            ("_type", "User"),
+            ("pk", "legacy#a@x.co"),
+            ("sk", "user#a@x.co"),
+            ("email", "a@x.co"),
+        ]);
+        let mut w = Vec::new();
+
+        // The rule fired: the key is the rule's, and nothing is left over.
+        let plan = d.plan(&it, &mut w).unwrap();
+        let mut fired = it.clone();
+        fired.insert(
+            "pk".to_string(),
+            AttributeValue::S("[REDACTED]".to_string()),
+        );
+        let mut rewritten = HashSet::new();
+        rewritten.insert("pk".to_string());
+        d.apply(&plan, &rewritten, &mut fired, &mut w);
+        assert!(
+            d.take_notices()
+                .iter()
+                .all(|n| !n.contains("kept the original pk")),
+            "a key the rule rewrote is not unrebuilt"
+        );
+
+        // The rule passed the item by: the key is nobody's, and is counted.
+        let plan = d.plan(&it, &mut w).unwrap();
+        let mut skipped = it.clone();
+        d.apply(&plan, &no_rewrites(), &mut skipped, &mut w);
+        assert!(
+            w.iter()
+                .any(|n| n.contains("a rule names pk but its condition passed")),
+            "{w:?}"
+        );
+        let notices = d.take_notices();
+        let kept = notices
+            .iter()
+            .find(|n| n.contains("kept the original pk on 1 items"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert_eq!(kept.concern, super::super::notice::Concern::Exposure);
     }
 
     #[test]
@@ -3620,15 +3846,42 @@ mod tests {
             }],
             description: None,
         }]);
-        let (_, warnings) = KeyDeriver::new(&model, &request(), &[], &no_consistency()).unwrap();
+        let (mut d, warnings) =
+            KeyDeriver::new(&model, &request(), &[], &no_consistency()).unwrap();
         // The table's name is added once, where the notice is filed; here the
-        // message stands alone. And the model itself claims this index's keys
-        // are built from attributes, so their surviving is an exposure.
+        // message stands alone. Before any item is read it is a caution: the
+        // model claims the index's keys are built from attributes, but
+        // nothing has yet been seen carrying them.
         let unmatched = warnings
             .iter()
             .find(|w| w.contains("index 'gs1' that the table does not"))
             .unwrap_or_else(|| panic!("{warnings:?}"));
-        assert_eq!(unmatched.concern, super::super::notice::Concern::Exposure);
+        assert_eq!(unmatched.concern, super::super::notice::Concern::Caution);
+        assert!(
+            d.take_notices().is_empty(),
+            "nothing observed on an empty table"
+        );
+
+        // An item carrying a key no entity templates is the observation: that
+        // key is the one the model meant, and it was not rebuilt.
+        let mut it = item(&[
+            ("pk", "user#1"),
+            ("sk", "user#"),
+            ("id", "1"),
+            ("gs1sk", "user#a@x.co"),
+            ("email", "a@x.co"),
+        ]);
+        let mut w = Vec::new();
+        let plan = d.plan(&it, &mut w).unwrap();
+        d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        let notices = d.take_notices();
+        let seen = notices
+            .iter()
+            .find(|n| n.contains("1 items carry gs1sk"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert_eq!(seen.concern, super::super::notice::Concern::Exposure);
+        assert!(seen.contains("index 'gs1'"), "{seen:?}");
+        assert!(d.take_notices().is_empty(), "taking clears");
     }
 
     #[test]

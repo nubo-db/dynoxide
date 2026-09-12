@@ -176,8 +176,9 @@ hashes on a plain attribute such as a tenant id and sorts on
 `user#${email}` still gets its sort key rebuilt. The OneTable index's `name`
 has to match the DynamoDB index, since OneTable otherwise defaults it to the
 schema key (`gs1`) and the importer cannot tell which index is meant. It
-reports any index in the model that the table does not have, rather than
-skipping it quietly.
+reports any index in the model that the table does not have, and counts the
+items that carry a key nothing templates, since that key is the one the model
+meant and it was not rebuilt.
 
 **Local secondary indexes are not rebuilt.** OneTable declares one with a sort
 key and no hash key, so it never reaches the model as an index the importer
@@ -286,8 +287,9 @@ anonymised nothing, which is what an unscoped rule that fires on no item is.
 An import that leaves an original value in the output exits **3** rather than
 0. That covers what the run actually saw: a rule that anonymised nothing, a
 key whose template could not rebuild it, a key the model never templated that
-still holds a value a rule replaced, items matching no entity, an index the
-model describes but the table lacks, and values a `mask` kept whole. Each one
+still holds a value a rule replaced, items matching no entity, keys nothing
+templates on a table whose model names an index it lacks, and values a `mask`
+kept whole. Each one
 is printed again at the end under the count, so the reason is in front of you.
 `--serve` and `--mcp` are gated the same way, before any server starts.
 

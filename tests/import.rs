@@ -1532,6 +1532,49 @@ action = { type = "fake", generator = "safe_email" }
     }
 
     #[test]
+    fn a_broken_join_still_prints_what_else_the_table_had_to_say() {
+        // The same failure, from the binary, with an item no entity claims in
+        // the same table. The verdict is the join break; the evidence printed
+        // with it has to include the table's own notices, or the operator
+        // fixes the join and finds the unmatched rows on the next run.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        let model_file = tmp.path().join("model.json");
+        const STRAY_ITEM: &str = r#"{"Item": {"pk": {"S": "LEGACY#9"}, "sk": {"S": "ROW"}}}"#;
+        setup_export_dir(&source, "App", &[CUSTOMER_ITEM, STRAY_ITEM, ORDER_ITEM]);
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(&rules_file, FAKE_EMAIL_RULE).unwrap();
+        shared_key_model(&model_file);
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+            .arg("import")
+            .arg("--source")
+            .arg(&source)
+            .arg("--schema")
+            .arg(&schema_file)
+            .arg("--rules")
+            .arg(&rules_file)
+            .arg("--data-model")
+            .arg(&model_file)
+            .arg("--output")
+            .arg(tmp.path().join("output.db"))
+            .output()
+            .expect("the binary runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+        assert!(
+            stderr.contains("entity 'Customer' and entity 'Order'"),
+            "the join break is the verdict: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 items matched no entity"),
+            "and the table's notices are the evidence: {stderr}"
+        );
+    }
+
+    #[test]
     fn test_one_entity_alone_imports_without_a_consistency_block() {
         let tmp = tempfile::tempdir().unwrap();
         let summary = shared_key_import(tmp.path(), &[CUSTOMER_ITEM], FAKE_EMAIL_RULE)

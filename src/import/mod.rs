@@ -299,12 +299,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     // would answer from a row that no longer exists. Neither happens without
     // rules, so a plain import keeps the fast path that assumes every key is
     // unique.
-    let key_attr_names: HashSet<String> = schemas
-        .iter()
-        .flat_map(|s| extract_key_attrs(&s.create_request))
-        .collect();
+    // Only a rule that applies to a table whose key it names counts: one
+    // scoped to another table is not rewriting this one's keys.
     let rules_touch_a_key = rules.iter().any(|rule| match rule.path.first() {
-        Some(crate::expressions::PathElement::Attribute(name)) => key_attr_names.contains(name),
+        Some(crate::expressions::PathElement::Attribute(name)) => schemas.iter().any(|s| {
+            rule.applies_to(&s.table_name) && extract_key_attrs(&s.create_request).contains(name)
+        }),
         _ => false,
     });
     let rebuilds_keys = !rules.is_empty() && (data_model.is_some() || rules_touch_a_key);
@@ -347,12 +347,10 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         ));
     }
 
-    let index_key_names: HashSet<String> = schemas
-        .iter()
-        .flat_map(|s| index_key_attrs(&s.create_request))
-        .collect();
     let rules_touch_an_index_key = rules.iter().any(|rule| match rule.path.first() {
-        Some(crate::expressions::PathElement::Attribute(name)) => index_key_names.contains(name),
+        Some(crate::expressions::PathElement::Attribute(name)) => schemas.iter().any(|s| {
+            rule.applies_to(&s.table_name) && index_key_attrs(&s.create_request).contains(name)
+        }),
         _ => false,
     });
     if rules_touch_an_index_key && data_model.is_none() {
@@ -541,6 +539,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         }
 
         if let Some(deriver) = key_deriver.as_mut() {
+            // Filed before the join check below, so that a run the check
+            // fails still prints everything else the table had to say.
+            for notice in deriver.take_notices() {
+                summary.notice(notice.for_table(table_name));
+            }
+
             // Both entities of a shared key attribute turned up, so the join
             // between them is broken in the output rather than merely at risk.
             // The CLI writes to a temporary file that an error discards, so
@@ -566,10 +570,6 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         String::new()
                     }
                 )));
-            }
-
-            for notice in deriver.take_notices() {
-                summary.notice(notice.for_table(table_name));
             }
         }
 
@@ -1022,6 +1022,30 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(all(test, feature = "import"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_text_views_are_the_notices_in_order_and_the_exposures_among_them() {
+        let mut summary = ImportSummary {
+            tables: Vec::new(),
+            total_items: 0,
+            total_bytes: 0,
+            total_skipped: 0,
+            notices: Vec::new(),
+            warnings: vec!["stale".to_string()],
+            exposures: vec!["stale".to_string()],
+            output_path: None,
+        };
+        summary.notice(Notice::caution("first, a caution"));
+        summary.notice(Notice::exposure("then an exposure"));
+        summary.notice(Notice::caution("last, a caution"));
+        summary.finish();
+
+        assert_eq!(
+            summary.warnings,
+            vec!["first, a caution", "then an exposure", "last, a caution"]
+        );
+        assert_eq!(summary.exposures, vec!["then an exposure"]);
+    }
 
     #[test]
     fn a_file_that_appeared_after_the_check_is_not_replaced_without_force() {

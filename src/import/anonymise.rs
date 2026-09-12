@@ -41,7 +41,7 @@ pub struct RuleWork {
 /// What `apply_rules` accumulates across every item of a table, so a run can
 /// report it once at the end rather than once per item.
 pub struct RuleTally<'a> {
-    /// Values a `mask` rule left as they arrived, by attribute.
+    /// Values a `mask` rule left as they arrived, by the rule's path.
     pub mask_passthroughs: &'a mut std::collections::HashMap<String, usize>,
     /// What each rule did, one entry per rule.
     pub rule_work: &'a mut [RuleWork],
@@ -51,9 +51,9 @@ pub struct RuleTally<'a> {
 ///
 /// Returns the warnings raised (e.g. key attribute collision risks) and the
 /// top-level attributes actually rewritten. Values a `mask` rule left as they
-/// arrived are counted into `mask_passthroughs`, keyed by attribute, since the
-/// output alone cannot tell a short value that was skipped from one that was
-/// never personal. The caller needs the second to
+/// arrived are counted into `mask_passthroughs`, keyed by the rule's path,
+/// since the output alone cannot tell a short value that was skipped from one
+/// that was never personal. The caller needs the second to
 /// know which keys a rule has taken over: predicting it from the rules is
 /// wrong, because each rule's condition sees the item as the rules before it
 /// left it, not as it arrived.
@@ -72,11 +72,16 @@ pub fn apply_rules(
     } = tally;
     let mut warnings: Vec<Notice> = Vec::new();
     let mut rewritten = std::collections::HashSet::new();
-    // Attributes a mask left whole and nothing since has rewritten. Judged
-    // once the rules have all run: a later rule that replaces the value has
-    // removed it, and reporting the mask's pass-through then would say real
-    // data survived a run that removed it.
-    let mut kept_whole_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Paths a mask left whole and nothing since has rewritten. Judged once
+    // the rules have all run: a later rule that replaces the value, or the
+    // map holding it, has removed it, and reporting the mask's pass-through
+    // then would say real data survived a run that removed it. Kept by full
+    // path rather than top-level attribute, so a rule on `profile.phone`
+    // does not stand in for one on `profile.email`.
+    let mut kept_whole_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Paths an earlier rule replaced, so a mask that then keeps the whole of
+    // what it finds there is keeping a fake, not an original.
+    let mut replaced_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (rule_idx, rule) in rules.iter().enumerate() {
         // What each rule actually did, so a run can say when one did nothing.
@@ -184,10 +189,14 @@ pub fn apply_rules(
                     .get_mut(rule_idx)
                     .expect("one entry per rule")
                     .rewrote += 1;
+                let path = path_label(&rule.path);
+                kept_whole_paths.retain(|kept| !covers(&path, kept));
                 if kept_whole {
-                    kept_whole_fields.insert(field_name.clone());
+                    if !replaced_paths.iter().any(|done| covers(done, &path)) {
+                        kept_whole_paths.insert(path);
+                    }
                 } else {
-                    kept_whole_fields.remove(&field_name);
+                    replaced_paths.insert(path);
                 }
                 rewritten.insert(field_name);
             }
@@ -200,11 +209,42 @@ pub fn apply_rules(
         }
     }
 
-    for field in kept_whole_fields {
-        *mask_passthroughs.entry(field).or_insert(0) += 1;
+    for path in kept_whole_paths {
+        *mask_passthroughs.entry(path).or_insert(0) += 1;
     }
 
     (warnings, rewritten)
+}
+
+/// A rule path as the rules file spells it: `profile.email`, `tags[0]`.
+fn path_label(path: &[crate::expressions::PathElement]) -> String {
+    use crate::expressions::PathElement;
+    let mut label = String::new();
+    for element in path {
+        match element {
+            PathElement::Attribute(name) => {
+                if !label.is_empty() {
+                    label.push('.');
+                }
+                label.push_str(name);
+            }
+            PathElement::Index(i) => {
+                label.push('[');
+                label.push_str(&i.to_string());
+                label.push(']');
+            }
+        }
+    }
+    label
+}
+
+/// Whether a rule on `rewritten` replaced what sits at `path`: the same
+/// path, or one beneath it. A sibling under the same map is neither.
+fn covers(rewritten: &str, path: &str) -> bool {
+    path == rewritten
+        || path
+            .strip_prefix(rewritten)
+            .is_some_and(|rest| rest.starts_with(['.', '[']))
 }
 
 /// Extract the top-level field name from a path.
@@ -783,6 +823,104 @@ mod tests {
             None,
             "the map was replaced, so nothing was kept as it arrived"
         );
+    }
+
+    fn profile_item() -> Item {
+        let mut inner = std::collections::HashMap::new();
+        inner.insert("email".to_string(), AttributeValue::S("ab@x".to_string()));
+        inner.insert(
+            "phone".to_string(),
+            AttributeValue::S("07700900000".to_string()),
+        );
+        let mut it = Item::new();
+        it.insert("profile".to_string(), AttributeValue::M(inner));
+        it
+    }
+
+    fn short_mask() -> ValidatedAction {
+        ValidatedAction::Mask {
+            keep_last: 4,
+            mask_char: '*',
+        }
+    }
+
+    #[test]
+    fn a_rule_on_a_sibling_path_does_not_clear_a_nested_mask_passthrough() {
+        // The mask kept profile.email whole. Redacting profile.phone touches
+        // the same top-level attribute and nothing else; the address is still
+        // in the output, and keyed by attribute the tally forgot it.
+        let rules = [
+            test_rule("profile.email", short_mask()),
+            test_rule("profile.phone", ValidatedAction::Redact),
+        ];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = profile_item();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(
+            passthroughs.get("profile.email"),
+            Some(&1),
+            "the address was kept and nothing since replaced it: {passthroughs:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_on_the_map_above_a_nested_mask_clears_its_passthrough() {
+        // Redacting the whole map removes the address the mask kept.
+        let rules = [
+            test_rule("profile.email", short_mask()),
+            test_rule("profile", ValidatedAction::Redact),
+        ];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = profile_item();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert!(passthroughs.is_empty(), "{passthroughs:?}");
+    }
+
+    #[test]
+    fn a_mask_that_keeps_the_whole_of_an_earlier_rules_output_is_not_a_passthrough() {
+        // The redact ran first, so what the mask found and kept was
+        // "[REDACTED]", not anything that arrived. Reporting that as real data
+        // in the output would fail a run that removed it.
+        let rules = [
+            test_rule("email", ValidatedAction::Redact),
+            test_rule(
+                "email",
+                ValidatedAction::Mask {
+                    keep_last: 20,
+                    mask_char: '*',
+                },
+            ),
+        ];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = item_with_email();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(
+            it.get("email"),
+            Some(&AttributeValue::S("[REDACTED]".to_string())),
+            "the mask kept the redaction whole"
+        );
+        assert!(passthroughs.is_empty(), "{passthroughs:?}");
+    }
+
+    #[test]
+    fn a_path_covers_itself_and_what_sits_beneath_it_but_not_a_sibling() {
+        assert!(covers("profile", "profile"));
+        assert!(covers("profile", "profile.email"));
+        assert!(covers("tags", "tags[0]"));
+        assert!(!covers("profile.phone", "profile.email"));
+        assert!(!covers("profile", "profiles"));
+        assert!(!covers("profile.email", "profile"));
+        assert_eq!(path_label(&parse_path_for_test("a.b[2].c")), "a.b[2].c");
+    }
+
+    fn parse_path_for_test(path: &str) -> Vec<crate::expressions::PathElement> {
+        crate::import::config::parse_path(path).expect("a valid path")
     }
 
     #[test]

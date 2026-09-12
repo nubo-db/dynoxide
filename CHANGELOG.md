@@ -33,8 +33,8 @@ Added.
 - **`dynoxide import` exits 3 when an original value reached the output**: a
   rule that anonymised nothing, a key its template could not rebuild, a key
   the model never templated that still holds a replaced value, items matching
-  no entity, an index the model describes but the table lacks, or values a
-  `mask` kept whole. Those are listed again at the end of the run, and
+  no entity, keys nothing templates on a table whose model names an index it
+  lacks, or values a `mask` kept whole. Those are listed again at the end of the run, and
   `--serve` and `--mcp` refuse to start on them. Pass `--accept-exposure` to
   exit 0 instead. `ImportSummary` gains a `notices` field carrying every message with its
   concern, and an `exposures` field holding the messages of the ones that count.

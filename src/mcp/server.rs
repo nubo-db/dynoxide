@@ -2277,7 +2277,7 @@ impl ServerHandler for McpServer {
         };
 
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("dynoxide", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("dynoxide", crate::PRODUCT_VERSION))
             .with_instructions(instructions)
     }
 }

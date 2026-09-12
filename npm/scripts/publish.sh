@@ -40,6 +40,26 @@ if [[ -z "$VERSION" || -z "$RELEASE_URL" ]]; then
   usage
 fi
 
+# The two arguments arrive independently, so nothing stopped a caller pairing a
+# version with an unrelated release's URL and publishing packages whose
+# metadata and binaries disagree. The URL ends in the tag, so they can be
+# checked against each other.
+# npm refuses a bare publish of a prerelease version and does not default a
+# dist-tag, so a prerelease release failed here while the browser package,
+# which computes its own tag, published fine. Same rule as npm.yml: a version
+# containing a hyphen is a prerelease and goes to `next`.
+case "$VERSION" in
+  *-*) NPM_TAG="next" ;;
+  *)   NPM_TAG="latest" ;;
+esac
+
+URL_TAG="${RELEASE_URL##*/}"
+if [[ "$URL_TAG" != "v$VERSION" && "$URL_TAG" != "$VERSION" ]]; then
+  echo "Release URL names $URL_TAG but --version is $VERSION." >&2
+  echo "Refusing to publish packages whose metadata and binaries would disagree." >&2
+  exit 1
+fi
+
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -144,9 +164,11 @@ for i in $(seq 0 $((PLATFORM_COUNT - 1))); do
 
   # Publish (only 409/EPUBLISHCONFLICT is safe to skip)
   echo "  Publishing $NPM_PKG@$VERSION..."
-  PUBLISH_OUTPUT=$(cd "$PKG_DIR" && npm publish --access public --provenance $DRY_RUN 2>&1) || {
+  PUBLISH_OUTPUT=$(cd "$PKG_DIR" && npm publish --access public --provenance --tag "$NPM_TAG" $DRY_RUN 2>&1) || {
     if echo "$PUBLISH_OUTPUT" | grep -q 'EPUBLISHCONFLICT\|previously published\|cannot publish over'; then
-      echo "  Already published, skipping."
+      # An npm version is immutable. Republishing the same number cannot fix a
+      # bad one, so this skip means "left as it is", not "verified correct".
+      echo "  Already published, skipping. Contents not verified; an npm version is immutable."
     else
       echo "  ERROR: publish failed for $NPM_PKG@$VERSION"
       echo "  $PUBLISH_OUTPUT"
@@ -171,7 +193,7 @@ jq --arg v "$VERSION" '
 mv "$WRAPPER_DIR/package.json.tmp" "$WRAPPER_DIR/package.json"
 
 echo "  Publishing dynoxide@$VERSION..."
-PUBLISH_OUTPUT=$(cd "$WRAPPER_DIR" && npm publish --access public --provenance $DRY_RUN 2>&1) || {
+PUBLISH_OUTPUT=$(cd "$WRAPPER_DIR" && npm publish --access public --provenance --tag "$NPM_TAG" $DRY_RUN 2>&1) || {
   if echo "$PUBLISH_OUTPUT" | grep -q 'EPUBLISHCONFLICT\|previously published\|cannot publish over'; then
     echo "  Already published, skipping."
   else

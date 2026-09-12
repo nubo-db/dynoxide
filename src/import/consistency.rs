@@ -6,8 +6,11 @@
 //! Example: if `userId = "USER#123"` is anonymised to `"USER#abc"` in the
 //! Users table, it should also become `"USER#abc"` in the Orders table.
 //!
-//! Hash actions are excluded from the map because SHA-256 is deterministic -
-//! the same input always produces the same output, so consistency is inherent.
+//! Hash actions are excluded from the map because HMAC-SHA256 over a canonical
+//! encoding is deterministic - the same input always produces the same output,
+//! so consistency is inherent. A seeded fake is excluded on the same terms, but
+//! only for a scalar: it draws from entropy for a map, list or set, so those
+//! still come through here.
 
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -23,7 +26,7 @@ const DEFAULT_MAX_ENTRIES_PER_FIELD: usize = 1_000_000;
 /// inherently consistent and bypass this map entirely.
 #[derive(Debug, Default)]
 pub struct ConsistencyMap {
-    map: HashMap<String, HashMap<String, AttributeValue>>,
+    map: HashMap<String, HashMap<Vec<u8>, AttributeValue>>,
     max_entries_per_field: usize,
     /// Fields that have hit their cap (warned once per field).
     capped_fields: std::collections::HashSet<String>,
@@ -41,9 +44,9 @@ impl ConsistencyMap {
     /// Look up a previously anonymised value.
     pub fn get(&self, field_name: &str, original: &AttributeValue) -> Option<AttributeValue> {
         let field_map = self.map.get(field_name)?;
-        let key = value_to_key(original);
-        // Cow<str> can look up in HashMap<String> via Borrow trait
-        field_map.get(key.as_ref()).cloned()
+        let key = super::anonymise::canonical_bytes(original);
+        // Vec<u8> looks up from a &[u8] through Borrow.
+        field_map.get(key.as_slice()).cloned()
     }
 
     /// Record an anonymisation mapping. Returns a warning if the field has
@@ -68,8 +71,7 @@ impl ConsistencyMap {
             return None;
         }
 
-        let key = value_to_key(&original);
-        field_map.insert(key.into_owned(), anonymised);
+        field_map.insert(super::anonymise::canonical_bytes(&original), anonymised);
         None
     }
 
@@ -81,24 +83,6 @@ impl ConsistencyMap {
     /// Total number of tracked mappings across all fields.
     pub fn total_mappings(&self) -> usize {
         self.map.values().map(|m| m.len()).sum()
-    }
-}
-
-/// Convert an AttributeValue to a deterministic string key for the HashMap.
-///
-/// Returns a `&str` for the common S/N cases (avoiding allocation), and
-/// falls back to an owned String for complex types.
-fn value_to_key(value: &AttributeValue) -> std::borrow::Cow<'_, str> {
-    // The common case: S and N values are the vast majority of consistency-tracked
-    // fields. We return a borrowed slice prefixed with a type tag to avoid allocation.
-    // For complex types, we fall back to JSON serialization.
-    match value {
-        AttributeValue::S(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        AttributeValue::N(n) => std::borrow::Cow::Borrowed(n.as_str()),
-        _ => {
-            let json = serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"));
-            std::borrow::Cow::Owned(json)
-        }
     }
 }
 
@@ -190,15 +174,54 @@ mod tests {
     }
 
     #[test]
-    fn test_value_to_key_no_allocation_for_strings() {
-        let s = AttributeValue::S("hello".to_string());
-        let key = value_to_key(&s);
-        assert!(matches!(key, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(key.as_ref(), "hello");
+    fn test_a_string_and_a_number_are_separate_entries() {
+        // The map used to key on the bare text, so S("42") and N("42") shared
+        // one entry and an anonymised number came back as the string that
+        // happened to be seen first. Keying on the canonical encoding carries
+        // the type, the way `hash` does.
+        let mut map = ConsistencyMap::new();
+        map.insert(
+            "amount".to_string(),
+            AttributeValue::S("42".to_string()),
+            AttributeValue::S("as-a-string".to_string()),
+        );
 
-        let n = AttributeValue::N("42".to_string());
-        let key = value_to_key(&n);
-        assert!(matches!(key, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(key.as_ref(), "42");
+        assert_eq!(
+            map.get("amount", &AttributeValue::S("42".to_string())),
+            Some(AttributeValue::S("as-a-string".to_string()))
+        );
+        assert_eq!(
+            map.get("amount", &AttributeValue::N("42".to_string())),
+            None,
+            "a number must not read the entry a string wrote"
+        );
+    }
+
+    #[test]
+    fn test_a_map_value_finds_its_own_entry_again() {
+        // AttributeValue::M holds a HashMap, so two instances of one value
+        // iterate in different orders. Keying on a serialisation of that order
+        // meant a lookup never matched what insert wrote, and every item drew
+        // a fresh value.
+        let entries = || {
+            let mut m = std::collections::HashMap::new();
+            for k in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
+                m.insert(k.to_string(), AttributeValue::S(format!("{k}-value")));
+            }
+            AttributeValue::M(m)
+        };
+
+        let mut map = ConsistencyMap::new();
+        map.insert(
+            "profile".to_string(),
+            entries(),
+            AttributeValue::S("anonymised".to_string()),
+        );
+
+        assert_eq!(
+            map.get("profile", &entries()),
+            Some(AttributeValue::S("anonymised".to_string())),
+            "an equal map must find the entry it wrote"
+        );
     }
 }

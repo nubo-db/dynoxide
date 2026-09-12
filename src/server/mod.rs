@@ -99,11 +99,11 @@ fn build_router(db: Database) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(SetResponseHeaderLayer::overriding(
             SERVER,
-            HeaderValue::from_static(concat!("Dynoxide/", env!("CARGO_PKG_VERSION"))),
+            HeaderValue::from_static(concat!("Dynoxide/", env!("DYNOXIDE_PRODUCT_VERSION"))),
         ))
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static("x-dynoxide-version"),
-            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+            HeaderValue::from_static(crate::PRODUCT_VERSION),
         ))
         .with_state(db)
 }

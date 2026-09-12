@@ -9,14 +9,27 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-/// Maximum total decompressed bytes before aborting (50 GB).
-/// Legitimate DynamoDB exports can be large, but this prevents decompression bombs.
-const MAX_DECOMPRESSED_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// Most bytes one export file may yield before the import fails (50 GB).
+///
+/// Per file, since files are read one at a time. A legitimate export can be
+/// large, but a gzip bomb is small on disk and enormous once inflated, and
+/// this is what stops it. Reaching the cap is an error, not the end of the
+/// file: stopping quietly at the limit would report a truncated import as a
+/// complete one, with fewer rows than the export and nothing to say so.
+const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
 /// Maximum length of a single line in bytes (4 MB).
-/// DynamoDB items are at most 400 KB, so a 4 MB line cap is generous
-/// even accounting for JSON overhead and base64-encoded binary attributes.
+///
+/// DynamoDB items are at most 400 KB, so this is generous even after JSON
+/// overhead and base64 for binary attributes. The cap is applied while the
+/// line is read, not after: a line is never held in memory past this size,
+/// which is the only way a cap on line length can also cap memory.
 const MAX_LINE_LENGTH: usize = 4 * 1024 * 1024;
+
+/// Most per-line warnings kept for one file. `skipped` still counts every
+/// line; past this the rest are summed into one line rather than held one
+/// string each, which a file of a million bad lines would otherwise cost.
+const MAX_LINE_WARNINGS: usize = 100;
 
 /// BufReader capacity (256 KB). The default 8 KB is too small for gzip
 /// decompression: larger buffers amortize decoder overhead significantly.
@@ -41,49 +54,67 @@ where
 
     let is_gzipped = path.extension().is_some_and(|ext| ext == "gz");
 
+    // The cap sits on the bytes this reader yields, inflated or not, so a
+    // plain file gets the same ceiling a gzipped one does.
     let reader: Box<dyn Read> = if is_gzipped {
-        // Cap total decompressed size to prevent gzip bombs
-        Box::new(GzDecoder::new(file).take(MAX_DECOMPRESSED_BYTES))
+        Box::new(Capped::new(GzDecoder::new(file), MAX_FILE_BYTES))
     } else {
-        Box::new(file)
+        Box::new(Capped::new(file, MAX_FILE_BYTES))
     };
 
-    let buf_reader = BufReader::with_capacity(BUF_READER_CAPACITY, reader);
+    let mut reader = BufReader::with_capacity(BUF_READER_CAPACITY, reader);
     let mut skipped = 0;
     let mut warnings = Vec::new();
-    let mut line_buf = String::with_capacity(4096);
+    let mut suppressed = 0usize;
+    let mut warn = |warnings: &mut Vec<String>, message: String| {
+        if warnings.len() < MAX_LINE_WARNINGS {
+            warnings.push(message);
+        } else {
+            suppressed += 1;
+        }
+    };
+    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut line_num = 0usize;
 
-    // Use read_line with a reusable buffer instead of lines() to avoid
-    // per-line allocation and to enforce a per-line length cap.
-    let mut reader = buf_reader;
     loop {
         line_buf.clear();
-        let bytes_read = reader.read_line(&mut line_buf).map_err(|e| {
+        let read = read_bounded_line(&mut reader, &mut line_buf, MAX_LINE_LENGTH).map_err(|e| {
             format!(
                 "{}:{}: failed to read line: {e}",
                 path.display(),
                 line_num + 1
             )
         })?;
-        if bytes_read == 0 {
-            break; // EOF
-        }
-        line_num += 1;
+        let line = match read {
+            LineRead::Eof => break,
+            LineRead::Line => {
+                line_num += 1;
+                std::str::from_utf8(&line_buf).map_err(|e| {
+                    format!(
+                        "{}:{}: line is not valid UTF-8: {e}",
+                        path.display(),
+                        line_num
+                    )
+                })?
+            }
+            LineRead::TooLong(len) => {
+                line_num += 1;
+                skipped += 1;
+                warn(
+                    &mut warnings,
+                    format!(
+                        "{}:{}: line exceeds maximum length of {} bytes ({} bytes)",
+                        path.display(),
+                        line_num,
+                        MAX_LINE_LENGTH,
+                        len
+                    ),
+                );
+                continue;
+            }
+        };
 
-        if line_buf.len() > MAX_LINE_LENGTH {
-            skipped += 1;
-            warnings.push(format!(
-                "{}:{}: line exceeds maximum length of {} bytes ({} bytes)",
-                path.display(),
-                line_num,
-                MAX_LINE_LENGTH,
-                line_buf.len()
-            ));
-            continue;
-        }
-
-        let trimmed = line_buf.trim();
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -92,12 +123,140 @@ where
             Ok(item) => handler(item),
             Err(e) => {
                 skipped += 1;
-                warnings.push(format!("{}:{}: {e}", path.display(), line_num));
+                warn(
+                    &mut warnings,
+                    format!("{}:{}: {e}", path.display(), line_num),
+                );
             }
         }
     }
 
+    if suppressed > 0 {
+        warnings.push(format!(
+            "{}: {suppressed} further lines were skipped and not listed; {skipped} skipped \
+             in all",
+            path.display()
+        ));
+    }
+
     Ok(StreamStats { skipped, warnings })
+}
+
+/// What one call to [`read_bounded_line`] found.
+enum LineRead {
+    /// Nothing left to read.
+    Eof,
+    /// A line, in the buffer, without its newline.
+    Line,
+    /// A line longer than the limit. It was consumed and discarded rather than
+    /// kept, and this is how long it was.
+    TooLong(usize),
+}
+
+/// Read one line into `buf`, keeping at most `limit` bytes of it in memory.
+///
+/// `read_line` reads the whole line first and lets the caller measure it
+/// afterwards, so a line with no newline for a gigabyte costs a gigabyte
+/// before any cap can act. This one watches the size as it copies, and once
+/// the line is over the limit it stops keeping bytes and only counts them
+/// until the newline, so memory is bounded by `limit` however long the line
+/// runs.
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<LineRead> {
+    let mut discarded = 0usize;
+    let mut too_long = false;
+    loop {
+        // Retried rather than failed, as `read_line` does: a signal landing
+        // mid-read on a network mount is not a reason to abandon the file.
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            return Ok(if too_long {
+                LineRead::TooLong(buf.len() + discarded)
+            } else if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        let (chunk, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (&available[..i], true),
+            None => (available, false),
+        };
+        let used = chunk.len() + usize::from(done);
+        if !too_long {
+            if buf.len() + chunk.len() > limit {
+                too_long = true;
+                discarded += buf.len() + chunk.len();
+                buf.clear();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        } else {
+            discarded += chunk.len();
+        }
+        reader.consume(used);
+        if done {
+            return Ok(if too_long {
+                LineRead::TooLong(discarded)
+            } else {
+                LineRead::Line
+            });
+        }
+    }
+}
+
+/// A reader that fails once it has yielded more than `limit` bytes.
+///
+/// `Read::take` would stop at the limit and look like the end of the file,
+/// so a bomb would read as a short export that imported cleanly. Failing is
+/// the honest outcome: the file is not one this tool will take, and the run
+/// says so rather than shipping part of it.
+struct Capped<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+}
+
+impl<R: Read> Capped<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+        }
+    }
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            // Anything past the limit means the file is bigger than allowed.
+            // Probe one byte so a file that is exactly the limit still ends
+            // cleanly rather than failing on its final read.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::other(format!(
+                    "file yields more than the {} byte limit",
+                    self.limit
+                ))),
+            };
+        }
+        let want = usize::try_from(self.remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
 }
 
 /// Parse a single JSON line from DynamoDB Export format.
@@ -311,7 +470,13 @@ pub fn discover_export_files(
                 .and_then(|n| n.to_str())
                 .unwrap_or("default")
                 .to_string();
-            tables.push((table_name, files));
+            // The filter applies here as it does above. Skipping it meant a
+            // table asked to be left out of the output arrived in it anyway,
+            // under the directory's name, with nothing said.
+            let wanted = table_filter.is_none_or(|filter| filter.iter().any(|f| f == &table_name));
+            if wanted {
+                tables.push((table_name, files));
+            }
         }
     }
 
@@ -410,6 +575,116 @@ mod tests {
         let item = parse_export_line(line).unwrap();
         assert_eq!(item.get("active").unwrap(), &AttributeValue::BOOL(true));
         assert_eq!(item.get("deleted").unwrap(), &AttributeValue::NULL(true));
+    }
+
+    fn lines_of(bytes: &[u8], limit: usize) -> Vec<Result<String, usize>> {
+        let mut reader = std::io::BufReader::with_capacity(7, bytes);
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match read_bounded_line(&mut reader, &mut buf, limit).unwrap() {
+                LineRead::Eof => break,
+                LineRead::Line => out.push(Ok(String::from_utf8(buf.clone()).unwrap())),
+                LineRead::TooLong(n) => out.push(Err(n)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_discarded_not_held() {
+        // The buffer never grows past the limit however long the line is,
+        // and the length reported is the whole line, not the part kept.
+        let long = "x".repeat(100);
+        let input = format!("short\n{long}\nafter\n");
+        let got = lines_of(input.as_bytes(), 10);
+        assert_eq!(got, vec![Ok("short".into()), Err(100), Ok("after".into())]);
+    }
+
+    #[test]
+    fn a_line_at_the_limit_is_kept_whole() {
+        let exact = "y".repeat(10);
+        let input = format!("{exact}\n");
+        assert_eq!(lines_of(input.as_bytes(), 10), vec![Ok(exact)]);
+    }
+
+    #[test]
+    fn a_final_line_without_a_newline_is_still_a_line() {
+        assert_eq!(
+            lines_of(b"one\ntwo", 10),
+            vec![Ok("one".into()), Ok("two".into())]
+        );
+        assert_eq!(lines_of(b"", 10), Vec::<Result<String, usize>>::new());
+    }
+
+    #[test]
+    fn an_overlong_last_line_without_a_newline_is_reported_too() {
+        let long = "z".repeat(50);
+        assert_eq!(lines_of(long.as_bytes(), 10), vec![Err(50)]);
+    }
+
+    #[test]
+    fn reading_past_the_file_cap_is_an_error_not_an_end() {
+        // Read::take would return EOF at the limit and the import would report
+        // a short file as a complete one. This has to fail instead.
+        let mut capped = Capped::new(&b"0123456789"[..], 10);
+        let mut all = Vec::new();
+        std::io::Read::read_to_end(&mut capped, &mut all).unwrap();
+        assert_eq!(
+            all, b"0123456789",
+            "a file exactly at the cap reads in full"
+        );
+
+        let mut capped = Capped::new(&b"0123456789X"[..], 10);
+        let mut all = Vec::new();
+        let err = std::io::Read::read_to_end(&mut capped, &mut all).unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn a_file_of_bad_lines_is_counted_in_full_but_listed_in_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        let mut body = String::new();
+        for _ in 0..10_000 {
+            body.push_str("not json\n");
+        }
+        std::fs::write(&path, body).unwrap();
+
+        let mut seen = 0;
+        let stats = parse_export_file_streaming(&path, |_| seen += 1).unwrap();
+        assert_eq!(seen, 0);
+        assert_eq!(stats.skipped, 10_000, "every bad line is counted");
+        assert!(
+            stats.warnings.len() <= MAX_LINE_WARNINGS + 1,
+            "but not every one is kept: {}",
+            stats.warnings.len()
+        );
+        let last = stats.warnings.last().unwrap();
+        assert!(last.contains("9900 further lines"), "{last}");
+        assert!(last.contains("10000 skipped in all"), "{last}");
+    }
+
+    #[test]
+    fn a_flat_directory_honours_the_table_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        // The directory's own name is the table name in the flat layout.
+        let flat = dir.path().join("Secrets");
+        std::fs::create_dir(&flat).unwrap();
+        std::fs::write(flat.join("a.json"), "{}\n").unwrap();
+
+        let none = discover_export_files(&flat, Some(&["Other".to_string()])).unwrap();
+        assert!(
+            none.is_empty(),
+            "a table not asked for must not be imported: {none:?}"
+        );
+
+        let some = discover_export_files(&flat, Some(&["Secrets".to_string()])).unwrap();
+        assert_eq!(some.len(), 1, "the table asked for is found: {some:?}");
+
+        let all = discover_export_files(&flat, None).unwrap();
+        assert_eq!(all.len(), 1, "no filter means everything, as before");
     }
 
     #[test]

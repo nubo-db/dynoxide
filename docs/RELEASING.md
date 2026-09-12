@@ -14,11 +14,14 @@ schedule. Versioning follows [SemVer](https://semver.org).
 1. Benchmark numbers shown in the README are refreshed by an automated
    workflow that opens a "docs: update benchmark numbers" PR. The maintainer
    reviews the numbers and merges.
-2. The version bump in `Cargo.toml` and a new `CHANGELOG.md` entry are
-   committed to `main`.
+2. The product version bump in `VERSION`, a crate version bump in
+   `Cargo.toml` if the Rust API changed, and a new `CHANGELOG.md` entry are
+   committed to `main`. The two versions move independently: see
+   `docs/versioning.md`.
 3. A `v*` tag is pushed on that commit.
 4. The tag push triggers the release pipeline: validate the tag against
-   `Cargo.toml` and `CHANGELOG.md`, build binaries for five targets in
+   `VERSION` and `CHANGELOG.md`, check the crate version is coherent, build
+   binaries for five targets in
    parallel, create a GitHub Release with artefacts and checksums, pause for
    one-click maintainer approval, then publish to crates.io, update the
    Homebrew tap, publish the npm packages, and push the Docker image.
@@ -39,7 +42,7 @@ GitHub Release in place; delete or mark it a draft if that matters.
 - **npm packages** are published with OIDC-backed provenance attestations.
   Provenance on npmjs.com confirms the package was built from this
   repository at the expected tag via GitHub Actions.
-- **crates.io** is published by the same pipeline under the same tag, so
+- **crates.io** is published by the same pipeline under the same tag, and is skipped when the crate version is already published, so
   `docs.rs`, the GitHub Release binaries, and the npm packages all
   correspond to a single commit.
 - **Docker images** carry SLSA provenance and SBOM attestations on the

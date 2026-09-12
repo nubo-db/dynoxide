@@ -21,6 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The dry runs below prove the registries would accept a publish. They
+      # say nothing about whether the version sources agree with each other,
+      # which is the failure this preflight exists to catch early.
+      - name: Check version sources agree
+        id: version-check
+        continue-on-error: true
+        run: scripts/check-versions.sh
+
       # --- crates.io -----------------------------------------------------
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -114,6 +122,7 @@ jobs:
       - name: Preflight summary
         if: always()
         env:
+          VERSION_OUTCOME: ${{ steps.version-check.outcome }}
           CARGO_OUTCOME: ${{ steps.cargo-check.outcome }}
           NPM_OUTCOME: ${{ steps.npm-check.outcome }}
           HOMEBREW_OUTCOME: ${{ steps.homebrew-check.outcome }}
@@ -126,6 +135,7 @@ jobs:
             echo ""
             echo "| Check | Result |"
             echo "|-------|--------|"
+            echo "| version sources agree | $VERSION_OUTCOME |"
             echo "| cargo publish --dry-run | $CARGO_OUTCOME |"
             echo "| npm publish --dry-run --provenance (meta) | $NPM_OUTCOME |"
             echo "| Homebrew tap write-access probe | $HOMEBREW_OUTCOME |"
@@ -137,7 +147,8 @@ jobs:
             echo "Triggered by: ${{ github.actor }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$CARGO_OUTCOME" != "success" ] || \
+          if [ "$VERSION_OUTCOME" != "success" ] || \
+             [ "$CARGO_OUTCOME" != "success" ] || \
              [ "$NPM_OUTCOME" != "success" ] || \
              [ "$HOMEBREW_OUTCOME" != "success" ] || \
              [ "$GHCR_OUTCOME" != "success" ] || \

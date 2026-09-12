@@ -1,51 +1,73 @@
 # Versioning
 
-Every Dynoxide artefact carries the same version number: the crate, the npm CLI
-wrapper and its platform binaries, the browser engine, the container images and
-the MCP registry entry. One tag produces one release across all of them.
+Dynoxide has two version streams.
 
-This page says what that number promises. It is not a claim that conformance is
+The **product version** covers everything you install: the `dynoxide` CLI and
+its platform binaries, the npm packages, the browser engine, the container
+images, the MCPB bundle, the MCP registry entry, the GitHub Action and the
+Homebrew formula. It lives in the `VERSION` file at the repository root, and
+the release tag carries it. `dynoxide --version`, the `x-dynoxide-version` and
+`Server` headers and the MCP server info all report it.
+
+The **crate version** covers `dynoxide-rs` on crates.io, and nothing else. It
+lives in `Cargo.toml`.
+
+They were one number until 1.1.0. The split happened because a change to a
+public Rust type forced a major on every artefact whose users never touch the
+Rust API, and stranding everyone on `^1.x` and `dynoxide:1` to report a change
+they cannot observe is a poor trade. The current mapping is product **1.2.0**,
+crate **2.0.0**.
+
+This page says what each number promises. It is not a claim that conformance is
 finished.
 
-## One number, four contracts
+## Four contracts, two streams
 
-| Contract | Surface |
-|---|---|
-| Rust API | Public types, traits, signatures, feature flags, MSRV |
-| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` header, container entrypoint and port, the `GET /` health response and the startup line |
-| Browser JS API | The Worker client API and message protocol |
-| Engine behaviour | How the engine answers, across every surface above |
+| Contract | Surface | Stream |
+|---|---|---|
+| Rust API | Public types, traits, signatures, feature flags, MSRV | Crate |
+| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` and `Server` headers, container entrypoint and port, the `GET /` health response and the startup line | Product |
+| Browser JS API | The Worker client API and message protocol | Product |
+| Engine behaviour | How the engine answers, across every surface above | Both |
 
-A break in any one of them forces a major on the shared number.
+Engine behaviour sits in both because both ship the same engine. A behaviour
+change moves whichever streams publish it, which is usually both.
 
-MSRV is the exception inside that list. It is named there because the version
+The MCP surface is deliberately absent. The data model is context for an agent,
+not something the engine enforces, so it carries no version promise. Its
+`serverInfo.version` reports the product version because that is what the user
+installed.
+
+MSRV is the exception inside the Rust row. It is named there because the crate
 number describes it, not because every move in it breaks a consumer: raising it
 ships as a minor. Where the two tables could be read against each other, the one
 below is the authority.
 
-That includes a case worth stating plainly because you will meet it: **a change
-to the Rust API bumps the CLI's major**, even though a CLI user never touches
-the Rust API. They share a number, so they share its increments. If that cost
-becomes routine, the answer is to move the crate onto its own version stream,
-and this is the reason it would happen.
-
 ## What forces what
 
-| Change | Version |
-|---|---|
-| Rust public type or signature change | major |
-| CLI flag removed or renamed | major |
-| HTTP response shape or error string change | major |
-| Worker message protocol or client API change | major |
-| Container entrypoint or exposed port change | major |
-| `GET /` health status or body change | major |
-| Startup line text, or the stream it goes to | major |
-| Engine behaviour change | major, unless it is a capture-backed conformance fix |
-| Conformance fix, capture-backed | minor |
-| New DynamoDB operation | minor |
-| New feature flag | minor |
-| MSRV raise | minor |
-| Dependency bump with no surface change | patch |
+"Breaking" is doing work in the first row. Adding a public type or function is
+additive and ships as a minor; changing or removing one is not.
+
+| Change | Stream | Version |
+|---|---|---|
+| Rust public type or signature change, breaking | Crate | major |
+| Rust public type or function added | Crate | minor |
+| CLI flag removed or renamed | Product | major |
+| HTTP response shape or error string change | Product | major |
+| Worker message protocol or client API change | Product | major |
+| Container entrypoint or exposed port change | Product | major |
+| `GET /` health status or body change | Product | major |
+| Startup line text, or the stream it goes to | Product | major |
+| Engine behaviour change | Both | major, unless it is a capture-backed conformance fix |
+| Conformance fix, capture-backed | Both | minor |
+| New DynamoDB operation | Both | minor |
+| New feature flag | Crate | minor |
+| MSRV raise | Crate | minor |
+| Dependency bump with no surface change | Both | patch |
+
+A release may move one stream and not the other. A Rust-only break publishes a
+new crate against an unchanged product; a CLI-only change publishes a new
+product against an unchanged crate.
 
 ## What a container waits on
 
@@ -79,7 +101,7 @@ release. Were it open, each of those would have been a break, and an engine
 growing its own storage layer would reach a new major every few months.
 
 So adding a method to it is not a break, and the trait keeps pace with the
-engine inside 1.x. You can name it and use it as a bound; you cannot implement
+engine inside a crate major. You can name it and use it as a bound; you cannot implement
 it. If third-party backends ever earn their place, unsealing is a minor.
 
 ## Conformance fixes are the exception
@@ -115,17 +137,32 @@ the alternative is a new major every few weeks.
 
 If you would rather behaviour held still:
 
-- **npm:** `~1.0.0` accepts patches only.
-- **Containers:** `dynoxide:1.0` is pinned to the minor. `dynoxide:1` floats
+- **npm:** `~1.2.0` accepts patches only.
+- **Containers:** `dynoxide:1.2` is pinned to the minor. `dynoxide:1` floats
   across the whole major line and does receive conformance fixes.
-- **Cargo:** `=1.0.0`, or rely on your lockfile.
+- **Cargo:** `=2.0.0`, or rely on your lockfile. That pins the crate, which is
+  a different number from the product version the binary reports.
 
-`npm install dynoxide` writes a caret range for you. If you want the narrower range,
-ask for it explicitly.
+`npm install dynoxide` writes a caret range for you. If you want the narrower
+range, ask for it explicitly.
+
+## Reading the two numbers
+
+The number in `dynoxide --version` is the product version. So is the image tag,
+the npm version and the Action tag. If you are reporting a bug, that is the
+number to give.
+
+`cargo install dynoxide-rs --version X` selects the **crate** version, and the
+binary it produces still reports the product version. They are different
+numbers on purpose, and `cargo install dynoxide-rs --version 1.2.0` will not
+find the product release. The crates.io badge in the README shows the crate.
+
+A product release does not always mean a new crate, and a crate release does
+not always mean new binaries.
 
 ## The browser engine
 
-`@dynoxide/wasm-engine` is versioned with everything else and covered by the
+`@dynoxide/wasm-engine` is versioned with the other installable artefacts and covered by the
 same rules.
 
 It is a scored target in the conformance suite. Current results are published

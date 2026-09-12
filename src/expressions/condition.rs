@@ -184,7 +184,15 @@ pub fn evaluate(
                     Ok(set.contains(&elem))
                 }
                 (Some(AttributeValue::NS(set)), Some(AttributeValue::N(elem))) => {
-                    Ok(set.contains(&elem))
+                    // One DynamoDB number has many spellings, and a rules file
+                    // written by hand supplies whichever one the author typed.
+                    // Comparing the text meant a set holding `1.0` did not
+                    // contain `1`, so a rule that should have matched did not,
+                    // and the value it was there to remove stayed put.
+                    let wanted = crate::types::normalize_dynamo_number(&elem);
+                    Ok(set
+                        .iter()
+                        .any(|member| crate::types::normalize_dynamo_number(member) == wanted))
                 }
                 (Some(AttributeValue::BS(set)), Some(AttributeValue::B(elem))) => {
                     Ok(set.contains(&elem))
@@ -1019,6 +1027,53 @@ fn check_path_non_scalar(
     }
 }
 
+/// Extract the `:name` value references in a condition expression, sorted and
+/// deduplicated, so a caller can check them against the values it holds.
+pub fn extract_value_refs(expr: &ConditionExpr) -> Vec<String> {
+    let mut refs = Vec::new();
+    collect_value_refs(expr, &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn collect_value_refs(expr: &ConditionExpr, out: &mut Vec<String>) {
+    match expr {
+        ConditionExpr::Comparison { left, right, .. } => {
+            collect_operand_value_ref(left, out);
+            collect_operand_value_ref(right, out);
+        }
+        ConditionExpr::Between { operand, lo, hi } => {
+            collect_operand_value_ref(operand, out);
+            collect_operand_value_ref(lo, out);
+            collect_operand_value_ref(hi, out);
+        }
+        ConditionExpr::In { operand, values } => {
+            collect_operand_value_ref(operand, out);
+            for v in values {
+                collect_operand_value_ref(v, out);
+            }
+        }
+        ConditionExpr::AttributeExists(_) | ConditionExpr::AttributeNotExists(_) => {}
+        ConditionExpr::AttributeType(_, operand) => collect_operand_value_ref(operand, out),
+        ConditionExpr::BeginsWith(a, b) | ConditionExpr::Contains(a, b) => {
+            collect_operand_value_ref(a, out);
+            collect_operand_value_ref(b, out);
+        }
+        ConditionExpr::And(a, b) | ConditionExpr::Or(a, b) => {
+            collect_value_refs(a, out);
+            collect_value_refs(b, out);
+        }
+        ConditionExpr::Not(inner) => collect_value_refs(inner, out),
+    }
+}
+
+fn collect_operand_value_ref(operand: &Operand, out: &mut Vec<String>) {
+    if let Operand::ValueRef(name) = operand {
+        out.push(name.clone());
+    }
+}
+
 /// Extract the top-level attribute names referenced in a condition expression.
 ///
 /// Resolves `#name` references using `expression_attribute_names`.
@@ -1117,6 +1172,16 @@ fn resolve_top_level_path(
         }
         _ => None,
     }
+}
+
+/// Extract the `#alias` name references in a condition expression, sorted
+/// and deduplicated.
+pub fn extract_name_refs(expr: &ConditionExpr) -> Vec<String> {
+    let mut refs = Vec::new();
+    collect_undefined_name_refs(expr, &None, &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 /// Validate that all `#name` references in a condition expression are defined
@@ -1227,6 +1292,44 @@ fn can_use_f64(s: &str) -> bool {
 }
 
 #[cfg(test)]
+mod name_ref_tests {
+    use super::*;
+
+    #[test]
+    fn extract_name_refs_walks_every_expression_shape() {
+        // The twin of extract_value_refs, added for the same purpose and
+        // never tested. A shape it forgets to walk means an alias used only
+        // there reads as unused, and the rule is rejected for a reason that
+        // is not true.
+        let cases = [
+            ("attribute_exists(#a)", vec!["#a"]),
+            ("#a = :v", vec!["#a"]),
+            ("NOT attribute_exists(#a)", vec!["#a"]),
+            ("#a = :v AND #b = :w", vec!["#a", "#b"]),
+            ("#a = :v OR (#b = :w AND #c = :x)", vec!["#a", "#b", "#c"]),
+            ("begins_with(#a, :v)", vec!["#a"]),
+            ("contains(#a, :v)", vec!["#a"]),
+            ("attribute_type(#a, :v)", vec!["#a"]),
+            ("size(#a) > :v", vec!["#a"]),
+            ("#a BETWEEN :v AND :w", vec!["#a"]),
+            ("#a IN (:v, :w)", vec!["#a"]),
+        ];
+        for (expr, want) in cases {
+            let parsed = parse(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
+            let got = extract_name_refs(&parsed);
+            let want: Vec<String> = want.into_iter().map(str::to_string).collect();
+            assert_eq!(got, want, "{expr}");
+        }
+    }
+
+    #[test]
+    fn an_expression_with_no_aliases_yields_none() {
+        let parsed = parse("attribute_exists(email)").unwrap();
+        assert!(extract_name_refs(&parsed).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::expressions::evaluate_without_tracking;
@@ -1316,6 +1419,20 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_value_refs_walks_every_operand_slot() {
+        let expr = parse(
+            "begins_with(pk, :p) AND (age BETWEEN :lo AND :hi OR NOT tier IN (:a, :p)) \
+             AND attribute_type(x, :t) AND contains(tags, :tag) AND size(n) > :n",
+        )
+        .unwrap();
+        assert_eq!(
+            extract_value_refs(&expr),
+            vec![":a", ":hi", ":lo", ":n", ":p", ":t", ":tag"]
+        );
+        assert!(extract_value_refs(&parse("attribute_exists(pk)").unwrap()).is_empty());
+    }
+
+    #[test]
     fn test_begins_with() {
         let expr = parse("begins_with(sk, :prefix)").unwrap();
         let item = make_item(&[("sk", AttributeValue::S("user#123".into()))]);
@@ -1340,6 +1457,32 @@ mod tests {
         )]);
         let av = vals(&[(":tag", AttributeValue::S("rust".into()))]);
         assert!(evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
+    }
+
+    #[test]
+    fn contains_matches_a_number_set_by_value_not_spelling() {
+        // A rules file is written by hand, so it supplies whichever spelling
+        // the author typed. Comparing the text meant a set holding `1.0` did
+        // not contain `1`, the rule did not fire, and the value it was there
+        // to remove stayed in the output.
+        let expr = parse("contains(scores, :n)").unwrap();
+        let item = make_item(&[("scores", AttributeValue::NS(vec!["1.0".into(), "2".into()]))]);
+        for spelling in ["1", "1.0", "1.00", "0.1e1"] {
+            let av = vals(&[(":n", AttributeValue::N(spelling.into()))]);
+            assert!(
+                evaluate_without_tracking(&expr, &item, &None, &av).unwrap(),
+                "the set holds this number, spelled {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_still_says_no_to_a_number_the_set_does_not_hold() {
+        // The other direction, so the comparison above is not simply true.
+        let expr = parse("contains(scores, :n)").unwrap();
+        let item = make_item(&[("scores", AttributeValue::NS(vec!["1.0".into(), "2".into()]))]);
+        let av = vals(&[(":n", AttributeValue::N("3".into()))]);
+        assert!(!evaluate_without_tracking(&expr, &item, &None, &av).unwrap());
     }
 
     #[test]

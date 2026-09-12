@@ -28,6 +28,16 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   is now tagged with its DynamoDB type and length-prefixed on the same terms
   as a seeded `fake`, so the string `"123"` and the number `123` no longer
   land on one pseudonym.
+- **`dynoxide import` exits 3 when it leaves an original value in the output.**
+  It printed the warning and exited 0, so a run whose whole purpose is removing
+  personal data reported success having left some behind, and a pipeline could
+  not tell the two apart. The new code covers what the run observed: a rule
+  that anonymised nothing, a key its template could not rebuild, items matching
+  no entity, an index whose keys are not rebuilt, and values a `mask` kept
+  whole. Those are listed again under a count at the end of the run.
+  `--accept-exposure` returns such a run to 0. A warning that only cautions,
+  rather than naming a value that survived, does not change the exit code.
+  `ImportSummary` gained an `exposures` field carrying the same list.
 - **The join check now examines a key that only one entity builds.** It formed
   a comparison group only where two entities templated the same key attribute,
   so the commonest single-table shape, one entity building the customer

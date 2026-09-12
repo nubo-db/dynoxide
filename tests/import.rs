@@ -86,6 +86,7 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -143,6 +144,7 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -184,6 +186,7 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -237,6 +240,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -319,6 +323,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -384,6 +389,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -417,6 +423,7 @@ fields = ["email"]
             compress: true,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -456,6 +463,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         });
 
@@ -972,6 +980,7 @@ fields = ["email"]
                 compress: false,
                 force: false,
                 continue_on_error: false,
+                accept_exposure: true,
             },
         )
         .unwrap();
@@ -1097,6 +1106,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1147,6 +1157,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap_err();
@@ -1192,6 +1203,7 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1263,6 +1275,7 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1319,6 +1332,7 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1367,6 +1381,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1430,6 +1445,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1508,6 +1524,7 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(model_file),
         })
     }
@@ -1613,6 +1630,7 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1712,6 +1730,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(model_file),
         })
         .unwrap();
@@ -1800,6 +1819,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(model_file),
         })
         .unwrap();
@@ -1884,6 +1904,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1934,6 +1955,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1999,6 +2021,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(model_file),
         })
         .unwrap_err();
@@ -2054,6 +2077,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -2092,6 +2116,7 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap()
@@ -2220,6 +2245,7 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
+            accept_exposure: true,
             data_model: None,
         })
         .unwrap()
@@ -2268,6 +2294,108 @@ fields = ["email"]
                 .any(|w| w.contains("rule 1") && w.contains("matched no item")),
             "a rule that matched nothing must say so: {:?}",
             summary.warnings
+        );
+    }
+
+    #[test]
+    fn a_rule_that_anonymised_nothing_is_recorded_as_an_exposure() {
+        // The exit code reads this list, not the prose, so it has to carry
+        // the shape a misspelt path takes.
+        let summary = run_with_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(pk)"
+path = "emial"
+action = { type = "redact" }
+"#,
+        );
+        assert!(
+            !summary.exposures.is_empty(),
+            "a run that anonymised nothing left originals in the output: {:?}",
+            summary.warnings
+        );
+        for exposure in &summary.exposures {
+            assert!(
+                summary.warnings.contains(exposure),
+                "an exposure is a warning too, so the printed summary still shows it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_run_records_no_exposure() {
+        // The other direction. If an ordinary import reported one, every
+        // pipeline would fail and the flag would become the default.
+        let summary = run_with_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+"#,
+        );
+        assert!(
+            summary.exposures.is_empty(),
+            "nothing survived, so nothing to report: {:?}",
+            summary.exposures
+        );
+    }
+
+    #[test]
+    fn the_cli_exits_three_when_an_original_value_reached_the_output() {
+        // Nothing else in this file runs the binary, so the exit code has
+        // never been asserted. A run that says real data got through and then
+        // exits 0 is a failure that looks exactly like a success.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(
+            &rules_file,
+            "[[rules]]\nmatch = \"attribute_exists(pk)\"\npath = \"emial\"\naction = { type = \"redact\" }\n",
+        )
+        .unwrap();
+
+        let run = |extra: &[&str]| {
+            let out = tmp.path().join(format!("out{}.db", extra.len()));
+            std::process::Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+                .arg("import")
+                .arg("--source")
+                .arg(&source)
+                .arg("--schema")
+                .arg(&schema_file)
+                .arg("--rules")
+                .arg(&rules_file)
+                .arg("--output")
+                .arg(&out)
+                .args(extra)
+                .output()
+                .expect("the binary runs")
+        };
+
+        let refused = run(&[]);
+        assert_eq!(
+            refused.status.code(),
+            Some(3),
+            "stderr: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+
+        let accepted = run(&["--accept-exposure"]);
+        assert_eq!(
+            accepted.status.code(),
+            Some(0),
+            "the flag is the way past: {}",
+            String::from_utf8_lossy(&accepted.stderr)
         );
     }
 

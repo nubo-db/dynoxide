@@ -76,6 +76,10 @@ pub struct ImportCommand {
     pub compress: bool,
     /// Overwrite existing output file without prompting.
     pub force: bool,
+    /// Finish with success even when the run reports that an original value
+    /// reached the output. Off by default: an import whose whole purpose is to
+    /// remove personal data should not report success having left some behind.
+    pub accept_exposure: bool,
     /// Continue importing when a batch fails (default: fail-fast).
     /// When true, batch errors are recorded as warnings and import continues.
     /// When false (default), the first batch error aborts the import.
@@ -95,6 +99,11 @@ pub struct ImportSummary {
     pub total_skipped: usize,
     /// Warnings generated during import.
     pub warnings: Vec<String>,
+    /// The subset of `warnings` that say an original value reached the output:
+    /// a rule that anonymised nothing, a key left holding what it arrived
+    /// with, a value a mask kept whole. These are the reason the run's exit
+    /// code is not 0, so a pipeline notices without reading prose.
+    pub exposures: Vec<String>,
     /// Output file path (may differ from input if compressed). None for in-memory imports.
     pub output_path: Option<std::path::PathBuf>,
 }
@@ -258,6 +267,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         total_bytes: 0,
         total_skipped: 0,
         warnings: Vec::new(),
+        exposures: Vec::new(),
         output_path: cmd.output.clone(),
     };
 
@@ -305,6 +315,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         );
     }
 
+    // A caution, not an observation: without a model the importer cannot tell
+    // whether any key here is built from an attribute a rule rewrites, so this
+    // is raised on every rules-only run. An exposure has to be something the
+    // run saw happen, or the common case exits non-zero and the flag that
+    // turns that off becomes the thing everyone passes.
     if !rules.is_empty() && data_model.is_none() {
         summary.warnings.push(
             "rules rewrite attributes only: a key built from an attribute (CUSTOMER#${email}) \
@@ -370,8 +385,13 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     }
                     ImportError::Config(format!("data model: {e}"))
                 })?;
+                let model_exposures: Vec<String> = deriver.model_exposures().to_vec();
                 for w in warnings {
-                    summary.warnings.push(format!("table '{table_name}': {w}"));
+                    let message = format!("table '{table_name}': {w}");
+                    if model_exposures.contains(&w) {
+                        summary.exposures.push(message.clone());
+                    }
+                    summary.warnings.push(message);
                 }
                 Some(deriver)
             }
@@ -494,12 +514,15 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         if let Some(deriver) = key_deriver.as_mut() {
             let unmatched = deriver.take_unmatched();
             if unmatched > 0 {
-                summary.warnings.push(format!(
-                    "table '{}': {} items matched no entity in the data model \
-                     (no type attribute, and no entity's key templates reproduce their keys); \
-                     their keys were not rebuilt",
-                    table_name, unmatched
-                ));
+                note_exposure(
+                    &mut summary,
+                    format!(
+                        "table '{}': {} items matched no entity in the data model \
+                         (no type attribute, and no entity's key templates reproduce their \
+                         keys); their keys were not rebuilt",
+                        table_name, unmatched
+                    ),
+                );
             }
             // Both entities of a shared key attribute turned up, so the join
             // between them is broken in the output rather than merely at risk.
@@ -538,11 +561,14 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             }
 
             for (entity, key, count) in deriver.take_unrebuilt() {
-                summary.warnings.push(format!(
-                    "table '{table_name}': entity '{entity}' kept the original {key} on \
-                     {count} items, because its template could not rebuild them. Those keys \
-                     still hold the values the export arrived with"
-                ));
+                note_exposure(
+                    &mut summary,
+                    format!(
+                        "table '{table_name}': entity '{entity}' kept the original {key} on \
+                         {count} items, because its template could not rebuild them. Those \
+                         keys still hold the values the export arrived with"
+                    ),
+                );
             }
 
             let unchecked = deriver.unchecked_join_keys();
@@ -584,11 +610,14 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         let mut left_whole: Vec<(&String, &usize)> = mask_passthroughs.iter().collect();
         left_whole.sort();
         for (attribute, count) in left_whole {
-            summary.warnings.push(format!(
-                "table '{table_name}': {count} items kept '{attribute}' as it arrived because \
-                 the value was no shorter than the characters the mask keeps, so those rows \
-                 carry the original value"
-            ));
+            note_exposure(
+                &mut summary,
+                format!(
+                    "table '{table_name}': {count} items kept '{attribute}' as it arrived \
+                     because the value was no shorter than the characters the mask keeps, so \
+                     those rows carry the original value"
+                ),
+            );
         }
 
         pb.finish_with_message(format!(
@@ -627,17 +656,23 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             .map(|r| crate::expressions::format_path_for_error(&r.path))
             .unwrap_or_default();
         if work.matched == 0 {
-            summary.warnings.push(format!(
-                "rule {number} (path '{path}') matched no item in any table, so nothing was \
-                 anonymised by it. Check the match expression, and check the path is spelled \
-                 the way the export spells it"
-            ));
+            note_exposure(
+                &mut summary,
+                format!(
+                    "rule {number} (path '{path}') matched no item in any table, so nothing \
+                     was anonymised by it. Check the match expression, and check the path is \
+                     spelled the way the export spells it"
+                ),
+            );
         } else if work.rewrote == 0 {
-            summary.warnings.push(format!(
-                "rule {number} matched {} items but rewrote none of them: not one carried \
-                 the path '{path}'. The attribute it names is absent from this data",
-                work.matched
-            ));
+            note_exposure(
+                &mut summary,
+                format!(
+                    "rule {number} matched {} items but rewrote none of them: not one carried \
+                     the path '{path}'. The attribute it names is absent from this data",
+                    work.matched
+                ),
+            );
         }
         // No branch for "matched some items that did not carry the path": a
         // match broader than the path is the shape this page documents, so
@@ -879,6 +914,21 @@ fn mixed_consistency_rules(
 }
 
 /// Extract key attribute names from a CreateTableRequest.
+/// Record a warning that says an original value reached the output.
+///
+/// It goes in `warnings` like any other, so the printed summary is unchanged,
+/// and in `exposures`, which is what the exit code reads. Kept as one call so
+/// a new message of this kind cannot be added to one list and forgotten in the
+/// other.
+///
+/// Only for something the run observed, never for something it cannot rule
+/// out. A caution raised on every ordinary import would make the non-zero exit
+/// the normal outcome, and the flag that suppresses it the default.
+fn note_exposure(summary: &mut ImportSummary, message: String) {
+    summary.warnings.push(message.clone());
+    summary.exposures.push(message);
+}
+
 /// Puts the database's ordinary PRAGMAs back however the import leaves.
 struct BulkLoading<'a> {
     db: &'a Database,

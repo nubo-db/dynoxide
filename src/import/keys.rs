@@ -311,6 +311,10 @@ pub struct KeyDeriver {
     /// Key attributes a rule names directly, so `plan` can tell a template
     /// that failed from a key the rules were always going to replace.
     rule_targets: HashSet<String>,
+    /// Construction-time warnings that mean a key will keep the value it
+    /// arrives with, kept apart from the rest so the caller can say the run
+    /// left original data in the output.
+    model_exposures: Vec<String>,
     /// (entity index, key index) pairs that could not be rendered after the
     /// rules ran, reported once.
     warned_unrenderable: HashMap<(usize, usize), usize>,
@@ -390,6 +394,8 @@ impl KeyDeriver {
 
         let rule_targets: HashSet<&str> = rules.iter().filter_map(rule_target).collect();
         let mut warnings = Vec::new();
+        // The subset of the warnings below that leave real values in a key.
+        let mut model_exposures: Vec<String> = Vec::new();
         let mut unmatched_indexes: HashSet<String> = HashSet::new();
 
         // A local secondary index never reaches the model: OneTable declares
@@ -399,7 +405,7 @@ impl KeyDeriver {
         if let Some(lsis) = request.local_secondary_indexes.as_deref()
             && !lsis.is_empty()
         {
-            warnings.push(format!(
+            model_exposures.push(format!(
                 "table '{}' has {} local secondary index(es); their sort keys are not rebuilt \
                  from templates and keep the values they arrive with",
                 request.table_name,
@@ -427,7 +433,7 @@ impl KeyDeriver {
                     // ("GSI1"). Silently skipping would leave that index's
                     // key holding whatever it arrived with.
                     if unmatched_indexes.insert(mapping.index_name.clone()) {
-                        warnings.push(format!(
+                        model_exposures.push(format!(
                             "the data model has an index '{}' that table '{}' does not: its keys \
                              are not rebuilt and keep the values they arrive with. Set the \
                              OneTable index's \"name\" to the DynamoDB index name",
@@ -688,6 +694,8 @@ impl KeyDeriver {
         type_attributes.sort();
         type_attributes.dedup();
 
+        warnings.extend(model_exposures.iter().cloned());
+
         Ok((
             Self {
                 entities,
@@ -696,6 +704,7 @@ impl KeyDeriver {
                 range_attribute: range.map(String::from),
                 warned_mismatch: HashMap::new(),
                 rule_targets: rule_targets.iter().map(|a| (*a).to_string()).collect(),
+                model_exposures,
                 warned_unrenderable: HashMap::new(),
                 warned_rule_wins: HashSet::new(),
                 unmatched: 0,
@@ -1044,6 +1053,11 @@ impl KeyDeriver {
                 )
             })
             .collect()
+    }
+
+    /// Construction warnings that mean a key keeps the value it arrived with.
+    pub fn model_exposures(&self) -> &[String] {
+        &self.model_exposures
     }
 
     /// Entities that split a sort key of their own. Not a broken join on its

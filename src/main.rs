@@ -271,6 +271,11 @@ struct ImportArgs {
     #[arg(long)]
     continue_on_error: bool,
 
+    /// Exit 0 even when the import reports that an original value reached the
+    /// output. Without it such a run exits 3, so a pipeline stops.
+    #[arg(long)]
+    accept_exposure: bool,
+
     /// After import, start an HTTP server with the imported data (in-memory)
     #[cfg(feature = "http-server")]
     #[arg(long, conflicts_with = "output")]
@@ -892,6 +897,33 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "import")]
+/// Exit code for a run that finished but left an original value in the output.
+/// Distinct from 1 so a pipeline can tell it from an import that failed.
+const EXIT_EXPOSURE: i32 = 3;
+
+/// Print the summary, then stop the pipeline if the run reported that real
+/// data reached the output. An anonymising import that says so and then exits
+/// 0 is a run whose failure looks exactly like its success.
+fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: bool) {
+    print_import_summary(summary);
+    if summary.exposures.is_empty() || accept_exposure {
+        return;
+    }
+    eprintln!();
+    eprintln!(
+        "{} of the warnings above say an original value reached the output:",
+        summary.exposures.len()
+    );
+    for exposure in &summary.exposures {
+        eprintln!("  - {exposure}");
+    }
+    eprintln!();
+    eprintln!(
+        "Exiting {EXIT_EXPOSURE}. Fix the rules, or pass --accept-exposure if this is expected."
+    );
+    std::process::exit(EXIT_EXPOSURE);
+}
+
 fn print_import_summary(summary: &dynoxide::import::ImportSummary) {
     eprintln!();
     eprintln!("Import complete:");
@@ -926,6 +958,7 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
         compress: args.compress,
         force: args.force,
         continue_on_error: args.continue_on_error,
+        accept_exposure: args.accept_exposure,
     }
 }
 
@@ -1021,7 +1054,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         // File mode (current behavior)
         let cmd = build_import_command(&args);
         let summary = dynoxide::import::run(cmd)?;
-        print_import_summary(&summary);
+        finish_import(&summary, args.accept_exposure);
     } else {
         return Err("Either --output or --serve/--mcp is required.\n\
              Use --output <path> to write a database file, or\n\
@@ -1049,7 +1082,7 @@ fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let cmd = build_import_command(&args);
     let summary = dynoxide::import::run(cmd)?;
-    print_import_summary(&summary);
+    finish_import(&summary, args.accept_exposure);
     Ok(())
 }
 

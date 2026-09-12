@@ -256,6 +256,21 @@ The field it names is always a top-level one, because that is what
 `[consistency] fields` is keyed on. A template reading `${contact.email}`
 is reported as `contact`.
 
+### Exit codes
+
+An import that leaves an original value in the output exits **3** rather than
+0. That covers what the run actually saw: a rule that anonymised nothing, a
+key whose template could not rebuild it, items matching no entity, an index
+whose keys are not rebuilt, and values a `mask` kept whole. Each one is printed
+again at the end under the count, so the reason is in front of you.
+
+`--accept-exposure` returns those runs to 0 for the cases you have looked at
+and accept. Everything else is unchanged: 0 is a clean import, 1 is a failure,
+and 3 is a run that finished while leaving something behind.
+
+A warning on its own does not change the exit code. Only the ones naming a
+value that survived do, which is why the list is printed separately.
+
 ### What the check cannot see
 
 It compares the key values two rows arrived with, so it only finds a break

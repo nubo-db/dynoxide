@@ -8,6 +8,7 @@ use crate::types::{AttributeValue, Item};
 
 use super::config::{Salt, ValidatedAction, ValidatedRule, matches_item};
 use super::consistency::ConsistencyMap;
+use super::notice::Notice;
 
 use hmac::{Hmac, Mac};
 
@@ -64,12 +65,12 @@ pub fn apply_rules(
     consistency_fields: &std::collections::HashSet<String>,
     key_attrs: &[String],
     tally: &mut RuleTally<'_>,
-) -> (Vec<String>, std::collections::HashSet<String>) {
+) -> (Vec<Notice>, std::collections::HashSet<String>) {
     let RuleTally {
         mask_passthroughs,
         rule_work,
     } = tally;
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<Notice> = Vec::new();
     let mut rewritten = std::collections::HashSet::new();
     // Attributes a mask left whole and nothing since has rewritten. Judged
     // once the rules have all run: a later rule that replaces the value has
@@ -135,7 +136,9 @@ pub fn apply_rules(
                     current_value.clone(),
                     generated.clone(),
                 ) {
-                    warnings.push(cap_warning);
+                    // The map has stopped guaranteeing consistency, which
+                    // is a risk to joins rather than a value seen surviving.
+                    warnings.push(Notice::caution(cap_warning));
                 }
                 generated
             }
@@ -168,10 +171,10 @@ pub fn apply_rules(
 
         // Warn if targeting a key attribute
         if key_attrs.contains(&field_name) {
-            warnings.push(format!(
+            warnings.push(Notice::caution(format!(
                 "anonymising key attribute '{}': potential for collisions",
                 field_name
-            ));
+            )));
         }
 
         // Apply the new value
@@ -189,7 +192,10 @@ pub fn apply_rules(
                 rewritten.insert(field_name);
             }
             Err(e) => {
-                warnings.push(format!("failed to set path '{}': {e}", field_name));
+                warnings.push(Notice::caution(format!(
+                    "failed to set path '{}': {e}",
+                    field_name
+                )));
             }
         }
     }

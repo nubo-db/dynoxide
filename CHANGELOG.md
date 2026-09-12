@@ -36,8 +36,8 @@ Added.
   no entity, an index the model describes but the table lacks, or values a
   `mask` kept whole. Those are listed again at the end of the run, and
   `--serve` and `--mcp` refuse to start on them. Pass `--accept-exposure` to
-  exit 0 instead. `ImportSummary` gains an `exposures` field holding the same
-  list.
+  exit 0 instead. `ImportSummary` gains a `notices` field carrying every message with its
+  concern, and an `exposures` field holding the messages of the ones that count.
 - **`salt_env` and `seed_env` must be at least 16 bytes.** Generate one with
   `openssl rand -base64 24`.
 - **`fake` on a numeric attribute draws from the full 64-bit range** rather

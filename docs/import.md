@@ -295,8 +295,12 @@ is printed again at the end under the count, so the reason is in front of you.
 and accept. Everything else is unchanged: 0 is a clean import, 1 is a failure,
 and 3 is a run that finished while leaving something behind.
 
-A warning on its own does not change the exit code. Only the ones naming a
-value that survived do, which is why the list is printed separately.
+A warning on its own does not change the exit code. Every message the import
+raises carries a concern, decided where it is raised: an *exposure* is a value
+the run saw reach the output, and a *caution* is something it could not do or
+could not check. Only exposures change the exit code, which is why they are
+printed separately, and `ImportSummary::notices` carries each message with
+its concern for anyone using the crate.
 
 ### What the check cannot see
 

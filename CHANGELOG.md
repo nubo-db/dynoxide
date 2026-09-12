@@ -28,6 +28,21 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   is now tagged with its DynamoDB type and length-prefixed on the same terms
   as a seeded `fake`, so the string `"123"` and the number `123` no longer
   land on one pseudonym.
+- **`--tables` now applies to a flat export directory.** It was only read for
+  the `<dir>/<Table>/data/` layout, so on a flat directory a table asked to be
+  left out arrived in the output anyway, named after the directory.
+- **A rule path is read in full or refused.** `a[0]b` parsed as `a[0]`,
+  silently dropping the rest, so a rule meant for a field inside a list
+  element rewrote the whole element, and `[0]` with no attribute at all was
+  accepted. Both are errors now, with the dotted form suggested.
+- **An export file past the size limit fails the import rather than ending
+  it.** The 50 GB cap on what one file may yield, inflated or not, was a quiet
+  end of file: a gzip bomb read as a short export that imported cleanly. The
+  cap now applies to plain files too.
+- **A line over the 4 MB limit is no longer held in memory before being
+  refused.** The check ran after the whole line had been read, so the cap on
+  line length did not cap memory. It is applied as the line is read, and a
+  60 MB line now costs about 20 MB resident rather than 84 MB.
 - **`dynoxide import` exits 3 when it leaves an original value in the output.**
   It printed the warning and exited 0, so a run whose whole purpose is removing
   personal data reported success having left some behind, and a pipeline could
@@ -82,6 +97,23 @@ and the Homebrew formula all carry 1.2.0. See the version split below.
   `openssl rand -base64 24`.
 
 ### Added
+- An import now says when several entities' templates reproduce the keys of an
+  item that carries no type attribute. The first in the model was taken, which
+  may be the wrong one, and nothing said so.
+- The import schema is parsed the same way the table is created, so a local
+  secondary index reaches everything that reads it. The two used to be separate
+  parses and this one had never learned about LSIs, so the warning that an
+  LSI's sort keys keep their values could never fire.
+- Overwritten rows are counted on the value the database stores. A numeric key
+  written `1` and one written `1.0` land on one row, and hashing the spelling
+  counted them as two, so the overwrite went unreported.
+- `--continue-on-error` now covers the last partial batch of a table, which
+  failed the run regardless.
+- Compression happens before anything reaches the output path, so a failed
+  compression no longer leaves the uncompressed database at the final path on
+  a run that reported an error.
+- A salt or seed that is set but not valid UTF-8 is reported as such, rather
+  than as unset.
 - An import now says when one entity split a sort key of its own. Rows share a
   sort value for reasons that are not relationships, so this is reported rather
   than fatal: two people of one name under one tenant shared it and were never

@@ -500,12 +500,25 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 summary.warnings.push(warning);
             }
 
-            // Flush remaining items
+            // Flush remaining items. Under --continue-on-error this batch is
+            // treated as the others were: the flag covered every full batch
+            // and then the last partial one failed the run anyway.
             if !batch.is_empty() {
-                let import_result = insert_items(table_name, batch)
-                    .map_err(|e| format!("Failed to import items into '{}': {e}", table_name))?;
-                table_items += import_result.items_imported;
-                table_bytes += import_result.bytes_imported;
+                match insert_items(table_name, batch) {
+                    Ok(result) => {
+                        table_items += result.items_imported;
+                        table_bytes += result.bytes_imported;
+                    }
+                    Err(e) => {
+                        let msg = format!("Batch import error for '{}': {e}", table_name);
+                        if cmd.continue_on_error {
+                            summary.warnings.push(msg);
+                        } else {
+                            pb.abandon_with_message(format!("{}: FAILED", table_name));
+                            return Err(ImportError::Database(msg));
+                        }
+                    }
+                }
                 pb.set_message(format!("{}: {} items", table_name, table_items));
                 pb.tick();
             }
@@ -757,17 +770,29 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
 
     // Atomically move the temp file to the final output path.
     // This overwrites any existing file (--force was already checked above).
+    // Compress before anything lands at the output path. Compressing after
+    // the rename left the uncompressed database at the final path when
+    // compression failed, on a run that then returned an error, which is the
+    // one shape "nothing is persisted on the error path" promised not to
+    // produce.
+    if compress {
+        let compressed_path = output_path.with_extension("db.zst");
+        let compressed_tmp = tempfile::NamedTempFile::new_in(output_dir)
+            .map_err(|e| ImportError::Database(format!("Failed to create temp file: {e}")))?
+            .into_temp_path();
+        let size = compress_to(&tmp_path, &compressed_tmp)?;
+        compressed_tmp.persist(&compressed_path).map_err(|e| {
+            ImportError::Database(format!("Failed to move database to output path: {e}"))
+        })?;
+        eprintln!("Compressed output: {}", format_bytes(size));
+        summary.output_path = Some(compressed_path);
+        return Ok(summary);
+    }
+
     tmp_file.persist(&output_path).map_err(|e| {
         ImportError::Database(format!("Failed to move database to output path: {e}"))
     })?;
-
-    summary.output_path = Some(output_path.clone());
-
-    // Optionally compress with zstd
-    if compress {
-        let compressed_path = compress_output(&output_path)?;
-        summary.output_path = Some(compressed_path);
-    }
+    summary.output_path = Some(output_path);
 
     Ok(summary)
 }
@@ -804,7 +829,7 @@ fn find_table_json(schema_json: &serde_json::Value, table_name: &str) -> Option<
 /// is gated on the billing mode having come from the summary: a schema
 /// already in CreateTable shape passes through untouched, so an inconsistent
 /// one still fails validation exactly as it would on the CreateTable API.
-fn unwrap_describe_table_shapes(table: &mut serde_json::Value) {
+pub(super) fn unwrap_describe_table_shapes(table: &mut serde_json::Value) {
     let Some(obj) = table.as_object_mut() else {
         return;
     };
@@ -981,41 +1006,27 @@ fn index_key_attrs(request: &crate::actions::create_table::CreateTableRequest) -
     names
 }
 
-/// Compress a file with zstd, removing the original.
-fn compress_output(path: &Path) -> Result<std::path::PathBuf, String> {
-    let compressed_path = path.with_extension("db.zst");
-    eprintln!("Compressing to {}...", compressed_path.display());
-
-    let input = std::fs::File::open(path)
-        .map_err(|e| format!("Failed to open {} for compression: {e}", path.display()))?;
-
-    let output = std::fs::File::create(&compressed_path)
-        .map_err(|e| format!("Failed to create {}: {e}", compressed_path.display()))?;
-
-    let mut encoder =
-        zstd::Encoder::new(output, 3).map_err(|e| format!("Failed to create zstd encoder: {e}"))?;
-
+/// Compress `src` into `dst` with zstd, returning the compressed size.
+fn compress_to(src: &Path, dst: &Path) -> Result<usize, ImportError> {
+    let input = std::fs::File::open(src).map_err(|e| {
+        ImportError::Database(format!(
+            "Failed to open {} for compression: {e}",
+            src.display()
+        ))
+    })?;
+    let output = std::fs::File::create(dst)
+        .map_err(|e| ImportError::Database(format!("Failed to create {}: {e}", dst.display())))?;
+    let mut encoder = zstd::Encoder::new(output, 3)
+        .map_err(|e| ImportError::Database(format!("Failed to create zstd encoder: {e}")))?;
     std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)
-        .map_err(|e| format!("Compression failed: {e}"))?;
-
+        .map_err(|e| ImportError::Database(format!("Compression failed: {e}")))?;
     encoder
         .finish()
-        .map_err(|e| format!("Failed to finalize compression: {e}"))?;
-
-    // Remove the uncompressed file
-    std::fs::remove_file(path).map_err(|e| format!("Failed to remove uncompressed file: {e}"))?;
-
-    let compressed_size = std::fs::metadata(&compressed_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    eprintln!(
-        "Compressed output: {}",
-        format_bytes(compressed_size as usize)
-    );
-
-    Ok(compressed_path)
+        .map_err(|e| ImportError::Database(format!("Failed to finalize compression: {e}")))?;
+    Ok(std::fs::metadata(dst)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0))
 }
-
 /// Format bytes as human-readable.
 fn format_bytes(bytes: usize) -> String {
     if bytes < 1024 {

@@ -256,6 +256,15 @@ The field it names is always a top-level one, because that is what
 `[consistency] fields` is keyed on. A template reading `${contact.email}`
 is reported as `contact`.
 
+### Limits
+
+One export file may yield at most 50 GB, inflated or not. Past that the import
+fails rather than stopping at the limit, since a file that stops quietly reads
+as a short export that imported cleanly. A single line may be at most 4 MB,
+about ten times the largest DynamoDB item; a longer one is skipped and
+reported, and it is never held in memory past the limit. An item nests at most
+32 levels, as in DynamoDB.
+
 ### Exit codes
 
 An import that leaves an original value in the output exits **3** rather than

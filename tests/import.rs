@@ -2400,6 +2400,106 @@ action = { type = "redact" }
     }
 
     #[test]
+    fn continue_on_error_covers_the_last_batch_of_a_table() {
+        // A batch is 10,000 items, so a small file is flushed once, after
+        // the loop. That flush used to fail the run whatever the flag said,
+        // while a failure inside the loop was tolerated.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}}}"#,
+                // No key attributes at all: the insert rejects it.
+                r#"{"Item": {"name": {"S": "no keys"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        let run = |continue_on_error: bool, name: &str| {
+            import::run(ImportCommand {
+                source: source.clone(),
+                output: Some(tmp.path().join(name)),
+                schema: schema_file.clone(),
+                rules: None,
+                tables: None,
+                compress: false,
+                force: false,
+                continue_on_error,
+                accept_exposure: true,
+                data_model: None,
+            })
+        };
+
+        let strict = run(false, "strict.db");
+        assert!(
+            strict.is_err(),
+            "without the flag the bad batch fails the run"
+        );
+
+        let lenient = run(true, "lenient.db").expect("with the flag the run completes");
+        assert!(
+            lenient
+                .warnings
+                .iter()
+                .any(|w| w.contains("Batch import error")),
+            "and the failure is reported rather than lost: {:?}",
+            lenient.warnings
+        );
+    }
+
+    #[test]
+    fn a_compressed_import_leaves_nothing_but_the_archive_at_the_output() {
+        // Compression now happens before the rename, so the uncompressed
+        // database never sits at the output path. This pins the shape the
+        // reordering produces; a compression failure part-way is not
+        // injectable from here, so the ordering itself is what the code
+        // comment carries.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}}}"#],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: None,
+            tables: None,
+            compress: true,
+            force: false,
+            continue_on_error: false,
+            accept_exposure: true,
+            data_model: None,
+        })
+        .unwrap();
+
+        let archive = output.with_extension("db.zst");
+        assert_eq!(summary.output_path.as_deref(), Some(archive.as_path()));
+        assert!(archive.exists(), "the archive is the output");
+        assert!(
+            !output.exists(),
+            "and nothing uncompressed was ever put there"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
     fn a_rule_that_did_its_job_says_nothing() {
         // The other direction. A warning that fires on every ordinary run is
         // a warning nobody reads.

@@ -344,6 +344,15 @@ pub(super) fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathEleme
         if part.is_empty() {
             return Err("empty path segment".to_string());
         }
+        // Every segment names an attribute first; an index can only follow
+        // one. `[0]` on its own has nothing to index into, and accepting it
+        // left a rule aimed at nothing in particular.
+        if part.starts_with('[') {
+            return Err(format!(
+                "segment '{part}' starts with an index; an index has to follow an attribute \
+                 name, as in items[0]"
+            ));
+        }
         // A rule path names a real attribute. `#alias` is a match-expression
         // idea, and the names table does not reach here, so accepting one
         // would leave a rule that quietly matches nothing.
@@ -372,6 +381,17 @@ pub(super) fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathEleme
                     .map_err(|_| format!("invalid array index in path: {path}"))?;
                 elements.push(PathElement::Index(idx));
                 remaining = &remaining[end + 1..];
+            }
+            // Whatever follows the last index was being dropped on the
+            // floor, so `a[0]b` parsed as `a[0]` and a rule meant for a field
+            // inside a list element rewrote the whole element instead. A
+            // path is either read in full or refused.
+            if !remaining.is_empty() {
+                return Err(format!(
+                    "unexpected '{remaining}' after the index in '{part}'; a nested attribute \
+                     needs a dot, as in {}.{remaining}",
+                    &part[..part.len() - remaining.len()]
+                ));
             }
         } else {
             elements.push(PathElement::Attribute(part.to_string()));
@@ -413,10 +433,17 @@ fn required_secret(
     purpose: &str,
     why_it_must_be_secret: &str,
 ) -> Result<Vec<u8>, String> {
-    let value = std::env::var(env_var).map_err(|_| {
-        format!(
+    let value = std::env::var(env_var).map_err(|e| match e {
+        std::env::VarError::NotPresent => format!(
             "Rule {rule_num}: environment variable '{env_var}' not set (required for {purpose})"
-        )
+        ),
+        // Set, but not text this process can read. Calling it unset sends
+        // the reader to check their CI secrets when the value is right there.
+        // The bytes themselves stay out of the message: they are the secret.
+        std::env::VarError::NotUnicode(_) => format!(
+            "Rule {rule_num}: environment variable '{env_var}' is set but is not valid UTF-8 \
+             (required for {purpose}). Generate one with `openssl rand -base64 24`"
+        ),
     })?;
     if value.is_empty() {
         return Err(format!(
@@ -713,6 +740,45 @@ action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
         let rule_debug = format!("{:?}", rule);
         assert!(rule_debug.contains("[REDACTED]"));
         assert!(!rule_debug.contains("super"));
+    }
+
+    #[test]
+    fn a_path_is_read_in_full_or_refused() {
+        // `a[0]b` used to parse as `a[0]`: the rule then rewrote the whole
+        // list element rather than the field inside it, and the run looked
+        // right because it had rewritten something.
+        for bad in ["a[0]b", "items[0]extra", "a[0]b[1]", "a[0][1]junk"] {
+            let err = parse_path(bad).unwrap_err();
+            assert!(err.contains("after the index"), "{bad}: {err}");
+        }
+        for bad in ["[0]", "[0].a", "a.[1]"] {
+            let err = parse_path(bad).unwrap_err();
+            assert!(err.contains("starts with an index"), "{bad}: {err}");
+        }
+        // And the shapes that are meant to work still do.
+        assert_eq!(parse_path("a[0].b[1]").unwrap().len(), 4);
+        assert_eq!(parse_path("items[0][1]").unwrap().len(), 3);
+        assert_eq!(parse_path("address.city").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_secret_that_is_not_utf8_is_not_reported_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe {
+            std::env::set_var(
+                "DYNOXIDE_TEST_BAD_UTF8",
+                std::ffi::OsStr::from_bytes(b"\xff\xfe0123456789abcdef"),
+            )
+        };
+        let err = required_secret(1, "DYNOXIDE_TEST_BAD_UTF8", "a test", "because").unwrap_err();
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_BAD_UTF8") };
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(!err.contains("not set"), "{err}");
+        assert!(
+            !err.contains("0123456789"),
+            "the bytes stay out of the message: {err}"
+        );
     }
 
     #[test]

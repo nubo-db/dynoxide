@@ -323,6 +323,9 @@ pub struct KeyDeriver {
     /// (entity index, key index) pairs where a rule took the key instead of
     /// its template, reported once.
     warned_rule_wins: HashSet<(usize, usize)>,
+    /// Sets of entities that all reproduced some untyped item's keys,
+    /// reported once per set.
+    warned_ambiguous: HashSet<Vec<usize>>,
     /// Attribute -> the entities that build a key from it, for attributes
     /// more than one entity keys on that are not consistency-tracked. Their
     /// keys cannot agree, so the entities stop joining.
@@ -707,6 +710,7 @@ impl KeyDeriver {
                 model_exposures,
                 warned_unrenderable: HashMap::new(),
                 warned_rule_wins: HashSet::new(),
+                warned_ambiguous: HashSet::new(),
                 unmatched: 0,
                 at_risk,
                 rebuilt_keys: HashSet::new(),
@@ -724,10 +728,31 @@ impl KeyDeriver {
     /// alone and reported (once per entity and key). An item that matches no
     /// entity is counted for [`take_unmatched`](Self::take_unmatched).
     pub fn plan(&mut self, item: &Item, warnings: &mut Vec<String>) -> Option<Rederivation> {
-        let Some(entity_idx) = self.resolve_entity(item) else {
-            self.unmatched += 1;
-            return None;
+        let (entity_idx, also) = match self.resolve_entity(item) {
+            Some(found) => found,
+            None => {
+                self.unmatched += 1;
+                return None;
+            }
         };
+        if !also.is_empty() {
+            // Without a type attribute the model cannot say whose row this
+            // is, and taking the first entity in model order picks one in
+            // silence. The item is still rebuilt as that entity, so nothing
+            // is left unrebuilt; but if the guess is wrong the keys are
+            // rendered from the wrong templates, and that is worth a line.
+            let mut group = vec![entity_idx];
+            group.extend(also.iter().copied());
+            if self.warned_ambiguous.insert(group.clone()) {
+                warnings.push(format!(
+                    "{} all reproduce the keys of at least one item that carries no type \
+                     attribute, so it was taken as entity '{}', the first in the model. Give \
+                     items a type attribute if that is not the entity they belong to",
+                    entity_list(&self.entities, &group),
+                    self.entities[entity_idx].name
+                ));
+            }
+        }
 
         let entity = &self.entities[entity_idx];
 
@@ -988,7 +1013,13 @@ impl KeyDeriver {
                 }
                 Some(AttributeValue::N(n)) => {
                     2u8.hash(&mut hasher);
-                    n.hash(&mut hasher);
+                    // The form the engine stores, where DynamoDB would accept
+                    // the number. `1` and `1.0` land on one row, and counting
+                    // them as two hid the overwrite this exists to count.
+                    match crate::types::validate_dynamo_number(n) {
+                        Ok(()) => crate::types::normalize_dynamo_number(n).hash(&mut hasher),
+                        Err(_) => n.hash(&mut hasher),
+                    }
                 }
                 Some(AttributeValue::B(b)) => {
                     3u8.hash(&mut hasher);
@@ -1141,7 +1172,11 @@ impl KeyDeriver {
 
     /// Find the item's entity: by its type attribute first, otherwise the
     /// first entity whose templates reproduce every key the item carries.
-    fn resolve_entity(&self, item: &Item) -> Option<usize> {
+    ///
+    /// Returns the entity and, when the item carried no type attribute and
+    /// more than one entity's templates reproduce its keys, the others that
+    /// did too. A type attribute settles it; a template match is a guess.
+    fn resolve_entity(&self, item: &Item) -> Option<(usize, Vec<usize>)> {
         for type_attribute in &self.type_attributes {
             let Some(AttributeValue::S(type_value)) = item.get(type_attribute) else {
                 continue;
@@ -1150,12 +1185,12 @@ impl KeyDeriver {
                 .entities
                 .iter()
                 .position(|e| e.name == *type_value && e.type_attribute == *type_attribute);
-            if by_type.is_some() {
-                return by_type;
+            if let Some(idx) = by_type {
+                return Some((idx, Vec::new()));
             }
         }
 
-        self.entities.iter().position(|e| {
+        let mut matches = self.entities.iter().enumerate().filter_map(|(idx, e)| {
             let mut present = 0;
             let all_match = e
                 .match_keys
@@ -1168,8 +1203,10 @@ impl KeyDeriver {
                     }
                     Some(_) => false,
                 });
-            all_match && present > 0
-        })
+            (all_match && present > 0).then_some(idx)
+        });
+        let first = matches.next()?;
+        Some((first, matches.collect()))
     }
 }
 
@@ -2407,6 +2444,70 @@ mod tests {
             "and nothing was split, so there is nothing to report: {:?}",
             d.sort_key_splits()
         );
+    }
+
+    #[test]
+    fn two_spellings_of_one_numeric_key_are_one_row() {
+        // The database normalises a number on write, so `1` and `1.0` land on
+        // one row and the second overwrites the first. Hashing the spelling
+        // counted them as two rows and the overwrite went unreported.
+        let mut request = request();
+        request.key_schema = vec![key_schema("id", KeyType::HASH)];
+        request.attribute_definitions = vec![crate::types::AttributeDefinition {
+            attribute_name: "id".to_string(),
+            attribute_type: crate::types::ScalarAttributeType::N,
+        }];
+        let (mut d, _) = KeyDeriver::new(&model(), &request, &[], &no_consistency()).unwrap();
+
+        let mut a = Item::new();
+        a.insert("id".to_string(), AttributeValue::N("1".to_string()));
+        let mut b = Item::new();
+        b.insert("id".to_string(), AttributeValue::N("1.0".to_string()));
+        d.note_primary_key(&a);
+        d.note_primary_key(&b);
+
+        assert_eq!(
+            d.take_collisions().0,
+            1,
+            "one row written twice is one collision"
+        );
+    }
+
+    #[test]
+    fn an_item_several_entities_could_own_is_reported() {
+        // Two entities with the same templates and no type attribute on the
+        // item: the first wins, which may be wrong, and used to be silent.
+        let twin = |name: &str| EntityDefinition {
+            name: name.to_string(),
+            pk_template: "thing#${id}".to_string(),
+            sk_template: Some("thing#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        };
+        let model = model_with(vec![twin("Left"), twin("Right")]);
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &[], &no_consistency()).unwrap();
+
+        let it = item(&[("pk", "thing#1"), ("sk", "thing#"), ("id", "1")]);
+        let mut warnings = Vec::new();
+        let plan = d
+            .plan(&it, &mut warnings)
+            .expect("the first entity is taken");
+        assert_eq!(plan.entity, 0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("entity 'Left' and entity 'Right'"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("taken as entity 'Left'"),
+            "{warnings:?}"
+        );
+
+        // Once per set of entities, not once per item.
+        let mut again = Vec::new();
+        d.plan(&it, &mut again);
+        assert!(again.is_empty(), "{again:?}");
     }
 
     #[test]

@@ -749,6 +749,7 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
     // existing archive be replaced without --force and blocked a compressed
     // run on a stray database it was never going to touch.
     let compress = cmd.compress;
+    let force = cmd.force;
     let final_path = if compress {
         output.with_extension("db.zst")
     } else {
@@ -812,17 +813,13 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
             .map_err(|e| ImportError::Database(format!("Failed to create temp file: {e}")))?
             .into_temp_path();
         let size = compress_to(&tmp_path, &compressed_tmp)?;
-        compressed_tmp.persist(&compressed_path).map_err(|e| {
-            ImportError::Database(format!("Failed to move database to output path: {e}"))
-        })?;
+        move_into_place(compressed_tmp, &compressed_path, force)?;
         eprintln!("Compressed output: {}", format_bytes(size));
         summary.output_path = Some(compressed_path);
         return Ok(summary);
     }
 
-    tmp_file.persist(&output_path).map_err(|e| {
-        ImportError::Database(format!("Failed to move database to output path: {e}"))
-    })?;
+    move_into_place(tmp_file, &output_path, force)?;
     summary.output_path = Some(output_path);
 
     Ok(summary)
@@ -1046,6 +1043,27 @@ fn index_key_attrs(request: &crate::actions::create_table::CreateTableRequest) -
     names
 }
 
+/// Rename a finished temp file onto the output path.
+///
+/// Without `--force` the rename refuses an existing file rather than
+/// replacing it. The existence check at the start of the run is not enough
+/// on its own: an import takes time, and a second run writing the same path
+/// can finish inside that window, after the check and before this rename.
+fn move_into_place(tmp: tempfile::TempPath, dst: &Path, force: bool) -> Result<(), ImportError> {
+    let moved = if force {
+        tmp.persist(dst)
+    } else {
+        tmp.persist_noclobber(dst)
+    };
+    moved.map_err(|e| {
+        ImportError::Database(format!(
+            "Failed to move database to output path '{}': {}",
+            dst.display(),
+            e.error
+        ))
+    })
+}
+
 /// Compress `src` into `dst` with zstd, returning the compressed size.
 fn compress_to(src: &Path, dst: &Path) -> Result<usize, ImportError> {
     let input = std::fs::File::open(src).map_err(|e| {
@@ -1075,5 +1093,30 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(all(test, feature = "import"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_appeared_after_the_check_is_not_replaced_without_force() {
+        // The race the up-front check cannot close: something else wrote the
+        // destination while this run was importing.
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("out.db");
+        std::fs::write(&dst, b"theirs").unwrap();
+
+        let tmp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(tmp.path(), b"ours").unwrap();
+        let err = move_into_place(tmp.into_temp_path(), &dst, false).unwrap_err();
+        assert!(err.to_string().contains("out.db"), "{err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"theirs", "theirs survives");
+
+        let tmp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(tmp.path(), b"ours").unwrap();
+        move_into_place(tmp.into_temp_path(), &dst, true).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"ours", "--force replaces it");
     }
 }

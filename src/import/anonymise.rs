@@ -71,9 +71,11 @@ pub fn apply_rules(
     } = tally;
     let mut warnings = Vec::new();
     let mut rewritten = std::collections::HashSet::new();
-    // Attributes already counted as kept whole for this item, so two mask
-    // rules over one attribute report one item rather than two.
-    let mut counted_whole: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Attributes a mask left whole and nothing since has rewritten. Judged
+    // once the rules have all run: a later rule that replaces the value has
+    // removed it, and reporting the mask's pass-through then would say real
+    // data survived a run that removed it.
+    let mut kept_whole_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (rule_idx, rule) in rules.iter().enumerate() {
         // What each rule actually did, so a run can say when one did nothing.
@@ -84,9 +86,7 @@ pub fn apply_rules(
             .get_mut(rule_idx)
             .expect("one entry per rule, sized by the caller");
         // A rule scoped to other tables neither matches nor counts here.
-        if let Some(tables) = &rule.tables
-            && !tables.iter().any(|t| t == table)
-        {
+        if !rule.applies_to(table) {
             continue;
         }
         if !matches_item(rule, item) {
@@ -152,8 +152,8 @@ pub fn apply_rules(
         // already begins with the mask character masks to itself and would
         // read as short, and two mask rules on one attribute would each count
         // the same item once, so the count is per item and attribute.
-        if let ValidatedAction::Mask { keep_last, .. } = &rule.action {
-            let kept_whole = match &current_value {
+        let kept_whole = match &rule.action {
+            ValidatedAction::Mask { keep_last, .. } => match &current_value {
                 AttributeValue::S(s) => s.chars().count() <= *keep_last,
                 AttributeValue::N(n) => n.len() <= *keep_last,
                 // Every other type is replaced wholesale with mask characters
@@ -162,11 +162,9 @@ pub fn apply_rules(
                 // in fact removed all of it, which is the wrong direction for
                 // a warning whose whole purpose is to say what got through.
                 _ => false,
-            };
-            if kept_whole && counted_whole.insert(field_name.clone()) {
-                *mask_passthroughs.entry(field_name.clone()).or_insert(0) += 1;
-            }
-        }
+            },
+            _ => false,
+        };
 
         // Warn if targeting a key attribute
         if key_attrs.contains(&field_name) {
@@ -183,12 +181,21 @@ pub fn apply_rules(
                     .get_mut(rule_idx)
                     .expect("one entry per rule")
                     .rewrote += 1;
+                if kept_whole {
+                    kept_whole_fields.insert(field_name.clone());
+                } else {
+                    kept_whole_fields.remove(&field_name);
+                }
                 rewritten.insert(field_name);
             }
             Err(e) => {
                 warnings.push(format!("failed to set path '{}': {e}", field_name));
             }
         }
+    }
+
+    for field in kept_whole_fields {
+        *mask_passthroughs.entry(field).or_insert(0) += 1;
     }
 
     (warnings, rewritten)
@@ -712,6 +719,37 @@ mod tests {
             passthroughs.get("code"),
             Some(&1),
             "one item kept its value, however many rules looked at it"
+        );
+    }
+
+    #[test]
+    fn a_value_a_mask_kept_whole_but_a_later_rule_replaced_is_not_a_passthrough() {
+        // The mask left "ab" alone; the redact after it did not. Nothing of
+        // the original reached the output, so nothing is reported.
+        let mut it = Item::new();
+        it.insert("code".to_string(), AttributeValue::S("ab".to_string()));
+        let rules = [
+            test_rule(
+                "code",
+                ValidatedAction::Mask {
+                    keep_last: 4,
+                    mask_char: '*',
+                },
+            ),
+            test_rule("code", ValidatedAction::Redact),
+        ];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(
+            it.get("code"),
+            Some(&AttributeValue::S("[REDACTED]".to_string())),
+            "the later rule won"
+        );
+        assert!(
+            passthroughs.is_empty(),
+            "so there is no pass-through to report: {passthroughs:?}"
         );
     }
 

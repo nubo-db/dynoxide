@@ -318,6 +318,10 @@ pub struct KeyDeriver {
     /// Every key attribute the table and its indexes have, so `apply` can
     /// find the ones an entity carries but its model never templates.
     schema_keys: Vec<String>,
+    /// The full path of every rule that applies to this table, so `plan` can
+    /// read the value a nested rule is about to replace, not only a
+    /// top-level one.
+    rule_paths: Vec<Vec<PathElement>>,
     /// (entity, key attribute) -> items whose untemplated key still held a
     /// value a rule had replaced. Warned once, counted throughout.
     survived: HashMap<(usize, String), usize>,
@@ -424,7 +428,16 @@ impl KeyDeriver {
         }
         grouped_by.retain(|attribute, _| !partition_keys.contains(attribute));
 
-        let rule_targets: HashSet<&str> = rules.iter().filter_map(rule_target).collect();
+        // Only the rules that apply to this table. A rule scoped elsewhere
+        // that names `pk` made this table's `pk` look rule-owned, so a key
+        // the template could not rebuild went uncounted and a shared key a
+        // direct rule never touched here left the join check.
+        let rules: Vec<&ValidatedRule> = rules
+            .iter()
+            .filter(|rule| rule.applies_to(&request.table_name))
+            .collect();
+        let rule_targets: HashSet<&str> = rules.iter().filter_map(|r| rule_target(r)).collect();
+        let rule_paths: Vec<Vec<PathElement>> = rules.iter().map(|r| r.path.clone()).collect();
         let mut warnings = Vec::new();
         // The subset of the warnings below that leave real values in a key.
         let mut model_exposures: Vec<String> = Vec::new();
@@ -556,7 +569,7 @@ impl KeyDeriver {
             }
 
             for key in &keys {
-                for rule in rules {
+                for rule in &rules {
                     let Some(target) = rule_target(rule) else {
                         continue;
                     };
@@ -742,6 +755,7 @@ impl KeyDeriver {
                 warned_mismatch: HashMap::new(),
                 rule_targets: rule_targets.iter().map(|a| (*a).to_string()).collect(),
                 schema_keys,
+                rule_paths,
                 survived: HashMap::new(),
                 model_exposures,
                 warned_unrenderable: HashMap::new(),
@@ -793,6 +807,7 @@ impl KeyDeriver {
         let entity = &self.entities[entity_idx];
 
         let mut keys = Vec::new();
+        let mut rewritten_directly: Vec<&str> = Vec::new();
         for (idx, key) in entity.keys.iter().enumerate() {
             let Some(current) = item.get(&key.attribute) else {
                 // A sparse index key: nothing to rebuild.
@@ -810,6 +825,10 @@ impl KeyDeriver {
                 // replaces it. Counting it among the keys that kept their
                 // original would claim real data survived a rule that removed
                 // it. The "a rule rewrote {key} directly" warning covers it.
+                // It still has a join to lose, though: two entities that
+                // arrived sharing this key and leave it to an unseeded rule
+                // split exactly as a rebuilt key would, so it is compared.
+                rewritten_directly.push(key.attribute.as_str());
             } else {
                 let seen = self.warned_mismatch.entry((entity_idx, idx)).or_insert(0);
                 *seen += 1;
@@ -825,27 +844,38 @@ impl KeyDeriver {
             }
         }
 
-        // Only a key that will actually be rebuilt takes part in the join
-        // check. One left holding its original value has already been
-        // reported as a template that does not reproduce, and that is the
-        // accurate diagnostic: comparing it against an entity that did
-        // rebuild would call it a broken join and advise [consistency],
-        // which cannot fix an attribute the item does not carry.
-        let rebuilt: Vec<&str> = keys
+        // Only a key that will actually change takes part in the join
+        // check: one the template rebuilds, or one a rule rewrites outright.
+        // One left holding its original value has already been reported as
+        // a template that does not reproduce, and that is the accurate
+        // diagnostic: comparing it against an entity that did rebuild would
+        // call it a broken join and advise [consistency], which cannot fix
+        // an attribute the item does not carry.
+        let mut changing: Vec<&str> = keys
             .iter()
             .map(|idx| entity.keys[*idx].attribute.as_str())
             .collect();
-        let at_risk_originals = self.at_risk_originals(entity_idx, item, &rebuilt);
+        changing.extend(rewritten_directly);
+        let at_risk_originals = self.at_risk_originals(entity_idx, item, &changing);
 
-        // Only the attributes a rule can rewrite, so this stays bounded by
-        // the rules file rather than the item.
+        // The value each applicable rule is about to replace, read through
+        // the rule's full path so a rule on `profile.email` records the
+        // address inside the map rather than nothing. Keyed by the top-level
+        // attribute, which is what `apply_rules` reports as rewritten.
+        // Bounded by the rules file rather than the item.
         let originals: Vec<(String, String)> = self
-            .rule_targets
+            .rule_paths
             .iter()
-            .filter_map(|attribute| match item.get(attribute)? {
-                AttributeValue::S(s) => Some((attribute.clone(), s.clone())),
-                AttributeValue::N(n) => Some((attribute.clone(), n.clone())),
-                _ => None,
+            .filter_map(|path| {
+                let root = match path.first()? {
+                    PathElement::Attribute(name) => name.clone(),
+                    _ => return None,
+                };
+                match resolve_path(item, path)? {
+                    AttributeValue::S(s) => Some((root, s)),
+                    AttributeValue::N(n) => Some((root, n)),
+                    _ => None,
+                }
             })
             .collect();
 
@@ -1040,7 +1070,7 @@ impl KeyDeriver {
                 .filter(|key| !entity.match_keys.iter().any(|k| &k.attribute == *key))
                 .filter(|key| match item.get(key.as_str()) {
                     Some(AttributeValue::S(value)) => plan.originals.iter().any(|(attr, old)| {
-                        rewritten_by_rules.contains(attr) && !old.is_empty() && value.contains(old)
+                        rewritten_by_rules.contains(attr) && holds_as_component(value, old)
                     }),
                     _ => false,
                 })
@@ -1314,6 +1344,17 @@ fn quoted_list(names: &[String]) -> String {
 }
 
 /// Hash a scalar attribute value, or `None` for anything a key cannot hold.
+/// Whether `key` carries `value` as a whole `#`-separated component.
+///
+/// Keys in this style are built from components joined with `#`, so a value
+/// a rule replaced shows up in one as a component: `CUSTOMER#alice@x` holds
+/// `alice@x`. Matching anywhere in the string instead would report
+/// `ORDER#1042` as holding a replaced `42`, and an exposure that fires on a
+/// coincidence is one people learn to wave through.
+fn holds_as_component(key: &str, value: &str) -> bool {
+    !value.is_empty() && (key == value || key.split('#').any(|component| component == value))
+}
+
 /// Which rows a key value is grouped with, as one hash.
 ///
 /// For a partition key that is the value itself. For a sort key it is the
@@ -2832,6 +2873,134 @@ mod tests {
             "but it is not an observed exposure: {:?}",
             d.model_exposures()
         );
+    }
+
+    #[test]
+    fn a_nested_rule_target_still_finds_its_value_in_a_key() {
+        // The rule is on profile.email. The snapshot used to read only the
+        // top-level `profile`, a map, and record nothing, so the address the
+        // rule replaced went unseen in the untemplated gs1pk.
+        let model = model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let rules = [rule(
+            "profile.email",
+            ValidatedAction::Fake {
+                generator: "safe_email".into(),
+                seed: None,
+            },
+        )];
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+
+        let mut profile = std::collections::HashMap::new();
+        profile.insert(
+            "email".to_string(),
+            AttributeValue::S("alice@real.co.uk".to_string()),
+        );
+        let mut it = item(&[
+            ("pk", "ORDER#o1"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "CUSTOMER#alice@real.co.uk"),
+            ("id", "o1"),
+        ]);
+        it.insert("profile".to_string(), AttributeValue::M(profile));
+
+        let mut warnings = Vec::new();
+        let plan = d.plan(&it, &mut warnings).unwrap();
+        let mut replaced = std::collections::HashMap::new();
+        replaced.insert(
+            "email".to_string(),
+            AttributeValue::S("fake@example.org".to_string()),
+        );
+        it.insert("profile".to_string(), AttributeValue::M(replaced));
+        let mut rewritten = HashSet::new();
+        rewritten.insert("profile".to_string());
+        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+
+        assert_eq!(
+            d.take_key_survivals(),
+            vec![("Order".to_string(), "gs1pk".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_value_has_to_sit_in_the_key_as_a_component_to_count() {
+        // id=42 was replaced. ORDER#1042 merely contains the digits; it does
+        // not hold the id. STATUS#42 does.
+        assert!(!holds_as_component("ORDER#1042", "42"));
+        assert!(holds_as_component("STATUS#42", "42"));
+        assert!(holds_as_component("CUSTOMER#alice@x", "alice@x"));
+        assert!(holds_as_component("alice@x", "alice@x"));
+        assert!(!holds_as_component("CUSTOMER#alice@x", ""));
+    }
+
+    #[test]
+    fn a_rule_for_another_table_does_not_shape_this_tables_keys() {
+        // The rule names pk, but only for Orders. On this table pk is not
+        // rule-owned, so a template that fails to reproduce it is counted
+        // rather than excused.
+        let mut scoped = rule("pk", ValidatedAction::Redact);
+        scoped.tables = Some(vec!["Orders".to_string()]);
+        let (mut d, _) =
+            KeyDeriver::new(&model(), &request(), &[scoped], &no_consistency()).unwrap();
+
+        let it = item(&[
+            ("_type", "User"),
+            ("pk", "somethingelse#1"),
+            ("sk", "user#a@x.co"),
+            ("email", "a@x.co"),
+        ]);
+        let mut warnings = Vec::new();
+        let _ = d.plan(&it, &mut warnings);
+        assert!(
+            d.take_unrebuilt()
+                .iter()
+                .any(|(e, k, _)| e == "User" && k == "pk"),
+            "pk did not reproduce and no applicable rule owns it"
+        );
+    }
+
+    #[test]
+    fn a_direct_key_rule_on_a_key_no_template_reproduces_is_still_join_checked() {
+        // Both entities arrived sharing pk = legacy#same, which neither
+        // template reproduces. A rule then rewrites pk with an unseeded fake
+        // and the two leave with different keys. That is a broken join, and
+        // a key excused from the mismatch count was also excused from this.
+        let rules = [rule(
+            "pk",
+            ValidatedAction::Fake {
+                generator: "word".into(),
+                seed: None,
+            },
+        )];
+        let (mut d, _) =
+            KeyDeriver::new(&shared_key_model(), &request(), &rules, &no_consistency()).unwrap();
+
+        let mut rewritten = HashSet::new();
+        rewritten.insert("pk".to_string());
+        for (ty, sk, becomes) in [
+            ("Customer", "PROFILE", "fake1"),
+            ("Order", "ORDER#1", "fake2"),
+        ] {
+            let mut it = item(&[
+                ("_type", ty),
+                ("pk", "legacy#same"),
+                ("sk", sk),
+                ("email", "a@x.co"),
+            ]);
+            let mut w = Vec::new();
+            let plan = d.plan(&it, &mut w).unwrap();
+            it.insert("pk".to_string(), AttributeValue::S(becomes.to_string()));
+            d.apply(&plan, &rewritten, &mut it, &mut w);
+        }
+
+        let breaks = d.join_breaks();
+        assert_eq!(breaks.len(), 1, "the shared key split: {breaks:?}");
     }
 
     #[test]

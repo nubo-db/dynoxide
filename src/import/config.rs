@@ -116,6 +116,19 @@ pub struct ValidatedRule {
     pub tables: Option<Vec<String>>,
 }
 
+impl ValidatedRule {
+    /// Whether the rule applies to `table`: every table unless it names some.
+    ///
+    /// One answer for every reader. The rule engine and the key rebuilder
+    /// both ask, and answering differently in the two places let a rule for
+    /// another table shape how this table's keys were judged.
+    pub fn applies_to(&self, table: &str) -> bool {
+        self.tables
+            .as_ref()
+            .is_none_or(|tables| tables.iter().any(|name| name == table))
+    }
+}
+
 /// A secret salt value with redacted Debug output.
 ///
 /// Wraps the raw salt bytes to prevent accidental leakage through

@@ -904,6 +904,7 @@ const EXIT_EXPOSURE: i32 = 3;
 /// Print the summary, then stop the pipeline if the run reported that real
 /// data reached the output. An anonymising import that says so and then exits
 /// 0 is a run whose failure looks exactly like its success.
+#[cfg(feature = "import")]
 fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: bool) {
     print_import_summary(summary);
     if summary.exposures.is_empty() || accept_exposure {
@@ -924,6 +925,7 @@ fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: boo
     std::process::exit(EXIT_EXPOSURE);
 }
 
+#[cfg(feature = "import")]
 fn print_import_summary(summary: &dynoxide::import::ImportSummary) {
     eprintln!();
     eprintln!("Import complete:");

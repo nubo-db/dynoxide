@@ -761,6 +761,10 @@ action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
         assert_eq!(parse_path("address.city").unwrap().len(), 2);
     }
 
+    // Only Unix lets a process set an environment value that is not UTF-8;
+    // Windows stores them as UTF-16 and the OsStr extension used here does
+    // not exist there.
+    #[cfg(unix)]
     #[test]
     fn a_secret_that_is_not_utf8_is_not_reported_as_unset() {
         use std::os::unix::ffi::OsStrExt;

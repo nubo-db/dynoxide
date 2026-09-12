@@ -31,11 +31,13 @@ Added.
   entries, and a seeded `fake` on a map, list or set goes through the map
   rather than being treated as deterministic.
 - **`dynoxide import` exits 3 when an original value reached the output**: a
-  rule that anonymised nothing, a key its template could not rebuild, items
-  matching no entity, an index whose keys are not rebuilt, or values a `mask`
-  kept whole. Those are listed again at the end of the run. Pass
-  `--accept-exposure` to exit 0 instead. `ImportSummary` gains an `exposures`
-  field holding the same list.
+  rule that anonymised nothing, a key its template could not rebuild, a key
+  the model never templated that still holds a replaced value, items matching
+  no entity, an index the model describes but the table lacks, or values a
+  `mask` kept whole. Those are listed again at the end of the run, and
+  `--serve` and `--mcp` refuse to start on them. Pass `--accept-exposure` to
+  exit 0 instead. `ImportSummary` gains an `exposures` field holding the same
+  list.
 - **`salt_env` and `seed_env` must be at least 16 bytes.** Generate one with
   `openssl rand -base64 24`.
 - **`fake` on a numeric attribute draws from the full 64-bit range** rather
@@ -68,6 +70,9 @@ Added.
   changed. Holds for a fixed build and for scalar values; mixing seeded and
   unseeded rules on one consistency field is reported
   ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
+- A rule can name the `tables` it applies to. A rule scoped to tables a run
+  leaves out with `--tables` is reported as not applied rather than as having
+  anonymised nothing.
 - Rules take `values` and `names` tables, in the shape of
   ExpressionAttributeValues and ExpressionAttributeNames, so a match can be
   scoped by key prefix or reach a reserved-word attribute. The rules file is
@@ -97,8 +102,8 @@ Added.
 
 #### Breaking (Rust API)
 
-- `ImportCommand` gains `data_model` and `accept_exposure` fields, so struct
-  literals need both adding. This is why the crate is 2.0.0.
+- `ImportCommand` gains a `data_model` field, so struct literals need it
+  adding. This is why the crate is 2.0.0.
 
 ### Fixed
 

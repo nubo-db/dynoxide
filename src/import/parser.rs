@@ -26,6 +26,11 @@ const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 /// which is the only way a cap on line length can also cap memory.
 const MAX_LINE_LENGTH: usize = 4 * 1024 * 1024;
 
+/// Most per-line warnings kept for one file. `skipped` still counts every
+/// line; past this the rest are summed into one line rather than held one
+/// string each, which a file of a million bad lines would otherwise cost.
+const MAX_LINE_WARNINGS: usize = 100;
+
 /// BufReader capacity (256 KB). The default 8 KB is too small for gzip
 /// decompression: larger buffers amortize decoder overhead significantly.
 const BUF_READER_CAPACITY: usize = 256 * 1024;
@@ -60,6 +65,14 @@ where
     let mut reader = BufReader::with_capacity(BUF_READER_CAPACITY, reader);
     let mut skipped = 0;
     let mut warnings = Vec::new();
+    let mut suppressed = 0usize;
+    let mut warn = |warnings: &mut Vec<String>, message: String| {
+        if warnings.len() < MAX_LINE_WARNINGS {
+            warnings.push(message);
+        } else {
+            suppressed += 1;
+        }
+    };
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut line_num = 0usize;
 
@@ -87,13 +100,16 @@ where
             LineRead::TooLong(len) => {
                 line_num += 1;
                 skipped += 1;
-                warnings.push(format!(
-                    "{}:{}: line exceeds maximum length of {} bytes ({} bytes)",
-                    path.display(),
-                    line_num,
-                    MAX_LINE_LENGTH,
-                    len
-                ));
+                warn(
+                    &mut warnings,
+                    format!(
+                        "{}:{}: line exceeds maximum length of {} bytes ({} bytes)",
+                        path.display(),
+                        line_num,
+                        MAX_LINE_LENGTH,
+                        len
+                    ),
+                );
                 continue;
             }
         };
@@ -107,9 +123,20 @@ where
             Ok(item) => handler(item),
             Err(e) => {
                 skipped += 1;
-                warnings.push(format!("{}:{}: {e}", path.display(), line_num));
+                warn(
+                    &mut warnings,
+                    format!("{}:{}: {e}", path.display(), line_num),
+                );
             }
         }
+    }
+
+    if suppressed > 0 {
+        warnings.push(format!(
+            "{}: {suppressed} further lines were skipped and not listed; {skipped} skipped \
+             in all",
+            path.display()
+        ));
     }
 
     Ok(StreamStats { skipped, warnings })
@@ -142,7 +169,13 @@ fn read_bounded_line<R: BufRead>(
     let mut discarded = 0usize;
     let mut too_long = false;
     loop {
-        let available = reader.fill_buf()?;
+        // Retried rather than failed, as `read_line` does: a signal landing
+        // mid-read on a network mount is not a reason to abandon the file.
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if available.is_empty() {
             return Ok(if too_long {
                 LineRead::TooLong(buf.len() + discarded)
@@ -607,6 +640,30 @@ mod tests {
         let mut all = Vec::new();
         let err = std::io::Read::read_to_end(&mut capped, &mut all).unwrap_err();
         assert!(err.to_string().contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn a_file_of_bad_lines_is_counted_in_full_but_listed_in_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        let mut body = String::new();
+        for _ in 0..10_000 {
+            body.push_str("not json\n");
+        }
+        std::fs::write(&path, body).unwrap();
+
+        let mut seen = 0;
+        let stats = parse_export_file_streaming(&path, |_| seen += 1).unwrap();
+        assert_eq!(seen, 0);
+        assert_eq!(stats.skipped, 10_000, "every bad line is counted");
+        assert!(
+            stats.warnings.len() <= MAX_LINE_WARNINGS + 1,
+            "but not every one is kept: {}",
+            stats.warnings.len()
+        );
+        let last = stats.warnings.last().unwrap();
+        assert!(last.contains("9900 further lines"), "{last}");
+        assert!(last.contains("10000 skipped in all"), "{last}");
     }
 
     #[test]

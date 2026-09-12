@@ -86,7 +86,6 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -144,7 +143,6 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -186,7 +184,6 @@ mod tests {
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -240,7 +237,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -323,7 +319,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -389,7 +384,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -423,7 +417,6 @@ fields = ["email"]
             compress: true,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -463,7 +456,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         });
 
@@ -980,7 +972,6 @@ fields = ["email"]
                 compress: false,
                 force: false,
                 continue_on_error: false,
-                accept_exposure: true,
             },
         )
         .unwrap();
@@ -1106,7 +1097,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1157,7 +1147,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap_err();
@@ -1203,7 +1192,6 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1275,7 +1263,6 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1332,7 +1319,6 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1381,7 +1367,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1445,7 +1430,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1524,7 +1508,6 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(model_file),
         })
     }
@@ -1630,7 +1613,6 @@ action = { type = "fake", generator = "safe_email" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -1730,7 +1712,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(model_file),
         })
         .unwrap();
@@ -1819,7 +1800,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(model_file),
         })
         .unwrap();
@@ -1904,7 +1884,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -1955,7 +1934,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -2021,7 +1999,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(model_file),
         })
         .unwrap_err();
@@ -2077,7 +2054,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: Some(onetable_fixture()),
         })
         .unwrap();
@@ -2116,7 +2092,6 @@ action = { type = "redact" }
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap()
@@ -2245,7 +2220,6 @@ fields = ["email"]
             compress: false,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap()
@@ -2427,7 +2401,6 @@ action = { type = "redact" }
                 compress: false,
                 force: false,
                 continue_on_error,
-                accept_exposure: true,
                 data_model: None,
             })
         };
@@ -2475,7 +2448,6 @@ action = { type = "redact" }
             compress: true,
             force: false,
             continue_on_error: false,
-            accept_exposure: true,
             data_model: None,
         })
         .unwrap();
@@ -2497,6 +2469,164 @@ action = { type = "redact" }
             leftovers.is_empty(),
             "no temp files left behind: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn a_rule_scoped_to_a_table_left_out_is_not_an_exposure() {
+        // A shared rules file run with --tables: the rule for the table left
+        // out matched nothing here, which is not a value left behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+
+[[rules]]
+match = "attribute_exists(amount)"
+path = "amount"
+action = { type = "redact" }
+tables = ["Orders"]
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("out.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: Some(vec!["Users".to_string()]),
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap();
+
+        assert!(
+            summary.exposures.is_empty(),
+            "the Orders rule had nothing to do here: {:?}",
+            summary.exposures
+        );
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("rule 2") && w.contains("scoped to 'Orders'")),
+            "but it is said: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn force_is_judged_against_the_path_a_compressed_run_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}}}"#],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        let run = |name: &str, force: bool| {
+            import::run(ImportCommand {
+                source: source.clone(),
+                output: Some(tmp.path().join(name)),
+                schema: schema_file.clone(),
+                rules: None,
+                tables: None,
+                compress: true,
+                force,
+                continue_on_error: false,
+                data_model: None,
+            })
+        };
+
+        // An existing archive is what --force protects.
+        std::fs::write(tmp.path().join("taken.db.zst"), b"old").unwrap();
+        let err = run("taken.db", false).unwrap_err().to_string();
+        assert!(
+            err.contains("taken.db.zst") && err.contains("--force"),
+            "{err}"
+        );
+        run("taken.db", true).expect("with --force the archive is replaced");
+
+        // A stray database at the uncompressed name is not in the way.
+        std::fs::write(tmp.path().join("stray.db"), b"unrelated").unwrap();
+        run("stray.db", false).expect("the run never writes stray.db");
+        assert_eq!(
+            std::fs::read(tmp.path().join("stray.db")).unwrap(),
+            b"unrelated"
+        );
+    }
+
+    #[cfg(feature = "mcp-server")]
+    #[test]
+    fn serving_is_refused_when_an_original_value_reached_the_output() {
+        // The serve path used to print the warning and then serve the real
+        // values. The gate has to run before any server exists, so this
+        // process must exit 3 rather than sit listening.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(
+            &rules_file,
+            "[[rules]]\nmatch = \"attribute_exists(pk)\"\npath = \"emial\"\naction = { type = \"redact\" }\n",
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+            .args(["import", "--mcp", "--source"])
+            .arg(&source)
+            .arg("--schema")
+            .arg(&schema_file)
+            .arg("--rules")
+            .arg(&rules_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the binary runs");
+
+        // Poll rather than wait: if the gate failed to fire the process would
+        // be serving, and the test must report that rather than hang.
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if started.elapsed() > std::time::Duration::from_secs(20) {
+                let _ = child.kill();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let status = status.expect("the process exited instead of serving");
+        assert_eq!(status.code(), Some(3), "exit 3 before any server starts");
     }
 
     #[test]

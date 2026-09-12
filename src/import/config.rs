@@ -43,6 +43,12 @@ pub struct RuleConfig {
     /// Attribute path to transform (supports dot notation: `address.city`).
     pub path: String,
 
+    /// Tables this rule applies to. Empty means every table. A rule scoped to
+    /// tables a run leaves out with `--tables` has nothing to do there and is
+    /// not reported as having anonymised nothing.
+    #[serde(default)]
+    pub tables: Vec<String>,
+
     /// The anonymisation action to apply.
     pub action: ActionConfig,
 }
@@ -106,6 +112,8 @@ pub struct ValidatedRule {
     pub path: Vec<crate::expressions::PathElement>,
     /// The action to apply.
     pub action: ValidatedAction,
+    /// Tables the rule applies to; `None` means all of them.
+    pub tables: Option<Vec<String>>,
 }
 
 /// A secret salt value with redacted Debug output.
@@ -204,16 +212,34 @@ pub fn load_and_validate(
 
         let action = validate_action(&rule.action, i + 1)?;
 
+        let tables = scoped_tables(&rule.tables, i + 1)?;
+
         validated.push(ValidatedRule {
             condition,
             names,
             values,
             path,
             action,
+            tables,
         });
     }
 
     Ok((validated, config.consistency))
+}
+
+/// A rule's `tables` list: empty means every table, and a blank name is a
+/// typo that would scope the rule to nothing.
+fn scoped_tables(tables: &[String], rule_num: usize) -> Result<Option<Vec<String>>, String> {
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    if let Some(blank) = tables.iter().find(|t| t.trim().is_empty()) {
+        return Err(format!(
+            "Rule {rule_num}: tables contains an empty name ({blank:?}); name the table or \
+             leave the list out to apply the rule everywhere"
+        ));
+    }
+    Ok(Some(tables.to_vec()))
 }
 
 /// Check a rule's `names` table: every alias starts with `#`.
@@ -729,6 +755,7 @@ action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
         assert!(!seeded_debug.contains("super"));
 
         let rule = ValidatedRule {
+            tables: None,
             condition: crate::expressions::condition::parse("attribute_exists(email)").unwrap(),
             names: None,
             values: None,
@@ -740,6 +767,47 @@ action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
         let rule_debug = format!("{:?}", rule);
         assert!(rule_debug.contains("[REDACTED]"));
         assert!(!rule_debug.contains("super"));
+    }
+
+    #[test]
+    fn a_rule_can_be_scoped_to_tables() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+tables = ["Orders", "Customers"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.tables.as_deref(),
+            Some(&["Orders".to_string(), "Customers".to_string()][..])
+        );
+
+        let everywhere = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(everywhere.tables, None, "no list means every table");
+
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+tables = ["Orders", " "]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty name"), "{err}");
     }
 
     #[test]
@@ -852,6 +920,7 @@ values = { ":a" = "x" }
         condition::validate_static(&condition, &values)?;
         condition::validate_operand_semantics(&condition, &names, &values)?;
         Ok(ValidatedRule {
+            tables: scoped_tables(&rule.tables, 1)?,
             condition,
             names,
             values,

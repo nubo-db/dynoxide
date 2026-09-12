@@ -288,6 +288,10 @@ struct Outcome {
 pub struct Rederivation {
     entity: usize,
     keys: Vec<usize>,
+    /// Scalar values of the rule-target attributes as the item arrived, so
+    /// `apply` can see whether a key the model never templated still holds
+    /// one after the rules replaced it.
+    originals: Vec<(String, String)>,
     /// (at-risk index, hash of the value this item arrived with), so `apply`
     /// can see whether two entities anonymised a shared value differently.
     at_risk_originals: Vec<(usize, u64)>,
@@ -311,6 +315,12 @@ pub struct KeyDeriver {
     /// Key attributes a rule names directly, so `plan` can tell a template
     /// that failed from a key the rules were always going to replace.
     rule_targets: HashSet<String>,
+    /// Every key attribute the table and its indexes have, so `apply` can
+    /// find the ones an entity carries but its model never templates.
+    schema_keys: Vec<String>,
+    /// (entity, key attribute) -> items whose untemplated key still held a
+    /// value a rule had replaced. Warned once, counted throughout.
+    survived: HashMap<(usize, String), usize>,
     /// Construction-time warnings that mean a key will keep the value it
     /// arrives with, kept apart from the rest so the caller can say the run
     /// left original data in the output.
@@ -369,6 +379,25 @@ impl KeyDeriver {
         // place, and splitting them then reads as a join break that never
         // existed. An attribute that is a partition key anywhere groups by
         // itself, whatever else it sorts.
+        let mut schema_keys: Vec<String> = Vec::new();
+        for name in hash.into_iter().chain(range) {
+            schema_keys.push(name.to_string());
+        }
+        for index in gsis {
+            for ks in &index.key_schema {
+                if !schema_keys.contains(&ks.attribute_name) {
+                    schema_keys.push(ks.attribute_name.clone());
+                }
+            }
+        }
+        for index in request.local_secondary_indexes.as_deref().unwrap_or(&[]) {
+            for ks in &index.key_schema {
+                if !schema_keys.contains(&ks.attribute_name) {
+                    schema_keys.push(ks.attribute_name.clone());
+                }
+            }
+        }
+
         let mut partition_keys: HashSet<&str> = HashSet::new();
         partition_keys.extend(hash);
         for gsi in gsis {
@@ -405,10 +434,15 @@ impl KeyDeriver {
         // one with a sort key and no hash, and the parser keeps only indexes
         // that name a hash attribute. Say so rather than leave its sort key
         // quietly holding the value it arrived with.
+        // A warning rather than an exposure: the model says nothing about an
+        // LSI, so nothing says its sort key embeds an attribute a rule
+        // touches. An index the model does describe but the table lacks is
+        // different, and stays an exposure below, because there the model
+        // itself claims those keys are built from attributes.
         if let Some(lsis) = request.local_secondary_indexes.as_deref()
             && !lsis.is_empty()
         {
-            model_exposures.push(format!(
+            warnings.push(format!(
                 "table '{}' has {} local secondary index(es); their sort keys are not rebuilt \
                  from templates and keep the values they arrive with",
                 request.table_name,
@@ -707,6 +741,8 @@ impl KeyDeriver {
                 range_attribute: range.map(String::from),
                 warned_mismatch: HashMap::new(),
                 rule_targets: rule_targets.iter().map(|a| (*a).to_string()).collect(),
+                schema_keys,
+                survived: HashMap::new(),
                 model_exposures,
                 warned_unrenderable: HashMap::new(),
                 warned_rule_wins: HashSet::new(),
@@ -801,9 +837,22 @@ impl KeyDeriver {
             .collect();
         let at_risk_originals = self.at_risk_originals(entity_idx, item, &rebuilt);
 
+        // Only the attributes a rule can rewrite, so this stays bounded by
+        // the rules file rather than the item.
+        let originals: Vec<(String, String)> = self
+            .rule_targets
+            .iter()
+            .filter_map(|attribute| match item.get(attribute)? {
+                AttributeValue::S(s) => Some((attribute.clone(), s.clone())),
+                AttributeValue::N(n) => Some((attribute.clone(), n.clone())),
+                _ => None,
+            })
+            .collect();
+
         Some(Rederivation {
             entity: entity_idx,
             keys,
+            originals,
             at_risk_originals,
         })
     }
@@ -979,11 +1028,55 @@ impl KeyDeriver {
             }
         }
 
+        // A key the model gives this entity no template for is not rebuilt,
+        // and nothing above looked at it. If a value a rule just replaced is
+        // still sitting inside it, that is real data in a key on a run that
+        // would otherwise report success. Judged on what is seen in the key,
+        // not on the index existing.
+        let survivals: Vec<String> = {
+            let entity = &self.entities[plan.entity];
+            self.schema_keys
+                .iter()
+                .filter(|key| !entity.match_keys.iter().any(|k| &k.attribute == *key))
+                .filter(|key| match item.get(key.as_str()) {
+                    Some(AttributeValue::S(value)) => plan.originals.iter().any(|(attr, old)| {
+                        rewritten_by_rules.contains(attr) && !old.is_empty() && value.contains(old)
+                    }),
+                    _ => false,
+                })
+                .cloned()
+                .collect()
+        };
+        for key in survivals {
+            let seen = self.survived.entry((plan.entity, key.clone())).or_insert(0);
+            *seen += 1;
+            if *seen == 1 {
+                warnings.push(format!(
+                    "entity '{}': {key} still holds a value a rule replaced, and the model gives \
+                     this entity no template for {key}, so nothing rebuilt it; the count is \
+                     reported once the table has been read",
+                    self.entities[plan.entity].name
+                ));
+            }
+        }
+
         // Every item's primary key is recorded, not only a rebuilt one: a
         // rebuilt key can land on a row that was left alone, and counting
         // only rebuilds would miss the row that got overwritten.
         self.note_primary_key(item);
         self.note_at_risk_results(plan, item);
+    }
+
+    /// Items whose untemplated key still held a value a rule replaced, by
+    /// entity and key. These are values the run exists to remove.
+    pub fn take_key_survivals(&mut self) -> Vec<(String, String, usize)> {
+        let mut out: Vec<(String, String, usize)> = self
+            .survived
+            .drain()
+            .map(|((entity, key), count)| (self.entities[entity].name.clone(), key, count))
+            .collect();
+        out.sort();
+        out
     }
 
     /// Remember this item's primary key so a later item landing on the same
@@ -1452,6 +1545,7 @@ mod tests {
 
     fn rule(path: &str, action: ValidatedAction) -> ValidatedRule {
         ValidatedRule {
+            tables: None,
             condition: condition::parse("attribute_exists(pk)").unwrap(),
             names: None,
             values: None,
@@ -1829,6 +1923,7 @@ mod tests {
         // must still be rebuilt, or the real email survives in the key.
         let rules = [
             ValidatedRule {
+                tables: None,
                 condition: condition::parse("attribute_exists(accountName)").unwrap(),
                 names: None,
                 values: None,
@@ -2530,15 +2625,31 @@ mod tests {
             let _ = d.plan(&it, &mut warnings);
         }
 
+        // A fourth item whose template does match, made unrenderable after the
+        // rules by turning `email` into a map. User's sk reads `email`, so the
+        // same (User, sk) lands in both maps and the merge has something to
+        // merge; its pk reads `accountId` and is untouched by this.
+        let mut u = user();
+        let mut w = Vec::new();
+        let plan = d
+            .plan(&u, &mut w)
+            .expect("the template reproduces this one");
+        u.insert(
+            "email".to_string(),
+            AttributeValue::M(std::collections::HashMap::new()),
+        );
+        d.apply(&plan, &no_rewrites(), &mut u, &mut w);
+
         let counts = d.take_unrebuilt();
         assert!(!counts.is_empty(), "the keys were not rebuilt");
-        for (entity, key, count) in &counts {
-            assert_eq!(
-                *count, 3,
-                "every one of the three items kept {entity}'s {key}: {counts:?}"
-            );
-        }
-
+        let sk_row = counts
+            .iter()
+            .find(|(e, k, _)| e == "User" && k == "sk")
+            .expect("a row for User/sk");
+        assert_eq!(
+            sk_row.2, 4,
+            "three mismatches and one unrenderable are one fact: {counts:?}"
+        );
         // One row per (entity, key). The two causes, a template that does not
         // reproduce and a key that cannot render after the rules, describe the
         // same outcome and used to be listed twice with two partial counts.
@@ -2639,6 +2750,150 @@ mod tests {
             2,
             "a sort key shared by two indexes has two groupings: {groupings:?}"
         );
+
+        // And the bucket itself: two rows whose GSI1 and GSI2 partitions
+        // spell the same string the other way round share no group in
+        // either index, so splitting their code costs nothing. Bucketing on
+        // the value alone put item 1's GSI2 row and item 2's GSI1 row in one
+        // bucket and reported a split that never happened.
+        let mut d = d;
+        let row = |id: &str, tenant: &str, region: &str| {
+            item(&[
+                ("pk", &format!("EVENT#{id}")),
+                ("sk", "EVENT#"),
+                ("gs1pk", &format!("T#{tenant}")),
+                ("gs1sk", "CODE#c1"),
+                ("gs2pk", &format!("T#{region}")),
+                ("id", id),
+                ("tenant", tenant),
+                ("region", region),
+                ("code", "c1"),
+            ])
+        };
+        run_item_on(&mut d, row("e1", "a", "b"), "code", "fake1");
+        run_item_on(&mut d, row("e2", "b", "a"), "code", "fake2");
+        assert!(
+            d.join_breaks().is_empty(),
+            "different groups in every index: {:?}",
+            d.join_breaks()
+        );
+        assert!(
+            d.sort_key_splits().is_empty(),
+            "and no split to report either: {:?}",
+            d.sort_key_splits()
+        );
+    }
+
+    #[test]
+    fn a_local_secondary_index_is_a_warning_not_an_exposure() {
+        // The model says nothing about an LSI, so nothing says its sort key
+        // embeds an attribute a rule touches. Reporting it is right; making
+        // every LSI table exit 3 was not.
+        let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "TableName": "App",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "lsisk", "AttributeType": "S"}
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "LSI1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsisk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }))
+        .unwrap();
+        // No GSI mapping, so the only thing the model can be told about the
+        // table is the LSI. (An index the model describes but the table lacks
+        // is a different case, and is meant to be an exposure.)
+        let model = model_with(vec![EntityDefinition {
+            name: "User".to_string(),
+            pk_template: "user#${id}".to_string(),
+            sk_template: Some("user#${email}".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let (d, warnings) =
+            KeyDeriver::new(&model, &request, &email_rule(), &no_consistency()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("local secondary index")),
+            "it is said: {warnings:?}"
+        );
+        assert!(
+            d.model_exposures().is_empty(),
+            "but it is not an observed exposure: {:?}",
+            d.model_exposures()
+        );
+    }
+
+    #[test]
+    fn a_key_the_model_never_templates_that_still_holds_a_replaced_value_is_counted() {
+        // The entity's model says nothing about gs1pk, so it is not rebuilt.
+        // The item carries it, built from the email a rule then replaced. The
+        // real address is in a key on a run that would otherwise pass.
+        let model = model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let (mut d, _) =
+            KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).unwrap();
+
+        let mut it = item(&[
+            ("pk", "ORDER#o1"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "CUSTOMER#alice@real.co.uk"),
+            ("id", "o1"),
+            ("email", "alice@real.co.uk"),
+        ]);
+        let mut warnings = Vec::new();
+        let plan = d.plan(&it, &mut warnings).unwrap();
+        it.insert(
+            "email".to_string(),
+            AttributeValue::S("fake@example.org".to_string()),
+        );
+        let mut rewritten = HashSet::new();
+        rewritten.insert("email".to_string());
+        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("gs1pk still holds a value a rule replaced")),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            d.take_key_survivals(),
+            vec![("Order".to_string(), "gs1pk".to_string(), 1)]
+        );
+
+        // The other direction: a key holding nothing a rule touched is not
+        // counted, or every untemplated index would raise this.
+        let mut clean = item(&[
+            ("pk", "ORDER#o2"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "STATUS#open"),
+            ("id", "o2"),
+            ("email", "bob@real.co.uk"),
+        ]);
+        let plan = d.plan(&clean, &mut warnings).unwrap();
+        clean.insert(
+            "email".to_string(),
+            AttributeValue::S("fake2@example.org".to_string()),
+        );
+        d.apply(&plan, &rewritten, &mut clean, &mut warnings);
+        assert!(d.take_key_survivals().is_empty());
     }
 
     #[test]

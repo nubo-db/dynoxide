@@ -960,7 +960,6 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
         compress: args.compress,
         force: args.force,
         continue_on_error: args.continue_on_error,
-        accept_exposure: args.accept_exposure,
     }
 }
 
@@ -986,7 +985,10 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         let db = Database::memory()?;
         let cmd = build_import_command(&args);
         let summary = dynoxide::import::run_into(&db, cmd)?;
-        print_import_summary(&summary);
+        // The gate runs before any server is built. Serving is the one
+        // outcome worse than writing a file, because the real values are
+        // handed out on request rather than sitting in a file nobody opened.
+        finish_import(&summary, args.accept_exposure);
         eprintln!();
 
         // Both --serve and --mcp: run HTTP + MCP concurrently

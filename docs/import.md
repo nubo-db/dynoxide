@@ -265,13 +265,31 @@ about ten times the largest DynamoDB item; a longer one is skipped and
 reported, and it is never held in memory past the limit. An item nests at most
 32 levels, as in DynamoDB.
 
+### Scoping a rule to tables
+
+A rule applies to every table unless it names some:
+
+```toml
+[[rules]]
+match = "attribute_exists(total)"
+path = "total"
+action = { type = "redact" }
+tables = ["Orders"]
+```
+
+The scope matters most with `--tables`. A rule for a table the run leaves out
+has nothing to do, and is reported as not applied rather than as having
+anonymised nothing, which is what an unscoped rule that fires on no item is.
+
 ### Exit codes
 
 An import that leaves an original value in the output exits **3** rather than
 0. That covers what the run actually saw: a rule that anonymised nothing, a
-key whose template could not rebuild it, items matching no entity, an index
-whose keys are not rebuilt, and values a `mask` kept whole. Each one is printed
-again at the end under the count, so the reason is in front of you.
+key whose template could not rebuild it, a key the model never templated that
+still holds a value a rule replaced, items matching no entity, an index the
+model describes but the table lacks, and values a `mask` kept whole. Each one
+is printed again at the end under the count, so the reason is in front of you.
+`--serve` and `--mcp` are gated the same way, before any server starts.
 
 `--accept-exposure` returns those runs to 0 for the cases you have looked at
 and accept. Everything else is unchanged: 0 is a clean import, 1 is a failure,

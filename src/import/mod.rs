@@ -76,10 +76,6 @@ pub struct ImportCommand {
     pub compress: bool,
     /// Overwrite existing output file without prompting.
     pub force: bool,
-    /// Finish with success even when the run reports that an original value
-    /// reached the output. Off by default: an import whose whole purpose is to
-    /// remove personal data should not report success having left some behind.
-    pub accept_exposure: bool,
     /// Continue importing when a batch fails (default: fail-fast).
     /// When true, batch errors are recorded as warnings and import continues.
     /// When false (default), the first batch error aborts the import.
@@ -434,12 +430,15 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         .and_then(|d| d.plan(&item, &mut warnings));
                     let (rule_warnings, rewritten) = anonymise::apply_rules(
                         &mut item,
+                        table_name,
                         &rules,
                         &mut consistency_map,
                         &consistency_fields,
                         &key_attrs,
-                        &mut mask_passthroughs,
-                        &mut rule_work,
+                        &mut anonymise::RuleTally {
+                            mask_passthroughs: &mut mask_passthroughs,
+                            rule_work: &mut rule_work,
+                        },
                     );
                     warnings.extend(rule_warnings);
                     match (key_deriver.as_mut(), plan) {
@@ -551,10 +550,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 for w in &summary.warnings {
                     eprintln!("  - {w}");
                 }
-                // `run_into` writes into a database the caller supplied and
-                // goes on using, so the bulk-loading PRAGMAs have to come off
-                // on the way out. Leaving `synchronous = OFF` on someone
-                // else's connection trades their durability for our import.
+                // The BulkLoading guard from step 5 restores the PRAGMAs.
                 return Err(ImportError::Config(format!(
                     "table '{}': {}{}",
                     table_name,
@@ -571,6 +567,17 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 summary
                     .warnings
                     .push(format!("table '{table_name}': {message}"));
+            }
+
+            for (entity, key, count) in deriver.take_key_survivals() {
+                note_exposure(
+                    &mut summary,
+                    format!(
+                        "table '{table_name}': entity '{entity}' carries {key} on {count} items \
+                         with a value a rule replaced still inside it. The model gives that \
+                         entity no template for {key}, so nothing rebuilt it"
+                    ),
+                );
             }
 
             for (entity, key, count) in deriver.take_unrebuilt() {
@@ -668,6 +675,22 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             .get(index)
             .map(|r| crate::expressions::format_path_for_error(&r.path))
             .unwrap_or_default();
+        // A rule scoped to tables this run did not read had no work to do,
+        // so its silence is not a value left behind. Without the scope a
+        // shared rules file run with --tables raised an exposure on every
+        // run for the rules aimed at the tables left out.
+        if let Some(tables) = rules.get(index).and_then(|r| r.tables.as_ref())
+            && !tables
+                .iter()
+                .any(|t| export_files.iter().any(|(name, _)| name == t))
+        {
+            summary.warnings.push(format!(
+                "rule {number} (path '{path}') is scoped to {} and none of those tables is in \
+                 this run, so it was not applied",
+                quoted_tables(tables)
+            ));
+            continue;
+        }
         if work.matched == 0 {
             note_exposure(
                 &mut summary,
@@ -721,16 +744,24 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
         .as_ref()
         .ok_or_else(|| ImportError::Config("output path required for file-based import".into()))?;
 
-    // Check for existing output file
-    if output.exists() && !cmd.force {
+    // Check the path this run will write, which under --compress is the
+    // archive, not the database name given. Checking the wrong one let an
+    // existing archive be replaced without --force and blocked a compressed
+    // run on a stray database it was never going to touch.
+    let compress = cmd.compress;
+    let final_path = if compress {
+        output.with_extension("db.zst")
+    } else {
+        output.clone()
+    };
+    if final_path.exists() && !cmd.force {
         return Err(ImportError::Config(format!(
             "Output file '{}' already exists. Use --force to overwrite.",
-            output.display()
+            final_path.display()
         )));
     }
 
     let output_path = output.clone();
-    let compress = cmd.compress;
 
     // Write to a temp file in the same directory as the output so that
     // persist() can do an atomic rename (same filesystem). On failure,
@@ -776,7 +807,7 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
     // one shape "nothing is persisted on the error path" promised not to
     // produce.
     if compress {
-        let compressed_path = output_path.with_extension("db.zst");
+        let compressed_path = final_path;
         let compressed_tmp = tempfile::NamedTempFile::new_in(output_dir)
             .map_err(|e| ImportError::Database(format!("Failed to create temp file: {e}")))?
             .into_temp_path();
@@ -938,7 +969,16 @@ fn mixed_consistency_rules(
     messages
 }
 
-/// Extract key attribute names from a CreateTableRequest.
+/// `'a'`, or `'a' and 'b'`, for a message.
+fn quoted_tables(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// Record a warning that says an original value reached the output.
 ///
 /// It goes in `warnings` like any other, so the printed summary is unchanged,

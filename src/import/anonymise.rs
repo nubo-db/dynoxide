@@ -37,6 +37,15 @@ pub struct RuleWork {
     pub rewrote: usize,
 }
 
+/// What `apply_rules` accumulates across every item of a table, so a run can
+/// report it once at the end rather than once per item.
+pub struct RuleTally<'a> {
+    /// Values a `mask` rule left as they arrived, by attribute.
+    pub mask_passthroughs: &'a mut std::collections::HashMap<String, usize>,
+    /// What each rule did, one entry per rule.
+    pub rule_work: &'a mut [RuleWork],
+}
+
 /// Apply all matching rules to an item, mutating it in place.
 ///
 /// Returns the warnings raised (e.g. key attribute collision risks) and the
@@ -49,13 +58,17 @@ pub struct RuleWork {
 /// left it, not as it arrived.
 pub fn apply_rules(
     item: &mut Item,
+    table: &str,
     rules: &[ValidatedRule],
     consistency_map: &mut ConsistencyMap,
     consistency_fields: &std::collections::HashSet<String>,
     key_attrs: &[String],
-    mask_passthroughs: &mut std::collections::HashMap<String, usize>,
-    rule_work: &mut [RuleWork],
+    tally: &mut RuleTally<'_>,
 ) -> (Vec<String>, std::collections::HashSet<String>) {
+    let RuleTally {
+        mask_passthroughs,
+        rule_work,
+    } = tally;
     let mut warnings = Vec::new();
     let mut rewritten = std::collections::HashSet::new();
     // Attributes already counted as kept whole for this item, so two mask
@@ -70,6 +83,12 @@ pub fn apply_rules(
         let work = rule_work
             .get_mut(rule_idx)
             .expect("one entry per rule, sized by the caller");
+        // A rule scoped to other tables neither matches nor counts here.
+        if let Some(tables) = &rule.tables
+            && !tables.iter().any(|t| t == table)
+        {
+            continue;
+        }
         if !matches_item(rule, item) {
             continue;
         }
@@ -578,6 +597,7 @@ mod tests {
             values: None,
             path: crate::import::config::parse_path(path).expect("a valid path"),
             action,
+            tables: None,
         }
     }
 
@@ -602,12 +622,33 @@ mod tests {
     ) {
         apply_rules(
             item,
+            "Users",
             rules,
             &mut ConsistencyMap::new(),
             &std::collections::HashSet::new(),
             &[],
-            passthroughs,
-            work,
+            &mut RuleTally {
+                mask_passthroughs: passthroughs,
+                rule_work: work,
+            },
+        );
+    }
+
+    #[test]
+    fn a_rule_scoped_to_another_table_neither_matches_nor_counts() {
+        let mut rule = test_rule("email", ValidatedAction::Redact);
+        rule.tables = Some(vec!["Orders".to_string()]);
+        let rules = [rule];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut it = item_with_email();
+        apply_for_test(&mut it, &rules, &mut work, &mut passthroughs);
+
+        assert_eq!(work[0].matched, 0, "the rule is not for this table");
+        assert_eq!(
+            it.get("email"),
+            Some(&AttributeValue::S("real@example.com".to_string())),
+            "so it changed nothing here"
         );
     }
 

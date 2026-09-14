@@ -250,7 +250,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         return Err(ImportError::Config(format!(
             "a data model describes one table, and this run covers {}. Pass --tables with \
              the one the model describes",
-            quoted_tables(&names)
+            quoted_names(&names)
         )));
     }
 
@@ -842,7 +842,7 @@ fn report_unused_rules(
             summary.notice(Notice::caution(format!(
                 "rule {number} (path '{path}') is scoped to {} and none of those tables is in \
                  this run, so it was not applied",
-                quoted_tables(tables)
+                quoted_names(tables)
             )));
             continue;
         }
@@ -1129,17 +1129,26 @@ fn refuse_scopes_outside_the_schema(
              tables are {}",
             index + 1,
             crate::expressions::format_path_for_error(&rule.path),
-            quoted_tables(&missing),
+            quoted_names(&missing),
             if missing.len() > 1 { "tables" } else { "table" },
-            quoted_tables(&known)
+            quoted_names(&known)
         )));
     }
     Ok(())
 }
 
-/// `'a'`, or `'a' and 'b'`, for a message.
-fn quoted_tables(names: &[String]) -> String {
-    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+/// `'a'`, or `'a' and 'b'`, or `'a', 'b' and 'c'`, for a message that names
+/// tables, indexes or attributes. One helper for the whole importer, so every
+/// message lists names the same way.
+pub(crate) fn quoted_names<I, S>(names: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let quoted: Vec<String> = names
+        .into_iter()
+        .map(|n| format!("'{}'", n.as_ref()))
+        .collect();
     match quoted.split_last() {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),

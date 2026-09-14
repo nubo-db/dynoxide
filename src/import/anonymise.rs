@@ -55,7 +55,10 @@ pub struct Rewritten {
     /// The paths of the rules that rewrote something, spelled as the rules
     /// file spells them. Two rules under one root can differ in whether they
     /// fired, and a rule that passed an item by has replaced nothing beneath
-    /// its path, so the root alone cannot say what was replaced.
+    /// its path, so the root alone cannot say what was replaced. A mask that
+    /// kept a short value whole is listed here too: its pass-through is
+    /// reported on its own, and a copy of the value in a key is then reported
+    /// as well rather than missed.
     pub paths: std::collections::HashSet<String>,
 }
 

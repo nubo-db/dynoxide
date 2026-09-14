@@ -982,7 +982,7 @@ impl KeyDeriver {
                          entities will not join",
                         entity_list(entities, &entities_using),
                         key_attribute,
-                        quoted_list(&unlisted)
+                        super::quoted_names(&unlisted)
                     )));
                 }
                 AtRisk {
@@ -1481,7 +1481,7 @@ impl KeyDeriver {
             )));
         }
         if !self.unmatched_model_indexes.is_empty() {
-            let indexes = quoted_list(&self.unmatched_model_indexes);
+            let indexes = super::quoted_names(&self.unmatched_model_indexes);
             for (key, count) in std::mem::take(&mut self.untemplated_index_keys) {
                 out.push(Notice::exposure(format!(
                     "{count} items carry {key}, a key of an index no entity in the data model \
@@ -1624,7 +1624,7 @@ impl KeyDeriver {
                     format!(
                         "Add {} to [consistency] fields, or use a deterministic action such \
                          as hash",
-                        quoted_list(&risk.consistency_roots)
+                        super::quoted_names(&risk.consistency_roots)
                     )
                 };
 
@@ -1776,16 +1776,6 @@ impl KeyDeriver {
     }
 }
 
-/// `'a'`, or `'a' and 'b'`, for a message.
-fn quoted_list(names: &[String]) -> String {
-    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
-    match quoted.split_last() {
-        Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
-        None => String::new(),
-    }
-}
-
 /// Hash a scalar attribute value, or `None` for anything a key cannot hold.
 /// Whether `key` carries `value` as a whole component.
 ///
@@ -1801,20 +1791,29 @@ fn quoted_list(names: &[String]) -> String {
 ///
 /// Case is folded on both sides. A key is often built from a lower-cased
 /// address while the attribute keeps the spelling the customer typed, and
-/// the address in the key is the same address.
+/// the address in the key is the same address. The exact spelling is tried
+/// first: folding is sensitive to what follows a letter (a Greek capital
+/// sigma lowercases one way at the end of a word and another way inside
+/// one), so a name can fold differently inside a key than on its own, and
+/// the folded search alone would miss a copy the exact search finds.
 fn holds_as_component(key: &str, value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    // The boundaries are read from the folded key, so they fall on its own
-    // character boundaries even where folding changed a length.
-    let key = key.to_lowercase();
-    let value = value.to_lowercase();
+    // The boundaries are read from the string that was searched, so they
+    // fall on its own character boundaries even where folding changed a
+    // length.
+    bounded_in(key, value) || bounded_in(&key.to_lowercase(), &value.to_lowercase())
+}
+
+/// Whether `value` sits in `key` bounded by non-alphanumeric characters or
+/// the key's ends, spelled exactly as given.
+fn bounded_in(key: &str, value: &str) -> bool {
     // Every start is tried, not only the non-overlapping ones `match_indices`
     // yields: a value that overlaps itself can fail the boundary where it
     // first appears and pass at a start inside that first match.
     let mut from = 0;
-    while let Some(offset) = key[from..].find(value.as_str()) {
+    while let Some(offset) = key[from..].find(value) {
         let start = from + offset;
         let before = key[..start].chars().next_back();
         let after = key[start + value.len()..].chars().next();
@@ -3669,6 +3668,16 @@ mod tests {
         assert!(holds_as_component("xa#a#a", "a#a"));
         assert!(!holds_as_component("xa#a#ax", "a#a"));
         assert!(!holds_as_component("CUSTOMER#alice@x", ""));
+    }
+
+    #[test]
+    fn a_name_that_folds_differently_inside_a_key_still_counts() {
+        // A Greek capital sigma lowercases to a final sigma on its own and to
+        // a medial one when letters follow, and an apostrophe does not break
+        // the word for that purpose. Folded separately, the key and the name
+        // spell the same name two ways; the exact match is what finds it.
+        assert!(holds_as_component("USER#ΝΙΚΟΣ'ACCOUNT", "ΝΙΚΟΣ"));
+        assert!(holds_as_component("user#νικος'account", "ΝΙΚΟΣ"));
     }
 
     #[test]

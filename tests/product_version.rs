@@ -2,40 +2,44 @@
 //! versions scripts/release-helpers.test.sh runs against scripts/is-semver.sh.
 //!
 //! build.rs has no test target of its own, so the rule lives in
-//! build/semver.rs and is included here as well. The two case lists below
-//! are copied from the shell test; a version added to one belongs in the
-//! other, so the Rust rule and the shell rule cannot drift apart unnoticed.
+//! build/semver.rs and is included here as well. Both tests read their cases
+//! from scripts/semver-cases.txt, so the Rust rule and the shell rule cannot
+//! drift apart unnoticed: a version added to the list is checked by both.
 
 include!("../build/semver.rs");
 
-/// The `good` list in scripts/release-helpers.test.sh.
-const ACCEPTED: &[&str] = &[
-    "1.2.0",
-    "1.2.0-rc.1",
-    "1.2.0-beta",
-    "0.0.0",
-    "1.2.0-0",
-    "1.2.0-alpha-1.x-y.0",
-];
+const CASES: &str = include_str!("../scripts/semver-cases.txt");
 
-/// The `bad` list in scripts/release-helpers.test.sh.
-const REFUSED: &[&str] = &[
-    "1.2.0-rc..1",
-    "1.2.0-",
-    "01.2.0",
-    "1.2.0-rc.01",
-    "1.2",
-    "1.2.0.1",
-    "v1.2.0",
-    "1.2.0+build.5",
-    "1.2.0-rc.1+build.5",
-    "1.2.0 ",
-    "",
-];
+/// The versions marked `kind` in the case file. A line that is neither a
+/// comment nor `ok:` nor `bad:` is a broken file, not a missing case.
+fn cases(kind: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for line in CASES.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, version) = line
+            .split_once(':')
+            .unwrap_or_else(|| panic!("scripts/semver-cases.txt has an unreadable line: {line:?}"));
+        assert!(
+            k == "ok" || k == "bad",
+            "scripts/semver-cases.txt has an unreadable line: {line:?}"
+        );
+        if k == kind {
+            out.push(version);
+        }
+    }
+    assert!(
+        out.len() >= 5,
+        "scripts/semver-cases.txt holds only {} {kind} cases; the list was not read",
+        out.len()
+    );
+    out
+}
 
 #[test]
 fn accepts_every_version_the_shell_rule_accepts() {
-    let wrongly_refused: Vec<&str> = ACCEPTED.iter().copied().filter(|v| !is_semver(v)).collect();
+    let wrongly_refused: Vec<&str> = cases("ok").into_iter().filter(|v| !is_semver(v)).collect();
     assert!(
         wrongly_refused.is_empty(),
         "refused, but scripts/is-semver.sh accepts: {wrongly_refused:?}"
@@ -44,7 +48,7 @@ fn accepts_every_version_the_shell_rule_accepts() {
 
 #[test]
 fn refuses_every_version_the_shell_rule_refuses() {
-    let wrongly_accepted: Vec<&str> = REFUSED.iter().copied().filter(|v| is_semver(v)).collect();
+    let wrongly_accepted: Vec<&str> = cases("bad").into_iter().filter(|v| is_semver(v)).collect();
     assert!(
         wrongly_accepted.is_empty(),
         "accepted, but scripts/is-semver.sh refuses: {wrongly_accepted:?}"

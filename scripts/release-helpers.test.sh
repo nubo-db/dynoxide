@@ -37,12 +37,23 @@ expect() {
 # --- is-semver.sh -----------------------------------------------------------
 
 SEMVER="$SCRIPTS/is-semver.sh"
-for good in "1.2.0" "1.2.0-rc.1" "1.2.0-beta" "0.0.0" "1.2.0-0" "1.2.0-alpha-1.x-y.0"; do
-  expect 0 "" "is-semver accepts $good" "$SEMVER" "$good"
-done
-for bad in "1.2.0-rc..1" "1.2.0-" "01.2.0" "1.2.0-rc.01" "1.2" "1.2.0.1" "v1.2.0" "1.2.0+build.5" "1.2.0-rc.1+build.5" "1.2.0 " ""; do
-  expect 1 "" "is-semver refuses '$bad'" "$SEMVER" "$bad"
-done
+# The cases live in semver-cases.txt, which tests/product_version.rs reads as
+# well, so the shell rule and the Rust rule in build/semver.rs answer to one
+# list. A line the file cannot be read from is a failure, not a skip.
+semver_cases=0
+while IFS= read -r line; do
+  case "$line" in
+    ''|'#'*) continue ;;
+    ok:*)  expect 0 "" "is-semver accepts ${line#ok:}" "$SEMVER" "${line#ok:}" ;;
+    bad:*) expect 1 "" "is-semver refuses '${line#bad:}'" "$SEMVER" "${line#bad:}" ;;
+    *) echo "FAIL  - semver-cases.txt has an unreadable line: '$line'"; failures=$((failures + 1)); checked=$((checked + 1)) ;;
+  esac
+  semver_cases=$((semver_cases + 1))
+done < "$SCRIPTS/semver-cases.txt"
+if [ "$semver_cases" -lt 10 ]; then
+  echo "FAIL  - semver-cases.txt holds only $semver_cases cases; the list was not read"
+  failures=$((failures + 1)); checked=$((checked + 1))
+fi
 
 # --- npm-dist-tag.sh --------------------------------------------------------
 

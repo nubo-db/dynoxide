@@ -1,0 +1,22 @@
+# Versions the release rule accepts (ok:) and refuses (bad:), one per line.
+# scripts/release-helpers.test.sh runs them against scripts/is-semver.sh and
+# tests/product_version.rs runs them against the Rust copy in build/semver.rs,
+# so the two rules are held to one list. A trailing space or an empty
+# version after the colon is part of the case.
+ok:1.2.0
+ok:1.2.0-rc.1
+ok:1.2.0-beta
+ok:0.0.0
+ok:1.2.0-0
+ok:1.2.0-alpha-1.x-y.0
+bad:1.2.0-rc..1
+bad:1.2.0-
+bad:01.2.0
+bad:1.2.0-rc.01
+bad:1.2
+bad:1.2.0.1
+bad:v1.2.0
+bad:1.2.0+build.5
+bad:1.2.0-rc.1+build.5
+bad:1.2.0 
+bad:

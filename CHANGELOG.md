@@ -75,7 +75,11 @@ Added.
   ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
 - A rule can name the `tables` it applies to. A rule scoped to tables a run
   leaves out with `--tables` is reported as not applied rather than as having
-  anonymised nothing.
+  anonymised nothing. A rule scoped to a table the schema file does not have,
+  and a `--tables` name the export does not hold, are refused rather than
+  skipped, since a misspelt name used to leave a table out of the output with
+  a clean exit. A data model applies to one table, so with rules a
+  multi-table export needs `--tables` naming the one it describes.
 - Rules take `values` and `names` tables, in the shape of
   ExpressionAttributeValues and ExpressionAttributeNames, so a match can be
   scoped by key prefix or reach a reserved-word attribute. The rules file is

@@ -356,7 +356,7 @@ fn parse_attribute_value_with_depth(
         "B" => {
             let b = inner.as_str().ok_or("B value must be a base64 string")?;
             let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b)
-                .map_err(|e| format!("invalid base64 in B value: {e}"))?;
+                .map_err(|_| "invalid base64 in B value".to_string())?;
             Ok(AttributeValue::B(bytes))
         }
         "BOOL" => {
@@ -408,7 +408,7 @@ fn parse_attribute_value_with_depth(
                 .map(|v| {
                     let s = v.as_str().ok_or("BS elements must be base64 strings")?;
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
-                        .map_err(|e| format!("invalid base64 in BS value: {e}"))
+                        .map_err(|_| "invalid base64 in BS value".to_string())
                 })
                 .collect();
             Ok(AttributeValue::BS(set?))
@@ -518,8 +518,8 @@ pub fn discover_export_files(
             present.sort();
             return Err(format!(
                 "--tables names {}, which the export does not hold. It holds {}",
-                quoted(&missing),
-                quoted(&present.iter().collect::<Vec<_>>())
+                super::quoted_names(&missing),
+                super::quoted_names(&present)
             ));
         }
     }
@@ -528,21 +528,6 @@ pub fn discover_export_files(
     tables.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(tables)
-}
-
-/// `'a', 'b' and 'c'`, for a message that names tables.
-fn quoted(names: &[&String]) -> String {
-    match names {
-        [] => String::new(),
-        [one] => format!("'{one}'"),
-        [rest @ .., last] => format!(
-            "{} and '{last}'",
-            rest.iter()
-                .map(|name| format!("'{name}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
 
 /// Collect `.json.gz` and `.json` files from a directory.
@@ -808,6 +793,35 @@ mod tests {
         let one = ["Users".to_string()];
         let found = discover_export_files(dir.path(), Some(&one)).unwrap();
         assert_eq!(found.len(), 1, "a filter the export satisfies is fine");
+
+        // Several missing names read as a list, in the order they were asked
+        // for.
+        let several = [
+            "Users".to_string(),
+            "Orders".to_string(),
+            "Payments".to_string(),
+        ];
+        let err = discover_export_files(dir.path(), Some(&several)).unwrap_err();
+        assert!(
+            err.contains("'Orders' and 'Payments'"),
+            "every missing name is listed: {err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_binary_value_is_reported_without_repeating_it() {
+        // A B that is not base64 is whatever the export put there, so the
+        // message says what was wrong and not which byte was.
+        let line = r#"{"Item": {"pk": {"S": "k"}, "b": {"B": "alice@example.com"}}}"#;
+        let err = parse_export_line(line).unwrap_err();
+        assert!(
+            err.contains("'b'") && err.contains("invalid base64"),
+            "the attribute and the fault are named: {err}"
+        );
+        assert!(
+            !err.contains("alice") && !err.contains("offset"),
+            "but nothing of the value is: {err}"
+        );
     }
 
     #[test]

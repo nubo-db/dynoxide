@@ -228,7 +228,8 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
 
     // 3. Discover export files
     let table_filter = cmd.tables.as_deref();
-    let export_files = parser::discover_export_files(&cmd.source, table_filter)?;
+    let export_files =
+        parser::discover_export_files(&cmd.source, table_filter).map_err(ImportError::Config)?;
 
     if export_files.is_empty() {
         return Err(ImportError::Config(format!(
@@ -241,8 +242,10 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     // A OneTable model describes one table. Built for a second one, every
     // row of it matches no entity, and the run exits 3 for data the model
     // was never about, which teaches the operator to pass the flag that
-    // turns the exit code off.
-    if data_model.is_some() && export_files.len() > 1 {
+    // turns the exit code off. Only with rules, though: without them no key
+    // is rebuilt and the model is never asked about a row, and a run given
+    // the model only so the output can be served covers every table.
+    if data_model.is_some() && !rules.is_empty() && export_files.len() > 1 {
         let names: Vec<String> = export_files.iter().map(|(name, _)| name.clone()).collect();
         return Err(ImportError::Config(format!(
             "a data model describes one table, and this run covers {}. Pass --tables with \
@@ -517,7 +520,7 @@ impl TableImport<'_> {
         const BATCH_SIZE: usize = 10_000;
 
         for file_path in files {
-            let mut pending = Pending::with_capacity(BATCH_SIZE);
+            let mut pending = Pending::with_capacity(BATCH_SIZE, rules.len());
 
             let stats = parser::parse_export_file_streaming(file_path, |mut item| {
                 // Skip processing if we've already hit a fatal batch error
@@ -542,7 +545,7 @@ impl TableImport<'_> {
                         &key_attrs,
                         &mut anonymise::RuleTally {
                             mask_passthroughs: &mut pending.mask_passthroughs,
-                            rule_work: &mut self.rule_work,
+                            rule_work: &mut pending.rule_work,
                         },
                     );
                     warnings.extend(rule_warnings);
@@ -577,7 +580,10 @@ impl TableImport<'_> {
 
                 // Flush batch when full
                 if pending.items.len() >= BATCH_SIZE {
-                    let full = std::mem::replace(&mut pending, Pending::with_capacity(BATCH_SIZE));
+                    let full = std::mem::replace(
+                        &mut pending,
+                        Pending::with_capacity(BATCH_SIZE, rules.len()),
+                    );
                     if let Err(msg) = self.land(table_name, full, &mut landed, summary) {
                         if self.continue_on_error {
                             summary.notice(Notice::caution(msg));
@@ -715,6 +721,9 @@ impl TableImport<'_> {
         for (path, count) in pending.mask_passthroughs {
             *landed.mask_passthroughs.entry(path).or_insert(0) += count;
         }
+        for (total, seen) in self.rule_work.iter_mut().zip(pending.rule_work) {
+            total.add(seen);
+        }
         for notice in pending.notices {
             if self.seen_warnings.insert(notice.message.clone()) {
                 summary.notice(notice);
@@ -742,16 +751,21 @@ struct Pending {
     raised: HashSet<String>,
     /// Values a mask rule left whole, by the rule's path.
     mask_passthroughs: std::collections::HashMap<String, usize>,
+    /// What each rule did to the batch's items, one entry per rule. A rule
+    /// that only ever rewrote rows that rolled back has anonymised nothing
+    /// in the output, and the run has to be able to say so.
+    rule_work: Vec<anonymise::RuleWork>,
 }
 
 impl Pending {
-    fn with_capacity(items: usize) -> Self {
+    fn with_capacity(items: usize, rules: usize) -> Self {
         Pending {
             items: Vec::with_capacity(items),
             observed: keys::Batch::default(),
             notices: Vec::new(),
             raised: HashSet::new(),
             mask_passthroughs: std::collections::HashMap::new(),
+            rule_work: vec![Default::default(); rules],
         }
     }
 

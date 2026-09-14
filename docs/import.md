@@ -41,6 +41,9 @@ dynoxide import --source ./export/ --schema schema.json --output snapshot.db \
   --tables Users,Orders
 ```
 
+A name the export does not hold fails the run before anything is written,
+and the error says which tables it does hold.
+
 ## Anonymisation
 
 Create a rules file (`rules.toml`):
@@ -158,9 +161,11 @@ Only a key that is actually rebuilt takes part in that check. One left holding
 its original value has already been reported as a template that does not
 reproduce, which is the accurate diagnostic for it.
 
-A model describes one table. An export holding more than one needs
-`--tables` naming the one the model describes; without it the import refuses
-to start, since every row of the other tables would match no entity.
+A model describes one table. When rules are given, an export holding more
+than one needs `--tables` naming the one the model describes; without it the
+import refuses to start, since every row of the other tables would match no
+entity. With no rules the model rebuilds nothing and is never matched against
+a row, so a run that passes it only for serving can cover every table.
 
 Templates follow OneTable's own forms: `${name}`, a dotted path that reaches
 into a map (`${address.city}`), and `${name:length:pad}` sort padding, which

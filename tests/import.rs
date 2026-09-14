@@ -2785,12 +2785,99 @@ action = { type = "mask", keep_last = 4 }
         );
         assert_eq!(summary.total_items, 0, "the whole batch rolled back");
         assert!(
-            summary.exposures.is_empty(),
+            !summary
+                .exposures
+                .iter()
+                .any(|e| e.contains("kept 'nick' as it arrived")),
             "no row was written, so no original reached the output: {:?}",
+            summary.exposures
+        );
+        // The rule matched nothing that landed, and that is reported as it
+        // would be for any rule that anonymised nothing in the output.
+        assert!(
+            summary
+                .exposures
+                .iter()
+                .any(|e| e.contains("matched no item")),
+            "{:?}",
             summary.exposures
         );
         let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
         assert!(scan_all(&db, "Users").is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_rolled_back_has_no_work_for_a_rule_to_count() {
+        // Each file is flushed as its own batch. The first holds a row the
+        // rule does not match. The second holds the only row it does match,
+        // beside a row with no keys, so that batch rolls back and neither
+        // row reaches the output. The rule's tally used to count the row it
+        // rewrote there all the same, so a rule that anonymised nothing in
+        // the output passed for one that had done its job.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "Users",
+            &[r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}}}"#],
+        );
+        std::fs::write(
+            source.join("Users").join("data").join("00000001.json"),
+            concat!(
+                r#"{"Item": {"pk": {"S": "USER#2"}, "sk": {"S": "PROFILE"}, "nick": {"S": "Roberta"}}}"#,
+                "\n",
+                r#"{"Item": {"nick": {"S": "no keys at all"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(nick)"
+path = "nick"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: true,
+            data_model: None,
+        })
+        .expect("the flag carries the run past the bad batch");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("Batch import error")),
+            "{:?}",
+            summary.warnings
+        );
+        assert_eq!(summary.total_items, 1, "only the first batch landed");
+        assert!(
+            summary
+                .exposures
+                .iter()
+                .any(|e| e.contains("matched no item")),
+            "the rule rewrote nothing that reached the output, and the run has to say so: {:?}",
+            summary.exposures
+        );
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        assert_eq!(scan_all(&db, "Users").len(), 1);
     }
 
     #[test]
@@ -3124,6 +3211,51 @@ action = { type = "fake", generator = "safe_email" }
             "nothing is said about templates the run never used: {:?}",
             summary.warnings
         );
+    }
+
+    #[test]
+    fn a_data_model_with_no_rules_does_not_refuse_a_second_table() {
+        // The refusal of a model over several tables exists because the
+        // model would be matched against rows it was never about, and that
+        // only happens when rules make it rebuild keys. A model given with
+        // no rules, as a run that only serves the output does, rebuilds
+        // nothing, so there is nothing to refuse.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@example.com"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        setup_export_dir(
+            &source,
+            "Sessions",
+            &[
+                r#"{"Item": {"pk": {"S": "SESSION#1"}, "sk": {"S": "SESSION"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(
+            &schema_file,
+            &[single_table_schema("App"), simple_table_schema("Sessions")],
+        );
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("out.db")),
+            schema: schema_file,
+            rules: None,
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(onetable_fixture()),
+        })
+        .expect("with no rules the model rebuilds nothing, so a second table is no problem");
+        assert_eq!(summary.tables.len(), 2, "{:?}", summary.tables);
+        assert_eq!(summary.total_items, 2);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::schema::{DataModel, EntityDefinition};
 use crate::types::{AttributeValue, GlobalSecondaryIndex, Item};
 use crate::validation::{partition_key_name, sort_key_name};
 
+use super::anonymise::{Rewritten, covers, path_label};
 use super::config::{ValidatedAction, ValidatedRule, parse_path};
 use super::notice::Notice;
 
@@ -317,10 +318,11 @@ pub struct Rederivation {
     /// Scalar values of the rule-target attributes as the item arrived, so
     /// `apply` can see whether a key the model never templated still holds
     /// one after the rules replaced it. A target that is a map, list or set
-    /// contributes every string and number leaf inside it, keyed by the
-    /// rule's root attribute: redacting a whole `profile` removes the address
-    /// inside it as surely as a rule on `profile.email` does, and the key
-    /// check has to know what it was.
+    /// contributes every string and number leaf inside it: redacting a whole
+    /// `profile` removes the address inside it as surely as a rule on
+    /// `profile.email` does, and the key check has to know what it was.
+    /// Keyed by the rule's path, so that once the rules have run only the
+    /// leaves of a rule that fired are compared.
     originals: Vec<(String, String)>,
     /// (at-risk index, hash of the value this item arrived with), so `apply`
     /// can see whether two entities anonymised a shared value differently.
@@ -1112,20 +1114,21 @@ impl KeyDeriver {
         // `profile` replaces everything inside it, so every scalar leaf of a
         // container is recorded: keeping only a scalar found at the path
         // itself let a redacted map's address sit on in an untemplated key
-        // with nothing to compare it against. Keyed by the top-level
-        // attribute, which is what `apply_rules` reports as rewritten. The
-        // item's own size bounds the walk.
+        // with nothing to compare it against. Keyed by the rule's path, not
+        // its root: whether the rule fires on this item is not known until
+        // the rules have run, and two rules under one root can differ. Keyed
+        // by the root, the leaves of a rule on `profile` that passed the item
+        // by were judged by a rule on `profile.email` that did fire, and a
+        // status the run never touched was reported as surviving. The item's
+        // own size bounds the walk.
         let originals: Vec<(String, String)> = self
             .rule_paths
             .iter()
             .filter_map(|path| {
-                let root = match path.first()? {
-                    PathElement::Attribute(name) => name.clone(),
-                    _ => return None,
-                };
+                let label = path_label(path);
                 let mut leaves = Vec::new();
                 scalar_leaves(resolve_path(item, path)?, &mut leaves);
-                Some(leaves.into_iter().map(move |leaf| (root.clone(), leaf)))
+                Some(leaves.into_iter().map(move |leaf| (label.clone(), leaf)))
             })
             .flatten()
             .collect();
@@ -1269,7 +1272,7 @@ impl KeyDeriver {
     pub fn apply(
         &self,
         plan: &Rederivation,
-        rewritten_by_rules: &HashSet<String>,
+        rewritten: &Rewritten,
         item: &mut Item,
         batch: &mut Batch,
         warnings: &mut Vec<Notice>,
@@ -1282,7 +1285,7 @@ impl KeyDeriver {
             // Taken from what the rules did rather than from what their
             // conditions predicted: each rule sees the item as the rules
             // before it left it, so a prediction made up front can be wrong.
-            if rewritten_by_rules.contains(&key.attribute) {
+            if rewritten.attributes.contains(&key.attribute) {
                 rule_wins.push(idx);
                 continue;
             }
@@ -1327,7 +1330,7 @@ impl KeyDeriver {
         // that is what it is; the caution says why this one was missed.
         for &idx in &plan.rule_owned {
             let key = &self.entities[plan.entity].keys[idx];
-            if rewritten_by_rules.contains(&key.attribute) {
+            if rewritten.attributes.contains(&key.attribute) {
                 continue;
             }
             if first_sighting(
@@ -1364,7 +1367,7 @@ impl KeyDeriver {
         if !self.unmatched_model_indexes.is_empty() {
             for key in &untemplated {
                 if self.unnamed_index_keys.contains(key)
-                    && !rewritten_by_rules.contains(key.as_str())
+                    && !rewritten.attributes.contains(key.as_str())
                 {
                     *batch
                         .untemplated_index_keys
@@ -1373,11 +1376,16 @@ impl KeyDeriver {
                 }
             }
         }
+        // Only a leaf recorded under a rule that fired was replaced. A rule
+        // on `profile` that fired covers a leaf recorded under
+        // `profile.email`; one on `profile.email` says nothing about the
+        // rest of the map.
         let survivals: Vec<String> = untemplated
             .into_iter()
             .filter(|key| match item.get(key.as_str()) {
-                Some(AttributeValue::S(value)) => plan.originals.iter().any(|(attr, old)| {
-                    rewritten_by_rules.contains(attr) && holds_as_component(value, old)
+                Some(AttributeValue::S(value)) => plan.originals.iter().any(|(recorded, old)| {
+                    rewritten.paths.iter().any(|fired| covers(fired, recorded))
+                        && holds_as_component(value, old)
                 }),
                 _ => false,
             })
@@ -1790,15 +1798,23 @@ fn quoted_list(names: &[String]) -> String {
 /// Matching anywhere in the string instead would report `ORDER#1042` as
 /// holding a replaced `42`, and an exposure that fires on a coincidence is
 /// one people learn to wave through.
+///
+/// Case is folded on both sides. A key is often built from a lower-cased
+/// address while the attribute keeps the spelling the customer typed, and
+/// the address in the key is the same address.
 fn holds_as_component(key: &str, value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
+    // The boundaries are read from the folded key, so they fall on its own
+    // character boundaries even where folding changed a length.
+    let key = key.to_lowercase();
+    let value = value.to_lowercase();
     // Every start is tried, not only the non-overlapping ones `match_indices`
     // yields: a value that overlaps itself can fail the boundary where it
     // first appears and pass at a start inside that first match.
     let mut from = 0;
-    while let Some(offset) = key[from..].find(value) {
+    while let Some(offset) = key[from..].find(value.as_str()) {
         let start = from + offset;
         let before = key[..start].chars().next_back();
         let after = key[start + value.len()..].chars().next();
@@ -2078,8 +2094,19 @@ mod tests {
         HashSet::new()
     }
 
-    fn no_rewrites() -> HashSet<String> {
-        HashSet::new()
+    fn no_rewrites() -> Rewritten {
+        Rewritten::default()
+    }
+
+    /// What `apply_rules` reports after rules on these paths fired.
+    fn rewrote(paths: &[&str]) -> Rewritten {
+        let mut rewritten = Rewritten::default();
+        for path in paths {
+            rewritten.paths.insert((*path).to_string());
+            let root = path.split(['.', '[']).next().unwrap_or(path);
+            rewritten.attributes.insert(root.to_string());
+        }
+        rewritten
     }
 
     /// Plan one item as a batch of its own that landed. Most of these tests
@@ -2100,7 +2127,7 @@ mod tests {
     fn apply_one(
         d: &mut KeyDeriver,
         plan: &Rederivation,
-        rewritten: &HashSet<String>,
+        rewritten: &Rewritten,
         item: &mut Item,
         warnings: &mut Vec<Notice>,
     ) {
@@ -2472,7 +2499,7 @@ mod tests {
             "sk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
-        let rewritten: HashSet<String> = ["sk".to_string()].into_iter().collect();
+        let rewritten = rewrote(&["sk"]);
         apply_one(&mut d, &plan, &rewritten, &mut user, &mut item_warnings);
         assert_eq!(user["sk"], AttributeValue::S("[REDACTED]".to_string()));
         assert!(
@@ -3524,8 +3551,7 @@ mod tests {
             AttributeValue::S("fake@example.org".to_string()),
         );
         it.insert("profile".to_string(), AttributeValue::M(replaced));
-        let mut rewritten = HashSet::new();
-        rewritten.insert("profile".to_string());
+        let rewritten = rewrote(&["profile.email"]);
         apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(
@@ -3572,8 +3598,7 @@ mod tests {
             "profile".to_string(),
             AttributeValue::M(std::collections::HashMap::new()),
         );
-        let mut rewritten = HashSet::new();
-        rewritten.insert("profile".to_string());
+        let rewritten = rewrote(&["profile"]);
         apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(
@@ -3614,8 +3639,7 @@ mod tests {
         let mut warnings = Vec::new();
         let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         it.insert("emails".to_string(), AttributeValue::L(Vec::new()));
-        let mut rewritten = HashSet::new();
-        rewritten.insert("emails".to_string());
+        let rewritten = rewrote(&["emails"]);
         apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(
@@ -3648,6 +3672,35 @@ mod tests {
     }
 
     #[test]
+    fn a_case_folded_copy_of_a_replaced_value_still_counts() {
+        // Keys are often built from a lower-cased address while the
+        // attribute keeps the spelling the customer typed. The address in
+        // the key is the same address, and a comparison that respects case
+        // let it through.
+        assert!(holds_as_component(
+            "CUSTOMER#alice@real.co.uk",
+            "Alice@Real.co.uk"
+        ));
+        assert!(holds_as_component(
+            "CUSTOMER#ALICE@REAL.CO.UK",
+            "alice@real.co.uk"
+        ));
+        // An exact match still counts, and folding does not widen the
+        // component rule: a coincidence inside a longer run is still not
+        // the value.
+        assert!(holds_as_component(
+            "CUSTOMER#alice@real.co.uk",
+            "alice@real.co.uk"
+        ));
+        assert!(!holds_as_component("ORDER#1042", "42"));
+        assert!(!holds_as_component("ID42", "42"));
+        assert!(!holds_as_component(
+            "CUSTOMER#malice@real.co.uk",
+            "Alice@Real.co.uk"
+        ));
+    }
+
+    #[test]
     fn a_key_joined_with_another_delimiter_still_counts_as_a_survival() {
         // The same untemplated key as above, joined with '|'. Splitting on
         // '#' alone found nothing here, and the real address stayed in the
@@ -3662,8 +3715,7 @@ mod tests {
         }]);
         let (mut d, _) =
             KeyDeriver::new(&model, &request(), &email_rule(), &no_consistency()).unwrap();
-        let mut rewritten = HashSet::new();
-        rewritten.insert("email".to_string());
+        let rewritten = rewrote(&["email"]);
 
         let mut it = item(&[
             ("pk", "ORDER#o1"),
@@ -3705,8 +3757,7 @@ mod tests {
             "id".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
-        let mut rewritten = HashSet::new();
-        rewritten.insert("id".to_string());
+        let rewritten = rewrote(&["id"]);
         apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
         assert!(d.take_key_survivals().is_empty());
     }
@@ -3733,8 +3784,7 @@ mod tests {
             "pk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
-        let mut rewritten = HashSet::new();
-        rewritten.insert("pk".to_string());
+        let rewritten = rewrote(&["pk"]);
         apply_one(&mut d, &plan, &rewritten, &mut fired, &mut w);
         assert!(
             d.take_notices()
@@ -3803,8 +3853,7 @@ mod tests {
         let (mut d, _) =
             KeyDeriver::new(&shared_key_model(), &request(), &rules, &no_consistency()).unwrap();
 
-        let mut rewritten = HashSet::new();
-        rewritten.insert("pk".to_string());
+        let rewritten = rewrote(&["pk"]);
         for (ty, sk, becomes) in [
             ("Customer", "PROFILE", "fake1"),
             ("Order", "ORDER#1", "fake2"),
@@ -3854,8 +3903,7 @@ mod tests {
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        let mut rewritten = HashSet::new();
-        rewritten.insert("email".to_string());
+        let rewritten = rewrote(&["email"]);
         apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert!(
@@ -3885,6 +3933,92 @@ mod tests {
         );
         apply_one(&mut d, &plan, &rewritten, &mut clean, &mut warnings);
         assert!(d.take_key_survivals().is_empty());
+    }
+
+    #[test]
+    fn a_leaf_of_a_rule_that_did_not_fire_is_not_a_survival() {
+        // Two rules under one root. The redact on the whole `profile` is for
+        // customers and passes this order by; the redact on `profile.email`
+        // fires. The order's untemplated gs1sk holds the status that sits
+        // inside `profile`, which only the rule that did not fire would have
+        // removed. Recording every applicable rule's leaves under the root
+        // and judging them by the root let the status read as a survival.
+        let model = model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let mut customers_only = rule("profile", ValidatedAction::Redact);
+        customers_only.condition = condition::parse("attribute_exists(customerOnly)").unwrap();
+        let rules = [
+            customers_only,
+            rule("profile.email", ValidatedAction::Redact),
+        ];
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+
+        let order = |email: &str, status: &str| {
+            let mut profile = std::collections::HashMap::new();
+            profile.insert("email".to_string(), AttributeValue::S(email.to_string()));
+            profile.insert("status".to_string(), AttributeValue::S(status.to_string()));
+            let mut it = item(&[
+                ("pk", "ORDER#o1"),
+                ("sk", "ORDER#"),
+                ("gs1sk", "STATUS#ACTIVE"),
+                ("id", "o1"),
+            ]);
+            it.insert("profile".to_string(), AttributeValue::M(profile));
+            it
+        };
+
+        let mut it = order("alice@real.co.uk", "ACTIVE");
+        let mut warnings = Vec::new();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
+        // The rule on profile.email fired and replaced the address; the
+        // rule on profile did not, so the status is still there.
+        let mut replaced = std::collections::HashMap::new();
+        replaced.insert(
+            "email".to_string(),
+            AttributeValue::S("[REDACTED]".to_string()),
+        );
+        replaced.insert(
+            "status".to_string(),
+            AttributeValue::S("ACTIVE".to_string()),
+        );
+        it.insert("profile".to_string(), AttributeValue::M(replaced));
+        apply_one(
+            &mut d,
+            &plan,
+            &rewrote(&["profile.email"]),
+            &mut it,
+            &mut warnings,
+        );
+        assert!(
+            d.take_key_survivals().is_empty(),
+            "the status was never a value a rule replaced: {warnings:?}"
+        );
+
+        // When the whole-map rule does fire, its leaves are still found.
+        let mut it = order("bob@real.co.uk", "ACTIVE");
+        it.insert("customerOnly".to_string(), AttributeValue::BOOL(true));
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
+        it.insert(
+            "profile".to_string(),
+            AttributeValue::M(std::collections::HashMap::new()),
+        );
+        apply_one(
+            &mut d,
+            &plan,
+            &rewrote(&["profile", "profile.email"]),
+            &mut it,
+            &mut warnings,
+        );
+        assert_eq!(
+            d.take_key_survivals(),
+            vec![("Order".to_string(), "gs1sk".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -4484,8 +4618,7 @@ mod tests {
             "gs1pk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
-        let mut rewritten = HashSet::new();
-        rewritten.insert("gs1pk".to_string());
+        let rewritten = rewrote(&["gs1pk"]);
         apply_one(&mut d, &plan, &rewritten, &mut it, &mut w);
 
         let notices = d.take_notices();

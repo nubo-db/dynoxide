@@ -413,7 +413,14 @@ fn parse_attribute_value_with_depth(
                 .collect();
             Ok(AttributeValue::BS(set?))
         }
-        other => Err(format!("unknown type descriptor: '{other}'")),
+        // The key is not quoted back. In an export that was never
+        // DynamoDB-typed the one key of a nested map is data, and the
+        // message lands in a summary that gets pasted into tickets.
+        _ => Err(
+            "unknown type descriptor: expected one of S, N, B, BOOL, NULL, M, L, SS, NS \
+                  or BS"
+                .to_string(),
+        ),
     }
 }
 
@@ -433,6 +440,10 @@ pub fn discover_export_files(
     }
 
     let mut tables = Vec::new();
+    // Every table the export holds, filtered or not, so a filter entry that
+    // named none of them can be refused with the names that would have
+    // worked.
+    let mut present: Vec<String> = Vec::new();
 
     // Check for DynamoDB Export structure: subdirectories with data/ folders
     let mut has_table_dirs = false;
@@ -452,6 +463,7 @@ pub fn discover_export_files(
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| format!("Invalid directory name: {}", path.display()))?
                     .to_string();
+                present.push(table_name.clone());
 
                 // Apply table filter
                 if let Some(filter) = table_filter
@@ -479,6 +491,7 @@ pub fn discover_export_files(
                 .and_then(|n| n.to_str())
                 .unwrap_or("default")
                 .to_string();
+            present.push(table_name.clone());
             // The filter applies here as it does above. Skipping it meant a
             // table asked to be left out of the output arrived in it anyway,
             // under the directory's name, with nothing said.
@@ -489,10 +502,47 @@ pub fn discover_export_files(
         }
     }
 
+    // A table asked for that the export does not hold. Dropping it in
+    // silence left a misspelt name out of the output with a full item count
+    // and a clean exit, and the run's caller had said which tables it
+    // wanted. An export holding nothing at all is left to the caller, whose
+    // message says what an export is expected to look like.
+    if let Some(filter) = table_filter
+        && !present.is_empty()
+    {
+        let missing: Vec<&String> = filter
+            .iter()
+            .filter(|wanted| !present.iter().any(|name| name == *wanted))
+            .collect();
+        if !missing.is_empty() {
+            present.sort();
+            return Err(format!(
+                "--tables names {}, which the export does not hold. It holds {}",
+                quoted(&missing),
+                quoted(&present.iter().collect::<Vec<_>>())
+            ));
+        }
+    }
+
     // Sort for deterministic ordering
     tables.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(tables)
+}
+
+/// `'a', 'b' and 'c'`, for a message that names tables.
+fn quoted(names: &[&String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("'{one}'"),
+        [rest @ .., last] => format!(
+            "{} and '{last}'",
+            rest.iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Collect `.json.gz` and `.json` files from a directory.
@@ -716,10 +766,13 @@ mod tests {
         std::fs::create_dir(&flat).unwrap();
         std::fs::write(flat.join("a.json"), "{}\n").unwrap();
 
-        let none = discover_export_files(&flat, Some(&["Other".to_string()])).unwrap();
+        let err = match discover_export_files(&flat, Some(&["Other".to_string()])) {
+            Err(err) => err,
+            Ok(found) => panic!("a filter the directory does not satisfy is refused: {found:?}"),
+        };
         assert!(
-            none.is_empty(),
-            "a table not asked for must not be imported: {none:?}"
+            err.contains("'Other'") && err.contains("'Secrets'"),
+            "naming what was asked for and what is here: {err}"
         );
 
         let some = discover_export_files(&flat, Some(&["Secrets".to_string()])).unwrap();
@@ -727,6 +780,51 @@ mod tests {
 
         let all = discover_export_files(&flat, None).unwrap();
         assert_eq!(all.len(), 1, "no filter means everything, as before");
+    }
+
+    #[test]
+    fn a_filter_naming_a_table_the_export_lacks_is_an_error() {
+        // The run used to import the tables it found and say nothing about
+        // the one it did not, so a misspelt name left a table out in silence.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Users").join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("a.json"), "{}\n").unwrap();
+
+        let filter = ["Users".to_string(), "Orders".to_string()];
+        let err = match discover_export_files(dir.path(), Some(&filter)) {
+            Err(err) => err,
+            Ok(found) => panic!("a table asked for and not found must be an error: {found:?}"),
+        };
+        assert!(
+            err.contains("'Orders'"),
+            "the missing table is named: {err}"
+        );
+        assert!(
+            err.contains("'Users'"),
+            "and so is what the export holds: {err}"
+        );
+
+        let one = ["Users".to_string()];
+        let found = discover_export_files(dir.path(), Some(&one)).unwrap();
+        assert_eq!(found.len(), 1, "a filter the export satisfies is fine");
+    }
+
+    #[test]
+    fn an_unknown_descriptor_below_the_top_level_does_not_quote_the_key() {
+        // In an export that was never DynamoDB-typed the one key of a nested
+        // map is data, and here it is an address. The message says what a
+        // descriptor should have been instead of what this one was.
+        let line = r#"{"Item": {"pk": {"S": "k"}, "x": {"alice@example.com": true}}}"#;
+        let err = parse_export_line(line).unwrap_err();
+        assert!(
+            err.contains("'x'") && err.contains("unknown type descriptor"),
+            "the top-level attribute and the fault are named: {err}"
+        );
+        assert!(
+            !err.contains("alice@example.com"),
+            "but not the key that stood where a descriptor should: {err}"
+        );
     }
 
     #[test]

@@ -38,6 +38,27 @@ pub struct RuleWork {
     pub rewrote: usize,
 }
 
+impl RuleWork {
+    /// Fold in what the rule did to a batch that reached the output.
+    pub fn add(&mut self, landed: RuleWork) {
+        self.matched += landed.matched;
+        self.path_missing += landed.path_missing;
+        self.rewrote += landed.rewrote;
+    }
+}
+
+/// What the rules rewrote in one item.
+#[derive(Debug, Default)]
+pub struct Rewritten {
+    /// The top-level attributes at least one rule rewrote.
+    pub attributes: std::collections::HashSet<String>,
+    /// The paths of the rules that rewrote something, spelled as the rules
+    /// file spells them. Two rules under one root can differ in whether they
+    /// fired, and a rule that passed an item by has replaced nothing beneath
+    /// its path, so the root alone cannot say what was replaced.
+    pub paths: std::collections::HashSet<String>,
+}
+
 /// What `apply_rules` accumulates across every item of a table, so a run can
 /// report it once at the end rather than once per item.
 pub struct RuleTally<'a> {
@@ -49,14 +70,14 @@ pub struct RuleTally<'a> {
 
 /// Apply all matching rules to an item, mutating it in place.
 ///
-/// Returns the warnings raised (e.g. key attribute collision risks) and the
-/// top-level attributes actually rewritten. Values a `mask` rule left as they
-/// arrived are counted into `mask_passthroughs`, keyed by the rule's path,
-/// since the output alone cannot tell a short value that was skipped from one
-/// that was never personal. The caller needs the second to
-/// know which keys a rule has taken over: predicting it from the rules is
-/// wrong, because each rule's condition sees the item as the rules before it
-/// left it, not as it arrived.
+/// Returns the warnings raised (e.g. key attribute collision risks) and what
+/// was actually rewritten, by top-level attribute and by rule path. Values a
+/// `mask` rule left as they arrived are counted into `mask_passthroughs`,
+/// keyed by the rule's path, since the output alone cannot tell a short value
+/// that was skipped from one that was never personal. The caller needs the
+/// second to know which keys a rule has taken over and which values a rule
+/// replaced: predicting either from the rules is wrong, because each rule's
+/// condition sees the item as the rules before it left it, not as it arrived.
 pub fn apply_rules(
     item: &mut Item,
     table: &str,
@@ -65,13 +86,13 @@ pub fn apply_rules(
     consistency_fields: &std::collections::HashSet<String>,
     key_attrs: &[String],
     tally: &mut RuleTally<'_>,
-) -> (Vec<Notice>, std::collections::HashSet<String>) {
+) -> (Vec<Notice>, Rewritten) {
     let RuleTally {
         mask_passthroughs,
         rule_work,
     } = tally;
     let mut warnings: Vec<Notice> = Vec::new();
-    let mut rewritten = std::collections::HashSet::new();
+    let mut rewritten = Rewritten::default();
     // Paths a mask left whole and nothing since has rewritten. Judged once
     // the rules have all run: a later rule that replaces the value, or the
     // map holding it, has removed it, and reporting the mask's pass-through
@@ -130,16 +151,18 @@ pub fn apply_rules(
             ValidatedAction::Fake { seed: Some(_), .. } => is_scalar(&current_value),
             _ => false,
         };
-        // Whether the cache handed back the value that is already there. The
-        // map never stores an original as its own pseudonym, so this should
-        // not happen; if it ever does, the rule is about to write the original
-        // back, and that has to count as the value surviving rather than as a
-        // rewrite that clears an earlier mask's pass-through.
-        let mut handed_back = false;
         let new_value = if is_consistency_field && !is_deterministic {
             // Check consistency map first
             if let Some(cached) = consistency_map.get(&field_name, &current_value) {
-                handed_back = canonical_bytes(&cached) == canonical_bytes(&current_value);
+                // The map never stores a value as its own pseudonym, so what
+                // it hands back is never the value already there. If it
+                // were, this rule would write the original back as though
+                // it had been anonymised, and the write would clear an
+                // earlier mask's pass-through on the way.
+                debug_assert!(
+                    canonical_bytes(&cached) != canonical_bytes(&current_value),
+                    "the consistency map handed back the value it was asked about"
+                );
                 cached
             } else {
                 let generated = generate_value(&rule.action, &current_value);
@@ -167,20 +190,19 @@ pub fn apply_rules(
         // already begins with the mask character masks to itself and would
         // read as short, and two mask rules on one attribute would each count
         // the same item once, so the count is per item and attribute.
-        let kept_whole = handed_back
-            || match &rule.action {
-                ValidatedAction::Mask { keep_last, .. } => match &current_value {
-                    AttributeValue::S(s) => s.chars().count() <= *keep_last,
-                    AttributeValue::N(n) => n.len() <= *keep_last,
-                    // Every other type is replaced wholesale with mask characters
-                    // rather than returned, so nothing of it is kept. Counting
-                    // those would report that real data survived a rule that had
-                    // in fact removed all of it, which is the wrong direction for
-                    // a warning whose whole purpose is to say what got through.
-                    _ => false,
-                },
+        let kept_whole = match &rule.action {
+            ValidatedAction::Mask { keep_last, .. } => match &current_value {
+                AttributeValue::S(s) => s.chars().count() <= *keep_last,
+                AttributeValue::N(n) => n.len() <= *keep_last,
+                // Every other type is replaced wholesale with mask characters
+                // rather than returned, so nothing of it is kept. Counting
+                // those would report that real data survived a rule that had
+                // in fact removed all of it, which is the wrong direction for
+                // a warning whose whole purpose is to say what got through.
                 _ => false,
-            };
+            },
+            _ => false,
+        };
 
         // Warn if targeting a key attribute
         if key_attrs.contains(&field_name) {
@@ -199,6 +221,7 @@ pub fn apply_rules(
                     .rewrote += 1;
                 let path = path_label(&rule.path);
                 kept_whole_paths.retain(|kept| !covers(&path, kept));
+                rewritten.paths.insert(path.clone());
                 if kept_whole {
                     if !replaced_paths.iter().any(|done| covers(done, &path)) {
                         kept_whole_paths.insert(path);
@@ -206,11 +229,17 @@ pub fn apply_rules(
                 } else {
                     replaced_paths.insert(path);
                 }
-                rewritten.insert(field_name);
+                rewritten.attributes.insert(field_name);
             }
             Err(e) => {
-                warnings.push(Notice::caution(format!(
-                    "failed to set path '{}': {e}",
+                // Not reached from here: the value was just resolved through
+                // the same maps and lists the write walks, and the write
+                // accepts everything the read did. Should that ever change,
+                // the original is still in the output, which is what an
+                // exposure is, so it is graded as one rather than as a
+                // caution the exit code would ignore.
+                warnings.push(Notice::exposure(format!(
+                    "failed to set path '{}', so the original value was left in place: {e}",
                     field_name
                 )));
             }
@@ -225,7 +254,7 @@ pub fn apply_rules(
 }
 
 /// A rule path as the rules file spells it: `profile.email`, `tags[0]`.
-fn path_label(path: &[crate::expressions::PathElement]) -> String {
+pub(super) fn path_label(path: &[crate::expressions::PathElement]) -> String {
     use crate::expressions::PathElement;
     let mut label = String::new();
     for element in path {
@@ -248,7 +277,7 @@ fn path_label(path: &[crate::expressions::PathElement]) -> String {
 
 /// Whether a rule on `rewritten` replaced what sits at `path`: the same
 /// path, or one beneath it. A sibling under the same map is neither.
-fn covers(rewritten: &str, path: &str) -> bool {
+pub(super) fn covers(rewritten: &str, path: &str) -> bool {
     path == rewritten
         || path
             .strip_prefix(rewritten)

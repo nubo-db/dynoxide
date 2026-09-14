@@ -7,8 +7,6 @@
 //! either something the run saw happen or it is not, and one function turns
 //! that into an exit code.
 
-use std::ops::Deref;
-
 /// How much a message matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Concern {
@@ -57,16 +55,9 @@ impl Notice {
     }
 }
 
-/// A notice reads as its message, so `notice.contains("...")` and the rest
-/// of the string API work on it directly.
-impl Deref for Notice {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.message
-    }
-}
-
+/// A notice prints as its message. It does not deref to one: the concern is
+/// the point of the type, and a notice that passed for a string anywhere a
+/// string is expected would lose it without a compile error.
 impl std::fmt::Display for Notice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)

@@ -18,7 +18,7 @@ pub(crate) mod anonymise;
 pub(crate) mod config;
 pub(crate) mod consistency;
 pub(crate) mod keys;
-pub mod notice;
+pub(crate) mod notice;
 pub(crate) mod parser;
 pub(crate) mod schema;
 
@@ -373,8 +373,8 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     for (table_name, files) in &export_files {
         let table_schema = schema_map.get(table_name.as_str()).unwrap();
         let key_attrs = extract_key_attrs(&table_schema.create_request);
-        // Values a mask rule left whole, by attribute. Bounded by the number
-        // of masked attributes, not by item count.
+        // Values a mask rule left whole, by the rule's path. Bounded by the
+        // number of mask rules, not by item count.
         let mut mask_passthroughs: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         // A data model with no rules has nothing to rebuild from: keys are
@@ -575,9 +575,9 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
 
         let mut left_whole: Vec<(&String, &usize)> = mask_passthroughs.iter().collect();
         left_whole.sort();
-        for (attribute, count) in left_whole {
+        for (path, count) in left_whole {
             summary.notice(Notice::exposure(format!(
-                "table '{table_name}': {count} items kept '{attribute}' as it arrived \
+                "table '{table_name}': {count} items kept '{path}' as it arrived \
                  because the value was no shorter than the characters the mask keeps, so \
                  those rows carry the original value"
             )));

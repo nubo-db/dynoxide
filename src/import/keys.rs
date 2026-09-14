@@ -366,8 +366,14 @@ pub struct KeyDeriver {
     /// Indexes the model declares that the table does not have, so `apply`
     /// can count the items whose untemplated keys those are likely to be.
     unmatched_model_indexes: Vec<String>,
+    /// Key attributes of the table's indexes that no entity's mapping names.
+    /// When the model names an index the table lacks, these are the keys it
+    /// most likely meant. A key of an index the model does name, however
+    /// plainly, is accounted for, and an LSI's key is not modelled by design.
+    unnamed_index_keys: Vec<String>,
     /// Key attribute -> items carrying it that no entity templates, counted
-    /// only while `unmatched_model_indexes` says the model meant to.
+    /// only for `unnamed_index_keys` and only while `unmatched_model_indexes`
+    /// says the model meant to.
     untemplated_index_keys: BTreeMap<String, usize>,
     /// Sets of entities that all reproduced some untyped item's keys,
     /// reported once per set.
@@ -433,6 +439,25 @@ impl KeyDeriver {
             for ks in &index.key_schema {
                 if !schema_keys.contains(&ks.attribute_name) {
                     schema_keys.push(ks.attribute_name.clone());
+                }
+            }
+        }
+
+        // The keys a mistyped model index most likely meant: those of a
+        // table index no entity's mapping names, by any name.
+        let named_indexes: HashSet<&str> = model
+            .entities
+            .iter()
+            .flat_map(|e| e.gsi_mappings.iter().map(|m| m.index_name.as_str()))
+            .collect();
+        let mut unnamed_index_keys: Vec<String> = Vec::new();
+        for index in gsis
+            .iter()
+            .filter(|g| !named_indexes.contains(g.index_name.as_str()))
+        {
+            for ks in &index.key_schema {
+                if !unnamed_index_keys.contains(&ks.attribute_name) {
+                    unnamed_index_keys.push(ks.attribute_name.clone());
                 }
             }
         }
@@ -806,6 +831,7 @@ impl KeyDeriver {
                     names.sort();
                     names
                 },
+                unnamed_index_keys,
                 untemplated_index_keys: BTreeMap::new(),
             },
             warnings,
@@ -1142,14 +1168,20 @@ impl KeyDeriver {
             .filter(|key| item.contains_key(key.as_str()))
             .collect();
         // The model declared an index the table lacks, and this item carries
-        // a key no entity templates: that key is in all likelihood the one
-        // the model meant, and it was not rebuilt. Now it has been seen.
+        // a key of an index the model never names: that key is in all
+        // likelihood the one the model meant, and it was not rebuilt. Now it
+        // has been seen. A key a rule just rewrote holds no original, so it
+        // is not counted.
         if !self.unmatched_model_indexes.is_empty() {
             for key in &untemplated {
-                *self
-                    .untemplated_index_keys
-                    .entry((*key).clone())
-                    .or_insert(0) += 1;
+                if self.unnamed_index_keys.contains(key)
+                    && !rewritten_by_rules.contains(key.as_str())
+                {
+                    *self
+                        .untemplated_index_keys
+                        .entry((*key).clone())
+                        .or_insert(0) += 1;
+                }
             }
         }
         let survivals: Vec<String> = untemplated
@@ -1221,9 +1253,9 @@ impl KeyDeriver {
             let indexes = quoted_list(&self.unmatched_model_indexes);
             for (key, count) in std::mem::take(&mut self.untemplated_index_keys) {
                 out.push(Notice::exposure(format!(
-                    "{count} items carry {key}, which no entity's templates build, while the \
-                     data model declares index {indexes} that the table does not have; \
-                     those keys were not rebuilt and hold the values they arrived with"
+                    "{count} items carry {key}, a key of an index no entity in the data model \
+                     names, while the model declares index {indexes} that the table does not \
+                     have; those keys were not rebuilt and hold the values they arrived with"
                 )));
             }
         }
@@ -1527,11 +1559,20 @@ fn holds_as_component(key: &str, value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    key.match_indices(value).any(|(start, _)| {
+    // Every start is tried, not only the non-overlapping ones `match_indices`
+    // yields: a value that overlaps itself can fail the boundary where it
+    // first appears and pass at a start inside that first match.
+    let mut from = 0;
+    while let Some(offset) = key[from..].find(value) {
+        let start = from + offset;
         let before = key[..start].chars().next_back();
         let after = key[start + value.len()..].chars().next();
-        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
-    })
+        if !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric) {
+            return true;
+        }
+        from = start + key[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Which rows a key value is grouped with, as one hash.
@@ -2006,10 +2047,10 @@ mod tests {
         }
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("entity 'User'"));
-        assert!(warnings[0].contains("does not reproduce sk"));
+        assert!(warnings[0].message.contains("entity 'User'"));
+        assert!(warnings[0].message.contains("does not reproduce sk"));
         assert!(
-            !warnings[0].contains("legacy-profile"),
+            !warnings[0].message.contains("legacy-profile"),
             "a warning must not quote the key value: {}",
             warnings[0]
         );
@@ -2055,8 +2096,14 @@ mod tests {
         );
         // sk and gs1pk both build from email, so both report
         assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings[1].contains("cannot rebuild sk"), "{warnings:?}");
-        assert!(warnings[2].contains("cannot rebuild gs1pk"), "{warnings:?}");
+        assert!(
+            warnings[1].message.contains("cannot rebuild sk"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[2].message.contains("cannot rebuild gs1pk"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -2110,11 +2157,11 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .all(|w| w.contains("targets key attribute 'sk' directly")),
+                .all(|w| w.message.contains("targets key attribute 'sk' directly")),
             "{warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("'Account'")),
+            warnings.iter().any(|w| w.message.contains("'Account'")),
             "the constant template must be named too: {warnings:?}"
         );
 
@@ -2132,7 +2179,7 @@ mod tests {
         assert!(
             item_warnings
                 .iter()
-                .any(|w| w.contains("a rule rewrote sk")),
+                .any(|w| w.message.contains("a rule rewrote sk")),
             "{item_warnings:?}"
         );
     }
@@ -2185,8 +2232,11 @@ mod tests {
             KeyDeriver::new(&model(), &request(), &rules, &no_consistency()).unwrap();
         // sk and gs1pk of User both build from email
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].contains("overwrites the last"), "{warnings:?}");
-        assert!(warnings[0].contains("'email'"));
+        assert!(
+            warnings[0].message.contains("overwrites the last"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].message.contains("'email'"));
 
         let rules = [rule(
             "email",
@@ -2230,9 +2280,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("entity 'Customer' and entity 'Order'"));
-        assert!(warnings[0].contains("'email'"));
-        assert!(warnings[0].contains("will not join"));
+        assert!(
+            warnings[0]
+                .message
+                .contains("entity 'Customer' and entity 'Order'")
+        );
+        assert!(warnings[0].message.contains("'email'"));
+        assert!(warnings[0].message.contains("will not join"));
         // Nothing seen yet, so nothing is broken yet.
         assert!(deriver.join_breaks().is_empty());
     }
@@ -2465,7 +2519,7 @@ mod tests {
         let (mut d, warnings) =
             KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("('contact')")),
+            warnings.iter().any(|w| w.message.contains("('contact')")),
             "the root is what [consistency] honours: {warnings:?}"
         );
 
@@ -2811,11 +2865,13 @@ mod tests {
         assert_eq!(plan.entity, 0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            warnings[0].contains("entity 'Left' and entity 'Right'"),
+            warnings[0]
+                .message
+                .contains("entity 'Left' and entity 'Right'"),
             "{warnings:?}"
         );
         assert!(
-            warnings[0].contains("taken as entity 'Left'"),
+            warnings[0].message.contains("taken as entity 'Left'"),
             "{warnings:?}"
         );
 
@@ -2846,11 +2902,11 @@ mod tests {
         let notices = d.take_notices();
         let kept = notices
             .iter()
-            .find(|n| n.contains("kept the original"))
+            .find(|n| n.message.contains("kept the original"))
             .unwrap_or_else(|| panic!("{notices:?}"));
         assert_eq!(kept.concern, Concern::Exposure);
         assert!(
-            !kept.contains("table '"),
+            !kept.message.contains("table '"),
             "the table is named once, where the notice is filed: {kept:?}"
         );
 
@@ -2876,7 +2932,7 @@ mod tests {
         let notices = d.take_notices();
         let split = notices
             .iter()
-            .find(|n| n.contains("took one original gs1sk"))
+            .find(|n| n.message.contains("took one original gs1sk"))
             .unwrap_or_else(|| panic!("{notices:?}"));
         assert_eq!(split.concern, Concern::Caution);
 
@@ -2889,7 +2945,7 @@ mod tests {
         assert!(
             notices
                 .iter()
-                .any(|n| n.contains("collision check stopped")),
+                .any(|n| n.message.contains("collision check stopped")),
             "{notices:?}"
         );
         assert!(d.take_notices().is_empty(), "the cap is said once");
@@ -3115,7 +3171,9 @@ mod tests {
         let (d, warnings) =
             KeyDeriver::new(&model, &request, &email_rule(), &no_consistency()).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("local secondary index")),
+            warnings
+                .iter()
+                .any(|w| w.message.contains("local secondary index")),
             "it is said: {warnings:?}"
         );
         assert!(
@@ -3195,6 +3253,11 @@ mod tests {
         assert!(holds_as_component("alice@x", "alice@x"));
         // A value that itself contains the delimiter is still one component.
         assert!(holds_as_component("TENANT#a#b#PROFILE", "a#b"));
+        // A value that overlaps itself: the first place it appears fails the
+        // boundary (an 'x' before it), and the place that passes starts
+        // inside that first match. Every start has to be tried.
+        assert!(holds_as_component("xa#a#a", "a#a"));
+        assert!(!holds_as_component("xa#a#ax", "a#a"));
         assert!(!holds_as_component("CUSTOMER#alice@x", ""));
     }
 
@@ -3290,7 +3353,7 @@ mod tests {
         assert!(
             d.take_notices()
                 .iter()
-                .all(|n| !n.contains("kept the original pk")),
+                .all(|n| !n.message.contains("kept the original pk")),
             "a key the rule rewrote is not unrebuilt"
         );
 
@@ -3299,14 +3362,15 @@ mod tests {
         let mut skipped = it.clone();
         d.apply(&plan, &no_rewrites(), &mut skipped, &mut w);
         assert!(
-            w.iter()
-                .any(|n| n.contains("a rule names pk but its condition passed")),
+            w.iter().any(|n| n
+                .message
+                .contains("a rule names pk but its condition passed")),
             "{w:?}"
         );
         let notices = d.take_notices();
         let kept = notices
             .iter()
-            .find(|n| n.contains("kept the original pk on 1 items"))
+            .find(|n| n.message.contains("kept the original pk on 1 items"))
             .unwrap_or_else(|| panic!("{notices:?}"));
         assert_eq!(kept.concern, super::super::notice::Concern::Exposure);
     }
@@ -3409,9 +3473,9 @@ mod tests {
         d.apply(&plan, &rewritten, &mut it, &mut warnings);
 
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("gs1pk still holds a value a rule replaced")),
+            warnings.iter().any(|w| w
+                .message
+                .contains("gs1pk still holds a value a rule replaced")),
             "{warnings:?}"
         );
         assert_eq!(
@@ -3723,7 +3787,11 @@ mod tests {
         let (mut d, warnings) =
             KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("entity 'Customer' and entity 'Order'"));
+        assert!(
+            warnings[0]
+                .message
+                .contains("entity 'Customer' and entity 'Order'")
+        );
 
         let mut run = |name: &str, source: &str, sk: &str, becomes: &str| {
             let mut it = item(&[
@@ -3817,7 +3885,9 @@ mod tests {
         d.apply(&plan, &no_rewrites(), &mut order, &mut warnings);
 
         assert!(
-            warnings.iter().any(|w| w.contains("does not reproduce pk")),
+            warnings
+                .iter()
+                .any(|w| w.message.contains("does not reproduce pk")),
             "the accurate diagnostic still fires: {warnings:?}"
         );
         assert!(
@@ -3854,7 +3924,7 @@ mod tests {
         // nothing has yet been seen carrying them.
         let unmatched = warnings
             .iter()
-            .find(|w| w.contains("index 'gs1' that the table does not"))
+            .find(|w| w.message.contains("index 'gs1' that the table does not"))
             .unwrap_or_else(|| panic!("{warnings:?}"));
         assert_eq!(unmatched.concern, super::super::notice::Concern::Caution);
         assert!(
@@ -3877,11 +3947,123 @@ mod tests {
         let notices = d.take_notices();
         let seen = notices
             .iter()
-            .find(|n| n.contains("1 items carry gs1sk"))
+            .find(|n| n.message.contains("1 items carry gs1sk"))
             .unwrap_or_else(|| panic!("{notices:?}"));
         assert_eq!(seen.concern, super::super::notice::Concern::Exposure);
-        assert!(seen.contains("index 'gs1'"), "{seen:?}");
+        assert!(seen.message.contains("index 'gs1'"), "{seen:?}");
         assert!(d.take_notices().is_empty(), "taking clears");
+    }
+
+    #[test]
+    fn only_a_key_of_an_index_the_model_never_names_counts_for_a_missing_index() {
+        use super::super::notice::Concern;
+        // The model names 'gs1' and the table calls it GSI1, so GSI1's keys
+        // are the ones the model meant. The table's LSI is not modelled by
+        // design, and a rule redacted gs1pk on this item, so neither of those
+        // is a value the model failed to rebuild.
+        let model = model_with(vec![EntityDefinition {
+            name: "User".to_string(),
+            pk_template: "user#${id}".to_string(),
+            sk_template: Some("user#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![GsiMapping {
+                index_name: "gs1".to_string(),
+                pk_template: String::new(),
+                sk_template: Some("user#${email}".to_string()),
+            }],
+            description: None,
+        }]);
+        let mut request = request();
+        request.local_secondary_indexes = Some(
+            serde_json::from_value(serde_json::json!([{
+                "IndexName": "LSI1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "ls1sk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]))
+            .unwrap(),
+        );
+        let rules = [rule("gs1pk", ValidatedAction::Redact)];
+        let (mut d, _) = KeyDeriver::new(&model, &request, &rules, &no_consistency()).unwrap();
+        let mut it = item(&[
+            ("pk", "user#1"),
+            ("sk", "user#"),
+            ("id", "1"),
+            ("gs1pk", "tenant#t1"),
+            ("gs1sk", "user#a@x.co"),
+            ("ls1sk", "2024-01-01"),
+            ("email", "a@x.co"),
+        ]);
+        let mut w = Vec::new();
+        let plan = d.plan(&it, &mut w).unwrap();
+        it.insert(
+            "gs1pk".to_string(),
+            AttributeValue::S("[REDACTED]".to_string()),
+        );
+        let mut rewritten = HashSet::new();
+        rewritten.insert("gs1pk".to_string());
+        d.apply(&plan, &rewritten, &mut it, &mut w);
+
+        let notices = d.take_notices();
+        let exposures: Vec<&Notice> = notices
+            .iter()
+            .filter(|n| n.concern == Concern::Exposure)
+            .collect();
+        assert_eq!(exposures.len(), 1, "{notices:?}");
+        assert!(
+            exposures[0].message.contains("1 items carry gs1sk"),
+            "{notices:?}"
+        );
+
+        // An index the model does name, even by a plain attribute with no
+        // template, is accounted for: its keys are not what a mistyped
+        // sibling index meant.
+        let model = model_with(vec![EntityDefinition {
+            name: "User".to_string(),
+            pk_template: "user#${id}".to_string(),
+            sk_template: Some("user#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![
+                GsiMapping {
+                    index_name: "GSI1".to_string(),
+                    pk_template: String::new(),
+                    sk_template: Some("user#${email}".to_string()),
+                },
+                GsiMapping {
+                    index_name: "gs2".to_string(),
+                    pk_template: "tenant#${tenant}".to_string(),
+                    sk_template: None,
+                },
+            ],
+            description: None,
+        }]);
+        let (mut d, _) =
+            KeyDeriver::new(&model, &two_index_request(), &[], &no_consistency()).unwrap();
+        let mut it = item(&[
+            ("pk", "user#1"),
+            ("sk", "user#"),
+            ("id", "1"),
+            ("gs1pk", "t1"),
+            ("gs1sk", "user#a@x.co"),
+            ("gs2pk", "tenant#t1"),
+            ("tenant", "t1"),
+            ("email", "a@x.co"),
+        ]);
+        let mut w = Vec::new();
+        let plan = d.plan(&it, &mut w).unwrap();
+        d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        let notices = d.take_notices();
+        let exposures: Vec<&Notice> = notices
+            .iter()
+            .filter(|n| n.concern == Concern::Exposure)
+            .collect();
+        assert_eq!(exposures.len(), 1, "{notices:?}");
+        assert!(
+            exposures[0].message.contains("1 items carry gs2pk"),
+            "gs1pk is a plain key of an index the model names: {notices:?}"
+        );
     }
 
     #[test]
@@ -3902,7 +4084,8 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("local secondary index") && w.contains("not rebuilt")),
+                .any(|w| w.message.contains("local secondary index")
+                    && w.message.contains("not rebuilt")),
             "{warnings:?}"
         );
     }
@@ -3915,10 +4098,10 @@ mod tests {
         assert!(!warnings.is_empty());
         for w in &warnings {
             assert!(
-                w.contains("keeps the key value it arrived with"),
+                w.message.contains("keeps the key value it arrived with"),
                 "null retains, it does not collapse: {w}"
             );
-            assert!(!w.contains("overwrites the last"), "{w}");
+            assert!(!w.message.contains("overwrites the last"), "{w}");
         }
     }
 

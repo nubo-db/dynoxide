@@ -1331,6 +1331,130 @@ action = { type = "fake", generator = "safe_email" }
     }
 
     #[test]
+    fn a_rule_scoped_to_one_table_does_not_count_as_touching_anothers_key() {
+        // 'email' is the partition key of Customers and an index key on
+        // Orders. A rule for one table alone rewrites only that table's keys,
+        // and the run must not say otherwise because the other table happens
+        // to key on the same attribute.
+        fn run(tmp: &std::path::Path, scoped_to: &str) -> import::ImportSummary {
+            let source = tmp.join(format!("export-{scoped_to}"));
+            let schema_file = tmp.join(format!("schema-{scoped_to}.json"));
+            let rules_file = tmp.join(format!("rules-{scoped_to}.toml"));
+            setup_export_dir(
+                &source,
+                "Orders",
+                &[
+                    r#"{"Item": {"pk": {"S": "ORDER#1"}, "sk": {"S": "ORDER"}, "email": {"S": "a@x.co"}}}"#,
+                ],
+            );
+            setup_export_dir(
+                &source,
+                "Customers",
+                &[r#"{"Item": {"email": {"S": "a@x.co"}, "name": {"S": "A"}}}"#],
+            );
+            create_schema_file(
+                &schema_file,
+                &[
+                    serde_json::json!({
+                        "Table": {
+                            "TableName": "Orders",
+                            "KeySchema": [
+                                {"AttributeName": "pk", "KeyType": "HASH"},
+                                {"AttributeName": "sk", "KeyType": "RANGE"}
+                            ],
+                            "AttributeDefinitions": [
+                                {"AttributeName": "pk", "AttributeType": "S"},
+                                {"AttributeName": "sk", "AttributeType": "S"},
+                                {"AttributeName": "email", "AttributeType": "S"}
+                            ],
+                            "GlobalSecondaryIndexes": [{
+                                "IndexName": "ByEmail",
+                                "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}],
+                                "Projection": {"ProjectionType": "ALL"}
+                            }]
+                        }
+                    }),
+                    serde_json::json!({
+                        "Table": {
+                            "TableName": "Customers",
+                            "KeySchema": [{"AttributeName": "email", "KeyType": "HASH"}],
+                            "AttributeDefinitions": [
+                                {"AttributeName": "email", "AttributeType": "S"}
+                            ]
+                        }
+                    }),
+                ],
+            );
+            std::fs::write(
+                &rules_file,
+                format!(
+                    r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = {{ type = "redact" }}
+tables = ["{scoped_to}"]
+"#
+                ),
+            )
+            .unwrap();
+            import::run(ImportCommand {
+                source,
+                output: Some(tmp.join(format!("out-{scoped_to}.db"))),
+                schema: schema_file,
+                rules: Some(rules_file),
+                tables: None,
+                compress: false,
+                force: false,
+                continue_on_error: false,
+                data_model: None,
+            })
+            .unwrap()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Scoped to Orders: an index key is rewritten there, and no primary
+        // key anywhere. Customers keys on email, but the rule never sees it.
+        let orders = run(tmp.path(), "Orders");
+        assert!(
+            orders
+                .warnings
+                .iter()
+                .any(|w| w.contains("rewrites an index key attribute")),
+            "{:?}",
+            orders.warnings
+        );
+        assert!(
+            !orders
+                .warnings
+                .iter()
+                .any(|w| w.contains("rewrites a key attribute directly")),
+            "Customers' key is not this rule's to rewrite: {:?}",
+            orders.warnings
+        );
+
+        // Scoped to Customers: the reverse.
+        let customers = run(tmp.path(), "Customers");
+        assert!(
+            customers
+                .warnings
+                .iter()
+                .any(|w| w.contains("rewrites a key attribute directly")),
+            "{:?}",
+            customers.warnings
+        );
+        assert!(
+            !customers
+                .warnings
+                .iter()
+                .any(|w| w.contains("rewrites an index key attribute")),
+            "Orders' index is not this rule's to rewrite: {:?}",
+            customers.warnings
+        );
+    }
+
+    #[test]
     fn test_data_model_reports_rows_collapsing_under_a_constant_action() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("export");

@@ -2677,6 +2677,123 @@ action = { type = "redact" }
     }
 
     #[test]
+    fn a_batch_that_rolled_back_has_no_join_for_a_later_batch_to_break() {
+        // The customer has no sort key, so its batch fails validation and
+        // rolls back: it never reaches the output. The order in the next
+        // file shares the customer's original partition. What the deriver
+        // saw of the customer's rebuilt key used to outlive the rollback, so
+        // the order was compared against a row that was never written and
+        // the run failed as a broken join.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        let model_file = tmp.path().join("model.json");
+        let customer_without_sk = r#"{"Item": {"_type": {"S": "Customer"}, "pk": {"S": "CUSTOMER#a@x.co"}, "email": {"S": "a@x.co"}}}"#;
+        let order = r#"{"Item": {"_type": {"S": "Order"}, "pk": {"S": "CUSTOMER#a@x.co"}, "sk": {"S": "ORDER#1"}, "customerEmail": {"S": "a@x.co"}, "orderId": {"S": "1"}}}"#;
+
+        setup_export_dir(&source, "App", &[customer_without_sk]);
+        std::fs::write(
+            source.join("App").join("data").join("00000001.json"),
+            format!("{order}\n"),
+        )
+        .unwrap();
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(&rules_file, FAKE_EMAIL_RULE).unwrap();
+        differently_named_source_model(&model_file);
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: true,
+            data_model: Some(model_file),
+        })
+        .expect("a row that never reached the output has no join to break");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("Batch import error")),
+            "the rollback is still reported: {:?}",
+            summary.warnings
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let items = scan_all(&db, "App");
+        assert_eq!(items.len(), 1, "only the order landed: {items:?}");
+        assert_eq!(string_attr(&items[0], "sk"), "ORDER#1");
+    }
+
+    #[test]
+    fn a_batch_that_rolled_back_has_no_masked_value_to_expose() {
+        // The short nickname is no longer than the characters the mask
+        // keeps, so the mask hands it back whole. The batch it sits in also
+        // holds a row with no keys, so the whole batch rolls back and neither
+        // row reaches the output. The run used to end as an exposure all the
+        // same, over a value in a row it never wrote.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "nick": {"S": "Bob"}}}"#,
+                r#"{"Item": {"nick": {"S": "no keys at all"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(nick)"
+path = "nick"
+action = { type = "mask", keep_last = 4 }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: true,
+            data_model: None,
+        })
+        .expect("the flag carries the run past the bad batch");
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("Batch import error")),
+            "{:?}",
+            summary.warnings
+        );
+        assert_eq!(summary.total_items, 0, "the whole batch rolled back");
+        assert!(
+            summary.exposures.is_empty(),
+            "no row was written, so no original reached the output: {:?}",
+            summary.exposures
+        );
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        assert!(scan_all(&db, "Users").is_empty());
+    }
+
+    #[test]
     fn a_compressed_import_leaves_nothing_but_the_archive_at_the_output() {
         // Compression now happens before the rename, so the uncompressed
         // database never sits at the output path. This pins the shape the

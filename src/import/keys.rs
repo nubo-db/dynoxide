@@ -327,6 +327,59 @@ pub struct Rederivation {
     at_risk_originals: Vec<(usize, u64)>,
 }
 
+/// What the deriver saw in the items of one batch, kept apart from what it
+/// knows until the batch is known to have reached the output.
+///
+/// A batch is one transaction, and a failure rolls all of it back. Counting
+/// a row that never landed would report an exposure the output does not
+/// hold, and remembering its key would compare the rows that did land
+/// against one that did not. So [`plan`](KeyDeriver::plan) and
+/// [`apply`](KeyDeriver::apply) write here, [`commit`](KeyDeriver::commit)
+/// folds it in once the insert has returned, and dropping it forgets the
+/// batch.
+#[derive(Debug, Default)]
+pub struct Batch {
+    /// Items that matched no entity.
+    unmatched: usize,
+    /// Sets of entities that all reproduced some untyped item's keys.
+    ambiguous: HashSet<Vec<usize>>,
+    /// (entity, key) -> items whose template did not reproduce the key.
+    mismatch: HashMap<(usize, usize), usize>,
+    /// (entity, key) -> items whose key would not render after the rules.
+    unrenderable: HashMap<(usize, usize), usize>,
+    /// (entity, key) pairs where a rule took the key instead of its template.
+    rule_wins: HashSet<(usize, usize)>,
+    /// (entity, key) -> items whose key a rule names but passed by.
+    rule_skipped: HashMap<(usize, usize), usize>,
+    /// Key attribute -> items carrying it that no entity templates.
+    untemplated_index_keys: BTreeMap<String, usize>,
+    /// (entity, key attribute) -> items whose untemplated key still held a
+    /// value a rule replaced.
+    survived: HashMap<(usize, String), usize>,
+    /// Hash of each item's primary key, in the order the items came, for
+    /// the collision check.
+    primary_keys: Vec<u64>,
+    /// (entity, at-risk index, hash of the key the item arrived with, hash
+    /// of the key it left with), in the order the items came, for the join
+    /// check.
+    at_risk_results: Vec<(usize, usize, u64, u64)>,
+}
+
+/// Count one more sighting of `key` in the batch, and say whether it is the
+/// first the run has had: none in a batch that landed, none earlier in this
+/// one. A caution raised on first sight is raised on this, so a sighting
+/// that only ever sat in a discarded batch is raised again by the next.
+fn first_sighting<K: Eq + Hash>(
+    committed: &HashMap<K, usize>,
+    batch: &mut HashMap<K, usize>,
+    key: K,
+) -> bool {
+    let known = committed.contains_key(&key);
+    let seen = batch.entry(key).or_insert(0);
+    *seen += 1;
+    *seen == 1 && !known
+}
+
 /// One entity key as the model templates it: the key attribute, the
 /// template text, and the attribute paths the template reads.
 type KeyShape = (String, String, Vec<Vec<PathElement>>);
@@ -958,11 +1011,19 @@ impl KeyDeriver {
     /// item arrived with. Any key the template does not reproduce is left
     /// alone and reported (once per entity and key). An item that matches no
     /// entity is counted for [`take_unmatched`](Self::take_unmatched).
-    pub fn plan(&mut self, item: &Item, warnings: &mut Vec<Notice>) -> Option<Rederivation> {
+    ///
+    /// What is seen of the item goes into `batch`, not into the deriver,
+    /// until [`commit`](Self::commit) says the item reached the output.
+    pub fn plan(
+        &self,
+        item: &Item,
+        batch: &mut Batch,
+        warnings: &mut Vec<Notice>,
+    ) -> Option<Rederivation> {
         let (entity_idx, also) = match self.resolve_entity(item) {
             Some(found) => found,
             None => {
-                self.unmatched += 1;
+                batch.unmatched += 1;
                 return None;
             }
         };
@@ -974,7 +1035,7 @@ impl KeyDeriver {
             // rendered from the wrong templates, and that is worth a line.
             let mut group = vec![entity_idx];
             group.extend(also.iter().copied());
-            if self.warned_ambiguous.insert(group.clone()) {
+            if !self.warned_ambiguous.contains(&group) && batch.ambiguous.insert(group.clone()) {
                 warnings.push(Notice::caution(format!(
                     "{} all reproduce the keys of at least one item that carries no type \
                      attribute, so it was taken as entity '{}', the first in the model. Give \
@@ -1015,9 +1076,11 @@ impl KeyDeriver {
                 rewritten_directly.push(key.attribute.as_str());
                 rule_owned.push(idx);
             } else {
-                let seen = self.warned_mismatch.entry((entity_idx, idx)).or_insert(0);
-                *seen += 1;
-                if *seen == 1 {
+                if first_sighting(
+                    &self.warned_mismatch,
+                    &mut batch.mismatch,
+                    (entity_idx, idx),
+                ) {
                     warnings.push(Notice::caution(format!(
                         "entity '{}': template '{}' does not reproduce {} (the attributes it \
                          names are missing, not scalars, or the key was built differently); \
@@ -1118,88 +1181,97 @@ impl KeyDeriver {
             .collect()
     }
 
-    /// After the rules ran: compare what this item's at-risk values became
-    /// against what an earlier item of a different entity made of the same
-    /// original. Two entities that agree, because the action is
-    /// deterministic or because no rule matched, are left alone.
-    fn note_at_risk_results(&mut self, plan: &Rederivation, item: &Item) {
+    /// After the rules ran: note what this item's at-risk keys became, for
+    /// the batch to compare against what other entities made of the same
+    /// originals once it lands. Two entities that agree, because the action
+    /// is deterministic or because no rule matched, are left alone.
+    fn note_at_risk_results(&self, plan: &Rederivation, item: &Item, batch: &mut Batch) {
         for (risk_idx, original) in &plan.at_risk_originals {
-            let risk = &mut self.at_risk[*risk_idx];
+            let risk = &self.at_risk[*risk_idx];
             let Some(now) = item.get(&risk.key_attribute).and_then(scalar_hash) else {
                 continue;
             };
+            batch
+                .at_risk_results
+                .push((plan.entity, *risk_idx, *original, now));
+        }
+    }
 
-            // A key already recorded is still compared after the cap. Only a
-            // key never seen before goes unchecked, and that is counted so
-            // the run can say the check was partial rather than clean.
-            if !risk.seen_keys.contains_key(original) {
-                if risk.seen_keys.len() >= MAX_TRACKED_KEYS {
-                    risk.unchecked += 1;
-                    continue;
-                }
-                risk.seen_keys.insert(*original, Vec::new());
-            }
-            let groups_rows = risk.grouped_by.is_empty();
-            let outcomes = risk.seen_keys.get_mut(original).expect("just inserted");
+    /// One item's at-risk key has landed: record what its entity made of
+    /// the original, and whether that disagrees with another entity's.
+    fn record_at_risk_result(&mut self, entity: usize, risk_idx: usize, original: u64, now: u64) {
+        let risk = &mut self.at_risk[risk_idx];
 
-            match outcomes.iter_mut().find(|o| o.entity == plan.entity) {
-                Some(mine) => mine.multiple |= mine.first != now,
-                None => outcomes.push(Outcome {
-                    entity: plan.entity,
-                    first: now,
-                    multiple: false,
-                }),
+        // A key already recorded is still compared after the cap. Only a
+        // key never seen before goes unchecked, and that is counted so
+        // the run can say the check was partial rather than clean.
+        if !risk.seen_keys.contains_key(&original) {
+            if risk.seen_keys.len() >= MAX_TRACKED_KEYS {
+                risk.unchecked += 1;
+                return;
             }
+            risk.seen_keys.insert(original, Vec::new());
+        }
+        let groups_rows = risk.grouped_by.is_empty();
+        let outcomes = risk.seen_keys.get_mut(&original).expect("just inserted");
 
-            // Two entities disagree when their results differ, or when either
-            // produced more than one result, since one of those must differ
-            // from what the other produced.
-            let mut diverged: Vec<usize> = Vec::new();
-            let mut split_alone: Vec<usize> = Vec::new();
-            for (i, a) in outcomes.iter().enumerate() {
-                // An entity that took one original key to more than one result
-                // has split the rows that shared it, and the pairwise pass
-                // below cannot see that because it never pairs an entity with
-                // itself. What that split costs depends on the key. Losing a
-                // partition means rows that came back from one query no longer
-                // do, so it fails the import. Losing a shared sort value
-                // inside a partition is weaker, and rows share one for
-                // reasons that are not relationships: two people called John
-                // Smith sat under one tenant share `NAME#John Smith` and were
-                // never related. Failing on that blocks a legitimate export,
-                // and the only way past would be to drop --data-model, which
-                // turns key rebuilding off and ships the real values.
-                if a.multiple {
-                    if groups_rows {
-                        diverged.push(a.entity);
-                    } else {
-                        split_alone.push(a.entity);
-                    }
-                }
-                for b in outcomes.iter().skip(i + 1) {
-                    if a.first != b.first || a.multiple || b.multiple {
-                        diverged.push(a.entity);
-                        diverged.push(b.entity);
-                    }
+        match outcomes.iter_mut().find(|o| o.entity == entity) {
+            Some(mine) => mine.multiple |= mine.first != now,
+            None => outcomes.push(Outcome {
+                entity,
+                first: now,
+                multiple: false,
+            }),
+        }
+
+        // Two entities disagree when their results differ, or when either
+        // produced more than one result, since one of those must differ
+        // from what the other produced.
+        let mut diverged: Vec<usize> = Vec::new();
+        let mut split_alone: Vec<usize> = Vec::new();
+        for (i, a) in outcomes.iter().enumerate() {
+            // An entity that took one original key to more than one result
+            // has split the rows that shared it, and the pairwise pass
+            // below cannot see that because it never pairs an entity with
+            // itself. What that split costs depends on the key. Losing a
+            // partition means rows that came back from one query no longer
+            // do, so it fails the import. Losing a shared sort value
+            // inside a partition is weaker, and rows share one for
+            // reasons that are not relationships: two people called John
+            // Smith sat under one tenant share `NAME#John Smith` and were
+            // never related. Failing on that blocks a legitimate export,
+            // and the only way past would be to drop --data-model, which
+            // turns key rebuilding off and ships the real values.
+            if a.multiple {
+                if groups_rows {
+                    diverged.push(a.entity);
+                } else {
+                    split_alone.push(a.entity);
                 }
             }
-            for entity in diverged {
-                risk.diverged.insert(entity);
-            }
-            for entity in split_alone {
-                risk.split_alone.insert(entity);
+            for b in outcomes.iter().skip(i + 1) {
+                if a.first != b.first || a.multiple || b.multiple {
+                    diverged.push(a.entity);
+                    diverged.push(b.entity);
+                }
             }
         }
+        risk.diverged.extend(diverged);
+        risk.split_alone.extend(split_alone);
     }
 
     /// After the rules run: render every planned key from the item's current
     /// attributes. A key whose template no longer renders (a rule nulled or
     /// removed an attribute it needs) is left unchanged and reported.
+    ///
+    /// As with [`plan`](Self::plan), what is seen goes into `batch` until
+    /// the item is known to have landed.
     pub fn apply(
-        &mut self,
+        &self,
         plan: &Rederivation,
         rewritten_by_rules: &HashSet<String>,
         item: &mut Item,
+        batch: &mut Batch,
         warnings: &mut Vec<Notice>,
     ) {
         let entity = &self.entities[plan.entity];
@@ -1219,12 +1291,11 @@ impl KeyDeriver {
                     item.insert(key.attribute.clone(), AttributeValue::S(value));
                 }
                 None => {
-                    let seen = self
-                        .warned_unrenderable
-                        .entry((plan.entity, idx))
-                        .or_insert(0);
-                    *seen += 1;
-                    if *seen == 1 {
+                    if first_sighting(
+                        &self.warned_unrenderable,
+                        &mut batch.unrenderable,
+                        (plan.entity, idx),
+                    ) {
                         warnings.push(Notice::caution(format!(
                             "entity '{}': cannot rebuild {} from template '{}' after the rules \
                              ran (an attribute it needs is no longer a string or number); \
@@ -1237,7 +1308,9 @@ impl KeyDeriver {
             }
         }
         for idx in rule_wins {
-            if self.warned_rule_wins.insert((plan.entity, idx)) {
+            if !self.warned_rule_wins.contains(&(plan.entity, idx))
+                && batch.rule_wins.insert((plan.entity, idx))
+            {
                 let key = &self.entities[plan.entity].keys[idx];
                 warnings.push(Notice::caution(format!(
                     "entity '{}': a rule rewrote {} directly, so it was not rebuilt from \
@@ -1257,12 +1330,11 @@ impl KeyDeriver {
             if rewritten_by_rules.contains(&key.attribute) {
                 continue;
             }
-            let seen = self
-                .warned_rule_skipped
-                .entry((plan.entity, idx))
-                .or_insert(0);
-            *seen += 1;
-            if *seen == 1 {
+            if first_sighting(
+                &self.warned_rule_skipped,
+                &mut batch.rule_skipped,
+                (plan.entity, idx),
+            ) {
                 warnings.push(Notice::caution(format!(
                     "entity '{}': a rule names {} but its condition passed at least one item \
                      by, and template '{}' does not reproduce that key; such keys are left \
@@ -1294,7 +1366,7 @@ impl KeyDeriver {
                 if self.unnamed_index_keys.contains(key)
                     && !rewritten_by_rules.contains(key.as_str())
                 {
-                    *self
+                    *batch
                         .untemplated_index_keys
                         .entry((*key).clone())
                         .or_insert(0) += 1;
@@ -1312,9 +1384,11 @@ impl KeyDeriver {
             .cloned()
             .collect();
         for key in survivals {
-            let seen = self.survived.entry((plan.entity, key.clone())).or_insert(0);
-            *seen += 1;
-            if *seen == 1 {
+            if first_sighting(
+                &self.survived,
+                &mut batch.survived,
+                (plan.entity, key.clone()),
+            ) {
                 warnings.push(Notice::caution(format!(
                     "entity '{}': {key} still holds a value a rule replaced, and the model gives \
                      this entity no template for {key}, so nothing rebuilt it; the count is \
@@ -1327,8 +1401,40 @@ impl KeyDeriver {
         // Every item's primary key is recorded, not only a rebuilt one: a
         // rebuilt key can land on a row that was left alone, and counting
         // only rebuilds would miss the row that got overwritten.
-        self.note_primary_key(item);
-        self.note_at_risk_results(plan, item);
+        self.note_primary_key(item, batch);
+        self.note_at_risk_results(plan, item, batch);
+    }
+
+    /// The batch reached the output, so what was seen of its items is now
+    /// what the run knows. Counts are added, first sightings are kept so the
+    /// next batch does not raise them again, and the primary keys and at-risk
+    /// keys are recorded in the order the items came, so a collision or a
+    /// split inside one batch is found exactly as one across batches is.
+    pub fn commit(&mut self, batch: Batch) {
+        self.unmatched += batch.unmatched;
+        self.warned_ambiguous.extend(batch.ambiguous);
+        for (id, count) in batch.mismatch {
+            *self.warned_mismatch.entry(id).or_insert(0) += count;
+        }
+        for (id, count) in batch.unrenderable {
+            *self.warned_unrenderable.entry(id).or_insert(0) += count;
+        }
+        self.warned_rule_wins.extend(batch.rule_wins);
+        for (id, count) in batch.rule_skipped {
+            *self.warned_rule_skipped.entry(id).or_insert(0) += count;
+        }
+        for (key, count) in batch.untemplated_index_keys {
+            *self.untemplated_index_keys.entry(key).or_insert(0) += count;
+        }
+        for (id, count) in batch.survived {
+            *self.survived.entry(id).or_insert(0) += count;
+        }
+        for key in batch.primary_keys {
+            self.record_primary_key(key);
+        }
+        for (entity, risk_idx, original, now) in batch.at_risk_results {
+            self.record_at_risk_result(entity, risk_idx, original, now);
+        }
     }
 
     /// Everything this table's derivation has to say, once it has been read,
@@ -1427,12 +1533,11 @@ impl KeyDeriver {
     /// one is counted as a collision. `apply` does this for every item it
     /// rebuilds; the pipeline calls it directly for an item that matched no
     /// entity, whose keys are kept as they arrived.
-    pub(super) fn note_primary_key(&mut self, item: &Item) {
+    pub(super) fn note_primary_key(&self, item: &Item, batch: &mut Batch) {
+        // Once the check has stopped there is nothing to hash for. The cap
+        // itself is applied as the keys are recorded, so a batch that
+        // crosses it is counted up to the cap and no further.
         if self.collision_check_capped {
-            return;
-        }
-        if self.rebuilt_keys.len() >= MAX_TRACKED_KEYS {
-            self.collision_check_capped = true;
             return;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1465,7 +1570,20 @@ impl KeyDeriver {
                 _ => 0u8.hash(&mut hasher),
             }
         }
-        if !self.rebuilt_keys.insert(hasher.finish()) {
+        batch.primary_keys.push(hasher.finish());
+    }
+
+    /// One item's primary key has landed. A key seen before is a collision:
+    /// this item overwrote the earlier one.
+    fn record_primary_key(&mut self, key: u64) {
+        if self.collision_check_capped {
+            return;
+        }
+        if self.rebuilt_keys.len() >= MAX_TRACKED_KEYS {
+            self.collision_check_capped = true;
+            return;
+        }
+        if !self.rebuilt_keys.insert(key) {
             self.collisions += 1;
         }
     }
@@ -1964,6 +2082,40 @@ mod tests {
         HashSet::new()
     }
 
+    /// Plan one item as a batch of its own that landed. Most of these tests
+    /// are about what the deriver makes of an item, not which batch it sat
+    /// in, so what it saw is committed at once.
+    fn plan_one(
+        d: &mut KeyDeriver,
+        item: &Item,
+        warnings: &mut Vec<Notice>,
+    ) -> Option<Rederivation> {
+        let mut batch = Batch::default();
+        let plan = d.plan(item, &mut batch, warnings);
+        d.commit(batch);
+        plan
+    }
+
+    /// Apply one item as a batch of its own that landed.
+    fn apply_one(
+        d: &mut KeyDeriver,
+        plan: &Rederivation,
+        rewritten: &HashSet<String>,
+        item: &mut Item,
+        warnings: &mut Vec<Notice>,
+    ) {
+        let mut batch = Batch::default();
+        d.apply(plan, rewritten, item, &mut batch, warnings);
+        d.commit(batch);
+    }
+
+    /// Note one item's primary key as a batch of its own that landed.
+    fn note_one(d: &mut KeyDeriver, item: &Item) {
+        let mut batch = Batch::default();
+        d.note_primary_key(item, &mut batch);
+        d.commit(batch);
+    }
+
     fn deriver() -> KeyDeriver {
         let (deriver, warnings) =
             KeyDeriver::new(&model(), &request(), &[], &no_consistency()).unwrap();
@@ -2084,12 +2236,18 @@ mod tests {
             ("customerId", "cust1"),
             ("orderNo", "42"),
         ]);
-        let plan = d.plan(&order, &mut item_warnings).unwrap();
+        let plan = plan_one(&mut d, &order, &mut item_warnings).unwrap();
         assert!(item_warnings.is_empty(), "{item_warnings:?}");
         assert_eq!(plan.keys.len(), 2);
 
         order.insert("orderNo".to_string(), AttributeValue::S("7".to_string()));
-        d.apply(&plan, &no_rewrites(), &mut order, &mut item_warnings);
+        apply_one(
+            &mut d,
+            &plan,
+            &no_rewrites(),
+            &mut order,
+            &mut item_warnings,
+        );
         assert_eq!(order["sk"], AttributeValue::S("order#00007".to_string()));
     }
 
@@ -2139,7 +2297,7 @@ mod tests {
         let mut warnings = Vec::new();
         let mut user = user();
 
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(plan.keys.len(), 3);
 
@@ -2147,7 +2305,7 @@ mod tests {
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
 
         assert_eq!(user["pk"], AttributeValue::S("account#acc1".to_string()));
         assert_eq!(
@@ -2176,14 +2334,14 @@ mod tests {
                 ("accountId", "acc1"),
                 ("email", "alice@example.com"),
             ]);
-            let plan = d.plan(&user, &mut warnings).unwrap();
+            let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
             assert_eq!(plan.keys.len(), 1, "only pk reproduces");
 
             user.insert(
                 "email".to_string(),
                 AttributeValue::S(format!("fake{n}@example.org")),
             );
-            d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
             assert_eq!(user["sk"], AttributeValue::S("legacy-profile".to_string()));
         }
 
@@ -2204,7 +2362,7 @@ mod tests {
         let mut user = user();
         user.remove("gs1pk");
         user.remove("gs1sk");
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
         assert_eq!(plan.keys.len(), 2);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -2222,14 +2380,14 @@ mod tests {
             ("accountId", "acc1"),
             ("email", "alice@example.com"),
         ]);
-        d.plan(&legacy, &mut warnings).unwrap();
+        plan_one(&mut d, &legacy, &mut warnings).unwrap();
         assert_eq!(warnings.len(), 1);
 
         // Second item: sk on-template, but the rule nulls email so it cannot render.
         let mut user = user();
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
         user.insert("email".to_string(), AttributeValue::NULL(true));
-        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
 
         assert_eq!(
             user["sk"],
@@ -2258,15 +2416,15 @@ mod tests {
             ("accountId", "acc1"),
             ("email", "alice@example.com"),
         ]);
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "User");
 
         let account = item(&[("pk", "account#acc1"), ("sk", "account#"), ("id", "acc1")]);
-        let plan = d.plan(&account, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &account, &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "Account");
 
         let stranger = item(&[("pk", "thing#1"), ("sk", "meta")]);
-        assert!(d.plan(&stranger, &mut warnings).is_none());
+        assert!(plan_one(&mut d, &stranger, &mut warnings).is_none());
         assert_eq!(d.take_unmatched(), 1);
         assert_eq!(d.take_unmatched(), 0);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -2308,14 +2466,14 @@ mod tests {
 
         let mut item_warnings = Vec::new();
         let mut user = user();
-        let plan = d.plan(&user, &mut item_warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut item_warnings).unwrap();
         // The rules rewrote sk, so the deriver must leave it alone.
         user.insert(
             "sk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
         let rewritten: HashSet<String> = ["sk".to_string()].into_iter().collect();
-        d.apply(&plan, &rewritten, &mut user, &mut item_warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut user, &mut item_warnings);
         assert_eq!(user["sk"], AttributeValue::S("[REDACTED]".to_string()));
         assert!(
             item_warnings
@@ -2351,13 +2509,13 @@ mod tests {
         let mut warnings = Vec::new();
         let mut user = user();
         assert!(!user.contains_key("accountName"), "the rule must not match");
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
 
         user.insert(
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
 
         assert_eq!(
             user["sk"],
@@ -2486,7 +2644,7 @@ mod tests {
                 ("sk", "PROFILE"),
                 ("email", &format!("c{n}@x.co")),
             ]);
-            d.plan(&customer, &mut warnings).unwrap();
+            plan_one(&mut d, &customer, &mut warnings).unwrap();
         }
 
         assert!(
@@ -2522,11 +2680,11 @@ mod tests {
             "no discriminator to fall back on"
         );
 
-        let plan = d.plan(&order, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &order, &mut warnings).unwrap();
         assert_eq!(d.entities[plan.entity].name, "Order");
 
         order.insert("orderId".to_string(), AttributeValue::S("anon".to_string()));
-        d.apply(&plan, &no_rewrites(), &mut order, &mut warnings);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut order, &mut warnings);
         assert_eq!(
             order["sk"],
             AttributeValue::S("ORDER#anon".to_string()),
@@ -2580,12 +2738,12 @@ mod tests {
             ("id", "u1"),
             ("email", "alice@real.co.uk"),
         ]);
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
         user.insert(
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
         assert_eq!(
             user["gs1sk"],
             AttributeValue::S("user#fake@example.org".to_string())
@@ -2620,9 +2778,9 @@ mod tests {
         let mut run = |name: &str, pk: &str, sk: &str, becomes: &str| {
             let mut it = item(&[("_type", name), ("pk", pk), ("sk", sk), ("id", "shared")]);
             let mut w = Vec::new();
-            let plan = d.plan(&it, &mut w).unwrap();
+            let plan = plan_one(&mut d, &it, &mut w).unwrap();
             it.insert("id".to_string(), AttributeValue::S(becomes.to_string()));
-            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         };
         run("Account", "account#shared", "account#", "anon1");
         run("Project", "project#shared", "project#", "anon2");
@@ -2673,9 +2831,9 @@ mod tests {
             let mut it = item(&[("_type", name), ("pk", "CUSTOMER#a@x.co"), ("sk", sk)]);
             it.insert("contact".to_string(), contact("a@x.co"));
             let mut w = Vec::new();
-            let plan = d.plan(&it, &mut w).unwrap();
+            let plan = plan_one(&mut d, &it, &mut w).unwrap();
             it.insert("contact".to_string(), contact(becomes));
-            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         };
         run("Customer", "PROFILE", "fake1@example.com");
         run("Order", "ORDER#1", "fake2@example.org");
@@ -2705,8 +2863,8 @@ mod tests {
                 AttributeValue::S("user#a@x.co".to_string()),
             );
             it.insert("email".to_string(), AttributeValue::S("a@x.co".to_string()));
-            let plan = d.plan(&it, &mut warnings).unwrap();
-            d.apply(&plan, &no_rewrites(), &mut it, &mut warnings);
+            let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
+            apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut warnings);
         }
         assert_eq!(d.take_collisions(), (0, false));
     }
@@ -2715,9 +2873,9 @@ mod tests {
     /// let the rules rewrite `email` to `becomes`, then apply.
     fn run_item(d: &mut KeyDeriver, mut item: Item, becomes: &str) {
         let mut warnings = Vec::new();
-        let plan = d.plan(&item, &mut warnings).unwrap();
+        let plan = plan_one(d, &item, &mut warnings).unwrap();
         item.insert("email".to_string(), AttributeValue::S(becomes.to_string()));
-        d.apply(&plan, &no_rewrites(), &mut item, &mut warnings);
+        apply_one(d, &plan, &no_rewrites(), &mut item, &mut warnings);
     }
 
     /// Two entities that both sort a GSI on `CODE#${code}`, hashed on tenant.
@@ -2973,8 +3131,8 @@ mod tests {
         a.insert("id".to_string(), AttributeValue::N("1".to_string()));
         let mut b = Item::new();
         b.insert("id".to_string(), AttributeValue::N("1.0".to_string()));
-        d.note_primary_key(&a);
-        d.note_primary_key(&b);
+        note_one(&mut d, &a);
+        note_one(&mut d, &b);
 
         assert_eq!(
             d.take_collisions().0,
@@ -3000,9 +3158,7 @@ mod tests {
 
         let it = item(&[("pk", "thing#1"), ("sk", "thing#"), ("id", "1")]);
         let mut warnings = Vec::new();
-        let plan = d
-            .plan(&it, &mut warnings)
-            .expect("the first entity is taken");
+        let plan = plan_one(&mut d, &it, &mut warnings).expect("the first entity is taken");
         assert_eq!(plan.entity, 0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -3018,7 +3174,7 @@ mod tests {
 
         // Once per set of entities, not once per item.
         let mut again = Vec::new();
-        d.plan(&it, &mut again);
+        plan_one(&mut d, &it, &mut again);
         assert!(again.is_empty(), "{again:?}");
     }
 
@@ -3031,7 +3187,8 @@ mod tests {
         // made at the call site in mod.rs; now they are made here, once.
         let (mut d, _) = KeyDeriver::new(&model(), &request(), &[], &no_consistency()).unwrap();
         let mut w = Vec::new();
-        let _ = d.plan(
+        let _ = plan_one(
+            &mut d,
             &item(&[
                 ("_type", "User"),
                 ("pk", "somethingelse#1"),
@@ -3110,7 +3267,7 @@ mod tests {
                 ("sk", "user#"),
                 ("email", "a@x.co"),
             ]);
-            let _ = d.plan(&it, &mut warnings);
+            let _ = plan_one(&mut d, &it, &mut warnings);
         }
 
         // A fourth item whose template does match, made unrenderable after the
@@ -3119,14 +3276,12 @@ mod tests {
         // merge; its pk reads `accountId` and is untouched by this.
         let mut u = user();
         let mut w = Vec::new();
-        let plan = d
-            .plan(&u, &mut w)
-            .expect("the template reproduces this one");
+        let plan = plan_one(&mut d, &u, &mut w).expect("the template reproduces this one");
         u.insert(
             "email".to_string(),
             AttributeValue::M(std::collections::HashMap::new()),
         );
-        d.apply(&plan, &no_rewrites(), &mut u, &mut w);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut u, &mut w);
 
         let counts = d.take_unrebuilt();
         assert!(!counts.is_empty(), "the keys were not rebuilt");
@@ -3362,7 +3517,7 @@ mod tests {
         it.insert("profile".to_string(), AttributeValue::M(profile));
 
         let mut warnings = Vec::new();
-        let plan = d.plan(&it, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         let mut replaced = std::collections::HashMap::new();
         replaced.insert(
             "email".to_string(),
@@ -3371,7 +3526,7 @@ mod tests {
         it.insert("profile".to_string(), AttributeValue::M(replaced));
         let mut rewritten = HashSet::new();
         rewritten.insert("profile".to_string());
-        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(
             d.take_key_survivals(),
@@ -3411,7 +3566,7 @@ mod tests {
         it.insert("profile".to_string(), AttributeValue::M(profile));
 
         let mut warnings = Vec::new();
-        let plan = d.plan(&it, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         // Redaction replaces the map wholesale.
         it.insert(
             "profile".to_string(),
@@ -3419,7 +3574,7 @@ mod tests {
         );
         let mut rewritten = HashSet::new();
         rewritten.insert("profile".to_string());
-        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(
             d.take_key_survivals(),
@@ -3457,11 +3612,11 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        let plan = d.plan(&it, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         it.insert("emails".to_string(), AttributeValue::L(Vec::new()));
         let mut rewritten = HashSet::new();
         rewritten.insert("emails".to_string());
-        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(
             d.take_key_survivals(),
@@ -3518,12 +3673,12 @@ mod tests {
             ("email", "alice@real.co.uk"),
         ]);
         let mut warnings = Vec::new();
-        let plan = d.plan(&it, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         it.insert(
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
-        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
         assert_eq!(
             d.take_key_survivals(),
             vec![("Order".to_string(), "gs1pk".to_string(), 1)]
@@ -3545,14 +3700,14 @@ mod tests {
             &no_consistency(),
         )
         .unwrap();
-        let plan = d.plan(&it, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         it.insert(
             "id".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
         let mut rewritten = HashSet::new();
         rewritten.insert("id".to_string());
-        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
         assert!(d.take_key_survivals().is_empty());
     }
 
@@ -3572,7 +3727,7 @@ mod tests {
         let mut w = Vec::new();
 
         // The rule fired: the key is the rule's, and nothing is left over.
-        let plan = d.plan(&it, &mut w).unwrap();
+        let plan = plan_one(&mut d, &it, &mut w).unwrap();
         let mut fired = it.clone();
         fired.insert(
             "pk".to_string(),
@@ -3580,7 +3735,7 @@ mod tests {
         );
         let mut rewritten = HashSet::new();
         rewritten.insert("pk".to_string());
-        d.apply(&plan, &rewritten, &mut fired, &mut w);
+        apply_one(&mut d, &plan, &rewritten, &mut fired, &mut w);
         assert!(
             d.take_notices()
                 .iter()
@@ -3589,9 +3744,9 @@ mod tests {
         );
 
         // The rule passed the item by: the key is nobody's, and is counted.
-        let plan = d.plan(&it, &mut w).unwrap();
+        let plan = plan_one(&mut d, &it, &mut w).unwrap();
         let mut skipped = it.clone();
-        d.apply(&plan, &no_rewrites(), &mut skipped, &mut w);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut skipped, &mut w);
         assert!(
             w.iter().any(|n| n
                 .message
@@ -3623,7 +3778,7 @@ mod tests {
             ("email", "a@x.co"),
         ]);
         let mut warnings = Vec::new();
-        let _ = d.plan(&it, &mut warnings);
+        let _ = plan_one(&mut d, &it, &mut warnings);
         assert!(
             d.take_unrebuilt()
                 .iter()
@@ -3661,9 +3816,9 @@ mod tests {
                 ("email", "a@x.co"),
             ]);
             let mut w = Vec::new();
-            let plan = d.plan(&it, &mut w).unwrap();
+            let plan = plan_one(&mut d, &it, &mut w).unwrap();
             it.insert("pk".to_string(), AttributeValue::S(becomes.to_string()));
-            d.apply(&plan, &rewritten, &mut it, &mut w);
+            apply_one(&mut d, &plan, &rewritten, &mut it, &mut w);
         }
 
         let breaks = d.join_breaks();
@@ -3694,14 +3849,14 @@ mod tests {
             ("email", "alice@real.co.uk"),
         ]);
         let mut warnings = Vec::new();
-        let plan = d.plan(&it, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &it, &mut warnings).unwrap();
         it.insert(
             "email".to_string(),
             AttributeValue::S("fake@example.org".to_string()),
         );
         let mut rewritten = HashSet::new();
         rewritten.insert("email".to_string());
-        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut warnings);
 
         assert!(
             warnings.iter().any(|w| w
@@ -3723,12 +3878,12 @@ mod tests {
             ("id", "o2"),
             ("email", "bob@real.co.uk"),
         ]);
-        let plan = d.plan(&clean, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &clean, &mut warnings).unwrap();
         clean.insert(
             "email".to_string(),
             AttributeValue::S("fake2@example.org".to_string()),
         );
-        d.apply(&plan, &rewritten, &mut clean, &mut warnings);
+        apply_one(&mut d, &plan, &rewritten, &mut clean, &mut warnings);
         assert!(d.take_key_survivals().is_empty());
     }
 
@@ -3797,12 +3952,12 @@ mod tests {
 
     fn run_item_on(d: &mut KeyDeriver, mut item: Item, attribute: &str, becomes: &str) {
         let mut warnings = Vec::new();
-        let plan = d.plan(&item, &mut warnings).unwrap();
+        let plan = plan_one(d, &item, &mut warnings).unwrap();
         item.insert(
             attribute.to_string(),
             AttributeValue::S(becomes.to_string()),
         );
-        d.apply(&plan, &no_rewrites(), &mut item, &mut warnings);
+        apply_one(d, &plan, &no_rewrites(), &mut item, &mut warnings);
     }
 
     fn shared_key_deriver() -> KeyDeriver {
@@ -3833,6 +3988,102 @@ mod tests {
             ("email", email),
             ("orderId", "1"),
         ])
+    }
+
+    #[test]
+    fn a_batch_that_is_dropped_leaves_nothing_behind() {
+        // The customer and the order share a partition and leave it to an
+        // unseeded rule, which is a broken join once both have landed. Seen
+        // in a batch that is then dropped, neither is remembered, so a later
+        // batch holding only the order has nothing to disagree with.
+        let mut d = shared_key_deriver();
+        let mut w = Vec::new();
+
+        let mut dropped = Batch::default();
+        for (mut it, becomes) in [
+            (customer_item("a@x.co"), "fake1@example.com"),
+            (order_item("a@x.co"), "fake2@example.org"),
+        ] {
+            let plan = d.plan(&it, &mut dropped, &mut w).unwrap();
+            it.insert("email".to_string(), AttributeValue::S(becomes.to_string()));
+            d.apply(&plan, &no_rewrites(), &mut it, &mut dropped, &mut w);
+        }
+        drop(dropped);
+        assert!(d.join_breaks().is_empty(), "{:?}", d.join_breaks());
+
+        run_item(&mut d, order_item("a@x.co"), "fake2@example.org");
+        assert!(
+            d.join_breaks().is_empty(),
+            "the customer never landed: {:?}",
+            d.join_breaks()
+        );
+
+        // Landed, the same two rows are the break they always were.
+        run_item(&mut d, customer_item("a@x.co"), "fake1@example.com");
+        assert_eq!(d.join_breaks().len(), 1, "{:?}", d.join_breaks());
+    }
+
+    #[test]
+    fn a_collision_is_counted_when_the_batch_lands_not_when_it_is_seen() {
+        // Two rows with one primary key are an overwrite only if both were
+        // written. Seen in a batch that is dropped, the second row overwrote
+        // nothing.
+        let mut d = deriver();
+
+        let mut dropped = Batch::default();
+        d.note_primary_key(&user(), &mut dropped);
+        d.note_primary_key(&user(), &mut dropped);
+        drop(dropped);
+        assert_eq!(d.take_collisions().0, 0, "neither row landed");
+
+        let mut landed = Batch::default();
+        d.note_primary_key(&user(), &mut landed);
+        d.note_primary_key(&user(), &mut landed);
+        d.commit(landed);
+        assert_eq!(
+            d.take_collisions().0,
+            1,
+            "the same two rows, landed, are one overwrite"
+        );
+    }
+
+    #[test]
+    fn a_caution_first_raised_in_a_dropped_batch_is_raised_again_by_the_next() {
+        // A mismatch is warned on first sight and counted from then on. A
+        // first sight in a batch that never lands went nowhere, so the next
+        // batch has to raise it again, and the count the table reports is
+        // of rows that landed.
+        let mut d = deriver();
+        let mut off = user();
+        off.insert(
+            "pk".to_string(),
+            AttributeValue::S("somethingelse#1".to_string()),
+        );
+
+        let mut dropped = Batch::default();
+        let mut first = Vec::new();
+        let _ = d.plan(&off, &mut dropped, &mut first);
+        assert_eq!(first.len(), 1, "{first:?}");
+        drop(dropped);
+
+        let mut landed = Batch::default();
+        let mut again = Vec::new();
+        let _ = d.plan(&off, &mut landed, &mut again);
+        let _ = d.plan(&off, &mut landed, &mut again);
+        assert_eq!(again.len(), 1, "once more, and once only: {again:?}");
+        d.commit(landed);
+
+        let mut later = Batch::default();
+        let mut quiet = Vec::new();
+        let _ = d.plan(&off, &mut later, &mut quiet);
+        assert!(quiet.is_empty(), "{quiet:?}");
+        d.commit(later);
+
+        assert_eq!(
+            d.take_unrebuilt(),
+            vec![("User".to_string(), "pk".to_string(), 3)],
+            "three rows landed with the key left as it was"
+        );
     }
 
     #[test]
@@ -3902,9 +4153,9 @@ mod tests {
                 ("id", "1"),
             ]);
             let mut w = Vec::new();
-            let plan = d.plan(&it, &mut w).unwrap();
+            let plan = plan_one(&mut d, &it, &mut w).unwrap();
             it.insert("email".to_string(), AttributeValue::S(becomes.to_string()));
-            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         };
         run("Customer", "a", "PROFILE", "fake1@example.com");
         run("Order", "b", "ORDER#1", "fake2@example.org");
@@ -4033,9 +4284,9 @@ mod tests {
                 ("id", "1"),
             ]);
             let mut w = Vec::new();
-            let plan = d.plan(&it, &mut w).unwrap();
+            let plan = plan_one(&mut d, &it, &mut w).unwrap();
             it.insert(source.to_string(), AttributeValue::S(becomes.to_string()));
-            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         };
         run("Customer", "email", "PROFILE", "fake1@example.com");
         run("Order", "customerEmail", "ORDER#1", "fake2@example.org");
@@ -4077,11 +4328,11 @@ mod tests {
                 ("id", "1"),
             ]);
             let mut w = Vec::new();
-            let plan = d.plan(&it, &mut w).unwrap();
+            let plan = plan_one(&mut d, &it, &mut w).unwrap();
             if let Some(becomes) = becomes {
                 it.insert(source.to_string(), AttributeValue::S(becomes.to_string()));
             }
-            d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         };
         run("Customer", "email", "PROFILE", Some("fake1@example.com"));
         run("Order", "customerEmail", "ORDER#1", None);
@@ -4112,8 +4363,8 @@ mod tests {
         ]);
         assert!(!order.contains_key("email"), "nothing to rebuild pk from");
         let mut warnings = Vec::new();
-        let plan = d.plan(&order, &mut warnings).unwrap();
-        d.apply(&plan, &no_rewrites(), &mut order, &mut warnings);
+        let plan = plan_one(&mut d, &order, &mut warnings).unwrap();
+        apply_one(&mut d, &plan, &no_rewrites(), &mut order, &mut warnings);
 
         assert!(
             warnings
@@ -4173,8 +4424,8 @@ mod tests {
             ("email", "a@x.co"),
         ]);
         let mut w = Vec::new();
-        let plan = d.plan(&it, &mut w).unwrap();
-        d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        let plan = plan_one(&mut d, &it, &mut w).unwrap();
+        apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         let notices = d.take_notices();
         let seen = notices
             .iter()
@@ -4228,14 +4479,14 @@ mod tests {
             ("email", "a@x.co"),
         ]);
         let mut w = Vec::new();
-        let plan = d.plan(&it, &mut w).unwrap();
+        let plan = plan_one(&mut d, &it, &mut w).unwrap();
         it.insert(
             "gs1pk".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
         let mut rewritten = HashSet::new();
         rewritten.insert("gs1pk".to_string());
-        d.apply(&plan, &rewritten, &mut it, &mut w);
+        apply_one(&mut d, &plan, &rewritten, &mut it, &mut w);
 
         let notices = d.take_notices();
         let exposures: Vec<&Notice> = notices
@@ -4283,8 +4534,8 @@ mod tests {
             ("email", "a@x.co"),
         ]);
         let mut w = Vec::new();
-        let plan = d.plan(&it, &mut w).unwrap();
-        d.apply(&plan, &no_rewrites(), &mut it, &mut w);
+        let plan = plan_one(&mut d, &it, &mut w).unwrap();
+        apply_one(&mut d, &plan, &no_rewrites(), &mut it, &mut w);
         let notices = d.take_notices();
         let exposures: Vec<&Notice> = notices
             .iter()
@@ -4346,18 +4597,18 @@ mod tests {
 
         let stranger = item(&[("pk", "account#acc1"), ("sk", "user#[REDACTED]")]);
         assert!(
-            d.plan(&stranger, &mut warnings).is_none(),
+            plan_one(&mut d, &stranger, &mut warnings).is_none(),
             "matches nothing"
         );
-        d.note_primary_key(&stranger);
+        note_one(&mut d, &stranger);
 
         let mut user = user();
-        let plan = d.plan(&user, &mut warnings).unwrap();
+        let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
         user.insert(
             "email".to_string(),
             AttributeValue::S("[REDACTED]".to_string()),
         );
-        d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+        apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
         assert_eq!(
             user["sk"],
             AttributeValue::S("user#[REDACTED]".to_string()),
@@ -4405,12 +4656,12 @@ mod tests {
                 ("accountId", "acc1"),
                 ("email", &format!("u{n}@example.com")),
             ]);
-            let plan = d.plan(&user, &mut warnings).unwrap();
+            let plan = plan_one(&mut d, &user, &mut warnings).unwrap();
             user.insert(
                 "email".to_string(),
                 AttributeValue::S("[REDACTED]".to_string()),
             );
-            d.apply(&plan, &no_rewrites(), &mut user, &mut warnings);
+            apply_one(&mut d, &plan, &no_rewrites(), &mut user, &mut warnings);
             assert_eq!(user["sk"], AttributeValue::S("user#[REDACTED]".to_string()));
         }
         assert_eq!(d.take_collisions(), (2, false));

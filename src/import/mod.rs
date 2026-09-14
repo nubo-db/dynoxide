@@ -462,20 +462,14 @@ impl TableImport<'_> {
         table_schema: &schema::TableSchema,
         summary: &mut ImportSummary,
     ) -> Result<(), ImportError> {
-        let db = self.db;
         let rules = self.rules;
-        let rebuilds_keys = self.rebuilds_keys;
         let key_attrs = extract_key_attrs(&table_schema.create_request);
-        // Values a mask rule left whole, by the rule's path. Bounded by the
-        // number of mask rules, not by item count.
-        let mut mask_passthroughs: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
         // A data model with no rules has nothing to rebuild from: keys are
         // only re-rendered after an anonymisation moved something, so the
         // deriver would collect model-versus-schema warnings and then never
         // be asked to plan a single item. Reporting those reads as diagnostics
         // about work the run did, and it did none.
-        let mut key_deriver = match self.data_model.filter(|_| !rules.is_empty()) {
+        let key_deriver = match self.data_model.filter(|_| !rules.is_empty()) {
             Some(model) => {
                 let (deriver, warnings) = keys::KeyDeriver::new(
                     model,
@@ -499,6 +493,12 @@ impl TableImport<'_> {
             }
             None => None,
         };
+        let mut landed = Landed {
+            key_deriver,
+            mask_passthroughs: std::collections::HashMap::new(),
+            items: 0,
+            bytes: 0,
+        };
 
         let file_count = files.len();
         eprintln!("Importing table '{}' ({} files)...", table_name, file_count);
@@ -511,15 +511,13 @@ impl TableImport<'_> {
         );
         pb.set_message(format!("{}: parsing...", table_name));
 
-        let mut table_items = 0usize;
-        let mut table_bytes = 0usize;
         let mut table_skipped = 0usize;
         let mut batch_error: Option<String> = None;
 
         const BATCH_SIZE: usize = 10_000;
 
         for file_path in files {
-            let mut batch: Vec<crate::types::Item> = Vec::with_capacity(BATCH_SIZE);
+            let mut pending = Pending::with_capacity(BATCH_SIZE);
 
             let stats = parser::parse_export_file_streaming(file_path, |mut item| {
                 // Skip processing if we've already hit a fatal batch error
@@ -531,9 +529,10 @@ impl TableImport<'_> {
                 // model says is built from the attributes just rewritten
                 if !rules.is_empty() {
                     let mut warnings = Vec::new();
-                    let plan = key_deriver
-                        .as_mut()
-                        .and_then(|d| d.plan(&item, &mut warnings));
+                    let plan = landed
+                        .key_deriver
+                        .as_ref()
+                        .and_then(|d| d.plan(&item, &mut pending.observed, &mut warnings));
                     let (rule_warnings, rewritten) = anonymise::apply_rules(
                         &mut item,
                         table_name,
@@ -542,54 +541,52 @@ impl TableImport<'_> {
                         self.consistency_fields,
                         &key_attrs,
                         &mut anonymise::RuleTally {
-                            mask_passthroughs: &mut mask_passthroughs,
+                            mask_passthroughs: &mut pending.mask_passthroughs,
                             rule_work: &mut self.rule_work,
                         },
                     );
                     warnings.extend(rule_warnings);
-                    match (key_deriver.as_mut(), plan) {
+                    match (landed.key_deriver.as_ref(), plan) {
                         (Some(deriver), Some(plan)) => {
-                            deriver.apply(&plan, &rewritten, &mut item, &mut warnings);
+                            deriver.apply(
+                                &plan,
+                                &rewritten,
+                                &mut item,
+                                &mut pending.observed,
+                                &mut warnings,
+                            );
                         }
                         // An item that matched no entity keeps its keys, but a
                         // rebuilt key can still land on them, and that row is
                         // lost like any other. Record it so the overwrite is
                         // counted rather than invisible.
-                        (Some(deriver), None) => deriver.note_primary_key(&item),
+                        (Some(deriver), None) => {
+                            deriver.note_primary_key(&item, &mut pending.observed)
+                        }
                         (None, _) => {}
                     }
                     for notice in warnings {
                         // Named for the table, both so the reader knows
                         // where it came from and so the cross-table dedupe
-                        // below cannot swallow table B's copy of a notice
-                        // table A already raised.
-                        let notice = notice.for_table(table_name);
-                        if self.seen_warnings.insert(notice.message.clone()) {
-                            summary.notice(notice);
-                        }
+                        // cannot swallow table B's copy of a notice table A
+                        // already raised.
+                        pending.raise(notice.for_table(table_name), &self.seen_warnings);
                     }
                 }
-                batch.push(item);
+                pending.items.push(item);
 
                 // Flush batch when full
-                if batch.len() >= BATCH_SIZE {
-                    let chunk = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-                    match insert_items(db, rebuilds_keys, table_name, chunk) {
-                        Ok(result) => {
-                            table_items += result.items_imported;
-                            table_bytes += result.bytes_imported;
-                        }
-                        Err(e) => {
-                            let msg = format!("Batch import error for '{}': {e}", table_name);
-                            if self.continue_on_error {
-                                summary.notice(Notice::caution(msg));
-                            } else {
-                                batch_error = Some(msg);
-                                return;
-                            }
+                if pending.items.len() >= BATCH_SIZE {
+                    let full = std::mem::replace(&mut pending, Pending::with_capacity(BATCH_SIZE));
+                    if let Err(msg) = self.land(table_name, full, &mut landed, summary) {
+                        if self.continue_on_error {
+                            summary.notice(Notice::caution(msg));
+                        } else {
+                            batch_error = Some(msg);
+                            return;
                         }
                     }
-                    pb.set_message(format!("{}: {} items", table_name, table_items));
+                    pb.set_message(format!("{}: {} items", table_name, landed.items));
                     pb.tick();
                 }
             })?;
@@ -610,28 +607,21 @@ impl TableImport<'_> {
             // Flush remaining items. Under --continue-on-error this batch is
             // treated as the others were: the flag covered every full batch
             // and then the last partial one failed the run anyway.
-            if !batch.is_empty() {
-                match insert_items(db, rebuilds_keys, table_name, batch) {
-                    Ok(result) => {
-                        table_items += result.items_imported;
-                        table_bytes += result.bytes_imported;
-                    }
-                    Err(e) => {
-                        let msg = format!("Batch import error for '{}': {e}", table_name);
-                        if self.continue_on_error {
-                            summary.notice(Notice::caution(msg));
-                        } else {
-                            pb.abandon_with_message(format!("{}: FAILED", table_name));
-                            return Err(ImportError::Database(msg));
-                        }
+            if !pending.items.is_empty() {
+                if let Err(msg) = self.land(table_name, pending, &mut landed, summary) {
+                    if self.continue_on_error {
+                        summary.notice(Notice::caution(msg));
+                    } else {
+                        pb.abandon_with_message(format!("{}: FAILED", table_name));
+                        return Err(ImportError::Database(msg));
                     }
                 }
-                pb.set_message(format!("{}: {} items", table_name, table_items));
+                pb.set_message(format!("{}: {} items", table_name, landed.items));
                 pb.tick();
             }
         }
 
-        if let Some(deriver) = key_deriver.as_mut() {
+        if let Some(deriver) = landed.key_deriver.as_mut() {
             // Filed before the join check below, so that a run the check
             // fails still prints everything else the table had to say.
             for notice in deriver.take_notices() {
@@ -666,7 +656,7 @@ impl TableImport<'_> {
             }
         }
 
-        let mut left_whole: Vec<(&String, &usize)> = mask_passthroughs.iter().collect();
+        let mut left_whole: Vec<(&String, &usize)> = landed.mask_passthroughs.iter().collect();
         left_whole.sort();
         for (path, count) in left_whole {
             summary.notice(Notice::exposure(format!(
@@ -679,8 +669,8 @@ impl TableImport<'_> {
         pb.finish_with_message(format!(
             "{}: {} items, {} bytes{}",
             table_name,
-            table_items,
-            format_bytes(table_bytes),
+            landed.items,
+            format_bytes(landed.bytes),
             if table_skipped > 0 {
                 format!(", {} skipped", table_skipped)
             } else {
@@ -690,15 +680,101 @@ impl TableImport<'_> {
 
         summary.tables.push(TableImportResult {
             table_name: table_name.to_string(),
-            items_imported: table_items,
-            bytes_imported: table_bytes,
+            items_imported: landed.items,
+            bytes_imported: landed.bytes,
             lines_skipped: table_skipped,
         });
-        summary.total_items += table_items;
-        summary.total_bytes += table_bytes;
+        summary.total_items += landed.items;
+        summary.total_bytes += landed.bytes;
         summary.total_skipped += table_skipped;
         Ok(())
     }
+
+    /// Insert one batch and, if it landed, keep what was seen of it.
+    ///
+    /// The insert is one transaction, so a failure means none of the
+    /// batch's rows reached the output. What they said about exposures,
+    /// collisions and joins is dropped with them, and a caution first raised
+    /// for one of them is raised again by the next row that earns it. The
+    /// error is the message the run reports; whether the run goes on is the
+    /// caller's decision.
+    fn land(
+        &mut self,
+        table_name: &str,
+        pending: Pending,
+        landed: &mut Landed,
+        summary: &mut ImportSummary,
+    ) -> Result<(), String> {
+        let result = insert_items(self.db, self.rebuilds_keys, table_name, pending.items)
+            .map_err(|e| format!("Batch import error for '{}': {e}", table_name))?;
+        landed.items += result.items_imported;
+        landed.bytes += result.bytes_imported;
+        if let Some(deriver) = landed.key_deriver.as_mut() {
+            deriver.commit(pending.observed);
+        }
+        for (path, count) in pending.mask_passthroughs {
+            *landed.mask_passthroughs.entry(path).or_insert(0) += count;
+        }
+        for notice in pending.notices {
+            if self.seen_warnings.insert(notice.message.clone()) {
+                summary.notice(notice);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One batch of items on its way to the output, with everything the run
+/// observed about them held back until the batch is known to have landed.
+///
+/// The insert is one transaction, and a failure rolls all of it back. A
+/// notice about a row that never reached the output would be false, and a
+/// key remembered from such a row would be compared against rows that did
+/// land. So nothing a batch says is believed until its insert returns.
+struct Pending {
+    items: Vec<crate::types::Item>,
+    /// What the key deriver saw, for it to fold in once the batch lands.
+    observed: keys::Batch,
+    /// Notices the items raised, in the order they were raised, each once.
+    notices: Vec<Notice>,
+    /// The messages of `notices`, so a batch whose every item raises one
+    /// caution holds it once rather than ten thousand times.
+    raised: HashSet<String>,
+    /// Values a mask rule left whole, by the rule's path.
+    mask_passthroughs: std::collections::HashMap<String, usize>,
+}
+
+impl Pending {
+    fn with_capacity(items: usize) -> Self {
+        Pending {
+            items: Vec::with_capacity(items),
+            observed: keys::Batch::default(),
+            notices: Vec::new(),
+            raised: HashSet::new(),
+            mask_passthroughs: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Hold a notice for the batch, unless a batch that landed already
+    /// raised it or this one has.
+    fn raise(&mut self, notice: Notice, already_raised: &HashSet<String>) {
+        if already_raised.contains(&notice.message) {
+            return;
+        }
+        if self.raised.insert(notice.message.clone()) {
+            self.notices.push(notice);
+        }
+    }
+}
+
+/// What one table's landed batches add up to.
+struct Landed {
+    key_deriver: Option<keys::KeyDeriver>,
+    /// Values a mask rule left whole, by the rule's path. Bounded by the
+    /// number of mask rules, not by item count.
+    mask_passthroughs: std::collections::HashMap<String, usize>,
+    items: usize,
+    bytes: usize,
 }
 
 /// Insert a batch on the write path the run chose.

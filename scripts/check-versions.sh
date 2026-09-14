@@ -14,6 +14,7 @@
 #   scripts/check-versions.sh 1.2.0 --built   # ...and so do the built artefacts
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPECTED="${1:-}"
 CHECK_BUILT=false
 for arg in "$@"; do [ "$arg" = "--built" ] && CHECK_BUILT=true; done
@@ -25,15 +26,25 @@ read_version_file() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' VERSION | head -1
 }
 
+[ -f VERSION ] || { fail "VERSION is missing"; exit 1; }
 PRODUCT="$(read_version_file)"
-CRATE="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+# `|| true` because under pipefail a Cargo.toml with no version line would
+# otherwise end the script here, silently, before the message below.
+CRATE="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2 || true)"
 
 [ -n "$PRODUCT" ] || fail "VERSION is empty"
 [ -n "$CRATE" ] || fail "could not read the crate version from Cargo.toml"
 
-SEMVER='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
-printf '%s' "$PRODUCT" | grep -qE "$SEMVER" || fail "product version '$PRODUCT' is not semver"
-printf '%s' "$CRATE"   | grep -qE "$SEMVER" || fail "crate version '$CRATE' is not semver"
+# The shape rule is shared with the release workflow and build.rs, so a
+# version that passes here is one every later stage accepts. The regex this
+# replaced took `1.2.0-rc..1`, which npm refuses once the GitHub Release is
+# already public.
+if [ -n "$PRODUCT" ]; then
+  "$SCRIPT_DIR/is-semver.sh" "$PRODUCT" || fail "product version '$PRODUCT' in VERSION is not semver"
+fi
+if [ -n "$CRATE" ]; then
+  "$SCRIPT_DIR/is-semver.sh" "$CRATE" || fail "crate version '$CRATE' in Cargo.toml is not semver"
+fi
 
 if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "--built" ] && [ "$PRODUCT" != "$EXPECTED" ]; then
   fail "VERSION ($PRODUCT) does not match the expected product version ($EXPECTED)"
@@ -55,8 +66,8 @@ check_json npm/wasm-engine/package.json '.version' "package version" "$PRODUCT"
 # The crate lockfile has to agree with the crate, or a publish goes out against
 # a stale lock. benchmarks/Cargo.lock is an unpublished dev package and is not
 # part of this.
-LOCKED="$(awk -v RS='' '/name = "dynoxide-rs"/ {print}' Cargo.lock | grep -m1 '^version = ' | cut -d'"' -f2)"
-[ "$LOCKED" = "$CRATE" ] || fail "Cargo.lock records dynoxide-rs $LOCKED, Cargo.toml says $CRATE"
+LOCKED="$(awk -v RS='' '/name = "dynoxide-rs"/ {print}' Cargo.lock | grep -m1 '^version = ' | cut -d'"' -f2 || true)"
+[ "$LOCKED" = "$CRATE" ] || fail "Cargo.lock records dynoxide-rs '$LOCKED', Cargo.toml says $CRATE"
 
 if [ "$CHECK_BUILT" = true ]; then
   # Built artefacts. These are what a user actually sees, and they are the

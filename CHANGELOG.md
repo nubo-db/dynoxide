@@ -16,14 +16,16 @@ Added.
 ### Behaviour changes
 
 - **`hash` rules now use HMAC-SHA256 keyed on the salt. Every hashed value
-  changes.** A dataset anonymised by 1.1.0 will not join against one anonymised
-  by this release, so re-import both sides, and rotate the salt while you are
-  there. The value is also tagged with its DynamoDB type, so the string `"123"`
-  and the number `123` no longer share a pseudonym.
+  changes.** The `SHA256(salt || value)` it replaced ran salt and value together
+  as one byte string with no boundary between them, and inherited SHA-256's
+  length extension. A dataset anonymised by 1.1.0 will not join against one
+  anonymised by this release, so re-import both sides, and rotate the salt
+  while you are there. The value is also tagged with its DynamoDB type, so the
+  string `"123"` and the number `123` no longer share a pseudonym.
 - **One DynamoDB number is one value however it is spelled.** `1`, `1.0` and
   `0.1e1` share a pseudonym in `hash`, seeded `fake` and the consistency map,
   as they share a row. A duplicated set member no longer changes a set's
-  pseudonym, and `contains` against a number set compares numerically.
+  pseudonym.
 - **`hash` on a map, list or set is now stable.** It hashed a serialisation
   whose order varied, so a hashed map gave every item its own pseudonym.
   Scalars hash exactly as they did earlier in this release.
@@ -107,6 +109,10 @@ Added.
 
 ### Fixed
 
+- `contains` against a number set compares numerically, as DynamoDB does, so
+  `contains(tags, :n)` with `:n` as `1` matches a set holding `1.0`. The
+  evaluator is shared, so this holds in a `FilterExpression` and a
+  `ConditionExpression` alike, not only in an import rule.
 - `safe_email` no longer collides at ordinary sizes: addresses carry a 64-bit
   derived suffix in the local part.
 - `${name:length:pad}` matches OneTable's rendering for a multi-character pad,
@@ -134,7 +140,9 @@ Added.
   Homebrew formula's test block runs before the tap moves, the website waits on
   both npm packages, prereleases publish with a dist-tag and install through
   the Action, `npm/scripts/publish.sh` refuses a version and release URL that
-  name different tags, and the npm job checks out the tag it publishes.
+  name different tags, the npm job checks out the tag it publishes, and a tag
+  whose version is not full semver (`v1.2.0-rc..1`) is refused before anything
+  is published rather than by npm afterwards.
 
 ## [1.1.0] - 2026-09-03
 

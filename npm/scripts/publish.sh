@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NPM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$NPM_DIR/.." && pwd)"
 PLATFORMS_JSON="$NPM_DIR/dynoxide/platforms.json"
 
 DRY_RUN=""
@@ -46,12 +47,9 @@ fi
 # checked against each other.
 # npm refuses a bare publish of a prerelease version and does not default a
 # dist-tag, so a prerelease release failed here while the browser package,
-# which computes its own tag, published fine. Same rule as npm.yml: a version
-# containing a hyphen is a prerelease and goes to `next`.
-case "$VERSION" in
-  *-*) NPM_TAG="next" ;;
-  *)   NPM_TAG="latest" ;;
-esac
+# which computed its own tag, published fine. The rule now lives in one script
+# that npm.yml and release.yml also call: a prerelease goes to `next`.
+NPM_TAG=$("$REPO_ROOT/scripts/npm-dist-tag.sh" "$VERSION")
 
 URL_TAG="${RELEASE_URL##*/}"
 if [[ "$URL_TAG" != "v$VERSION" && "$URL_TAG" != "$VERSION" ]]; then
@@ -71,7 +69,6 @@ fi
 echo ""
 
 # Generate THIRD_PARTY_LICENSES if cargo-about is available
-REPO_ROOT="$(cd "$NPM_DIR/.." && pwd)"
 THIRD_PARTY_LICENSES=""
 if command -v cargo-about &>/dev/null && [[ -f "$REPO_ROOT/Cargo.toml" ]]; then
   echo "Generating THIRD_PARTY_LICENSES..."

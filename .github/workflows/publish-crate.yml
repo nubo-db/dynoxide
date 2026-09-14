@@ -39,19 +39,17 @@ jobs:
 
       # Recovery is run by hand against a tag, so the crate version it finds
       # may already be published. Say so and stop, rather than failing on a
-      # cargo error that reads like something went wrong.
+      # cargo error that reads like something went wrong. The probe is the
+      # script release.yml uses, so the two paths cannot drift.
       - name: Is this crate version already published
         run: |
           CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
-                   -H 'User-Agent: dynoxide-release' \
-                   "https://crates.io/api/v1/crates/dynoxide-rs/$CRATE" || echo "000")
-          if [ "$CODE" = "200" ]; then
-            echo "::error::dynoxide-rs $CRATE is already on crates.io. Nothing to recover."
+          ALREADY=$(scripts/is-crate-published.sh dynoxide-rs "$CRATE") || {
+            echo "::error::could not determine whether dynoxide-rs $CRATE is published. Refusing to guess."
             exit 1
-          fi
-          if [ "$CODE" != "404" ]; then
-            echo "::error::could not reach crates.io (status $CODE). Refusing to guess."
+          }
+          if [ "$ALREADY" = true ]; then
+            echo "::error::dynoxide-rs $CRATE is already on crates.io. Nothing to recover."
             exit 1
           fi
           echo "dynoxide-rs $CRATE is not published; continuing"

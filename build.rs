@@ -27,31 +27,54 @@ fn main() {
     });
     let version = raw.trim();
 
-    // Not a full semver parse: enough to catch an empty file, a stray editor
-    // newline turned into whitespace, or a `v` prefix copied from a git tag.
-    // A prerelease suffix is allowed, because the release workflow accepts
+    // The same rule as scripts/is-semver.sh, so a version that builds is one
+    // the release pipeline will accept. The looser check this replaced let
+    // `1.2.0-rc..1` through, which npm rejects only after the GitHub Release
+    // exists. A prerelease is allowed, because the release workflow accepts
     // prerelease tags and the npm publish path has a channel for them.
-    let (core, pre) = match version.split_once('-') {
-        Some((core, pre)) => (core, Some(pre)),
-        None => (version, None),
-    };
-    let core_ok = core.split('.').count() == 3
-        && core
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
-    let pre_ok = pre.is_none_or(|pre| {
-        !pre.is_empty()
-            && pre
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    });
-    if !core_ok || !pre_ok {
+    if !is_semver(version) {
         panic!(
             "the product version in {} is {version:?}, which is not \
-             MAJOR.MINOR.PATCH with an optional -prerelease suffix",
+             MAJOR.MINOR.PATCH with no leading zeros and an optional \
+             -prerelease of dot-separated non-empty identifiers",
             path.display()
         );
     }
 
     println!("cargo:rustc-env=DYNOXIDE_PRODUCT_VERSION={version}");
+}
+
+/// Semver 2.0.0 without build metadata: a numeric core with no leading zeros,
+/// then an optional prerelease of dot-separated identifiers, each non-empty,
+/// drawn from `[0-9A-Za-z-]`, and with no leading zero when purely numeric.
+/// Build metadata is refused because the version becomes a git tag, a
+/// container image tag, which cannot hold a `+`, and an npm version, which
+/// drops it.
+fn is_semver(version: &str) -> bool {
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let core_ok = core.split('.').count() == 3 && core.split('.').all(is_numeric_identifier);
+    let pre_ok = pre.is_none_or(|pre| pre.split('.').all(is_prerelease_identifier));
+    core_ok && pre_ok
+}
+
+/// `0`, or digits with no leading zero.
+fn is_numeric_identifier(part: &str) -> bool {
+    !part.is_empty()
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && (part == "0" || !part.starts_with('0'))
+}
+
+/// A non-empty run of `[0-9A-Za-z-]`; when it is all digits, no leading zero.
+fn is_prerelease_identifier(part: &str) -> bool {
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return false;
+    }
+    if part.bytes().all(|b| b.is_ascii_digit()) {
+        is_numeric_identifier(part)
+    } else {
+        true
+    }
 }

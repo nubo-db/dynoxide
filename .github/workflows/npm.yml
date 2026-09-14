@@ -63,13 +63,13 @@ jobs:
             TAG="$RELEASE_TAG"
           fi
 
-          # Validate tag format
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
-            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
+          # Same shape rule as release.yml's validate job, from the same script.
+          VERSION="${TAG#v}"
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
             exit 1
           fi
 
-          VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: $VERSION (tag: $TAG)"
@@ -137,22 +137,20 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           TAG="$INPUT_TAG"
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
-            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
+          VERSION="${TAG#v}"
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
             exit 1
           fi
-          VERSION="${TAG#v}"
           # The engine ships at the release version, in lockstep with every other
           # artefact. It previously rode a separate preview track as
           # <crate-base>-preview; that track ended when the wasm path graduated.
           # NPM_TAG keeps a prerelease off the `latest` dist-tag: npm refuses a
           # bare publish of a prerelease and does not default a tag, so the value
-          # is passed explicitly at publish time either way.
-          case "$VERSION" in
-            *-*) NPM_TAG="next" ;;
-            *)   NPM_TAG="latest" ;;
-          esac
-          # Defence in depth: the tag regex above already guarantees a non-empty
+          # is passed explicitly at publish time either way. The rule is the one
+          # script every publisher calls.
+          NPM_TAG=$(scripts/npm-dist-tag.sh "$VERSION")
+          # Defence in depth: the shape check above already guarantees a non-empty
           # version, but assert it before these values reach the skip check and the
           # publish. An empty engine version would make the `npm view ...@` probe
           # match the whole package and silently skip the publish.

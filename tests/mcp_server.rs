@@ -4023,17 +4023,17 @@ fn write_export_dir(dir: &std::path::Path, table: &str, items: &[&str]) {
     }
 }
 
-/// The whole path: `dynoxide import --mcp --accept-exposure` on an export
-/// whose rule rewrote nothing. The gate lets the run through because the
-/// exposure was accepted, and the server that starts must then say so to
-/// the agent, which has no other way to learn it.
+/// An export whose one rule matches every item and rewrites none of them,
+/// because its path is misspelt. Importing it raises one caution and one
+/// exposure, so the gate refuses it without `--accept-exposure`. Returns the
+/// export directory, the schema file and the rules file.
 #[cfg(feature = "import")]
-#[test]
-fn test_import_mcp_reports_accepted_exposure() {
-    let tmp = tempfile::tempdir().unwrap();
-    let source = tmp.path().join("export");
-    let schema_file = tmp.path().join("schema.json");
-    let rules_file = tmp.path().join("rules.toml");
+fn write_exposed_export(
+    tmp: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let source = tmp.join("export");
+    let schema_file = tmp.join("schema.json");
+    let rules_file = tmp.join("rules.toml");
     write_export_dir(
         &source,
         "Users",
@@ -4059,37 +4059,18 @@ fn test_import_mcp_reports_accepted_exposure() {
         .to_string(),
     )
     .unwrap();
-    // The path is misspelt, so the rule matches every item and rewrites none.
     std::fs::write(
         &rules_file,
         "[[rules]]\nmatch = \"attribute_exists(pk)\"\npath = \"emial\"\naction = { type = \"redact\" }\n",
     )
     .unwrap();
+    (source, schema_file, rules_file)
+}
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
-        .args(["import", "--mcp", "--accept-exposure", "--source"])
-        .arg(&source)
-        .arg("--schema")
-        .arg(&schema_file)
-        .arg("--rules")
-        .arg(&rules_file)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn dynoxide import --mcp");
-
-    let resp = init_mcp(&mut child);
-    let instructions = resp["result"]["instructions"].as_str().unwrap();
-    assert!(
-        instructions.contains(
-            "This database was populated by dynoxide import; get_database_info reports 2 notices, of which 1 is an exposure that was accepted with --accept-exposure."
-        ),
-        "the instructions must carry the counts: {instructions}"
-    );
-
-    let resp = call_tool(&mut child, 1, "get_database_info", json!({}));
-    let content = tool_content(&resp);
+/// The `import` object `get_database_info` must return for the export
+/// `write_exposed_export` builds, once the exposure has been accepted.
+#[cfg(feature = "import")]
+fn assert_accepted_exposure_report(content: &Value) {
     let import = &content["import"];
     assert!(import.is_object(), "import must be reported: {content}");
     assert_eq!(import["tables"], 1);
@@ -4117,7 +4098,242 @@ fn test_import_mcp_reports_accepted_exposure() {
             .contains("rewrote none of them"),
         "the exposure keeps its message: {notices:?}"
     );
+}
+
+/// The whole path: `dynoxide import --mcp --accept-exposure` on an export
+/// whose rule rewrote nothing. The gate lets the run through because the
+/// exposure was accepted, and the server that starts must then say so to
+/// the agent, which has no other way to learn it.
+#[cfg(feature = "import")]
+#[test]
+fn test_import_mcp_reports_accepted_exposure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (source, schema_file, rules_file) = write_exposed_export(tmp.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .args(["import", "--mcp", "--accept-exposure", "--source"])
+        .arg(&source)
+        .arg("--schema")
+        .arg(&schema_file)
+        .arg("--rules")
+        .arg(&rules_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide import --mcp");
+
+    let resp = init_mcp(&mut child);
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(
+            "This database was populated by dynoxide import; get_database_info reports 2 notices, of which 1 is an exposure that was accepted with --accept-exposure."
+        ),
+        "the instructions must carry the counts: {instructions}"
+    );
+
+    let resp = call_tool(&mut child, 1, "get_database_info", json!({}));
+    assert_accepted_exposure_report(&tool_content(&resp));
 
     drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `--mcp-read-only` on `import --mcp` must reach the server: an agent handed
+/// a copy of real data over stdio is refused writes the same way `dynoxide
+/// mcp --read-only` refuses them.
+#[cfg(feature = "import")]
+#[test]
+fn test_import_mcp_read_only_rejects_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("export");
+    let schema_file = tmp.path().join("schema.json");
+    write_export_dir(
+        &source,
+        "Users",
+        &[r#"{"Item": {"pk": {"S": "USER#1"}, "name": {"S": "Ada"}}}"#],
+    );
+    std::fs::write(
+        &schema_file,
+        json!([{
+            "Table": {
+                "TableName": "Users",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+            }
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .args(["import", "--mcp", "--mcp-read-only", "--source"])
+        .arg(&source)
+        .arg("--schema")
+        .arg(&schema_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide import --mcp --mcp-read-only");
+
+    init_mcp(&mut child);
+
+    let resp = call_tool(&mut child, 1, "get_database_info", json!({}));
+    assert!(!is_tool_error(&resp));
+    let content = tool_content(&resp);
+    assert_eq!(
+        content["read_only"], true,
+        "the flag must be reported: {content}"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Users", "item": {"pk": {"S": "USER#2"}, "name": {"S": "Bob"}}}),
+    );
+    assert!(is_tool_error(&resp), "put_item must be refused: {resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "AccessDeniedException");
+    assert!(content["message"].as_str().unwrap().contains("read-only"));
+
+    // The imported data is still readable.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({"table_name": "Users", "key": {"pk": {"S": "USER#1"}}}),
+    );
+    assert!(!is_tool_error(&resp), "reads still work: {resp}");
+    assert_eq!(tool_content(&resp)["Item"]["name"]["S"], "Ada");
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Two loopback ports that are free at the same moment, so the pair cannot
+/// collide with each other.
+#[cfg(all(feature = "import", feature = "http-server"))]
+fn two_free_ports() -> (u16, u16) {
+    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port(),
+    )
+}
+
+/// One JSON-RPC request over the streamable HTTP transport. The server runs
+/// stateless with JSON responses, so every call is a single POST.
+#[cfg(all(feature = "import", feature = "http-server"))]
+async fn mcp_http(client: &reqwest::Client, url: &str, body: Value) -> Value {
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .json(&body)
+        .send()
+        .await
+        .expect("the MCP HTTP server answers");
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "MCP HTTP {status}: {text}");
+    serde_json::from_str(&text).expect("a JSON-RPC response")
+}
+
+/// The same import served the other way: `--serve --mcp` runs the DynamoDB
+/// wire surface and the MCP server side by side, and the MCP side must carry
+/// the same report the stdio server does.
+#[cfg(all(feature = "import", feature = "http-server"))]
+#[tokio::test]
+async fn test_import_serve_mcp_reports_accepted_exposure_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (source, schema_file, rules_file) = write_exposed_export(tmp.path());
+    let (http_port, mcp_port) = two_free_ports();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .args([
+            "import",
+            "--serve",
+            "--mcp",
+            "--mcp-no-auth",
+            "--accept-exposure",
+        ])
+        .args(["--port", &http_port.to_string()])
+        .args(["--mcp-port", &mcp_port.to_string()])
+        .arg("--source")
+        .arg(&source)
+        .arg("--schema")
+        .arg(&schema_file)
+        .arg("--rules")
+        .arg(&rules_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide import --serve --mcp");
+
+    // Wait for the MCP listener rather than sleeping: the import runs first
+    // and the two servers bind after it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", mcp_port)).is_ok() {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("the process exited before serving: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the MCP HTTP server did not start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{mcp_port}/mcp");
+
+    let resp = mcp_http(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            }
+        }),
+    )
+    .await;
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(
+            "This database was populated by dynoxide import; get_database_info reports 2 notices, of which 1 is an exposure that was accepted with --accept-exposure."
+        ),
+        "the instructions must carry the counts: {instructions}"
+    );
+
+    let resp = mcp_http(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "get_database_info", "arguments": {}}
+        }),
+    )
+    .await;
+    assert!(
+        !is_tool_error(&resp),
+        "get_database_info must succeed: {resp}"
+    );
+    assert_accepted_exposure_report(&tool_content(&resp));
+
+    let _ = child.kill();
     let _ = child.wait();
 }

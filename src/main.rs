@@ -1080,6 +1080,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
             let mcp_data_model =
                 load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
             let mcp_config = dynoxide::mcp::McpConfig {
+                read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
                 import: Some(import_report(&summary, args.accept_exposure)),
                 ..Default::default()

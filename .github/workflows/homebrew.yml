@@ -33,6 +33,11 @@ jobs:
         run: |
           TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
+          # Same shape rule as release.yml and npm.yml, from the same script.
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 

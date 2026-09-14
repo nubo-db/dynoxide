@@ -41,7 +41,8 @@ Added.
   exit 0 instead. `ImportSummary` gains a `notices` field carrying every message with its
   concern, and an `exposures` field holding the messages of the ones that count.
 - **`salt_env` and `seed_env` must be at least 16 bytes.** Generate one with
-  `openssl rand -base64 24`.
+  `openssl rand -base64 24`. The salt is wiped from memory once the run is
+  done with it, as the encryption key already was.
 - **`fake` on a numeric attribute draws from the full 64-bit range** rather
   than four digits, so a few hundred items no longer collide.
 - **`--tables` applies to a flat export directory** as well as the per-table

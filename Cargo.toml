@@ -73,7 +73,10 @@ web-time = "1"
 # so it is safe to call from inside the tokio-based HTTP/MCP servers.
 pollster = "0.4"
 
-# Optional encryption dependency
+# `encryption` wipes the key once the PRAGMA has taken it. `import` wraps the
+# salt the same way: a salt is cloned into every rule that names it and held
+# for the whole run, so redacting `Debug` alone would leave copies in freed
+# memory.
 zeroize = { version = "1", optional = true }
 
 # Optional HTTP server dependencies

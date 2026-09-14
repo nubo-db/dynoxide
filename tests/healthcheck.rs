@@ -155,3 +155,21 @@ fn help_text_lists_all_flags() {
         assert!(stdout.contains(flag), "help missing {flag}: {stdout}");
     }
 }
+
+/// `--version` and `-V` report the product version.
+///
+/// The CLI used to take clap's implicit Cargo version, which now tracks the
+/// Rust API rather than the thing a CLI user installed.
+#[test]
+fn cli_version_flags_report_the_product_version() {
+    let expected = format!("dynoxide {}", dynoxide::PRODUCT_VERSION);
+    for flag in ["--version", "-V"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+            .arg(flag)
+            .output()
+            .unwrap_or_else(|e| panic!("running {flag}: {e}"));
+        assert!(out.status.success(), "{flag} should succeed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), expected, "{flag} output");
+    }
+}

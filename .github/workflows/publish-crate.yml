@@ -37,6 +37,23 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      # Recovery is run by hand against a tag, so the crate version it finds
+      # may already be published. Say so and stop, rather than failing on a
+      # cargo error that reads like something went wrong. The probe is the
+      # script release.yml uses, so the two paths cannot drift.
+      - name: Is this crate version already published
+        run: |
+          CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          ALREADY=$(scripts/is-crate-published.sh dynoxide-rs "$CRATE") || {
+            echo "::error::could not determine whether dynoxide-rs $CRATE is published. Refusing to guess."
+            exit 1
+          }
+          if [ "$ALREADY" = true ]; then
+            echo "::error::dynoxide-rs $CRATE is already on crates.io. Nothing to recover."
+            exit 1
+          fi
+          echo "dynoxide-rs $CRATE is not published; continuing"
+
       - name: Dry run
         run: cargo publish --dry-run
         env:

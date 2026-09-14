@@ -49,7 +49,9 @@ pub struct GsiMapping {
     /// (e.g. "gs1"). Must match the name from CreateTable / describe_table
     /// so agents can pass it directly to query's `index_name` parameter.
     pub index_name: String,
-    /// GSI partition key template
+    /// GSI partition key template. Empty when the index hashes on a plain
+    /// attribute (a tenant id, say) and only its sort key is templated: the
+    /// index is still listed so the sort key template reaches every reader.
     pub pk_template: String,
     /// GSI sort key template (if the index has a sort key)
     #[serde(skip_serializing_if = "Option::is_none")]

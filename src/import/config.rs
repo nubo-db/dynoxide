@@ -23,12 +23,31 @@ pub struct ImportConfig {
 #[derive(Debug, Deserialize)]
 pub struct RuleConfig {
     /// DynamoDB ConditionExpression syntax to match items.
-    /// e.g. `attribute_exists(email)` or `begins_with(pk, 'USER#')`
+    /// e.g. `attribute_exists(email)` or `begins_with(pk, :prefix)`, with
+    /// `:prefix` supplied through `values`.
     #[serde(rename = "match")]
     pub match_expr: String,
 
+    /// Names for the `#alias` references in `match`, in the shape of
+    /// ExpressionAttributeNames: `names = { "#n" = "name" }`. Needed for
+    /// attributes whose names are reserved words.
+    #[serde(default)]
+    pub names: HashMap<String, String>,
+
+    /// Values for the `:name` references in `match`, in the shape of
+    /// ExpressionAttributeValues: `values = { ":prefix" = "USER#" }`.
+    /// Strings become `S`, integers and floats `N`, booleans `BOOL`.
+    #[serde(default)]
+    pub values: HashMap<String, toml::Value>,
+
     /// Attribute path to transform (supports dot notation: `address.city`).
     pub path: String,
+
+    /// Tables this rule applies to. Empty means every table. A rule scoped to
+    /// tables a run leaves out with `--tables` has nothing to do there and is
+    /// not reported as having anonymised nothing.
+    #[serde(default)]
+    pub tables: Vec<String>,
 
     /// The anonymisation action to apply.
     pub action: ActionConfig,
@@ -43,6 +62,10 @@ pub enum ActionConfig {
         /// Generator name: `safe_email`, `name`, `phone_number`, `address`,
         /// `company_name`, `sentence`, `word`, `first_name`, `last_name`.
         generator: String,
+        /// Environment variable holding a secret that makes the generated
+        /// value a function of the original, so the same input gives the same
+        /// output on every run. Without it each run re-rolls.
+        seed_env: Option<String>,
     },
     /// Mask characters, keeping the last N.
     Mask {
@@ -51,7 +74,7 @@ pub enum ActionConfig {
         #[serde(default = "default_mask_char")]
         mask_char: String,
     },
-    /// One-way SHA-256 hash with salt from environment variable.
+    /// One-way HMAC-SHA256 keyed on a salt from an environment variable.
     Hash {
         /// Environment variable name containing the salt.
         salt_env: Option<String>,
@@ -81,10 +104,29 @@ pub struct ConsistencyConfig {
 pub struct ValidatedRule {
     /// Parsed condition expression.
     pub condition: ConditionExpr,
+    /// Names behind the `#alias` references in `condition`, if it has any.
+    pub names: Option<HashMap<String, String>>,
+    /// Values behind the `:name` references in `condition`, if it has any.
+    pub values: Option<HashMap<String, AttributeValue>>,
     /// Parsed path elements for navigating into items.
     pub path: Vec<crate::expressions::PathElement>,
     /// The action to apply.
     pub action: ValidatedAction,
+    /// Tables the rule applies to; `None` means all of them.
+    pub tables: Option<Vec<String>>,
+}
+
+impl ValidatedRule {
+    /// Whether the rule applies to `table`: every table unless it names some.
+    ///
+    /// One answer for every reader. The rule engine and the key rebuilder
+    /// both ask, and answering differently in the two places let a rule for
+    /// another table shape how this table's keys were judged.
+    pub fn applies_to(&self, table: &str) -> bool {
+        self.tables
+            .as_ref()
+            .is_none_or(|tables| tables.iter().any(|name| name == table))
+    }
 }
 
 /// A secret salt value with redacted Debug output.
@@ -93,12 +135,18 @@ pub struct ValidatedRule {
 /// `Debug` formatting (logs, panics, `dbg!()` calls). The salt exists
 /// specifically to prevent rainbow table attacks - `#[derive(Debug)]`
 /// on the raw bytes would undo that protection.
+///
+/// The bytes are zeroized on drop. Redacting `Debug` covers what gets
+/// printed; it says nothing about what stays in freed heap memory, and a
+/// salt is cloned into every rule that names it and held for the whole
+/// import run, so several copies outlive their last use. The same binary
+/// already treats `DYNOXIDE_ENCRYPTION_KEY` this way.
 #[derive(Clone)]
-pub struct Salt(Vec<u8>);
+pub struct Salt(zeroize::Zeroizing<Vec<u8>>);
 
 impl Salt {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(zeroize::Zeroizing::new(bytes))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -115,9 +163,18 @@ impl std::fmt::Debug for Salt {
 /// A validated action with resolved values (e.g., salt from env).
 #[derive(Debug, Clone)]
 pub enum ValidatedAction {
-    Fake { generator: String },
-    Mask { keep_last: usize, mask_char: char },
-    Hash { salt: Salt },
+    Fake {
+        generator: String,
+        /// Present when `seed_env` was set: makes generation deterministic.
+        seed: Option<Salt>,
+    },
+    Mask {
+        keep_last: usize,
+        mask_char: char,
+    },
+    Hash {
+        salt: Salt,
+    },
     Redact,
     Null,
 }
@@ -149,24 +206,172 @@ pub fn load_and_validate(
             )
         })?;
 
+        let names = convert_names(&rule.names, i + 1)?;
+        let values = convert_values(&rule.values, i + 1)?;
+        validate_name_refs(&condition, &names, i + 1)?;
+        validate_value_refs(&condition, &values, i + 1)?;
+        condition::validate_static(&condition, &values)
+            .and_then(|()| condition::validate_operand_semantics(&condition, &names, &values))
+            .map_err(|e| {
+                format!(
+                    "Rule {}: invalid match expression '{}': {e}",
+                    i + 1,
+                    rule.match_expr
+                )
+            })?;
+
         let path = parse_path(&rule.path)
             .map_err(|e| format!("Rule {}: invalid path '{}': {e}", i + 1, rule.path))?;
 
         let action = validate_action(&rule.action, i + 1)?;
 
+        let tables = scoped_tables(&rule.tables, i + 1)?;
+
         validated.push(ValidatedRule {
             condition,
+            names,
+            values,
             path,
             action,
+            tables,
         });
     }
 
     Ok((validated, config.consistency))
 }
 
+/// A rule's `tables` list: empty means every table, and a blank name is a
+/// typo that would scope the rule to nothing.
+fn scoped_tables(tables: &[String], rule_num: usize) -> Result<Option<Vec<String>>, String> {
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    if let Some(blank) = tables.iter().find(|t| t.trim().is_empty()) {
+        return Err(format!(
+            "Rule {rule_num}: tables contains an empty name ({blank:?}); name the table or \
+             leave the list out to apply the rule everywhere"
+        ));
+    }
+    Ok(Some(tables.to_vec()))
+}
+
+/// Check a rule's `names` table: every alias starts with `#`.
+fn convert_names(
+    names: &HashMap<String, String>,
+    rule_num: usize,
+) -> Result<Option<HashMap<String, String>>, String> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    for alias in names.keys() {
+        if !alias.starts_with('#') {
+            return Err(format!(
+                "Rule {rule_num}: name alias '{alias}' must start with '#' (for example \"#n\")"
+            ));
+        }
+    }
+    Ok(Some(names.clone()))
+}
+
+/// Check that `names` and the `#alias` references in the match expression
+/// line up: every reference is defined, and every name is used.
+fn validate_name_refs(
+    condition: &ConditionExpr,
+    names: &Option<HashMap<String, String>>,
+    rule_num: usize,
+) -> Result<(), String> {
+    condition::validate_name_refs(condition, names)
+        .map_err(|e| format!("Rule {rule_num}: {e}. Add it to the rule's names table"))?;
+
+    if let Some(names) = names {
+        let used = crate::expressions::condition::extract_name_refs(condition);
+        let mut unused: Vec<&String> = names.keys().filter(|k| !used.contains(k)).collect();
+        unused.sort();
+        if let Some(alias) = unused.first() {
+            return Err(format!(
+                "Rule {rule_num}: name {alias} is not referenced by the match expression"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Convert a rule's `values` table into attribute values.
+///
+/// Mirrors ExpressionAttributeValues: every name starts with `:`, and only
+/// scalars are accepted, since that is all a match expression can compare.
+fn convert_values(
+    values: &HashMap<String, toml::Value>,
+    rule_num: usize,
+) -> Result<Option<HashMap<String, AttributeValue>>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut converted = HashMap::with_capacity(values.len());
+    for (name, value) in values {
+        if !name.starts_with(':') {
+            return Err(format!(
+                "Rule {rule_num}: value name '{name}' must start with ':' (for example \":prefix\")"
+            ));
+        }
+        let attr = match value {
+            toml::Value::String(s) => AttributeValue::S(s.clone()),
+            toml::Value::Integer(i) => AttributeValue::N(i.to_string()),
+            toml::Value::Float(f) if f.is_finite() => AttributeValue::N(f.to_string()),
+            toml::Value::Float(_) => {
+                return Err(format!(
+                    "Rule {rule_num}: value '{name}' must be a finite number"
+                ));
+            }
+            toml::Value::Boolean(b) => AttributeValue::BOOL(*b),
+            _ => {
+                return Err(format!(
+                    "Rule {rule_num}: value '{name}' must be a string, number or boolean"
+                ));
+            }
+        };
+        converted.insert(name.clone(), attr);
+    }
+    Ok(Some(converted))
+}
+
+/// Check that `values` and the `:name` references in the match expression
+/// line up: every reference is defined, and every value is used. The same
+/// two checks DynamoDB applies to ExpressionAttributeValues.
+fn validate_value_refs(
+    condition: &ConditionExpr,
+    values: &Option<HashMap<String, AttributeValue>>,
+    rule_num: usize,
+) -> Result<(), String> {
+    let refs = condition::extract_value_refs(condition);
+
+    for name in &refs {
+        let defined = values.as_ref().is_some_and(|v| v.contains_key(name));
+        if !defined {
+            return Err(format!(
+                "Rule {rule_num}: match expression references {name} but values does not define it. \
+                 Add values = {{ \"{name}\" = \"...\" }} to the rule"
+            ));
+        }
+    }
+
+    if let Some(values) = values {
+        let mut unused: Vec<&String> = values.keys().filter(|k| !refs.contains(k)).collect();
+        unused.sort();
+        if let Some(name) = unused.first() {
+            return Err(format!(
+                "Rule {rule_num}: value {name} is not referenced by the match expression"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a dot-notation path into PathElements.
 /// Supports: `email`, `address.city`, `items[0].name`
-fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathElement>, String> {
+pub(super) fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathElement>, String> {
     use crate::expressions::PathElement;
 
     if path.is_empty() {
@@ -177,6 +382,24 @@ fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathElement>, String
     for part in path.split('.') {
         if part.is_empty() {
             return Err("empty path segment".to_string());
+        }
+        // Every segment names an attribute first; an index can only follow
+        // one. `[0]` on its own has nothing to index into, and accepting it
+        // left a rule aimed at nothing in particular.
+        if part.starts_with('[') {
+            return Err(format!(
+                "segment '{part}' starts with an index; an index has to follow an attribute \
+                 name, as in items[0]"
+            ));
+        }
+        // A rule path names a real attribute. `#alias` is a match-expression
+        // idea, and the names table does not reach here, so accepting one
+        // would leave a rule that quietly matches nothing.
+        if part.starts_with('#') {
+            return Err(format!(
+                "'{part}' is an expression attribute name; a path names the attribute itself, \
+                 so write the attribute's own name here"
+            ));
         }
 
         // Handle array indexing: `items[0]`
@@ -198,6 +421,17 @@ fn parse_path(path: &str) -> Result<Vec<crate::expressions::PathElement>, String
                 elements.push(PathElement::Index(idx));
                 remaining = &remaining[end + 1..];
             }
+            // Whatever follows the last index was being dropped on the
+            // floor, so `a[0]b` parsed as `a[0]` and a rule meant for a field
+            // inside a list element rewrote the whole element instead. A
+            // path is either read in full or refused.
+            if !remaining.is_empty() {
+                return Err(format!(
+                    "unexpected '{remaining}' after the index in '{part}'; a nested attribute \
+                     needs a dot, as in {}.{remaining}",
+                    &part[..part.len() - remaining.len()]
+                ));
+            }
         } else {
             elements.push(PathElement::Attribute(part.to_string()));
         }
@@ -218,9 +452,62 @@ const VALID_GENERATORS: &[&str] = &[
     "last_name",
 ];
 
+/// The shortest secret a rule will accept, in bytes.
+///
+/// A salt or a seed only works while it cannot be guessed, and the values
+/// people reach for by reflex - `test`, `salt`, a project name - are all
+/// inside a wordlist an attacker would try before breakfast. Rejecting the
+/// empty string catches an unset CI secret; it does nothing about a short
+/// one, which fails in exactly the same way and looks deliberate.
+const MIN_SECRET_LEN: usize = 16;
+
+/// A secret a rule reads from the environment. Both a hash salt and a fake
+/// seed are only as good as the secret behind them, so an unset variable is
+/// an error, so is an empty one - empty is the shape a missing CI secret
+/// takes, and it would pass through as if it were a value - and so is one
+/// too short to survive a wordlist.
+fn required_secret(
+    rule_num: usize,
+    env_var: &str,
+    purpose: &str,
+    why_it_must_be_secret: &str,
+) -> Result<Vec<u8>, String> {
+    let value = std::env::var(env_var).map_err(|e| match e {
+        std::env::VarError::NotPresent => format!(
+            "Rule {rule_num}: environment variable '{env_var}' not set (required for {purpose})"
+        ),
+        // Set, but not text this process can read. Calling it unset sends
+        // the reader to check their CI secrets when the value is right there.
+        // The bytes themselves stay out of the message: they are the secret.
+        std::env::VarError::NotUnicode(_) => format!(
+            "Rule {rule_num}: environment variable '{env_var}' is set but is not valid UTF-8 \
+             (required for {purpose}). Generate one with `openssl rand -base64 24`"
+        ),
+    })?;
+    if value.is_empty() {
+        return Err(format!(
+            "Rule {rule_num}: environment variable '{env_var}' is empty. \
+             {why_it_must_be_secret}, so set it to a secret value"
+        ));
+    }
+    if value.len() < MIN_SECRET_LEN {
+        return Err(format!(
+            "Rule {rule_num}: environment variable '{env_var}' is {} bytes, and at least \
+             {MIN_SECRET_LEN} are required for {purpose}. {why_it_must_be_secret}, and a \
+             short value is guessable in the time it takes to read this. Generate one with \
+             `openssl rand -base64 24`",
+            value.len()
+        ));
+    }
+    Ok(value.into_bytes())
+}
+
 fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAction, String> {
     match action {
-        ActionConfig::Fake { generator } => {
+        ActionConfig::Fake {
+            generator,
+            seed_env,
+        } => {
             if !VALID_GENERATORS.contains(&generator.as_str()) {
                 return Err(format!(
                     "Rule {rule_num}: unknown generator '{}'. Valid generators: {}",
@@ -228,8 +515,23 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
                     VALID_GENERATORS.join(", ")
                 ));
             }
+            // An empty variable is the shape an unset CI secret takes, and a
+            // seed anyone can guess makes the mapping from original to fake
+            // reproducible by anyone holding the source data, which is the
+            // whole thing the seed is for.
+            let seed = match seed_env {
+                Some(env_var) => Some(Salt::new(required_secret(
+                    rule_num,
+                    env_var,
+                    "the fake seed",
+                    "The seed is what stops anyone with the original data reproducing \
+                     the anonymised values",
+                )?)),
+                None => None,
+            };
             Ok(ValidatedAction::Fake {
                 generator: generator.clone(),
+                seed,
             })
         }
         ActionConfig::Mask {
@@ -252,18 +554,18 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
         }
         ActionConfig::Hash { salt_env } => {
             let salt = match salt_env {
-                Some(env_var) => {
-                    std::env::var(env_var).map_err(|_| {
-                        format!(
-                            "Rule {rule_num}: environment variable '{env_var}' not set (required for hash salt)"
-                        )
-                    })?.into_bytes()
-                }
+                Some(env_var) => required_secret(
+                    rule_num,
+                    env_var,
+                    "hash salt",
+                    "An unkeyed digest of a low-entropy value is trivially reversible via rainbow tables",
+                )?,
                 None => {
                     return Err(format!(
                         "Rule {rule_num}: salt_env is required for hash actions. \
-                         SHA-256 without a salt is trivially reversible via rainbow tables. \
-                         Set salt_env to an environment variable containing a secret salt value."
+                         An unkeyed digest of a low-entropy value is trivially reversible via \
+                         rainbow tables. Set salt_env to an environment variable containing a \
+                         secret salt value."
                     ));
                 }
             };
@@ -278,24 +580,17 @@ fn validate_action(action: &ActionConfig, rule_num: usize) -> Result<ValidatedAc
 
 /// Evaluate a match expression against an item.
 ///
-/// ## Supported expressions
+/// Match expressions use DynamoDB ConditionExpression syntax, so anything a
+/// ConditionExpression can say works here: `attribute_exists`,
+/// `attribute_not_exists`, `attribute_type`, `begins_with`, `contains`,
+/// `size`, comparisons, `BETWEEN`, `IN`, and `AND` / `OR` / `NOT`.
 ///
-/// Match expressions use DynamoDB ConditionExpression syntax. The following
-/// functions work without expression attribute values:
-///
-/// - `attribute_exists(path)`: matches if the attribute is present
-/// - `attribute_not_exists(path)`: matches if the attribute is absent
-/// - `attribute_type(path, type)`: matches if the attribute is the given type
-/// - Boolean operators: `AND`, `OR`, `NOT`
-///
-/// ## Known limitation
-///
-/// Functions that require string literal arguments (e.g., `begins_with(pk, 'USER#')`)
-/// are **not supported** because the condition parser expects `:val` expression
-/// attribute value references, not inline string literals. String literal support
-/// is tracked as a follow-up task.
+/// As on DynamoDB, an operand that is not a path is a `:name` reference,
+/// never an inline literal: `begins_with(pk, :prefix)` with the prefix in the
+/// rule's `values` table. A reserved word or an awkward attribute name goes
+/// through the `names` table as `#alias`, as ExpressionAttributeNames would.
 pub fn matches_item(rule: &ValidatedRule, item: &HashMap<String, AttributeValue>) -> bool {
-    crate::expressions::evaluate_without_tracking(&rule.condition, item, &None, &None)
+    crate::expressions::evaluate_without_tracking(&rule.condition, item, &rule.names, &rule.values)
         .unwrap_or(false)
 }
 
@@ -351,6 +646,7 @@ mod tests {
     fn test_validate_fake_action() {
         let action = ActionConfig::Fake {
             generator: "safe_email".to_string(),
+            seed_env: None,
         };
         assert!(validate_action(&action, 1).is_ok());
     }
@@ -359,8 +655,66 @@ mod tests {
     fn test_validate_fake_unknown_generator() {
         let action = ActionConfig::Fake {
             generator: "unknown".to_string(),
+            seed_env: None,
         };
         assert!(validate_action(&action, 1).is_err());
+    }
+
+    #[test]
+    fn test_seed_env_is_resolved_and_required_to_be_non_empty() {
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SEED", "a-seed-long-enough") };
+        let action = ActionConfig::Fake {
+            generator: "safe_email".to_string(),
+            seed_env: Some("DYNOXIDE_TEST_SEED".to_string()),
+        };
+        match validate_action(&action, 1).unwrap() {
+            ValidatedAction::Fake { seed, .. } => assert_eq!(
+                seed.expect("seed should be resolved").as_bytes(),
+                b"a-seed-long-enough",
+                "the configured seed must reach the action"
+            ),
+            other => panic!("expected Fake, got {other:?}"),
+        }
+
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SEED", "") };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_SEED") };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("not set"), "{err}");
+    }
+
+    #[test]
+    fn test_fake_without_seed_env_has_no_seed() {
+        let action = ActionConfig::Fake {
+            generator: "safe_email".to_string(),
+            seed_env: None,
+        };
+        match validate_action(&action, 1).unwrap() {
+            ValidatedAction::Fake { seed, .. } => assert!(seed.is_none()),
+            other => panic!("expected Fake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_seed_env_parses_from_a_rules_file() {
+        let config: ImportConfig = toml::from_str(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email", seed_env = "SOME_SEED" }
+"#,
+        )
+        .unwrap();
+        match &config.rules[0].action {
+            ActionConfig::Fake { seed_env, .. } => {
+                assert_eq!(seed_env.as_deref(), Some("SOME_SEED"))
+            }
+            other => panic!("expected Fake, got {other:?}"),
+        }
     }
 
     #[test]
@@ -403,8 +757,21 @@ mod tests {
         assert!(action_debug.contains("[REDACTED]"));
         assert!(!action_debug.contains("super"));
 
+        // A seeded fake holds its seed in the same wrapper, so it redacts on
+        // the same terms as a hash salt.
+        let seeded = ValidatedAction::Fake {
+            generator: "safe_email".to_string(),
+            seed: Some(Salt::new(b"super-secret-value".to_vec())),
+        };
+        let seeded_debug = format!("{:?}", seeded);
+        assert!(seeded_debug.contains("[REDACTED]"));
+        assert!(!seeded_debug.contains("super"));
+
         let rule = ValidatedRule {
+            tables: None,
             condition: crate::expressions::condition::parse("attribute_exists(email)").unwrap(),
+            names: None,
+            values: None,
             path: vec![crate::expressions::PathElement::Attribute(
                 "email".to_string(),
             )],
@@ -413,6 +780,439 @@ mod tests {
         let rule_debug = format!("{:?}", rule);
         assert!(rule_debug.contains("[REDACTED]"));
         assert!(!rule_debug.contains("super"));
+    }
+
+    #[test]
+    fn a_rule_can_be_scoped_to_tables() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+tables = ["Orders", "Customers"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.tables.as_deref(),
+            Some(&["Orders".to_string(), "Customers".to_string()][..])
+        );
+
+        let everywhere = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(everywhere.tables, None, "no list means every table");
+
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+tables = ["Orders", " "]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn a_path_is_read_in_full_or_refused() {
+        // `a[0]b` used to parse as `a[0]`: the rule then rewrote the whole
+        // list element rather than the field inside it, and the run looked
+        // right because it had rewritten something.
+        for bad in ["a[0]b", "items[0]extra", "a[0]b[1]", "a[0][1]junk"] {
+            let err = parse_path(bad).unwrap_err();
+            assert!(err.contains("after the index"), "{bad}: {err}");
+        }
+        for bad in ["[0]", "[0].a", "a.[1]"] {
+            let err = parse_path(bad).unwrap_err();
+            assert!(err.contains("starts with an index"), "{bad}: {err}");
+        }
+        // And the shapes that are meant to work still do.
+        assert_eq!(parse_path("a[0].b[1]").unwrap().len(), 4);
+        assert_eq!(parse_path("items[0][1]").unwrap().len(), 3);
+        assert_eq!(parse_path("address.city").unwrap().len(), 2);
+    }
+
+    // Only Unix lets a process set an environment value that is not UTF-8;
+    // Windows stores them as UTF-16 and the OsStr extension used here does
+    // not exist there.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_that_is_not_utf8_is_not_reported_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe {
+            std::env::set_var(
+                "DYNOXIDE_TEST_BAD_UTF8",
+                std::ffi::OsStr::from_bytes(b"\xff\xfe0123456789abcdef"),
+            )
+        };
+        let err = required_secret(1, "DYNOXIDE_TEST_BAD_UTF8", "a test", "because").unwrap_err();
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_BAD_UTF8") };
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(!err.contains("not set"), "{err}");
+        assert!(
+            !err.contains("0123456789"),
+            "the bytes stay out of the message: {err}"
+        );
+    }
+
+    #[test]
+    fn a_name_the_match_expression_never_uses_is_rejected() {
+        // An unused alias is almost always a rename half-done: the table was
+        // updated and the expression was not, so the rule still matches on
+        // the old attribute and quietly covers nothing.
+        let err = parsed_rule(
+            r##"
+[[rules]]
+match = "attribute_exists(#a)"
+path = "email"
+action = { type = "redact" }
+names = { "#a" = "email", "#b" = "phone" }
+"##,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("#b") && err.contains("is not referenced"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_value_the_match_expression_never_uses_is_rejected() {
+        let err = parsed_rule(
+            r##"
+[[rules]]
+match = "email = :a"
+path = "email"
+action = { type = "redact" }
+values = { ":a" = "x", ":b" = "y" }
+"##,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(":b") && err.contains("is not referenced"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_name_and_value_being_used_is_accepted() {
+        // The other direction, so the check above is not simply rejecting
+        // every rule that carries a table at all.
+        parsed_rule(
+            r##"
+[[rules]]
+match = "#a = :a"
+path = "email"
+action = { type = "redact" }
+names = { "#a" = "email" }
+values = { ":a" = "x" }
+"##,
+        )
+        .expect("a rule that uses everything it declares is valid");
+    }
+
+    fn parsed_rule(toml_str: &str) -> Result<ValidatedRule, String> {
+        let config: ImportConfig = toml::from_str(toml_str).map_err(|e| e.to_string())?;
+        let rule = &config.rules[0];
+        let condition = condition::parse(&rule.match_expr).map_err(|e| e.to_string())?;
+        let names = convert_names(&rule.names, 1)?;
+        let values = convert_values(&rule.values, 1)?;
+        validate_name_refs(&condition, &names, 1)?;
+        validate_value_refs(&condition, &values, 1)?;
+        condition::validate_static(&condition, &values)?;
+        condition::validate_operand_semantics(&condition, &names, &values)?;
+        Ok(ValidatedRule {
+            tables: scoped_tables(&rule.tables, 1)?,
+            condition,
+            names,
+            values,
+            path: parse_path(&rule.path)?,
+            action: validate_action(&rule.action, 1)?,
+        })
+    }
+
+    #[test]
+    fn test_values_table_feeds_begins_with() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = "USER#" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("USER#1".to_string()));
+        assert!(matches_item(&rule, &item));
+
+        item.insert("pk".to_string(), AttributeValue::S("ORDER#1".to_string()));
+        assert!(!matches_item(&rule, &item));
+    }
+
+    #[test]
+    fn test_values_convert_by_toml_type() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "age > :min AND active = :yes"
+values = { ":min" = 18, ":yes" = true }
+path = "name"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+        let values = rule.values.unwrap();
+        assert_eq!(values[":min"], AttributeValue::N("18".to_string()));
+        assert_eq!(values[":yes"], AttributeValue::BOOL(true));
+    }
+
+    #[test]
+    fn test_values_missing_reference_rejected() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains(":prefix"), "{err}");
+        assert!(err.contains("does not define"), "{err}");
+    }
+
+    #[test]
+    fn test_values_unused_rejected() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(pk)"
+values = { ":prefix" = "USER#" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains(":prefix"), "{err}");
+        assert!(err.contains("not referenced"), "{err}");
+    }
+
+    #[test]
+    fn test_values_name_must_start_with_colon() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { "prefix" = "USER#" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("must start with ':'"), "{err}");
+    }
+
+    #[test]
+    fn test_path_rejects_an_expression_attribute_name() {
+        let err = parse_path("#n").unwrap_err();
+        assert!(err.contains("names the attribute itself"), "{err}");
+        assert!(parse_path("name").is_ok());
+    }
+
+    #[test]
+    fn test_empty_salt_is_rejected() {
+        // SAFETY: single-threaded test, no concurrent env reads
+        unsafe { std::env::set_var("DYNOXIDE_TEST_EMPTY_SALT", "") };
+        let action = ActionConfig::Hash {
+            salt_env: Some("DYNOXIDE_TEST_EMPTY_SALT".to_string()),
+        };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        unsafe { std::env::set_var("DYNOXIDE_TEST_EMPTY_SALT", "a-salt-long-enough") };
+        assert!(validate_action(&action, 1).is_ok());
+    }
+
+    #[test]
+    fn test_short_salt_is_rejected() {
+        // Empty catches an unset CI secret. A short salt is the other half:
+        // it looks deliberate and fails the same way, so it is rejected on
+        // its own terms with its own message.
+        // SAFETY: this name is used by this test alone
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SALT", "hunter2") };
+        let action = ActionConfig::Hash {
+            salt_env: Some("DYNOXIDE_TEST_SHORT_SALT".to_string()),
+        };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(
+            err.contains("7 bytes"),
+            "the message names the length: {err}"
+        );
+        assert!(err.contains("at least 16"), "{err}");
+        assert!(
+            !err.contains("is empty"),
+            "a short salt is not an empty one: {err}"
+        );
+        assert!(
+            !err.contains("hunter2"),
+            "the message must not quote the value: {err}"
+        );
+
+        // One byte under is still under; one byte over is accepted.
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SALT", "123456789012345") };
+        assert!(validate_action(&action, 1).is_err(), "15 bytes is short");
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SALT", "1234567890123456") };
+        assert!(validate_action(&action, 1).is_ok(), "16 bytes is enough");
+
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_SHORT_SALT") };
+    }
+
+    #[test]
+    fn test_short_seed_is_rejected_on_the_same_terms_as_a_salt() {
+        // SAFETY: this name is used by this test alone
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SEED", "seed") };
+        let action = ActionConfig::Fake {
+            generator: "safe_email".to_string(),
+            seed_env: Some("DYNOXIDE_TEST_SHORT_SEED".to_string()),
+        };
+        let err = validate_action(&action, 1).unwrap_err();
+        assert!(err.contains("at least 16"), "{err}");
+
+        unsafe { std::env::set_var("DYNOXIDE_TEST_SHORT_SEED", "1234567890123456") };
+        assert!(validate_action(&action, 1).is_ok());
+
+        unsafe { std::env::remove_var("DYNOXIDE_TEST_SHORT_SEED") };
+    }
+
+    #[test]
+    fn test_values_reject_non_finite_floats() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "amount < :max"
+values = { ":max" = inf }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("finite"), "{err}");
+    }
+
+    #[test]
+    fn test_values_accept_finite_floats_exactly() {
+        let rule = parsed_rule(
+            r#"
+[[rules]]
+match = "amount < :max"
+values = { ":max" = 3.14 }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+        let values = rule.values.expect("a values table");
+        assert_eq!(values[":max"], AttributeValue::N("3.14".to_string()));
+    }
+
+    #[test]
+    fn test_values_of_the_wrong_type_are_rejected_up_front() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = 123 }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("begins_with"), "{err}");
+    }
+
+    #[test]
+    fn test_names_table_reaches_a_reserved_word_attribute() {
+        let rule = parsed_rule(
+            r##"
+[[rules]]
+match = "attribute_exists(#n)"
+names = { "#n" = "name" }
+path = "email"
+action = { type = "redact" }
+"##,
+        )
+        .unwrap();
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), AttributeValue::S("Ada".to_string()));
+        assert!(matches_item(&rule, &item));
+        assert!(!matches_item(&rule, &HashMap::new()));
+    }
+
+    #[test]
+    fn test_names_undefined_or_unused_rejected() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(#n)"
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("#n"), "{err}");
+
+        let err = parsed_rule(
+            r##"
+[[rules]]
+match = "attribute_exists(pk)"
+names = { "#n" = "name" }
+path = "email"
+action = { type = "redact" }
+"##,
+        )
+        .unwrap_err();
+        assert!(err.contains("not referenced"), "{err}");
+
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "attribute_exists(pk)"
+names = { "n" = "name" }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("must start with '#'"), "{err}");
+    }
+
+    #[test]
+    fn test_values_reject_non_scalars() {
+        let err = parsed_rule(
+            r#"
+[[rules]]
+match = "begins_with(pk, :prefix)"
+values = { ":prefix" = ["USER#"] }
+path = "email"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("string, number or boolean"), "{err}");
     }
 
     #[test]

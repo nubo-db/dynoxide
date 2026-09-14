@@ -150,6 +150,33 @@ jobs:
       - name: Check for stale version pins and preview wording in docs
         run: scripts/check-stale-docs.sh
 
+      # The check above has twice been able to pass for the wrong reason: a
+      # pattern that stopped matching once the project moved past it, and a
+      # missing input that read as clean. This exercises both directions
+      # against a fixture tree, so a future edit that makes it vacuous fails
+      # here rather than at a release.
+      - name: Check the stale-docs check can still fail
+        run: scripts/check-stale-docs.test.sh
+
+      # Two version streams means more than one file can be left behind. This
+      # is cheap enough to run on every PR, which is the point: the alternative
+      # is finding out at tag time, when the tag is already pushed.
+      - name: Check version sources agree
+        run: scripts/check-versions.sh
+
+      # Same reasoning as the stale-docs test: a gate that has only ever been
+      # seen to pass is not evidence. This mutates each file the version check
+      # reads and asserts the check names it, and feeds it the version shapes
+      # npm rejects.
+      - name: Check the version check can still fail
+        run: scripts/check-versions.test.sh
+
+      # The release workflows share four small scripts (version shape, crate
+      # probe, binary probe, npm dist-tag) that only otherwise run at tag time.
+      # Exercised here so a change to one fails on a PR rather than mid-release.
+      - name: Check the release helper scripts can still fail
+        run: scripts/release-helpers.test.sh
+
       # Nothing built the docs, so broken intra-doc links accumulated unseen:
       # ten of them, half pointing at private items and half at cfg-gated ones
       # absent from the default build docs.rs renders. They degrade the
@@ -332,7 +359,7 @@ jobs:
 
   # Gate the Docker smoke test on the paths that can actually break the
   # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
-  # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version — both can
+  # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version - both can
   # break the recipe without touching src/mcp/, so a src/mcp-only gate is too
   # narrow. Implemented with git diff (no third-party action).
   changes:
@@ -351,7 +378,7 @@ jobs:
         run: |
           set -euo pipefail
           # workflow_dispatch has no PR base, and a missing/unreachable base ref
-          # should fail open — run the smoke job rather than skip it silently.
+          # should fail open - run the smoke job rather than skip it silently.
           if [ -z "${BASE_SHA:-}" ] || ! changed=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null); then
             echo "docker=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -401,9 +428,9 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       # Two flags are load-bearing for `--load`:
-      #   --platform linux/amd64  — without it buildx builds a multi-platform
+      #   --platform linux/amd64  - without it buildx builds a multi-platform
       #     manifest that --load cannot export.
-      #   --provenance=false      — without it buildx attaches an attestation
+      #   --provenance=false      - without it buildx attaches an attestation
       #     manifest, which is also a manifest list and is rejected by --load on
       #     the runner's classic (non-containerd) image store.
       # Single-arch amd64 is enough for a smoke test; release.yml does multi-arch.

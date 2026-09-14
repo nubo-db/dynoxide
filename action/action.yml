@@ -48,24 +48,30 @@ runs:
         esac
         echo "target=$target" >> "$GITHUB_OUTPUT"
 
+    # Inputs reach the scripts through env, not through ${{ }} inside run:,
+    # which the runner expands into the script text before bash sees it. A
+    # value would then be interpreted before the checks below could refuse it.
     - name: Validate inputs
       shell: bash
+      env:
+        PORT: ${{ inputs.port }}
+        VERSION: ${{ inputs.version }}
+        SNAPSHOT_URL: ${{ inputs.snapshot-url }}
+        MODE: ${{ inputs.mode }}
+        DB_PATH: ${{ inputs.db-path }}
       run: |
-        PORT="${{ inputs.port }}"
-        VERSION="${{ inputs.version }}"
-        SNAPSHOT_URL="${{ inputs.snapshot-url }}"
-        MODE="${{ inputs.mode }}"
-        DB_PATH="${{ inputs.db-path }}"
-
         # Validate port is a number in valid range
         if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
           echo "::error::Invalid port: '$PORT'. Must be a number between 1 and 65535."
           exit 1
         fi
 
-        # Validate version format (vX.Y.Z or "latest")
-        if [ "$VERSION" != "latest" ] && ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "::error::Invalid version: '$VERSION'. Must be 'latest' or vX.Y.Z (e.g., v0.9.1)."
+        # Validate version format (vX.Y.Z, optionally with a prerelease
+        # suffix, or "latest"). The release pipeline can publish a prerelease,
+        # so rejecting one here made this the only path that could not install
+        # a version the project had actually shipped.
+        if [ "$VERSION" != "latest" ] && ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "::error::Invalid version: '$VERSION'. Must be 'latest' or vX.Y.Z, optionally with a -prerelease suffix (e.g., v1.2.0 or v1.2.0-rc.1)."
           exit 1
         fi
 
@@ -89,9 +95,10 @@ runs:
 
     - name: Download Dynoxide
       shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        TARGET: ${{ steps.platform.outputs.target }}
       run: |
-        VERSION="${{ inputs.version }}"
-        TARGET="${{ steps.platform.outputs.target }}"
         REPO="nubo-db/dynoxide"
 
         if [ "$VERSION" = "latest" ]; then
@@ -108,8 +115,9 @@ runs:
     - name: Download snapshot
       if: inputs.snapshot-url != ''
       shell: bash
+      env:
+        URL: ${{ inputs.snapshot-url }}
       run: |
-        URL="${{ inputs.snapshot-url }}"
         FILENAME=$(basename "$URL")
         echo "Downloading snapshot from $URL"
         curl -fsSL -o "$FILENAME" "$URL"
@@ -126,11 +134,11 @@ runs:
     - name: Start Dynoxide
       id: start
       shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        PORT: ${{ inputs.port }}
+        DB_PATH: ${{ inputs.db-path }}
       run: |
-        MODE="${{ inputs.mode }}"
-        PORT="${{ inputs.port }}"
-        DB_PATH="${{ inputs.db-path }}"
-
         # Use snapshot if downloaded
         if [ -n "$DB_FILE" ]; then
           DB_PATH="$DB_FILE"

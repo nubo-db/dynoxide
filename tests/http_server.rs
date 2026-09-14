@@ -260,12 +260,7 @@ async fn test_server_version_headers_on_success() {
     let resp = dynamo_request(&url, "ListTables", json!({})).await;
 
     assert_eq!(resp.status(), 200);
-    let server = resp.headers().get("server").unwrap().to_str().unwrap();
-    assert!(
-        server.starts_with("Dynoxide/"),
-        "Server header should start with 'Dynoxide/', got: {server}"
-    );
-    assert!(resp.headers().contains_key("x-dynoxide-version"));
+    assert_version_headers(&resp);
 }
 
 #[tokio::test]
@@ -283,9 +278,7 @@ async fn test_server_version_headers_on_error() {
     .await;
 
     assert_eq!(resp.status(), 400);
-    let server = resp.headers().get("server").unwrap().to_str().unwrap();
-    assert!(server.starts_with("Dynoxide/"));
-    assert!(resp.headers().contains_key("x-dynoxide-version"));
+    assert_version_headers(&resp);
 }
 
 #[tokio::test]
@@ -301,9 +294,40 @@ async fn test_server_version_headers_on_preflight() {
         .unwrap();
 
     assert_eq!(resp.status(), 200);
+    assert_version_headers(&resp);
+}
+
+/// Both version headers carry the product version, exactly.
+///
+/// Asserting the value rather than the shape is the point: these headers used
+/// to report the crate version, and two identically wrong values passed the
+/// old "they agree and contain a dot" check.
+fn assert_version_headers(resp: &reqwest::Response) {
+    let expected = dynoxide::PRODUCT_VERSION;
     let server = resp.headers().get("server").unwrap().to_str().unwrap();
-    assert!(server.starts_with("Dynoxide/"));
-    assert!(resp.headers().contains_key("x-dynoxide-version"));
+    assert_eq!(
+        server,
+        format!("Dynoxide/{expected}"),
+        "Server header should carry the product version"
+    );
+    let version = resp
+        .headers()
+        .get("x-dynoxide-version")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        version, expected,
+        "x-dynoxide-version should carry the product version"
+    );
+}
+
+#[tokio::test]
+async fn test_product_version_is_the_checked_in_version_file() {
+    // Catches build.rs drifting from the file, and catches anyone rewiring
+    // the product version back to the crate version.
+    let file = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/VERSION")).unwrap();
+    assert_eq!(dynoxide::PRODUCT_VERSION, file.trim());
 }
 
 #[tokio::test]

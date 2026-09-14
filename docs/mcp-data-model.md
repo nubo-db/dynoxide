@@ -40,6 +40,12 @@ With `--data-model`, the MCP instructions include a compact entity summary and `
 
 The agent knows which entity types exist, how their keys are structured, and which GSI to query for a given access pattern before making a single query.
 
+An index whose hash key is a plain attribute and whose sort key is templated
+is listed with an empty `pk_template`, as in
+`{ "index_name": "ByTenant", "pk_template": "", "sk_template": "user#${email}" }`.
+The empty string means the hash key is not built from a template, not that
+the index has no hash key.
+
 ## Index name resolution
 
 OneTable uses shorthand keys internally (e.g. `gs1`). If the index definition includes a `name` field (e.g. `"name": "GSI1"`), the parser uses the DynamoDB-facing name so it matches `describe_table` output and works directly with `query --index-name`.
@@ -56,4 +62,6 @@ dynoxide serve --mcp --mcp-data-model schema.json
 
 ## Important
 
-The data model is context-only. Dynoxide does not validate writes against the schema. The MCP instructions note this explicitly so agents don't assume enforcement.
+The data model is context-only for MCP. Dynoxide does not validate writes against the schema. The MCP instructions note this explicitly so agents don't assume enforcement.
+
+The same file has one active use: `dynoxide import --data-model` rebuilds keys from their entity templates after anonymisation, so a rule on `email` also rewrites `user#${email}`. See [import.md](import.md#single-table-designs).

@@ -4,10 +4,6 @@
 //! (raw DynamoDB JSON format) and converts them into CreateTableRequests.
 
 use crate::actions::create_table::CreateTableRequest;
-use crate::types::{
-    AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
-    ProjectionType, ScalarAttributeType,
-};
 use std::path::Path;
 
 /// A parsed table schema ready for table creation.
@@ -56,6 +52,13 @@ pub fn load_schemas(path: &Path) -> Result<(Vec<TableSchema>, serde_json::Value)
 }
 
 /// Parse a single DescribeTable response into a TableSchema.
+///
+/// Goes through the same translation and deserialisation `run_into` uses to
+/// create the table, rather than a parse of its own. The two used to be
+/// separate, and this one had never learned about LocalSecondaryIndexes, so
+/// the table was created with its LSIs while everything downstream that read
+/// this schema believed there were none: the warning about LSI sort keys
+/// keeping their values could never fire. One parse, one truth.
 fn parse_describe_table_response(value: &serde_json::Value) -> Result<TableSchema, String> {
     // DescribeTable response has a "Table" wrapper
     let table = value.get("Table").unwrap_or(value);
@@ -66,170 +69,14 @@ fn parse_describe_table_response(value: &serde_json::Value) -> Result<TableSchem
         .ok_or("missing TableName")?
         .to_string();
 
-    // Parse KeySchema
-    let key_schema = table
-        .get("KeySchema")
-        .and_then(|v| v.as_array())
-        .ok_or("missing KeySchema")?;
-
-    let key_schema_parsed: Vec<KeySchemaElement> = key_schema
-        .iter()
-        .map(parse_key_schema_element)
-        .collect::<Result<_, _>>()?;
-
-    // Parse AttributeDefinitions
-    let attr_defs = table
-        .get("AttributeDefinitions")
-        .and_then(|v| v.as_array())
-        .ok_or("missing AttributeDefinitions")?;
-
-    let attr_defs_parsed: Vec<AttributeDefinition> = attr_defs
-        .iter()
-        .map(parse_attribute_definition)
-        .collect::<Result<_, _>>()?;
-
-    // Parse GSIs (optional)
-    let gsis = table
-        .get("GlobalSecondaryIndexes")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(parse_gsi).collect::<Result<Vec<_>, _>>())
-        .transpose()?;
-
-    // Parse StreamSpecification (optional)
-    let stream_spec = table
-        .get("StreamSpecification")
-        .map(parse_stream_specification)
-        .transpose()?;
-
-    let create_request = CreateTableRequest {
-        table_name: table_name.clone(),
-        key_schema: key_schema_parsed,
-        attribute_definitions: attr_defs_parsed,
-        global_secondary_indexes: gsis,
-        billing_mode: None,
-        provisioned_throughput: None,
-        stream_specification: stream_spec,
-        ..Default::default()
-    };
+    let mut table = table.clone();
+    super::unwrap_describe_table_shapes(&mut table);
+    let create_request: CreateTableRequest =
+        serde_json::from_value(table).map_err(|e| format!("table '{table_name}': {e}"))?;
 
     Ok(TableSchema {
         table_name,
         create_request,
-    })
-}
-
-fn parse_key_schema_element(ks: &serde_json::Value) -> Result<KeySchemaElement, String> {
-    let name = ks
-        .get("AttributeName")
-        .and_then(|v| v.as_str())
-        .ok_or("KeySchema element missing AttributeName")?;
-    let key_type = ks
-        .get("KeyType")
-        .and_then(|v| v.as_str())
-        .ok_or("KeySchema element missing KeyType")?;
-
-    Ok(KeySchemaElement {
-        attribute_name: name.to_string(),
-        key_type: match key_type {
-            "HASH" => KeyType::HASH,
-            "RANGE" => KeyType::RANGE,
-            other => return Err(format!("unknown KeyType: '{other}'")),
-        },
-    })
-}
-
-fn parse_attribute_definition(ad: &serde_json::Value) -> Result<AttributeDefinition, String> {
-    let name = ad
-        .get("AttributeName")
-        .and_then(|v| v.as_str())
-        .ok_or("AttributeDefinition missing AttributeName")?;
-    let attr_type = ad
-        .get("AttributeType")
-        .and_then(|v| v.as_str())
-        .ok_or("AttributeDefinition missing AttributeType")?;
-
-    Ok(AttributeDefinition {
-        attribute_name: name.to_string(),
-        attribute_type: match attr_type {
-            "S" => ScalarAttributeType::S,
-            "N" => ScalarAttributeType::N,
-            "B" => ScalarAttributeType::B,
-            other => return Err(format!("unknown AttributeType: '{other}'")),
-        },
-    })
-}
-
-fn parse_gsi(gsi: &serde_json::Value) -> Result<GlobalSecondaryIndex, String> {
-    let index_name = gsi
-        .get("IndexName")
-        .and_then(|v| v.as_str())
-        .ok_or("GSI missing IndexName")?
-        .to_string();
-
-    let key_schema = gsi
-        .get("KeySchema")
-        .and_then(|v| v.as_array())
-        .ok_or("GSI missing KeySchema")?
-        .iter()
-        .map(parse_key_schema_element)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let projection = gsi
-        .get("Projection")
-        .map(parse_projection)
-        .transpose()?
-        .unwrap_or_default();
-
-    Ok(GlobalSecondaryIndex {
-        index_name,
-        key_schema,
-        projection,
-        provisioned_throughput: None,
-    })
-}
-
-fn parse_projection(proj: &serde_json::Value) -> Result<Projection, String> {
-    let projection_type = proj
-        .get("ProjectionType")
-        .and_then(|v| v.as_str())
-        .map(|pt| match pt {
-            "ALL" => Ok(ProjectionType::ALL),
-            "KEYS_ONLY" => Ok(ProjectionType::KEYS_ONLY),
-            "INCLUDE" => Ok(ProjectionType::INCLUDE),
-            other => Err(format!("unknown ProjectionType: '{other}'")),
-        })
-        .transpose()?;
-
-    let non_key_attributes = proj
-        .get("NonKeyAttributes")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        });
-
-    Ok(Projection {
-        projection_type,
-        non_key_attributes,
-    })
-}
-
-fn parse_stream_specification(
-    spec: &serde_json::Value,
-) -> Result<crate::actions::create_table::StreamSpecification, String> {
-    let enabled = spec
-        .get("StreamEnabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let view_type = spec
-        .get("StreamViewType")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    Ok(crate::actions::create_table::StreamSpecification {
-        stream_enabled: enabled,
-        stream_view_type: view_type,
     })
 }
 
@@ -294,6 +141,45 @@ mod tests {
         });
         let schema = parse_describe_table_response(&json).unwrap();
         assert_eq!(schema.table_name, "Simple");
+    }
+
+    #[test]
+    fn a_local_secondary_index_survives_the_parse() {
+        // The hand-written parse this replaced dropped LSIs on the floor, so
+        // the deriver never saw them and the warning about their sort keys
+        // keeping real values could not fire.
+        let json = serde_json::json!({"Table": {
+            "TableName": "Orders",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "lsisk", "AttributeType": "S"}
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "LSI1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsisk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }});
+        let schema = parse_describe_table_response(&json).unwrap();
+        let lsis = schema
+            .create_request
+            .local_secondary_indexes
+            .as_deref()
+            .unwrap_or(&[]);
+        assert_eq!(
+            lsis.len(),
+            1,
+            "the LSI has to reach the schema the deriver reads"
+        );
+        assert_eq!(lsis[0].index_name, "LSI1");
     }
 
     #[test]

@@ -4,6 +4,8 @@
 
 A DynamoDB emulator in Rust, backed by SQLite. Runs as an HTTP server or an MCP server for coding agents, embeds into Rust and iOS applications as a library, and compiles to WebAssembly for the browser.
 
+> The crates.io badge above shows the **crate** version, which covers the Rust library alone. Everything you install rather than depend on carries a separate **product** version: the binary, the npm packages, the container images, the browser engine and the Action. That is the number `dynoxide --version` prints and the one to quote in a bug report. [Why there are two](docs/versioning.md).
+
 ## Why Dynoxide?
 
 I built Dynoxide because DynamoDB Local is slow, heavy, and can't embed. It needs a JVM, and the typical Docker-based setups adds <!-- prose:ddb_local_cold_start -->2–3 seconds<!-- /bench --> of cold-start, <!-- prose:ddb_local_idle_memory -->~193 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~473 MB<!-- /bench --> on disk) before you've done anything useful. If you're running integration tests, that's Docker starting, the JVM warming up, and your pipeline waiting.

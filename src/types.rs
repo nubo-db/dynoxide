@@ -565,6 +565,14 @@ pub fn normalize_dynamo_number(num_str: &str) -> String {
     if trimmed.is_empty() {
         return "0".to_string();
     }
+    // The expansion below walks the exponent one character at a time, so an
+    // exponent DynamoDB would never accept turns a short string into a
+    // multi-gigabyte one. `1e-2147483647` is nine characters in and about two
+    // gigabytes out. Outside the range DynamoDB itself accepts there is no
+    // canonical form worth producing, so hand the input back untouched.
+    if validate_dynamo_number(trimmed).is_err() {
+        return trimmed.to_string();
+    }
 
     let negative = trimmed.starts_with('-');
     let abs_str = if negative {

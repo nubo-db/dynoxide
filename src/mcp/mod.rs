@@ -10,7 +10,7 @@ mod server;
 pub use auth::{
     AuthError, AuthMode, ResolvedAuth, first_run_message, is_loopback_host, resolve_auth,
 };
-pub use server::{McpConfig, McpServer};
+pub use server::{ImportConcern, ImportNotice, ImportReport, McpConfig, McpServer};
 
 use crate::Database;
 use std::sync::Arc;

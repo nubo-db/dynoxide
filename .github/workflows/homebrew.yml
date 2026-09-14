@@ -33,6 +33,11 @@ jobs:
         run: |
           TAG="$INPUT_TAG"
           VERSION="${TAG#v}"
+          # Same shape rule as release.yml and npm.yml, from the same script.
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -91,13 +96,20 @@ jobs:
                 bin.install "dynoxide"
               end
               test do
-                assert_match version.to_s, shell_output("#{bin}/dynoxide --version")
+                assert_equal "dynoxide #{version}", shell_output("#{bin}/dynoxide --version").strip
               end
             end
           FORMULA
           echo "Generated formula:"
           cat formula.rb
-          
+
+      # Same pre-push check as the release path, through the same script: the
+      # formula's own test block is never executed by this workflow either.
+      - name: Check the released binary reports the formula's version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: scripts/check-release-binary-version.sh "$VERSION"
+
       - name: Push formula to tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

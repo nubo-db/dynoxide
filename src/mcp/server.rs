@@ -33,6 +33,9 @@ pub struct McpConfig {
     pub data_model: Option<crate::schema::DataModel>,
     /// Maximum number of entities shown in the MCP instructions summary. 0 = suppress.
     pub data_model_summary_limit: usize,
+    /// What `dynoxide import` did to fill this database, when it did. None
+    /// when the data came from anywhere else.
+    pub import: Option<ImportReport>,
 }
 
 impl Default for McpConfig {
@@ -43,7 +46,114 @@ impl Default for McpConfig {
             max_size_bytes: None,
             data_model: None,
             data_model_summary_limit: 20,
+            import: None,
         }
+    }
+}
+
+/// How much an import notice matters. Mirrors the import pipeline's own
+/// grading without depending on it, so the server builds without `import`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportConcern {
+    /// An original value was seen reaching the output.
+    Exposure,
+    /// Something the import could not do or could not check.
+    Caution,
+}
+
+impl ImportConcern {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exposure => "exposure",
+            Self::Caution => "caution",
+        }
+    }
+}
+
+/// One message an import raised, with its concern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportNotice {
+    pub concern: ImportConcern,
+    pub message: String,
+}
+
+/// What `dynoxide import` did before this server started. The CLI prints
+/// the same facts to stderr, which an MCP client does not show to the agent,
+/// so this is the agent's only way to learn whether the data was anonymised
+/// cleanly and what the run warned about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Tables imported.
+    pub tables: usize,
+    /// Items imported across all tables.
+    pub items: usize,
+    /// Lines skipped because they did not parse.
+    pub skipped: usize,
+    /// Every notice the import raised, in the order it raised them.
+    pub notices: Vec<ImportNotice>,
+    /// Whether `--accept-exposure` let the run serve despite its exposures.
+    pub exposures_accepted: bool,
+}
+
+impl ImportReport {
+    /// How many notices say an original value reached the output.
+    pub fn exposure_count(&self) -> usize {
+        self.notices
+            .iter()
+            .filter(|n| n.concern == ImportConcern::Exposure)
+            .count()
+    }
+
+    /// The one sentence the server instructions carry about the import.
+    pub fn instructions_sentence(&self) -> String {
+        let notices = self.notices.len();
+        let exposures = self.exposure_count();
+        if notices == 0 {
+            return "This database was populated by dynoxide import, which raised no notices."
+                .to_string();
+        }
+        let counted = format!(
+            "This database was populated by dynoxide import; get_database_info reports {} {}",
+            notices,
+            if notices == 1 { "notice" } else { "notices" }
+        );
+        if exposures == 0 {
+            return format!("{counted}, none of them exposures.");
+        }
+        let which = if exposures == 1 {
+            format!("{exposures} is an exposure")
+        } else {
+            format!("{exposures} are exposures")
+        };
+        if self.exposures_accepted {
+            let was = if exposures == 1 { "was" } else { "were" };
+            format!("{counted}, of which {which} that {was} accepted with --accept-exposure.")
+        } else {
+            format!("{counted}, of which {which}.")
+        }
+    }
+
+    /// The `import` object `get_database_info` returns.
+    fn to_json(&self) -> serde_json::Value {
+        let notices: Vec<serde_json::Value> = self
+            .notices
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "concern": n.concern.as_str(),
+                    "message": n.message,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "tables": self.tables,
+            "items": self.items,
+            "skipped": self.skipped,
+            "notice_count": self.notices.len(),
+            "exposure_count": self.exposure_count(),
+            "exposures_accepted": self.exposures_accepted,
+            "notices": notices,
+        })
     }
 }
 
@@ -1593,7 +1703,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Get database-level information: storage mode, path, size, table count, and per-table summaries. Use this as your first call to orient yourself."
+        description = "Get database-level information: storage mode, path, size, table count, and per-table summaries. When the data was loaded by dynoxide import, also returns the import's notices and whether any exposures were accepted. Use this as your first call to orient yourself."
     )]
     fn get_database_info(&self) -> Result<CallToolResult, McpError> {
         let db_info = self
@@ -1655,6 +1765,10 @@ impl McpServer {
         if let Some(ref data_model) = self.config.data_model {
             info["data_model"] = serde_json::to_value(data_model)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+
+        if let Some(ref report) = self.config.import {
+            info["import"] = report.to_json();
         }
 
         json_result(&info)
@@ -2266,18 +2380,23 @@ impl ServerHandler for McpServer {
             Snapshots: create_snapshot, restore_snapshot, list_snapshots, delete_snapshot\n\
             Info: get_database_info";
 
-        let instructions = match self
+        let mut instructions = base_instructions.to_string();
+        if let Some(report) = &self.config.import {
+            instructions.push_str("\n\n");
+            instructions.push_str(&report.instructions_sentence());
+        }
+        if let Some(summary) = self
             .config
             .data_model
             .as_ref()
             .and_then(|dm| dm.instructions_summary(self.config.data_model_summary_limit))
         {
-            Some(summary) => format!("{base_instructions}\n\n{summary}"),
-            None => base_instructions.to_string(),
-        };
+            instructions.push_str("\n\n");
+            instructions.push_str(&summary);
+        }
 
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("dynoxide", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("dynoxide", crate::PRODUCT_VERSION))
             .with_instructions(instructions)
     }
 }
@@ -2608,4 +2727,63 @@ fn find_attribute_type(
             crate::types::ScalarAttributeType::B => "B",
         })
         .unwrap_or("S")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(exposures: usize, cautions: usize, accepted: bool) -> ImportReport {
+        let mut notices = Vec::new();
+        for i in 0..exposures {
+            notices.push(ImportNotice {
+                concern: ImportConcern::Exposure,
+                message: format!("exposure {i}"),
+            });
+        }
+        for i in 0..cautions {
+            notices.push(ImportNotice {
+                concern: ImportConcern::Caution,
+                message: format!("caution {i}"),
+            });
+        }
+        ImportReport {
+            tables: 1,
+            items: 1,
+            skipped: 0,
+            notices,
+            exposures_accepted: accepted,
+        }
+    }
+
+    #[test]
+    fn several_accepted_exposures_read_as_a_plural() {
+        assert_eq!(
+            report(2, 1, true).instructions_sentence(),
+            "This database was populated by dynoxide import; get_database_info reports 3 notices, \
+             of which 2 are exposures that were accepted with --accept-exposure."
+        );
+    }
+
+    #[test]
+    fn an_exposure_nobody_accepted_is_still_named() {
+        // Only reachable for a crate user building the config by hand, since
+        // the CLI exits before serving. The sentence must not claim acceptance.
+        assert_eq!(
+            report(1, 0, false).instructions_sentence(),
+            "This database was populated by dynoxide import; get_database_info reports 1 notice, \
+             of which 1 is an exposure."
+        );
+    }
+
+    #[test]
+    fn the_json_counts_agree_with_the_notices() {
+        let json = report(1, 2, true).to_json();
+        assert_eq!(json["notice_count"], 3);
+        assert_eq!(json["exposure_count"], 1);
+        assert_eq!(json["exposures_accepted"], true);
+        assert_eq!(json["notices"][0]["concern"], "exposure");
+        assert_eq!(json["notices"][1]["concern"], "caution");
+        assert_eq!(json["notices"].as_array().unwrap().len(), 3);
+    }
 }

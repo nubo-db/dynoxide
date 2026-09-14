@@ -23,8 +23,9 @@ use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
+
     name = "dynoxide",
-    version,
+    version = dynoxide::PRODUCT_VERSION,
     about = "A fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite",
     after_help = after_help_text(),
     args_conflicts_with_subcommands = true,
@@ -248,6 +249,12 @@ struct ImportArgs {
     #[arg(long)]
     rules: Option<std::path::PathBuf>,
 
+    /// OneTable schema whose entity key templates rebuild pk, sk and GSI keys after anonymisation
+    ///
+    /// Also serves as the MCP data model when --mcp is set without --mcp-data-model.
+    #[arg(long, value_name = "PATH")]
+    data_model: Option<std::path::PathBuf>,
+
     /// Comma-separated list of table names to import (default: all)
     #[arg(long, value_delimiter = ',')]
     tables: Option<Vec<String>>,
@@ -263,6 +270,11 @@ struct ImportArgs {
     /// Continue importing when a batch fails instead of aborting
     #[arg(long)]
     continue_on_error: bool,
+
+    /// Exit 0 even when the import reports that an original value reached the
+    /// output. Without it such a run exits 3, so a pipeline stops.
+    #[arg(long)]
+    accept_exposure: bool,
 
     /// After import, start an HTTP server with the imported data (in-memory)
     #[cfg(feature = "http-server")]
@@ -864,6 +876,7 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_size_bytes: args.max_size_bytes,
         data_model,
         data_model_summary_limit: args.data_model_summary_limit,
+        import: None,
     };
 
     if args.http {
@@ -883,6 +896,65 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 // Import subcommand (import feature)
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "import")]
+/// Exit code for a run that finished but left an original value in the output.
+/// Distinct from 1 so a pipeline can tell it from an import that failed.
+const EXIT_EXPOSURE: i32 = 3;
+
+/// Print the summary, then stop the pipeline if the run reported that real
+/// data reached the output. An anonymising import that says so and then exits
+/// 0 is a run whose failure looks exactly like its success.
+#[cfg(feature = "import")]
+fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: bool) {
+    print_import_summary(summary);
+    if summary.exposures.is_empty() || accept_exposure {
+        return;
+    }
+    eprintln!();
+    eprintln!(
+        "{} of the warnings above say an original value reached the output:",
+        summary.exposures.len()
+    );
+    for exposure in &summary.exposures {
+        eprintln!("  - {exposure}");
+    }
+    eprintln!();
+    eprintln!(
+        "Exiting {EXIT_EXPOSURE}. Fix the rules, or pass --accept-exposure if this is expected."
+    );
+    std::process::exit(EXIT_EXPOSURE);
+}
+
+/// The view of the summary an MCP agent gets. The summary itself is printed
+/// to stderr, which an MCP client keeps from the agent, so this is what tells
+/// the agent whether the data was anonymised cleanly.
+#[cfg(all(feature = "import", feature = "mcp-server"))]
+fn import_report(
+    summary: &dynoxide::import::ImportSummary,
+    accept_exposure: bool,
+) -> dynoxide::mcp::ImportReport {
+    use dynoxide::import::Concern;
+    use dynoxide::mcp::{ImportConcern, ImportNotice, ImportReport};
+
+    ImportReport {
+        tables: summary.tables.len(),
+        items: summary.total_items,
+        skipped: summary.total_skipped,
+        notices: summary
+            .notices
+            .iter()
+            .map(|n| ImportNotice {
+                concern: match n.concern {
+                    Concern::Exposure => ImportConcern::Exposure,
+                    Concern::Caution => ImportConcern::Caution,
+                },
+                message: n.message.clone(),
+            })
+            .collect(),
+        exposures_accepted: accept_exposure && !summary.exposures.is_empty(),
+    }
+}
 
 #[cfg(feature = "import")]
 fn print_import_summary(summary: &dynoxide::import::ImportSummary) {
@@ -914,6 +986,7 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
         output: args.output.clone(),
         schema: args.schema.clone(),
         rules: args.rules.clone(),
+        data_model: args.data_model.clone(),
         tables: args.tables.clone(),
         compress: args.compress,
         force: args.force,
@@ -943,7 +1016,10 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         let db = Database::memory()?;
         let cmd = build_import_command(&args);
         let summary = dynoxide::import::run_into(&db, cmd)?;
-        print_import_summary(&summary);
+        // The gate runs before any server is built. Serving is the one
+        // outcome worse than writing a file, because the real values are
+        // handed out on request rather than sitting in a file nobody opened.
+        finish_import(&summary, args.accept_exposure);
         eprintln!();
 
         // Both --serve and --mcp: run HTTP + MCP concurrently
@@ -951,10 +1027,12 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         if wants_serve && wants_mcp {
             use tokio_util::sync::CancellationToken;
 
-            let mcp_data_model = load_data_model(args.mcp_data_model.as_ref())?;
+            let mcp_data_model =
+                load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
             let mcp_config = dynoxide::mcp::McpConfig {
                 read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
+                import: Some(import_report(&summary, args.accept_exposure)),
                 ..Default::default()
             };
             let opts = resolve_mcp_http_options(
@@ -999,9 +1077,12 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
 
         #[cfg(feature = "mcp-server")]
         if wants_mcp {
-            let mcp_data_model = load_data_model(args.mcp_data_model.as_ref())?;
+            let mcp_data_model =
+                load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
             let mcp_config = dynoxide::mcp::McpConfig {
+                read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
+                import: Some(import_report(&summary, args.accept_exposure)),
                 ..Default::default()
             };
             dynoxide::mcp::serve_stdio(db, mcp_config).await?;
@@ -1011,7 +1092,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         // File mode (current behavior)
         let cmd = build_import_command(&args);
         let summary = dynoxide::import::run(cmd)?;
-        print_import_summary(&summary);
+        finish_import(&summary, args.accept_exposure);
     } else {
         return Err("Either --output or --serve/--mcp is required.\n\
              Use --output <path> to write a database file, or\n\
@@ -1039,7 +1120,7 @@ fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let cmd = build_import_command(&args);
     let summary = dynoxide::import::run(cmd)?;
-    print_import_summary(&summary);
+    finish_import(&summary, args.accept_exposure);
     Ok(())
 }
 

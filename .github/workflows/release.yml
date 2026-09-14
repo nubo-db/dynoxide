@@ -1,10 +1,14 @@
 name: Release
 
 # Tag-triggered release pipeline. Push a v* tag on a commit where:
-#   - Cargo.toml version matches the tag
+#   - VERSION matches the tag
 #   - CHANGELOG.md has a matching ## [X.Y.Z] entry
 #   - CI has gone green
 # then let this workflow do the rest.
+#
+# Two version streams: the tag carries the product version, Cargo.toml carries
+# the crate version, and a release may move one without the other. See
+# docs/versioning.md.
 #
 # Flow: validate -> build (5 targets) -> github-release -> publish-crate
 # (review gate) -> publish-homebrew + publish-npm + publish-docker in parallel.
@@ -51,47 +55,33 @@ jobs:
         id: resolve
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+          VERSION="${TAG#v}"
+          # The shape rule lives in one script, shared with check-versions.sh
+          # and build.rs, so the tag cannot pass a looser test than the
+          # version file did.
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
             echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
             exit 1
           fi
-          VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved tag=$TAG version=$VERSION"
 
-      - name: Check Cargo.toml version matches tag
+
+      # The tag carries the product version. The crate is a separate stream:
+      # a Rust API break moves dynoxide-rs without charging a major to the
+      # CLI, containers, browser engine or npm packages, whose users never
+      # touch that API. See docs/versioning.md.
+      - name: Check the product version matches the tag
         env:
           EXPECTED: ${{ steps.resolve.outputs.version }}
         run: |
-          ACTUAL=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          echo "Cargo.toml version: $ACTUAL"
-          echo "Expected: $EXPECTED"
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "::error::Cargo.toml version ($ACTUAL) does not match tag ($EXPECTED)"
-            exit 1
-          fi
+          scripts/check-versions.sh "$EXPECTED"
 
       - name: Check CHANGELOG has entry for this version
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: scripts/extract-changelog.sh "$VERSION" CHANGELOG.md > /dev/null
-
-      # The MCPB bundle is the one versioned artefact nothing stamps: the npm
-      # packages and server.json ship a placeholder that publish rewrites,
-      # while this file is edited by hand. That is why it sat at 0.11.1 while
-      # the crate was at 0.13.0. docs/versioning.md now promises every artefact
-      # carries the same number, so the tag has to enforce it.
-      - name: Check the MCPB manifest version matches the tag
-        env:
-          EXPECTED: ${{ steps.resolve.outputs.version }}
-        run: |
-          ACTUAL=$(jq -r '.version' mcpb/manifest.json)
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "::error::mcpb/manifest.json version ($ACTUAL) does not match tag ($EXPECTED). Bump it and re-tag."
-            exit 1
-          fi
-          echo "mcpb/manifest.json version: $ACTUAL"
 
   # -------------------------------------------------------------------
   # Build release binaries for all targets.
@@ -235,18 +225,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # The crate is on its own stream, so a product release can carry a
+      # crate version that is already on crates.io. That is not an error and
+      # must not fail this job: four publishers depend on it, and failing here
+      # would strand the product release with no npm, container, Homebrew or
+      # registry update.
+      # The probe is a script shared with publish-crate.yml, so the two paths
+      # cannot answer the same question differently. It retries anything that
+      # is not a 200 or a 404 and refuses to guess if that persists.
+      - name: Is this crate version already published
+        id: published
+        run: |
+          CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "crate version: $CRATE"
+          ALREADY=$(scripts/is-crate-published.sh dynoxide-rs "$CRATE") || {
+            echo "::error::could not determine whether dynoxide-rs $CRATE is published. Refusing to guess."
+            exit 1
+          }
+          echo "already=$ALREADY" >> "$GITHUB_OUTPUT"
+          if [ "$ALREADY" = true ]; then
+            echo "::warning::dynoxide-rs $CRATE is already on crates.io, so the crate is not republished. If src/ changed since it was published, Cargo.toml needed a bump."
+            echo "dynoxide-rs $CRATE is already on crates.io; skipping publication"
+          else
+            echo "dynoxide-rs $CRATE is not on crates.io; publishing"
+          fi
+
       - name: cargo publish --dry-run
+        if: steps.published.outputs.already == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --dry-run
 
       - name: cargo publish
+        if: steps.published.outputs.already == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
 
   # -------------------------------------------------------------------
-  # Update the Homebrew tap formula. Runs only after crates.io succeeds.
+  # Update the Homebrew tap formula. Runs after the crate job, which succeeds
+  # whether it published or found the crate version already there.
   # -------------------------------------------------------------------
   publish-homebrew:
     name: Update Homebrew tap
@@ -255,6 +273,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # The binary probe below is a script in the tree, so the tree is needed.
+      - uses: actions/checkout@v5
+
       - name: Download checksums from release
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -310,10 +331,20 @@ jobs:
                 bin.install "dynoxide"
               end
               test do
-                assert_match version.to_s, shell_output("#{bin}/dynoxide --version")
+                assert_equal "dynoxide #{version}", shell_output("#{bin}/dynoxide --version").strip
               end
             end
           FORMULA
+
+      # The formula carries a test block, but nothing ran it: Homebrew only
+      # executes it on `brew test`, so a formula whose binary reports the wrong
+      # version reached the tap unchallenged. The script does what that block
+      # does, against the same archive the formula points at, before the tap
+      # moves. homebrew.yml calls the same script.
+      - name: Check the released binary reports the formula's version
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: scripts/check-release-binary-version.sh "$VERSION"
 
       - name: Push formula to tap
         env:
@@ -456,6 +487,28 @@ jobs:
             org.opencontainers.image.vendor=Martin Hicks
             org.opencontainers.image.licenses=MIT OR Apache-2.0
 
+      # Build the native architecture locally and probe it before anything is
+      # pushed. The published probe below is still worth keeping, because it
+      # checks what the registry actually serves, but on its own it only tells
+      # you a wrong image is already public.
+      - name: Build for probing, and check the version before publishing
+        env:
+          EXPECTED: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Two flags are load-bearing for --load on this runner, as ci.yml
+          # says: --platform keeps the result to one platform, and
+          # --provenance=false stops buildx attaching an attestation, which
+          # makes even a single-platform result a manifest list the classic
+          # image store cannot load.
+          docker buildx build --provenance=false --platform linux/amd64 --load -t dynoxide:probe .
+          actual=$(docker run --rm dynoxide:probe --version | awk '{print $NF}')
+          echo "pre-push image reports: $actual"
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::image reports $actual, expected $EXPECTED. Not publishing."
+            exit 1
+          fi
+
       - name: Build and push to GHCR
         id: build
         uses: docker/build-push-action@v7
@@ -566,7 +619,9 @@ jobs:
     name: Publish to MCP registry
     needs: [validate, publish-npm, publish-docker]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Two packages are waited on in turn, up to ten minutes each, before the
+    # registry steps run.
+    timeout-minutes: 30
 
     permissions:
       id-token: write
@@ -582,20 +637,30 @@ jobs:
       # publish-npm only dispatches npm.yml, so the npm publish finishes
       # asynchronously. Wait for the version to appear before publishing the
       # registry entry, otherwise the npm ownership check fails.
-      - name: Wait for npm package to go live
+      # Both npm packages, not just the CLI. npm.yml publishes the CLI and the
+      # browser engine in independent jobs, so waiting on the CLI alone let a
+      # browser failure pass unnoticed while the release carried on and the
+      # site was told the version had shipped.
+      - name: Wait for the npm packages to go live
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          for i in $(seq 1 60); do
-            if npm view "dynoxide@$VERSION" version >/dev/null 2>&1; then
-              echo "dynoxide@$VERSION is live on npm"
-              exit 0
+          for pkg in "dynoxide" "@dynoxide/wasm-engine"; do
+            live=false
+            for i in $(seq 1 60); do
+              if npm view "$pkg@$VERSION" version >/dev/null 2>&1; then
+                echo "$pkg@$VERSION is live on npm"
+                live=true
+                break
+              fi
+              echo "Waiting for $pkg@$VERSION on npm ($i/60)..."
+              sleep 10
+            done
+            if [ "$live" != true ]; then
+              echo "::error::$pkg@$VERSION did not appear on npm within 10 minutes"
+              exit 1
             fi
-            echo "Waiting for dynoxide@$VERSION on npm ($i/60)..."
-            sleep 10
           done
-          echo "::error::dynoxide@$VERSION did not appear on npm within 10 minutes"
-          exit 1
 
       - name: Install mcp-publisher
         run: |
@@ -639,6 +704,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      # The dist-tag rule below is a script in the tree, so the tree is needed.
+      - uses: actions/checkout@v5
+
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -653,6 +721,11 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          # A prerelease publishes to `next`, never `latest`, so waiting on
+          # `latest` would sit here for twenty minutes and then fail a release
+          # that had in fact succeeded. The rule is the one the publishers use.
+          DIST_TAG=$(scripts/npm-dist-tag.sh "$VERSION")
+          echo "waiting on dist-tags.$DIST_TAG"
           DEADLINE=$(( $(date +%s) + 1200 ))
           ATTEMPT=0
           while :; do
@@ -660,17 +733,17 @@ jobs:
             # Keep stderr, so a genuine failure (auth, DNS, a 500) is
             # distinguishable from "not published yet" rather than both looking
             # like a timeout twenty minutes later.
-            LATEST=$(npm view dynoxide dist-tags.latest 2>/tmp/npm-view-err) || true
+            LATEST=$(npm view dynoxide "dist-tags.$DIST_TAG" 2>/tmp/npm-view-err) || true
             if [ "$LATEST" = "$VERSION" ]; then
-              echo "npm dist-tags.latest is now $VERSION after $ATTEMPT attempt(s)"
+              echo "npm dist-tags.$DIST_TAG is now $VERSION after $ATTEMPT attempt(s)"
               exit 0
             fi
             if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "::error::npm dist-tags.latest is '${LATEST:-unreadable}' after 20 minutes, expected $VERSION"
+              echo "::error::npm dist-tags.$DIST_TAG is '${LATEST:-unreadable}' after 20 minutes, expected $VERSION"
               if [ -s /tmp/npm-view-err ]; then echo "Last npm error:"; cat /tmp/npm-view-err; fi
               exit 1
             fi
-            echo "Attempt $ATTEMPT: dist-tags.latest is '${LATEST:-unreadable}', waiting for $VERSION"
+            echo "Attempt $ATTEMPT: dist-tags.$DIST_TAG is '${LATEST:-unreadable}', waiting for $VERSION"
             sleep 10
           done
 

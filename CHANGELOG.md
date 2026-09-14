@@ -7,6 +7,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-11
+
+The crate moves to `dynoxide-rs` 2.0.0 because `ImportCommand` gained a
+field. Everything else a user installs carries 1.2.0; see the version split
+under Added.
+
+### Behaviour changes
+
+- **`hash` rules now use HMAC-SHA256 keyed on the salt. Every hashed value
+  changes.** `SHA256(salt || value)` ran salt and value together as one byte
+  string with no boundary between them, and inherited SHA-256's length
+  extension. The value is tagged with its DynamoDB type, so the string `"123"`
+  and the number `123` no longer share a pseudonym, and a map, list or set is
+  hashed over a canonical encoding, so its pseudonym no longer depends on the
+  order it was serialised in. A dataset anonymised by 1.1.0 will not join
+  against one anonymised by this release: re-import both sides, and rotate the
+  salt while you are there.
+- **One value has one pseudonym however it is spelled.** `1`, `1.0` and
+  `0.1e1` are one number to `hash`, to a seeded `fake` and to the consistency
+  map, as they are one number to DynamoDB, and a duplicated set member no
+  longer changes a set's pseudonym. The map keeps types apart, so `"42"` and
+  `42` are separate entries, and a seeded `fake` on a map, list or set goes
+  through the map rather than being treated as deterministic.
+- **`dynoxide import` exits 3 when an original value reached the output.**
+  That covers a rule that anonymised nothing, a key its template could not
+  rebuild, a key the model never templated that still holds a replaced value,
+  items matching no entity, keys of an index the model never names on a table
+  whose model names an index it lacks, and values a `mask` kept whole. They
+  are listed again at the end of the run, `--serve` and `--mcp` refuse to
+  start on them, and `--accept-exposure` returns the exit code to 0.
+  `ImportSummary` gains a `notices` field carrying every message with its
+  concern, and an `exposures` field holding the messages of the ones that
+  count.
+- **`salt_env` and `seed_env` must be at least 16 bytes.** Generate one with
+  `openssl rand -base64 24`. The salt is wiped from memory once the run is
+  done with it, as the encryption key already was.
+- **`fake` on a numeric attribute draws from the full 64-bit range** rather
+  than four digits, so a few hundred items no longer collide.
+- **A misspelt table name is an error.** A rule scoped to a table the schema
+  file does not have, and a `--tables` name the export does not hold, are
+  refused rather than skipped; either used to leave a table out of the output
+  with a clean exit. `--tables` also applies to a flat export directory, where
+  the filter was ignored before.
+- **A rule path is read in full or refused.** `a[0]b` parsed as `a[0]` and
+  rewrote the whole list element; it is now an error suggesting `a[0].b`.
+- **An export file over the 50 GB limit fails the import** rather than ending
+  quietly at the limit, and the cap applies to uncompressed files too. A line
+  over 4 MB is refused without first being held in memory.
+
+### Added
+
+- `dynoxide import --data-model <onetable.json>` rebuilds keys from their
+  OneTable templates after anonymisation, so `pk = "CUSTOMER#<email>"` and
+  every index key built from `email` take the anonymised value and keep their
+  prefix. A key is rewritten only where its template reproduces the value it
+  arrived with; anything else is left alone and counted. Templates follow
+  OneTable's forms, including dotted paths and `${name:length:pad}` padding.
+  A model describes one table, so with rules a multi-table export needs
+  `--tables` naming the one it describes
+  ([#201](https://github.com/nubo-db/dynoxide/issues/201)).
+- An import fails when the anonymisation breaks a join: one original key
+  taken to two values, by two entities or by one entity across rows that
+  shared a partition. Put the attribute in `[consistency] fields`, or use
+  `hash`. A split sort key is reported rather than fatal, and `docs/import.md`
+  lists what the check cannot see
+  ([#202](https://github.com/nubo-db/dynoxide/issues/202)).
+- `fake` rules take `seed_env`, naming a secret that makes the generated value
+  a function of the original, so a fixture only changes where the source data
+  changed. Holds for a fixed build and for scalar values; mixing seeded and
+  unseeded rules on one consistency field is reported
+  ([#203](https://github.com/nubo-db/dynoxide/issues/203)).
+- A rule can name the `tables` it applies to. A rule scoped to tables a run
+  leaves out with `--tables` is reported as not applied rather than as having
+  anonymised nothing.
+- Rules take `values` and `names` tables, in the shape of
+  ExpressionAttributeValues and ExpressionAttributeNames, so a match can be
+  scoped by key prefix or reach a reserved-word attribute. The rules file is
+  validated before any data is read
+  ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
+- `import --mcp` tells the agent what the import did. `get_database_info`
+  returns the run's notices with their concern, and the server instructions
+  say how many there were and whether an exposure was accepted with
+  `--accept-exposure`. `docs/mcp.md` covers it.
+- The crate version and the product version are separate streams. `VERSION`
+  holds the product version and every installable artefact reports it;
+  `Cargo.toml` holds the crate version. `cargo install dynoxide-rs --version`
+  now selects the crate version. `docs/versioning.md` has the rules and
+  `scripts/check-versions.sh` enforces them in CI.
+- New warnings, counted where a count is possible: a rule that matched nothing
+  or rewrote nothing; keys a template could not rebuild; values a `mask` kept
+  whole; a rule that rewrites a key or index key directly with no data model;
+  an item several entities' templates reproduce; one entity splitting its own
+  sort key; a data model supplied with no rules.
+
+### Changed
+
+- Prefer `hash`, or a seeded `safe_email`, for an attribute a key is built
+  from. The other `fake` generators repeat within a few hundred items, `mask`
+  collides on shared tails, `redact` collapses every item onto one key and
+  `null` cannot render a key at all. The up-front warning names the
+  consequence per action.
+- An import that rebuilds keys, or whose rules name a key attribute, maintains
+  secondary indexes on write so an overwritten row leaves no stale index
+  entry. Other imports keep the faster path.
+
+#### Breaking (Rust API)
+
+- `ImportCommand` gains a `data_model` field, so struct literals need it
+  adding. This is why the crate is 2.0.0.
+
+### Fixed
+
+- `contains` against a number set compares numerically, as DynamoDB does, so
+  `contains(tags, :n)` with `:n` as `1` matches a set holding `1.0`. The
+  evaluator is shared, so this holds in a `FilterExpression` and a
+  `ConditionExpression` alike, not only in an import rule.
+- `safe_email` no longer collides at ordinary sizes: addresses carry a 64-bit
+  derived suffix in the local part.
+- `${name:length:pad}` matches OneTable's rendering for a multi-character pad,
+  counting in UTF-16 units as JavaScript does.
+- The check for a replaced value left inside a key finds it inside a redacted
+  map or list, in another case, and behind any delimiter, and counts only a
+  value a rule actually replaced.
+- Under `--continue-on-error`, the last batch of a table is covered, and a
+  batch that rolled back no longer counts towards the join check, the
+  collision count or an exposure: only rows that reached the output do.
+- `import --mcp` honours `--mcp-read-only`, as `--serve --mcp` already did.
+- Local secondary indexes in the schema file reach the key rebuilder, which
+  reports them rather than skipping them, along with any OneTable index the
+  table lacks. An index whose hash key is a plain attribute keeps its sort key
+  template, and a schema keyed on `PK`/`SK` parses its primary key templates.
+- Overwritten rows are counted on the number the database stores, so `1` and
+  `1.0` count as the one row they are.
+- A rule `path` starting with `#` is rejected rather than silently matching
+  nothing, and an empty salt variable is rejected rather than producing
+  unsalted SHA-256. A salt or seed that is set but not valid UTF-8 is reported
+  as such rather than as unset.
+- Compression happens before the rename, so a failed compression leaves nothing
+  at the output path.
+- `docs/import.md` no longer shows `begins_with(pk, 'USER#')`, which the
+  parser rejects; use the `values` table
+  ([#200](https://github.com/nubo-db/dynoxide/issues/200)).
+- Release pipeline: the container image is version-probed before push, the
+  Homebrew formula's test block runs before the tap moves, the website waits on
+  both npm packages, prereleases publish with a dist-tag and install through
+  the Action, `npm/scripts/publish.sh` refuses a version and release URL that
+  name different tags, the npm job checks out the tag it publishes, and a tag
+  whose version is not full semver (`v1.2.0-rc..1`) is refused before anything
+  is published rather than by npm afterwards.
+
 ## [1.1.0] - 2026-09-03
 
 ### Behaviour changes
@@ -646,7 +796,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/nubo-db/dynoxide/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/nubo-db/dynoxide/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/nubo-db/dynoxide/compare/v0.12.0...v0.13.0

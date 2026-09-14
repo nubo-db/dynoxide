@@ -112,10 +112,14 @@ fi
 cp pkg/dynoxide_bg.wasm dist/
 cp node_modules/@sqlite.org/sqlite-wasm/dist/sqlite3.wasm dist/
 
+
 # 4. Stamp a manifest so a consumer can pin and verify what it embeds. The
-#    engine version is the crate version; the contract version is the envelope
-#    shape the client validates on boot (see src/wasm_api.rs CONTRACT_VERSION).
-engine_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+#    engine version is the product version from VERSION, which is what the
+#    browser package is published under; the crate version in Cargo.toml
+#    tracks the Rust API and is a different stream (see docs/versioning.md).
+#    The contract version is the envelope shape the client validates on boot
+#    (see src/wasm_api.rs CONTRACT_VERSION).
+engine_version="$(tr -d '[:space:]' < VERSION)"
 contract_version="$(grep -m1 'CONTRACT_VERSION: u32' src/wasm_api.rs | sed -E 's/.*= *([0-9]+).*/\1/')"
 cat > dist/manifest.json <<JSON
 {

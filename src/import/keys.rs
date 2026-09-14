@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use crate::actions::create_table::CreateTableRequest;
 use crate::expressions::{PathElement, resolve_path};
 use crate::schema::{DataModel, EntityDefinition};
-use crate::types::{AttributeValue, Item};
+use crate::types::{AttributeValue, GlobalSecondaryIndex, Item};
 use crate::validation::{partition_key_name, sort_key_name};
 
 use super::config::{ValidatedAction, ValidatedRule, parse_path};
@@ -316,11 +316,32 @@ pub struct Rederivation {
     rule_owned: Vec<usize>,
     /// Scalar values of the rule-target attributes as the item arrived, so
     /// `apply` can see whether a key the model never templated still holds
-    /// one after the rules replaced it.
+    /// one after the rules replaced it. A target that is a map, list or set
+    /// contributes every string and number leaf inside it, keyed by the
+    /// rule's root attribute: redacting a whole `profile` removes the address
+    /// inside it as surely as a rule on `profile.email` does, and the key
+    /// check has to know what it was.
     originals: Vec<(String, String)>,
     /// (at-risk index, hash of the value this item arrived with), so `apply`
     /// can see whether two entities anonymised a shared value differently.
     at_risk_originals: Vec<(usize, u64)>,
+}
+
+/// One entity key as the model templates it: the key attribute, the
+/// template text, and the attribute paths the template reads.
+type KeyShape = (String, String, Vec<Vec<PathElement>>);
+
+/// Key attribute -> (entities a rule puts at risk, the roots a rule rewrites
+/// that their templates read, entities that build the key untouched).
+type SharedGroups = Vec<(String, (Vec<usize>, Vec<String>, Vec<usize>))>;
+
+/// What resolving the model's entities against the table produced.
+struct BuiltEntities {
+    entities: Vec<EntityKeys>,
+    /// Each entity's key shapes, in model order, for the join check.
+    key_shapes: Vec<Vec<KeyShape>>,
+    /// Indexes the model declares that the table does not have, sorted.
+    unmatched_indexes: Vec<String>,
 }
 
 /// Rebuilds templated keys for the items of one table.
@@ -415,36 +436,109 @@ impl KeyDeriver {
         let range = sort_key_name(&request.key_schema);
         let gsis = request.global_secondary_indexes.as_deref().unwrap_or(&[]);
 
-        // What groups rows with each other, per key attribute. A partition key
-        // groups by itself: rows sharing one come back from a single query. A
-        // sort key only orders rows inside a partition it does not define, so
-        // two rows sharing a sort value are grouped only when they share that
-        // partition as well, and the join check has to read both. Comparing a
-        // sort value alone calls two rows a group when they were never in one
-        // place, and splitting them then reads as a join break that never
-        // existed. An attribute that is a partition key anywhere groups by
-        // itself, whatever else it sorts.
+        let schema_keys = Self::schema_keys(request);
+        let unnamed_index_keys = Self::unnamed_index_keys(model, gsis);
+        let grouped_by = Self::grouped_by(hash, range, gsis);
+
+        // Only the rules that apply to this table. A rule scoped elsewhere
+        // that names `pk` made this table's `pk` look rule-owned, so a key
+        // the template could not rebuild went uncounted and a shared key a
+        // direct rule never touched here left the join check.
+        let rules: Vec<&ValidatedRule> = rules
+            .iter()
+            .filter(|rule| rule.applies_to(&request.table_name))
+            .collect();
+        let rule_targets: HashSet<&str> = rules.iter().filter_map(|r| rule_target(r)).collect();
+        let rule_paths: Vec<Vec<PathElement>> = rules.iter().map(|r| r.path.clone()).collect();
+
+        let mut warnings: Vec<Notice> = Vec::new();
+        warnings.extend(Self::lsi_notice(request));
+        let built = Self::build_entities(
+            model,
+            gsis,
+            hash,
+            range,
+            &rules,
+            &rule_targets,
+            &mut warnings,
+        )?;
+        let shared = Self::shared_key_groups(&built.key_shapes, &rule_targets);
+        let at_risk = Self::at_risk_groups(
+            shared,
+            &built.entities,
+            &grouped_by,
+            consistency_fields,
+            &mut warnings,
+        );
+
+        let mut type_attributes: Vec<String> = built
+            .entities
+            .iter()
+            .map(|e| e.type_attribute.clone())
+            .collect();
+        type_attributes.sort();
+        type_attributes.dedup();
+
+        Ok((
+            Self {
+                entities: built.entities,
+                type_attributes,
+                hash_attribute: hash.map(String::from),
+                range_attribute: range.map(String::from),
+                warned_mismatch: HashMap::new(),
+                rule_targets: rule_targets.iter().map(|a| (*a).to_string()).collect(),
+                schema_keys,
+                rule_paths,
+                survived: HashMap::new(),
+                warned_unrenderable: HashMap::new(),
+                warned_rule_wins: HashSet::new(),
+                warned_ambiguous: HashSet::new(),
+                unmatched: 0,
+                at_risk,
+                rebuilt_keys: HashSet::new(),
+                collisions: 0,
+                collision_check_capped: false,
+                collision_cap_reported: false,
+                warned_rule_skipped: HashMap::new(),
+                unmatched_model_indexes: built.unmatched_indexes,
+                unnamed_index_keys,
+                untemplated_index_keys: BTreeMap::new(),
+            },
+            warnings,
+        ))
+    }
+
+    /// Every key attribute the table and its indexes have: the primary key
+    /// first, then each GSI's keys and each LSI's in declaration order, each
+    /// name once.
+    fn schema_keys(request: &CreateTableRequest) -> Vec<String> {
         let mut schema_keys: Vec<String> = Vec::new();
-        for name in hash.into_iter().chain(range) {
+        for name in partition_key_name(&request.key_schema)
+            .into_iter()
+            .chain(sort_key_name(&request.key_schema))
+        {
             schema_keys.push(name.to_string());
         }
-        for index in gsis {
-            for ks in &index.key_schema {
+        let gsis = request.global_secondary_indexes.as_deref().unwrap_or(&[]);
+        let lsis = request.local_secondary_indexes.as_deref().unwrap_or(&[]);
+        for key_schema in gsis
+            .iter()
+            .map(|index| &index.key_schema)
+            .chain(lsis.iter().map(|index| &index.key_schema))
+        {
+            for ks in key_schema {
                 if !schema_keys.contains(&ks.attribute_name) {
                     schema_keys.push(ks.attribute_name.clone());
                 }
             }
         }
-        for index in request.local_secondary_indexes.as_deref().unwrap_or(&[]) {
-            for ks in &index.key_schema {
-                if !schema_keys.contains(&ks.attribute_name) {
-                    schema_keys.push(ks.attribute_name.clone());
-                }
-            }
-        }
+        schema_keys
+    }
 
-        // The keys a mistyped model index most likely meant: those of a
-        // table index no entity's mapping names, by any name.
+    /// The key attributes of the table's GSIs that no entity's mapping names,
+    /// by any name, each once: the keys a mistyped model index most likely
+    /// meant.
+    fn unnamed_index_keys(model: &DataModel, gsis: &[GlobalSecondaryIndex]) -> Vec<String> {
         let named_indexes: HashSet<&str> = model
             .entities
             .iter()
@@ -461,7 +555,25 @@ impl KeyDeriver {
                 }
             }
         }
+        unnamed_index_keys
+    }
 
+    /// What groups rows with each other, per key attribute: for each sort
+    /// key, the partition keys of the indexes it sorts.
+    ///
+    /// A partition key groups by itself: rows sharing one come back from a
+    /// single query, so it has no entry here. A sort key only orders rows
+    /// inside a partition it does not define, so two rows sharing a sort
+    /// value are grouped only when they share that partition as well, and the
+    /// join check has to read both. Comparing a sort value alone calls two
+    /// rows a group when they were never in one place, and splitting them
+    /// then reads as a join break that never existed. An attribute that is a
+    /// partition key anywhere groups by itself, whatever else it sorts.
+    fn grouped_by<'a>(
+        hash: Option<&'a str>,
+        range: Option<&'a str>,
+        gsis: &'a [GlobalSecondaryIndex],
+    ) -> HashMap<&'a str, Vec<&'a str>> {
         let mut partition_keys: HashSet<&str> = HashSet::new();
         partition_keys.extend(hash);
         for gsi in gsis {
@@ -487,40 +599,49 @@ impl KeyDeriver {
             }
         }
         grouped_by.retain(|attribute, _| !partition_keys.contains(attribute));
+        grouped_by
+    }
 
-        // Only the rules that apply to this table. A rule scoped elsewhere
-        // that names `pk` made this table's `pk` look rule-owned, so a key
-        // the template could not rebuild went uncounted and a shared key a
-        // direct rule never touched here left the join check.
-        let rules: Vec<&ValidatedRule> = rules
-            .iter()
-            .filter(|rule| rule.applies_to(&request.table_name))
-            .collect();
-        let rule_targets: HashSet<&str> = rules.iter().filter_map(|r| rule_target(r)).collect();
-        let rule_paths: Vec<Vec<PathElement>> = rules.iter().map(|r| r.path.clone()).collect();
-        let mut warnings: Vec<Notice> = Vec::new();
-        let mut unmatched_indexes: HashSet<String> = HashSet::new();
-
-        // A local secondary index never reaches the model: OneTable declares
-        // one with a sort key and no hash, and the parser keeps only indexes
-        // that name a hash attribute. Say so rather than leave its sort key
-        // quietly holding the value it arrived with.
-        // A warning rather than an exposure: the model says nothing about an
-        // LSI, so nothing says its sort key embeds an attribute a rule
-        // touches.
-        if let Some(lsis) = request.local_secondary_indexes.as_deref()
-            && !lsis.is_empty()
-        {
-            warnings.push(Notice::caution(format!(
-                "has {} local secondary index(es); their sort keys are not rebuilt from \
-                 templates and keep the values they arrive with",
-                lsis.len()
-            )));
+    /// The caution for a table with local secondary indexes, or nothing.
+    ///
+    /// A local secondary index never reaches the model: OneTable declares
+    /// one with a sort key and no hash, and the parser keeps only indexes
+    /// that name a hash attribute. Say so rather than leave its sort key
+    /// quietly holding the value it arrived with. A warning rather than an
+    /// exposure: the model says nothing about an LSI, so nothing says its
+    /// sort key embeds an attribute a rule touches.
+    fn lsi_notice(request: &CreateTableRequest) -> Option<Notice> {
+        let lsis = request.local_secondary_indexes.as_deref()?;
+        if lsis.is_empty() {
+            return None;
         }
+        Some(Notice::caution(format!(
+            "has {} local secondary index(es); their sort keys are not rebuilt from \
+             templates and keep the values they arrive with",
+            lsis.len()
+        )))
+    }
 
+    /// Each entity's keys resolved against the table's schema, in model
+    /// order, with the notices raised on the way: an index the model names
+    /// that the table lacks, a rule that takes a key from its template, and
+    /// a rule whose action on a template's source would collapse the key.
+    /// Alongside the entities come their key shapes, kept for the join
+    /// check, and the sorted names of the indexes the table did not have. A
+    /// template that cannot be parsed, or that reads another templated key,
+    /// is an error.
+    fn build_entities(
+        model: &DataModel,
+        gsis: &[GlobalSecondaryIndex],
+        hash: Option<&str>,
+        range: Option<&str>,
+        rules: &[&ValidatedRule],
+        rule_targets: &HashSet<&str>,
+        warnings: &mut Vec<Notice>,
+    ) -> Result<BuiltEntities, String> {
+        let mut unmatched_indexes: HashSet<String> = HashSet::new();
         let mut entities = Vec::with_capacity(model.entities.len());
-        type KeyShape = (String, String, Vec<Vec<PathElement>>);
-        let mut entity_key_shapes: Vec<Vec<KeyShape>> = Vec::with_capacity(model.entities.len());
+        let mut key_shapes: Vec<Vec<KeyShape>> = Vec::with_capacity(model.entities.len());
         for entity in &model.entities {
             let mut match_keys = Vec::new();
             push_key(&mut match_keys, entity, hash, Some(&entity.pk_template))?;
@@ -604,9 +725,9 @@ impl KeyDeriver {
                 }
             }
 
-            // Recorded before the rule-target retain below: this is a
-            // property of the model's templates, not of what survives.
-            entity_key_shapes.push(
+            // A property of the model's templates, not of what survives the
+            // rules, so it is recorded from every key the entity templates.
+            key_shapes.push(
                 keys.iter()
                     .map(|key| {
                         (
@@ -630,7 +751,7 @@ impl KeyDeriver {
             }
 
             for key in &keys {
-                for rule in &rules {
+                for rule in rules {
                     let Some(target) = rule_target(rule) else {
                         continue;
                     };
@@ -677,28 +798,46 @@ impl KeyDeriver {
             });
         }
 
-        // Two entities that build the same key attribute are asserting their
-        // keys can agree, which is how a single-table design keeps a customer
-        // and its orders in one partition. If a rule rewrites an attribute
-        // one of those templates reads, each entity anonymises it
-        // independently and the two can stop agreeing.
-        //
-        // Grouping on the key attribute alone, not on the template text, is
-        // deliberate: the canonical join is `CUSTOMER#${id}` against
-        // `CUSTOMER#${customerId}`, two different templates that produce the
-        // same partition. Requiring identical text would miss it. Unrelated
-        // entities that merely share a key name cost nothing here, because
-        // what is actually compared later is the key *value* an item arrived
-        // with, and `account#acc1` never equalled `project#p1`.
-        //
-        // Consistency-tracked roots are tracked too, and only excused from
-        // the warning. The consistency map stops taking new values at its own
-        // cap and starts handing out fresh ones, so a field listed in
-        // [consistency] is not a permanent guarantee, and the value check is
-        // what notices when it lapses.
-        type SharedGroups = Vec<(String, (Vec<usize>, Vec<String>, Vec<usize>))>;
+        let mut unmatched_indexes: Vec<String> = unmatched_indexes.into_iter().collect();
+        unmatched_indexes.sort();
+        Ok(BuiltEntities {
+            entities,
+            key_shapes,
+            unmatched_indexes,
+        })
+    }
+
+    /// The entities that build each key attribute, grouped for the join
+    /// check: per attribute, the entities a rule puts at risk, the roots
+    /// their templates read that a rule rewrites, and the entities that build
+    /// the same key from nothing a rule touches. Sorted by attribute, with
+    /// only the groups that have at least one entity at risk.
+    ///
+    /// Two entities that build the same key attribute are asserting their
+    /// keys can agree, which is how a single-table design keeps a customer
+    /// and its orders in one partition. If a rule rewrites an attribute one
+    /// of those templates reads, each entity anonymises it independently and
+    /// the two can stop agreeing.
+    ///
+    /// Grouping on the key attribute alone, not on the template text, is
+    /// deliberate: the canonical join is `CUSTOMER#${id}` against
+    /// `CUSTOMER#${customerId}`, two different templates that produce the
+    /// same partition. Requiring identical text would miss it. Unrelated
+    /// entities that merely share a key name cost nothing here, because what
+    /// is actually compared later is the key *value* an item arrived with,
+    /// and `account#acc1` never equalled `project#p1`.
+    ///
+    /// Consistency-tracked roots are tracked too, and only excused from the
+    /// warning. The consistency map stops taking new values at its own cap
+    /// and starts handing out fresh ones, so a field listed in [consistency]
+    /// is not a permanent guarantee, and the value check is what notices
+    /// when it lapses.
+    fn shared_key_groups(
+        key_shapes: &[Vec<KeyShape>],
+        rule_targets: &HashSet<&str>,
+    ) -> SharedGroups {
         let mut shared: SharedGroups = Vec::new();
-        for (idx, shape) in entity_key_shapes.iter().enumerate() {
+        for (idx, shape) in key_shapes.iter().enumerate() {
             for (attribute, _template, sources) in shape {
                 // An entity whose sources no rule rewrites keeps its key as
                 // it arrived. It is not at risk itself, but it is what a
@@ -756,8 +895,20 @@ impl KeyDeriver {
         // only one entity templates a key, was never checked at all.
         shared.retain(|(_, (users, _, _))| !users.is_empty());
         shared.sort_by(|a, b| a.0.cmp(&b.0));
+        shared
+    }
 
-        let at_risk: Vec<AtRisk> = shared
+    /// The at-risk group the join check tracks for each shared key, in the
+    /// order given, warning up front about any two entities that build a
+    /// key from an attribute outside `[consistency] fields`.
+    fn at_risk_groups(
+        shared: SharedGroups,
+        entities: &[EntityKeys],
+        grouped_by: &HashMap<&str, Vec<&str>>,
+        consistency_fields: &HashSet<String>,
+        warnings: &mut Vec<Notice>,
+    ) -> Vec<AtRisk> {
+        shared
             .into_iter()
             .map(|(key_attribute, (entities_using, roots, observers))| {
                 let unlisted: Vec<String> = roots
@@ -774,7 +925,7 @@ impl KeyDeriver {
                         "{} both build {} from an attribute outside [consistency] fields ({}): \
                          if they both appear in this import their keys may not agree and the \
                          entities will not join",
-                        entity_list(&entities, &entities_using),
+                        entity_list(entities, &entities_using),
                         key_attribute,
                         quoted_list(&unlisted)
                     )));
@@ -798,44 +949,7 @@ impl KeyDeriver {
                     unchecked: 0,
                 }
             })
-            .collect();
-
-        let mut type_attributes: Vec<String> =
-            entities.iter().map(|e| e.type_attribute.clone()).collect();
-        type_attributes.sort();
-        type_attributes.dedup();
-
-        Ok((
-            Self {
-                entities,
-                type_attributes,
-                hash_attribute: hash.map(String::from),
-                range_attribute: range.map(String::from),
-                warned_mismatch: HashMap::new(),
-                rule_targets: rule_targets.iter().map(|a| (*a).to_string()).collect(),
-                schema_keys,
-                rule_paths,
-                survived: HashMap::new(),
-                warned_unrenderable: HashMap::new(),
-                warned_rule_wins: HashSet::new(),
-                warned_ambiguous: HashSet::new(),
-                unmatched: 0,
-                at_risk,
-                rebuilt_keys: HashSet::new(),
-                collisions: 0,
-                collision_check_capped: false,
-                collision_cap_reported: false,
-                warned_rule_skipped: HashMap::new(),
-                unmatched_model_indexes: {
-                    let mut names: Vec<String> = unmatched_indexes.into_iter().collect();
-                    names.sort();
-                    names
-                },
-                unnamed_index_keys,
-                untemplated_index_keys: BTreeMap::new(),
-            },
-            warnings,
-        ))
+            .collect()
     }
 
     /// Before the rules run: decide which of the item's keys will be rebuilt.
@@ -931,9 +1045,13 @@ impl KeyDeriver {
 
         // The value each applicable rule is about to replace, read through
         // the rule's full path so a rule on `profile.email` records the
-        // address inside the map rather than nothing. Keyed by the top-level
-        // attribute, which is what `apply_rules` reports as rewritten.
-        // Bounded by the rules file rather than the item.
+        // address inside the map rather than nothing. A rule on the whole
+        // `profile` replaces everything inside it, so every scalar leaf of a
+        // container is recorded: keeping only a scalar found at the path
+        // itself let a redacted map's address sit on in an untemplated key
+        // with nothing to compare it against. Keyed by the top-level
+        // attribute, which is what `apply_rules` reports as rewritten. The
+        // item's own size bounds the walk.
         let originals: Vec<(String, String)> = self
             .rule_paths
             .iter()
@@ -942,12 +1060,11 @@ impl KeyDeriver {
                     PathElement::Attribute(name) => name.clone(),
                     _ => return None,
                 };
-                match resolve_path(item, path)? {
-                    AttributeValue::S(s) => Some((root, s)),
-                    AttributeValue::N(n) => Some((root, n)),
-                    _ => None,
-                }
+                let mut leaves = Vec::new();
+                scalar_leaves(resolve_path(item, path)?, &mut leaves);
+                Some(leaves.into_iter().map(move |leaf| (root.clone(), leaf)))
             })
+            .flatten()
             .collect();
 
         Some(Rederivation {
@@ -1573,6 +1690,30 @@ fn holds_as_component(key: &str, value: &str) -> bool {
         from = start + key[start..].chars().next().map_or(1, char::len_utf8);
     }
     false
+}
+
+/// Every string and number a value holds, itself if it is one, otherwise
+/// each one found anywhere inside a map, list or set. Binary values are left
+/// out: a key is a string, and bytes are not looked for in one.
+fn scalar_leaves(value: AttributeValue, out: &mut Vec<String>) {
+    match value {
+        AttributeValue::S(s) | AttributeValue::N(s) => out.push(s),
+        AttributeValue::SS(set) | AttributeValue::NS(set) => out.extend(set),
+        AttributeValue::L(list) => {
+            for element in list {
+                scalar_leaves(element, out);
+            }
+        }
+        AttributeValue::M(map) => {
+            for element in map.into_values() {
+                scalar_leaves(element, out);
+            }
+        }
+        AttributeValue::B(_)
+        | AttributeValue::BS(_)
+        | AttributeValue::BOOL(_)
+        | AttributeValue::NULL(_) => {}
+    }
 }
 
 /// Which rows a key value is grouped with, as one hash.
@@ -3230,6 +3371,96 @@ mod tests {
         it.insert("profile".to_string(), AttributeValue::M(replaced));
         let mut rewritten = HashSet::new();
         rewritten.insert("profile".to_string());
+        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+
+        assert_eq!(
+            d.take_key_survivals(),
+            vec![("Order".to_string(), "gs1pk".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_redacted_map_still_finds_its_leaves_in_a_key() {
+        // The rule is on `profile`, the whole map. The snapshot used to keep
+        // only a string or number found at the rule's path, so a map target
+        // recorded nothing, and the address inside it that also sat in the
+        // untemplated gs1pk was never compared: the run exited clean with the
+        // address still in the key.
+        let model = model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let rules = [rule("profile", ValidatedAction::Redact)];
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+
+        let mut profile = std::collections::HashMap::new();
+        profile.insert(
+            "email".to_string(),
+            AttributeValue::S("alice@x.co".to_string()),
+        );
+        let mut it = item(&[
+            ("pk", "ORDER#o1"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "EMAIL#alice@x.co"),
+            ("id", "o1"),
+        ]);
+        it.insert("profile".to_string(), AttributeValue::M(profile));
+
+        let mut warnings = Vec::new();
+        let plan = d.plan(&it, &mut warnings).unwrap();
+        // Redaction replaces the map wholesale.
+        it.insert(
+            "profile".to_string(),
+            AttributeValue::M(std::collections::HashMap::new()),
+        );
+        let mut rewritten = HashSet::new();
+        rewritten.insert("profile".to_string());
+        d.apply(&plan, &rewritten, &mut it, &mut warnings);
+
+        assert_eq!(
+            d.take_key_survivals(),
+            vec![("Order".to_string(), "gs1pk".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_redacted_list_still_finds_its_elements_in_a_key() {
+        // Same as the map case, for a list of strings: `emails` is redacted
+        // whole, and one of its elements is the untemplated gs1pk.
+        let model = model_with(vec![EntityDefinition {
+            name: "Order".to_string(),
+            pk_template: "ORDER#${id}".to_string(),
+            sk_template: Some("ORDER#".to_string()),
+            type_attribute: None,
+            gsi_mappings: vec![],
+            description: None,
+        }]);
+        let rules = [rule("emails", ValidatedAction::Redact)];
+        let (mut d, _) = KeyDeriver::new(&model, &request(), &rules, &no_consistency()).unwrap();
+
+        let mut it = item(&[
+            ("pk", "ORDER#o1"),
+            ("sk", "ORDER#"),
+            ("gs1pk", "EMAIL#bob@x.co"),
+            ("id", "o1"),
+        ]);
+        it.insert(
+            "emails".to_string(),
+            AttributeValue::L(vec![
+                AttributeValue::S("alice@x.co".to_string()),
+                AttributeValue::S("bob@x.co".to_string()),
+            ]),
+        );
+
+        let mut warnings = Vec::new();
+        let plan = d.plan(&it, &mut warnings).unwrap();
+        it.insert("emails".to_string(), AttributeValue::L(Vec::new()));
+        let mut rewritten = HashSet::new();
+        rewritten.insert("emails".to_string());
         d.apply(&plan, &rewritten, &mut it, &mut warnings);
 
         assert_eq!(

@@ -130,9 +130,16 @@ pub fn apply_rules(
             ValidatedAction::Fake { seed: Some(_), .. } => is_scalar(&current_value),
             _ => false,
         };
+        // Whether the cache handed back the value that is already there. The
+        // map never stores an original as its own pseudonym, so this should
+        // not happen; if it ever does, the rule is about to write the original
+        // back, and that has to count as the value surviving rather than as a
+        // rewrite that clears an earlier mask's pass-through.
+        let mut handed_back = false;
         let new_value = if is_consistency_field && !is_deterministic {
             // Check consistency map first
             if let Some(cached) = consistency_map.get(&field_name, &current_value) {
+                handed_back = canonical_bytes(&cached) == canonical_bytes(&current_value);
                 cached
             } else {
                 let generated = generate_value(&rule.action, &current_value);
@@ -160,19 +167,20 @@ pub fn apply_rules(
         // already begins with the mask character masks to itself and would
         // read as short, and two mask rules on one attribute would each count
         // the same item once, so the count is per item and attribute.
-        let kept_whole = match &rule.action {
-            ValidatedAction::Mask { keep_last, .. } => match &current_value {
-                AttributeValue::S(s) => s.chars().count() <= *keep_last,
-                AttributeValue::N(n) => n.len() <= *keep_last,
-                // Every other type is replaced wholesale with mask characters
-                // rather than returned, so nothing of it is kept. Counting
-                // those would report that real data survived a rule that had
-                // in fact removed all of it, which is the wrong direction for
-                // a warning whose whole purpose is to say what got through.
+        let kept_whole = handed_back
+            || match &rule.action {
+                ValidatedAction::Mask { keep_last, .. } => match &current_value {
+                    AttributeValue::S(s) => s.chars().count() <= *keep_last,
+                    AttributeValue::N(n) => n.len() <= *keep_last,
+                    // Every other type is replaced wholesale with mask characters
+                    // rather than returned, so nothing of it is kept. Counting
+                    // those would report that real data survived a rule that had
+                    // in fact removed all of it, which is the wrong direction for
+                    // a warning whose whole purpose is to say what got through.
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
-        };
+            };
 
         // Warn if targeting a key attribute
         if key_attrs.contains(&field_name) {
@@ -351,7 +359,14 @@ fn seeded_rng(generator: &str, original: &AttributeValue, seed: Option<&Salt>) -
             field(b'g', generator.as_bytes());
             match original {
                 AttributeValue::S(s) => field(b's', s.as_bytes()),
-                AttributeValue::N(n) => field(b'n', n.as_bytes()),
+                // One number, one draw, however the export spelt it. The same
+                // guard as `canonical_bytes`: a value DynamoDB would reject
+                // keeps its own bytes under its own tag, because normalising
+                // reads everything unreadable as zero.
+                AttributeValue::N(n) => match crate::types::validate_dynamo_number(n) {
+                    Ok(()) => field(b'n', crate::types::normalize_dynamo_number(n).as_bytes()),
+                    Err(_) => field(b'x', n.as_bytes()),
+                },
                 AttributeValue::B(b) => field(b'b', b),
                 // Anything else is a map, a list or a set, and their
                 // serialised bytes are not stable: `AttributeValue::M` holds a
@@ -687,6 +702,29 @@ mod tests {
         );
     }
 
+    fn apply_with_consistency(
+        item: &mut Item,
+        rules: &[ValidatedRule],
+        map: &mut ConsistencyMap,
+        fields: &[&str],
+        work: &mut [RuleWork],
+        passthroughs: &mut std::collections::HashMap<String, usize>,
+    ) {
+        let fields = fields.iter().map(|f| f.to_string()).collect();
+        apply_rules(
+            item,
+            "Users",
+            rules,
+            map,
+            &fields,
+            &[],
+            &mut RuleTally {
+                mask_passthroughs: passthroughs,
+                rule_work: work,
+            },
+        );
+    }
+
     #[test]
     fn a_rule_scoped_to_another_table_neither_matches_nor_counts() {
         let mut rule = test_rule("email", ValidatedAction::Redact);
@@ -796,6 +834,44 @@ mod tests {
         assert!(
             passthroughs.is_empty(),
             "so there is no pass-through to report: {passthroughs:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_value_a_mask_kept_does_not_reach_a_later_rule_through_the_cache() {
+        // The mask keeps "ab" whole and, with the attribute under
+        // consistency, records ab -> ab. The fake after it finds that entry,
+        // writes the original back as though it were a pseudonym, and the
+        // write clears the mask's pass-through. The output is the real code
+        // and the tally has nothing to say about it.
+        let mut it = Item::new();
+        it.insert("code".to_string(), AttributeValue::S("ab".to_string()));
+        let rules = [
+            test_rule("code", short_mask()),
+            test_rule(
+                "code",
+                ValidatedAction::Fake {
+                    generator: "word".to_string(),
+                    seed: None,
+                },
+            ),
+        ];
+        let mut work = work_for(&rules);
+        let mut passthroughs = std::collections::HashMap::new();
+        let mut map = ConsistencyMap::new();
+        apply_with_consistency(
+            &mut it,
+            &rules,
+            &mut map,
+            &["code"],
+            &mut work,
+            &mut passthroughs,
+        );
+
+        let survived = it.get("code") == Some(&AttributeValue::S("ab".to_string()));
+        assert!(
+            !survived || !passthroughs.is_empty(),
+            "the original reached the output and nothing reported it: {it:?} {passthroughs:?}"
         );
     }
 
@@ -1203,6 +1279,68 @@ mod tests {
         // A different secret gives a different mapping entirely.
         let other = seed("another-secret");
         assert_ne!(generate_fake("safe_email", &alice, Some(&other)), first);
+    }
+
+    #[test]
+    fn a_seeded_fake_gives_one_number_one_value_however_it_is_spelled() {
+        // Two rows carrying one customer, exported as 1 and as 1.0. A seeded
+        // fake bypasses the consistency map on the strength of being a
+        // function of the value, so the derivation has to see the number and
+        // not the spelling, or the join between the two rows is gone.
+        let rules = [test_rule(
+            "customerId",
+            ValidatedAction::Fake {
+                generator: "word".to_string(),
+                seed: Some(seed("a-secret")),
+            },
+        )];
+        let mut map = ConsistencyMap::new();
+        let mut drawn = Vec::new();
+        for spelling in ["1", "1.0", "0.1e1", "01"] {
+            let mut it = Item::new();
+            it.insert(
+                "customerId".to_string(),
+                AttributeValue::N(spelling.to_string()),
+            );
+            let mut work = work_for(&rules);
+            let mut passthroughs = std::collections::HashMap::new();
+            apply_with_consistency(
+                &mut it,
+                &rules,
+                &mut map,
+                &["customerId"],
+                &mut work,
+                &mut passthroughs,
+            );
+            drawn.push(it.get("customerId").cloned());
+        }
+        assert!(
+            drawn.iter().all(|d| d == &drawn[0]),
+            "one number took more than one value: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn a_seeded_fake_over_a_broken_number_keeps_its_own_draw() {
+        // The parser does not check that an `N` holds a number, and
+        // normalising reads everything it cannot parse as zero. Hashing
+        // through it unguarded would put every broken value on the draw for
+        // zero, so a broken value derives from its own bytes instead.
+        let s = seed("a-secret");
+        let n = |v: &str| AttributeValue::N(v.to_string());
+        let zero = derived("word", &n("0"), &s);
+        for bad in ["abc", "NaN", "", "1.2.3"] {
+            assert_ne!(
+                derived("word", &n(bad), &s),
+                zero,
+                "N({bad:?}) must not draw as zero"
+            );
+        }
+        assert_ne!(
+            derived("word", &n("abc"), &s),
+            derived("word", &n("NaN"), &s),
+            "and two different broken values stay two"
+        );
     }
 
     /// The first draw from the derived stream, which is what every generated

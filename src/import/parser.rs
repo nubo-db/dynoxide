@@ -297,9 +297,18 @@ fn parse_dynamodb_item_with_depth(
         ));
     }
     let mut item = HashMap::new();
-    for (key, value) in obj {
-        let attr = parse_attribute_value_with_depth(value, depth)
-            .map_err(|e| format!("attribute '{key}': {e}"))?;
+    for (position, (key, value)) in obj.iter().enumerate() {
+        // A top-level attribute name is schema. A key inside a map is data,
+        // and in an export keyed by user (an address, an account id) it is
+        // the very thing the import is there to remove, so the warning that
+        // reaches the summary names its position instead.
+        let attr = parse_attribute_value_with_depth(value, depth).map_err(|e| {
+            if depth == 0 {
+                format!("attribute '{key}': {e}")
+            } else {
+                format!("entry {position}: {e}")
+            }
+        })?;
         item.insert(key.clone(), attr);
     }
     Ok(item)
@@ -664,6 +673,39 @@ mod tests {
         let last = stats.warnings.last().unwrap();
         assert!(last.contains("9900 further lines"), "{last}");
         assert!(last.contains("10000 skipped in all"), "{last}");
+    }
+
+    #[test]
+    fn a_skip_warning_below_the_top_level_does_not_quote_the_key() {
+        // A map keyed by user data puts an address in the key, and a skip
+        // warning lands in the summary an operator pastes into a ticket. The
+        // top-level name is schema and stays; below it the position stands in
+        // for the name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"Item": {"pk": {"S": "k"}}}"#,
+                "\n",
+                r#"{"Item": {"pk": {"S": "k"}, "contacts": {"M": {"alice@x.co": {"S": 1}}}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let stats = parse_export_file_streaming(&path, |_| {}).unwrap();
+        assert_eq!(stats.skipped, 1);
+        let warning = &stats.warnings[0];
+        assert!(warning.contains(":2:"), "the line is named: {warning}");
+        assert!(
+            warning.contains("'contacts'"),
+            "and the top-level attribute: {warning}"
+        );
+        assert!(
+            !warning.contains("alice@x.co"),
+            "but not the nested key: {warning}"
+        );
     }
 
     #[test]

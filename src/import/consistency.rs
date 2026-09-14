@@ -57,6 +57,17 @@ impl ConsistencyMap {
         original: AttributeValue,
         anonymised: AttributeValue,
     ) -> Option<String> {
+        // A mask keeps a value no longer than its keep_last as it arrived, so
+        // what it hands back is the original. Stored, that entry would let a
+        // later rule on the same attribute read the original out of the cache
+        // and write it back as though it had been anonymised. Compared as
+        // values rather than as bytes, so a respelt number is still the same
+        // number.
+        let original = super::anonymise::canonical_bytes(&original);
+        if super::anonymise::canonical_bytes(&anonymised) == original {
+            return None;
+        }
+
         let field_map = self.map.entry(field_name.clone()).or_default();
 
         // Check capacity cap
@@ -71,7 +82,7 @@ impl ConsistencyMap {
             return None;
         }
 
-        field_map.insert(super::anonymise::canonical_bytes(&original), anonymised);
+        field_map.insert(original, anonymised);
         None
     }
 
@@ -170,6 +181,37 @@ mod tests {
         assert_eq!(
             map.get("email", &AttributeValue::S("user3@example.com".to_string())),
             None
+        );
+    }
+
+    #[test]
+    fn an_original_is_never_stored_as_its_own_pseudonym() {
+        // A mask that keeps a short value whole hands back what it was
+        // given. Storing that would let a later rule on the attribute read
+        // the original out of the cache as though it had been anonymised.
+        let mut map = ConsistencyMap::new();
+        let code = AttributeValue::S("ab".to_string());
+        assert!(
+            map.insert("code".to_string(), code.clone(), code.clone())
+                .is_none()
+        );
+        assert_eq!(
+            map.get("code", &code),
+            None,
+            "the original is not a pseudonym"
+        );
+        assert_eq!(map.total_mappings(), 0);
+
+        // Judged as a value, not as bytes: N("1") and N("1.0") are one number.
+        map.insert(
+            "amount".to_string(),
+            AttributeValue::N("1".to_string()),
+            AttributeValue::N("1.0".to_string()),
+        );
+        assert_eq!(
+            map.total_mappings(),
+            0,
+            "a respelling of the original is still the original"
         );
     }
 

@@ -2004,6 +2004,93 @@ action = { type = "redact" }
     }
 
     #[test]
+    fn test_a_key_rule_collision_across_batches_leaves_no_stale_index_row() {
+        // The other way a key can move: no data model, and a rule that
+        // rewrites the partition key itself. Two items in separate export
+        // files land on one primary key once both are redacted to the same
+        // constant, but keep distinct GSI keys. The overwritten item's index
+        // row must go with it, exactly as when a model rebuilt the key.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+
+        let data_dir = source.join("App").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        for (file, email, order) in [
+            ("00000000.json", "a@x.co", "1"),
+            ("00000001.json", "b@y.co", "2"),
+        ] {
+            std::fs::write(
+                data_dir.join(file),
+                format!(
+                    r#"{{"Item": {{"pk": {{"S": "CUSTOMER#{email}"}}, "sk": {{"S": "ORDER"}}, "gs1pk": {{"S": "ORDER#{order}"}}, "gs1sk": {{"S": "ORDER"}}, "orderId": {{"S": "{order}"}}}}}}"#
+                ) + "\n",
+            )
+            .unwrap();
+        }
+
+        create_schema_file(&schema_file, &[single_table_schema("App")]);
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "begins_with(pk, :customer)"
+values = { ":customer" = "CUSTOMER#" }
+path = "pk"
+action = { type = "redact" }
+"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output.clone()),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap();
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("rewrites a key attribute directly")),
+            "the rule on a key is the trigger under test: {:?}",
+            summary.warnings
+        );
+
+        let db = dynoxide::Database::new(output.to_str().unwrap()).unwrap();
+        let base = scan_all(&db, "App");
+        assert_eq!(base.len(), 1, "the two collapsed onto one row");
+        assert_eq!(string_attr(&base[0], "pk"), "[REDACTED]");
+
+        let indexed = db
+            .scan(dynoxide::actions::scan::ScanRequest {
+                table_name: "App".to_string(),
+                index_name: Some("GSI1".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .items
+            .unwrap();
+        assert_eq!(
+            indexed.len(),
+            1,
+            "the overwritten item's index row must go with it, got {indexed:?}"
+        );
+        assert_eq!(
+            string_attr(&indexed[0], "gs1pk"),
+            string_attr(&base[0], "gs1pk")
+        );
+    }
+
+    #[test]
     fn test_mixed_rules_on_a_consistency_field_are_reported() {
         // A seeded fake derives its value and skips the consistency map, so
         // pairing it with an unseeded rule on the same field means one input
@@ -2653,7 +2740,12 @@ action = { type = "redact" }
                 r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
             ],
         );
-        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+        // Orders is a table the schema file knows; --tables is what leaves
+        // it out of this run.
+        create_schema_file(
+            &schema_file,
+            &[simple_table_schema("Users"), simple_table_schema("Orders")],
+        );
         std::fs::write(
             &rules_file,
             r#"
@@ -2695,6 +2787,224 @@ tables = ["Orders"]
                 .iter()
                 .any(|w| w.contains("rule 2") && w.contains("scoped to 'Orders'")),
             "but it is said: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn a_rule_scoped_to_a_table_the_schema_does_not_have_is_refused() {
+        // A misspelt table name scopes the rule to nothing. Filed as "not
+        // applied" it would read like a table left out on purpose, and the
+        // run would exit 0 with the attribute untouched. So it is refused
+        // before any data is read, the way a blank name already is.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        setup_export_dir(
+            &source,
+            "Users",
+            &[
+                r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
+            ],
+        );
+        setup_export_dir(
+            &source,
+            "Orders",
+            &[r#"{"Item": {"pk": {"S": "ORDER#1"}, "sk": {"S": "ORDER"}, "amount": {"N": "9"}}}"#],
+        );
+        create_schema_file(
+            &schema_file,
+            &[simple_table_schema("Orders"), simple_table_schema("Users")],
+        );
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "redact" }
+
+[[rules]]
+match = "attribute_exists(amount)"
+path = "amount"
+action = { type = "redact" }
+tables = ["Orderz"]
+"#,
+        )
+        .unwrap();
+
+        let result = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("out.db")),
+            schema: schema_file,
+            rules: Some(rules_file),
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        });
+
+        let err = match result {
+            Err(err) => err.to_string(),
+            Ok(summary) => panic!(
+                "a table the schema file does not have must be refused, but the run finished \
+                 with {:?}",
+                summary.warnings
+            ),
+        };
+        assert!(
+            err.contains("rule 2") && err.contains("amount") && err.contains("'Orderz'"),
+            "the message names the rule, its path and the misspelt table: {err}"
+        );
+        assert!(
+            err.contains("'Orders'") && err.contains("'Users'"),
+            "and the tables the schema file does have: {err}"
+        );
+        assert!(
+            !tmp.path().join("out.db").exists(),
+            "nothing is written by a refused run"
+        );
+    }
+
+    #[test]
+    fn a_data_model_describes_one_table_so_a_multi_table_run_needs_tables() {
+        // A OneTable model describes one table. Matched against a second
+        // one, every row of it matches no entity and the run exits 3 for
+        // data the model was never about. Refuse the pair up front, and let
+        // --tables narrow the run to the table the model describes.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let rules_file = tmp.path().join("rules.toml");
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "User"}, "pk": {"S": "account#acc1"}, "sk": {"S": "user#alice@example.com"}, "gs1pk": {"S": "user#alice@example.com"}, "gs1sk": {"S": "user#"}, "accountId": {"S": "acc1"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        setup_export_dir(
+            &source,
+            "Sessions",
+            &[
+                r#"{"Item": {"pk": {"S": "SESSION#1"}, "sk": {"S": "SESSION"}, "email": {"S": "alice@example.com"}}}"#,
+            ],
+        );
+        create_schema_file(
+            &schema_file,
+            &[single_table_schema("App"), simple_table_schema("Sessions")],
+        );
+        std::fs::write(
+            &rules_file,
+            r#"
+[[rules]]
+match = "attribute_exists(email)"
+path = "email"
+action = { type = "fake", generator = "safe_email" }
+"#,
+        )
+        .unwrap();
+        let run = |name: &str, tables: Option<Vec<String>>| {
+            import::run(ImportCommand {
+                source: source.clone(),
+                output: Some(tmp.path().join(name)),
+                schema: schema_file.clone(),
+                rules: Some(rules_file.clone()),
+                tables,
+                compress: false,
+                force: false,
+                continue_on_error: false,
+                data_model: Some(onetable_fixture()),
+            })
+        };
+
+        let err = match run("both.db", None) {
+            Err(err) => err.to_string(),
+            Ok(summary) => panic!(
+                "a model against two tables must be refused, but the run finished with {:?}",
+                summary.warnings
+            ),
+        };
+        assert!(
+            err.contains("'App'") && err.contains("'Sessions'") && err.contains("--tables"),
+            "the message names the tables and the way through: {err}"
+        );
+        assert!(
+            !tmp.path().join("both.db").exists(),
+            "nothing is written by a refused run"
+        );
+
+        let summary = run("app.db", Some(vec!["App".to_string()]))
+            .expect("narrowed to the table the model describes, the run goes ahead");
+        assert_eq!(summary.total_items, 1);
+        assert!(
+            summary.exposures.is_empty(),
+            "the model fits the one table it was given: {:?}",
+            summary.exposures
+        );
+    }
+
+    #[test]
+    fn a_data_model_with_no_rules_is_not_read_for_its_templates() {
+        // Without rules no key is rebuilt, so the model is never asked to
+        // render one, and a template it could not have rendered is no reason
+        // to fail work that never ran. The run says once that the model did
+        // nothing, and that is all it says about it.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let schema_file = tmp.path().join("schema.json");
+        let model_file = tmp.path().join("model.json");
+        setup_export_dir(
+            &source,
+            "App",
+            &[
+                r#"{"Item": {"_type": {"S": "Order"}, "pk": {"S": "CUSTOMER#a@x.co"}, "sk": {"S": "ORDER"}, "email": {"S": "a@x.co"}}}"#,
+            ],
+        );
+        create_schema_file(&schema_file, &[simple_table_schema("App")]);
+        std::fs::write(
+            &model_file,
+            r#"{
+                "format": "onetable:1.1.0",
+                "indexes": { "primary": { "hash": "pk", "sort": "sk" } },
+                "params": { "typeField": "_type" },
+                "models": {
+                    "Order": {
+                        "pk": { "type": "string", "value": "CUSTOMER#${email" },
+                        "sk": { "type": "string", "value": "ORDER" },
+                        "email": { "type": "string" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(tmp.path().join("out.db")),
+            schema: schema_file,
+            rules: None,
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: Some(model_file),
+        })
+        .expect("a template nothing will render is no reason to fail");
+        assert_eq!(summary.total_items, 1);
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("a data model was given but no rules")),
+            "{:?}",
+            summary.warnings
+        );
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("template")),
+            "nothing is said about templates the run never used: {:?}",
             summary.warnings
         );
     }

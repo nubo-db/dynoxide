@@ -158,6 +158,10 @@ Only a key that is actually rebuilt takes part in that check. One left holding
 its original value has already been reported as a template that does not
 reproduce, which is the accurate diagnostic for it.
 
+A model describes one table. An export holding more than one needs
+`--tables` naming the one the model describes; without it the import refuses
+to start, since every row of the other tables would match no entity.
+
 Templates follow OneTable's own forms: `${name}`, a dotted path that reaches
 into a map (`${address.city}`), and `${name:length:pad}` sort padding, which
 prefixes the value with `pad` (default `0`, as OneTable treats an empty one)
@@ -281,6 +285,10 @@ tables = ["Orders"]
 The scope matters most with `--tables`. A rule for a table the run leaves out
 has nothing to do, and is reported as not applied rather than as having
 anonymised nothing, which is what an unscoped rule that fires on no item is.
+
+A table name the schema file does not have is an error, and the run stops
+before it reads any data. A rule scoped to `Usres` would otherwise apply to
+nothing and pass for one whose table was left out on purpose.
 
 ### Exit codes
 

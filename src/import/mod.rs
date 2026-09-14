@@ -197,11 +197,10 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         (Vec::new(), None)
     };
 
-    let consistency_fields: std::collections::HashSet<String> = consistency_config
+    let consistency_fields: HashSet<String> = consistency_config
         .as_ref()
         .map(|c| c.fields.iter().cloned().collect())
         .unwrap_or_default();
-    let mut consistency_map = ConsistencyMap::new();
 
     let data_model = match cmd.data_model {
         Some(ref path) => {
@@ -218,14 +217,6 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         None => None,
     };
 
-    // A seeded fake derives its value and does not populate the consistency
-    // map, because it does not need to. That only holds while every rule
-    // writing a given field agrees: mix a seeded rule with an unseeded one, or
-    // two different seeds or generators, and the same input can leave with two
-    // different values depending on which rule matched. Nothing downstream
-    // would show that, so say it here.
-    let mixed = mixed_consistency_rules(&rules, &consistency_fields);
-
     // 2. Load table schemas (returns both parsed schemas and raw JSON)
     let (schemas, schema_json) = schema::load_schemas(&cmd.schema)?;
     eprintln!(
@@ -233,6 +224,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         schemas.len(),
         cmd.schema.display()
     );
+    refuse_scopes_outside_the_schema(&rules, &schemas)?;
 
     // 3. Discover export files
     let table_filter = cmd.tables.as_deref();
@@ -243,6 +235,19 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             "No export files found in {}. Expected DynamoDB Export directory structure \
              (<dir>/<TableName>/data/*.json.gz) or flat directory (<dir>/*.json[.gz]).",
             cmd.source.display()
+        )));
+    }
+
+    // A OneTable model describes one table. Built for a second one, every
+    // row of it matches no entity, and the run exits 3 for data the model
+    // was never about, which teaches the operator to pass the flag that
+    // turns the exit code off.
+    if data_model.is_some() && export_files.len() > 1 {
+        let names: Vec<String> = export_files.iter().map(|(name, _)| name.clone()).collect();
+        return Err(ImportError::Config(format!(
+            "a data model describes one table, and this run covers {}. Pass --tables with \
+             the one the model describes",
+            quoted_tables(&names)
         )));
     }
 
@@ -299,34 +304,93 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     // would answer from a row that no longer exists. Neither happens without
     // rules, so a plain import keeps the fast path that assumes every key is
     // unique.
-    // Only a rule that applies to a table whose key it names counts: one
-    // scoped to another table is not rewriting this one's keys.
-    let rules_touch_a_key = rules.iter().any(|rule| match rule.path.first() {
-        Some(crate::expressions::PathElement::Attribute(name)) => schemas.iter().any(|s| {
-            rule.applies_to(&s.table_name) && extract_key_attrs(&s.create_request).contains(name)
-        }),
-        _ => false,
-    });
+    let rules_touch_a_key = rules_touch(&rules, &schemas, extract_key_attrs);
     let rebuilds_keys = !rules.is_empty() && (data_model.is_some() || rules_touch_a_key);
-    let insert_items = |table: &str, batch: Vec<crate::types::Item>| {
-        if rebuilds_keys {
-            db.import_items(table, batch, ImportOptions::default())
-        } else {
-            db.import_items_fresh(table, batch, ImportOptions::default())
-        }
+
+    preflight_cautions(
+        &mut summary,
+        &rules,
+        &schemas,
+        &consistency_fields,
+        data_model.is_some(),
+        rules_touch_a_key,
+    );
+
+    let mut run = TableImport {
+        db,
+        rules: &rules,
+        consistency_fields: &consistency_fields,
+        data_model: data_model.as_ref(),
+        rebuilds_keys,
+        continue_on_error: cmd.continue_on_error,
+        consistency_map: ConsistencyMap::new(),
+        seen_warnings: HashSet::new(),
+        rule_work: vec![Default::default(); rules.len()],
     };
 
-    for message in mixed {
+    for (table_name, files) in &export_files {
+        let table_schema = schema_map.get(table_name.as_str()).unwrap();
+        run.import_table(table_name, files, table_schema, &mut summary)?;
+    }
+
+    report_unused_rules(&mut summary, &rules, &run.rule_work, &export_files);
+
+    // 7. Restore normal PRAGMAs (important if DB will be served after import)
+    db.disable_bulk_loading()
+        .map_err(|e| format!("Failed to disable bulk loading: {e}"))?;
+
+    // Report consistency map stats
+    if run.consistency_map.field_count() > 0 {
+        eprintln!(
+            "Consistency map: {} fields, {} total mappings",
+            run.consistency_map.field_count(),
+            run.consistency_map.total_mappings()
+        );
+    }
+
+    summary.finish();
+    Ok(summary)
+}
+
+/// Whether a rule rewrites, on a table it applies to, an attribute `keys_of`
+/// picks out of that table's schema.
+///
+/// Only a rule that applies to a table whose key it names counts: one scoped
+/// to another table is not rewriting this one's keys.
+fn rules_touch(
+    rules: &[config::ValidatedRule],
+    schemas: &[schema::TableSchema],
+    keys_of: fn(&crate::actions::create_table::CreateTableRequest) -> Vec<String>,
+) -> bool {
+    rules.iter().any(|rule| match rule.path.first() {
+        Some(crate::expressions::PathElement::Attribute(name)) => schemas
+            .iter()
+            .any(|s| rule.applies_to(&s.table_name) && keys_of(&s.create_request).contains(name)),
+        _ => false,
+    })
+}
+
+/// The cautions a run raises before it reads an item, from the rules and the
+/// schemas alone.
+fn preflight_cautions(
+    summary: &mut ImportSummary,
+    rules: &[config::ValidatedRule],
+    schemas: &[schema::TableSchema],
+    consistency_fields: &HashSet<String>,
+    has_data_model: bool,
+    rules_touch_a_key: bool,
+) {
+    // A seeded fake derives its value and does not populate the consistency
+    // map, because it does not need to. That only holds while every rule
+    // writing a given field agrees: mix a seeded rule with an unseeded one, or
+    // two different seeds or generators, and the same input can leave with two
+    // different values depending on which rule matched. Nothing downstream
+    // would show that, so say it here.
+    for message in mixed_consistency_rules(rules, consistency_fields) {
         summary.notice(Notice::caution(message));
     }
 
-    let mut seen_warnings: HashSet<String> = HashSet::new();
-    // Across every table, not per table: a rule can legitimately touch nothing
-    // in one table and every item of the next, so only the whole run can say
-    // that a rule did nothing at all.
-    let mut rule_work: Vec<anonymise::RuleWork> = vec![Default::default(); rules.len()];
-
-    if rules.is_empty() && data_model.is_some() {
+    if rules.is_empty() && has_data_model {
         summary.notice(Notice::caution(
             "a data model was given but no rules, so nothing was anonymised and no key was \
              rebuilt. The model is only used to re-render keys after a rule has changed an \
@@ -339,7 +403,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     // is raised on every rules-only run. An exposure has to be something the
     // run saw happen, or the common case exits non-zero and the flag that
     // turns that off becomes the thing everyone passes.
-    if !rules.is_empty() && data_model.is_none() {
+    if !rules.is_empty() && !has_data_model {
         summary.notice(Notice::caution(
             "rules rewrite attributes only: a key built from an attribute (CUSTOMER#${email}) \
              keeps its original value. Pass --data-model <onetable.json> to rebuild keys \
@@ -347,13 +411,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         ));
     }
 
-    let rules_touch_an_index_key = rules.iter().any(|rule| match rule.path.first() {
-        Some(crate::expressions::PathElement::Attribute(name)) => schemas.iter().any(|s| {
-            rule.applies_to(&s.table_name) && index_key_attrs(&s.create_request).contains(name)
-        }),
-        _ => false,
-    });
-    if rules_touch_an_index_key && data_model.is_none() {
+    if rules_touch(rules, schemas, index_key_attrs) && !has_data_model {
         summary.notice(Notice::caution(
             "a rule rewrites an index key attribute directly. No row is lost, but rows that \
              an index returned together are moved apart, and without a data model nothing \
@@ -361,7 +419,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         ));
     }
 
-    if rules_touch_a_key && data_model.is_none() {
+    if rules_touch_a_key && !has_data_model {
         summary.notice(Notice::caution(
             "a rule rewrites a key attribute directly, and without a data model nothing \
              counts what that costs: two items whose rewritten key comes out the same land \
@@ -369,9 +427,44 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
              when --data-model is given, so the item count below will not show what was lost",
         ));
     }
+}
 
-    for (table_name, files) in &export_files {
-        let table_schema = schema_map.get(table_name.as_str()).unwrap();
+/// What every table of one run shares.
+///
+/// The consistency map, the dedupe of item-level warnings and the per-rule
+/// tallies all span tables: a value seen in one table must leave the same way
+/// from the next, and only the whole run can say that a rule did nothing at
+/// all.
+struct TableImport<'a> {
+    db: &'a Database,
+    rules: &'a [config::ValidatedRule],
+    consistency_fields: &'a HashSet<String>,
+    data_model: Option<&'a crate::schema::DataModel>,
+    /// Whether the run takes the write path that keeps the indexes right when
+    /// one item's key lands on another's.
+    rebuilds_keys: bool,
+    continue_on_error: bool,
+    consistency_map: ConsistencyMap,
+    seen_warnings: HashSet<String>,
+    /// Across every table, not per table: a rule can legitimately touch nothing
+    /// in one table and every item of the next, so only the whole run can say
+    /// that a rule did nothing at all.
+    rule_work: Vec<anonymise::RuleWork>,
+}
+
+impl TableImport<'_> {
+    /// Read one table's export files, anonymise and insert the items, and
+    /// record what the table had to say.
+    fn import_table(
+        &mut self,
+        table_name: &str,
+        files: &[std::path::PathBuf],
+        table_schema: &schema::TableSchema,
+        summary: &mut ImportSummary,
+    ) -> Result<(), ImportError> {
+        let db = self.db;
+        let rules = self.rules;
+        let rebuilds_keys = self.rebuilds_keys;
         let key_attrs = extract_key_attrs(&table_schema.create_request);
         // Values a mask rule left whole, by the rule's path. Bounded by the
         // number of mask rules, not by item count.
@@ -382,13 +475,13 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         // deriver would collect model-versus-schema warnings and then never
         // be asked to plan a single item. Reporting those reads as diagnostics
         // about work the run did, and it did none.
-        let mut key_deriver = match data_model.as_ref() {
+        let mut key_deriver = match self.data_model.filter(|_| !rules.is_empty()) {
             Some(model) => {
                 let (deriver, warnings) = keys::KeyDeriver::new(
                     model,
                     &table_schema.create_request,
-                    &rules,
-                    &consistency_fields,
+                    rules,
+                    self.consistency_fields,
                 )
                 .map_err(|e| {
                     // The warnings collected so far are part of the
@@ -444,13 +537,13 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                     let (rule_warnings, rewritten) = anonymise::apply_rules(
                         &mut item,
                         table_name,
-                        &rules,
-                        &mut consistency_map,
-                        &consistency_fields,
+                        rules,
+                        &mut self.consistency_map,
+                        self.consistency_fields,
                         &key_attrs,
                         &mut anonymise::RuleTally {
                             mask_passthroughs: &mut mask_passthroughs,
-                            rule_work: &mut rule_work,
+                            rule_work: &mut self.rule_work,
                         },
                     );
                     warnings.extend(rule_warnings);
@@ -471,7 +564,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                         // below cannot swallow table B's copy of a notice
                         // table A already raised.
                         let notice = notice.for_table(table_name);
-                        if seen_warnings.insert(notice.message.clone()) {
+                        if self.seen_warnings.insert(notice.message.clone()) {
                             summary.notice(notice);
                         }
                     }
@@ -481,14 +574,14 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 // Flush batch when full
                 if batch.len() >= BATCH_SIZE {
                     let chunk = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-                    match insert_items(table_name, chunk) {
+                    match insert_items(db, rebuilds_keys, table_name, chunk) {
                         Ok(result) => {
                             table_items += result.items_imported;
                             table_bytes += result.bytes_imported;
                         }
                         Err(e) => {
                             let msg = format!("Batch import error for '{}': {e}", table_name);
-                            if cmd.continue_on_error {
+                            if self.continue_on_error {
                                 summary.notice(Notice::caution(msg));
                             } else {
                                 batch_error = Some(msg);
@@ -518,14 +611,14 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
             // treated as the others were: the flag covered every full batch
             // and then the last partial one failed the run anyway.
             if !batch.is_empty() {
-                match insert_items(table_name, batch) {
+                match insert_items(db, rebuilds_keys, table_name, batch) {
                     Ok(result) => {
                         table_items += result.items_imported;
                         table_bytes += result.bytes_imported;
                     }
                     Err(e) => {
                         let msg = format!("Batch import error for '{}': {e}", table_name);
-                        if cmd.continue_on_error {
+                        if self.continue_on_error {
                             summary.notice(Notice::caution(msg));
                         } else {
                             pb.abandon_with_message(format!("{}: FAILED", table_name));
@@ -559,7 +652,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
                 for n in &summary.notices {
                     eprintln!("  - {n}");
                 }
-                // The BulkLoading guard from step 5 restores the PRAGMAs.
+                // The BulkLoading guard in `run_into` restores the PRAGMAs.
                 return Err(ImportError::Config(format!(
                     "table '{}': {}{}",
                     table_name,
@@ -596,7 +689,7 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         ));
 
         summary.tables.push(TableImportResult {
-            table_name: table_name.clone(),
+            table_name: table_name.to_string(),
             items_imported: table_items,
             bytes_imported: table_bytes,
             lines_skipped: table_skipped,
@@ -604,14 +697,43 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         summary.total_items += table_items;
         summary.total_bytes += table_bytes;
         summary.total_skipped += table_skipped;
+        Ok(())
     }
+}
 
-    // A rules file is the operator's statement of which attributes hold
-    // personal data. A rule that never fired means that statement was not
-    // carried out, and nothing else in the output says so: the item count is
-    // full, no warning is raised, and the run exits 0. A misspelt path or a
-    // match expression that fits none of the data both take exactly that
-    // shape, which is why this is reported per rule rather than in aggregate.
+/// Insert a batch on the write path the run chose.
+///
+/// A run whose keys can move takes the path that deletes an overwritten
+/// row's index entries first. One whose keys come from the export unchanged
+/// cannot collide, and keeps the faster path that assumes every key is
+/// unique.
+fn insert_items(
+    db: &Database,
+    rebuilds_keys: bool,
+    table: &str,
+    batch: Vec<crate::types::Item>,
+) -> crate::Result<crate::ImportResult> {
+    if rebuilds_keys {
+        db.import_items(table, batch, ImportOptions::default())
+    } else {
+        db.import_items_fresh(table, batch, ImportOptions::default())
+    }
+}
+
+/// Report each rule that did nothing in the whole run.
+///
+/// A rules file is the operator's statement of which attributes hold
+/// personal data. A rule that never fired means that statement was not
+/// carried out, and nothing else in the output says so: the item count is
+/// full, no warning is raised, and the run exits 0. A misspelt path or a
+/// match expression that fits none of the data both take exactly that
+/// shape, which is why this is reported per rule rather than in aggregate.
+fn report_unused_rules(
+    summary: &mut ImportSummary,
+    rules: &[config::ValidatedRule],
+    rule_work: &[anonymise::RuleWork],
+    export_files: &[(String, Vec<std::path::PathBuf>)],
+) {
     for (index, work) in rule_work.iter().enumerate() {
         let number = index + 1;
         let path = rules
@@ -652,22 +774,6 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         // most correct rules would raise it on every run and the warnings
         // would stop being read.
     }
-
-    // 7. Restore normal PRAGMAs (important if DB will be served after import)
-    db.disable_bulk_loading()
-        .map_err(|e| format!("Failed to disable bulk loading: {e}"))?;
-
-    // Report consistency map stats
-    if consistency_map.field_count() > 0 {
-        eprintln!(
-            "Consistency map: {} fields, {} total mappings",
-            consistency_map.field_count(),
-            consistency_map.total_mappings()
-        );
-    }
-
-    summary.finish();
-    Ok(summary)
 }
 
 /// Execute the import pipeline with file-based output.
@@ -904,6 +1010,43 @@ fn mixed_consistency_rules(
     messages
 }
 
+/// Refuse a rule whose `tables` names a table the schema file does not have.
+///
+/// The schema file is every table the run knows about, so a scoped name
+/// absent from it is a misspelling rather than a table `--tables` left out.
+/// Left to the end of the run it would be filed as "not applied", which
+/// reads like a table left out on purpose, and the attribute the rule names
+/// would reach the output untouched on a run that exits 0.
+fn refuse_scopes_outside_the_schema(
+    rules: &[config::ValidatedRule],
+    schemas: &[schema::TableSchema],
+) -> Result<(), ImportError> {
+    for (index, rule) in rules.iter().enumerate() {
+        let Some(tables) = rule.tables.as_ref() else {
+            continue;
+        };
+        let missing: Vec<String> = tables
+            .iter()
+            .filter(|name| !schemas.iter().any(|s| &s.table_name == *name))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let known: Vec<String> = schemas.iter().map(|s| s.table_name.clone()).collect();
+        return Err(ImportError::Config(format!(
+            "rule {} (path '{}') is scoped to {}, and the schema file has no such {}. Its \
+             tables are {}",
+            index + 1,
+            crate::expressions::format_path_for_error(&rule.path),
+            quoted_tables(&missing),
+            if missing.len() > 1 { "tables" } else { "table" },
+            quoted_tables(&known)
+        )));
+    }
+    Ok(())
+}
+
 /// `'a'`, or `'a' and 'b'`, for a message.
 fn quoted_tables(names: &[String]) -> String {
     let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
@@ -1003,7 +1146,7 @@ fn compress_to(src: &Path, dst: &Path) -> Result<usize, ImportError> {
         .map_err(|e| ImportError::Database(format!("Compression failed: {e}")))?;
     encoder
         .finish()
-        .map_err(|e| ImportError::Database(format!("Failed to finalize compression: {e}")))?;
+        .map_err(|e| ImportError::Database(format!("Failed to finalise compression: {e}")))?;
     Ok(std::fs::metadata(dst)
         .map(|m| m.len() as usize)
         .unwrap_or(0))

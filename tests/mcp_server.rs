@@ -3916,3 +3916,208 @@ fn an_agents_search_is_held_to_the_wire_request_model() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+// ---------------------------------------------------------------------------
+// Import report tests
+// ---------------------------------------------------------------------------
+
+/// The instructions sentence and the `import` object are only present when
+/// the database was populated by `dynoxide import` in this process.
+#[test]
+fn test_no_import_report_without_import() {
+    let mut child = spawn_mcp();
+    let resp = init_mcp(&mut child);
+
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        !instructions.contains("populated by dynoxide import"),
+        "instructions must not mention an import that did not happen"
+    );
+
+    let resp = call_tool(&mut child, 1, "get_database_info", json!({}));
+    let content = tool_content(&resp);
+    assert!(
+        content.get("import").is_none(),
+        "import must be absent when nothing was imported: {content}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A report with no notices still tells the agent where the data came from.
+#[test]
+fn test_import_report_with_no_notices_in_instructions() {
+    use dynoxide::mcp::{ImportReport, McpConfig, McpServer};
+    use rmcp::ServerHandler;
+    use std::sync::Arc;
+
+    let db = dynoxide::Database::memory().unwrap();
+    let report = ImportReport {
+        tables: 2,
+        items: 40,
+        skipped: 0,
+        notices: Vec::new(),
+        exposures_accepted: false,
+    };
+    let config = McpConfig {
+        import: Some(report),
+        ..Default::default()
+    };
+    let server = McpServer::with_config(Arc::new(db), config);
+
+    let instructions = server.get_info().instructions.unwrap();
+    assert!(
+        instructions
+            .contains("This database was populated by dynoxide import, which raised no notices."),
+        "a clean import is still worth a sentence: {instructions}"
+    );
+    assert!(
+        !instructions.contains("accepted"),
+        "nothing was accepted, so nothing should say so: {instructions}"
+    );
+}
+
+/// A report whose notices are all cautions says so, rather than reporting
+/// zero exposures as if they had been accepted.
+#[test]
+fn test_import_report_with_cautions_only_in_instructions() {
+    use dynoxide::mcp::{ImportConcern, ImportNotice, ImportReport, McpConfig, McpServer};
+    use rmcp::ServerHandler;
+    use std::sync::Arc;
+
+    let db = dynoxide::Database::memory().unwrap();
+    let report = ImportReport {
+        tables: 1,
+        items: 3,
+        skipped: 1,
+        notices: vec![ImportNotice {
+            concern: ImportConcern::Caution,
+            message: "1 lines skipped".into(),
+        }],
+        exposures_accepted: false,
+    };
+    let config = McpConfig {
+        import: Some(report),
+        ..Default::default()
+    };
+    let server = McpServer::with_config(Arc::new(db), config);
+
+    let instructions = server.get_info().instructions.unwrap();
+    assert!(
+        instructions.contains(
+            "This database was populated by dynoxide import; get_database_info reports 1 notice, none of them exposures."
+        ),
+        "cautions are reported without an exposure count: {instructions}"
+    );
+}
+
+/// Write a DynamoDB export directory with one data file for `table`.
+#[cfg(feature = "import")]
+fn write_export_dir(dir: &std::path::Path, table: &str, items: &[&str]) {
+    let data_dir = dir.join(table).join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut f = std::fs::File::create(data_dir.join("00000000.json")).unwrap();
+    for item in items {
+        writeln!(f, "{item}").unwrap();
+    }
+}
+
+/// The whole path: `dynoxide import --mcp --accept-exposure` on an export
+/// whose rule rewrote nothing. The gate lets the run through because the
+/// exposure was accepted, and the server that starts must then say so to
+/// the agent, which has no other way to learn it.
+#[cfg(feature = "import")]
+#[test]
+fn test_import_mcp_reports_accepted_exposure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("export");
+    let schema_file = tmp.path().join("schema.json");
+    let rules_file = tmp.path().join("rules.toml");
+    write_export_dir(
+        &source,
+        "Users",
+        &[
+            r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "email": {"S": "a@real.co.uk"}}}"#,
+        ],
+    );
+    std::fs::write(
+        &schema_file,
+        json!([{
+            "Table": {
+                "TableName": "Users",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"}
+                ]
+            }
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    // The path is misspelt, so the rule matches every item and rewrites none.
+    std::fs::write(
+        &rules_file,
+        "[[rules]]\nmatch = \"attribute_exists(pk)\"\npath = \"emial\"\naction = { type = \"redact\" }\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .args(["import", "--mcp", "--accept-exposure", "--source"])
+        .arg(&source)
+        .arg("--schema")
+        .arg(&schema_file)
+        .arg("--rules")
+        .arg(&rules_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn dynoxide import --mcp");
+
+    let resp = init_mcp(&mut child);
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(
+            "This database was populated by dynoxide import; get_database_info reports 2 notices, of which 1 is an exposure that was accepted with --accept-exposure."
+        ),
+        "the instructions must carry the counts: {instructions}"
+    );
+
+    let resp = call_tool(&mut child, 1, "get_database_info", json!({}));
+    let content = tool_content(&resp);
+    let import = &content["import"];
+    assert!(import.is_object(), "import must be reported: {content}");
+    assert_eq!(import["tables"], 1);
+    assert_eq!(import["items"], 1);
+    assert_eq!(import["skipped"], 0);
+    assert_eq!(import["notice_count"], 2);
+    assert_eq!(import["exposure_count"], 1);
+    assert_eq!(import["exposures_accepted"], true);
+
+    let notices = import["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 2, "every notice is listed: {notices:?}");
+    assert_eq!(notices[0]["concern"], "caution");
+    assert!(
+        notices[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rules rewrite attributes only"),
+        "the caution keeps its message: {notices:?}"
+    );
+    assert_eq!(notices[1]["concern"], "exposure");
+    assert!(
+        notices[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rewrote none of them"),
+        "the exposure keeps its message: {notices:?}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

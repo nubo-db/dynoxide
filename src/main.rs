@@ -876,6 +876,7 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_size_bytes: args.max_size_bytes,
         data_model,
         data_model_summary_limit: args.data_model_summary_limit,
+        import: None,
     };
 
     if args.http {
@@ -923,6 +924,36 @@ fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: boo
         "Exiting {EXIT_EXPOSURE}. Fix the rules, or pass --accept-exposure if this is expected."
     );
     std::process::exit(EXIT_EXPOSURE);
+}
+
+/// The view of the summary an MCP agent gets. The summary itself is printed
+/// to stderr, which an MCP client keeps from the agent, so this is what tells
+/// the agent whether the data was anonymised cleanly.
+#[cfg(all(feature = "import", feature = "mcp-server"))]
+fn import_report(
+    summary: &dynoxide::import::ImportSummary,
+    accept_exposure: bool,
+) -> dynoxide::mcp::ImportReport {
+    use dynoxide::import::Concern;
+    use dynoxide::mcp::{ImportConcern, ImportNotice, ImportReport};
+
+    ImportReport {
+        tables: summary.tables.len(),
+        items: summary.total_items,
+        skipped: summary.total_skipped,
+        notices: summary
+            .notices
+            .iter()
+            .map(|n| ImportNotice {
+                concern: match n.concern {
+                    Concern::Exposure => ImportConcern::Exposure,
+                    Concern::Caution => ImportConcern::Caution,
+                },
+                message: n.message.clone(),
+            })
+            .collect(),
+        exposures_accepted: accept_exposure && !summary.exposures.is_empty(),
+    }
 }
 
 #[cfg(feature = "import")]
@@ -1001,6 +1032,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
             let mcp_config = dynoxide::mcp::McpConfig {
                 read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
+                import: Some(import_report(&summary, args.accept_exposure)),
                 ..Default::default()
             };
             let opts = resolve_mcp_http_options(
@@ -1049,6 +1081,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
             let mcp_config = dynoxide::mcp::McpConfig {
                 data_model: mcp_data_model,
+                import: Some(import_report(&summary, args.accept_exposure)),
                 ..Default::default()
             };
             dynoxide::mcp::serve_stdio(db, mcp_config).await?;

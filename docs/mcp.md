@@ -158,3 +158,8 @@ dynoxide mcp --data-model schema.json --db-path data.db
 
 The data model is context-only - dynoxide does not validate writes against the schema. See [docs/mcp-data-model.md](mcp-data-model.md) for the full format reference, options, and examples.
 
+## Serving an import
+
+`dynoxide import --mcp` loads a DynamoDB export into memory and serves it over stdio, so an agent can work on a copy of real data that disappears with the process. With `--rules`, the data is anonymised on the way in, and the run is gated on the result: if an original value reached the output, the import exits 3 before any server starts, and `--accept-exposure` lets it serve anyway. The [exit codes](import.md#exit-codes) section of the import docs sets out what counts as an exposure.
+
+The agent does not see the import's stderr, so the server tells it instead. The instructions name the import and its counts, and `get_database_info` returns an `import` object with every notice, its concern (`exposure` or `caution`), and whether exposures were accepted. Read it before treating the data as anonymised.

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-19
+
+### Security
+
+- **`rmcp` moves to 2.2.0**, clearing GHSA-9pj6-vhgr-3mwh, GHSA-33f5-2c5q-wgwj
+  and GHSA-9g45-5xwm-f3wc against the 1.x line. None of the three was reachable
+  from a Dynoxide build: two cover client transports this crate never compiles,
+  and the session-table leak sits behind rmcp's `stateful_mode`, which the MCP
+  HTTP transport sets to `false`. 1.8.0 is the end of the 1.x line, so there was
+  no backport to take. The MCP protocol version on the wire is unchanged.
+- **`rustls` moves to 0.23.45** for RUSTSEC-2026-0285. It reaches the tree
+  through dev-dependencies only and never shipped in a released artefact.
+
 ## [1.2.0] - 2026-09-11
 
 The crate moves to `dynoxide-rs` 2.0.0 because `ImportCommand` gained a
@@ -796,7 +809,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/nubo-db/dynoxide/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/nubo-db/dynoxide/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nubo-db/dynoxide/compare/v0.13.0...v1.0.0

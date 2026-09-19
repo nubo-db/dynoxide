@@ -889,7 +889,7 @@ fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
 /// Return a tool-level validation error (keeps the agent conversation flowing,
 /// unlike McpError which may abort it).
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(
+    CallToolResult::error(vec![ContentBlock::text(
         serde_json::json!({
             "error_type": error_type,
             "message": message,
@@ -955,7 +955,7 @@ fn capitalize_first(s: &str) -> String {
 fn json_result(value: impl serde::Serialize) -> Result<CallToolResult, McpError> {
     let json =
         serde_json::to_value(value).map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         json.to_string(),
     )]))
 }
@@ -977,7 +977,7 @@ impl McpServer {
     /// Reject the call if the server is in read-only mode.
     fn reject_if_read_only(&self, tool_name: &str) -> Option<CallToolResult> {
         if self.config.read_only {
-            Some(CallToolResult::error(vec![Content::text(
+            Some(CallToolResult::error(vec![ContentBlock::text(
                 serde_json::json!({
                     "error_type": "AccessDeniedException",
                     "message": format!("Tool '{tool_name}' is disabled: server is in read-only mode (--read-only)"),
@@ -1021,13 +1021,13 @@ impl McpServer {
                 ),
                 "retryable": false,
             });
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 error_json.to_string(),
             )]));
         }
         // SAFETY: serde_json::to_vec always produces valid UTF-8
         let text = unsafe { String::from_utf8_unchecked(serialized) };
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -1235,7 +1235,7 @@ impl McpServer {
         let snap_info = match snapshots::auto_snapshot(&self.db, &params.table_name) {
             Ok(info) => info,
             Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     serde_json::json!({
                         "error_type": "SnapshotFailed",
                         "message": format!(

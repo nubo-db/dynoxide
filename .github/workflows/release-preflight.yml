@@ -33,11 +33,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # crates.io publishing is Trusted Publishing, so there is no stored
+      # secret left to probe and this step only proves the crate packages
+      # cleanly. A publisher config missing or misnamed on crates.io is
+      # therefore not caught here; release.yml is where it would surface.
+      # Giving this workflow its own config would catch it, at the price of
+      # letting a workflow_dispatch with no environment gate mint a real
+      # publish token, so it deliberately does not have one.
       - name: cargo publish --dry-run
         id: cargo-check
         continue-on-error: true
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --dry-run
 
       # --- npm OIDC ------------------------------------------------------

@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rustls` moves to 0.23.45** for RUSTSEC-2026-0285. It reaches the tree
   through dev-dependencies only and never shipped in a released artefact.
 
+### Changed
+
+- The crate is published to crates.io with Trusted Publishing. The release
+  workflow exchanges a short-lived OIDC token for a publish token that expires
+  after 30 minutes, so no long-lived registry token is stored on the repository.
+
 ## [1.2.0] - 2026-09-11
 
 The crate moves to `dynoxide-rs` 2.0.0 because `ImportCommand` gained a

@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # required for npm OIDC provenance dry-run and ECR Public OIDC
+  id-token: write  # npm OIDC provenance dry-run, ECR Public OIDC, crates.io probe
   packages: read   # required for GHCR auth probe
 
 jobs:
@@ -33,12 +33,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # crates.io auth is Trusted Publishing, so there is no stored secret
+      # left for this step to exercise; it proves the crate packages cleanly
+      # and nothing more. Whether crates.io would accept the publish is the
+      # next step's job.
       - name: cargo publish --dry-run
         id: cargo-check
         continue-on-error: true
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --dry-run
+
+      # Confirms release.yml and publish-crate.yml are both registered on
+      # crates.io, by asking for a token this workflow is not allowed to have
+      # and reading the refusal. No token is ever minted. The script explains
+      # why that is the right way round.
+      - name: crates.io Trusted Publishing probe
+        id: trustpub-check
+        continue-on-error: true
+        run: scripts/trustpub-probe.sh release.yml publish-crate.yml
 
       # --- npm OIDC ------------------------------------------------------
       - uses: actions/setup-node@v5
@@ -124,6 +135,7 @@ jobs:
         env:
           VERSION_OUTCOME: ${{ steps.version-check.outcome }}
           CARGO_OUTCOME: ${{ steps.cargo-check.outcome }}
+          TRUSTPUB_OUTCOME: ${{ steps.trustpub-check.outcome }}
           NPM_OUTCOME: ${{ steps.npm-check.outcome }}
           HOMEBREW_OUTCOME: ${{ steps.homebrew-check.outcome }}
           GHCR_OUTCOME: ${{ steps.ghcr-check.outcome }}
@@ -137,6 +149,7 @@ jobs:
             echo "|-------|--------|"
             echo "| version sources agree | $VERSION_OUTCOME |"
             echo "| cargo publish --dry-run | $CARGO_OUTCOME |"
+            echo "| crates.io Trusted Publishing config | $TRUSTPUB_OUTCOME |"
             echo "| npm publish --dry-run --provenance (meta) | $NPM_OUTCOME |"
             echo "| Homebrew tap write-access probe | $HOMEBREW_OUTCOME |"
             echo "| GHCR auth probe | $GHCR_OUTCOME |"
@@ -149,6 +162,7 @@ jobs:
 
           if [ "$VERSION_OUTCOME" != "success" ] || \
              [ "$CARGO_OUTCOME" != "success" ] || \
+             [ "$TRUSTPUB_OUTCOME" != "success" ] || \
              [ "$NPM_OUTCOME" != "success" ] || \
              [ "$HOMEBREW_OUTCOME" != "success" ] || \
              [ "$GHCR_OUTCOME" != "success" ] || \

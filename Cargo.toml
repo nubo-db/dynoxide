@@ -1,6 +1,6 @@
 [package]
 name = "dynoxide-rs"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 description = "An embeddable DynamoDB emulator backed by SQLite. Starts in under a millisecond, and is verified against real AWS by a public conformance suite."
 license = "MIT OR Apache-2.0"
@@ -90,7 +90,7 @@ socket2 = { version = "0.6", optional = true }
 crc32fast = { version = "1", optional = true }
 
 # Optional MCP server dependencies
-rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
+rmcp = { version = "2", features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
 schemars = { version = "1", optional = true }
 tokio-util = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }

@@ -5,7 +5,7 @@
 //! are reserved for infrastructure failures.
 
 use crate::errors::DynoxideError;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 /// Short error type name without the DynamoDB namespace prefix.
 fn short_error_type(err: &DynoxideError) -> &'static str {
@@ -60,7 +60,7 @@ pub fn to_tool_error(err: DynoxideError) -> CallToolResult {
         "retryable": is_retryable(&err),
     });
 
-    CallToolResult::error(vec![Content::text(error_json.to_string())])
+    CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
 }
 
 #[cfg(test)]

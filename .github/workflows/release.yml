@@ -219,6 +219,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # id-token is what crates.io Trusted Publishing exchanges for a publish
+    # token. Stated at the job rather than inherited, as the other publishers
+    # here do, so the grant is visible next to the job that uses it.
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - uses: actions/checkout@v5
 
@@ -250,16 +257,28 @@ jobs:
             echo "dynoxide-rs $CRATE is not on crates.io; publishing"
           fi
 
+      # Trusted Publishing. The OIDC token this job is granted is exchanged
+      # for a crates.io token that lasts 30 minutes and is revoked when the
+      # job ends, so nothing long-lived is stored in the repository. crates.io
+      # matches the exchange against the repository, this workflow's filename
+      # and the environment above, so renaming this file or the environment
+      # breaks publishing until the config on crates.io is updated to match.
+      # Minted only when there is something to publish.
+      - name: Authenticate with crates.io
+        id: auth
+        if: steps.published.outputs.already == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: cargo publish --dry-run
         if: steps.published.outputs.already == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --dry-run
 
       - name: cargo publish
         if: steps.published.outputs.already == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish
 
   # -------------------------------------------------------------------

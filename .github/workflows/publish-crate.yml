@@ -17,6 +17,7 @@ concurrency:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -54,12 +55,20 @@ jobs:
           fi
           echo "dynoxide-rs $CRATE is not published; continuing"
 
+      # Trusted Publishing, as release.yml uses. crates.io matches the
+      # exchange on the workflow filename, so this recovery path needs its own
+      # config on crates.io naming publish-crate.yml; the one for release.yml
+      # will not cover it.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Dry run
         run: cargo publish --dry-run
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish
         run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

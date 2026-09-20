@@ -104,6 +104,17 @@ So adding a method to it is not a break, and the trait keeps pace with the
 engine inside a crate major. You can name it and use it as a bound; you cannot implement
 it. If third-party backends ever earn their place, unsealing is a minor.
 
+## The MCP server type
+
+`mcp::McpServer` is public and implements rmcp's `ServerHandler`. That impl is
+not a supported surface. It is there because the transport needs it, not so a
+third party can host `McpServer` inside their own rmcp server, and the type's
+own methods take Dynoxide types only.
+
+So an rmcp major ships under the dependency row above, as a patch, and does not
+take the crate major with it. The alternative is a new crate major every time
+rmcp cuts one, for a surface this page already declines to version.
+
 ## Conformance fixes are the exception
 
 Dynoxide exists to behave like DynamoDB. Where it does not, that is a bug, and

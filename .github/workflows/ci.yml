@@ -177,6 +177,14 @@ jobs:
       - name: Check the release helper scripts can still fail
         run: scripts/release-helpers.test.sh
 
+      # The Trusted Publishing probe passes by reading a refusal from
+      # crates.io, which is easy to get wrong in the direction that always
+      # says yes. Every answer crates.io can give is replayed against it here,
+      # including a success, which the probe has to treat as a finding rather
+      # than a pass. It never reaches the network.
+      - name: Check the Trusted Publishing probe can still fail
+        run: scripts/trustpub-probe.test.sh
+
       # Nothing built the docs, so broken intra-doc links accumulated unseen:
       # ten of them, half pointing at private items and half at cfg-gated ones
       # absent from the default build docs.rs renders. They degrade the

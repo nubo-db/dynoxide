@@ -1,0 +1,16 @@
+{
+  "os": "Linux",
+  "kernel": "6.17.0-1022-azure",
+  "arch": "x86_64",
+  "cpu_model": "Intel(R) Xeon(R) 6973P-C",
+  "cpu_cores": "4",
+  "total_ram_gb": "15.6",
+  "rust_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "dynoxide_version": "2.0.1",
+  "dynoxide_commit": "49c6338",
+  "dynamodb_local_image_id": "sha256:9539a",
+  "dynoxide_binary_bytes": 7475672,
+  "dynamodb_local_image_bytes": 495952200,
+  "localstack_image_bytes": 1277978948,
+  "timestamp": "2026-09-20T15:39:28.254391+00:00"
+}

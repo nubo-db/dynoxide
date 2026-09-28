@@ -29,6 +29,21 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
+/// Options controlling HTTP server startup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerOptions {
+    suppress_startup_messages: bool,
+}
+
+impl ServerOptions {
+    /// Suppress informational startup output.
+    pub const fn quiet() -> Self {
+        Self {
+            suppress_startup_messages: true,
+        }
+    }
+}
+
 /// Check whether the port is already in use by attempting a TCP connection.
 ///
 /// Probes both the requested address and the cross-address (wildcard vs localhost)
@@ -61,6 +76,16 @@ fn check_port_available(addr: SocketAddr) -> Result<(), String> {
 
 /// Start the HTTP server.
 pub async fn start(host: &str, port: u16, db: Database) -> Result<(), String> {
+    start_with_options(host, port, db, ServerOptions::default()).await
+}
+
+/// Start the HTTP server with explicit startup options.
+pub async fn start_with_options(
+    host: &str,
+    port: u16,
+    db: Database,
+    options: ServerOptions,
+) -> Result<(), String> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| format!("invalid address {host}:{port}: {e}"))?;
@@ -74,7 +99,9 @@ pub async fn start(host: &str, port: u16, db: Database) -> Result<(), String> {
 
     let app = build_router(db);
 
-    eprintln!("Dynoxide listening on http://{addr}");
+    if !options.suppress_startup_messages {
+        eprintln!("Dynoxide listening on http://{addr}");
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

@@ -74,6 +74,9 @@ Run a local server without installing anything:
 npx dynoxide --port 8000
 ```
 
+Add `--log quiet` to suppress informational startup messages on stderr (useful
+in test suites). Without `--log`, startup output is unchanged.
+
 Or install it into a project to pin the version, after which `npx dynoxide` uses that copy:
 
 ```sh

@@ -31,6 +31,8 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
+/// Poll `GET /` until the server answers or `timeout` elapses.
+#[cfg(unix)]
 async fn wait_until_http_ready(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let client = reqwest::Client::new();
@@ -206,8 +208,11 @@ fn root_schema_scaffolds_tables_on_startup() {
     );
 }
 
+/// Unix only: the server is stopped with `kill -TERM`. Off unix it only
+/// listens for Ctrl+C, which a test cannot easily send to a child process.
+#[cfg(unix)]
 #[tokio::test]
-async fn log_quiet_suppresses_serve_startup_messages() {
+async fn log_quiet_suppresses_startup_and_shutdown_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let schema_file = tmp.path().join("schema.json");
     write_schema_file(&schema_file, "QuietTable");

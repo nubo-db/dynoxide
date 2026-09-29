@@ -56,8 +56,8 @@ Works with any language or SDK that supports custom endpoints: Python (boto3), N
 
 ## Logging
 
-The default startup output is unchanged when `--log` is omitted. To suppress
-informational startup messages on stderr, use quiet mode:
+The default output is unchanged when `--log` is omitted. To suppress
+informational startup and shutdown messages on stderr, use quiet mode:
 
 ```sh
 dynoxide --log quiet --port 8000

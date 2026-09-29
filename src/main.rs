@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum LogMode {
+    /// Suppress informational startup and shutdown messages
     Quiet,
 }
 
@@ -1335,12 +1336,12 @@ mod tests {
         }
 
         #[test]
-        fn legacy_and_unsupported_log_modes_are_rejected() {
+        fn unsupported_log_modes_are_rejected() {
             for argv in [
                 vec!["dynoxide", "--quiet"],
                 vec!["dynoxide", "serve", "--quiet"],
-                vec!["dynoxide", "--log", "verbose"],
-                vec!["dynoxide", "serve", "--log", "verbose"],
+                vec!["dynoxide", "--log", "loud"],
+                vec!["dynoxide", "serve", "--log", "loud"],
             ] {
                 assert!(
                     Cli::try_parse_from(&argv).is_err(),

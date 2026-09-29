@@ -36,17 +36,6 @@ aws dynamodb describe-table --table-name Users > schema.json
 dynoxide --schema schema.json --port 8000
 ```
 
-## Logging
-
-The default startup output is unchanged when `--log` is omitted. To suppress
-informational startup messages on stderr, use quiet mode:
-
-```sh
-dynoxide --log quiet --port 8000
-```
-
-`RUST_LOG` continues to control tracing independently.
-
 Then use the AWS CLI or any DynamoDB SDK pointed at localhost:
 
 ```sh
@@ -64,3 +53,14 @@ aws dynamodb get-item \
 ```
 
 Works with any language or SDK that supports custom endpoints: Python (boto3), Node.js (AWS SDK v3), Go, Java, etc.
+
+## Logging
+
+The default startup output is unchanged when `--log` is omitted. To suppress
+informational startup messages on stderr, use quiet mode:
+
+```sh
+dynoxide --log quiet --port 8000
+```
+
+`RUST_LOG` continues to control tracing independently.

@@ -31,14 +31,23 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-fn wait_until_ready(port: u16, timeout: Duration) -> bool {
+async fn wait_until_http_ready(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
+    let client = reqwest::Client::new();
+
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .is_ok()
+        {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(10));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
     false
 }
 
@@ -129,7 +138,7 @@ fn root_help_lists_schema_flag() {
 }
 
 #[test]
-fn serve_help_lists_log_but_not_quiet_flag() {
+fn serve_help_lists_log() {
     let output = Command::new(dynoxide_bin())
         .args(["serve", "--help"])
         .output()
@@ -137,14 +146,10 @@ fn serve_help_lists_log_but_not_quiet_flag() {
     assert!(output.status.success(), "--help should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--log <MODE>"), "missing --log:\n{stdout}");
-    assert!(
-        !stdout.contains("--quiet"),
-        "legacy --quiet remains:\n{stdout}"
-    );
 }
 
 #[test]
-fn root_help_lists_log_but_not_quiet_flag() {
+fn root_help_lists_log() {
     let output = Command::new(dynoxide_bin())
         .args(["--help"])
         .output()
@@ -152,10 +157,6 @@ fn root_help_lists_log_but_not_quiet_flag() {
     assert!(output.status.success(), "--help should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--log <MODE>"), "missing --log:\n{stdout}");
-    assert!(
-        !stdout.contains("--quiet"),
-        "legacy --quiet remains:\n{stdout}"
-    );
 }
 
 #[test]
@@ -205,8 +206,8 @@ fn root_schema_scaffolds_tables_on_startup() {
     );
 }
 
-#[test]
-fn log_quiet_suppresses_serve_startup_messages() {
+#[tokio::test]
+async fn log_quiet_suppresses_serve_startup_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let schema_file = tmp.path().join("schema.json");
     write_schema_file(&schema_file, "QuietTable");
@@ -226,7 +227,7 @@ fn log_quiet_suppresses_serve_startup_messages() {
             schema_file.to_string_lossy().into_owned(),
         ]);
 
-        let mut child = Command::new(dynoxide_bin())
+        let child = Command::new(dynoxide_bin())
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -234,12 +235,27 @@ fn log_quiet_suppresses_serve_startup_messages() {
             .expect("spawn dynoxide");
 
         assert!(
-            wait_until_ready(port, Duration::from_secs(10)),
+            wait_until_http_ready(port, Duration::from_secs(10)).await,
             "dynoxide did not become ready with args {args:?}"
         );
-        let _ = child.kill();
+        let signal = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(signal.success(), "failed to send SIGTERM");
+
         let output = child.wait_with_output().expect("collect dynoxide output");
+        assert!(
+            output.status.success(),
+            "dynoxide did not shut down gracefully: {:?}",
+            output.status
+        );
+
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Shutting down"),
+            "quiet mode emitted shutdown message: {stderr}"
+        );
 
         assert!(
             !stderr.contains("Scaffolded"),

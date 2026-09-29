@@ -29,17 +29,17 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
-/// Options controlling HTTP server startup.
-#[derive(Debug, Clone, Copy, Default)]
+/// Options controlling HTTP server output.
+#[derive(Debug, Clone, Default)]
 pub struct ServerOptions {
-    suppress_startup_messages: bool,
+    suppress_informational_messages: bool,
 }
 
 impl ServerOptions {
-    /// Suppress informational startup output.
+    /// Suppress informational server output.
     pub const fn quiet() -> Self {
         Self {
-            suppress_startup_messages: true,
+            suppress_informational_messages: true,
         }
     }
 }
@@ -99,12 +99,12 @@ pub async fn start_with_options(
 
     let app = build_router(db);
 
-    if !options.suppress_startup_messages {
+    if !options.suppress_informational_messages {
         eprintln!("Dynoxide listening on http://{addr}");
     }
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(options.suppress_informational_messages))
         .await
         .map_err(|e| format!("server failed: {e}"))
 }
@@ -217,7 +217,7 @@ async fn handle_fallback() -> Response {
     dynamo_response_raw(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(suppress_informational_messages: bool) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -234,7 +234,9 @@ async fn shutdown_signal() {
             .await
             .expect("failed to install CTRL+C handler");
     }
-    eprintln!("\nShutting down...");
+    if !suppress_informational_messages {
+        eprintln!("\nShutting down...");
+    }
 }
 
 async fn handle_request(

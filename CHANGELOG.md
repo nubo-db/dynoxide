@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--log quiet` suppresses informational startup messages on stderr while
+  leaving the default startup output unchanged.
+- `server::ServerOptions` and `server::start_with_options` let embedded Rust
+  callers configure server startup output.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

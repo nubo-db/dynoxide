@@ -11,7 +11,7 @@ use dynoxide::Database;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 use tracing_subscriber::EnvFilter;
@@ -20,6 +20,12 @@ use tracing_subscriber::EnvFilter;
 // Do NOT change these guards to `_has-encryption`: that's for the library API only.
 #[cfg(all(feature = "encryption", feature = "http-server"))]
 use zeroize::Zeroizing;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LogMode {
+    /// Suppress informational startup and shutdown messages
+    Quiet,
+}
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +61,10 @@ struct Cli {
     /// Path to file containing the encryption key (requires encryption feature)
     #[arg(long, value_name = "PATH")]
     encryption_key_file: Option<PathBuf>,
+
+    /// Logging mode
+    #[arg(long, value_enum, value_name = "MODE")]
+    log: Option<LogMode>,
 
     /// Schema file (JSON with DescribeTable responses): scaffolds empty tables on startup
     #[cfg(feature = "import")]
@@ -99,6 +109,10 @@ struct ServeArgs {
     /// Path to file containing the encryption key (requires encryption feature)
     #[arg(long, value_name = "PATH")]
     encryption_key_file: Option<PathBuf>,
+
+    /// Logging mode
+    #[arg(long, value_enum, value_name = "MODE")]
+    log: Option<LogMode>,
 
     /// Also start MCP server over Streamable HTTP (for Claude Code integration)
     #[cfg(feature = "mcp-server")]
@@ -410,6 +424,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 port: cli.port.unwrap_or(8000),
                 db_path: cli.db_path,
                 encryption_key_file: cli.encryption_key_file,
+                log: cli.log,
                 #[cfg(feature = "mcp-server")]
                 mcp: false,
                 #[cfg(feature = "mcp-server")]
@@ -475,6 +490,8 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "http-server")]
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let is_quiet = args.log == Some(LogMode::Quiet);
+
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
 
@@ -505,8 +522,16 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(schema_path) = &args.schema {
         let n = dynoxide::import::scaffold_from_schema(&db, schema_path)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        eprintln!("Scaffolded {} table(s) from schema", n);
+        if !is_quiet {
+            eprintln!("Scaffolded {} table(s) from schema", n);
+        }
     }
+
+    let server_options = if is_quiet {
+        dynoxide::server::ServerOptions::quiet()
+    } else {
+        dynoxide::server::ServerOptions::default()
+    };
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {
@@ -529,14 +554,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mcp_shutdown = CancellationToken::new();
         let mcp_shutdown_clone = mcp_shutdown.clone();
 
-        eprintln!(
-            "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
-            args.host, args.port, args.mcp_host, args.mcp_port
-        );
+        if !is_quiet {
+            eprintln!(
+                "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
+                args.host, args.port, args.mcp_host, args.mcp_port
+            );
+        }
 
         let (http_result, mcp_result) = tokio::join!(
             async {
-                let r = dynoxide::server::start(&args.host, args.port, db).await;
+                let r =
+                    dynoxide::server::start_with_options(&args.host, args.port, db, server_options)
+                        .await;
                 // HTTP server exited (Ctrl+C): tell MCP to shut down too
                 mcp_shutdown_clone.cancel();
                 r
@@ -548,7 +577,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    dynoxide::server::start(&args.host, args.port, db).await?;
+    dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
     Ok(())
 }
 
@@ -1291,6 +1320,33 @@ mod tests {
             match cli.command {
                 Some(Commands::Serve(args)) => assert_eq!(args.port, 8893),
                 _ => panic!("expected serve subcommand"),
+            }
+        }
+
+        #[test]
+        fn quiet_log_mode_parses_for_both_serve_forms() {
+            let cli = Cli::try_parse_from(["dynoxide", "--log", "quiet"]).unwrap();
+            assert_eq!(cli.log, Some(LogMode::Quiet));
+
+            let cli = Cli::try_parse_from(["dynoxide", "serve", "--log", "quiet"]).unwrap();
+            match cli.command {
+                Some(Commands::Serve(args)) => assert_eq!(args.log, Some(LogMode::Quiet)),
+                _ => panic!("expected serve subcommand"),
+            }
+        }
+
+        #[test]
+        fn unsupported_log_modes_are_rejected() {
+            for argv in [
+                vec!["dynoxide", "--quiet"],
+                vec!["dynoxide", "serve", "--quiet"],
+                vec!["dynoxide", "--log", "loud"],
+                vec!["dynoxide", "serve", "--log", "loud"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(&argv).is_err(),
+                    "expected parse error for {argv:?}"
+                );
             }
         }
     }

@@ -88,6 +88,9 @@ docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
 
 Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, Cargo, pre-built binaries, and embedding as a Rust library, see the [installation guide](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md).
 
+Add `--log quiet` to suppress informational startup messages on stderr (useful
+in test suites). Without `--log`, startup output is unchanged.
+
 ## Documentation
 
 - [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker

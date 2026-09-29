@@ -82,7 +82,8 @@ of passing by accident.
 
 The startup line reads `Dynoxide listening on http://<host>:<port>` and goes to
 **stderr**. Tracing output goes to stdout, so a log-based wait pointed at the
-wrong stream waits for ever.
+wrong stream waits forever. `--log quiet` suppresses the startup line; a wait
+on `GET /` works with either logging mode.
 
 `tests/container_contract.rs` holds both. Worth knowing if you change either:
 the container's own `HEALTHCHECK` reads the status line and never the body, so

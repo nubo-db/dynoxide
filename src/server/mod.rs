@@ -29,6 +29,21 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
+/// Options controlling HTTP server output.
+#[derive(Debug, Clone, Default)]
+pub struct ServerOptions {
+    suppress_informational_messages: bool,
+}
+
+impl ServerOptions {
+    /// Suppress informational server output.
+    pub const fn quiet() -> Self {
+        Self {
+            suppress_informational_messages: true,
+        }
+    }
+}
+
 /// Check whether the port is already in use by attempting a TCP connection.
 ///
 /// Probes both the requested address and the cross-address (wildcard vs localhost)
@@ -61,6 +76,16 @@ fn check_port_available(addr: SocketAddr) -> Result<(), String> {
 
 /// Start the HTTP server.
 pub async fn start(host: &str, port: u16, db: Database) -> Result<(), String> {
+    start_with_options(host, port, db, ServerOptions::default()).await
+}
+
+/// Start the HTTP server with explicit startup options.
+pub async fn start_with_options(
+    host: &str,
+    port: u16,
+    db: Database,
+    options: ServerOptions,
+) -> Result<(), String> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| format!("invalid address {host}:{port}: {e}"))?;
@@ -74,10 +99,12 @@ pub async fn start(host: &str, port: u16, db: Database) -> Result<(), String> {
 
     let app = build_router(db);
 
-    eprintln!("Dynoxide listening on http://{addr}");
+    if !options.suppress_informational_messages {
+        eprintln!("Dynoxide listening on http://{addr}");
+    }
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(options.suppress_informational_messages))
         .await
         .map_err(|e| format!("server failed: {e}"))
 }
@@ -190,7 +217,7 @@ async fn handle_fallback() -> Response {
     dynamo_response_raw(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(suppress_informational_messages: bool) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -207,7 +234,9 @@ async fn shutdown_signal() {
             .await
             .expect("failed to install CTRL+C handler");
     }
-    eprintln!("\nShutting down...");
+    if !suppress_informational_messages {
+        eprintln!("\nShutting down...");
+    }
 }
 
 async fn handle_request(

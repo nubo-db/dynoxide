@@ -54,3 +54,13 @@ aws dynamodb get-item \
 
 Works with any language or SDK that supports custom endpoints: Python (boto3), Node.js (AWS SDK v3), Go, Java, etc.
 
+## Logging
+
+The default startup output is unchanged when `--log` is omitted. To suppress
+informational startup messages on stderr, use quiet mode:
+
+```sh
+dynoxide --log quiet --port 8000
+```
+
+`RUST_LOG` continues to control tracing independently.

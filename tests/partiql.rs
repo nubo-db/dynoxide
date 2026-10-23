@@ -3811,6 +3811,129 @@ fn test_lowercase_count_is_rejected_the_same_way() {
 }
 
 #[test]
+fn select_with_common_partition_key_across_or_groups_reads_only_that_partition() {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "SharedPartition",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "by_gsi",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let payload = "x".repeat(3_000);
+    for n in 1..=3 {
+        for (pk, gsi_pk, x) in [("k", "g", n), ("other", "other", n + 10)] {
+            let mut item = HashMap::new();
+            item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+            item.insert("sk".to_string(), AttributeValue::S(format!("row-{n}")));
+            item.insert("gsiPk".to_string(), AttributeValue::S(gsi_pk.to_string()));
+            item.insert("x".to_string(), AttributeValue::N(x.to_string()));
+            item.insert("payload".to_string(), AttributeValue::S(payload.clone()));
+            db.put_item(PutItemRequest {
+                table_name: "SharedPartition".to_string(),
+                item,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+    }
+
+    let read = |statement: &str| {
+        db.execute_statement(ExecuteStatementRequest {
+            statement: statement.to_string(),
+            return_consumed_capacity: Some("TOTAL".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+
+    let table_keyed = read("SELECT * FROM \"SharedPartition\" WHERE pk = 'k'");
+    let table_or = read("SELECT * FROM \"SharedPartition\" WHERE pk = 'k' AND (x = 1 OR x = 2)");
+    assert_eq!(table_or.items.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        table_or.consumed_capacity.unwrap().capacity_units,
+        table_keyed.consumed_capacity.unwrap().capacity_units,
+        "an OR whose branches all pin the same table partition should read only that partition"
+    );
+
+    let index_keyed = read("SELECT * FROM \"SharedPartition\".\"by_gsi\" WHERE gsiPk = 'g'");
+    let index_or =
+        read("SELECT * FROM \"SharedPartition\".\"by_gsi\" WHERE gsiPk = 'g' AND (x = 1 OR x = 2)");
+    assert_eq!(index_or.items.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        index_or.consumed_capacity.unwrap().capacity_units,
+        index_keyed.consumed_capacity.unwrap().capacity_units,
+        "an OR whose branches all pin the same index partition should read only that partition"
+    );
+
+    // If every branch does not pin one shared partition, keep the scan plan.
+    let full_scan = read("SELECT * FROM \"SharedPartition\" WHERE x = 999");
+    for statement in [
+        "SELECT * FROM \"SharedPartition\" WHERE pk = 'k' OR x = 999",
+        "SELECT * FROM \"SharedPartition\" WHERE pk = 'k' OR pk = 'other'",
+    ] {
+        let response = read(statement);
+        assert_eq!(
+            response.consumed_capacity.unwrap().capacity_units,
+            full_scan.consumed_capacity.as_ref().unwrap().capacity_units,
+            "a query without a shared partition key should remain a scan: {statement}"
+        );
+    }
+
+    let page = |next_token| {
+        db.execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"SharedPartition\" WHERE pk = 'k' AND (x = 1 OR x = 2)"
+                .to_string(),
+            limit: Some(1),
+            next_token,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let mut next_token = None;
+    let mut values = Vec::new();
+    loop {
+        let response = page(next_token);
+        values.extend(
+            response
+                .items
+                .unwrap()
+                .iter()
+                .filter_map(|item| match item.get("x") {
+                    Some(AttributeValue::N(value)) => value.parse::<i64>().ok(),
+                    _ => None,
+                }),
+        );
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+    }
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        [1, 2],
+        "pagination should walk only the shared partition"
+    );
+}
+
+#[test]
 fn test_count_of_an_attribute_is_rejected_with_the_same_length() {
     // The length in the message is the COUNT token itself, not the whole call.
     let db = Database::memory().unwrap();

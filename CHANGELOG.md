@@ -55,6 +55,15 @@ Behaviour changes and `docs/compatibility-summary.md`.
   message, and a null where a member's value belongs with the deserialiser's
   `invalid type: null, expected ...`, as DynamoDB does. Other operations are
   unchanged ([#266](https://github.com/nubo-db/dynoxide/issues/266)).
+- `SearchVectors` answers a malformed request as DynamoDB's search endpoint
+  does. A wrongly typed member quotes the deserialiser, an unknown type lists
+  the ones it accepts, and the search vector, expression values and expression
+  names are checked before the table is looked up, in DynamoDB's order. An
+  invalid `ReturnConsumedCapacity` is refused on its own, without the
+  `1 validation error detected:` envelope, and a `TopK` beyond the 32-bit range
+  is a `ValidationException`. Its `SerializationException` bodies use a
+  lowercase `message`, as that endpoint writes them. Other operations are
+  unchanged ([#267](https://github.com/nubo-db/dynoxide/issues/267)).
 
 ## [1.4.0] - 2026-10-21
 

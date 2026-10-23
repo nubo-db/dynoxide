@@ -1709,3 +1709,186 @@ async fn test_search_vectors_missing_member_names_the_first_in_dynamodb_order() 
         );
     }
 }
+
+/// Send `body` to SearchVectors exactly as written, so a message's column can
+/// be compared with the one DynamoDB gave for the same bytes, and return the
+/// status and the response body.
+async fn search_vectors_raw(url: &str, body: &str) -> (u16, String) {
+    let resp = client()
+        .post(url)
+        .header("x-amz-target", "DynamoDB_20120810.SearchVectors")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+        )
+        .header("x-amz-date", "20260101T000000Z")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    (resp.status().as_u16(), resp.text().await.unwrap())
+}
+
+/// A SearchVectors body naming an absent table, with `values` as its
+/// ExpressionAttributeValues.
+fn search_vectors_with_values(values: &str) -> String {
+    format!(
+        r#"{{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{{"N":"1"}}],"TopK":1,"ExpressionAttributeValues":{values}}}"#
+    )
+}
+
+/// A SearchVectors body naming an absent table, with `vector` as its
+/// SearchVector.
+fn search_vectors_with_vector(vector: &str) -> String {
+    format!(
+        r#"{{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":{vector},"TopK":1}}"#
+    )
+}
+
+#[tokio::test]
+async fn test_search_vectors_shapeless_value_is_a_serialization_exception_with_no_message() {
+    let (url, _handle) = start_test_server().await;
+
+    // SearchVectors reads each attribute value strictly, one member at a
+    // time. A value that is null, has no member or has a second one, at the
+    // top or inside a list or map, is a SerializationException with no
+    // message at all (captured eu-west-2 and us-east-1, 23 October 2026).
+    let bodies = [
+        search_vectors_with_vector("[null]"),
+        search_vectors_with_vector(r#"[{"N":"1"},null]"#),
+        search_vectors_with_vector("[{}]"),
+        search_vectors_with_vector(r#"[{"S":"x","N":"1"}]"#),
+        search_vectors_with_values(r#"{":v":null}"#),
+        search_vectors_with_values(r#"{":v":{}}"#),
+        search_vectors_with_values(r#"{":a":{"S":"x"},":v":null}"#),
+        search_vectors_with_values(r#"{":v":{"S":"x","N":"1"}}"#),
+        search_vectors_with_values(r#"{":v":{"S":"a","N":null}}"#),
+        search_vectors_with_values(r#"{":v":{"L":[null]}}"#),
+        search_vectors_with_values(r#"{":v":{"M":{"a":null}}}"#),
+        // Read ahead of a null IndexName later in the body.
+        r#"{"TableName":"_capture_20261023_absent_x9","SearchVector":[null],"IndexName":null,"TopK":1}"#
+            .to_string(),
+    ];
+    for body in bodies {
+        let (status, response) = search_vectors_raw(&url, &body).await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            response, r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_vectors_typed_null_quotes_the_deserialiser() {
+    let (url, _handle) = start_test_server().await;
+
+    // A null where a member's own value belongs names the type the member
+    // takes, at the position DynamoDB gave for the same bytes (captured
+    // eu-west-2 and us-east-1, 23 October 2026).
+    let cases = [
+        (
+            search_vectors_with_vector(r#"[{"N":null}]"#),
+            "a string at line 1 column 86",
+        ),
+        (
+            search_vectors_with_vector(r#"[{"S":null}]"#),
+            "a string at line 1 column 86",
+        ),
+        (
+            search_vectors_with_vector(r#"[{"BOOL":null}]"#),
+            "a boolean at line 1 column 89",
+        ),
+        (
+            search_vectors_with_vector(r#"[{"L":null}]"#),
+            "a sequence at line 1 column 86",
+        ),
+        (
+            search_vectors_with_vector(r#"[{"NULL":null}]"#),
+            "a boolean at line 1 column 89",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"N":null}}"#),
+            "a string at line 1 column 140",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"S":null}}"#),
+            "a string at line 1 column 140",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"B":null}}"#),
+            "a Base64-encoded string at line 1 column 140",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"M":null}}"#),
+            "a map at line 1 column 140",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"SS":null}}"#),
+            "a sequence at line 1 column 141",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"BOOL":null}}"#),
+            "a boolean at line 1 column 143",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"NULL":null}}"#),
+            "a boolean at line 1 column 143",
+        ),
+        (
+            search_vectors_with_values(r#"{":v":{"SS":[null]}}"#),
+            "a string at line 1 column 142",
+        ),
+        // The first member is read before the second is noticed.
+        (
+            search_vectors_with_values(r#"{":v":{"N":null,"S":"a"}}"#),
+            "a string at line 1 column 140",
+        ),
+    ];
+    for (body, expected) in cases {
+        let (status, response) = search_vectors_raw(&url, &body).await;
+        assert_eq!(status, 400, "{body}");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["__type"], "com.amazon.coral.service#SerializationException",
+            "{body}"
+        );
+        assert_eq!(
+            response["Message"],
+            format!("invalid type: null, expected {expected}"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_null_value_on_query_is_still_a_validation_exception() {
+    let (url, _handle) = start_test_server().await;
+
+    // Only SearchVectors reads values strictly: Query answers the same shapes
+    // with a ValidationException, as DynamoDB does (captured eu-west-2, 23
+    // October 2026).
+    for values in [
+        json!({":v": null}),
+        json!({":v": {}}),
+        json!({":v": {"S": null}}),
+    ] {
+        let resp = dynamo_request(
+            &url,
+            "Query",
+            json!({
+                "TableName": "AnyTable",
+                "KeyConditionExpression": "pk = :v",
+                "ExpressionAttributeValues": values
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["__type"], "com.amazon.coral.validate#ValidationException",
+            "{values}"
+        );
+    }
+}

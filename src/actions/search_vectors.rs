@@ -51,7 +51,7 @@ struct SearchVectorsRequestRaw {
     index_name: String,
     /// A bare JSON array of number attribute values, not wrapped in `L`
     /// (confirmed on the wire against the AWS SDK's serialisation).
-    #[serde(rename = "SearchVector")]
+    #[serde(rename = "SearchVector", deserialize_with = "strict_values::vector")]
     search_vector: Vec<AttributeValue>,
     #[serde(rename = "TableName")]
     table_name: String,
@@ -69,10 +69,190 @@ struct SearchVectorsRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "strict_values::value_map"
+    )]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
+}
+
+/// SearchVectors' strict reading of attribute values.
+///
+/// DynamoDB's SearchVectors deserialiser reads each value as a tagged type,
+/// one member at a time, unlike the other operations, which look at a value
+/// whole and answer with a ValidationException. A value that is null, has no
+/// member or has a second one, at the top or inside a list or map, is a
+/// SerializationException with no message. A null where a member's own value
+/// belongs quotes the deserialiser, naming the type the member takes: "invalid
+/// type: null, expected a string at line 1 column N" (captured eu-west-2 and
+/// us-east-1, 23 October 2026).
+///
+/// Only the shape is checked here. A value that passes is handed to the shared
+/// decoder, so every other answer about it, and every value whose member is
+/// not a type this reads, stays as the other operations give it.
+mod strict_values {
+    use crate::types::AttributeValue;
+    use serde::Deserialize;
+    use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::fmt;
+
+    /// The SerializationException with no message a shapeless value gets.
+    fn shapeless<E: de::Error>() -> E {
+        E::custom(crate::serde_errors::SERIALIZATION_MARKER)
+    }
+
+    /// One attribute value, read strictly and decoded by the shared decoder.
+    struct Strict(AttributeValue);
+
+    impl<'de> Deserialize<'de> for Strict {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let shape = deserializer.deserialize_any(Shape)?;
+            AttributeValue::deserialize(shape)
+                .map(Strict)
+                .map_err(de::Error::custom)
+        }
+    }
+
+    /// An attribute value's JSON, checked member by member.
+    struct Shape;
+
+    /// A list or map element: shaped like a value, kept as JSON.
+    struct Element(Value);
+
+    impl<'de> Deserialize<'de> for Element {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(Shape).map(Element)
+        }
+    }
+
+    /// B and BS members, whose type DynamoDB names as a Base64-encoded string.
+    struct Base64Text(String);
+
+    impl<'de> Deserialize<'de> for Base64Text {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Text;
+            impl Visitor<'_> for Text {
+                type Value = String;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a Base64-encoded string")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+                    Ok(v.to_string())
+                }
+            }
+            deserializer.deserialize_string(Text).map(Base64Text)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Shape {
+        type Value = Value;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an attribute value")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+            Err(shapeless())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let Some(member) = map.next_key::<String>()? else {
+                return Err(shapeless());
+            };
+            let value = match member.as_str() {
+                "S" | "N" => Value::String(map.next_value()?),
+                "B" => Value::String(map.next_value::<Base64Text>()?.0),
+                "BOOL" | "NULL" => Value::Bool(map.next_value()?),
+                "SS" | "NS" => Value::from(map.next_value::<Vec<String>>()?),
+                "BS" => Value::from(
+                    map.next_value::<Vec<Base64Text>>()?
+                        .into_iter()
+                        .map(|text| text.0)
+                        .collect::<Vec<_>>(),
+                ),
+                "L" => Value::Array(
+                    map.next_value::<Vec<Element>>()?
+                        .into_iter()
+                        .map(|element| element.0)
+                        .collect(),
+                ),
+                "M" => Value::Object(
+                    map.next_value::<HashMap<String, Element>>()?
+                        .into_iter()
+                        .map(|(name, element)| (name, element.0))
+                        .collect(),
+                ),
+                // A member this does not read: the rest of the value goes to
+                // the shared decoder as it is.
+                _ => {
+                    let mut object = serde_json::Map::new();
+                    object.insert(member, map.next_value()?);
+                    while let Some((name, value)) = map.next_entry::<String, Value>()? {
+                        object.insert(name, value);
+                    }
+                    return Ok(Value::Object(object));
+                }
+            };
+            if map.next_key::<de::IgnoredAny>()?.is_some() {
+                return Err(shapeless());
+            }
+            let mut object = serde_json::Map::new();
+            object.insert(member, value);
+            Ok(Value::Object(object))
+        }
+
+        // Anything that is not an object or null is the shared decoder's to
+        // answer, as before.
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
+            Ok(Value::Bool(v))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
+            Ok(Value::from(v))
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+            Ok(Value::from(v))
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
+            Ok(Value::from(v))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+            Ok(Value::String(v.to_string()))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            let mut items = Vec::new();
+            while let Some(item) = seq.next_element::<Value>()? {
+                items.push(item);
+            }
+            Ok(Value::Array(items))
+        }
+    }
+
+    /// SearchVector, each element read strictly.
+    pub(super) fn vector<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<AttributeValue>, D::Error> {
+        let values = Vec::<Strict>::deserialize(deserializer)?;
+        Ok(values.into_iter().map(|value| value.0).collect())
+    }
+
+    /// ExpressionAttributeValues, each value read strictly. A null map reads
+    /// as absent.
+    pub(super) fn value_map<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+        let values = Option::<HashMap<String, Strict>>::deserialize(deserializer)?;
+        Ok(values.map(|values| {
+            values
+                .into_iter()
+                .map(|(name, value)| (name, value.0))
+                .collect()
+        }))
+    }
 }
 
 /// A SearchVectors request.

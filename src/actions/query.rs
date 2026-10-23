@@ -944,6 +944,13 @@ pub async fn execute<S: StorageBackend>(
     let mut base_table_cumulative_size = 0usize;
     let mut index_cumulative_size = 0usize;
 
+    // A read of the table itself is charged on its items' billed size, a vector
+    // at four bytes per dimension (captured eu-west-2 and us-east-1,
+    // 2026-10-23). Index entries stay sized by their numbers, as their writes
+    // are, and the 1MB page limit stays on the stored size.
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let mut billed_cumulative_size = 0usize;
+
     for (_pk, _sk, item_json) in &rows {
         let index_item: Item = serde_json::from_str(item_json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
@@ -971,7 +978,8 @@ pub async fn execute<S: StorageBackend>(
                 let full_item: Item = serde_json::from_str(&full_json).map_err(|e| {
                     DynoxideError::InternalServerError(format!("Bad item JSON: {e}"))
                 })?;
-                base_table_cumulative_size += crate::types::item_size(&full_item);
+                base_table_cumulative_size +=
+                    crate::types::billed_item_size(&full_item, &vector_defs);
                 full_item
             } else {
                 index_item.clone()
@@ -990,6 +998,9 @@ pub async fn execute<S: StorageBackend>(
             break;
         }
         cumulative_size += item_size;
+        if request.index_name.is_none() {
+            billed_cumulative_size += crate::types::billed_item_size(&item, &vector_defs);
+        }
 
         // Apply filter
         if let Some(ref filter) = filter_expr {
@@ -1115,7 +1126,7 @@ pub async fn execute<S: StorageBackend>(
     } else {
         crate::types::consumed_capacity(
             &request.table_name,
-            crate::types::read_capacity_units_with_consistency(cumulative_size, consistent),
+            crate::types::read_capacity_units_with_consistency(billed_cumulative_size, consistent),
             &request.return_consumed_capacity,
         )
     };

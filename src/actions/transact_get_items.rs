@@ -263,18 +263,21 @@ pub async fn execute<S: StorageBackend>(
     let mut reasons: Vec<CancellationReason> = Vec::with_capacity(request.transact_items.len());
     let mut validated_schemas: Vec<Option<helpers::KeySchema>> =
         Vec::with_capacity(request.transact_items.len());
+    let mut vector_defs: Vec<Vec<crate::types::VectorIndex>> =
+        Vec::with_capacity(request.transact_items.len());
     let mut has_failure = false;
 
     for transact_item in &request.transact_items {
         let get = &transact_item.get;
         match validate_action(storage, get).await {
-            Ok(schema) => {
+            Ok((schema, defs)) => {
                 reasons.push(CancellationReason {
                     code: "None".to_string(),
                     message: None,
                     item: None,
                 });
                 validated_schemas.push(Some(schema));
+                vector_defs.push(defs);
             }
             // Group KeyEmptyValueValidation with ValidationException so an
             // empty-value key stays a per-action ValidationError cancellation
@@ -329,8 +332,14 @@ pub async fn execute<S: StorageBackend>(
     }
 
     let mut responses = Vec::with_capacity(request.transact_items.len());
+    let mut read_sizes = Vec::with_capacity(request.transact_items.len());
 
-    for (transact_item, schema) in request.transact_items.iter().zip(validated_schemas.iter()) {
+    for ((transact_item, schema), defs) in request
+        .transact_items
+        .iter()
+        .zip(validated_schemas.iter())
+        .zip(vector_defs.iter())
+    {
         let get = &transact_item.get;
         let key_schema = schema.as_ref().expect("validated above");
 
@@ -340,6 +349,14 @@ pub async fn execute<S: StorageBackend>(
         let item_json = storage.get_item(&get.table_name, &pk, &sk).await?;
 
         let item: Option<Item> = item_json.and_then(|j| serde_json::from_str(&j).ok());
+
+        // Charged on the whole item's billed size, whatever the projection
+        // returns (captured eu-west-2 and us-east-1, 2026-10-23).
+        read_sizes.push(
+            item.as_ref()
+                .map(|item| crate::types::billed_item_size(item, defs))
+                .unwrap_or(0),
+        );
 
         // Apply projection if present
         let tracker = crate::expressions::TrackedExpressionAttributes::new(
@@ -400,8 +417,7 @@ pub async fn execute<S: StorageBackend>(
         // table, so a boundary-straddling item is not undercharged.
         let mut table_units: std::collections::HashMap<String, f64> =
             std::collections::HashMap::new();
-        for (resp, req_item) in responses.iter().zip(request.transact_items.iter()) {
-            let size = resp.item.as_ref().map(crate::types::item_size).unwrap_or(0);
+        for (&size, req_item) in read_sizes.iter().zip(request.transact_items.iter()) {
             *table_units
                 .entry(req_item.get.table_name.clone())
                 .or_default() += crate::types::TRANSACTIONAL_CAPACITY_FACTOR
@@ -432,14 +448,16 @@ pub async fn execute<S: StorageBackend>(
 /// through the cancellation channel as ValidationError) for a single
 /// TransactGet action: table-name shape, table existence, parsed key schema,
 /// and key shape against that schema. Returns the resolved KeySchema so the
-/// caller can avoid re-parsing it before extract_key_strings.
+/// caller can avoid re-parsing it before extract_key_strings, and the table's
+/// vector indexes, which the read is billed by.
 async fn validate_action<S: StorageBackend>(
     storage: &S,
     get: &TransactGet,
-) -> Result<helpers::KeySchema> {
+) -> Result<(helpers::KeySchema, Vec<crate::types::VectorIndex>)> {
     crate::validation::validate_table_name(&get.table_name)?;
     let meta = helpers::require_table_for_item_op(storage, &get.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
     helpers::validate_key_only(&get.key, &key_schema)?;
-    Ok(key_schema)
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(&meta)?;
+    Ok((key_schema, vector_defs))
 }

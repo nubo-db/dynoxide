@@ -555,6 +555,97 @@ fn imported_stream_records_follow_the_tables_view_type() {
     }
 }
 
+/// Every record on `table`'s one shard, from the start, as a consumer reads it.
+fn all_stream_records(db: &Database, table: &str) -> Vec<dynoxide::actions::get_records::Record> {
+    use dynoxide::actions::get_records::GetRecordsRequest;
+    use dynoxide::actions::get_shard_iterator::GetShardIteratorRequest;
+    use dynoxide::actions::list_streams::ListStreamsRequest;
+
+    let stream_arn = db
+        .list_streams(ListStreamsRequest {
+            table_name: Some(table.to_string()),
+            exclusive_start_stream_arn: None,
+            limit: None,
+        })
+        .unwrap()
+        .streams
+        .remove(0)
+        .stream_arn;
+    let shard = only_shard(db, &stream_arn);
+    let iterator = db
+        .get_shard_iterator(GetShardIteratorRequest {
+            stream_arn,
+            shard_id: shard.shard_id,
+            shard_iterator_type: "TRIM_HORIZON".to_string(),
+            sequence_number: None,
+        })
+        .unwrap()
+        .shard_iterator
+        .unwrap();
+    db.get_records(GetRecordsRequest {
+        shard_iterator: iterator,
+        limit: None,
+    })
+    .unwrap()
+    .records
+}
+
+/// An import that replaces an item records a `MODIFY` carrying the item it
+/// replaced, as a `PutItem` over the key does, whether the earlier item was
+/// already stored or came earlier in the same import. A new key is still an
+/// `INSERT`.
+#[test]
+fn an_import_over_an_existing_key_records_a_modify() {
+    use dynoxide::actions::create_table::CreateTableRequest;
+    use dynoxide::types::{AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType};
+
+    let db = create_test_db();
+    db.create_table(CreateTableRequest {
+        table_name: "Replaced".to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::HASH,
+        }],
+        attribute_definitions: vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: ScalarAttributeType::S,
+        }],
+        stream_specification: Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some("NEW_AND_OLD_IMAGES".to_string()),
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    let opts = || ImportOptions {
+        record_streams: true,
+        ..Default::default()
+    };
+
+    let a1 = dynoxide::item! { "pk" => "a", "v" => "1" };
+    let a2 = dynoxide::item! { "pk" => "a", "v" => "2" };
+    let a3 = dynoxide::item! { "pk" => "a", "v" => "3" };
+    let b1 = dynoxide::item! { "pk" => "b", "v" => "1" };
+    db.import_items("Replaced", vec![a1.clone()], opts())
+        .unwrap();
+    db.import_items("Replaced", vec![a2.clone(), b1.clone(), a3.clone()], opts())
+        .unwrap();
+
+    let records: Vec<_> = all_stream_records(&db, "Replaced")
+        .into_iter()
+        .map(|r| (r.event_name, r.dynamodb.old_image, r.dynamodb.new_image))
+        .collect();
+    assert_eq!(
+        records,
+        vec![
+            ("INSERT".to_string(), None, Some(a1.clone())),
+            ("MODIFY".to_string(), Some(a1), Some(a2.clone())),
+            ("INSERT".to_string(), None, Some(b1)),
+            ("MODIFY".to_string(), Some(a2), Some(a3)),
+        ]
+    );
+}
+
 #[test]
 fn import_with_record_streams() {
     use dynoxide::actions::create_table::CreateTableRequest;

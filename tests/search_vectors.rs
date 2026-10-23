@@ -689,8 +689,10 @@ async fn member_errors_come_before_a_malformed_table_name_in_process() {
 
 #[test]
 fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
-    // SearchVectors asks the shared enum helper rather than carrying its own
-    // copy, so the wording here is the same one Query, Scan and PutItem give.
+    // SearchVectors asks the shared enum helper for the wording Query, Scan
+    // and PutItem give, but reports it bare, on its own after the member
+    // constraints: this pinned the envelope those operations use until the
+    // search endpoint was captured (eu-west-2 and us-east-1, 23 October 2026).
     // The table name has to be valid: a short one is reported first.
     let err = request_model_error(serde_json::from_value(json!({
         "TableName": "AnyTable", "IndexName": "vix",
@@ -699,8 +701,8 @@ fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
     })));
     assert_eq!(
         err,
-        "1 validation error detected: Value 'INDEX' at 'returnConsumedCapacity' failed to \
-         satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+        "Value 'INDEX' at 'returnConsumedCapacity' failed to satisfy constraint: Member must \
+         satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
 }
 
@@ -1810,28 +1812,18 @@ async fn a_nested_path_in_the_condition_is_rejected_not_silently_empty() {
     let storage = Storage::memory().unwrap();
     create_schema_fixture(&storage, "VecNest").await;
 
-    // Each expression is given only the names and values it uses, since an
-    // unused one is refused before the table is looked up.
-    for (expr, names, values) in [
-        (
-            "#t.deep = :t",
-            json!({"#t": "tenant"}),
-            json!({":t": {"S": "t1"}}),
-        ),
-        (
-            "#t = :t AND #c.deep = :c",
-            json!({"#t": "tenant", "#c": "category"}),
-            json!({":t": {"S": "t1"}, ":c": {"S": "c1"}}),
-        ),
-    ] {
+    // Both expressions share one body, so the first leaves #c and :c unused:
+    // the nested refusal still comes first (captured eu-west-2 and us-east-1,
+    // 23 October 2026).
+    for expr in ["#t.deep = :t", "#t = :t AND #c.deep = :c"] {
         let err = search(
             &storage,
             json!({
                 "TableName": "VecNest", "IndexName": "schema",
                 "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 5,
                 "SearchConditionExpression": expr,
-                "ExpressionAttributeNames": names,
-                "ExpressionAttributeValues": values
+                "ExpressionAttributeNames": {"#t": "tenant", "#c": "category"},
+                "ExpressionAttributeValues": {":t": {"S": "t1"}, ":c": {"S": "c1"}}
             }),
         )
         .await

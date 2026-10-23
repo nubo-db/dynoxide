@@ -416,16 +416,19 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
         // to its own words, so the pass-through is made here rather than in the
         // shared decoder. A null optional member reads as absent, as it does on
         // DynamoDB.
+        // An integer TopK beyond i32 is quoted the same way, as a
+        // ValidationException (captured eu-west-2 and us-east-1, 23 October
+        // 2026).
         let raw = SearchVectorsRequestRaw::deserialize(deserializer).map_err(|e| {
             let msg = e.to_string();
-            if msg.starts_with("invalid type: ") {
-                serde::de::Error::custom(format!(
-                    "{}{msg}",
-                    crate::serde_errors::SERIALIZATION_AS_READ_MARKER
-                ))
+            let marker = if msg.starts_with("invalid type: ") {
+                crate::serde_errors::SERIALIZATION_AS_READ_MARKER
+            } else if msg.starts_with("invalid value: ") {
+                crate::serde_errors::VALIDATION_AS_READ_MARKER
             } else {
-                e
-            }
+                return e;
+            };
+            serde::de::Error::custom(format!("{marker}{msg}"))
         })?;
         use crate::validation::format_validation_errors;
 
@@ -439,30 +442,25 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
             )));
         }
 
-        let mut errors = member_constraint_errors(
+        let errors = member_constraint_errors(
             &raw.index_name,
             raw.search_vector.len(),
             i64::from(raw.top_k),
         );
 
+        if let Some(msg) = format_validation_errors(&errors) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+        }
+
         // A table name that breaks its constraints comes after those members
         // and ahead of ReturnConsumedCapacity, without the envelope, one error
         // per name (captured 2026-10-09, six of six regions).
-        if errors.is_empty()
-            && let Some(msg) = crate::validation::first_table_name_error(&raw.table_name)
-        {
+        if let Some(msg) = crate::validation::first_table_name_error(&raw.table_name) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
 
-        // ReturnConsumedCapacity enum validation
-        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-            raw.return_consumed_capacity.as_deref(),
-        ) {
-            errors.push(msg);
-        }
-
-        if let Some(msg) = format_validation_errors(&errors) {
-            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+        if let Some(e) = return_consumed_capacity_error(raw.return_consumed_capacity.as_deref()) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{e}")));
         }
 
         // Then the TopK ceiling, the search vector and the expression values,
@@ -741,6 +739,15 @@ fn search_vector_floats(search_vector: &[AttributeValue]) -> Result<Vec<f32>> {
         .collect()
 }
 
+/// ReturnConsumedCapacity outside its enum, checked on its own and reported
+/// bare, after the member constraints and the table name and ahead of the TopK
+/// ceiling; a member constraint beside it is reported alone (captured
+/// eu-west-2 and us-east-1, 23 October 2026).
+fn return_consumed_capacity_error(mode: Option<&str>) -> Option<DynoxideError> {
+    crate::validation::return_consumed_capacity_rejection(mode)
+        .map(DynoxideError::ValidationException)
+}
+
 /// TopK beyond the upper bound rejects bare with the value interpolated
 /// (captured 2026-08-11: 101), after the member constraints and before the
 /// search vector (captured eu-west-2 and us-east-1, 23 October 2026). The
@@ -834,6 +841,9 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(msg));
     }
 
+    if let Some(e) = return_consumed_capacity_error(request.return_consumed_capacity.as_deref()) {
+        return Err(e);
+    }
     if let Some(e) = top_k_ceiling_error(request.top_k) {
         return Err(e);
     }
@@ -913,6 +923,40 @@ pub async fn execute<S: StorageBackend>(
         None => None,
     };
 
+    // A condition on a nested attribute is refused outright, with one message
+    // covering both element types (captured eu-west-2, 2026-08-19), before an
+    // unused name or value and before the table is looked up, as is a second
+    // condition on one attribute (captured eu-west-2 and us-east-1, 23 October
+    // 2026). Without
+    // this a nested path silently matched nothing, so a malformed search was
+    // indistinguishable from one that found nothing.
+    if pairs.iter().any(|p| p.nested) {
+        return Err(DynoxideError::ValidationException(
+            "Invalid SearchConditionExpression: SearchConditionExpression cannot have \
+             conditions on nested attributes"
+                .to_string(),
+        ));
+    }
+
+    // Exactly one condition per attribute. Two that contradict, two that agree,
+    // and two carrying a type error between them all give this same message,
+    // and the order they appear in does not change it (captured eu-west-2,
+    // 2026-08-19). Reconciling two scope values would be modelling something
+    // the wire never accepts, so the checks below can assume one pair each.
+    {
+        let mut seen: Vec<&str> = Vec::with_capacity(pairs.len());
+        for pair in &pairs {
+            if seen.contains(&pair.attr.as_str()) {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid SearchConditionExpression: SearchConditionExpression must only \
+                     contain one condition per attribute"
+                        .to_string(),
+                ));
+            }
+            seen.push(&pair.attr);
+        }
+    }
+
     // Register what the expressions use, then refuse an unused name or value
     // before the table is looked up, names first (captured eu-west-2 and
     // us-east-1, 23 October 2026).
@@ -972,37 +1016,6 @@ pub async fn execute<S: StorageBackend>(
                 "SearchConditionExpression must not contain any attributes that is not in \
                  SearchSchema. Invalid attribute: {attr}"
             )));
-        }
-    }
-
-    // A condition on a nested attribute is refused outright, with one message
-    // covering both element types (captured eu-west-2, 2026-08-19). Without
-    // this a nested path silently matched nothing, so a malformed search was
-    // indistinguishable from one that found nothing.
-    if pairs.iter().any(|p| p.nested) {
-        return Err(DynoxideError::ValidationException(
-            "Invalid SearchConditionExpression: SearchConditionExpression cannot have \
-             conditions on nested attributes"
-                .to_string(),
-        ));
-    }
-
-    // Exactly one condition per attribute. Two that contradict, two that agree,
-    // and two carrying a type error between them all give this same message,
-    // and the order they appear in does not change it (captured eu-west-2,
-    // 2026-08-19). Reconciling two scope values would be modelling something
-    // the wire never accepts, so the checks below can assume one pair each.
-    {
-        let mut seen: Vec<&str> = Vec::with_capacity(pairs.len());
-        for pair in &pairs {
-            if seen.contains(&pair.attr.as_str()) {
-                return Err(DynoxideError::ValidationException(
-                    "Invalid SearchConditionExpression: SearchConditionExpression must only \
-                     contain one condition per attribute"
-                        .to_string(),
-                ));
-            }
-            seen.push(&pair.attr);
         }
     }
 

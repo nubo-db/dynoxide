@@ -64,13 +64,19 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 /// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag,
 /// `VALIDATION:` a bare `ValidationException` and `SERIALIZATION:` a
 /// `SerializationException`, as does `SERIALIZATION_AS_READ:` with the
-/// position left on; an unmarked message returns
+/// position left on, and `VALIDATION_AS_READ:` a `ValidationException` the
+/// same way; an unmarked message returns
 /// `None` for the caller to classify. This is the single owner of the
 /// marker-to-variant mapping, shared by [`deserialize`] and callers that
 /// decode via `serde_json::from_value` (the MCP surface).
 pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
     if let Some(as_read) = msg.strip_prefix(SERIALIZATION_AS_READ_MARKER) {
         return Some(crate::DynoxideError::SerializationException(
+            as_read.to_string(),
+        ));
+    }
+    if let Some(as_read) = msg.strip_prefix(VALIDATION_AS_READ_MARKER) {
+        return Some(crate::DynoxideError::ValidationException(
             as_read.to_string(),
         ));
     }
@@ -182,6 +188,10 @@ pub(crate) const SERIALIZATION_MARKER: &str = "SERIALIZATION:";
 /// serde_json's position suffix included. The suffix belongs to the inner
 /// error, since serde_json adds none to a custom error raised at the top level.
 pub(crate) const SERIALIZATION_AS_READ_MARKER: &str = "SERIALIZATION_AS_READ:";
+
+/// As [`SERIALIZATION_AS_READ_MARKER`], mapped to a bare `ValidationException`
+/// that keeps the deserialiser's message whole.
+pub(crate) const VALIDATION_AS_READ_MARKER: &str = "VALIDATION_AS_READ:";
 
 /// Marker prefix for the request-validation class raised inside serde
 /// deserialisation, mapped to the wire-invisible `EnvelopedValidation` tag
@@ -318,6 +328,7 @@ pub(crate) fn clean_serde_message(msg: &str) -> &str {
     let clean = strip_position(msg);
     clean
         .strip_prefix(SERIALIZATION_AS_READ_MARKER)
+        .or_else(|| clean.strip_prefix(VALIDATION_AS_READ_MARKER))
         .or_else(|| clean.strip_prefix(REQUEST_VALIDATION_MARKER))
         .or_else(|| clean.strip_prefix(VALIDATION_MARKER))
         .or_else(|| clean.strip_prefix(SERIALIZATION_MARKER))

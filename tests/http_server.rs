@@ -2781,3 +2781,215 @@ async fn test_search_vectors_expression_parameters() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_search_vectors_return_consumed_capacity_is_its_own_check() {
+    let (url, _handle) = start_test_server().await;
+
+    // ReturnConsumedCapacity is checked on its own, bare, after the member
+    // constraints and the table name and ahead of the TopK ceiling and the
+    // search vector. A member constraint beside it is reported alone. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "r_rcc",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+            ),
+            (
+                "r_rcc_lower",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ReturnConsumedCapacity":"total"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'total' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+            ),
+            (
+                "r_rcc_badvec",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+            ),
+            (
+                "r_rcc_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "r_rcc_topk0",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":0,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'TopK' failed to satisfy constraint: Member must have value greater than or equal to 1"}"#,
+            ),
+            (
+                "r_rcc_tblBad",
+                r#"{"TableName":"a!","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "r_rcc_topk101",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":101,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+            ),
+            (
+                "r_rcc_badvec_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"S":"a"}],"TopK":1,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "r_rcc_emptyVec",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[],"TopK":1,"ReturnConsumedCapacity":"BAD"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'SearchVector' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+            ),
+            (
+                "r_rcc_eavNoExpr",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ReturnConsumedCapacity":"BAD","ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_top_k_of_the_wrong_type() {
+    let (url, _handle) = start_test_server().await;
+
+    // TopK of the wrong JSON type quotes the deserialiser as a
+    // SerializationException; an integer beyond i32 is a ValidationException
+    // in the same words; a whole number written as a float is read. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "t_str10",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":"10"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"10\", expected i32 at line 1 column 99"}"#,
+            ),
+            (
+                "t_strAbc",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":"abc"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"abc\", expected i32 at line 1 column 100"}"#,
+            ),
+            (
+                "t_str15",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":"1.5"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"1.5\", expected i32 at line 1 column 100"}"#,
+            ),
+            (
+                "t_bool",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":true}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: boolean `true`, expected i32 at line 1 column 99"}"#,
+            ),
+            (
+                "t_map",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: map, expected i32 at line 1 column 95"}"#,
+            ),
+            (
+                "t_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":[]}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: sequence, expected i32 at line 1 column 95"}"#,
+            ),
+            (
+                "t_big",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":10000000000}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"invalid value: integer `10000000000`, expected i32 at line 1 column 106"}"#,
+            ),
+            (
+                "t_i32max1",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":2147483648}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"invalid value: integer `2147483648`, expected i32 at line 1 column 105"}"#,
+            ),
+            (
+                "t_neg",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":-1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'TopK' failed to satisfy constraint: Member must have value greater than or equal to 1"}"#,
+            ),
+            (
+                "t_float_whole",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":2}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_condition_shape_is_refused_before_unused_names() {
+    let (url, _handle) = start_test_server().await;
+
+    // A condition on a nested attribute, or two on one attribute, is refused
+    // before an unused name or value is, and before the table is looked up. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "n_nested_unused",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#t.deep = :t","ExpressionAttributeNames":{"#t":"tenant","#c":"category"},"ExpressionAttributeValues":{":t":{"S":"t1"},":c":{"S":"c1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression cannot have conditions on nested attributes"}"#,
+            ),
+            (
+                "n_nested_only",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#t.deep = :t","ExpressionAttributeNames":{"#t":"tenant"},"ExpressionAttributeValues":{":t":{"S":"t1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression cannot have conditions on nested attributes"}"#,
+            ),
+            (
+                "n_nested_unusedValue",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#t.deep = :t","ExpressionAttributeNames":{"#t":"tenant"},"ExpressionAttributeValues":{":t":{"S":"t1"},":c":{"S":"c1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression cannot have conditions on nested attributes"}"#,
+            ),
+            (
+                "n_nested2_unused",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#t = :t AND #c.deep = :c","ExpressionAttributeNames":{"#t":"tenant","#c":"category","#z":"z"},"ExpressionAttributeValues":{":t":{"S":"t1"},":c":{"S":"c1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression cannot have conditions on nested attributes"}"#,
+            ),
+            (
+                "n_nested_literal_unused",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"tenant.deep = :t","ExpressionAttributeNames":{"#c":"category"},"ExpressionAttributeValues":{":t":{"S":"t1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression cannot have conditions on nested attributes"}"#,
+            ),
+            (
+                "n_index_nested",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#t[0] = :t","ExpressionAttributeNames":{"#t":"tenant","#c":"c"},"ExpressionAttributeValues":{":t":{"S":"t1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression cannot have conditions on nested attributes"}"#,
+            ),
+            (
+                "n_twice_unused",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#t = :t AND #t = :t","ExpressionAttributeNames":{"#t":"tenant","#c":"c"},"ExpressionAttributeValues":{":t":{"S":"t1"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: SearchConditionExpression must only contain one condition per attribute"}"#,
+            ),
+        ],
+    )
+    .await;
+}

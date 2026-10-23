@@ -22,6 +22,14 @@ Behaviour changes and `docs/compatibility-summary.md`.
 
 ### Behaviour changes
 
+- **The `http-server` and `mcp-server` features no longer turn on `cli`.** A
+  library that embeds either server stops compiling clap and
+  `tracing-subscriber`, which only the binary uses: 22 fewer crates for
+  `native-sqlite,http-server`. The default features, `full` and the
+  `encrypted-*` bundles include `cli` already, but a build that names the
+  server features explicitly needs `cli` added to get the binary. A crate that
+  relied on Dynoxide to turn on `tracing-subscriber`'s `env-filter` feature
+  needs to enable it itself.
 - **A read of a table with a vector index is charged on the billed size.**
   DynamoDB bills a vector attribute at four bytes per dimension on reads now,
   as it already did on writes, so an item whose numbers took it over a 4 KB

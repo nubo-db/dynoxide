@@ -16,6 +16,12 @@ Behaviour changes and `docs/compatibility-summary.md`.
 
 ### Security
 
+- **`tokio` moves to 1.54.1** for RUSTSEC-2026-0386. `AsyncFd`'s safe
+  constructors accepted a file descriptor the caller didn't own, which could
+  lead to a use-after-free in the runtime if that descriptor was closed and its
+  number reused. Dynoxide doesn't use `AsyncFd`, but tokio is built into the
+  binary and the `http-server` and `mcp-server` features, so the fix ships in
+  this release.
 - **`ctutils` moves to 0.4.5** for RUSTSEC-2026-0385, non-constant-time mask
   generation and `u128` comparisons. It reaches the tree through the AWS SDK,
   a dev-dependency only, and never shipped in a released artefact.

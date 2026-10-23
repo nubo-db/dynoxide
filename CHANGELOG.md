@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-23
+
+The crate moves to `dynoxide-rs` 3.2.0. Everything else a user installs carries
+1.5.0. The release brings read capacity, stream records and SearchVectors
+errors in line with DynamoDB, so some requests answer differently: see
+Behaviour changes and `docs/compatibility-summary.md`.
+
+### Security
+
+- **`ctutils` moves to 0.4.5** for RUSTSEC-2026-0385, non-constant-time mask
+  generation and `u128` comparisons. It reaches the tree through the AWS SDK,
+  a dev-dependency only, and never shipped in a released artefact.
+
+### Behaviour changes
+
+- **A read of a table with a vector index is charged on the billed size.**
+  DynamoDB bills a vector attribute at four bytes per dimension on reads now,
+  as it already did on writes, so an item whose numbers took it over a 4 KB
+  boundary costs a unit less. This applies to `GetItem`, `BatchGetItem`,
+  `TransactGetItems`, `Query`, `Scan` and every PartiQL read of the table. A
+  read served from a secondary index and the 400 KB item limit still size the
+  vector by its numbers ([#264](https://github.com/nubo-db/dynoxide/issues/264)).
+- **`GetItem` and `TransactGetItems` charge the whole item whatever the
+  projection returns**, as `BatchGetItem` and DynamoDB already did. A read of
+  one attribute of a large item used to cost only what it returned.
+- An import with `record_streams` records a `MODIFY` carrying the item it
+  replaced when it overwrites a key, whether that item was stored before the
+  import or came earlier in it, as a `PutItem` over the key does. It used to
+  record an `INSERT` with no old image
+  ([#265](https://github.com/nubo-db/dynoxide/issues/265)).
+
+### Fixed
+
+- Stream records written by an import with `record_streams` go to the shard
+  `DescribeStream` lists and follow the table's `StreamViewType`. A consumer
+  following `DescribeStream` never saw them, and a `KEYS_ONLY` table got the
+  new image anyway ([#260](https://github.com/nubo-db/dynoxide/issues/260)).
+- `SearchVectors` answers an explicit null `IndexName`, `TableName`,
+  `SearchVector` or `TopK` with a `SerializationException` quoting the
+  deserialiser, as DynamoDB does. A missing `TableName` gets the same
+  missing-field `ValidationException` as the other three required members,
+  ahead of a too-short `IndexName`
+  ([#263](https://github.com/nubo-db/dynoxide/issues/263)).
+- `SearchVectors` answers a null, empty or two-type value in `SearchVector` or
+  `ExpressionAttributeValues` with a `SerializationException` carrying no
+  message, and a null where a member's value belongs with the deserialiser's
+  `invalid type: null, expected ...`, as DynamoDB does. Other operations are
+  unchanged ([#266](https://github.com/nubo-db/dynoxide/issues/266)).
+
 ## [1.4.0] - 2026-10-21
 
 The crate moves to `dynoxide-rs` 3.1.0 for the new `server::serve_with_shutdown`.
@@ -1884,7 +1933,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/nubo-db/dynoxide/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...v1.2.1

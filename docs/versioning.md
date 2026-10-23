@@ -62,6 +62,7 @@ additive and ships as a minor; changing or removing one is not.
 | Conformance fix, capture-backed | Both | minor |
 | New DynamoDB operation | Both | minor |
 | New feature flag | Crate | minor |
+| Feature flag turns on less, with no public item lost | Crate | minor |
 | MSRV raise | Crate | minor |
 | Dependency bump with no surface change | Both | patch |
 

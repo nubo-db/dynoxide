@@ -801,8 +801,10 @@ fn arm(cc: &Value, index: Option<&str>) -> f64 {
 /// number-rule size, as the entry's own write is (captured eu-west-2 and
 /// us-east-1, 2026-10-09, see
 /// `secondary_indexes_on_a_vector_table_size_entries_by_their_numbers`).
-/// Reads from an index were not captured separately; this pins the reading
-/// that keeps them consistent with that write sizing. A read of the base item,
+/// Reads from an index follow it: a Query of an ALL GSI (eventually
+/// consistent) and of an ALL LSI (strongly consistent), and a PartiQL read of
+/// the GSI, cost 1, 2 and 1 units for an item billed at 4,096 and 4,201 bytes
+/// by its numbers (captured eu-west-2, 2026-10-23). A read of the base item,
 /// the LSI fetch behind `Select: ALL_ATTRIBUTES` on a KEYS_ONLY LSI and a
 /// PartiQL reach-back, is a table read and charged on the billed size. The
 /// item is billed at 4,096 bytes and over 4,096 by its numbers, so each arm

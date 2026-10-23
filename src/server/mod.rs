@@ -373,7 +373,7 @@ async fn handle_request(
         }
         Err(e) => {
             let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
-            let json = e.to_json();
+            let json = e.to_json_for(operation);
             tracing::warn!(operation, status = %status, "error response");
             tracing::trace!(operation, body = %json, "error response body");
             dynamo_response(status, response_ct, json)

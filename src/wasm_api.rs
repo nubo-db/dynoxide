@@ -209,7 +209,7 @@ pub async fn dispatch_http<S: StorageBackend>(
                 return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
             }
             crate::deep_nesting::DeepBody::Refuse(e) => {
-                return HttpOutcome::new(e.status_code(), e.to_json());
+                return HttpOutcome::new(e.status_code(), e.to_json_for(operation));
             }
             crate::deep_nesting::DeepBody::Run(body) => {
                 rewritten = body;
@@ -225,7 +225,7 @@ pub async fn dispatch_http<S: StorageBackend>(
     // serialised envelope. Same source of truth as the native server.
     match route(backend, ctx, operation, body).await {
         Ok(json) => HttpOutcome::new(200, json),
-        Err(e) => HttpOutcome::new(e.status_code(), e.to_json()),
+        Err(e) => HttpOutcome::new(e.status_code(), e.to_json_for(operation)),
     }
 }
 
@@ -275,15 +275,15 @@ pub async fn dispatch<S: StorageBackend>(
                 crate::deep_nesting::DeepBody::Unreadable => {
                     Err(SERIALIZATION_EXCEPTION_BARE.to_string())
                 }
-                crate::deep_nesting::DeepBody::Refuse(e) => Err(e.to_json()),
+                crate::deep_nesting::DeepBody::Refuse(e) => Err(e.to_json_for(op)),
                 crate::deep_nesting::DeepBody::Run(rewritten) => {
                     route(backend, ctx, op, &rewritten)
                         .await
-                        .map_err(|e| e.to_json())
+                        .map_err(|e| e.to_json_for(op))
                 }
             }
         }
-        Err(e) => Err(e.to_json()),
+        Err(e) => Err(e.to_json_for(op)),
     }
 }
 
@@ -882,6 +882,48 @@ mod tests {
             !message.contains("at line"),
             "raw serde text leaked instead of the captured message: {v}"
         );
+    }
+
+    /// SearchVectors' SerializationException reaches both wasm surfaces as its
+    /// endpoint writes it: `__type` then a lowercase `message`, and no message
+    /// key at all when there is no message (captured eu-west-2 and us-east-1,
+    /// 23 October 2026). `a_mistyped_vector_field_is_a_serialization_exception_here_too`
+    /// pins the capital `Message` every other operation keeps.
+    #[test]
+    fn search_vectors_serialization_bodies_use_a_lowercase_message() {
+        let backend = Storage::memory().unwrap();
+        let null_table =
+            r#"{"IndexName":"vix","TableName":null,"SearchVector":[{"N":"1"}],"TopK":1}"#;
+        let body = run(&backend, "SearchVectors", null_table).unwrap_err();
+        assert!(
+            body.starts_with(r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string"#),
+            "dispatch: {body}"
+        );
+
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.SearchVectors"),
+            null_table,
+        );
+        assert_eq!(out.status, 400);
+        assert!(
+            out.body.starts_with(r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string"#),
+            "dispatch_http: {}",
+            out.body
+        );
+
+        let null_element = r#"{"IndexName":"vix","TableName":"t","SearchVector":[null],"TopK":1}"#;
+        let bare = r#"{"__type":"com.amazon.coral.service#SerializationException"}"#;
+        assert_eq!(
+            run(&backend, "SearchVectors", null_element).unwrap_err(),
+            bare
+        );
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.SearchVectors"),
+            null_element,
+        );
+        assert_eq!((out.status, out.body.as_str()), (400, bare));
     }
 
     #[test]

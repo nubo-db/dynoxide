@@ -1602,6 +1602,7 @@ async fn execute_select<S: StorageBackend>(
     };
     let meta = &resolved.meta;
     let table_key_schema = &resolved.key_schema;
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
 
     let index = index_name
         .map(|name| resolve_index(meta, name))
@@ -1763,6 +1764,7 @@ async fn execute_select<S: StorageBackend>(
         reach_back,
         consistent_read,
         order.as_ref(),
+        &vector_defs,
     )
     .await?;
 
@@ -1861,6 +1863,7 @@ async fn evaluate_window<S: StorageBackend>(
     reach_back: bool,
     consistent_read: bool,
     order: Option<&OrderPlan>,
+    vector_defs: &[crate::types::VectorIndex],
 ) -> Result<Window> {
     // A keyed read needs an equality on the partition key. An index whose key
     // has more than one attribute never gets here: its reads are refused first
@@ -2042,7 +2045,14 @@ async fn evaluate_window<S: StorageBackend>(
         let item: Item = serde_json::from_str(&json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
         })?;
-        evaluated_bytes += crate::types::item_size(&item);
+        // A row of the table itself is charged on its billed size, a vector at
+        // four bytes per dimension (captured eu-west-2 and us-east-1,
+        // 2026-10-23). An index row stays sized by its numbers.
+        evaluated_bytes += if index.is_none() {
+            crate::types::billed_item_size(&item, vector_defs)
+        } else {
+            crate::types::item_size(&item)
+        };
 
         // The reach-back runs on every row walked, not on the rows the filter
         // keeps. Charging only the survivors made a filter that matched nothing
@@ -2063,7 +2073,7 @@ async fn evaluate_window<S: StorageBackend>(
         };
         if let Some(ref full) = full {
             base_read_units += crate::types::read_capacity_units_with_consistency(
-                crate::types::item_size(full),
+                crate::types::billed_item_size(full, vector_defs),
                 consistent_read,
             );
         }

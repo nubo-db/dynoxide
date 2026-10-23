@@ -10,7 +10,7 @@
 //! The binary tests spawn `dynoxide` as a subprocess so the argument parsing
 //! and the startup routing are exercised end to end.
 
-#![cfg(all(feature = "http-server", feature = "mcp-server"))]
+#![cfg(all(feature = "http-server", feature = "mcp-server", feature = "cli"))]
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};

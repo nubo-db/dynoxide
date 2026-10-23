@@ -64,6 +64,16 @@ fn request_model_error(result: Result<SearchVectorsRequest, serde_json::Error>) 
         .to_string()
 }
 
+/// Unwrap a rejection raised inside serde that passes the deserialiser's own
+/// text through, which carries the internal `SERIALIZATION_AS_READ:` marker
+/// the server layer strips.
+fn as_read_error(result: Result<SearchVectorsRequest, serde_json::Error>) -> String {
+    let err = result.unwrap_err().to_string();
+    err.strip_prefix("SERIALIZATION_AS_READ:")
+        .expect("deserialiser rejections carry the SERIALIZATION_AS_READ: marker")
+        .to_string()
+}
+
 /// The `(pk, score)` pairs of a response, in response order.
 fn scores(resp: &SearchVectorsResponse) -> Vec<(String, f64)> {
     resp.search_results
@@ -80,6 +90,13 @@ fn scores(resp: &SearchVectorsResponse) -> Vec<(String, f64)> {
 
 fn n_vec(ns: &[&str]) -> serde_json::Value {
     json!(ns.iter().map(|n| json!({"N": n})).collect::<Vec<_>>())
+}
+
+/// As [`n_vec`], as the attribute values a request built in Rust carries.
+fn n_vec_values(ns: &[&str]) -> Vec<dynoxide::types::AttributeValue> {
+    ns.iter()
+        .map(|n| dynoxide::types::AttributeValue::N(n.to_string()))
+        .collect()
 }
 
 /// The epoch second every lifecycle test starts its clock at. An index armed
@@ -672,8 +689,10 @@ async fn member_errors_come_before_a_malformed_table_name_in_process() {
 
 #[test]
 fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
-    // SearchVectors asks the shared enum helper rather than carrying its own
-    // copy, so the wording here is the same one Query, Scan and PutItem give.
+    // SearchVectors asks the shared enum helper for the wording Query, Scan
+    // and PutItem give, but reports it bare, on its own after the member
+    // constraints: this pinned the envelope those operations use until the
+    // search endpoint was captured (eu-west-2 and us-east-1, 23 October 2026).
     // The table name has to be valid: a short one is reported first.
     let err = request_model_error(serde_json::from_value(json!({
         "TableName": "AnyTable", "IndexName": "vix",
@@ -682,30 +701,38 @@ fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
     })));
     assert_eq!(
         err,
-        "1 validation error detected: Value 'INDEX' at 'returnConsumedCapacity' failed to \
-         satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+        "Value 'INDEX' at 'returnConsumedCapacity' failed to satisfy constraint: Member must \
+         satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn top_k_101_rejects_bare_with_the_value_interpolated() {
-    let storage = Storage::memory().unwrap();
-    create_distance_fixture(&storage, "VecBig").await;
+    let expected = "Provided TopK value '101' is out of valid range. The value must be \
+                    between 1 and 100 inclusive";
+    let err = request_model_error(serde_json::from_value(json!({
+        "TableName": "VecBig", "IndexName": "cosine",
+        "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 101
+    })));
+    assert_eq!(err, expected);
 
-    let err = search(
+    // A request built in Rust meets the same check, before the table is
+    // looked up.
+    let storage = Storage::memory().unwrap();
+    let err = dynoxide::actions::search_vectors::execute(
         &storage,
-        json!({
-            "TableName": "VecBig", "IndexName": "cosine",
-            "SearchVector": n_vec(&["1", "0", "0"]), "TopK": 101
-        }),
+        SearchVectorsRequest {
+            table_name: "Absent".to_string(),
+            index_name: "cosine".to_string(),
+            search_vector: n_vec_values(&["1", "0", "0"]),
+            top_k: 101,
+            ..Default::default()
+        },
+        &VectorIndexLifecycle::new(),
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Provided TopK value '101' is out of valid range. The value must be between 1 and \
-         100 inclusive"
-    );
+    assert_eq!(err.to_string(), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -876,36 +903,48 @@ async fn dimension_mismatch_rejects_with_both_dimensions_interpolated() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn invalid_search_vector_elements_reject_with_the_captured_string() {
-    let storage = Storage::memory().unwrap();
-    create_distance_fixture(&storage, "VecBad").await;
-
     let expected = "Search vector contains invalid values. All values in the search vector \
                     must be a 32-bit floating-point number attribute";
 
-    // An out-of-f32-range element (captured 2026-08-12).
-    let err = search(
-        &storage,
-        json!({
-            "TableName": "VecBad", "IndexName": "cosine",
-            "SearchVector": [{"N": "1E+39"}, {"N": "0"}, {"N": "0"}], "TopK": 1
-        }),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.to_string(), expected);
+    // An out-of-f32-range element (captured 2026-08-12). The vector is checked
+    // before the table is looked up (captured eu-west-2 and us-east-1, 23
+    // October 2026), so a decoded request never reaches it.
+    let err = request_model_error(serde_json::from_value(json!({
+        "TableName": "VecBad", "IndexName": "cosine",
+        "SearchVector": [{"N": "1E+39"}, {"N": "0"}, {"N": "0"}], "TopK": 1
+    })));
+    assert_eq!(err, expected);
 
     // An L-wrapped vector (captured 2026-08-11): the element check fires
     // before the dimension check even though the count also mismatches.
-    let err = search(
-        &storage,
-        json!({
-            "TableName": "VecBad", "IndexName": "cosine",
-            "SearchVector": [{"L": n_vec(&["1", "0", "0"])}], "TopK": 1
-        }),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.to_string(), expected);
+    let err = request_model_error(serde_json::from_value(json!({
+        "TableName": "VecBad", "IndexName": "cosine",
+        "SearchVector": [{"L": n_vec(&["1", "0", "0"])}], "TopK": 1
+    })));
+    assert_eq!(err, expected);
+
+    // A request built in Rust meets the same check, before the table is
+    // looked up.
+    let storage = Storage::memory().unwrap();
+    for search_vector in [
+        n_vec_values(&["1E+39", "0", "0"]),
+        vec![dynoxide::types::AttributeValue::S("1".to_string())],
+    ] {
+        let err = dynoxide::actions::search_vectors::execute(
+            &storage,
+            SearchVectorsRequest {
+                table_name: "Absent".to_string(),
+                index_name: "cosine".to_string(),
+                search_vector,
+                top_k: 1,
+                ..Default::default()
+            },
+            &VectorIndexLifecycle::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), expected);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,15 +1123,16 @@ async fn expression_attribute_values_without_expressions_reject() {
     )
     .await
     .unwrap_err();
+    // Bare, with nothing after it (captured eu-west-2 and us-east-1, 23
+    // October 2026).
     assert_eq!(
         err.to_string(),
-        "ExpressionAttributeValues can only be specified when using expressions: \
-         SearchConditionExpression is null"
+        "ExpressionAttributeValues can only be specified when using expressions"
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unused_expression_attribute_values_reject_after_the_search() {
+async fn unused_expression_attribute_values_reject() {
     let storage = Storage::memory().unwrap();
     create_schema_fixture(&storage, "VecUnused").await;
 
@@ -1717,24 +1757,20 @@ fn empty_search_vector_rejects_without_a_value_echo() {
 
 #[test]
 fn top_k_fractional_rejects_inside_serde_with_the_captured_message_shape() {
-    let err = serde_json::from_value::<SearchVectorsRequest>(json!({
+    let err = as_read_error(serde_json::from_value::<SearchVectorsRequest>(json!({
         "TableName": "T", "IndexName": "vix",
         "SearchVector": [{"N": "1"}], "TopK": 3.5
-    }))
-    .unwrap_err()
-    .to_string();
+    })));
     assert_eq!(err, "invalid type: floating point `3.5`, expected i32");
 }
 
 #[test]
 fn top_k_out_of_range_floats_reject_without_echoing_saturated_sentinels() {
     for (v, spelled) in [(1e300, "1e+300"), (-1e300, "-1e+300")] {
-        let err = serde_json::from_value::<SearchVectorsRequest>(json!({
+        let err = as_read_error(serde_json::from_value::<SearchVectorsRequest>(json!({
             "TableName": "T", "IndexName": "vix",
             "SearchVector": [{"N": "1"}], "TopK": v
-        }))
-        .unwrap_err()
-        .to_string();
+        })));
         assert_eq!(
             err,
             format!("invalid type: floating point `{spelled}`, expected i32"),
@@ -1776,6 +1812,9 @@ async fn a_nested_path_in_the_condition_is_rejected_not_silently_empty() {
     let storage = Storage::memory().unwrap();
     create_schema_fixture(&storage, "VecNest").await;
 
+    // Both expressions share one body, so the first leaves #c and :c unused:
+    // the nested refusal still comes first (captured eu-west-2 and us-east-1,
+    // 23 October 2026).
     for expr in ["#t.deep = :t", "#t = :t AND #c.deep = :c"] {
         let err = search(
             &storage,

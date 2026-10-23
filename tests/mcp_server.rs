@@ -3,7 +3,7 @@
 //! These tests exercise the MCP server by spawning `dynoxide mcp` as a
 //! subprocess and communicating over its stdin/stdout JSON-RPC transport.
 
-#![cfg(feature = "mcp-server")]
+#![cfg(all(feature = "mcp-server", feature = "cli"))]
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};

@@ -7,8 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-23
+
+The crate moves to `dynoxide-rs` 3.2.0. Everything else a user installs carries
+1.5.0. The release brings read capacity, stream records and SearchVectors
+errors in line with DynamoDB, so some requests answer differently: see
+Behaviour changes and `docs/compatibility-summary.md`.
+
+### Security
+
+- **`tokio` moves to 1.54.1** for RUSTSEC-2026-0386. `AsyncFd`'s safe
+  constructors accepted a file descriptor the caller didn't own, which could
+  lead to a use-after-free in the runtime if that descriptor was closed and its
+  number reused. Dynoxide doesn't use `AsyncFd`, but tokio is built into the
+  binary and the `http-server` and `mcp-server` features, so the fix ships in
+  this release.
+- **`ctutils` moves to 0.4.5** for RUSTSEC-2026-0385, non-constant-time mask
+  generation and `u128` comparisons. It reaches the tree through the AWS SDK,
+  a dev-dependency only, and never shipped in a released artefact.
+
 ### Behaviour changes
 
+- **The `http-server` and `mcp-server` features no longer turn on `cli`.** A
+  library that embeds either server stops compiling clap and
+  `tracing-subscriber`, which only the binary uses: 22 fewer crates for
+  `native-sqlite,http-server`. The default features, `full` and the
+  `encrypted-*` bundles include `cli` already, but a build that names the
+  server features explicitly needs `cli` added to get the binary. A crate that
+  relied on Dynoxide to turn on `tracing-subscriber`'s `env-filter` feature
+  needs to enable it itself.
+- **A read of a table with a vector index is charged on the billed size.**
+  DynamoDB bills a vector attribute at four bytes per dimension on reads now,
+  as it already did on writes, so an item whose numbers took it over a 4 KB
+  boundary costs a unit less. This applies to `GetItem`, `BatchGetItem`,
+  `TransactGetItems`, `Query`, `Scan` and every PartiQL read of the table. A
+  read served from a secondary index and the 400 KB item limit still size the
+  vector by its numbers ([#264](https://github.com/nubo-db/dynoxide/issues/264)).
+- **`GetItem` and `TransactGetItems` charge the whole item whatever the
+  projection returns**, as `BatchGetItem` and DynamoDB already did. A read of
+  one attribute of a large item used to cost only what it returned.
+- An import with `record_streams` records a `MODIFY` carrying the item it
+  replaced when it overwrites a key, whether that item was stored before the
+  import or came earlier in it, as a `PutItem` over the key does. It used to
+  record an `INSERT` with no old image
+  ([#265](https://github.com/nubo-db/dynoxide/issues/265)).
 - **A stream record's `SequenceNumber` is 21 digits**, within DynamoDB's 21 to
   40, and records already in a database file are shown in the same 21-digit
   form. Every table's next number is at least the current time in
@@ -36,7 +78,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently dropped new events. Each new record gets a random 32-character
   hex id when it is written, stored with it so every read returns the same
   one. Records already in a database file keep the eventIDs they reported
-  before.
+  before ([#258](https://github.com/nubo-db/dynoxide/issues/258)).
+- Stream records written by an import with `record_streams` go to the shard
+  `DescribeStream` lists and follow the table's `StreamViewType`. A consumer
+  following `DescribeStream` never saw them, and a `KEYS_ONLY` table got the
+  new image anyway ([#260](https://github.com/nubo-db/dynoxide/issues/260)).
+- `SearchVectors` answers an explicit null `IndexName`, `TableName`,
+  `SearchVector` or `TopK` with a `SerializationException` quoting the
+  deserialiser, as DynamoDB does. A missing `TableName` gets the same
+  missing-field `ValidationException` as the other three required members,
+  ahead of a too-short `IndexName`
+  ([#263](https://github.com/nubo-db/dynoxide/issues/263)).
+- `SearchVectors` answers a null, empty or two-type value in `SearchVector` or
+  `ExpressionAttributeValues` with a `SerializationException` carrying no
+  message, and a null where a member's value belongs with the deserialiser's
+  `invalid type: null, expected ...`, as DynamoDB does. Other operations are
+  unchanged ([#266](https://github.com/nubo-db/dynoxide/issues/266)).
+- `SearchVectors` answers a malformed request as DynamoDB's search endpoint
+  does. A wrongly typed member quotes the deserialiser, an unknown type lists
+  the ones it accepts, and the search vector, expression values and expression
+  names are checked before the table is looked up, in DynamoDB's order. An
+  invalid `ReturnConsumedCapacity` is refused on its own, without the
+  `1 validation error detected:` envelope, and a `TopK` beyond the 32-bit range
+  is a `ValidationException`. Its `SerializationException` bodies use a
+  lowercase `message`, as that endpoint writes them. Other operations are
+  unchanged ([#267](https://github.com/nubo-db/dynoxide/issues/267)).
 
 ## [1.4.0] - 2026-10-21
 
@@ -1915,7 +1981,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/nubo-db/dynoxide/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...v1.2.1

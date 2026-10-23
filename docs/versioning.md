@@ -15,8 +15,8 @@ lives in `Cargo.toml`.
 They were one number until 1.1.0. The split happened because a change to a
 public Rust type forced a major on every artefact whose users never touch the
 Rust API, and stranding everyone on `^1.x` and `dynoxide:1` to report a change
-they cannot observe is a poor trade. The current mapping is product **1.4.0**,
-crate **3.1.0**.
+they cannot observe is a poor trade. The current mapping is product **1.5.0**,
+crate **3.2.0**.
 
 This page says what each number promises. It is not a claim that conformance is
 finished.
@@ -62,6 +62,7 @@ additive and ships as a minor; changing or removing one is not.
 | Conformance fix, capture-backed | Both | minor |
 | New DynamoDB operation | Both | minor |
 | New feature flag | Crate | minor |
+| Feature flag turns on less, with no public item lost | Crate | minor |
 | MSRV raise | Crate | minor |
 | Dependency bump with no surface change | Both | patch |
 

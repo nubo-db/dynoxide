@@ -4,7 +4,7 @@
 //! contract that `HEALTHCHECK` and Kubernetes probes rely on is exercised
 //! end to end.
 
-#![cfg(feature = "http-server")]
+#![cfg(all(feature = "http-server", feature = "cli"))]
 
 use std::io::Write;
 use std::process::Command;

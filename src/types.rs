@@ -627,7 +627,10 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
 }
 
 /// DynamoDB's refusal of `type_key`'s member when it is an empty set.
-fn empty_set_refusal(type_key: &str, member: &serde_json::Value) -> Option<&'static str> {
+pub(crate) fn empty_set_refusal(
+    type_key: &str,
+    member: &serde_json::Value,
+) -> Option<&'static str> {
     if !member.as_array().is_some_and(Vec::is_empty) {
         return None;
     }
@@ -1401,16 +1404,18 @@ pub(crate) fn vector_billed_bytes(dimensions: u32) -> usize {
     4 * dimensions as usize
 }
 
-/// The size DynamoDB bills a write of `item` at, and the figure TableSizeBytes
-/// sums, on a table whose vector indexes are `vector_indexes`.
+/// The size DynamoDB bills a write or a table read of `item` at, and the
+/// figure TableSizeBytes sums, on a table whose vector indexes are
+/// `vector_indexes`.
 ///
 /// An attribute a vector index reads costs its name plus
 /// [`vector_billed_bytes`], once however many indexes read it; everything else
-/// is sized as [`item_size`] sizes it. Read units and the 400 KB limit still
-/// use [`item_size`]: DynamoDB sizes the vector by its numbers for both.
-/// Captured eu-west-2 and us-east-1, 2026-10-09, at 1, 3, 6, 8, 256 and 1,024
+/// is sized as [`item_size`] sizes it. The 400 KB limit still uses
+/// [`item_size`]: DynamoDB sizes the vector by its numbers there. Captured
+/// eu-west-2 and us-east-1, 2026-10-09, at 1, 3, 6, 8, 256 and 1,024
 /// dimensions, with two indexes on different attributes charged their own
-/// dimensions each.
+/// dimensions each. Reads were sized by the numbers then too, and moved to this
+/// figure by 2026-10-22 (captured again 2026-10-23).
 ///
 /// A value that is not a valid vector for its index is sized as usual. A live
 /// write refuses one, so only an item written before the index existed can

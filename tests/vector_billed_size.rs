@@ -722,3 +722,170 @@ async fn secondary_indexes_on_a_vector_table_size_entries_by_their_numbers() {
     let lsi = &table.local_secondary_indexes.unwrap()[0];
     assert_eq!((lsi.item_count, lsi.index_size_bytes), (Some(3), Some(750)));
 }
+
+/// A table with a vector index on `e8`, an ALL GSI on `g`, an ALL LSI on `l`
+/// and a KEYS_ONLY LSI on `k`, holding one item billed at exactly 4,096 bytes
+/// whose numbers take it past 4,096. Returns the item's number-rule size.
+async fn indexed_vector_table(storage: &Storage) -> usize {
+    let req = json!({
+        "TableName": "VidxRead",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+            {"AttributeName": "l", "AttributeType": "S"},
+            {"AttributeName": "k", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{"IndexName": "gAll",
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}}],
+        "LocalSecondaryIndexes": [
+            {"IndexName": "lAll",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "l", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}},
+            {"IndexName": "lKeys",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "k", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "KEYS_ONLY"}}
+        ],
+        "VectorIndexes": [vector_index("vix8", "e8", 8, "KEYS_ONLY")],
+        "BillingMode": "PAY_PER_REQUEST"
+    });
+    create_table::execute(storage, serde_json::from_value(req).unwrap())
+        .await
+        .unwrap();
+
+    let mut item = json!({"pk": {"S": "a"}, "sk": {"S": "1"}, "g": {"S": "g1"},
+        "l": {"S": "l1"}, "k": {"S": "k1"}, "e8": numbers(&SEVEN_DIGITS)});
+    let without_vector: Item = serde_json::from_value(json!({"pk": {"S": "a"},
+        "sk": {"S": "1"}, "g": {"S": "g1"}, "l": {"S": "l1"}, "k": {"S": "k1"}}))
+    .unwrap();
+    let fixed = item_size(&without_vector) + "e8".len() + 4 * 8 + "pad".len();
+    item["pad"] = json!({"S": "x".repeat(4096 - fixed)});
+    let parsed: Item = serde_json::from_value(item.clone()).unwrap();
+    let number_rule = item_size(&parsed);
+    put(storage, "VidxRead", item).await;
+    number_rule
+}
+
+/// The `ConsumedCapacity` a read reports, as JSON.
+fn capacity_json(resp: &impl serde::Serialize) -> Value {
+    serde_json::to_value(resp).unwrap()["ConsumedCapacity"].clone()
+}
+
+/// The arm a read is charged on, from its `ConsumedCapacity`: `Table`, or an
+/// index named under `GlobalSecondaryIndexes` or `LocalSecondaryIndexes`.
+fn arm(cc: &Value, index: Option<&str>) -> f64 {
+    let node = match index {
+        None => &cc["Table"],
+        Some(name) if !cc["GlobalSecondaryIndexes"][name].is_null() => {
+            &cc["GlobalSecondaryIndexes"][name]
+        }
+        Some(name) => &cc["LocalSecondaryIndexes"][name],
+    };
+    node["CapacityUnits"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no arm {index:?} in {cc}"))
+}
+
+/// A read served from a GSI or LSI is charged on the index entry's
+/// number-rule size, as the entry's own write is (captured eu-west-2 and
+/// us-east-1, 2026-10-09, see
+/// `secondary_indexes_on_a_vector_table_size_entries_by_their_numbers`).
+/// Reads from an index were not captured separately; this pins the reading
+/// that keeps them consistent with that write sizing. A read of the base item,
+/// the LSI fetch behind `Select: ALL_ATTRIBUTES` on a KEYS_ONLY LSI and a
+/// PartiQL reach-back, is a table read and charged on the billed size. The
+/// item is billed at 4,096 bytes and over 4,096 by its numbers, so each arm
+/// lands on one side of a read-unit boundary or the other.
+#[tokio::test(flavor = "current_thread")]
+async fn index_reads_charge_the_number_rule_and_base_reads_the_billed_size() {
+    let storage = Storage::memory().unwrap();
+    let number_rule = indexed_vector_table(&storage).await;
+    assert!(number_rule > 4096 && number_rule <= 8192, "{number_rule}");
+
+    let query = |req: Value| {
+        let storage = &storage;
+        async move {
+            let resp = query::execute(storage, serde_json::from_value(req).unwrap())
+                .await
+                .unwrap();
+            capacity_json(&resp)
+        }
+    };
+    let by_pk = json!({":p": {"S": "a"}});
+
+    // GSI, eventually consistent: 1 unit by the numbers, 0.5 if billed.
+    let cc = query(json!({"TableName": "VidxRead", "IndexName": "gAll",
+        "KeyConditionExpression": "g = :g", "ExpressionAttributeValues": {":g": {"S": "g1"}},
+        "ReturnConsumedCapacity": "INDEXES"}))
+    .await;
+    assert_eq!(arm(&cc, Some("gAll")), 1.0, "GSI query: {cc}");
+
+    // LSI, strongly consistent: 2 units by the numbers, 1 if billed.
+    let cc = query(json!({"TableName": "VidxRead", "IndexName": "lAll",
+        "KeyConditionExpression": "pk = :p", "ExpressionAttributeValues": by_pk,
+        "ConsistentRead": true, "ReturnConsumedCapacity": "INDEXES"}))
+    .await;
+    assert_eq!(arm(&cc, Some("lAll")), 2.0, "LSI query: {cc}");
+
+    // KEYS_ONLY LSI with ALL_ATTRIBUTES: the base fetch is a table read on the
+    // billed size (1 unit, 2 by the numbers); the small index entry is 1.
+    let cc = query(json!({"TableName": "VidxRead", "IndexName": "lKeys",
+        "KeyConditionExpression": "pk = :p", "ExpressionAttributeValues": by_pk,
+        "ConsistentRead": true, "Select": "ALL_ATTRIBUTES",
+        "ReturnConsumedCapacity": "INDEXES"}))
+    .await;
+    assert_eq!(arm(&cc, None), 1.0, "LSI base fetch: {cc}");
+    assert_eq!(arm(&cc, Some("lKeys")), 1.0, "LSI base fetch: {cc}");
+
+    // Scans of either index charge the numbers too.
+    let scan = |req: Value| {
+        let storage = &storage;
+        async move {
+            let resp = scan::execute(storage, serde_json::from_value(req).unwrap())
+                .await
+                .unwrap();
+            capacity_json(&resp)
+        }
+    };
+    let cc = scan(json!({"TableName": "VidxRead", "IndexName": "gAll",
+        "ReturnConsumedCapacity": "INDEXES"}))
+    .await;
+    assert_eq!(arm(&cc, Some("gAll")), 1.0, "GSI scan: {cc}");
+    let cc = scan(json!({"TableName": "VidxRead", "IndexName": "lAll",
+        "ConsistentRead": true, "ReturnConsumedCapacity": "TOTAL"}))
+    .await;
+    assert_eq!(cc["CapacityUnits"].as_f64(), Some(2.0), "LSI scan: {cc}");
+
+    // PartiQL: a GSI read charges the numbers; a KEYS_ONLY LSI read naming an
+    // unprojected attribute reaches back, and the reach-back is billed.
+    let statement = |stmt: &str, consistent: bool| {
+        let storage = &storage;
+        let req = json!({"Statement": stmt, "ConsistentRead": consistent,
+            "ReturnConsumedCapacity": "INDEXES"});
+        async move {
+            let resp = execute_statement::execute(storage, serde_json::from_value(req).unwrap())
+                .await
+                .unwrap();
+            capacity_json(&resp)
+        }
+    };
+    let cc = statement("SELECT * FROM \"VidxRead\".\"gAll\" WHERE g = 'g1'", false).await;
+    assert_eq!(arm(&cc, Some("gAll")), 1.0, "PartiQL GSI read: {cc}");
+    let cc = statement(
+        "SELECT pad FROM \"VidxRead\".\"lKeys\" WHERE pk = 'a'",
+        true,
+    )
+    .await;
+    assert_eq!(arm(&cc, None), 1.0, "PartiQL reach-back: {cc}");
+}

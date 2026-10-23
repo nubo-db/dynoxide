@@ -644,4 +644,45 @@ mod tests {
         assert!(err.error_type().contains("InternalServerError"));
         assert!(err.to_string().contains("locked"));
     }
+
+    /// SearchVectors' own endpoint writes a SerializationException as
+    /// `__type` then a lowercase `message`, leaving the message out when it
+    /// has none (captured eu-west-2 and us-east-1, 23 October 2026).
+    #[test]
+    fn search_vectors_writes_a_serialization_exception_with_a_lowercase_message() {
+        let err = DynoxideError::SerializationException(
+            "invalid type: null, expected a string at line 1 column 20".to_string(),
+        );
+        assert_eq!(
+            err.to_json_for("SearchVectors"),
+            r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string at line 1 column 20"}"#
+        );
+        assert_eq!(
+            DynoxideError::SerializationException(String::new()).to_json_for("SearchVectors"),
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#
+        );
+    }
+
+    /// Every other operation, and every other error from SearchVectors, keeps
+    /// the body `to_json` writes.
+    #[test]
+    fn other_operations_and_errors_keep_the_shared_body() {
+        let serialization = DynoxideError::SerializationException("Unexpected field type".into());
+        for operation in ["Query", "CreateTable", "GetItem"] {
+            assert_eq!(
+                serialization.to_json_for(operation),
+                serialization.to_json()
+            );
+        }
+        let validation = DynoxideError::ValidationException("bad".into());
+        assert_eq!(
+            validation.to_json_for("SearchVectors"),
+            validation.to_json()
+        );
+        assert!(
+            serialization
+                .to_json()
+                .contains(r#""Message":"Unexpected field type""#)
+        );
+    }
 }

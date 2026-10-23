@@ -884,6 +884,48 @@ mod tests {
         );
     }
 
+    /// SearchVectors' SerializationException reaches both wasm surfaces as its
+    /// endpoint writes it: `__type` then a lowercase `message`, and no message
+    /// key at all when there is no message (captured eu-west-2 and us-east-1,
+    /// 23 October 2026). `a_mistyped_vector_field_is_a_serialization_exception_here_too`
+    /// pins the capital `Message` every other operation keeps.
+    #[test]
+    fn search_vectors_serialization_bodies_use_a_lowercase_message() {
+        let backend = Storage::memory().unwrap();
+        let null_table =
+            r#"{"IndexName":"vix","TableName":null,"SearchVector":[{"N":"1"}],"TopK":1}"#;
+        let body = run(&backend, "SearchVectors", null_table).unwrap_err();
+        assert!(
+            body.starts_with(r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string"#),
+            "dispatch: {body}"
+        );
+
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.SearchVectors"),
+            null_table,
+        );
+        assert_eq!(out.status, 400);
+        assert!(
+            out.body.starts_with(r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string"#),
+            "dispatch_http: {}",
+            out.body
+        );
+
+        let null_element = r#"{"IndexName":"vix","TableName":"t","SearchVector":[null],"TopK":1}"#;
+        let bare = r#"{"__type":"com.amazon.coral.service#SerializationException"}"#;
+        assert_eq!(
+            run(&backend, "SearchVectors", null_element).unwrap_err(),
+            bare
+        );
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.SearchVectors"),
+            null_element,
+        );
+        assert_eq!((out.status, out.body.as_str()), (400, bare));
+    }
+
     #[test]
     fn the_vector_control_plane_and_data_plane_agree() {
         // The pairing that matters: if DescribeTable reflects an index, a

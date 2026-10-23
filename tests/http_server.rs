@@ -1573,3 +1573,139 @@ async fn test_search_vectors_fractional_top_k_is_a_serialization_exception() {
         "unexpected message: {message}"
     );
 }
+
+/// Send a SearchVectors body and return the error's short type name and
+/// message, asserting the status is 400.
+async fn search_vectors_error(url: &str, body: serde_json::Value) -> (String, String) {
+    let resp = dynamo_request(url, "SearchVectors", body).await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let kind = body["__type"].as_str().unwrap();
+    let kind = kind.rsplit('#').next().unwrap().to_string();
+    let message = body["Message"].as_str().or(body["message"].as_str());
+    (kind, message.unwrap_or_default().to_string())
+}
+
+/// Whether `message` is `prefix` followed by serde's position suffix,
+/// " at line 1 column N". The column depends on the body's layout.
+fn is_at_position(message: &str, prefix: &str) -> bool {
+    message
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix(" at line 1 column "))
+        .is_some_and(|column| !column.is_empty() && column.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[tokio::test]
+async fn test_search_vectors_explicit_null_member_is_a_serialization_exception() {
+    let (url, _handle) = start_test_server().await;
+
+    // SearchVectors reads its body with a strict deserialiser, so an explicit
+    // null for a required member is a SerializationException quoting it,
+    // position included, ahead of any member check. Captured from real
+    // DynamoDB (eu-west-2 and us-east-1, 9 October 2026, again 23 October).
+    let valid = json!({
+        "TableName": "AnyTable", "IndexName": "vix",
+        "SearchVector": [{"N": "1"}], "TopK": 1
+    });
+    for (member, expected) in [
+        ("IndexName", "a string"),
+        ("TableName", "a string"),
+        ("SearchVector", "a sequence"),
+        ("TopK", "i32"),
+    ] {
+        let mut body = valid.clone();
+        body[member] = serde_json::Value::Null;
+        let (kind, message) = search_vectors_error(&url, body).await;
+        assert_eq!(kind, "SerializationException", "{member}: {message}");
+        assert!(
+            is_at_position(
+                &message,
+                &format!("invalid type: null, expected {expected}")
+            ),
+            "{member}: unexpected message: {message}"
+        );
+    }
+
+    // A null name is refused as it is read, before a too-short IndexName.
+    let (kind, message) = search_vectors_error(
+        &url,
+        json!({
+            "TableName": null, "IndexName": "ab",
+            "SearchVector": [{"N": "1"}], "TopK": 1
+        }),
+    )
+    .await;
+    assert_eq!(kind, "SerializationException");
+    assert!(
+        is_at_position(&message, "invalid type: null, expected a string"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn test_search_vectors_null_optional_member_reads_as_absent() {
+    let (url, _handle) = start_test_server().await;
+
+    // A null optional member is read as absent, so the request goes on to the
+    // table lookup (captured, eu-west-2 and us-east-1, 23 October 2026).
+    for member in [
+        "SearchConditionExpression",
+        "ProjectionExpression",
+        "ExpressionAttributeNames",
+        "ExpressionAttributeValues",
+        "ReturnConsumedCapacity",
+    ] {
+        let mut body = json!({
+            "TableName": "AnyTable", "IndexName": "vix",
+            "SearchVector": [{"N": "1"}], "TopK": 1
+        });
+        body[member] = serde_json::Value::Null;
+        let (kind, _) = search_vectors_error(&url, body).await;
+        assert_eq!(kind, "ResourceNotFoundException", "{member}");
+    }
+}
+
+#[tokio::test]
+async fn test_search_vectors_missing_member_names_the_first_in_dynamodb_order() {
+    let (url, _handle) = start_test_server().await;
+
+    // A missing TableName is serde's missing-field message like the other
+    // three required members, ahead of a too-short IndexName. With more than
+    // one missing, DynamoDB names the first of IndexName, SearchVector,
+    // TableName, TopK (captured, eu-west-2 and us-east-1, 23 October 2026).
+    let valid = json!({
+        "TableName": "AnyTable", "IndexName": "vix",
+        "SearchVector": [{"N": "1"}], "TopK": 1
+    });
+    let without = |members: &[&str], short_index: bool| {
+        let mut body = valid.clone();
+        let object = body.as_object_mut().unwrap();
+        for member in members {
+            object.remove(*member);
+        }
+        if short_index {
+            object.insert("IndexName".to_string(), json!("ab"));
+        }
+        body
+    };
+    for (missing, short_index, named) in [
+        (&["TableName"][..], false, "TableName"),
+        (&["TableName"][..], true, "TableName"),
+        (&["TableName", "SearchVector"][..], false, "SearchVector"),
+        (&["TableName", "TopK"][..], false, "TableName"),
+        (&["IndexName", "SearchVector"][..], false, "IndexName"),
+        (&["SearchVector", "TopK"][..], false, "SearchVector"),
+        (
+            &["TableName", "IndexName", "SearchVector", "TopK"][..],
+            false,
+            "IndexName",
+        ),
+    ] {
+        let (kind, message) = search_vectors_error(&url, without(missing, short_index)).await;
+        assert_eq!(kind, "ValidationException", "{missing:?}: {message}");
+        assert!(
+            is_at_position(&message, &format!("missing field `{named}`")),
+            "{missing:?}: unexpected message: {message}"
+        );
+    }
+}

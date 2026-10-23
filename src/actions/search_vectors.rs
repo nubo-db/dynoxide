@@ -35,19 +35,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Internal deserialisation struct for detecting missing fields.
+///
+/// The four required members are declared in the order DynamoDB names them
+/// when more than one is missing: IndexName, SearchVector, TableName, TopK
+/// (captured eu-west-2 and us-east-1, 23 October 2026). Serde reports the
+/// first missing field in declaration order, so the order is load-bearing.
 #[derive(Debug, Default, Deserialize)]
 struct SearchVectorsRequestRaw {
-    #[serde(rename = "TableName", default)]
-    table_name: Option<String>,
-    /// Required: a missing IndexName, SearchVector or TopK gets serde's own
-    /// "missing field `IndexName` at line 1 column N", which is DynamoDB's
-    /// answer too (captured 2026-10-09, six of six regions).
+    /// Required: a missing IndexName, SearchVector, TableName or TopK gets
+    /// serde's own "missing field `IndexName` at line 1 column N", which is
+    /// DynamoDB's answer too (captured 2026-10-09, six of six regions, and for
+    /// TableName eu-west-2 and us-east-1, 9 October 2026), ahead of any
+    /// member constraint.
     #[serde(rename = "IndexName")]
     index_name: String,
     /// A bare JSON array of number attribute values, not wrapped in `L`
     /// (confirmed on the wire against the AWS SDK's serialisation).
     #[serde(rename = "SearchVector")]
     search_vector: Vec<AttributeValue>,
+    #[serde(rename = "TableName")]
+    table_name: String,
     /// Deserialised as i32 so a fractional or out-of-i32-range value rejects
     /// inside serde with the raw serde-style SerializationException message
     /// real DynamoDB returns for a fractional TopK: "invalid type: floating
@@ -140,43 +147,47 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let raw = SearchVectorsRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        // An explicit null for a required member is refused by DynamoDB's
+        // strict deserialiser as a SerializationException quoting it, position
+        // included: "invalid type: null, expected a string at line 1 column N"
+        // (captured eu-west-2 and us-east-1, 9 October 2026). Every other
+        // operation answers a null with a ValidationException, so the
+        // pass-through is made here rather than in the shared decoder. A null
+        // optional member reads as absent, as it does on DynamoDB.
+        let raw = SearchVectorsRequestRaw::deserialize(deserializer).map_err(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("invalid type: null, expected ") {
+                serde::de::Error::custom(format!(
+                    "{}{msg}",
+                    crate::serde_errors::SERIALIZATION_AS_READ_MARKER
+                ))
+            } else {
+                e
+            }
+        })?;
+        use crate::validation::format_validation_errors;
 
         // An empty table name is the newer validation layer's own check,
         // reported on its own (captured 2026-10-09, six of six regions that
-        // serve SearchVectors). A missing one joins the member errors below.
-        if raw.table_name.as_deref() == Some("") {
+        // serve SearchVectors). A missing one never gets this far.
+        if raw.table_name.is_empty() {
             return Err(serde::de::Error::custom(format!(
                 "VALIDATION:{}",
                 crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
             )));
         }
 
-        let mut errors = Vec::new();
-        if raw.table_name.is_none() {
-            errors.extend(table_name_constraint_errors(
-                None,
-                TableNameContext::ReadWrite,
-            ));
-        }
-
-        errors.extend(member_constraint_errors(
+        let mut errors = member_constraint_errors(
             &raw.index_name,
             raw.search_vector.len(),
             i64::from(raw.top_k),
-        ));
+        );
 
         // A table name that breaks its constraints comes after those members
         // and ahead of ReturnConsumedCapacity, without the envelope, one error
         // per name (captured 2026-10-09, six of six regions).
         if errors.is_empty()
-            && let Some(msg) = raw
-                .table_name
-                .as_deref()
-                .and_then(crate::validation::first_table_name_error)
+            && let Some(msg) = crate::validation::first_table_name_error(&raw.table_name)
         {
             return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
@@ -193,7 +204,7 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
         }
 
         Ok(SearchVectorsRequest {
-            table_name: raw.table_name.unwrap_or_default(),
+            table_name: raw.table_name,
             index_name: raw.index_name,
             search_vector: raw.search_vector,
             top_k: i64::from(raw.top_k),

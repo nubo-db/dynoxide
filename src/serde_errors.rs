@@ -63,11 +63,17 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 /// `VALIDATION_REQUEST:` becomes the wire-invisible
 /// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag,
 /// `VALIDATION:` a bare `ValidationException` and `SERIALIZATION:` a
-/// `SerializationException`; an unmarked message returns
+/// `SerializationException`, as does `SERIALIZATION_AS_READ:` with the
+/// position left on; an unmarked message returns
 /// `None` for the caller to classify. This is the single owner of the
 /// marker-to-variant mapping, shared by [`deserialize`] and callers that
 /// decode via `serde_json::from_value` (the MCP surface).
 pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
+    if let Some(as_read) = msg.strip_prefix(SERIALIZATION_AS_READ_MARKER) {
+        return Some(crate::DynoxideError::SerializationException(
+            as_read.to_string(),
+        ));
+    }
     if let Some(stripped) = msg.strip_prefix(SERIALIZATION_MARKER) {
         return Some(crate::DynoxideError::SerializationException(
             strip_position(stripped).to_string(),
@@ -170,6 +176,12 @@ pub(crate) const VALIDATION_MARKER: &str = "VALIDATION:";
 /// deserialisation, mapped to a `SerializationException` whose message is the
 /// rest of the text.
 pub(crate) const SERIALIZATION_MARKER: &str = "SERIALIZATION:";
+
+/// Marker prefix for a deserialiser error passed to the wire as it was raised,
+/// mapped to a `SerializationException` that keeps the message whole,
+/// serde_json's position suffix included. The suffix belongs to the inner
+/// error, since serde_json adds none to a custom error raised at the top level.
+pub(crate) const SERIALIZATION_AS_READ_MARKER: &str = "SERIALIZATION_AS_READ:";
 
 /// Marker prefix for the request-validation class raised inside serde
 /// deserialisation, mapped to the wire-invisible `EnvelopedValidation` tag
@@ -305,7 +317,8 @@ fn strip_position(msg: &str) -> &str {
 pub(crate) fn clean_serde_message(msg: &str) -> &str {
     let clean = strip_position(msg);
     clean
-        .strip_prefix(REQUEST_VALIDATION_MARKER)
+        .strip_prefix(SERIALIZATION_AS_READ_MARKER)
+        .or_else(|| clean.strip_prefix(REQUEST_VALIDATION_MARKER))
         .or_else(|| clean.strip_prefix(VALIDATION_MARKER))
         .or_else(|| clean.strip_prefix(SERIALIZATION_MARKER))
         .unwrap_or(clean)

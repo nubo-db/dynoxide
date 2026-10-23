@@ -91,6 +91,11 @@ pub async fn execute<S: StorageBackend>(
     let label = meta.stream_label.clone().unwrap_or_default();
     let sid = streams::shard_id(&table_name);
     let (start_seq, end_seq) = storage.get_shard_sequence_range(&table_name, &sid).await?;
+    let public = |seq: Option<String>| {
+        seq.and_then(|s| s.parse().ok())
+            .map(streams::format_sequence_number)
+    };
+    let (start_seq, end_seq) = (public(start_seq), public(end_seq));
 
     Ok(DescribeStreamResponse {
         stream_description: StreamDescription {

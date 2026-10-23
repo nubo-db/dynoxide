@@ -37,9 +37,34 @@ Behaviour changes and `docs/compatibility-summary.md`.
   import or came earlier in it, as a `PutItem` over the key does. It used to
   record an `INSERT` with no old image
   ([#265](https://github.com/nubo-db/dynoxide/issues/265)).
+- **A stream record's `SequenceNumber` is 21 digits**, within DynamoDB's 21 to
+  40, and records already in a database file are shown in the same 21-digit
+  form. Every table's next number is at least the current time in
+  microseconds, so an in-memory server doesn't normally reissue the numbers
+  an earlier run gave out. Numbers keep their order as strings and as numbers.
+- **`GetShardIterator` validates `SequenceNumber` as DynamoDB does**, with a
+  `ValidationException`. An `AT_SEQUENCE_NUMBER` or `AFTER_SEQUENCE_NUMBER`
+  request refuses a missing number, one outside 21 to 40 characters, and one
+  that names no record that could have been issued; it used to read the stream
+  from its start. `TRIM_HORIZON` and `LATEST` refuse a `SequenceNumber`, where
+  they used to ignore it. The short numbers earlier builds returned fail the
+  length check, so a consumer holding one has to restart from
+  `TRIM_HORIZON`.
+- **Downgrading replays the stream.** A `SequenceNumber` saved under this
+  release does not resolve on an earlier release, so a consumer that resumes
+  from one after a downgrade reads the stream again from its start. Records
+  written under this release also report a different eventID on an earlier
+  release, so a consumer that de-duplicates by eventID processes them again.
 
 ### Fixed
 
+- **A stream record's `eventID` is globally unique.** It was the record's
+  sequence number, so an in-memory server issued `1`, `2`, `3` again after
+  every restart, and a consumer that skips eventIDs it has already processed
+  silently dropped new events. Each new record gets a random 32-character
+  hex id when it is written, stored with it so every read returns the same
+  one. Records already in a database file keep the eventIDs they reported
+  before ([#258](https://github.com/nubo-db/dynoxide/issues/258)).
 - Stream records written by an import with `record_streams` go to the shard
   `DescribeStream` lists and follow the table's `StreamViewType`. A consumer
   following `DescribeStream` never saw them, and a `KEYS_ONLY` table got the
@@ -64,6 +89,7 @@ Behaviour changes and `docs/compatibility-summary.md`.
   is a `ValidationException`. Its `SerializationException` bodies use a
   lowercase `message`, as that endpoint writes them. Other operations are
   unchanged ([#267](https://github.com/nubo-db/dynoxide/issues/267)).
+||||||| f8e2058
 
 ## [1.4.0] - 2026-10-21
 

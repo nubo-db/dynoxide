@@ -740,4 +740,18 @@ fn import_with_record_streams() {
     assert_eq!(records_resp.records.len(), 2);
     assert_eq!(records_resp.records[0].event_name, "INSERT");
     assert_eq!(records_resp.records[1].event_name, "INSERT");
+
+    // Each imported record carries its own eventID, shaped as DynamoDB's.
+    for record in &records_resp.records {
+        let id = &record.event_id;
+        assert_eq!(id.len(), 32, "eventID {id}");
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "{id}"
+        );
+    }
+    assert_ne!(
+        records_resp.records[0].event_id,
+        records_resp.records[1].event_id
+    );
 }

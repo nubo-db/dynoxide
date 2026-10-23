@@ -50,6 +50,10 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: GetShardIteratorRequest,
 ) -> Result<GetShardIteratorResponse> {
+    if let Some(value) = &request.sequence_number {
+        check_sequence_number_length(value)?;
+    }
+
     // Parse table name from ARN
     let table_name = parse_table_name_from_arn(&request.stream_arn).ok_or_else(|| {
         DynoxideError::ResourceNotFoundException(format!(
@@ -75,31 +79,26 @@ pub async fn execute<S: StorageBackend>(
         )));
     }
 
-    let position = match request.shard_iterator_type.as_str() {
+    let kind = request.shard_iterator_type.as_str();
+    if matches!(kind, "TRIM_HORIZON" | "LATEST") && request.sequence_number.is_some() {
+        return Err(DynoxideError::ValidationException(
+            "One or more parameter values were invalid: SequenceNumber should not be passed for this iterator type"
+                .to_string(),
+        ));
+    }
+
+    let position = match kind {
         "TRIM_HORIZON" => 0,
         "LATEST" => {
-            // Position at the latest record
-            let seq = storage.next_stream_sequence_number(&table_name).await?;
-            seq - 1 // Will return records after this position
+            // Position at the shard's last record, so only later ones return.
+            let (_, last) = storage
+                .get_shard_sequence_range(&table_name, &request.shard_id)
+                .await?;
+            last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
         }
-        "AT_SEQUENCE_NUMBER" => {
-            let seq: i64 = request
-                .sequence_number
-                .as_deref()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            seq - 1 // AT means include this record, so position before it
-        }
-        "AFTER_SEQUENCE_NUMBER" => {
-            let seq: i64 = request
-                .sequence_number
-                .as_deref()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            seq
-        }
+        // AT includes the named record, so position just before it.
+        "AT_SEQUENCE_NUMBER" => requested_sequence_number(&request)? - 1,
+        "AFTER_SEQUENCE_NUMBER" => requested_sequence_number(&request)?,
         other => {
             return Err(DynoxideError::ValidationException(format!(
                 "Invalid ShardIteratorType: {other}"
@@ -111,6 +110,33 @@ pub async fn execute<S: StorageBackend>(
 
     Ok(GetShardIteratorResponse {
         shard_iterator: Some(iterator),
+    })
+}
+
+/// DynamoDB's 21 to 40 character constraint on `SequenceNumber`.
+fn check_sequence_number_length(value: &str) -> Result<()> {
+    let len = value.chars().count();
+    let bound = if len < 21 {
+        "greater than or equal to 21"
+    } else if len > 40 {
+        "less than or equal to 40"
+    } else {
+        return Ok(());
+    };
+    Err(DynoxideError::ValidationException(format!(
+        "1 validation error detected: Value at 'sequenceNumber' failed to satisfy constraint: Member must have length {bound}"
+    )))
+}
+
+/// The stored sequence number an AT_ or AFTER_SEQUENCE_NUMBER request names.
+fn requested_sequence_number(request: &GetShardIteratorRequest) -> Result<i64> {
+    let value = request.sequence_number.as_deref().ok_or_else(|| {
+        DynoxideError::ValidationException(
+            "One or more parameter values were invalid: SequenceNumber cannot be null".to_string(),
+        )
+    })?;
+    crate::streams::parse_sequence_number(value).ok_or_else(|| {
+        DynoxideError::ValidationException("Invalid SequenceNumber for the shard".to_string())
     })
 }
 

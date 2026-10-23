@@ -253,12 +253,15 @@ mod private {
 /// [versioning policy]: https://github.com/nubo-db/dynoxide/blob/main/docs/versioning.md
 ///
 /// Method signatures mirror [`Storage`](crate::storage::Storage)'s public
-/// surface 1:1, with three mechanical transformations:
+/// surface, with three mechanical transformations:
 ///
 /// 1. `Result<T, DynoxideError>` becomes `Result<T, BackendError>`.
 /// 2. `fn` becomes `async fn`.
 /// 3. Filesystem-typed and rusqlite-typed methods are excluded; they remain
 ///    on the native [`Storage`](crate::storage::Storage) only.
+///
+/// Methods marked `#[doc(hidden)]` serve this crate's own action handlers,
+/// have no public `Storage` counterpart and are not part of the stable API.
 ///
 /// The trait is not consumed dynamically today. The native
 /// [`Storage`](crate::storage::Storage) and the wasm
@@ -859,6 +862,17 @@ pub trait StorageBackend: private::Sealed {
         after_sequence: i64,
         limit: usize,
     ) -> Result<Vec<StreamRecord>, BackendError>;
+
+    /// As `get_stream_records`, with each record's stored event id. The id is
+    /// `None` only on a row an older build wrote since this one opened the file.
+    #[doc(hidden)]
+    async fn get_stream_records_with_event_ids(
+        &self,
+        table_name: &str,
+        shard_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamRecord, Option<String>)>, BackendError>;
 
     async fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>, BackendError>;
 

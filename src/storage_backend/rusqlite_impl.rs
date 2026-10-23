@@ -601,6 +601,17 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn get_stream_records_with_event_ids(
+        &self,
+        table_name: &str,
+        shard_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamRecord, Option<String>)>, BackendError> {
+        Storage::stream_records_with_event_ids(self, table_name, shard_id, after_sequence, limit)
+            .map_err(dyno_to_backend)
+    }
+
     async fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>, BackendError> {
         Storage::list_stream_enabled_tables(self).map_err(dyno_to_backend)
     }

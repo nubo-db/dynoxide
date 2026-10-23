@@ -208,8 +208,21 @@ pub const INIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS _config (
                 sequence_number TEXT NOT NULL,
                 shard_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                user_identity TEXT
+                user_identity TEXT,
+                event_id TEXT
             );";
+
+/// Whether `_stream_records` has an `event_id` column, as `0` or `1`.
+pub const STREAM_RECORDS_HAVE_EVENT_ID: &str =
+    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('_stream_records') WHERE name = 'event_id')";
+
+/// Add the `event_id` column to a stream record table made before it existed.
+pub const ADD_STREAM_EVENT_ID_COLUMN: &str = "ALTER TABLE _stream_records ADD COLUMN event_id TEXT";
+
+/// Give each stream record without an event id the one it has always
+/// reported: its stored sequence number.
+pub const BACKFILL_STREAM_EVENT_IDS: &str =
+    "UPDATE _stream_records SET event_id = sequence_number WHERE event_id IS NULL";
 
 // --- Transaction control (constant SQL) ---------------------------------
 

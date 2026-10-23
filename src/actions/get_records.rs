@@ -99,13 +99,13 @@ pub async fn execute<S: StorageBackend>(
 
     let limit = request.limit.unwrap_or(1000).min(1000);
     let raw_records = storage
-        .get_stream_records(&table_name, &shard_id, position, limit)
+        .get_stream_records_with_event_ids(&table_name, &shard_id, position, limit)
         .await?;
 
     let mut records = Vec::with_capacity(raw_records.len());
     let mut last_seq: i64 = position;
 
-    for raw in &raw_records {
+    for (raw, event_id) in &raw_records {
         let keys: Item = serde_json::from_str(&raw.keys_json).unwrap_or_default();
         let new_image: Option<Item> = raw
             .new_image
@@ -138,8 +138,13 @@ pub async fn execute<S: StorageBackend>(
                 })
         });
 
+        let sequence_number = crate::streams::format_sequence_number(seq_num);
         records.push(Record {
-            event_id: raw.sequence_number.clone(),
+            // A row an older build wrote has no id; it reports its stored
+            // sequence number, as the open-time backfill would store.
+            event_id: event_id
+                .clone()
+                .unwrap_or_else(|| raw.sequence_number.clone()),
             event_name: raw.event_name.clone(),
             event_version: "1.1".to_string(),
             event_source: "aws:dynamodb".to_string(),
@@ -148,7 +153,7 @@ pub async fn execute<S: StorageBackend>(
                 keys,
                 new_image,
                 old_image,
-                sequence_number: raw.sequence_number.clone(),
+                sequence_number,
                 size_bytes: size as i64,
                 stream_view_type: view_type.clone(),
                 approximate_creation_date_time: raw.created_at as f64,

@@ -44,6 +44,31 @@ pub fn shard_id(table_name: &str) -> String {
     format!("shardId-00000001-{table_name}")
 }
 
+/// Offset that turns a stored sequence number into its 21-digit public form.
+const SEQUENCE_NUMBER_OFFSET: u128 = 100_000_000_000_000_000_000;
+
+/// The public form of a stored sequence number: 21 digits, as DynamoDB's are
+/// (21 to 40). Fixed width, so string and numeric order agree.
+pub(crate) fn format_sequence_number(stored: i64) -> String {
+    (SEQUENCE_NUMBER_OFFSET + stored.max(0) as u128).to_string()
+}
+
+/// The stored sequence number a public one names, or `None` when it could
+/// not have been issued.
+pub(crate) fn parse_sequence_number(public: &str) -> Option<i64> {
+    let value: u128 = public.parse().ok()?;
+    let stored = i64::try_from(value.checked_sub(SEQUENCE_NUMBER_OFFSET)?).ok()?;
+    (stored > 0).then_some(stored)
+}
+
+/// The floor for a new stored sequence number: microseconds since the epoch,
+/// so a fresh in-memory database doesn't normally reissue an earlier session's
+/// numbers.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+pub(crate) fn sequence_number_floor(clock: &dyn Clock) -> i64 {
+    (clock.now_unix_secs_f64() * 1_000_000.0) as i64
+}
+
 /// Generate a stream label from the current timestamp.
 ///
 /// The label format preserves the historical `<secs>.<nanos>` shape. The
@@ -169,4 +194,33 @@ pub async fn record_stream_event<S: StorageBackend>(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sequence_number_round_trips_through_its_public_form() {
+        for stored in [1, 1_761_000_000_000_000, i64::MAX] {
+            let public = format_sequence_number(stored);
+            assert_eq!(public.len(), 21, "{public}");
+            assert_eq!(parse_sequence_number(&public), Some(stored));
+        }
+        assert!(format_sequence_number(9) < format_sequence_number(10));
+    }
+
+    #[test]
+    fn a_number_that_was_never_issued_names_nothing() {
+        for public in [
+            "5",
+            "abc",
+            "000000000000000000000",
+            "100000000000000000000",
+            "999999999999999999999999999999999999999",
+        ] {
+            assert_eq!(parse_sequence_number(public), None, "{public}");
+        }
+        assert_eq!(parse_sequence_number("+100000000000000000005"), Some(5));
+    }
 }

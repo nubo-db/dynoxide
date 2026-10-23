@@ -538,6 +538,16 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn get_stream_records_with_event_ids(
+        &self,
+        _table_name: &str,
+        _shard_id: &str,
+        _after_sequence: i64,
+        _limit: usize,
+    ) -> Result<Vec<(StreamRecord, Option<String>)>, BackendError> {
+        unimplemented!()
+    }
+
     async fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>, BackendError> {
         unimplemented!()
     }

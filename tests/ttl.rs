@@ -319,6 +319,15 @@ fn test_ttl_deletion_generates_stream_remove_record() {
     let identity = remove_record.user_identity.as_ref().unwrap();
     assert_eq!(identity.identity_type, "Service");
     assert_eq!(identity.principal_id, "dynamodb.amazonaws.com");
+
+    // The TTL delete's record carries its own eventID, shaped as DynamoDB's.
+    let id = &remove_record.event_id;
+    assert_eq!(id.len(), 32, "eventID {id}");
+    assert!(
+        id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "{id}"
+    );
+    assert_ne!(id, &insert_record.event_id);
 }
 
 #[test]

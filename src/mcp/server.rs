@@ -810,7 +810,9 @@ pub struct GetShardIteratorParams {
     )]
     pub shard_iterator_type: String,
 
-    #[schemars(description = "Sequence number (required for AT/AFTER_SEQUENCE_NUMBER)")]
+    #[schemars(
+        description = "Sequence number, 21 to 40 digits (required for AT/AFTER_SEQUENCE_NUMBER, refused for TRIM_HORIZON and LATEST)"
+    )]
     pub sequence_number: Option<String>,
 }
 

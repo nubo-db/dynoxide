@@ -264,7 +264,7 @@ async fn execute_inner<S: StorageBackend>(
             if options.record_streams && meta.stream_enabled {
                 let seq = next_seq;
                 next_seq += 1;
-                let shard_id = format!("shardId-{table_name}-000000");
+                let shard_id = crate::streams::shard_id(table_name);
                 let keys_json = {
                     let mut keys = std::collections::HashMap::new();
                     if let Some(v) = item.get(&key_schema.partition_key) {
@@ -277,6 +277,8 @@ async fn execute_inner<S: StorageBackend>(
                     }
                     serde_json::to_string(&keys).unwrap_or_default()
                 };
+                let (new_image, old_image) =
+                    crate::streams::stream_images(&meta, None, Some(&item));
                 let now_epoch = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
@@ -286,8 +288,8 @@ async fn execute_inner<S: StorageBackend>(
                         table_name,
                         "INSERT",
                         &keys_json,
-                        Some(&item_json),
-                        None,
+                        new_image.as_deref(),
+                        old_image.as_deref(),
                         &seq.to_string(),
                         &shard_id,
                         now_epoch,

@@ -451,6 +451,110 @@ fn import_large_batch() {
     assert!(get_item(&db, "Users", "user#499", "PROFILE").is_some());
 }
 
+/// The one shard DescribeStream lists for `stream_arn`.
+fn only_shard(db: &Database, stream_arn: &str) -> dynoxide::actions::describe_stream::Shard {
+    use dynoxide::actions::describe_stream::DescribeStreamRequest;
+
+    let mut shards = db
+        .describe_stream(DescribeStreamRequest {
+            stream_arn: stream_arn.to_string(),
+            exclusive_start_shard_id: None,
+            limit: None,
+        })
+        .unwrap()
+        .stream_description
+        .shards;
+    assert_eq!(shards.len(), 1);
+    shards.remove(0)
+}
+
+/// Import one item into a fresh table streaming `view_type`, and return the
+/// record a consumer reads from the shard DescribeStream lists.
+fn import_one_and_read_its_record(view_type: &str) -> dynoxide::actions::get_records::Record {
+    use dynoxide::actions::create_table::CreateTableRequest;
+    use dynoxide::actions::get_records::GetRecordsRequest;
+    use dynoxide::actions::get_shard_iterator::GetShardIteratorRequest;
+    use dynoxide::actions::list_streams::ListStreamsRequest;
+    use dynoxide::types::{AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType};
+
+    let db = create_test_db();
+    db.create_table(CreateTableRequest {
+        table_name: "Viewed".to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::HASH,
+        }],
+        attribute_definitions: vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: ScalarAttributeType::S,
+        }],
+        stream_specification: Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(view_type.to_string()),
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let opts = ImportOptions {
+        record_streams: true,
+        ..Default::default()
+    };
+    let items = vec![dynoxide::item! { "pk" => "a", "name" => "Alice" }];
+    db.import_items("Viewed", items, opts).unwrap();
+
+    let stream_arn = db
+        .list_streams(ListStreamsRequest {
+            table_name: Some("Viewed".to_string()),
+            exclusive_start_stream_arn: None,
+            limit: None,
+        })
+        .unwrap()
+        .streams
+        .remove(0)
+        .stream_arn;
+    let shard = only_shard(&db, &stream_arn);
+    let iterator = db
+        .get_shard_iterator(GetShardIteratorRequest {
+            stream_arn,
+            shard_id: shard.shard_id,
+            shard_iterator_type: "TRIM_HORIZON".to_string(),
+            sequence_number: None,
+        })
+        .unwrap()
+        .shard_iterator
+        .unwrap();
+    let mut records = db
+        .get_records(GetRecordsRequest {
+            shard_iterator: iterator,
+            limit: None,
+        })
+        .unwrap()
+        .records;
+    assert_eq!(records.len(), 1, "{view_type}");
+    records.remove(0)
+}
+
+#[test]
+fn imported_stream_records_follow_the_tables_view_type() {
+    let key = dynoxide::item! { "pk" => "a" };
+    let full = dynoxide::item! { "pk" => "a", "name" => "Alice" };
+
+    for (view_type, new_image) in [
+        ("KEYS_ONLY", None),
+        ("NEW_IMAGE", Some(&full)),
+        ("OLD_IMAGE", None),
+        ("NEW_AND_OLD_IMAGES", Some(&full)),
+    ] {
+        let record = import_one_and_read_its_record(view_type);
+        assert_eq!(record.event_name, "INSERT", "{view_type}");
+        assert_eq!(record.dynamodb.keys, key, "{view_type}");
+        assert_eq!(record.dynamodb.new_image.as_ref(), new_image, "{view_type}");
+        assert_eq!(record.dynamodb.old_image, None, "{view_type}");
+        assert_eq!(record.dynamodb.stream_view_type, view_type);
+    }
+}
+
 #[test]
 fn import_with_record_streams() {
     use dynoxide::actions::create_table::CreateTableRequest;
@@ -515,10 +619,20 @@ fn import_with_record_streams() {
     assert_eq!(streams_resp.streams.len(), 1);
     let stream_arn = &streams_resp.streams[0].stream_arn;
 
+    // Follow the shard DescribeStream lists, as a stream consumer does.
+    let shard = only_shard(&db, stream_arn);
+    assert!(
+        shard
+            .sequence_number_range
+            .starting_sequence_number
+            .is_some(),
+        "the listed shard holds the imported records"
+    );
+
     let iter_resp = db
         .get_shard_iterator(GetShardIteratorRequest {
             stream_arn: stream_arn.clone(),
-            shard_id: "shardId-StreamTable-000000".to_string(),
+            shard_id: shard.shard_id,
             shard_iterator_type: "TRIM_HORIZON".to_string(),
             sequence_number: None,
         })

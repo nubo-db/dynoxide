@@ -113,13 +113,13 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 | `http-server` | Yes | Adds axum-based HTTP server exposing the DynamoDB JSON API. |
 | `mcp-server` | Yes | Adds MCP server for coding agents (stdio and Streamable HTTP transports). |
 | `import` | Yes | Adds `dynoxide import` CLI for importing DynamoDB Export data with anonymisation. |
-| `cli` | Indirect | Gates the `dynoxide` binary. Pulled in automatically by `http-server`, `mcp-server`, or `import`, so default builds include it; a library-only or `wasm-sqlite` build omits the binary. |
+| `cli` | Yes | Gates the `dynoxide` binary, with its argument parser (clap) and log subscriber (`tracing-subscriber`). The binary also needs `http-server`, `mcp-server` or `import`. `import` turns `cli` on; `http-server` and `mcp-server` don't, so a library that embeds a server compiles neither dependency and keeps its own logging setup. |
 | `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS). Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See the WASM section. |
 | `encryption` | No | Bundles SQLCipher + vendored OpenSSL. Adds `Database::new_encrypted()` for encryption at rest. |
 | `encryption-cc` | No | Like `encryption` but uses Apple CommonCrypto instead of bundled OpenSSL. For macOS and iOS builds. |
-| `encrypted-server` | No | Convenience: enables `encryption` + `http-server`. |
-| `encrypted-server-cc` | No | Convenience: enables `encryption-cc` + `http-server`. |
-| `encrypted-full` | No | Convenience: enables `encryption` + `http-server` + `mcp-server` + `import`. |
+| `encrypted-server` | No | Convenience: enables `encryption` + `http-server` + `cli`. |
+| `encrypted-server-cc` | No | Convenience: enables `encryption-cc` + `http-server` + `cli`. |
+| `encrypted-full` | No | Convenience: enables `encryption` + `http-server` + `mcp-server` + `import` + `cli`. |
 | `full` | - | Alias for default features (backward compatibility). |
 
 `native-sqlite`, `encryption` and `wasm-sqlite` are **mutually exclusive** - they select different SQLite backends. `wasm-sqlite` additionally excludes the CLI, server and MCP features, which are native-only. Cargo adds the default features to whatever you list, so naming one of these on its own is not enough: `features = ["wasm-sqlite"]` still enables `native-sqlite` and the CLI from the defaults, and the build stops on a `compile_error!` saying so. Always pair a non-default backend with `default-features = false`. To use encryption:

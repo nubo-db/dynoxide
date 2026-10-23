@@ -19,26 +19,28 @@ name = "dynoxide"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["native-sqlite", "http-server", "mcp-server", "import"]
+default = ["native-sqlite", "http-server", "mcp-server", "import", "cli"]
 
 # Marker feature for the CLI binary (`src/main.rs`). The binary always needs
-# clap and one of the CLI-capable features below; `[[bin]] required-features`
-# keys off `cli` so the binary is skipped in backend-neutral builds such as
-# `--no-default-features --features wasm-sqlite`, which ship the library only.
-cli = ["dep:clap"]
+# clap, a log subscriber and one of `http-server`, `mcp-server` or `import`;
+# `[[bin]] required-features` keys off `cli` so the binary is skipped in
+# library builds. The server features don't imply it, so a library that embeds
+# the HTTP or MCP server compiles neither clap nor the subscriber: the library
+# logs through `tracing` alone and leaves the subscriber to the application.
+cli = ["dep:clap", "dep:tracing-subscriber"]
 # Operation counters for the performance questions that are about how many times
 # something happens rather than how long it takes. Off by default; compiles to
 # nothing when absent. See `src/bench_counters.rs`.
 bench-counters = []
-http-server = ["cli", "dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:socket2", "dep:crc32fast", "dep:windows-sys"]
+http-server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:tracing", "dep:socket2", "dep:crc32fast", "dep:windows-sys"]
 native-sqlite = ["dep:rusqlite", "rusqlite/bundled"]
 _has-encryption = ["dep:zeroize"]
 encryption = ["_has-encryption", "rusqlite/bundled-sqlcipher-vendored-openssl"]
 encryption-cc = ["_has-encryption", "rusqlite/bundled-sqlcipher"]
-encrypted-server = ["encryption", "http-server"]
-encrypted-server-cc = ["encryption-cc", "http-server"]
-encrypted-full = ["encryption", "http-server", "mcp-server", "import"]
-mcp-server = ["cli", "dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:tracing-subscriber", "dep:libc", "dep:directories", "dep:subtle", "dep:socket2", "dep:windows-sys"]
+encrypted-server = ["encryption", "http-server", "cli"]
+encrypted-server-cc = ["encryption-cc", "http-server", "cli"]
+encrypted-full = ["encryption", "http-server", "mcp-server", "import", "cli"]
+mcp-server = ["dep:rmcp", "dep:schemars", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tracing", "dep:libc", "dep:directories", "dep:subtle", "dep:socket2", "dep:windows-sys"]
 import = ["cli", "dep:toml", "dep:fake", "dep:sha2", "dep:hmac", "dep:zeroize", "dep:flate2", "dep:indicatif", "dep:zstd", "dep:tempfile"]
 
 # Real wasm SQLite backend. dynoxide compiles to wasm32-unknown-unknown and
@@ -53,7 +55,7 @@ wasm-sqlite = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures", "de
 wasm-harness = ["wasm-sqlite"]
 
 # Backward-compatible alias - identical to default features
-full = ["native-sqlite", "http-server", "mcp-server", "import"]
+full = ["native-sqlite", "http-server", "mcp-server", "import", "cli"]
 
 [dependencies]
 rusqlite = { version = "0.36", features = ["backup", "functions"], optional = true }

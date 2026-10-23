@@ -9,7 +9,7 @@
 //! The container's own `HEALTHCHECK` (`do_healthcheck` in `src/main.rs`) reads
 //! the status line and never the body, so the body is pinned only here.
 
-#![cfg(feature = "http-server")]
+#![cfg(all(feature = "http-server", feature = "cli"))]
 
 use dynoxide::Database;
 use std::io::{BufRead, BufReader, Read};

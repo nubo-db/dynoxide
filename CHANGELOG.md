@@ -97,7 +97,6 @@ Behaviour changes and `docs/compatibility-summary.md`.
   is a `ValidationException`. Its `SerializationException` bodies use a
   lowercase `message`, as that endpoint writes them. Other operations are
   unchanged ([#267](https://github.com/nubo-db/dynoxide/issues/267)).
-||||||| f8e2058
 
 ## [1.4.0] - 2026-10-21
 

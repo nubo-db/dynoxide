@@ -302,6 +302,31 @@ impl DynoxideError {
         }
     }
 
+    /// Serialise to the JSON body `operation` answers with.
+    ///
+    /// SearchVectors is served by its own endpoint, which writes every error
+    /// as `__type` then a lowercase `message`, a `SerializationException`
+    /// included (captured eu-west-2 and us-east-1, 23 October 2026). Every
+    /// other operation gets [`to_json`](Self::to_json).
+    #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+    pub(crate) fn to_json_for(&self, operation: &str) -> String {
+        match self {
+            DynoxideError::SerializationException(_) if operation == "SearchVectors" => {
+                let message = self.to_string();
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "__type".to_string(),
+                    serde_json::Value::String(self.error_type().to_string()),
+                );
+                if !message.is_empty() {
+                    m.insert("message".to_string(), serde_json::Value::String(message));
+                }
+                serde_json::to_string(&m).unwrap_or_default()
+            }
+            _ => self.to_json(),
+        }
+    }
+
     /// Serialise to DynamoDB-compatible JSON string.
     ///
     /// `SerializationException` and `TransactionCanceledException` use

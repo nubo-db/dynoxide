@@ -627,7 +627,10 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
 }
 
 /// DynamoDB's refusal of `type_key`'s member when it is an empty set.
-fn empty_set_refusal(type_key: &str, member: &serde_json::Value) -> Option<&'static str> {
+pub(crate) fn empty_set_refusal(
+    type_key: &str,
+    member: &serde_json::Value,
+) -> Option<&'static str> {
     if !member.as_array().is_some_and(Vec::is_empty) {
         return None;
     }

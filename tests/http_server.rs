@@ -1451,7 +1451,9 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
     let (url, _handle) = start_test_server().await;
 
     // SearchVector must be a bare array of attribute values, not an
-    // L-wrapped attribute value.
+    // L-wrapped attribute value. The search endpoint quotes its deserialiser,
+    // with a lowercase `message` (captured eu-west-2 and us-east-1, 23 October
+    // 2026).
     let resp = dynamo_request(
         &url,
         "SearchVectors",
@@ -1471,9 +1473,10 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
         "unexpected __type: {}",
         body["__type"]
     );
-    assert_eq!(
-        body["Message"],
-        "Start of structure or map found where not expected"
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("invalid type: map, expected a sequence at line 1 column "),
+        "unexpected message: {message}"
     );
 
     // A Create or Delete inside VectorIndexUpdates names the vector action,
@@ -1514,7 +1517,8 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["Message"], "Unexpected field type");
 
-    // TopK as a string is a serialisation-layer type mismatch.
+    // TopK as a string is a serialisation-layer type mismatch, quoted the way
+    // a fractional TopK is.
     let resp = dynamo_request(
         &url,
         "SearchVectors",
@@ -1534,9 +1538,10 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
         "unexpected __type: {}",
         body["__type"]
     );
-    assert_eq!(
-        body["Message"],
-        "STRING_VALUE cannot be converted to Integer"
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(r#"invalid type: string "10", expected i32 at line 1 column "#),
+        "unexpected message: {message}"
     );
 }
 
@@ -1567,7 +1572,7 @@ async fn test_search_vectors_fractional_top_k_is_a_serialization_exception() {
         "unexpected __type: {}",
         body["__type"]
     );
-    let message = body["Message"].as_str().unwrap();
+    let message = body["message"].as_str().unwrap();
     assert!(
         message.starts_with("invalid type: floating point `3.5`, expected i32 at line 1 column"),
         "unexpected message: {message}"
@@ -1855,7 +1860,7 @@ async fn test_search_vectors_typed_null_quotes_the_deserialiser() {
             "{body}"
         );
         assert_eq!(
-            response["Message"],
+            response["message"],
             format!("invalid type: null, expected {expected}"),
             "{body}"
         );
@@ -1891,4 +1896,888 @@ async fn test_null_value_on_query_is_still_a_validation_exception() {
             "{values}"
         );
     }
+}
+
+/// Send each captured SearchVectors body and compare the whole response with
+/// the bytes DynamoDB's search endpoint returned for it.
+async fn assert_search_vectors_answers(url: &str, cases: &[(&str, &str, u16, &str)]) {
+    for (name, body, status, expected) in cases {
+        let (got_status, got) = search_vectors_raw(url, body).await;
+        assert_eq!(got_status, *status, "{name}: {got}");
+        assert_eq!(got, *expected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn test_search_vectors_wrongly_typed_member_quotes_the_deserialiser() {
+    let (url, _handle) = start_test_server().await;
+
+    // A member holding the wrong JSON type, at any depth, is a SerializationException
+    // quoting the deserialiser, position included. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "svN_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":1}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a string at line 1 column 83"}"#,
+            ),
+            (
+                "svN_float",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":1.5}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: floating point `1.5`, expected a string at line 1 column 85"}"#,
+            ),
+            (
+                "svN_bool",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":true}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: boolean `true`, expected a string at line 1 column 86"}"#,
+            ),
+            (
+                "svN_map",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":{}}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: map, expected a string at line 1 column 82"}"#,
+            ),
+            (
+                "svN_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":[]}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: sequence, expected a string at line 1 column 82"}"#,
+            ),
+            (
+                "svS_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":1}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a string at line 1 column 83"}"#,
+            ),
+            (
+                "svB_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"B":1}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a Base64-encoded string at line 1 column 83"}"#,
+            ),
+            (
+                "svBOOL_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"BOOL":"true"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"true\", expected a boolean at line 1 column 91"}"#,
+            ),
+            (
+                "svBOOL_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"BOOL":1}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a boolean at line 1 column 86"}"#,
+            ),
+            (
+                "svNULL_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"NULL":"true"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"true\", expected a boolean at line 1 column 91"}"#,
+            ),
+            (
+                "svL_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"L":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"a\", expected a sequence at line 1 column 85"}"#,
+            ),
+            (
+                "svL_map",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"L":{}}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: map, expected a sequence at line 1 column 82"}"#,
+            ),
+            (
+                "svM_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"M":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"a\", expected a map at line 1 column 85"}"#,
+            ),
+            (
+                "svM_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"M":[]}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: sequence, expected a map at line 1 column 82"}"#,
+            ),
+            (
+                "svSS_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"SS":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"a\", expected a sequence at line 1 column 86"}"#,
+            ),
+            (
+                "svSS_intElem",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"SS":[1]}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a string at line 1 column 85"}"#,
+            ),
+            (
+                "svNS_intElem",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"NS":[1]}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a string at line 1 column 85"}"#,
+            ),
+            (
+                "svBS_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"BS":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"a\", expected a sequence at line 1 column 86"}"#,
+            ),
+            (
+                "sv_map",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":{},"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: map, expected a sequence at line 1 column 76"}"#,
+            ),
+            (
+                "sv_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":"x","TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"x\", expected a sequence at line 1 column 79"}"#,
+            ),
+            (
+                "sv_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":1,"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a sequence at line 1 column 77"}"#,
+            ),
+            (
+                "ev_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":"x"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"x\", expected a map at line 1 column 128"}"#,
+            ),
+            (
+                "ev_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":[]}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: sequence, expected a map at line 1 column 125"}"#,
+            ),
+            (
+                "evN_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"N":1}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a string at line 1 column 137"}"#,
+            ),
+            (
+                "evS_bool",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"S":false}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: boolean `false`, expected a string at line 1 column 141"}"#,
+            ),
+            (
+                "evM_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"M":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: sequence, expected a map at line 1 column 136"}"#,
+            ),
+            (
+                "evL_map",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"L":{}}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: map, expected a sequence at line 1 column 136"}"#,
+            ),
+            (
+                "evBOOL_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"BOOL":"true"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"true\", expected a boolean at line 1 column 145"}"#,
+            ),
+            (
+                "evNULL_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"NULL":"true"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: string \"true\", expected a boolean at line 1 column 145"}"#,
+            ),
+            (
+                "tbl_int",
+                r#"{"TableName":5,"IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `5`, expected a string at line 1 column 14"}"#,
+            ),
+            (
+                "topk_float",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1.5}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: floating point `1.5`, expected i32 at line 1 column 98"}"#,
+            ),
+            (
+                "v_eavINT_bad",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":1}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: integer `1`, expected a string at line 1 column 139"}"#,
+            ),
+            (
+                "v_eavINT_null",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":null}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string at line 1 column 142"}"#,
+            ),
+            (
+                "v_svINT_null",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"INT":null}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException","message":"invalid type: null, expected a string at line 1 column 88"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_unknown_type_lists_the_variants() {
+    let (url, _handle) = start_test_server().await;
+
+    // A type DynamoDB does not know, or a bare string where a value belongs, lists
+    // the types it does know; any other value that is not an object has no
+    // message, nor does a body that is not JSON. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "svElem_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":["1"],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"unknown variant `1`, expected one of `B`, `BOOL`, `BS`, `DECIMAL`, `DECIMALSET`, `DOUBLE`, `DOUBLESET`, `INT`, `INTSET`, `L`, `M`, `N`, `NS`, `NULL`, `S`, `SS` at line 1 column 80"}"#,
+            ),
+            (
+                "svElem_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[1],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "svElem_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[[{"N":"1"}]],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "svElem_bool",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[true],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "evVal_str",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":"x"}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"unknown variant `x`, expected one of `B`, `BOOL`, `BS`, `DECIMAL`, `DECIMALSET`, `DOUBLE`, `DOUBLESET`, `INT`, `INTSET`, `L`, `M`, `N`, `NS`, `NULL`, `S`, `SS` at line 1 column 134"}"#,
+            ),
+            (
+                "evVal_int",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":1}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "evVal_seq",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":[]}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "svX",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"X":"1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"unknown variant `X`, expected one of `B`, `BOOL`, `BS`, `DECIMAL`, `DECIMALSET`, `DOUBLE`, `DOUBLESET`, `INT`, `INTSET`, `L`, `M`, `N`, `NS`, `NULL`, `S`, `SS` at line 1 column 81"}"#,
+            ),
+            (
+                "evX",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"X":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"unknown variant `X`, expected one of `B`, `BOOL`, `BS`, `DECIMAL`, `DECIMALSET`, `DOUBLE`, `DOUBLESET`, `INT`, `INTSET`, `L`, `M`, `N`, `NS`, `NULL`, `S`, `SS` at line 1 column 135"}"#,
+            ),
+            (
+                "evLower",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"s":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"unknown variant `s`, expected one of `B`, `BOOL`, `BS`, `DECIMAL`, `DECIMALSET`, `DOUBLE`, `DOUBLESET`, `INT`, `INTSET`, `L`, `M`, `N`, `NS`, `NULL`, `S`, `SS` at line 1 column 135"}"#,
+            ),
+            (
+                "evX_then_S",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"X":"1","S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"unknown variant `X`, expected one of `B`, `BOOL`, `BS`, `DECIMAL`, `DECIMALSET`, `DOUBLE`, `DOUBLESET`, `INT`, `INTSET`, `L`, `M`, `N`, `NS`, `NULL`, `S`, `SS` at line 1 column 135"}"#,
+            ),
+            (
+                "evS_then_X",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"S":"a","X":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "v_eavINT_then_S",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":"1","S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+            (
+                "bad_json",
+                r#"{not json"#,
+                400,
+                r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_expression_value_refusals() {
+    let (url, _handle) = start_test_server().await;
+
+    // Each expression value is checked on its own before the expression
+    // parameters are: a type DynamoDB keeps for itself, an empty set, a number it
+    // cannot read, a NULL that is not true. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "evINT",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "evDECIMAL",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"DECIMAL":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "evDOUBLE",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"DOUBLE":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "evINTSET",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INTSET":["1"]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "v_eavDECIMALSET",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"DECIMALSET":["1"]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "v_eavDOUBLESET",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"DOUBLESET":["1"]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "evSS_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"SS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set  may not be empty"}"#,
+            ),
+            (
+                "evNS_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"NS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An number set  may not be empty"}"#,
+            ),
+            (
+                "evBS_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"BS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Binary sets should not be empty"}"#,
+            ),
+            (
+                "evN_abc",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"N":"abc"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+            ),
+            (
+                "evNS_abc",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"NS":["abc"]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+            ),
+            (
+                "evN_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"N":""}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: "}"#,
+            ),
+            (
+                "evNULL_false",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"NULL":false}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Null attribute value types must have the value of true"}"#,
+            ),
+            (
+                "v_eavINT_noExpr",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This type mapping is not supported"}"#,
+            ),
+            (
+                "e_eav_noexpr_emptySS_twokeys",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"S":"a"},":w":{"SS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set  may not be empty"}"#,
+            ),
+            (
+                "e_ean_noexpr_eav_emptySS",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeNames":{"#a":"a"},"ExpressionAttributeValues":{":v":{"SS":[]}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set  may not be empty"}"#,
+            ),
+            (
+                "e_eav_noexpr_emptySS_badkey",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{"v":{"SS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set  may not be empty"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_search_vector_holds_32_bit_floats() {
+    let (url, _handle) = start_test_server().await;
+
+    // Every element of the search vector must be a number that reads as a finite
+    // 32-bit float, whatever else it is; the check runs before the table is
+    // looked up. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "svINT",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"INT":"1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svSS_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"SS":[]}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svN_abc",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"abc"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svN_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":""}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svN_huge",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1e400"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svN_tiny",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1e-400"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+            (
+                "svN_42digits",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"123456789012345678901234567890123456789012"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svS",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svN_then_S",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"},{"S":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "svN_abc_then_S",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"},{"N":"abc"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svLelem",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"L":[{"N":"1"}]}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svN_1e39",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1e39"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svN_ws",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":" 1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svN_hex",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"0x1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svN_inf",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"Infinity"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svN_nan",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"NaN"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_svN_plus",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"+1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+            (
+                "v_svN_dot",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":".5"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_check_order() {
+    let (url, _handle) = start_test_server().await;
+
+    // The member constraints, the table name, ReturnConsumedCapacity and the TopK
+    // ceiling come first, then the search vector, then the expression values. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "o_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"S":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "o_topk0",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":0}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'TopK' failed to satisfy constraint: Member must have value greater than or equal to 1"}"#,
+            ),
+            (
+                "o_topk101",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":101}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Provided TopK value '101' is out of valid range. The value must be between 1 and 100 inclusive"}"#,
+            ),
+            (
+                "o_tblBad",
+                r#"{"TableName":"a!","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "o_tblEmpty",
+                r#"{"TableName":"","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'TableName' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+            ),
+            (
+                "o_eavNoExpr",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_eavEmpty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ExpressionAttributeValues":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_eavEmptySS",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ExpressionAttributeValues":{":v":{"SS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_eavBadN",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ExpressionAttributeValues":{":v":{"N":"abc"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_eavINT",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_scSyntax",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"SearchConditionExpression":"a = = :v","ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_scEmpty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"SearchConditionExpression":""}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_projEmpty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"S":"a"}],"TopK":1,"ProjectionExpression":""}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "o_dims",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"},{"S":"a"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute"}"#,
+            ),
+            (
+                "v_eavINT_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"INT":"1"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "v_eavEmptySS_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"SS":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "v_eavBadN_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"N":"abc"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "v_eavNoExpr_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "v_eavNoExpr_topk101",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":101,"ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Provided TopK value '101' is out of valid range. The value must be between 1 and 100 inclusive"}"#,
+            ),
+            (
+                "v_eavEmpty_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "v_eavNULLfalse_idxShort",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"NULL":false}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_search_vectors_expression_parameters() {
+    let (url, _handle) = start_test_server().await;
+
+    // Names need an expression and values need a SearchConditionExpression; an
+    // empty map, a malformed key and an unused name or value are refused before
+    // the table is looked up, names ahead of values. Every response is the body DynamoDB's search
+    // endpoint gave for the same request (captured eu-west-2 and us-east-1,
+    // 23 October 2026, identical apart from columns).
+    assert_search_vectors_answers(
+        &url,
+        &[
+            (
+                "evNULL_true",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"NULL":true}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"#,
+            ),
+            (
+                "evL_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"L":[]}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"#,
+            ),
+            (
+                "evM_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"M":{}}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"#,
+            ),
+            (
+                "ev_noexpr",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"#,
+            ),
+            (
+                "ev_emptyMap",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues must not be empty"}"#,
+            ),
+            (
+                "ean_noexpr",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeNames":{"#a":"a"}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"#,
+            ),
+            (
+                "ev_unused",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"a = :v","ExpressionAttributeValues":{":v":{"S":"a"},":w":{"S":"b"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeValues unused in expressions: keys: {:w}"}"#,
+            ),
+            (
+                "ev_projection_only",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ProjectionExpression":"a","ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"#,
+            ),
+            (
+                "e_ean_proj",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ProjectionExpression":"#a","ExpressionAttributeNames":{"#a":"a"}}"##,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+            (
+                "e_ean_proj_unused",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ProjectionExpression":"#a","ExpressionAttributeNames":{"#a":"a","#b":"b"}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeNames unused in expressions: keys: {#b}"}"#,
+            ),
+            (
+                "e_ean_empty",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ProjectionExpression":"a","ExpressionAttributeNames":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames must not be empty"}"#,
+            ),
+            (
+                "e_ean_empty_noexpr",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeNames":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames must not be empty"}"#,
+            ),
+            (
+                "e_ean_badkey",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ProjectionExpression":"a","ExpressionAttributeNames":{"a":"a"}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid key: Syntax error; key: \"a\""}"#,
+            ),
+            (
+                "e_eav_badkey",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"a = :v","ExpressionAttributeValues":{"v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid key: Syntax error; key: \"v\""}"#,
+            ),
+            (
+                "e_eav_empty_cond",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"a = :v","ExpressionAttributeValues":{}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues must not be empty"}"#,
+            ),
+            (
+                "e_eav_unused_cond",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"a = :v","ExpressionAttributeValues":{":v":{"S":"a"},":w":{"S":"b"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeValues unused in expressions: keys: {:w}"}"#,
+            ),
+            (
+                "e_eav_unused_both",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#a = :v","ExpressionAttributeNames":{"#a":"a","#b":"b"},"ExpressionAttributeValues":{":v":{"S":"a"},":w":{"S":"b"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeNames unused in expressions: keys: {#b}"}"#,
+            ),
+            (
+                "e_ean_unused_cond",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"#a = :v","ExpressionAttributeNames":{"#a":"a","#b":"b"},"ExpressionAttributeValues":{":v":{"S":"a"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeNames unused in expressions: keys: {#b}"}"#,
+            ),
+            (
+                "e_eav_undefined",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"a = :v"}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid SearchConditionExpression: An expression attribute value used in expression is not defined; attribute value: :v"}"#,
+            ),
+            (
+                "e_eav_noexpr_badkey",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeValues":{"v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid key: Syntax error; key: \"v\""}"#,
+            ),
+            (
+                "e_eav_proj_cond_ok",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"SearchConditionExpression":"a = :v","ProjectionExpression":"a","ExpressionAttributeValues":{":v":{"S":"a"}}}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+            (
+                "v_eanNoExpr_eavNoExpr",
+                r##"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"ExpressionAttributeNames":{"#a":"a"},"ExpressionAttributeValues":{":v":{"S":"a"}}}"##,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"#,
+            ),
+            (
+                "rnf",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+            (
+                "idx_short",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"ab","SearchVector":[{"N":"1"}],"TopK":1}"#,
+                400,
+                r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'IndexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+            ),
+            (
+                "unknown_member",
+                r#"{"TableName":"_capture_20261023_absent_x9","IndexName":"vix","SearchVector":[{"N":"1"}],"TopK":1,"Foo":1}"#,
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+            ),
+        ],
+    )
+    .await;
 }

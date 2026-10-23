@@ -360,16 +360,11 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             check_field_is_list(obj, "Tags")?;
             check_list_elements_are_structs(obj, "Tags")?;
         }
-        "SearchVectors" => {
-            // SearchVector is a bare array of AttributeValue structs, not
-            // wrapped in L. TableName, IndexName, ProjectionExpression, and
-            // the expression attribute maps are covered by the common checks
-            // below.
-            check_field_is_list(obj, "SearchVector")?;
-            check_list_elements_are_structs(obj, "SearchVector")?;
-            check_field_is_int(obj, "TopK")?;
-            check_field_is_string(obj, "SearchConditionExpression")?;
-        }
+        // SearchVectors is served by its own endpoint, whose strict
+        // deserialiser answers every JSON type mismatch in its own words (see
+        // `actions::search_vectors`), so none of the checks here apply to it,
+        // the common ones below included.
+        "SearchVectors" => return Ok(()),
         _ => {}
     }
 

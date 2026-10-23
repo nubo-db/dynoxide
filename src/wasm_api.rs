@@ -209,7 +209,7 @@ pub async fn dispatch_http<S: StorageBackend>(
                 return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
             }
             crate::deep_nesting::DeepBody::Refuse(e) => {
-                return HttpOutcome::new(e.status_code(), e.to_json());
+                return HttpOutcome::new(e.status_code(), e.to_json_for(operation));
             }
             crate::deep_nesting::DeepBody::Run(body) => {
                 rewritten = body;
@@ -225,7 +225,7 @@ pub async fn dispatch_http<S: StorageBackend>(
     // serialised envelope. Same source of truth as the native server.
     match route(backend, ctx, operation, body).await {
         Ok(json) => HttpOutcome::new(200, json),
-        Err(e) => HttpOutcome::new(e.status_code(), e.to_json()),
+        Err(e) => HttpOutcome::new(e.status_code(), e.to_json_for(operation)),
     }
 }
 
@@ -275,15 +275,15 @@ pub async fn dispatch<S: StorageBackend>(
                 crate::deep_nesting::DeepBody::Unreadable => {
                     Err(SERIALIZATION_EXCEPTION_BARE.to_string())
                 }
-                crate::deep_nesting::DeepBody::Refuse(e) => Err(e.to_json()),
+                crate::deep_nesting::DeepBody::Refuse(e) => Err(e.to_json_for(op)),
                 crate::deep_nesting::DeepBody::Run(rewritten) => {
                     route(backend, ctx, op, &rewritten)
                         .await
-                        .map_err(|e| e.to_json())
+                        .map_err(|e| e.to_json_for(op))
                 }
             }
         }
-        Err(e) => Err(e.to_json()),
+        Err(e) => Err(e.to_json_for(op)),
     }
 }
 

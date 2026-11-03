@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **PartiQL reads a shared partition when every OR branch pins the same key.**
+  A condition such as `pk = 'k' AND (x = 1 OR x = 2)` used to scan the table,
+  so it could return short pages and charge for every partition. It now reads
+  that partition on both tables and indexes, while applying the full condition
+  as a filter. Captured against eu-west-2 and us-east-1 on 23 October 2026;
+  the earlier scan behaviour was captured in both regions on 10 October 2026.
+
 ## [1.5.0] - 2026-10-23
 
 The crate moves to `dynoxide-rs` 3.2.0. Everything else a user installs carries
@@ -72,12 +81,6 @@ Behaviour changes and `docs/compatibility-summary.md`.
 
 ### Fixed
 
-- **PartiQL reads a shared partition when every OR branch pins the same key.**
-  A condition such as `pk = 'k' AND (x = 1 OR x = 2)` used to scan the table,
-  so it could return short pages and charge for every partition. It now reads
-  that partition on both tables and indexes, while applying the full condition
-  as a filter. Captured against eu-west-2 and us-east-1 on 23 October 2026;
-  the earlier scan behaviour was captured in both regions on 10 October 2026.
 - **A stream record's `eventID` is globally unique.** It was the record's
   sequence number, so an in-memory server issued `1`, `2`, `3` again after
   every restart, and a consumer that skips eventIDs it has already processed

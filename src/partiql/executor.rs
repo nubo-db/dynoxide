@@ -1867,7 +1867,13 @@ async fn evaluate_window<S: StorageBackend>(
 ) -> Result<Window> {
     // A keyed read needs an equality on the partition key. An index whose key
     // has more than one attribute never gets here: its reads are refused first
-    // (see `reject_multi_attribute_index`).
+    // (see `reject_multi_attribute_index`). An OR whose branches all pin the
+    // same partition key reads that partition too, with the whole clause as a
+    // filter (captured eu-west-2 and us-east-1, 2026-10-23:
+    // `pk = 'k' AND (x = 1 OR x = 2)` costs what `pk = 'k'` costs, on a table,
+    // an ALL GSI and an LSI). Its key is refused for size as a single-group
+    // read's is (captured eu-west-2 and us-east-1, 2026-10-10:
+    // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table).
     let pk_condition = where_clause
         .and_then(|wc| find_pk_condition(wc, read_pk).or_else(|| pk_in_every_group(wc, read_pk)));
     // A partition key value no key can have only gets this far when the clause

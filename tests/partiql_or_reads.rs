@@ -136,14 +136,32 @@ fn sort_key_equalities_read_only_their_union() {
         let page = read(&db, &sql, None, None, true);
         assert_eq!(page.items.unwrap().len(), 2);
         assert_eq!(page.consumed_capacity.unwrap().capacity_units, 2.0);
+        // Eventually consistent, the captured read: 1.0, as DynamoDB charges.
+        let page = read(&db, &sql, None, None, false);
+        assert_eq!(page.consumed_capacity.unwrap().capacity_units, 1.0);
+        // DynamoDB returns the two rows over two pages, the second without a
+        // token, since the read has passed the last requested key.
         let page = read(&db, &sql, Some(1), None, true);
         assert_eq!(page.items.unwrap().len(), 1);
+        assert!(page.next_token.is_some());
         let page = read(&db, &sql, Some(1), page.next_token, true);
         assert_eq!(page.items.unwrap().len(), 1);
-        let page = read(&db, &sql, Some(1), page.next_token, true);
-        assert!(page.items.unwrap().is_empty());
-        assert!(page.next_token.is_none());
+        assert!(page.next_token.is_none(), "{clause}");
+        // A limit that covers every key needs one page.
+        let page = read(&db, &sql, Some(2), None, true);
+        assert_eq!(page.items.unwrap().len(), 2);
+        assert!(page.next_token.is_none(), "{clause}");
     }
+    // A requested key the read hasn't passed keeps the token, even when no
+    // item has it: row-9 sorts after row-2.
+    let sql = "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-2' OR sk = 'row-9')";
+    let page = read(&db, sql, Some(1), None, true);
+    assert_eq!(page.items.unwrap().len(), 1);
+    assert!(page.next_token.is_some());
+    // A filter that isn't a fixed set of keys keeps the token at the limit.
+    let sql = "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (x = 1 OR x = 2)";
+    let page = read(&db, sql, Some(2), None, true);
+    assert!(page.next_token.is_some());
 }
 
 /// Three rows: one passes every pair, one fails only the last pair, and one
@@ -372,6 +390,12 @@ fn equivalent_partition_parameters_use_the_same_keyed_read() {
             page.items.unwrap()[0]["sk"],
             dynoxide::types::AttributeValue::S("row-2".into())
         );
+        if key == "pk" {
+            // The table read has passed the last requested key (#271).
+            assert!(page.next_token.is_none());
+            continue;
+        }
+        // An index sort key isn't unique, so the index read keeps its token.
         let page = db
             .execute_statement(request(Some(1), page.next_token))
             .unwrap();

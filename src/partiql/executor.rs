@@ -1763,9 +1763,22 @@ async fn execute_select<S: StorageBackend>(
 
     // A continuation is owed whenever the read stopped because it hit the
     // limit, whether or not anything in the window matched. That is why a page
-    // can come back short, or empty, and still carry a token.
+    // can come back short, or empty, and still carry a token. The exception is
+    // a table read of a fixed set of keys: once it has passed the last of them
+    // there is nothing left to read, and DynamoDB hands back no token (#271,
+    // captured eu-west-2 and us-east-1, 2026-10-23: two OR'd sort-key
+    // equalities under `Limit: 1` come back over two pages, not three).
+    let keys_exhausted = |stop: &Cursor| {
+        index.is_none()
+            && order.is_none()
+            && where_clause
+                .and_then(|wc| find_pk_condition(wc, read_pk, parameters))
+                .is_some()
+            && exact_sort_keys(where_clause, read_sk, parameters)
+                .is_some_and(|keys| keys.iter().all(|key| key.as_str() <= stop.sk.as_str()))
+    };
     let token = match (limit, &window.last_evaluated) {
-        (Some(lim), Some(stop)) if window.evaluated >= lim => {
+        (Some(lim), Some(stop)) if window.evaluated >= lim && !keys_exhausted(stop) => {
             Some(encode_next_token(table_name, fingerprint, stop))
         }
         _ => None,
@@ -2479,6 +2492,29 @@ fn read_sk_sql(
         Some(groups) => sk_condition_groups_to_sql(&groups),
         None => (None, Vec::new()),
     }
+}
+
+/// The stored sort keys a clause reads when every OR group pins the sort key
+/// with a single equality and nothing else, as `pk = 'k' AND (sk = 'a' OR
+/// sk = 'b')` does. Stored keys compare the way the read orders its rows.
+fn exact_sort_keys(
+    where_clause: Option<&WhereClause>,
+    sk_name: Option<&str>,
+    parameters: &[AttributeValue],
+) -> Option<Vec<String>> {
+    let (wc, sk_name) = (where_clause?, sk_name?);
+    if wc.groups.is_empty() {
+        return None;
+    }
+    wc.groups
+        .iter()
+        .map(
+            |group| match translate_sk_conditions(group, sk_name, parameters)?.as_slice() {
+                [ResolvedSortKeyCondition::Eq(_, value)] => value.to_key_string(),
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// Translate a single AND-group's sort-key conditions into the resolved form

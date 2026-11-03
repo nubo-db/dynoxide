@@ -31,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#269](https://github.com/nubo-db/dynoxide/pull/269), thanks
   [@jay23606](https://github.com/jay23606)).
 - A PartiQL OR of sort-key equalities reads only the requested keys within
-  the shared partition, on tables and global secondary indexes. Read capacity
-  and pagination follow those keys
+  the shared partition, on tables and global secondary indexes, and read
+  capacity follows those keys. On a table, a `Limit` read that has passed the
+  last requested key returns no `NextToken`, so two keys under `Limit: 1` take
+  two pages rather than three
   ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
 - PartiQL accepts `ORDER BY` on the sort key when OR branches share one
   partition. It used to count that partition more than once and demand the

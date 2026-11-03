@@ -917,3 +917,35 @@ fn two_bad_key_conditions_get_the_same_answer_every_time() {
         );
     }
 }
+
+#[test]
+fn underscore_names_require_expression_attribute_name_aliases() {
+    // #274: reported AWS Syntax error on the leading underscore.
+    let db = setup();
+    for expression in ["_gsi1_pk = :p", "pk = :p AND begins_with(_gsi1_sk, :p)"] {
+        let err = db
+            .query(
+                serde_json::from_value::<QueryRequest>(json!({
+                    "TableName":"Tbl", "KeyConditionExpression":expression,
+                    "ExpressionAttributeValues":{":p":{"S":"a"}}
+                }))
+                .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Invalid KeyConditionExpression: Syntax error; token: \"_\""),
+            "{err}"
+        );
+        assert!(err.contains("near:"), "{err}");
+    }
+    db.query(
+        serde_json::from_value::<QueryRequest>(json!({
+            "TableName":"Tbl", "KeyConditionExpression":"#_pk = :_p",
+            "ExpressionAttributeNames":{"#_pk":"pk"},
+            "ExpressionAttributeValues":{":_p":{"S":"a"}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}

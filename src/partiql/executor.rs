@@ -5,7 +5,7 @@
 use crate::actions::index_capacity::WriteCapacity;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
-use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
+use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_condition_groups_to_sql};
 use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
     WhereClause, WhereCondition,
@@ -350,6 +350,9 @@ pub(crate) fn keyed_select(
     else {
         return KeyedSelect::NotByPrimaryKey;
     };
+    if !wc.fully_expanded {
+        return KeyedSelect::NotByPrimaryKey;
+    }
     let [group] = wc.groups.as_slice() else {
         return KeyedSelect::NotByPrimaryKey;
     };
@@ -508,7 +511,8 @@ pub(crate) fn delete_has_condition(stmt: &Statement, resolved: &ResolvedTable) -
         WhereCondition::In(path, values) => values.len() == 1 && is_key(path),
         _ => false,
     };
-    !matches!(wc.groups.as_slice(), [group] if group.iter().all(|c| names_key(c)))
+    !wc.fully_expanded
+        || !matches!(wc.groups.as_slice(), [group] if group.iter().all(|c| names_key(c)))
 }
 
 /// Check one statement parameter as any attribute value is checked, with no
@@ -707,6 +711,9 @@ fn key_groups(
     read_sk: Option<&str>,
 ) -> Vec<Vec<Arc<WhereCondition>>> {
     use crate::partiql::parser::ConditionTree;
+    if !wc.fully_expanded {
+        return wc.groups.clone();
+    }
     let is_key = |cond: &WhereCondition| {
         condition_path(cond).is_some_and(|path| {
             let root = root_attribute(path);
@@ -964,22 +971,21 @@ fn plan_order(
     let pk_term = order_by
         .iter()
         .find(|term| names_attribute(&term.path, read_pk));
-    if partition_values.len() > 1 && pk_term.is_none() {
-        return Err(reject(
-            "Must have hash key in ORDER BY clause when more than one hash key condition \
-             specified in WHERE clause."
-                .to_string(),
-        ));
-    }
-
-    // A stored partition key sorts the way its type orders, so sorting the
-    // stored form is sorting the keys.
+    // OR branches may repeat a partition. Compare resolved storage keys so
+    // parameter aliases and equivalent numeric spellings count only once too.
     let mut partitions = Vec::with_capacity(partition_values.len());
     for value in partition_values {
         partitions.push(key_string(&resolve_value(value, parameters)?, read_pk)?);
     }
     partitions.sort();
     partitions.dedup();
+    if partitions.len() > 1 && pk_term.is_none() {
+        return Err(reject(
+            "Must have hash key in ORDER BY clause when more than one hash key condition \
+             specified in WHERE clause."
+                .to_string(),
+        ));
+    }
     if pk_term.is_some_and(|term| term.descending) {
         partitions.reverse();
     }
@@ -1011,16 +1017,7 @@ async fn read_in_order<S: StorageBackend>(
     limit: Option<usize>,
     plan: &OrderPlan,
 ) -> Result<Vec<(String, String, String)>> {
-    // Sort-key conditions are pushed into each Query only when the clause is a
-    // single AND group, so they hold in every partition the read visits.
-    let sk_conditions = match (read_sk, where_clause) {
-        (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
-            translate_sk_conditions(&wc.groups[0], sk_name, parameters)
-        }
-        _ => None,
-    }
-    .unwrap_or_default();
-    let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
+    let (sk_condition_sql, sk_param_values) = read_sk_sql(where_clause, read_sk, parameters);
     let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
     let first = match cursor {
@@ -1293,10 +1290,8 @@ fn validate_operand_types(
     let Some(wc) = where_clause else {
         return Ok(());
     };
-    for group in &wc.groups {
-        for condition in group {
-            check(condition, parameters)?;
-        }
+    for condition in wc.tree.conditions() {
+        check(condition, parameters)?;
     }
     Ok(())
 }
@@ -1889,12 +1884,12 @@ async fn evaluate_window<S: StorageBackend>(
             if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
                 return Err(refusal);
             }
-            if let (Some(sk_name), Some(wc)) =
-                (read_sk, where_clause.filter(|wc| wc.groups.len() == 1))
+            // AWS measures sort-key bounds only for a single AND group.
+            // An OR of sort-key equalities is accepted even when one bound
+            // exceeds the stored-key limit (2026-10-10 capture k19).
+            if let (Some(sk_name), Some(wc)) = (read_sk, where_clause)
+                && wc.groups.len() == 1
             {
-                // With multiple OR groups, the read uses the shared partition
-                // and evaluates the full condition as a filter. Sort-key
-                // values in one group are not key conditions for that read.
                 let sk_conditions =
                     translate_sk_conditions(&wc.groups[0], sk_name, parameters).unwrap_or_default();
                 for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
@@ -1925,24 +1920,7 @@ async fn evaluate_window<S: StorageBackend>(
     } else if let Some(None) = pk_key {
         Vec::new()
     } else if let Some(Some(pk_str)) = pk_key {
-        // Sort-key conditions from a single OR group can be pushed into the
-        // SQL, so `limit` counts rows within the key-condition range. With
-        // multiple groups, read the shared partition and apply the whole WHERE
-        // clause as a filter instead; no one group's sort-key conditions apply
-        // to every row in the partition.
-        let sk_conditions = match (read_sk, where_clause) {
-            (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
-                translate_sk_conditions(&wc.groups[0], sk_name, parameters)
-            }
-            _ => None,
-        }
-        .unwrap_or_default();
-
-        // The shared helper numbers placeholders after the pk (?1), and the
-        // SQL builder appends the cursor's exclusive-start comparison after
-        // them, so a pushed-down range and a continuation compose the same
-        // way they do for Query.
-        let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
+        let (sk_condition_sql, sk_param_values) = read_sk_sql(where_clause, read_sk, parameters);
         let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
         // Ascending, so this path and the scan below agree on row order and a
@@ -2281,13 +2259,11 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for group in &wc.groups {
-        for condition in group {
-            for path in condition_paths(condition) {
-                let root = root_attribute(path).to_string();
-                if !out.contains(&root) {
-                    out.push(root);
-                }
+    for condition in wc.tree.conditions() {
+        for path in condition_paths(condition) {
+            let root = root_attribute(path).to_string();
+            if !out.contains(&root) {
+                out.push(root);
             }
         }
     }
@@ -2484,6 +2460,28 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
     })
 }
 
+/// Push the union of branch ranges down into the keyed read. If any branch
+/// has no translatable range, the whole partition remains eligible. SQL OR
+/// naturally deduplicates rows in overlapping ranges and preserves cursors.
+fn read_sk_sql(
+    where_clause: Option<&WhereClause>,
+    sk_name: Option<&str>,
+    parameters: &[AttributeValue],
+) -> (Option<String>, Vec<String>) {
+    let groups = match (where_clause, sk_name) {
+        (Some(wc), Some(sk)) => wc
+            .groups
+            .iter()
+            .map(|group| translate_sk_conditions(group, sk, parameters))
+            .collect::<Option<Vec<_>>>(),
+        _ => None,
+    };
+    match groups {
+        Some(groups) => sk_condition_groups_to_sql(&groups),
+        None => (None, Vec::new()),
+    }
+}
+
 /// Translate a single AND-group's sort-key conditions into the resolved form
 /// the Query action feeds its SQL builder, so a pk-bound SELECT reads only the
 /// key-condition range and `limit` paces the way DynamoDB's does.
@@ -2574,28 +2572,16 @@ fn translate_sk_conditions(
     Some(resolved)
 }
 
-/// Find a partition key equality condition, searching across all OR groups.
-/// Whether the WHERE clause keys this index, which is what decides between a
-/// query and a scan and so whether an unprojected filter attribute is rejected.
-///
-/// Broader than `find_pk_condition` on one axis and identical on the other. An
-/// `IN` on the index partition key counts: one value reads as `=` and queries
-/// the index, while several can't be pushed down as a single key and still
-/// scan; AWS rejects an unprojected filter alongside either. An index key reached through OR does not count, and AWS
-/// accepts an unprojected filter there. Captured eu-west-2 2026-08-15.
-///
-/// "Reached through OR" is the presence of an alternation, not the absence of
-/// the key from some branch of it. Case R11 in that capture ran
-/// `(gsiPk='x' AND nonproj='N1') OR (gsiPk='y')`, where every branch does name
-/// the key, and AWS still accepted the unprojected filter. So the group count is
-/// the test, and a rule reading the key off every group would reject what AWS
-/// allows.
+/// An index filter is keyed for a single pinned group (including IN), or
+/// when every OR branch pins the same partition. Different partitions retain
+/// the scan behavior captured in August; the shared-partition case was
+/// captured in eu-west-2 and us-east-1 on 2026-10-23 (#272).
 fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     let Some(wc) = where_clause else {
         return false;
     };
     if wc.groups.len() != 1 {
-        return false;
+        return pk_in_every_group(wc, pk_name).is_some();
     }
     wc.groups[0].iter().any(|c| match &**c {
         WhereCondition::Comparison(cond) => {
@@ -2606,20 +2592,10 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     })
 }
 
-/// The one value a single-group WHERE clause pins the partition key to, when
-/// it pins one: an `=`, or an `IN` with one value, which DynamoDB reads exactly
-/// as `=` (captured eu-west-2 and us-east-1, 2026-10-10: `pk IN ['a']` costs
-/// what `pk = 'a'` costs, where a scan costs more).
+/// A partition can be queried when every branch pins the same key. Keep the
+/// full WHERE clause as a post-read filter.
 fn find_pk_condition<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
-    // Only optimise to a Query when there is a single OR group
-    // (multi-group OR with pk in only one group would need a union approach).
-    // A partition key named by more than one condition isn't a key read either
-    // (captured eu-west-2 and us-east-1, 2026-10-09: `pk = true AND pk = 'x'`
-    // is served as a scan and returns nothing).
-    let [group] = wc.groups.as_slice() else {
-        return None;
-    };
-    group_pk_value(group, pk_name)
+    pk_in_every_group(wc, pk_name)
 }
 
 /// The one value every group of a clause pins the partition key to, when
@@ -3928,18 +3904,32 @@ fn matches_where(
     // negated forms), and a statement short of its parameters mustn't read or
     // delete an item on that account.
     if wc
-        .groups
+        .tree
+        .conditions()
         .iter()
-        .flatten()
         .any(|condition| has_unbound_parameter(condition, parameters.len()))
     {
         return false;
     }
-
-    // OR semantics: any group matching is sufficient
-    wc.groups
-        .iter()
-        .any(|group| matches_conditions(item, group, parameters))
+    fn matches_tree(
+        item: &Item,
+        tree: &crate::partiql::parser::ConditionTree,
+        parameters: &[AttributeValue],
+    ) -> bool {
+        use crate::partiql::parser::ConditionTree;
+        match tree {
+            ConditionTree::Leaf(condition) => {
+                matches_conditions(item, std::slice::from_ref(condition), parameters)
+            }
+            ConditionTree::And(terms) => terms
+                .iter()
+                .all(|term| matches_tree(item, term, parameters)),
+            ConditionTree::Or(terms) => terms
+                .iter()
+                .any(|term| matches_tree(item, term, parameters)),
+        }
+    }
+    matches_tree(item, &wc.tree, parameters)
 }
 
 /// Whether `condition` names a parameter at or past `bound`, the number

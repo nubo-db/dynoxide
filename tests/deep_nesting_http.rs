@@ -1319,3 +1319,64 @@ async fn a_batch_statement_parameter_at_32_levels_runs_beside_a_63_level_one() {
     assert_eq!(responses[1]["Error"]["Message"], NEST, "{body}");
     assert!(item_exists(&url, "base").await);
 }
+
+// #262, captured eu-west-2 and us-east-1 on 9 October 2026.
+#[tokio::test]
+async fn older_member_errors_win_over_deep_values() {
+    let url = start().await;
+    let rv = "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]";
+    let xor = "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
+    for depth in [63, 100] {
+        let v = deep_map(depth);
+        for member in [
+            format!(r#""Key":{{"pk":{v}}}"#),
+            format!(
+                r#""Key":{{"pk":{{"S":"a"}}}},"ExpressionAttributeValues":{{":v":{v}}},"ConditionExpression":"pk = :v""#
+            ),
+            format!(r#""Key":{{"pk":{{"S":"a"}}}},"Expected":{{"data":{{"Value":{v}}}}}"#),
+        ] {
+            let (status, body) = send(
+                &url,
+                "DeleteItem",
+                format!(r#"{{"TableName":"Deep",{member},"ReturnValues":"BOGUS"}}"#),
+            )
+            .await;
+            assert_validation(status, &body, rv);
+        }
+        for (operation, member) in [
+            ("PutItem", r#""Item":{"pk":{"S":"a"}}"#),
+            ("UpdateItem", r#""Key":{"pk":{"S":"a"}}"#),
+        ] {
+            let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},"ConditionalOperator":"XOR"}}"#)).await;
+            assert_validation(status, &body, xor);
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_update_key_joins_older_member_errors() {
+    let url = start().await;
+    for (body, expected) in [
+        (
+            r#"{"TableName":""}"#,
+            "2 validation errors detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1; Value null at 'key' failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            r#"{"TableName":"","ReturnConsumedCapacity":"BOGUS","ReturnValues":"BOGUS"}"#,
+            "4 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1; Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]; Value null at 'key' failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            r#"{"TableName":"Deep","Expected":{"a":{"Exists":false},"b":{"Exists":false}},"ConditionalOperator":"XOR"}"#,
+            "2 validation errors detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]; Value null at 'key' failed to satisfy constraint: Member must not be null",
+        ),
+    ] {
+        let (status, body) = send(&url, "UpdateItem", body.into()).await;
+        assert_validation(status, &body, expected);
+    }
+    let (status, body) = send(&url, "Query", r#"{"TableName":"Deep","Select":"BOGUS","ConditionalOperator":"XOR","QueryFilter":{"a":{"ComparisonOperator":"NULL"},"b":{"ComparisonOperator":"NULL"}}}"#.into()).await;
+    assert_validation(
+        status,
+        &body,
+        "Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]",
+    );
+}

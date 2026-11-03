@@ -136,17 +136,17 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
     // 2026-10-09, for ALL_NEW and UPDATED_NEW).
     if operation == "DeleteItem" {
         let enveloped = crate::validation::envelope_message(RETURN_VALUES_NOT_HONOURED);
-        return match err {
+        match &err {
             DynoxideError::ValidationException(message)
             | DynoxideError::EnvelopedValidation(message)
-                if message == enveloped || message == RETURN_VALUES_NOT_HONOURED =>
+                if message == &enveloped || message == RETURN_VALUES_NOT_HONOURED =>
             {
-                DynoxideError::ValidationException(RETURN_VALUES_NOT_HONOURED.to_string())
+                return DynoxideError::ValidationException(RETURN_VALUES_NOT_HONOURED.to_string());
             }
-            other => other,
-        };
+            _ => {}
+        }
     }
-    if !matches!(operation, "PutItem" | "UpdateItem") {
+    if !matches!(operation, "PutItem" | "UpdateItem" | "DeleteItem") {
         return err;
     }
     let generic = crate::validation::RETURN_VALUES_REJECTION;
@@ -216,10 +216,14 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
 
     crate::serialization_checks::pre_check_serialization_types(operation, body)?;
     match operation {
-        "PutItem" => deserialize::<put_item::PutItemRequest>(body).map(drop),
+        "PutItem" => deserialize::<put_item::PutItemRequest>(body).and_then(|request| {
+            check_older_conditional_operator(request.conditional_operator.as_deref())
+        }),
         "GetItem" => deserialize::<get_item::GetItemRequest>(body).map(drop),
         "DeleteItem" => deserialize::<delete_item::DeleteItemRequest>(body).map(drop),
-        "UpdateItem" => deserialize::<update_item::UpdateItemRequest>(body).map(drop),
+        "UpdateItem" => deserialize::<update_item::UpdateItemRequest>(body).and_then(|request| {
+            check_older_conditional_operator(request.conditional_operator.as_deref())
+        }),
         "Query" => deserialize::<query::QueryRequest>(body).map(drop),
         "Scan" => deserialize::<scan::ScanRequest>(body).map(drop),
         "BatchGetItem" => deserialize::<batch_get_item::BatchGetItemRequest>(body).map(drop),
@@ -233,6 +237,15 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
                 .and_then(|request| transact_write_items::check_request(&request))
         }
         _ => Ok(()),
+    }
+}
+
+fn check_older_conditional_operator(operator: Option<&str>) -> crate::Result<()> {
+    match crate::validation::conditional_operator_rejection(operator) {
+        Some(message) => Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&message),
+        )),
+        None => Ok(()),
     }
 }
 

@@ -353,13 +353,6 @@ pub async fn execute<S: StorageBackend>(
         helpers::validate_expression_params(&ctx)?;
     }
 
-    // ---- Select, after the mixing check (captured 2026-10-09) ----
-    if let Some(msg) = request.select.as_deref().and_then(select_rejection) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
-    }
-
     // ---- ConditionalOperator only joins legacy QueryFilter conditions, so it
     // is refused without two of them, whatever its value. Query reports it
     // without the envelope (captured 2026-10-09, all seven regions). ----
@@ -368,6 +361,13 @@ pub async fn execute<S: StorageBackend>(
         crate::validation::legacy_condition_count(request.query_filter.as_ref()),
     ) {
         return Err(DynoxideError::ValidationException(msg.to_string()));
+    }
+
+    // ---- Select, after the mixing check (captured 2026-10-09) ----
+    if let Some(msg) = request.select.as_deref().and_then(select_rejection) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
     }
 
     // ---- Validate filter attribute values (before argument counts, matching DynamoDB) ----

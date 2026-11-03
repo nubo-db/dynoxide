@@ -19,12 +19,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **PartiQL reads a shared partition when every OR branch pins the same key.**
-  A condition such as `pk = 'k' AND (x = 1 OR x = 2)` used to scan the table,
-  so it could return short pages and charge for every partition. It now reads
-  that partition on both tables and indexes, while applying the full condition
-  as a filter. Captured against eu-west-2 and us-east-1 on 23 October 2026;
-  the earlier scan behaviour was captured in both regions on 10 October 2026.
+- Expressions refuse attribute names starting with `_` unless they use an
+  `ExpressionAttributeNames` alias, as DynamoDB does
+  ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
+- PartiQL `SELECT` reads one partition when every OR branch names the same
+  partition key. It used to scan the table, charging for unrelated rows and
+  counting them towards `Limit`. Captured against eu-west-2 and us-east-1 on
+  23 October 2026
+  ([#229](https://github.com/nubo-db/dynoxide/issues/229),
+  [#269](https://github.com/nubo-db/dynoxide/pull/269), thanks
+  [@jay23606](https://github.com/jay23606)).
+- A PartiQL OR of sort-key equalities reads only the requested keys within
+  the shared partition. Read capacity and pagination follow those keys
+  ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
+- PartiQL accepts `ORDER BY` on the sort key when OR branches share one
+  partition. It used to count that partition more than once and demand the
+  partition key in `ORDER BY`
+  ([#273](https://github.com/nubo-db/dynoxide/issues/273)).
+- A PartiQL filter on an attribute an index doesn't project is refused when
+  OR branches share the index partition key. It used to return no items
+  ([#272](https://github.com/nubo-db/dynoxide/issues/272)).
+- PartiQL evaluates large OR filters as a tree when expanding their
+  combinations would exceed the read planner's budget. A partition key
+  equality beside the filter still reads that partition. Nine, sixteen and
+  forty pairs of OR conditions now run
+  ([#225](https://github.com/nubo-db/dynoxide/issues/225)).
+- Request-member errors follow DynamoDB's wording and order for deep
+  `DeleteItem`, `PutItem` and `UpdateItem` requests. An `UpdateItem` without
+  a key joins an empty table name or invalid `ConditionalOperator` with the
+  missing-key error, and Query reports a misused `ConditionalOperator` before
+  an invalid `Select`
+  ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
 
 ## [1.5.0] - 2026-10-23
 

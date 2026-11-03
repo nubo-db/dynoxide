@@ -5,7 +5,7 @@
 
 use crate::expressions::condition::parse_raw_path;
 use crate::expressions::tokenizer::{
-    Token, TokenSpan, TokenStream, check_redundant_parens, tokenize,
+    Token, TokenSpan, TokenStream, check_redundant_parens, tokenize, tokenizer_syntax_error,
 };
 use crate::expressions::{PathElement, TrackedExpressionAttributes};
 use crate::types::AttributeValue;
@@ -62,7 +62,12 @@ pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCon
     // real DynamoDB (eu-west-2).
     super::check_expression_size(expr)
         .map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
-    let tokens = tokenize(expr).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
+    let tokens = tokenize(expr).map_err(|e| {
+        format!(
+            "Invalid KeyConditionExpression: {}",
+            tokenizer_syntax_error(expr, &e)
+        )
+    })?;
     // Reject redundant parens before stripping outer ones (strip_outer_parens
     // would otherwise silently accept `((pk = :pk))`).
     check_redundant_parens(&tokens).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
@@ -464,6 +469,35 @@ pub fn sk_conditions_to_sql(
         .flat_map(|c| c.to_sql_conditions())
         .collect();
     pairs_to_sql(&pairs)
+}
+
+/// Render a union of sort-key ranges. Every group must constrain the sort key;
+/// an unconstrained branch requires reading the whole partition instead.
+pub fn sk_condition_groups_to_sql(
+    groups: &[Vec<ResolvedSortKeyCondition>],
+) -> (Option<String>, Vec<String>) {
+    if let [group] = groups {
+        return sk_conditions_to_sql(group);
+    }
+    let mut branches = Vec::new();
+    let mut values = Vec::new();
+    for group in groups {
+        let pairs: Vec<_> = group.iter().flat_map(|c| c.to_sql_conditions()).collect();
+        if pairs.is_empty() {
+            return (None, Vec::new());
+        }
+        let mut bounds = Vec::new();
+        for (op, value) in pairs {
+            bounds.push(format!("sk {op} ?{}", values.len() + 2));
+            values.push(value);
+        }
+        branches.push(format!("({})", bounds.join(" AND ")));
+    }
+    if branches.is_empty() {
+        (None, values)
+    } else {
+        (Some(format!("AND ({})", branches.join(" OR "))), values)
+    }
 }
 
 /// Render `(operator, value)` bounds on the sk column as SQL, numbering the

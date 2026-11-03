@@ -690,7 +690,7 @@ mod tests {
     fn test_rule(path: &str, action: ValidatedAction) -> ValidatedRule {
         ValidatedRule {
             condition: crate::expressions::condition::parse(
-                "attribute_not_exists(__no_item_has_this__)",
+                "attribute_not_exists(no_item_has_this)",
             )
             .expect("a condition true of every item"),
             names: None,

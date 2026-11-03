@@ -1576,11 +1576,16 @@ pub fn table_read_capacity_units(old_size: Option<usize>, new_size: Option<usize
     read_capacity_units(larger)
 }
 
+/// The bytes one strongly consistent read unit covers.
+pub const READ_UNIT_BYTES: usize = 4096;
+
 /// Calculate read capacity units assuming strongly consistent reads
 /// (1 RCU per 4KB, rounded up). Used when ConsistentRead is true or
 /// when the read type is not specified.
 pub fn read_capacity_units(item_size_bytes: usize) -> f64 {
-    ((item_size_bytes as f64) / 4096.0).ceil().max(1.0)
+    ((item_size_bytes as f64) / READ_UNIT_BYTES as f64)
+        .ceil()
+        .max(1.0)
 }
 
 /// Calculate read capacity units accounting for consistency mode.

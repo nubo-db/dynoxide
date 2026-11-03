@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Expressions refuse attribute names starting with `_` unless they use an
-  `ExpressionAttributeNames` alias, as DynamoDB does
+  `ExpressionAttributeNames` alias, as DynamoDB does, in key condition,
+  filter, projection, condition and update expressions alike. This includes
+  an import rule's `match` expression, so a rule matching such an attribute
+  now needs an alias in its `names`. A rule's `path` is unaffected
   ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
 - PartiQL `SELECT` reads one partition when every OR branch names the same
   partition key. It used to scan the table, charging for unrelated rows and
@@ -30,24 +33,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#229](https://github.com/nubo-db/dynoxide/issues/229),
   [#269](https://github.com/nubo-db/dynoxide/pull/269), thanks
   [@jay23606](https://github.com/jay23606)).
-- A PartiQL OR of sort-key equalities reads only the requested keys within
-  the shared partition, on tables and global secondary indexes, and read
-  capacity follows those keys. On a table, a `Limit` read that has passed the
-  last requested key returns no `NextToken`, so two keys under `Limit: 1` take
-  two pages rather than three
+- A PartiQL OR of sort-key conditions reads only their union within the
+  shared partition, on tables and global secondary indexes, including beside
+  a filter too wide to expand. A `Limit` read with nothing left in that union
+  returns no `NextToken`, so two keys under `Limit: 1` take two pages rather
+  than three, on an index and under `ORDER BY` too. Each requested key is
+  charged whether or not it exists, as DynamoDB charges it. Captured against
+  eu-west-2 and us-east-1 on 3 November 2026
   ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
 - PartiQL accepts `ORDER BY` on the sort key when OR branches share one
   partition. It used to count that partition more than once and demand the
   partition key in `ORDER BY`
   ([#273](https://github.com/nubo-db/dynoxide/issues/273)).
 - A PartiQL filter on an attribute an index doesn't project is refused when
-  OR branches share the index partition key. It used to return no items
+  OR branches share the index partition key, including through one
+  multi-value `IN`. It used to return no items
   ([#272](https://github.com/nubo-db/dynoxide/issues/272)).
 - PartiQL evaluates large OR filters as a tree when expanding their
   combinations would exceed the read planner's budget. A partition key
   equality beside the filter still reads that partition. Nine, sixteen and
   forty pairs of OR conditions now run, with key-type and overlapping-range
-  checks preserved when the filter exceeds the expansion budget
+  checks preserved when the filter exceeds the expansion budget. A string
+  partition key given `1` and `1.0` is refused for its type, where it used to
+  read nothing
   ([#225](https://github.com/nubo-db/dynoxide/issues/225)).
 - Request-member errors follow DynamoDB's wording and order for deep
   `DeleteItem`, `PutItem` and `UpdateItem` requests. An `UpdateItem` without

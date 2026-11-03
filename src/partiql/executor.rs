@@ -258,12 +258,20 @@ fn first_of_each<T: PartialEq>(
 }
 
 /// Append an S, N or B value to `key` as a tag and its length-prefixed bytes,
-/// so two encodings match exactly when the values are equal. `false` for any
-/// other type.
+/// so two encodings match exactly when the values are equal. A number is
+/// encoded by value, as its stored key is, so `1` and `1.0` are one condition
+/// and the same partition `pk_in_every_group` reads (captured eu-west-2 and
+/// us-east-1, 2026-11-03: `pk = 1 AND pk = 1.0` reads that key on a number
+/// key and is refused for its type on a string key). `false` for any other
+/// type.
 fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
+    let number;
     let (tag, bytes) = match value {
         AttributeValue::S(s) => (b'S', s.as_bytes()),
-        AttributeValue::N(n) => (b'N', n.as_bytes()),
+        AttributeValue::N(n) => {
+            number = crate::types::normalize_number_for_sort(n);
+            (b'N', number.as_bytes())
+        }
         AttributeValue::B(b) => (b'B', b.as_slice()),
         _ => return false,
     };
@@ -1010,12 +1018,14 @@ async fn read_in_order<S: StorageBackend>(
     index: Option<&ResolvedIndex>,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
+    read_pk: &str,
     read_sk: Option<&str>,
     cursor: Option<&Cursor>,
     limit: Option<usize>,
     plan: &OrderPlan,
 ) -> Result<Vec<(String, String, String)>> {
-    let (sk_condition_sql, sk_param_values) = read_sk_sql(where_clause, read_sk, parameters);
+    let (sk_condition_sql, sk_param_values) =
+        read_sk_sql(where_clause, read_pk, read_sk, parameters);
     let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
     let first = match cursor {
@@ -1761,26 +1771,8 @@ async fn execute_select<S: StorageBackend>(
     )
     .await?;
 
-    // A continuation is owed whenever the read stopped because it hit the
-    // limit, whether or not anything in the window matched. That is why a page
-    // can come back short, or empty, and still carry a token. The exception is
-    // a table read of a fixed set of keys: once it has passed the last of them
-    // there is nothing left to read, and DynamoDB hands back no token (#271,
-    // captured eu-west-2 and us-east-1, 2026-10-23: two OR'd sort-key
-    // equalities under `Limit: 1` come back over two pages, not three).
-    let keys_exhausted = |stop: &Cursor| {
-        index.is_none()
-            && order.is_none()
-            && where_clause
-                .and_then(|wc| pk_in_every_group(wc, read_pk, parameters))
-                .is_some()
-            && exact_sort_keys(where_clause, read_sk, parameters)
-                .is_some_and(|keys| keys.iter().all(|key| key.as_str() <= stop.sk.as_str()))
-    };
-    let token = match (limit, &window.last_evaluated) {
-        (Some(lim), Some(stop)) if window.evaluated >= lim && !keys_exhausted(stop) => {
-            Some(encode_next_token(table_name, fingerprint, stop))
-        }
+    let token = match &window.last_evaluated {
+        Some(stop) if window.continues => Some(encode_next_token(table_name, fingerprint, stop)),
         _ => None,
     };
 
@@ -1837,8 +1829,8 @@ struct Window {
     /// Where the last row read sat, matching or not. The cursor a continuation
     /// resumes from, so no row is evaluated twice.
     last_evaluated: Option<Cursor>,
-    /// How many rows were read, matching or not.
-    evaluated: usize,
+    /// Whether the read owes a continuation from `last_evaluated`.
+    continues: bool,
     /// What those rows weighed as they were read, before the WHERE clause and
     /// before any projection. This is what the read is charged on.
     evaluated_bytes: usize,
@@ -1916,23 +1908,38 @@ async fn evaluate_window<S: StorageBackend>(
         None => None,
     };
 
-    let rows: Vec<(String, String, String)> = if let Some(plan) = order {
+    // A read of one partition whose OR branches each bound the sort key ends
+    // once nothing in their union is left (#271): it reads one row past its
+    // limit to find out, which also keeps a continuation for the rest of an
+    // index sort key shared by several items. A fixed set of sort keys ends
+    // once the read has passed the last of them.
+    let exact_keys = pk_key
+        .as_ref()
+        .and_then(|_| exact_sort_keys(where_clause, read_pk, read_sk, parameters));
+    let peek = limit.is_some()
+        && (exact_keys.is_some()
+            || (pk_key.is_some() && sort_key_union(where_clause, read_pk, read_sk, parameters)));
+    let read_limit = limit.map(|lim| if peek { lim + 1 } else { lim });
+
+    let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
         read_in_order(
             storage,
             table_name,
             index,
             where_clause,
             parameters,
+            read_pk,
             read_sk,
             cursor,
-            limit,
+            read_limit,
             plan,
         )
         .await?
     } else if let Some(None) = pk_key {
         Vec::new()
     } else if let Some(Some(pk_str)) = pk_key {
-        let (sk_condition_sql, sk_param_values) = read_sk_sql(where_clause, read_sk, parameters);
+        let (sk_condition_sql, sk_param_values) =
+            read_sk_sql(where_clause, read_pk, read_sk, parameters);
         let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
         // Ascending, so this path and the scan below agree on row order and a
@@ -1941,7 +1948,7 @@ async fn evaluate_window<S: StorageBackend>(
             sk_condition: sk_condition_sql.as_deref(),
             sk_params: &sk_params_refs,
             forward: true,
-            limit,
+            limit: read_limit,
             exclusive_start_sk: cursor.map(|c| c.sk.as_str()),
             exclusive_start_base_pk: cursor.and_then(|c| c.base_pk.as_deref()),
             exclusive_start_base_sk: cursor.and_then(|c| c.base_sk.as_deref()),
@@ -1983,6 +1990,13 @@ async fn evaluate_window<S: StorageBackend>(
         }
     };
 
+    let more_rows = match limit {
+        Some(lim) if peek && rows.len() > lim => {
+            rows.truncate(lim);
+            true
+        }
+        _ => false,
+    };
     let evaluated = rows.len();
     // The stop position is read off the last row whether or not it matched.
     // An index read needs the base table key with it, and the index row holds
@@ -2022,6 +2036,71 @@ async fn evaluate_window<S: StorageBackend>(
     let mut evaluated_bytes = 0usize;
     let mut base_read_units = 0f64;
     let mut matched = Vec::new();
+
+    // A continuation is owed whenever the read stopped because it hit the
+    // limit, whether or not anything in the window matched. That is why a page
+    // can come back short, or empty, and still carry a token. The exception is
+    // a read of a union of sort-key branches with nothing after it: DynamoDB
+    // hands back no token (#271, captured eu-west-2 and us-east-1, 2026-10-23
+    // and 2026-11-03: two OR'd sort-key equalities under `Limit: 1` come back
+    // over two pages, not three, on a table, an ALL GSI and under `ORDER BY sk
+    // DESC`, and so do `sk < 'row-2' OR sk > 'row-2'` and `sk = 'row-1' OR
+    // sk > 'row-2'`). A requested key that is missing still holds the token
+    // until the read has passed it.
+    let forward = order.is_none_or(|plan| plan.forward);
+    let passed = |key: &str, stop: &Cursor| {
+        if forward {
+            key <= stop.sk.as_str()
+        } else {
+            key >= stop.sk.as_str()
+        }
+    };
+    let continues = match (limit, &last_evaluated) {
+        (Some(lim), Some(stop)) if evaluated >= lim => {
+            !peek
+                || more_rows
+                || exact_keys
+                    .as_ref()
+                    .is_some_and(|keys| keys.iter().any(|key| !passed(key, stop)))
+        }
+        _ => false,
+    };
+
+    // Each requested key is charged whether or not it exists: a read unit for
+    // a missing one, on the page that reaches it, on the table and on an index
+    // alike (captured eu-west-2 and us-east-1, 2026-11-03: `sk = 'row-0' OR
+    // sk = 'row-2'` with only `row-2` stored costs 1.0 eventually consistent
+    // and 2 consistent, where `row-2` alone costs 0.5, and two missing keys
+    // cost 1.0). It is added as a read unit's worth of bytes, which rounds to
+    // exactly one more unit whatever the rows found weigh.
+    if let Some(keys) = &exact_keys {
+        let found: std::collections::HashSet<&str> =
+            rows.iter().map(|(_, sk, _)| sk.as_str()).collect();
+        let after_cursor = |key: &str| {
+            cursor.is_none_or(|c| {
+                if forward {
+                    key > c.sk.as_str()
+                } else {
+                    key < c.sk.as_str()
+                }
+            })
+        };
+        let missing = first_of_each(keys.iter().map(String::as_str), |key| {
+            Some(key.as_bytes().to_vec())
+        })
+        .into_iter()
+        .filter(|key| {
+            after_cursor(key)
+                && !found.contains(key)
+                && (!continues
+                    || last_evaluated
+                        .as_ref()
+                        .is_some_and(|stop| passed(key, stop)))
+        })
+        .count();
+        evaluated_bytes += missing * crate::types::READ_UNIT_BYTES;
+    }
+
     for (_, _, json) in rows {
         // A row that will not deserialise is a storage fault, and it is reported
         // rather than walked past. Skipping it left the row counted in
@@ -2078,7 +2157,7 @@ async fn evaluate_window<S: StorageBackend>(
     Ok(Window {
         matched,
         last_evaluated,
-        evaluated,
+        continues,
         evaluated_bytes,
         base_read_units,
     })
@@ -2472,20 +2551,43 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
     })
 }
 
+/// The OR-groups a keyed read takes its sort-key ranges from. A clause too
+/// wide to expand keeps only its common conditions in `groups`, which would
+/// drop an OR of sort-key conditions beside the wide filter, so the read uses
+/// the clause's key-only projection instead (captured eu-west-2 and
+/// us-east-1, 2026-11-03: `pk = 'k' AND (sk = 'row-1' OR sk = 'row-2')`
+/// beside nine wide filter pairs costs what the two keys cost). `None` when
+/// even that projection is too large, which reads the whole partition.
+fn read_groups<'a>(
+    wc: &'a WhereClause,
+    read_pk: &str,
+    read_sk: &str,
+) -> Option<std::borrow::Cow<'a, [Vec<Arc<WhereCondition>>]>> {
+    if wc.fully_expanded {
+        Some(std::borrow::Cow::Borrowed(&wc.groups))
+    } else {
+        key_groups(wc, read_pk, Some(read_sk))
+            .ok()
+            .map(std::borrow::Cow::Owned)
+    }
+}
+
 /// Push the union of branch ranges down into the keyed read. If any branch
 /// has no translatable range, the whole partition remains eligible. SQL OR
 /// naturally deduplicates rows in overlapping ranges and preserves cursors.
 fn read_sk_sql(
     where_clause: Option<&WhereClause>,
+    pk_name: &str,
     sk_name: Option<&str>,
     parameters: &[AttributeValue],
 ) -> (Option<String>, Vec<String>) {
     let groups = match (where_clause, sk_name) {
-        (Some(wc), Some(sk)) => wc
-            .groups
-            .iter()
-            .map(|group| translate_sk_conditions(group, sk, parameters))
-            .collect::<Option<Vec<_>>>(),
+        (Some(wc), Some(sk)) => read_groups(wc, pk_name, sk).and_then(|groups| {
+            groups
+                .iter()
+                .map(|group| translate_sk_conditions(group, sk, parameters))
+                .collect::<Option<Vec<_>>>()
+        }),
         _ => None,
     };
     match groups {
@@ -2494,19 +2596,41 @@ fn read_sk_sql(
     }
 }
 
+/// Whether a keyed read's OR branches each bound the sort key, so the read is
+/// a union of two or more sort-key ranges rather than the whole partition.
+fn sort_key_union(
+    where_clause: Option<&WhereClause>,
+    pk_name: &str,
+    sk_name: Option<&str>,
+    parameters: &[AttributeValue],
+) -> bool {
+    let (Some(wc), Some(sk_name)) = (where_clause, sk_name) else {
+        return false;
+    };
+    read_groups(wc, pk_name, sk_name).is_some_and(|groups| {
+        groups.len() > 1
+            && groups.iter().all(|group| {
+                translate_sk_conditions(group, sk_name, parameters)
+                    .is_some_and(|conditions| !conditions.is_empty())
+            })
+    })
+}
+
 /// The stored sort keys a clause reads when every OR group pins the sort key
 /// with a single equality and nothing else, as `pk = 'k' AND (sk = 'a' OR
 /// sk = 'b')` does. Stored keys compare the way the read orders its rows.
 fn exact_sort_keys(
     where_clause: Option<&WhereClause>,
+    pk_name: &str,
     sk_name: Option<&str>,
     parameters: &[AttributeValue],
 ) -> Option<Vec<String>> {
     let (wc, sk_name) = (where_clause?, sk_name?);
-    if wc.groups.is_empty() {
+    let groups = read_groups(wc, pk_name, sk_name)?;
+    if groups.is_empty() {
         return None;
     }
-    wc.groups
+    groups
         .iter()
         .map(
             |group| match translate_sk_conditions(group, sk_name, parameters)?.as_slice() {
@@ -2608,9 +2732,11 @@ fn translate_sk_conditions(
 }
 
 /// An index filter is keyed for a single pinned group (including IN), or
-/// when every OR branch pins the same partition. Different partitions retain
+/// when every OR branch pins the same partitions. Different partitions retain
 /// the scan behaviour captured in August; the shared-partition case was
-/// captured in eu-west-2 and us-east-1 on 2026-10-23 (#272).
+/// captured in eu-west-2 and us-east-1 on 2026-10-23 (#272), and a shared
+/// multi-value `IN` on 2026-11-03 (`g IN ['k', 'a'] AND (x = 1 OR x = 2)` is
+/// refused as `g IN ['k', 'a'] AND x = 1` is).
 fn keys_index(
     where_clause: Option<&WhereClause>,
     pk_name: &str,
@@ -2620,7 +2746,8 @@ fn keys_index(
         return false;
     };
     if wc.groups.len() != 1 {
-        return pk_in_every_group(wc, pk_name, parameters).is_some();
+        return pk_in_every_group(wc, pk_name, parameters).is_some()
+            || same_partitions_in_every_group(wc, pk_name, parameters);
     }
     wc.groups[0].iter().any(|c| match &**c {
         WhereCondition::Comparison(cond) => {
@@ -2629,6 +2756,48 @@ fn keys_index(
         WhereCondition::In(path, _) => names_attribute(path, pk_name),
         _ => false,
     })
+}
+
+/// Whether every group pins the partition key to the same set of stored
+/// keys, through one `=` or `IN` each: `pk IN ['a', 'b'] AND (x = 1 OR x = 2)`
+/// flattens to two groups that both name partitions `a` and `b`.
+fn same_partitions_in_every_group(
+    wc: &WhereClause,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> bool {
+    let partitions = |group: &[Arc<WhereCondition>]| -> Option<Vec<String>> {
+        let mut pinning = group.iter().filter_map(|c| match &**c {
+            WhereCondition::Comparison(cond)
+                if names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq =>
+            {
+                Some(std::slice::from_ref(&cond.value))
+            }
+            WhereCondition::In(path, values) if names_attribute(path, pk_name) => {
+                Some(values.as_slice())
+            }
+            _ => None,
+        });
+        let values = pinning.next()?;
+        if pinning.next().is_some() {
+            return None;
+        }
+        let mut keys = values
+            .iter()
+            .map(|v| resolve_value(v, parameters).ok()?.to_key_string())
+            .collect::<Option<Vec<_>>>()?;
+        keys.sort();
+        keys.dedup();
+        Some(keys)
+    };
+    let Some((first, rest)) = wc.groups.split_first() else {
+        return false;
+    };
+    let Some(shared) = partitions(first) else {
+        return false;
+    };
+    rest.iter()
+        .all(|group| partitions(group).as_ref() == Some(&shared))
 }
 
 /// The one value every group of a clause pins the partition key to, when

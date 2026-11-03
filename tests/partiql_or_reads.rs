@@ -1,5 +1,6 @@
 //! Regressions for #229 and #271–#273, captured in eu-west-2 and us-east-1
-//! on 10 and 23 October 2026 (see the corresponding GitHub issues).
+//! on 10 and 23 October and 3 November 2026 (see the corresponding GitHub
+//! issues).
 use dynoxide::Database;
 use dynoxide::actions::execute_statement::{ExecuteStatementRequest, ExecuteStatementResponse};
 use serde_json::json;
@@ -97,6 +98,25 @@ fn an_or_on_unprojected_attributes_is_refused_when_the_partition_is_shared() {
         err,
         "One or more parameter values were invalid: Secondary index g-keys does not project one or more filter attributes: [x]"
     );
+    // So is one shared by every branch through a multi-value IN, as the same
+    // IN beside a single filter is (captured eu-west-2 and us-east-1,
+    // 2026-11-03).
+    for filter in ["(x = 1 OR x = 2)", "x = 1"] {
+        let err = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: format!(
+                    "SELECT * FROM \"OrReads\".\"g-keys\" WHERE g IN ['k', 'a'] AND {filter}"
+                ),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "One or more parameter values were invalid: Secondary index g-keys does not project one or more filter attributes: [x]",
+            "{filter}"
+        );
+    }
     // A different partition in each branch retains the previously captured scan behaviour.
     // The unprojected `x` matches nothing on the index row, so only partition
     // `z` comes back, at the cost of scanning the whole index.
@@ -410,17 +430,9 @@ fn equivalent_partition_parameters_use_the_same_keyed_read() {
             page.items.unwrap()[0]["sk"],
             dynoxide::types::AttributeValue::S("row-2".into())
         );
-        if key == "pk" {
-            // The table read has passed the last requested key (#271).
-            assert!(page.next_token.is_none());
-            continue;
-        }
-        // An index sort key isn't unique, so the index read keeps its token.
-        let page = db
-            .execute_statement(request(Some(1), page.next_token))
-            .unwrap();
-        assert!(page.items.unwrap().is_empty());
-        assert!(page.next_token.is_none());
+        // The read has passed the last requested key, with nothing after it
+        // (#271).
+        assert!(page.next_token.is_none(), "{source}");
     }
     let db = setup("KEYS_ONLY");
     let err = db
@@ -486,4 +498,270 @@ fn equivalent_numeric_partition_spellings_share_the_read_plan() {
             dynoxide::types::AttributeValue::S("row-1".into())
         );
     }
+}
+
+/// Every page of a statement, as (the rows' `pk/sk`, whether it carried a
+/// token, what it cost).
+fn walk(
+    db: &Database,
+    sql: &str,
+    limit: Option<usize>,
+    consistent: bool,
+) -> Vec<(Vec<String>, bool, f64)> {
+    let text = |value: &dynoxide::types::AttributeValue| match value {
+        dynoxide::types::AttributeValue::S(s) => s.clone(),
+        other => panic!("{other:?}"),
+    };
+    let mut pages = Vec::new();
+    let mut token = None;
+    loop {
+        let page = read(db, sql, limit, token, consistent);
+        let rows = page
+            .items
+            .unwrap()
+            .iter()
+            .map(|item| format!("{}/{}", text(&item["pk"]), text(&item["sk"])))
+            .collect();
+        pages.push((
+            rows,
+            page.next_token.is_some(),
+            page.consumed_capacity.unwrap().capacity_units,
+        ));
+        token = page.next_token;
+        if token.is_none() || pages.len() == 8 {
+            return pages;
+        }
+    }
+}
+
+fn page(rows: &[&str], token: bool, cost: f64) -> (Vec<String>, bool, f64) {
+    (rows.iter().map(|r| r.to_string()).collect(), token, cost)
+}
+
+#[test]
+fn a_union_of_sort_key_branches_ends_after_its_last_row() {
+    // #271, captured eu-west-2 and us-east-1 on 2026-11-03: under `Limit: 1`
+    // each of these comes back over two pages, the second with no token.
+    let db = setup("ALL");
+    for (sql, first, second) in [
+        (
+            "SELECT * FROM \"OrReads\".\"g-keys\" WHERE g = 'k' AND (sk = 'row-1' OR sk = 'row-2')",
+            "k/row-1",
+            "k/row-2",
+        ),
+        (
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk = 'row-2') ORDER BY sk DESC",
+            "k/row-2",
+            "k/row-1",
+        ),
+        (
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk < 'row-2' OR sk > 'row-2')",
+            "k/row-1",
+            "k/row-3",
+        ),
+        (
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk > 'row-2')",
+            "k/row-1",
+            "k/row-3",
+        ),
+    ] {
+        assert_eq!(
+            walk(&db, sql, Some(1), false),
+            [page(&[first], true, 0.5), page(&[second], false, 0.5)],
+            "{sql}"
+        );
+    }
+    // Three keys under `Limit: 2` take two pages.
+    assert_eq!(
+        walk(
+            &db,
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk = 'row-2' OR sk = 'row-3')",
+            Some(2),
+            false
+        ),
+        [
+            page(&["k/row-1", "k/row-2"], true, 1.0),
+            page(&["k/row-3"], false, 0.5)
+        ]
+    );
+    // A filter that isn't a union of sort-key branches keeps its token at the
+    // limit, and the next page finds nothing.
+    assert_eq!(
+        walk(
+            &db,
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (x = 1 OR x = 2)",
+            Some(2),
+            false
+        ),
+        [
+            page(&["k/row-1", "k/row-2"], true, 1.0),
+            page(&[], false, 0.5)
+        ]
+    );
+}
+
+#[test]
+fn an_index_sort_key_shared_by_two_items_keeps_its_token() {
+    // Captured us-east-1, 2026-11-03: the read doesn't end on the first of two
+    // items under one index key. eu-west-2 returned the same three rows with a
+    // fourth, empty page after them.
+    let db = setup("ALL");
+    for (pk, sk) in [("tie-a", "row-2"), ("tie-b", "row-2"), ("tie-c", "row-1")] {
+        db.put_item(
+            serde_json::from_value(json!({"TableName":"OrReads", "Item":{
+                "pk":{"S":pk},"sk":{"S":sk},"g":{"S":"tie"},"x":{"N":"1"},
+                "payload":{"S":"x".repeat(3000)}
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let sql =
+        "SELECT * FROM \"OrReads\".\"g-keys\" WHERE g = 'tie' AND (sk = 'row-1' OR sk = 'row-2')";
+    assert_eq!(
+        walk(&db, sql, Some(1), false),
+        [
+            page(&["tie-c/row-1"], true, 0.5),
+            page(&["tie-a/row-2"], true, 0.5),
+            page(&["tie-b/row-2"], false, 0.5),
+        ]
+    );
+    assert_eq!(
+        walk(&db, sql, Some(2), false),
+        [
+            page(&["tie-c/row-1", "tie-a/row-2"], true, 1.0),
+            page(&["tie-b/row-2"], false, 0.5),
+        ]
+    );
+}
+
+#[test]
+fn each_requested_key_is_charged_whether_or_not_it_exists() {
+    // Captured eu-west-2 and us-east-1, 2026-11-03. Each stored row weighs
+    // about 3 KB, half a unit eventually consistent, and a missing key costs
+    // what a row does.
+    let db = setup("ALL");
+    let table = |clause: &str| format!("SELECT * FROM \"OrReads\" WHERE pk = 'k' AND {clause}");
+    let cases = [
+        (
+            table("(sk = 'row-0' OR sk = 'row-2')"),
+            Some(1),
+            false,
+            vec![page(&["k/row-2"], false, 1.0)],
+        ),
+        (
+            table("(sk = 'row-0' OR sk = 'row-2')"),
+            None,
+            true,
+            vec![page(&["k/row-2"], false, 2.0)],
+        ),
+        (
+            table("(sk = 'row-0' OR sk = 'row-9')"),
+            None,
+            false,
+            vec![page(&[], false, 1.0)],
+        ),
+        (
+            table("(sk = 'row-0' OR sk = 'row-00' OR sk = 'row-000' OR sk = 'row-2')"),
+            None,
+            false,
+            vec![page(&["k/row-2"], false, 2.0)],
+        ),
+        (
+            table("(sk = 'row-1' OR sk = 'row-15' OR sk = 'row-2')"),
+            Some(1),
+            false,
+            vec![
+                page(&["k/row-1"], true, 0.5),
+                page(&["k/row-2"], false, 1.0),
+            ],
+        ),
+        (
+            table("(sk = 'row-2' OR sk = 'row-9')"),
+            Some(1),
+            false,
+            vec![page(&["k/row-2"], true, 0.5), page(&[], false, 0.5)],
+        ),
+        (
+            "SELECT * FROM \"OrReads\".\"g-keys\" WHERE g = 'k' AND (sk = 'row-0' OR sk = 'row-2')"
+                .to_string(),
+            Some(1),
+            false,
+            vec![page(&["k/row-2"], false, 1.0)],
+        ),
+    ];
+    for (sql, limit, consistent, expected) in cases {
+        assert_eq!(walk(&db, &sql, limit, consistent), expected, "{sql}");
+    }
+}
+
+#[test]
+fn sort_key_range_unions_read_only_their_ranges() {
+    // Captured eu-west-2 and us-east-1, 2026-11-03: each reads rows 1 and 3
+    // and costs what those two rows cost, not the partition's three.
+    let db = setup("ALL");
+    for sql in [
+        "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk < 'row-2' OR sk > 'row-2')",
+        "SELECT * FROM \"OrReads\".\"g-keys\" WHERE g = 'k' AND (sk < 'row-2' OR sk BETWEEN 'row-3' AND 'row-4')",
+        "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (begins_with(sk, 'row-1') OR begins_with(sk, 'row-3'))",
+        "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk > 'row-2')",
+    ] {
+        assert_eq!(
+            walk(&db, sql, None, false),
+            [page(&["k/row-1", "k/row-3"], false, 1.0)],
+            "{sql}"
+        );
+    }
+    // Ranges that meet, and a branch that doesn't bound the sort key, are
+    // refused.
+    for clause in [
+        "(sk <= 'row-2' OR sk >= 'row-2')",
+        "(sk = 'row-1' OR x = 3)",
+    ] {
+        let err = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: format!("SELECT * FROM \"OrReads\" WHERE pk = 'k' AND {clause}"),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err, "Overlapping conditions with range keys are not supported in where clause",
+            "{clause}"
+        );
+    }
+}
+
+#[test]
+fn sort_key_equalities_beside_a_wide_filter_read_only_their_keys() {
+    // #225 with #271: too wide to expand, the clause still reads the two keys
+    // (captured eu-west-2 and us-east-1, 2026-11-03: 1.0, no items).
+    let db = setup("ALL");
+    let filter = (0..9)
+        .map(|i| format!("(x = {i} OR x = {})", i + 100))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk = 'row-2') AND {filter}"
+    );
+    assert_eq!(walk(&db, &sql, None, false), [page(&[], false, 1.0)]);
+}
+
+#[test]
+fn a_string_partition_key_given_one_number_twice_is_refused() {
+    // Captured eu-west-2 and us-east-1, 2026-11-03: `1` and `1.0` are one
+    // condition, so the key is checked for its type, where a number key reads
+    // it (see `equivalent_numeric_partition_spellings_share_the_read_plan`).
+    let db = setup("ALL");
+    let err = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"OrReads\" WHERE pk = 1 AND pk = 1.0".into(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "Key attribute's data type should match its data type in table's schema: Key pk"
+    );
 }

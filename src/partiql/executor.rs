@@ -1772,7 +1772,7 @@ async fn execute_select<S: StorageBackend>(
         index.is_none()
             && order.is_none()
             && where_clause
-                .and_then(|wc| find_pk_condition(wc, read_pk, parameters))
+                .and_then(|wc| pk_in_every_group(wc, read_pk, parameters))
                 .is_some()
             && exact_sort_keys(where_clause, read_sk, parameters)
                 .is_some_and(|keys| keys.iter().all(|key| key.as_str() <= stop.sk.as_str()))
@@ -1882,7 +1882,7 @@ async fn evaluate_window<S: StorageBackend>(
     // Its key is refused for size as a single-group read's is (captured
     // eu-west-2 and us-east-1, 2026-10-10: `pk = <2,049 bytes> AND
     // (x = 1 OR x = 2)` on a table).
-    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk, parameters));
+    let pk_condition = where_clause.and_then(|wc| pk_in_every_group(wc, read_pk, parameters));
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
@@ -2609,7 +2609,7 @@ fn translate_sk_conditions(
 
 /// An index filter is keyed for a single pinned group (including IN), or
 /// when every OR branch pins the same partition. Different partitions retain
-/// the scan behavior captured in August; the shared-partition case was
+/// the scan behaviour captured in August; the shared-partition case was
 /// captured in eu-west-2 and us-east-1 on 2026-10-23 (#272).
 fn keys_index(
     where_clause: Option<&WhereClause>,
@@ -2631,19 +2631,10 @@ fn keys_index(
     })
 }
 
-/// A partition can be queried when every branch pins the same key. Keep the
-/// full WHERE clause as a post-read filter.
-fn find_pk_condition<'a>(
-    wc: &'a WhereClause,
-    pk_name: &str,
-    parameters: &[AttributeValue],
-) -> Option<&'a PartiqlValue> {
-    pk_in_every_group(wc, pk_name, parameters)
-}
-
 /// The one value every group of a clause pins the partition key to, when
 /// they all pin the same one: `pk = 'a' AND (x = 1 OR x = 2)` flattens to two
-/// groups that both name partition `a`.
+/// groups that both name partition `a`. A partition pinned this way is read
+/// by key, with the full WHERE clause kept as a post-read filter.
 fn pk_in_every_group<'a>(
     wc: &'a WhereClause,
     pk_name: &str,
@@ -2677,7 +2668,7 @@ fn same_partition_value(
     }
 }
 
-/// The one value a group pins the partition key to, as `find_pk_condition`
+/// The one value a group pins the partition key to, as `pk_in_every_group`
 /// reads it.
 fn group_pk_value<'a>(
     group: &'a [Arc<WhereCondition>],

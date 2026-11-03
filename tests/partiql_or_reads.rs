@@ -97,13 +97,33 @@ fn an_or_on_unprojected_attributes_is_refused_when_the_partition_is_shared() {
         err,
         "One or more parameter values were invalid: Secondary index g-keys does not project one or more filter attributes: [x]"
     );
-    // A different partition in each branch retains the previously captured scan behavior.
-    read(
+    // A different partition in each branch retains the previously captured scan behaviour.
+    // The unprojected `x` matches nothing on the index row, so only partition
+    // `z` comes back, at the cost of scanning the whole index.
+    let page = read(
         &db,
         "SELECT * FROM \"OrReads\".\"g-keys\" WHERE (g = 'k' AND x = 1) OR g = 'z'",
         None,
         None,
         false,
+    );
+    let items = page.items.unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(
+        items
+            .iter()
+            .all(|item| item["g"] == dynoxide::types::AttributeValue::S("z".into()))
+    );
+    let scan = read(
+        &db,
+        "SELECT * FROM \"OrReads\".\"g-keys\"",
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        page.consumed_capacity.unwrap().capacity_units,
+        scan.consumed_capacity.unwrap().capacity_units
     );
 }
 

@@ -13,6 +13,7 @@ use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::query::QueryRequest;
+use dynoxide::actions::update_item::UpdateItemRequest;
 use serde_json::{Value, json};
 
 const INVALID: &str = "The provided starting key is invalid";
@@ -947,5 +948,81 @@ fn underscore_names_require_expression_attribute_name_aliases() {
         }))
         .unwrap(),
     )
+    .unwrap();
+}
+
+#[test]
+fn underscore_names_need_an_alias_in_every_expression() {
+    // #274: the rule sits in the shared tokenizer, as DynamoDB's does, so
+    // filter, projection, condition and update expressions refuse an
+    // unaliased leading `_` too, and accept it through an alias.
+    let db = setup();
+    let refused = |err: String| {
+        assert!(err.contains("Syntax error; token: \"_\""), "{err}");
+    };
+    let query = |extra: Value| {
+        let mut body = json!({
+            "TableName": "Tbl", "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "a"}}
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        db.query(serde_json::from_value::<QueryRequest>(body).unwrap())
+    };
+    refused(
+        query(json!({"FilterExpression": "attribute_exists(_x)"}))
+            .unwrap_err()
+            .to_string(),
+    );
+    refused(
+        query(json!({"ProjectionExpression": "pk, _x"}))
+            .unwrap_err()
+            .to_string(),
+    );
+    query(json!({
+        "FilterExpression": "attribute_not_exists(#x)",
+        "ProjectionExpression": "pk, #x",
+        "ExpressionAttributeNames": {"#x": "_x"}
+    }))
+    .unwrap();
+
+    let put = |extra: Value| {
+        let mut body = json!({"TableName": "Tbl", "Item": {"pk": {"S": "u"}, "sk": {"N": "1"}}});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        db.put_item(serde_json::from_value::<PutItemRequest>(body).unwrap())
+    };
+    refused(
+        put(json!({"ConditionExpression": "attribute_not_exists(_x)"}))
+            .unwrap_err()
+            .to_string(),
+    );
+    put(json!({
+        "ConditionExpression": "attribute_not_exists(#x)",
+        "ExpressionAttributeNames": {"#x": "_x"}
+    }))
+    .unwrap();
+
+    let update = |extra: Value| {
+        let mut body = json!({
+            "TableName": "Tbl", "Key": {"pk": {"S": "u"}, "sk": {"N": "1"}},
+            "ExpressionAttributeValues": {":v": {"S": "v"}}
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        db.update_item(serde_json::from_value::<UpdateItemRequest>(body).unwrap())
+    };
+    refused(
+        update(json!({"UpdateExpression": "SET _x = :v"}))
+            .unwrap_err()
+            .to_string(),
+    );
+    update(json!({
+        "UpdateExpression": "SET #x = :v",
+        "ExpressionAttributeNames": {"#x": "_x"}
+    }))
     .unwrap();
 }

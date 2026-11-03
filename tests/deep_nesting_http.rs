@@ -1326,15 +1326,31 @@ async fn older_member_errors_win_over_deep_values() {
     let url = start().await;
     let rv = "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]";
     let xor = "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
-    for depth in [63, 100] {
+    // Shallower requests keep the newer wording, so the rewording must not
+    // reach them: the generic ReturnValues set at 40 levels, [ALL, OR] at 33
+    // and 40.
+    let generic_rv = "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+    let newer_xor = "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]";
+    for depth in [33, 40, 63, 100] {
         let v = deep_map(depth);
-        for member in [
-            format!(r#""Key":{{"pk":{v}}}"#),
-            format!(
-                r#""Key":{{"pk":{{"S":"a"}}}},"ExpressionAttributeValues":{{":v":{v}}},"ConditionExpression":"pk = :v""#
-            ),
-            format!(r#""Key":{{"pk":{{"S":"a"}}}},"Expected":{{"data":{{"Value":{v}}}}}"#),
-        ] {
+        let (rv, xor) = if depth < 63 {
+            (generic_rv, newer_xor)
+        } else {
+            (rv, xor)
+        };
+        // DeleteItem's shallow wording was captured at 40 levels only.
+        let delete_members = if depth == 33 {
+            Vec::new()
+        } else {
+            vec![
+                format!(r#""Key":{{"pk":{v}}}"#),
+                format!(
+                    r#""Key":{{"pk":{{"S":"a"}}}},"ExpressionAttributeValues":{{":v":{v}}},"ConditionExpression":"pk = :v""#
+                ),
+                format!(r#""Key":{{"pk":{{"S":"a"}}}},"Expected":{{"data":{{"Value":{v}}}}}"#),
+            ]
+        };
+        for member in delete_members {
             let (status, body) = send(
                 &url,
                 "DeleteItem",

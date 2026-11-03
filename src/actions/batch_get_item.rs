@@ -251,6 +251,7 @@ pub async fn execute<S: StorageBackend>(
     for (table_name, keys_and_attrs) in &request.request_items {
         let meta = helpers::require_table_for_item_op(storage, table_name).await?;
         let key_schema = helpers::parse_key_schema(&meta)?;
+        let vector_defs = crate::actions::vector_index::parse_vector_defs(&meta)?;
 
         // Parse projection if present; also handle legacy AttributesToGet
         let projection = if let Some(ref expr) = keys_and_attrs.projection_expression {
@@ -309,9 +310,11 @@ pub async fn execute<S: StorageBackend>(
 
                 cumulative_size += item_size;
 
-                // RCU is based on full item size, not projected size
+                // RCU is based on the full item's billed size, not projected
+                // size: a vector is charged at four bytes per dimension.
+                let billed = crate::types::billed_item_size(&item, &vector_defs);
                 per_table_rcu +=
-                    crate::types::read_capacity_units_with_consistency(item_size, consistent);
+                    crate::types::read_capacity_units_with_consistency(billed, consistent);
 
                 let result_item = if let Some(ref proj) = projection {
                     expressions::projection::apply(&item, proj, &tracker, &key_attrs)

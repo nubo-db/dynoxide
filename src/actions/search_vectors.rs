@@ -30,24 +30,31 @@ use crate::expressions;
 use crate::expressions::PathElement;
 use crate::expressions::condition::{CompOp, ConditionExpr, Operand};
 use crate::storage_backend::{StorageBackend, VectorCandidateRow};
-use crate::types::{AttributeValue, Item, VectorIndex};
+use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Internal deserialisation struct for detecting missing fields.
+///
+/// The four required members are declared in the order DynamoDB names them
+/// when more than one is missing: IndexName, SearchVector, TableName, TopK
+/// (captured eu-west-2 and us-east-1, 23 October 2026). Serde reports the
+/// first missing field in declaration order, so the order is load-bearing.
 #[derive(Debug, Default, Deserialize)]
 struct SearchVectorsRequestRaw {
-    #[serde(rename = "TableName", default)]
-    table_name: Option<String>,
-    /// Required: a missing IndexName, SearchVector or TopK gets serde's own
-    /// "missing field `IndexName` at line 1 column N", which is DynamoDB's
-    /// answer too (captured 2026-10-09, six of six regions).
+    /// Required: a missing IndexName, SearchVector, TableName or TopK gets
+    /// serde's own "missing field `IndexName` at line 1 column N", which is
+    /// DynamoDB's answer too (captured 2026-10-09, six of six regions, and for
+    /// TableName eu-west-2 and us-east-1, 9 October 2026), ahead of any
+    /// member constraint.
     #[serde(rename = "IndexName")]
     index_name: String,
     /// A bare JSON array of number attribute values, not wrapped in `L`
     /// (confirmed on the wire against the AWS SDK's serialisation).
-    #[serde(rename = "SearchVector")]
-    search_vector: Vec<AttributeValue>,
+    #[serde(rename = "SearchVector", deserialize_with = "strict_values::vector")]
+    search_vector: Vec<serde_json::Value>,
+    #[serde(rename = "TableName")]
+    table_name: String,
     /// Deserialised as i32 so a fractional or out-of-i32-range value rejects
     /// inside serde with the raw serde-style SerializationException message
     /// real DynamoDB returns for a fractional TopK: "invalid type: floating
@@ -62,10 +69,271 @@ struct SearchVectorsRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "strict_values::value_map"
+    )]
+    expression_attribute_values: Option<Vec<(String, serde_json::Value)>>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
+}
+
+/// SearchVectors' strict reading of attribute values.
+///
+/// DynamoDB's SearchVectors deserialiser reads each value as a tagged type,
+/// one member at a time, unlike the other operations, which look at a value
+/// whole. Everything here was captured from the search endpoint in eu-west-2
+/// and us-east-1 on 23 October 2026:
+///
+/// - A value that is null, has no member or a second one, or is a number, a
+///   boolean or a list, at the top or inside a list or map, is a
+///   SerializationException with no message.
+/// - A member holding the wrong JSON type quotes the deserialiser, position
+///   included: "invalid type: integer `1`, expected a string at line 1 column
+///   N". B and BS name their type "a Base64-encoded string".
+/// - A member DynamoDB does not know, or a bare string where a value belongs,
+///   is a ValidationException listing the members it does know, including the
+///   six it keeps for itself (see [`INTERNAL_TYPES`]).
+///
+/// Only the shape is checked here: the value comes back as JSON, for the
+/// request decoder to check once the members it reports first are clean.
+mod strict_values {
+    use serde::Deserialize;
+    use serde::de::{self, Deserializer, MapAccess, SeqAccess, Unexpected, Visitor};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::fmt;
+
+    /// The members DynamoDB's deserialiser knows, in the order it lists them.
+    const VARIANTS: &[&str] = &[
+        "B",
+        "BOOL",
+        "BS",
+        "DECIMAL",
+        "DECIMALSET",
+        "DOUBLE",
+        "DOUBLESET",
+        "INT",
+        "INTSET",
+        "L",
+        "M",
+        "N",
+        "NS",
+        "NULL",
+        "S",
+        "SS",
+    ];
+
+    /// The members DynamoDB reads but does not accept in a request, refused as
+    /// "This type mapping is not supported" once the value has been read.
+    pub(super) const INTERNAL_TYPES: &[&str] = &[
+        "DECIMAL",
+        "DECIMALSET",
+        "DOUBLE",
+        "DOUBLESET",
+        "INT",
+        "INTSET",
+    ];
+
+    /// The SerializationException with no message a shapeless value gets.
+    fn shapeless<E: de::Error>() -> E {
+        E::custom(crate::serde_errors::SERIALIZATION_MARKER)
+    }
+
+    /// An attribute value's JSON, checked member by member.
+    struct Shape;
+
+    /// A value, wherever one belongs: shaped, kept as JSON.
+    struct Element(Value);
+
+    impl<'de> Deserialize<'de> for Element {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(Shape).map(Element)
+        }
+    }
+
+    /// B and BS members, whose type DynamoDB names as a Base64-encoded string.
+    struct Base64Text(String);
+
+    impl<'de> Deserialize<'de> for Base64Text {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Text;
+            impl Visitor<'_> for Text {
+                type Value = String;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a Base64-encoded string")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+                    Ok(v.to_string())
+                }
+            }
+            deserializer.deserialize_string(Text).map(Base64Text)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Shape {
+        type Value = Value;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an attribute value")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let Some(member) = map.next_key::<String>()? else {
+                return Err(shapeless());
+            };
+            let value = match member.as_str() {
+                "S" | "N" | "INT" | "DECIMAL" | "DOUBLE" => Value::String(map.next_value()?),
+                "B" => Value::String(map.next_value::<Base64Text>()?.0),
+                "BOOL" | "NULL" => Value::Bool(map.next_value()?),
+                "SS" | "NS" | "INTSET" | "DECIMALSET" | "DOUBLESET" => {
+                    Value::from(map.next_value::<Vec<String>>()?)
+                }
+                "BS" => Value::from(
+                    map.next_value::<Vec<Base64Text>>()?
+                        .into_iter()
+                        .map(|text| text.0)
+                        .collect::<Vec<_>>(),
+                ),
+                "L" => Value::Array(
+                    map.next_value::<Vec<Element>>()?
+                        .into_iter()
+                        .map(|element| element.0)
+                        .collect(),
+                ),
+                "M" => Value::Object(
+                    map.next_value::<HashMap<String, Element>>()?
+                        .into_iter()
+                        .map(|(name, element)| (name, element.0))
+                        .collect(),
+                ),
+                _ => return Err(de::Error::unknown_variant(&member, VARIANTS)),
+            };
+            if map.next_key::<de::IgnoredAny>()?.is_some() {
+                return Err(shapeless());
+            }
+            let mut object = serde_json::Map::new();
+            object.insert(member, value);
+            Ok(Value::Object(object))
+        }
+
+        /// A bare string is read as a member's name with no value.
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+            if VARIANTS.contains(&v) {
+                Err(E::invalid_type(Unexpected::UnitVariant, &"newtype variant"))
+            } else {
+                Err(E::unknown_variant(v, VARIANTS))
+            }
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+            Err(shapeless())
+        }
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Value, E> {
+            Err(shapeless())
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Value, E> {
+            Err(shapeless())
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Value, E> {
+            Err(shapeless())
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Value, E> {
+            Err(shapeless())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, _: A) -> Result<Value, A::Error> {
+            Err(shapeless())
+        }
+    }
+
+    /// SearchVector, each element read strictly.
+    pub(super) fn vector<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Value>, D::Error> {
+        let values = Vec::<Element>::deserialize(deserializer)?;
+        Ok(values.into_iter().map(|value| value.0).collect())
+    }
+
+    /// ExpressionAttributeValues, each value read strictly, in the order
+    /// written. A null map reads as absent.
+    pub(super) fn value_map<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<(String, Value)>>, D::Error> {
+        struct Values;
+        impl<'de> Visitor<'de> for Values {
+            type Value = Vec<(String, Value)>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some((name, value)) = map.next_entry::<String, Element>()? {
+                    values.push((name, value.0));
+                }
+                Ok(values)
+            }
+        }
+        struct Present;
+        impl<'de> Visitor<'de> for Present {
+            type Value = Option<Vec<(String, Value)>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map")
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_map(Values).map(Some)
+            }
+        }
+        deserializer.deserialize_option(Present)
+    }
+}
+
+/// Check one expression value DynamoDB has read, as SearchVectors checks it
+/// after the members it reports first: a member it keeps for itself, an empty
+/// set, then whatever the shared decoder refuses (a number it cannot read, a
+/// NULL that is not true). The refusals are bare, with no key named (captured
+/// eu-west-2 and us-east-1, 23 October 2026). The error carries the marker
+/// prefix the shared decoder uses, for [`crate::serde_errors`] to classify.
+fn read_expression_value(raw: serde_json::Value) -> std::result::Result<AttributeValue, String> {
+    if let Some(object) = raw.as_object() {
+        if object
+            .keys()
+            .any(|member| strict_values::INTERNAL_TYPES.contains(&member.as_str()))
+        {
+            return Err(format!(
+                "{}This type mapping is not supported",
+                crate::serde_errors::VALIDATION_MARKER
+            ));
+        }
+        if let Some(refusal) = object
+            .iter()
+            .find_map(|(member, value)| crate::types::empty_set_refusal(member, value))
+        {
+            return Err(format!(
+                "{}{refusal}",
+                crate::serde_errors::VALIDATION_MARKER
+            ));
+        }
+    }
+    AttributeValue::deserialize(raw).map_err(|e| e.to_string())
+}
+
+/// Read a search vector element DynamoDB has read: anything but a number is
+/// refused when the vector is checked, so only a number's text is kept.
+fn read_vector_element(raw: serde_json::Value) -> Option<AttributeValue> {
+    match raw {
+        serde_json::Value::Object(mut object) if object.len() == 1 => match object.remove("N") {
+            Some(serde_json::Value::String(n)) => Some(AttributeValue::N(n)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A SearchVectors request.
@@ -140,67 +408,96 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let raw = SearchVectorsRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        // A member holding the wrong JSON type, an explicit null for a required
+        // member included, is refused by DynamoDB's strict deserialiser as a
+        // SerializationException quoting it, position included: "invalid type:
+        // null, expected a string at line 1 column N" (captured eu-west-2 and
+        // us-east-1, 9 and 23 October 2026). Every other operation maps these
+        // to its own words, so the pass-through is made here rather than in the
+        // shared decoder. A null optional member reads as absent, as it does on
+        // DynamoDB.
+        // An integer TopK beyond i32 is quoted the same way, as a
+        // ValidationException (captured eu-west-2 and us-east-1, 23 October
+        // 2026).
+        let raw = SearchVectorsRequestRaw::deserialize(deserializer).map_err(|e| {
+            let msg = e.to_string();
+            let marker = if msg.starts_with("invalid type: ") {
+                crate::serde_errors::SERIALIZATION_AS_READ_MARKER
+            } else if msg.starts_with("invalid value: ") {
+                crate::serde_errors::VALIDATION_AS_READ_MARKER
+            } else {
+                return e;
+            };
+            serde::de::Error::custom(format!("{marker}{msg}"))
+        })?;
+        use crate::validation::format_validation_errors;
 
         // An empty table name is the newer validation layer's own check,
         // reported on its own (captured 2026-10-09, six of six regions that
-        // serve SearchVectors). A missing one joins the member errors below.
-        if raw.table_name.as_deref() == Some("") {
+        // serve SearchVectors). A missing one never gets this far.
+        if raw.table_name.is_empty() {
             return Err(serde::de::Error::custom(format!(
                 "VALIDATION:{}",
                 crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
             )));
         }
 
-        let mut errors = Vec::new();
-        if raw.table_name.is_none() {
-            errors.extend(table_name_constraint_errors(
-                None,
-                TableNameContext::ReadWrite,
-            ));
-        }
-
-        errors.extend(member_constraint_errors(
+        let errors = member_constraint_errors(
             &raw.index_name,
             raw.search_vector.len(),
             i64::from(raw.top_k),
-        ));
-
-        // A table name that breaks its constraints comes after those members
-        // and ahead of ReturnConsumedCapacity, without the envelope, one error
-        // per name (captured 2026-10-09, six of six regions).
-        if errors.is_empty()
-            && let Some(msg) = raw
-                .table_name
-                .as_deref()
-                .and_then(crate::validation::first_table_name_error)
-        {
-            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
-        }
-
-        // ReturnConsumedCapacity enum validation
-        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-            raw.return_consumed_capacity.as_deref(),
-        ) {
-            errors.push(msg);
-        }
+        );
 
         if let Some(msg) = format_validation_errors(&errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
 
+        // A table name that breaks its constraints comes after those members
+        // and ahead of ReturnConsumedCapacity, without the envelope, one error
+        // per name (captured 2026-10-09, six of six regions).
+        if let Some(msg) = crate::validation::first_table_name_error(&raw.table_name) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+        }
+
+        if let Some(e) = return_consumed_capacity_error(raw.return_consumed_capacity.as_deref()) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{e}")));
+        }
+
+        // Then the TopK ceiling, the search vector and the expression values,
+        // as `execute` checks a request built in Rust.
+        if let Some(e) = top_k_ceiling_error(i64::from(raw.top_k)) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{e}")));
+        }
+        let search_vector = raw
+            .search_vector
+            .into_iter()
+            .map(read_vector_element)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!("VALIDATION:{}", invalid_search_vector()))
+            })?;
+        search_vector_floats(&search_vector)
+            .map_err(|e| serde::de::Error::custom(format!("VALIDATION:{e}")))?;
+        let expression_attribute_values = raw
+            .expression_attribute_values
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, read_expression_value(value)?)))
+                    .collect::<std::result::Result<HashMap<_, _>, String>>()
+            })
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+
         Ok(SearchVectorsRequest {
-            table_name: raw.table_name.unwrap_or_default(),
+            table_name: raw.table_name,
             index_name: raw.index_name,
-            search_vector: raw.search_vector,
+            search_vector,
             top_k: i64::from(raw.top_k),
             search_condition_expression: raw.search_condition_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             return_consumed_capacity: raw.return_consumed_capacity,
         })
     }
@@ -423,28 +720,97 @@ fn higher_is_better(distance_function: &str) -> bool {
 /// Validate the query vector: element validity first, then the dimension
 /// count. The order is captured: an L-wrapped single element reports the
 /// invalid-values message even though its element count also mismatches.
-fn parse_query_vector(search_vector: &[AttributeValue], vix: &VectorIndex) -> Result<Vec<f32>> {
-    let mut out = Vec::with_capacity(search_vector.len());
-    for elem in search_vector {
-        let AttributeValue::N(n) = elem else {
-            return Err(invalid_search_vector());
-        };
-        // Out-of-f32-range values overflow to infinity on conversion; real
-        // DynamoDB rejects them with the same invalid-values string
-        // (captured 2026-08-12).
-        match n.parse::<f32>() {
-            Ok(v) if v.is_finite() => out.push(v),
-            _ => return Err(invalid_search_vector()),
+/// The query vector as f32s, or the captured refusal for any element that is
+/// not a number reading as a finite 32-bit float. Out-of-range values overflow
+/// to infinity on conversion; real DynamoDB rejects them with the same
+/// invalid-values string (captured 2026-08-12), and rejects every element that
+/// is not a number, whatever it is, before the table is looked up (captured
+/// eu-west-2 and us-east-1, 23 October 2026).
+fn search_vector_floats(search_vector: &[AttributeValue]) -> Result<Vec<f32>> {
+    search_vector
+        .iter()
+        .map(|elem| match elem {
+            AttributeValue::N(n) => match n.parse::<f32>() {
+                Ok(v) if v.is_finite() => Ok(v),
+                _ => Err(invalid_search_vector()),
+            },
+            _ => Err(invalid_search_vector()),
+        })
+        .collect()
+}
+
+/// ReturnConsumedCapacity outside its enum, checked on its own and reported
+/// bare, after the member constraints and the table name and ahead of the TopK
+/// ceiling; a member constraint beside it is reported alone (captured
+/// eu-west-2 and us-east-1, 23 October 2026).
+fn return_consumed_capacity_error(mode: Option<&str>) -> Option<DynoxideError> {
+    crate::validation::return_consumed_capacity_rejection(mode)
+        .map(DynoxideError::ValidationException)
+}
+
+/// TopK beyond the upper bound rejects bare with the value interpolated
+/// (captured 2026-08-11: 101), after the member constraints and before the
+/// search vector (captured eu-west-2 and us-east-1, 23 October 2026). The
+/// lower bound is a member constraint.
+fn top_k_ceiling_error(top_k: i64) -> Option<DynoxideError> {
+    (top_k > 100).then(|| {
+        DynoxideError::ValidationException(format!(
+            "Provided TopK value '{top_k}' is out of valid range. The value must be between 1 \
+             and 100 inclusive"
+        ))
+    })
+}
+
+/// SearchVectors' checks on its expression parameters, before the
+/// expressions are parsed: an empty map, then a malformed key, then a map
+/// with no expression to use it, names ahead of values throughout. Names may
+/// serve either expression; values only SearchConditionExpression. Every
+/// refusal is bare (captured eu-west-2 and us-east-1, 23 October 2026).
+fn check_expression_parameters(request: &SearchVectorsRequest) -> Result<()> {
+    let refuse = |message: String| Err(DynoxideError::ValidationException(message));
+    let names = request.expression_attribute_names.as_ref();
+    let values = request.expression_attribute_values.as_ref();
+    if names.is_some_and(HashMap::is_empty) {
+        return refuse("ExpressionAttributeNames must not be empty".to_string());
+    }
+    if values.is_some_and(HashMap::is_empty) {
+        return refuse("ExpressionAttributeValues must not be empty".to_string());
+    }
+    for (map, keys, prefix) in [
+        (
+            "ExpressionAttributeNames",
+            names.map(|n| n.keys().collect::<Vec<_>>()),
+            '#',
+        ),
+        (
+            "ExpressionAttributeValues",
+            values.map(|v| v.keys().collect::<Vec<_>>()),
+            ':',
+        ),
+    ] {
+        let mut keys = keys.unwrap_or_default();
+        keys.sort();
+        if let Some(key) = keys
+            .into_iter()
+            .find(|key| !key.starts_with(prefix) || !key.is_ascii())
+        {
+            return refuse(format!(
+                "{map} contains invalid key: Syntax error; key: \"{key}\""
+            ));
         }
     }
-    if out.len() != vix.dimensions as usize {
-        return Err(DynoxideError::ValidationException(format!(
-            "Input search vector dimension {} does not match vector index dimension {}",
-            out.len(),
-            vix.dimensions
-        )));
+    let condition = request.search_condition_expression.is_some();
+    if names.is_some() && !condition && request.projection_expression.is_none() {
+        return refuse(
+            "ExpressionAttributeNames can only be specified when using expressions".to_string(),
+        );
     }
-    Ok(out)
+    if values.is_some() && !condition {
+        return refuse(
+            "ExpressionAttributeValues can only be specified when using expressions".to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub async fn execute<S: StorageBackend>(
@@ -475,40 +841,31 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(msg));
     }
 
-    // TopK beyond the upper bound rejects bare with the value interpolated
-    // (captured 2026-08-11: 101). Checked before the table lookup, mirroring
-    // the Query family's input-first posture (the relative order against table
-    // existence is uncaptured). The lower bound is a member constraint, above.
-    if request.top_k > 100 {
-        return Err(DynoxideError::ValidationException(format!(
-            "Provided TopK value '{}' is out of valid range. The value must be between 1 and \
-             100 inclusive",
-            request.top_k
-        )));
+    if let Some(e) = return_consumed_capacity_error(request.return_consumed_capacity.as_deref()) {
+        return Err(e);
+    }
+    if let Some(e) = top_k_ceiling_error(request.top_k) {
+        return Err(e);
     }
 
-    // Names/values without any expression reject the way the Query family
-    // rejects them (uncaptured for this operation).
+    // Then the search vector, then each expression value, as the request
+    // decoder checks them. A value built in Rust goes through the same reading
+    // as one decoded from a body, so it meets the same refusals.
+    let query_vec = search_vector_floats(&request.search_vector)?;
+    for value in request
+        .expression_attribute_values
+        .iter()
+        .flat_map(HashMap::values)
     {
-        let mut expr = Vec::new();
-        if request.search_condition_expression.is_some() {
-            expr.push("SearchConditionExpression");
-        }
-        if request.projection_expression.is_some() {
-            expr.push("ProjectionExpression");
-        }
-        let no_raw_eav: Option<serde_json::Value> = None;
-        let ctx = helpers::ExpressionParamContext {
-            non_expression_params: Vec::new(),
-            expression_params: expr,
-            all_expression_param_names: vec!["SearchConditionExpression"],
-            expression_attribute_names: &request.expression_attribute_names,
-            expression_attribute_values: &request.expression_attribute_values,
-            expression_attribute_values_raw: &no_raw_eav,
-            layer: crate::validation::ValueLayer::Older,
-        };
-        helpers::validate_expression_params(&ctx)?;
+        let raw = serde_json::to_value(value)
+            .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+        read_expression_value(raw).map_err(|msg| {
+            crate::serde_errors::classify_marked_serde_error(&msg)
+                .unwrap_or(DynoxideError::ValidationException(msg))
+        })?;
     }
+
+    check_expression_parameters(&request)?;
 
     // Expression syntax and the equality-only restriction pass run before the
     // table existence check, mirroring the Query family's captured
@@ -566,51 +923,11 @@ pub async fn execute<S: StorageBackend>(
         None => None,
     };
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
-    let vixs = parse_vector_defs(&meta)?;
-    let Some(vix) = vixs.iter().find(|v| v.index_name == request.index_name) else {
-        return Err(DynoxideError::ValidationException(format!(
-            "The table does not have the specified index: {}",
-            request.index_name
-        )));
-    };
-
-    // An index added to a live table refuses a search for the whole of its
-    // creation window, and keeps refusing for a period after it reports ACTIVE
-    // (captured eu-west-2, 2026-08-11). Placed after index resolution so an
-    // unknown index still answers its own message, and before the vector and
-    // SearchSchema checks: this ordering against them is uncaptured, and is
-    // chosen to match the operation's other resource-state answers rather than
-    // its input validation.
-    if !lifecycle
-        .phase_of_index(storage, &request.table_name, &request.index_name)
-        .is_searchable()
-    {
-        return Err(DynoxideError::ValidationException(format!(
-            "Cannot search backfilling vector index: {}",
-            request.index_name
-        )));
-    }
-
-    let query_vec = parse_query_vector(&request.search_vector, vix)?;
-
-    // Every referenced attribute must belong to the SearchSchema. The message
-    // preserves AWS's own grammar exactly as captured.
-    for attr in &referenced_attrs {
-        let in_schema = vix
-            .search_schema
-            .as_ref()
-            .is_some_and(|schema| schema.iter().any(|e| e.attribute_name == *attr));
-        if !in_schema {
-            return Err(DynoxideError::ValidationException(format!(
-                "SearchConditionExpression must not contain any attributes that is not in \
-                 SearchSchema. Invalid attribute: {attr}"
-            )));
-        }
-    }
-
     // A condition on a nested attribute is refused outright, with one message
-    // covering both element types (captured eu-west-2, 2026-08-19). Without
+    // covering both element types (captured eu-west-2, 2026-08-19), before an
+    // unused name or value and before the table is looked up, as is a second
+    // condition on one attribute (captured eu-west-2 and us-east-1, 23 October
+    // 2026). Without
     // this a nested path silently matched nothing, so a malformed search was
     // indistinguishable from one that found nothing.
     if pairs.iter().any(|p| p.nested) {
@@ -640,6 +957,68 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Register what the expressions use, then refuse an unused name or value
+    // before the table is looked up, names first (captured eu-west-2 and
+    // us-east-1, 23 October 2026).
+    if let Some(ref cond) = condition {
+        tracker.track_condition_expr(cond);
+    }
+    if let Some(ref proj) = projection {
+        tracker.track_projection_expr(proj);
+        expressions::projection::validate(proj, &tracker)
+            .map_err(DynoxideError::ValidationException)?;
+    }
+    tracker.check_unused()?;
+
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
+    let vixs = parse_vector_defs(&meta)?;
+    let Some(vix) = vixs.iter().find(|v| v.index_name == request.index_name) else {
+        return Err(DynoxideError::ValidationException(format!(
+            "The table does not have the specified index: {}",
+            request.index_name
+        )));
+    };
+
+    // An index added to a live table refuses a search for the whole of its
+    // creation window, and keeps refusing for a period after it reports ACTIVE
+    // (captured eu-west-2, 2026-08-11). Placed after index resolution so an
+    // unknown index still answers its own message, and before the vector and
+    // SearchSchema checks: this ordering against them is uncaptured, and is
+    // chosen to match the operation's other resource-state answers rather than
+    // its input validation.
+    if !lifecycle
+        .phase_of_index(storage, &request.table_name, &request.index_name)
+        .is_searchable()
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "Cannot search backfilling vector index: {}",
+            request.index_name
+        )));
+    }
+
+    if query_vec.len() != vix.dimensions as usize {
+        return Err(DynoxideError::ValidationException(format!(
+            "Input search vector dimension {} does not match vector index dimension {}",
+            query_vec.len(),
+            vix.dimensions
+        )));
+    }
+
+    // Every referenced attribute must belong to the SearchSchema. The message
+    // preserves AWS's own grammar exactly as captured.
+    for attr in &referenced_attrs {
+        let in_schema = vix
+            .search_schema
+            .as_ref()
+            .is_some_and(|schema| schema.iter().any(|e| e.attribute_name == *attr));
+        if !in_schema {
+            return Err(DynoxideError::ValidationException(format!(
+                "SearchConditionExpression must not contain any attributes that is not in \
+                 SearchSchema. Invalid attribute: {attr}"
+            )));
+        }
+    }
+
     // A HASH-schema index scopes every search to one partition value, so an
     // equality on the HASH attribute is mandatory. Captured for the
     // absent-expression case; an expression that omits the HASH attribute
@@ -653,17 +1032,6 @@ pub async fn execute<S: StorageBackend>(
                     .to_string(),
             ));
         }
-    }
-
-    // Pre-register expression references so the unused check works even with
-    // zero candidates, mirroring Query.
-    if let Some(ref cond) = condition {
-        tracker.track_condition_expr(cond);
-    }
-    if let Some(ref proj) = projection {
-        tracker.track_projection_expr(proj);
-        expressions::projection::validate(proj, &tracker)
-            .map_err(DynoxideError::ValidationException)?;
     }
 
     // Candidate load, scoped through the indexed hash_value column when the
@@ -828,10 +1196,6 @@ pub async fn execute<S: StorageBackend>(
             score,
         });
     }
-
-    // Unused expression attribute names/values reject the way the Query
-    // family rejects them (uncaptured for this operation).
-    tracker.check_unused()?;
 
     // Identical under TOTAL and INDEXES, absent under NONE (captured).
     let consumed_capacity =

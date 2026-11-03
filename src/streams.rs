@@ -118,6 +118,31 @@ pub fn extract_keys_with_schema(
     keys
 }
 
+/// The new and old images a stream record carries, as JSON, under the table's
+/// `StreamViewType`. Shared by every writer of stream records, so an import
+/// records what a live write would.
+pub(crate) fn stream_images(
+    meta: &TableMetadata,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+) -> (Option<String>, Option<String>) {
+    let view_type = meta
+        .stream_view_type
+        .as_deref()
+        .unwrap_or("NEW_AND_OLD_IMAGES");
+    let to_json = |i: &Item| serde_json::to_string(i).unwrap_or_default();
+
+    let new_image = match view_type {
+        "NEW_IMAGE" | "NEW_AND_OLD_IMAGES" => new_item.map(to_json),
+        _ => None,
+    };
+    let old_image = match view_type {
+        "OLD_IMAGE" | "NEW_AND_OLD_IMAGES" => old_item.map(to_json),
+        _ => None,
+    };
+    (new_image, old_image)
+}
+
 /// Record a stream event if streams are enabled on the table.
 ///
 /// `old_item` and `new_item` are the item before and after the operation.
@@ -135,11 +160,6 @@ pub async fn record_stream_event<S: StorageBackend>(
         return Ok(());
     }
 
-    let view_type = meta
-        .stream_view_type
-        .as_deref()
-        .unwrap_or("NEW_AND_OLD_IMAGES");
-
     let event_name = match (old_item, new_item) {
         (None, Some(_)) => "INSERT",
         (Some(_), Some(_)) => "MODIFY",
@@ -152,19 +172,7 @@ pub async fn record_stream_event<S: StorageBackend>(
     let keys = extract_keys(ref_item, &meta.key_schema);
     let keys_json = serde_json::to_string(&keys).unwrap_or_default();
 
-    let new_image_json = match view_type {
-        "NEW_IMAGE" | "NEW_AND_OLD_IMAGES" => {
-            new_item.map(|i| serde_json::to_string(i).unwrap_or_default())
-        }
-        _ => None,
-    };
-
-    let old_image_json = match view_type {
-        "OLD_IMAGE" | "NEW_AND_OLD_IMAGES" => {
-            old_item.map(|i| serde_json::to_string(i).unwrap_or_default())
-        }
-        _ => None,
-    };
+    let (new_image_json, old_image_json) = stream_images(meta, old_item, new_item);
 
     let seq_num = storage
         .next_stream_sequence_number(&meta.table_name)

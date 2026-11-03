@@ -22,8 +22,9 @@ jobs:
             flags: "--no-default-features --features native-sqlite --lib"
           - name: encryption-only
             flags: "--no-default-features --features encryption --lib"
+          # `cli` builds the binary, which the server's end-to-end tests spawn.
           - name: encryption+http-server
-            flags: "--no-default-features --features encryption,http-server"
+            flags: "--no-default-features --features encryption,http-server,cli"
           # The work counters are off by default and compile to nothing when
           # absent, so nothing else in the matrix builds the harness that
           # measures repeated work. Without this leg the evidence behind the
@@ -396,13 +397,46 @@ jobs:
             --features wasm-sqlite
           must_fail_on_guard "the native-sqlite arm" \
             --no-default-features --features wasm-sqlite,native-sqlite
-          must_fail_on_guard "the cli arm, reached through mcp-server" \
+          must_fail_on_guard "the cli arm" \
+            --no-default-features --features wasm-sqlite,cli
+          must_fail_on_guard "the http-server arm" \
+            --no-default-features --features wasm-sqlite,http-server
+          must_fail_on_guard "the mcp-server arm" \
             --no-default-features --features wasm-sqlite,mcp-server
+          must_fail_on_guard "the import arm" \
+            --no-default-features --features wasm-sqlite,import
           must_fail_on_guard "the _has-encryption arm" \
             --no-default-features --features wasm-sqlite,_has-encryption
 
       - name: wasm-sqlite on its own must build
         run: cargo check --no-default-features --features wasm-sqlite
+
+      # A library that embeds the HTTP or MCP server has no use for the
+      # binary's argument parser or log subscriber, so neither may reach its
+      # dependency graph. The default build is checked first and must list
+      # clap: if it doesn't, the match below can't see the crates it looks for
+      # and would pass on anything.
+      - name: The server features pull in no CLI dependencies
+        run: |
+          if ! cargo tree -e normal --prefix none | grep -qE '^clap '; then
+            echo "ERROR: the default build lists no clap, so this check can't see it"
+            exit 1
+          fi
+          for features in native-sqlite,http-server native-sqlite,mcp-server \
+              native-sqlite,http-server,mcp-server; do
+            tree=$(cargo tree -e normal --prefix none \
+              --no-default-features --features "$features")
+            if ! grep -qE '^dynoxide-rs ' <<<"$tree"; then
+              echo "ERROR: no dependency tree for $features"
+              exit 1
+            fi
+            if leaked=$(grep -E '^(clap|tracing-subscriber) ' <<<"$tree"); then
+              echo "ERROR: $features pulls in CLI dependencies:"
+              sort -u <<<"$leaked"
+              exit 1
+            fi
+            echo "OK: $features ($(sort -u <<<"$tree" | wc -l) crates)"
+          done
 
   wasm-check:
     name: wasm-sqlite build check

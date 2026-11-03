@@ -189,6 +189,16 @@ pub async fn execute<S: StorageBackend>(
     let item: Option<HashMap<String, AttributeValue>> =
         item_json.and_then(|json| serde_json::from_str::<Item>(&json).ok());
 
+    // A read is charged on the whole item's billed size, a vector at four bytes
+    // per dimension, whatever the projection returns (captured eu-west-2 and
+    // us-east-1, 2026-10-23).
+    let read_size = match &item {
+        Some(full_item) => {
+            types::billed_item_size(full_item, &super::vector_index::parse_vector_defs(&meta)?)
+        }
+        None => 0,
+    };
+
     // Check for unused expression attribute names/values
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &request.expression_attribute_names,
@@ -242,9 +252,8 @@ pub async fn execute<S: StorageBackend>(
     tracker.check_unused()?;
 
     let consumed_capacity = {
-        let size = item.as_ref().map(types::item_size).unwrap_or(0);
         let consistent = request.consistent_read.unwrap_or(false);
-        let rcu = types::read_capacity_units_with_consistency(size, consistent);
+        let rcu = types::read_capacity_units_with_consistency(read_size, consistent);
         types::consumed_capacity(&request.table_name, rcu, &request.return_consumed_capacity)
     };
 

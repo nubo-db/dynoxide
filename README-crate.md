@@ -14,7 +14,7 @@ browser. See [the repository](https://github.com/nubo-db/dynoxide) for those.
 
 ```toml
 [dependencies]
-dynoxide-rs = "3.1"
+dynoxide-rs = "3.2"
 ```
 
 ```rust
@@ -46,7 +46,7 @@ The default features pull in the CLI, HTTP and MCP servers. For the library
 alone:
 
 ```toml
-dynoxide-rs = { version = "3.1", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "3.2", default-features = false, features = ["native-sqlite"] }
 ```
 
 [Library guide](https://github.com/nubo-db/dynoxide/blob/main/docs/library.md)

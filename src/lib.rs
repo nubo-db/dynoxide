@@ -34,7 +34,10 @@ compile_error!(
     any(
         feature = "native-sqlite",
         feature = "_has-encryption",
-        feature = "cli"
+        feature = "cli",
+        feature = "http-server",
+        feature = "mcp-server",
+        feature = "import"
     )
 ))]
 compile_error!(

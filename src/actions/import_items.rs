@@ -107,6 +107,13 @@ async fn execute_inner<S: StorageBackend>(
 
         let mut base_rows: Vec<BaseItemRow> = Vec::with_capacity(item_count.min(FLUSH_BATCH));
 
+        // The item each key held last in this import, so a stream record for a
+        // key written twice carries the item it replaced. Base rows flush in
+        // batches, so storage alone can miss one written earlier in the import.
+        let recording = options.record_streams && meta.stream_enabled;
+        let mut imported: std::collections::HashMap<(String, String), crate::types::Item> =
+            std::collections::HashMap::new();
+
         for (idx, mut item) in items.into_iter().enumerate() {
             // 5. Validate required keys and extract pk/sk. The import variant
             // keeps the classic key checks but skips the vector write
@@ -260,11 +267,28 @@ async fn execute_inner<S: StorageBackend>(
                 .await?;
             }
 
-            // 9. Optional stream recording
-            if options.record_streams && meta.stream_enabled {
+            // 9. Optional stream recording. An item that replaces one records a
+            // MODIFY carrying the old item, as a PutItem over the key does. A
+            // fresh import has nothing stored to replace.
+            if recording {
+                let old_item = match imported.get(&(pk.clone(), sk.clone())) {
+                    Some(earlier) => Some(earlier.clone()),
+                    None if skip_gsi_deletes => None,
+                    None => storage
+                        .get_item(table_name, &pk, &sk)
+                        .await?
+                        .map(|json| {
+                            serde_json::from_str::<crate::types::Item>(&json).map_err(|e| {
+                                DynoxideError::InternalServerError(format!(
+                                    "Bad item JSON in storage: {e}"
+                                ))
+                            })
+                        })
+                        .transpose()?,
+                };
                 let seq = next_seq;
                 next_seq += 1;
-                let shard_id = format!("shardId-{table_name}-000000");
+                let shard_id = crate::streams::shard_id(table_name);
                 let keys_json = {
                     let mut keys = std::collections::HashMap::new();
                     if let Some(v) = item.get(&key_schema.partition_key) {
@@ -277,6 +301,13 @@ async fn execute_inner<S: StorageBackend>(
                     }
                     serde_json::to_string(&keys).unwrap_or_default()
                 };
+                let (new_image, old_image) =
+                    crate::streams::stream_images(&meta, old_item.as_ref(), Some(&item));
+                let event_name = if old_item.is_some() {
+                    "MODIFY"
+                } else {
+                    "INSERT"
+                };
                 let now_epoch = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
@@ -284,15 +315,16 @@ async fn execute_inner<S: StorageBackend>(
                 storage
                     .insert_stream_record(
                         table_name,
-                        "INSERT",
+                        event_name,
                         &keys_json,
-                        Some(&item_json),
-                        None,
+                        new_image.as_deref(),
+                        old_image.as_deref(),
                         &seq.to_string(),
                         &shard_id,
                         now_epoch,
                     )
                     .await?;
+                imported.insert((pk.clone(), sk.clone()), item);
             }
 
             // Collect the base row; base inserts flush in batches here (and a

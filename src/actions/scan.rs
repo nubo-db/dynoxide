@@ -823,6 +823,13 @@ pub async fn execute<S: StorageBackend>(
     let mut last_evaluated_item: Option<Item> = None;
     let mut truncated_by_size = false;
 
+    // A scan of the table itself is charged on its items' billed size, a
+    // vector at four bytes per dimension (captured eu-west-2 and us-east-1,
+    // 2026-10-23). Index entries stay sized by their numbers, and the 1MB page
+    // limit stays on the stored size.
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let mut billed_cumulative_size = 0usize;
+
     for (_pk, _sk, item_json) in &rows {
         let item: Item = serde_json::from_str(item_json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
@@ -838,6 +845,9 @@ pub async fn execute<S: StorageBackend>(
             break;
         }
         cumulative_size += item_size;
+        if request.index_name.is_none() {
+            billed_cumulative_size += crate::types::billed_item_size(&item, &vector_defs);
+        }
 
         // Apply filter
         if let Some(ref filter) = filter_expr {
@@ -938,7 +948,14 @@ pub async fn execute<S: StorageBackend>(
     } else {
         crate::types::consumed_capacity(
             &request.table_name,
-            crate::types::read_capacity_units_with_consistency(cumulative_size, consistent),
+            crate::types::read_capacity_units_with_consistency(
+                if request.index_name.is_none() {
+                    billed_cumulative_size
+                } else {
+                    cumulative_size
+                },
+                consistent,
+            ),
             &request.return_consumed_capacity,
         )
     };

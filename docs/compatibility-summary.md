@@ -315,11 +315,13 @@ matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.
 
 The base table charges the vector the same way. On a table with a vector index,
 an attribute an index reads costs its name plus `4 * dimensions` in a write's
-units and in `TableSizeBytes`, whatever numbers it holds, while read units and
-the 400 KB item limit size it as the list of numbers it is. Both rules are
-DynamoDB's, captured in eu-west-2 and us-east-1 at 1, 3, 6, 8, 256 and 1,024
-dimensions. A GSI's or LSI's share of the write is sized by the number rule even
-when the index projects the vector, so their `IndexSizeBytes` is too. A vector
+units, in a read's units on every read path and in `TableSizeBytes`, whatever
+numbers it holds, while the 400 KB item limit sizes it as the list of numbers it
+is. Both rules are DynamoDB's, captured in eu-west-2 and us-east-1 at 1, 3, 6,
+8, 256 and 1,024 dimensions; reads moved to the billed size between 9 and 22
+October 2026. A GSI's or LSI's share of the write, and a read served from one,
+is sized by the number rule even when the index projects the vector, so their
+`IndexSizeBytes` is too. A vector
 index's `ItemCount` and `IndexSizeBytes` count its entries and total their write
 figure without the floor.
 

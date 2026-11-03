@@ -117,6 +117,7 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     }
     if let Err(e) = check_members(operation, &rewritten) {
         let e = older_return_values_wording(operation, &rewritten, e);
+        let e = join_older_conditional_operator(operation, &rewritten, e);
         return DeepBody::Refuse(crate::validation::resolve_request_validation_tag(
             operation, e,
         ));
@@ -173,6 +174,45 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
             DynoxideError::EnvelopedValidation(reword(message))
         }
         other => other,
+    }
+}
+
+/// The older layer reports an unknown `ReturnValues` and an unknown
+/// `ConditionalOperator` together, where the decoder stops at the first
+/// (captured eu-west-2 and us-east-1, 2026-11-03: a PutItem or UpdateItem with
+/// an `Expected` value nested 100 levels, `XOR` and `ReturnValues` of `BOGUS`
+/// gets `2 validation errors detected:`, `returnValues` first).
+fn join_older_conditional_operator(
+    operation: &str,
+    body: &str,
+    err: DynoxideError,
+) -> DynoxideError {
+    if !matches!(operation, "PutItem" | "UpdateItem") {
+        return err;
+    }
+    let DynoxideError::ValidationException(message) = &err else {
+        return err;
+    };
+    let Some(return_values) = message
+        .strip_prefix("1 validation error detected: ")
+        .filter(|rest| rest.contains(" at 'returnValues' "))
+    else {
+        return err;
+    };
+    let operator = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|request| {
+            request
+                .get("ConditionalOperator")?
+                .as_str()
+                .map(str::to_string)
+        });
+    match crate::validation::conditional_operator_rejection(operator.as_deref()) {
+        Some(rejection) => DynoxideError::ValidationException(
+            crate::validation::format_validation_errors(&[return_values.to_string(), rejection])
+                .expect("two errors"),
+        ),
+        None => err,
     }
 }
 

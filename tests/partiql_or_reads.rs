@@ -765,3 +765,57 @@ fn a_string_partition_key_given_one_number_twice_is_refused() {
         "Key attribute's data type should match its data type in table's schema: Key pk"
     );
 }
+
+#[test]
+fn number_sort_key_unions_end_after_their_last_row() {
+    // Captured eu-west-2 and us-east-1, 2026-11-03: stored number keys order
+    // by value, negative and decimal ones included.
+    let db = Database::memory().unwrap();
+    db.create_table(serde_json::from_value(json!({
+        "TableName":"NumberSk", "BillingMode":"PAY_PER_REQUEST",
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"}],
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}]
+    })).unwrap()).unwrap();
+    for sk in ["-1", "1.5", "2", "10"] {
+        db.put_item(
+            serde_json::from_value(json!({"TableName":"NumberSk", "Item":{
+                "pk":{"S":"k"},"sk":{"N":sk},"payload":{"S":"x".repeat(3000)}
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    for (clause, first, second) in [
+        ("(sk = 2 OR sk = 10)", "2", "10"),
+        ("(sk = -1 OR sk = 1.5)", "-1", "1.5"),
+    ] {
+        let sql = format!("SELECT * FROM \"NumberSk\" WHERE pk = 'k' AND {clause}");
+        let mut seen = Vec::new();
+        let mut token = None;
+        loop {
+            let page = read(&db, &sql, Some(1), token, false);
+            let rows: Vec<_> = page
+                .items
+                .unwrap()
+                .iter()
+                .map(|item| match &item["sk"] {
+                    dynoxide::types::AttributeValue::N(n) => n.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            seen.push((rows, page.next_token.is_some()));
+            token = page.next_token;
+            if token.is_none() || seen.len() == 8 {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                (vec![first.to_string()], true),
+                (vec![second.to_string()], false)
+            ],
+            "{clause}"
+        );
+    }
+}

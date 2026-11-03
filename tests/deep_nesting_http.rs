@@ -1338,18 +1338,15 @@ async fn older_member_errors_win_over_deep_values() {
         } else {
             (rv, xor)
         };
-        // DeleteItem's shallow wording was captured at 40 levels only.
-        let delete_members = if depth == 33 {
-            Vec::new()
-        } else {
-            vec![
-                format!(r#""Key":{{"pk":{v}}}"#),
-                format!(
-                    r#""Key":{{"pk":{{"S":"a"}}}},"ExpressionAttributeValues":{{":v":{v}}},"ConditionExpression":"pk = :v""#
-                ),
-                format!(r#""Key":{{"pk":{{"S":"a"}}}},"Expected":{{"data":{{"Value":{v}}}}}"#),
-            ]
-        };
+        // DeleteItem's shallow wording at 33 levels was captured on
+        // 2026-11-03.
+        let delete_members = [
+            format!(r#""Key":{{"pk":{v}}}"#),
+            format!(
+                r#""Key":{{"pk":{{"S":"a"}}}},"ExpressionAttributeValues":{{":v":{v}}},"ConditionExpression":"pk = :v""#
+            ),
+            format!(r#""Key":{{"pk":{{"S":"a"}}}},"Expected":{{"data":{{"Value":{v}}}}}"#),
+        ];
         for member in delete_members {
             let (status, body) = send(
                 &url,
@@ -1366,6 +1363,17 @@ async fn older_member_errors_win_over_deep_values() {
             let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},"ConditionalOperator":"XOR"}}"#)).await;
             assert_validation(status, &body, xor);
         }
+    }
+    // Both members wrong at 100 levels: joined, ReturnValues first (captured
+    // eu-west-2 and us-east-1, 2026-11-03).
+    let v = deep_map(100);
+    let joined = "2 validation errors detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]; Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
+    for (operation, member) in [
+        ("PutItem", r#""Item":{"pk":{"S":"a"}}"#),
+        ("UpdateItem", r#""Key":{"pk":{"S":"a"}}"#),
+    ] {
+        let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},"ConditionalOperator":"XOR","ReturnValues":"BOGUS"}}"#)).await;
+        assert_validation(status, &body, joined);
     }
 }
 

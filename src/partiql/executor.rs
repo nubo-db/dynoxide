@@ -1919,7 +1919,7 @@ async fn evaluate_window<S: StorageBackend>(
     let peek = limit.is_some()
         && (exact_keys.is_some()
             || (pk_key.is_some() && sort_key_union(where_clause, read_pk, read_sk, parameters)));
-    let read_limit = limit.map(|lim| if peek { lim + 1 } else { lim });
+    let read_limit = limit.map(|lim| if peek { lim.saturating_add(1) } else { lim });
 
     let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
         read_in_order(

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`zstd` moves to 0.13.4, `zstd-safe` to 7.4.0 and `zstd-sys` to 2.1.2** for
+  RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 and
+  RUSTSEC-2026-0410. They cover context reuse across streams, seekable and
+  legacy-frame decompression, and the wasm32 allocator shim. Dynoxide only
+  compresses import output with a fresh `zstd::Encoder` on native targets, so
+  none of them reach its code, but zstd is built into the binary with the
+  `import` feature, so the fix ships in the next release.
+
 ### Fixed
 
 - **PartiQL reads a shared partition when every OR branch pins the same key.**

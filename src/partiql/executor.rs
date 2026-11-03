@@ -1867,8 +1867,15 @@ async fn evaluate_window<S: StorageBackend>(
 ) -> Result<Window> {
     // A keyed read needs an equality on the partition key. An index whose key
     // has more than one attribute never gets here: its reads are refused first
-    // (see `reject_multi_attribute_index`).
-    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
+    // (see `reject_multi_attribute_index`). An OR whose branches all pin the
+    // same partition key reads that partition too, with the whole clause as a
+    // filter (captured eu-west-2 and us-east-1, 2026-10-23:
+    // `pk = 'k' AND (x = 1 OR x = 2)` costs what `pk = 'k'` costs, on a table,
+    // an ALL GSI and an LSI). Its key is refused for size as a single-group
+    // read's is (captured eu-west-2 and us-east-1, 2026-10-10:
+    // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table).
+    let pk_condition = where_clause
+        .and_then(|wc| find_pk_condition(wc, read_pk).or_else(|| pk_in_every_group(wc, read_pk)));
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
@@ -1882,7 +1889,12 @@ async fn evaluate_window<S: StorageBackend>(
             if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
                 return Err(refusal);
             }
-            if let (Some(sk_name), Some(wc)) = (read_sk, where_clause) {
+            if let (Some(sk_name), Some(wc)) =
+                (read_sk, where_clause.filter(|wc| wc.groups.len() == 1))
+            {
+                // With multiple OR groups, the read uses the shared partition
+                // and evaluates the full condition as a filter. Sort-key
+                // values in one group are not key conditions for that read.
                 let sk_conditions =
                     translate_sk_conditions(&wc.groups[0], sk_name, parameters).unwrap_or_default();
                 for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
@@ -1894,22 +1906,7 @@ async fn evaluate_window<S: StorageBackend>(
             }
             Some(value.to_key_string())
         }
-        None => {
-            // An OR beside the key condition leaves the key in every group the
-            // clause expands to, so the statement still reads one partition
-            // and an oversized key is refused as it is without the OR
-            // (captured eu-west-2 and us-east-1, 2026-10-10:
-            // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table; an index's
-            // key is inferred to follow suit, as its key reads do). The read
-            // itself stays a scan here.
-            if let Some(value) = where_clause.and_then(|wc| pk_in_every_group(wc, read_pk)) {
-                let value = resolve_value(value, parameters)?;
-                if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
-                    return Err(refusal);
-                }
-            }
-            None
-        }
+        None => None,
     };
 
     let rows: Vec<(String, String, String)> = if let Some(plan) = order {
@@ -1928,13 +1925,13 @@ async fn evaluate_window<S: StorageBackend>(
     } else if let Some(None) = pk_key {
         Vec::new()
     } else if let Some(Some(pk_str)) = pk_key {
-        // Sort-key conditions that a key condition can express are pushed into
-        // the SQL, so `limit` counts rows within the key-condition range rather
-        // than rows in the whole partition, which is how DynamoDB paces a
-        // key-bound read. find_pk_condition only fires on a single-OR-group
-        // WHERE, so the group holding the sort-key conditions is unambiguous.
+        // Sort-key conditions from a single OR group can be pushed into the
+        // SQL, so `limit` counts rows within the key-condition range. With
+        // multiple groups, read the shared partition and apply the whole WHERE
+        // clause as a filter instead; no one group's sort-key conditions apply
+        // to every row in the partition.
         let sk_conditions = match (read_sk, where_clause) {
-            (Some(sk_name), Some(wc)) => {
+            (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
                 translate_sk_conditions(&wc.groups[0], sk_name, parameters)
             }
             _ => None,

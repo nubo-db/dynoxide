@@ -334,11 +334,17 @@ fn a_statement_that_does_not_pin_the_key_is_not_refused_for_its_size() {
         assert_eq!(single(&db, statement(text)), Ok(vec![item("b")]));
     }
     // k19: so do several sort key conditions.
-    let text = format!(
-        r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND (sk = '{}' OR sk = 'a')"#,
-        s(1025)
-    );
-    assert_eq!(single(&db, statement(text)), Ok(vec![item("a")]));
+    let oversized_sort_key = s(1025);
+    for text in [
+        format!(
+            r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND (sk = '{oversized_sort_key}' OR sk = 'a')"#
+        ),
+        format!(
+            r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND (sk = 'a' OR sk = '{oversized_sort_key}')"#
+        ),
+    ] {
+        assert_eq!(single(&db, statement(text)), Ok(vec![item("a")]));
+    }
     // k15: an UPDATE missing its sort key is refused for that first.
     let text = format!(r#"UPDATE "{TK}" SET x = 1 WHERE pk = '{}'"#, k(2049));
     assert_eq!(single(&db, statement(text)), Err(refused(MANDATORY)));

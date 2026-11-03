@@ -294,7 +294,16 @@ fn check_read_key_types(
     let Some(wc) = where_clause else {
         return Ok(());
     };
-    for group in &wc.groups {
+    // Planning may keep only common predicates. Validation must still see
+    // every key alternative, without distributing unrelated filter ORs.
+    let projected;
+    let groups = if wc.fully_expanded {
+        &wc.groups
+    } else {
+        projected = key_groups(wc, read_pk, read_sk)?;
+        &projected
+    };
+    for group in groups {
         let Some(pk) = key_conditions(group, read_pk, false, parameters) else {
             return Ok(());
         };
@@ -579,7 +588,7 @@ fn reject_overlapping_key_conditions(
         Ok(keys)
     };
 
-    let groups = key_groups(wc, read_pk, read_sk);
+    let groups = key_groups(wc, read_pk, read_sk)?;
     let mut branches = Vec::with_capacity(groups.len());
     for group in &groups {
         let mut partitions: Option<Vec<String>> = None;
@@ -709,11 +718,8 @@ fn key_groups(
     wc: &WhereClause,
     read_pk: &str,
     read_sk: Option<&str>,
-) -> Vec<Vec<Arc<WhereCondition>>> {
+) -> Result<Vec<Vec<Arc<WhereCondition>>>> {
     use crate::partiql::parser::ConditionTree;
-    if !wc.fully_expanded {
-        return wc.groups.clone();
-    }
     let is_key = |cond: &WhereCondition| {
         condition_path(cond).is_some_and(|path| {
             let root = root_attribute(path);
@@ -728,37 +734,29 @@ fn key_groups(
             }
         }
     }
-    fn flatten(
-        tree: &ConditionTree,
-        is_key: &dyn Fn(&WhereCondition) -> bool,
-    ) -> Vec<Vec<Arc<WhereCondition>>> {
+    fn project(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> ConditionTree {
         match tree {
-            ConditionTree::Leaf(cond) => vec![vec![cond.clone()]],
-            // A filter: it narrows no key range, so it contributes nothing.
-            ConditionTree::Or(terms) if !terms.iter().any(|t| mentions_key(t, is_key)) => {
-                vec![Vec::new()]
+            ConditionTree::Leaf(cond) if is_key(cond) => ConditionTree::Leaf(cond.clone()),
+            ConditionTree::Leaf(_) => ConditionTree::And(Vec::new()),
+            // Keep the branch structure when any alternative names a key.
+            // An empty alternative then still represents a scan branch.
+            ConditionTree::Or(terms) if terms.iter().any(|t| mentions_key(t, is_key)) => {
+                ConditionTree::Or(terms.iter().map(|t| project(t, is_key)).collect())
             }
-            ConditionTree::Or(terms) => terms.iter().flat_map(|t| flatten(t, is_key)).collect(),
+            ConditionTree::Or(_) => ConditionTree::And(Vec::new()),
             ConditionTree::And(terms) => {
-                let mut out = vec![Vec::new()];
-                for term in terms {
-                    let term_groups = flatten(term, is_key);
-                    out = out
-                        .iter()
-                        .flat_map(|held: &Vec<Arc<WhereCondition>>| {
-                            term_groups.iter().map(move |group| {
-                                let mut joined = held.clone();
-                                joined.extend(group.iter().cloned());
-                                joined
-                            })
-                        })
-                        .collect();
-                }
-                out
+                ConditionTree::And(terms.iter().map(|t| project(t, is_key)).collect())
             }
         }
     }
-    flatten(&wc.tree, &is_key)
+    // Reuse the parser's allocation bounds. Large non-key filters disappear
+    // before expansion; a key-only explosion is refused rather than silently
+    // skipping validation or allocating its exponential product.
+    crate::partiql::parser::to_dnf(&project(&wc.tree, &is_key)).map_err(|message| {
+        DynoxideError::ValidationException(
+            crate::partiql::parser::ParseError::Syntax(message).into_message(),
+        )
+    })
 }
 
 /// The atoms of one sort key condition as bytes, equal exactly when the atoms
@@ -1685,7 +1683,7 @@ async fn execute_select<S: StorageBackend>(
             }
         }
 
-        if keys_index(where_clause, read_pk) {
+        if keys_index(where_clause, read_pk, parameters) {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
                 .filter(|attr| !idx.projects(attr, table_key_schema))
@@ -1866,11 +1864,12 @@ async fn evaluate_window<S: StorageBackend>(
     // same partition key reads that partition too, with the whole clause as a
     // filter (captured eu-west-2 and us-east-1, 2026-10-23:
     // `pk = 'k' AND (x = 1 OR x = 2)` costs what `pk = 'k'` costs, on a table,
-    // an ALL GSI and an LSI). Its key is refused for size as a single-group
-    // read's is (captured eu-west-2 and us-east-1, 2026-10-10:
-    // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table).
-    let pk_condition = where_clause
-        .and_then(|wc| find_pk_condition(wc, read_pk).or_else(|| pk_in_every_group(wc, read_pk)));
+    // an ALL GSI and an LSI). When every branch bounds the sort key, the union
+    // of those ranges is pushed into the read too (see `read_sk_sql`, #271).
+    // Its key is refused for size as a single-group read's is (captured
+    // eu-west-2 and us-east-1, 2026-10-10: `pk = <2,049 bytes> AND
+    // (x = 1 OR x = 2)` on a table).
+    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk, parameters));
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
@@ -2576,12 +2575,16 @@ fn translate_sk_conditions(
 /// when every OR branch pins the same partition. Different partitions retain
 /// the scan behavior captured in August; the shared-partition case was
 /// captured in eu-west-2 and us-east-1 on 2026-10-23 (#272).
-fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
+fn keys_index(
+    where_clause: Option<&WhereClause>,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> bool {
     let Some(wc) = where_clause else {
         return false;
     };
     if wc.groups.len() != 1 {
-        return pk_in_every_group(wc, pk_name).is_some();
+        return pk_in_every_group(wc, pk_name, parameters).is_some();
     }
     wc.groups[0].iter().any(|c| match &**c {
         WhereCondition::Comparison(cond) => {
@@ -2594,24 +2597,57 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
 
 /// A partition can be queried when every branch pins the same key. Keep the
 /// full WHERE clause as a post-read filter.
-fn find_pk_condition<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
-    pk_in_every_group(wc, pk_name)
+fn find_pk_condition<'a>(
+    wc: &'a WhereClause,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> Option<&'a PartiqlValue> {
+    pk_in_every_group(wc, pk_name, parameters)
 }
 
 /// The one value every group of a clause pins the partition key to, when
 /// they all pin the same one: `pk = 'a' AND (x = 1 OR x = 2)` flattens to two
 /// groups that both name partition `a`.
-fn pk_in_every_group<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
+fn pk_in_every_group<'a>(
+    wc: &'a WhereClause,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> Option<&'a PartiqlValue> {
     let (first, rest) = wc.groups.split_first()?;
-    let value = group_pk_value(first, pk_name)?;
+    let value = group_pk_value(first, pk_name, parameters)?;
     rest.iter()
-        .all(|group| group_pk_value(group, pk_name) == Some(value))
+        .all(|group| {
+            group_pk_value(group, pk_name, parameters)
+                .is_some_and(|other| same_partition_value(value, other, parameters))
+        })
         .then_some(value)
+}
+
+/// Compare resolved storage keys so separate placeholders and equivalent
+/// numeric spellings name the same partition. Identical syntax also keeps
+/// unresolved values on their existing validation path.
+fn same_partition_value(
+    left: &PartiqlValue,
+    right: &PartiqlValue,
+    parameters: &[AttributeValue],
+) -> bool {
+    if left == right {
+        return true;
+    }
+    let stored = |value| resolve_value(value, parameters).ok()?.to_key_string();
+    match (stored(left), stored(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// The one value a group pins the partition key to, as `find_pk_condition`
 /// reads it.
-fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option<&'a PartiqlValue> {
+fn group_pk_value<'a>(
+    group: &'a [Arc<WhereCondition>],
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> Option<&'a PartiqlValue> {
     let mut pinning = group.iter().filter_map(|c| match &**c {
         WhereCondition::Comparison(cond)
             if names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq =>
@@ -2623,15 +2659,13 @@ fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option
         }
         _ => None,
     });
-    let values = pinning.next()?;
-    if pinning.any(|other| other != values) {
-        return None;
-    }
     // An IN with several values names several partitions; it stays a scan.
-    match values {
-        [value] => Some(value),
-        _ => None,
-    }
+    let [value] = pinning.next()? else {
+        return None;
+    };
+    pinning
+        .all(|other| matches!(other, [other] if same_partition_value(value, other, parameters)))
+        .then_some(value)
 }
 
 /// A table's metadata and its parsed key schema, worked out once.

@@ -3538,7 +3538,7 @@ fn slots(groups: &Groups) -> usize {
 /// slots to `MAX_OR_SLOTS` between them, checking each arm before adding it.
 /// The conditions themselves are shared, so a slot costs a pointer however
 /// long the path or literal it names.
-fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
+pub(crate) fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
     let too_complex = || Err(TOO_COMPLEX.to_string());
     match tree {
         ConditionTree::Leaf(cond) => Ok(vec![vec![Arc::clone(cond)]]),

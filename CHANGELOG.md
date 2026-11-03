@@ -24,13 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
 - PartiQL `SELECT` reads one partition when every OR branch names the same
   partition key. It used to scan the table, charging for unrelated rows and
-  counting them towards `Limit`. Captured against eu-west-2 and us-east-1 on
-  23 October 2026
+  counting them towards `Limit`. Separate parameters holding the same key,
+  including equivalent numeric spellings, use the same partition read.
+  Captured against eu-west-2 and us-east-1 on 23 October 2026
   ([#229](https://github.com/nubo-db/dynoxide/issues/229),
   [#269](https://github.com/nubo-db/dynoxide/pull/269), thanks
   [@jay23606](https://github.com/jay23606)).
 - A PartiQL OR of sort-key equalities reads only the requested keys within
-  the shared partition. Read capacity and pagination follow those keys
+  the shared partition, on tables and global secondary indexes. Read capacity
+  and pagination follow those keys
   ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
 - PartiQL accepts `ORDER BY` on the sort key when OR branches share one
   partition. It used to count that partition more than once and demand the
@@ -42,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PartiQL evaluates large OR filters as a tree when expanding their
   combinations would exceed the read planner's budget. A partition key
   equality beside the filter still reads that partition. Nine, sixteen and
-  forty pairs of OR conditions now run
+  forty pairs of OR conditions now run, with key-type and overlapping-range
+  checks preserved when the filter exceeds the expansion budget
   ([#225](https://github.com/nubo-db/dynoxide/issues/225)).
 - Request-member errors follow DynamoDB's wording and order for deep
   `DeleteItem`, `PutItem` and `UpdateItem` requests. An `UpdateItem` without

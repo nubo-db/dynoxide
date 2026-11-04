@@ -1166,6 +1166,7 @@ fn a_range_written_two_ways_is_one_branch() {
         "((sk >= 'row-1' AND sk <= 'row-3' AND l = 'a') OR (sk >= 'row-1' AND sk <= 'row-3' AND l = 'b'))",
         "((sk >= 'row-1' AND sk <= 'row-3' AND l = 'a') OR (sk <= 'row-3' AND sk >= 'row-1' AND l = 'b'))",
         "((sk BETWEEN 'row-1' AND 'row-3' AND l = 'a') OR (sk <= 'row-3' AND l = 'b' AND sk >= 'row-1'))",
+        "((sk >= 'row-1' AND sk <= 'row-3' AND l = 'a') OR (sk >= 'row-1' AND sk <= 'row-3' AND sk >= 'row-1' AND l = 'b'))",
     ] {
         let sql = format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
         assert_eq!(

@@ -201,7 +201,6 @@ fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> Dynox
     };
     let about_a_member = |error: &str| {
         error == RETURN_VALUES_NOT_HONOURED
-            || error.contains(crate::validation::RETURN_VALUES_REJECTION)
             || order
                 .iter()
                 .any(|member| error.contains(&format!(" at '{}' ", member.wire)))
@@ -248,8 +247,8 @@ impl OlderMember {
         use crate::validation::*;
         let text = value.and_then(|v| v.as_str());
         match self.check {
-            // One DeleteItem doesn't honour is in the enum, so it isn't
-            // rejected here.
+            // `ALL_NEW` and the other values DeleteItem refuses are in the
+            // enum, so the older layer doesn't reject them here.
             OlderCheck::ReturnValues => text
                 .filter(|v| !RETURN_VALUES.contains(v))
                 .map(return_values_value_rejection),
@@ -261,7 +260,8 @@ impl OlderMember {
             OlderCheck::ReturnItemCollectionMetrics => {
                 return_item_collection_metrics_rejection(text)
             }
-            OlderCheck::Required => value.is_none().then(|| {
+            // A null member is read as a missing one.
+            OlderCheck::Required => value.is_none_or(serde_json::Value::is_null).then(|| {
                 format!(
                     "Value null at '{}' failed to satisfy constraint: Member must not be null",
                     self.wire
@@ -377,7 +377,9 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
             check_older_conditional_operator(request.conditional_operator.as_deref())
         }),
         "GetItem" => deserialize::<get_item::GetItemRequest>(body).map(drop),
-        "DeleteItem" => deserialize::<delete_item::DeleteItemRequest>(body).map(drop),
+        "DeleteItem" => deserialize::<delete_item::DeleteItemRequest>(body).and_then(|request| {
+            check_older_conditional_operator(request.conditional_operator.as_deref())
+        }),
         "UpdateItem" => deserialize::<update_item::UpdateItemRequest>(body).and_then(|request| {
             check_older_conditional_operator(request.conditional_operator.as_deref())
         }),

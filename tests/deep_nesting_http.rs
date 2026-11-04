@@ -1509,6 +1509,17 @@ async fn older_member_errors_win_over_deep_values() {
             all.to_string(),
             vec![rv, xor, rvoccf, rcc, ricm, no_key],
         ),
+        // A null key or item is read as a missing one.
+        (
+            "UpdateItem",
+            r#""Key":null,"ConditionalOperator":"XOR","ReturnValues":"BOGUS""#.to_string(),
+            vec![rv, xor, no_key],
+        ),
+        (
+            "PutItem",
+            r#""Item":null,"ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#.to_string(),
+            vec![rv, no_item, rcc],
+        ),
     ] {
         let (status, body) = send(
             &url,
@@ -1522,6 +1533,43 @@ async fn older_member_errors_win_over_deep_values() {
             expected.join("; ")
         );
         assert_validation(status, &body, &message);
+    }
+    // One member wrong is still the older layer's, enveloped, and a
+    // DeleteItem `XOR` alone is reported rather than the nesting (captured
+    // eu-west-2 and us-east-1, 2026-11-04).
+    for (operation, members, expected) in [
+        (
+            "UpdateItem",
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            rcc,
+        ),
+        (
+            "UpdateItem",
+            format!(r#"{key},"ReturnValuesOnConditionCheckFailure":"BOGUS""#),
+            rvoccf,
+        ),
+        (
+            "DeleteItem",
+            format!(r#"{key},"ConditionalOperator":"XOR""#),
+            xor,
+        ),
+        (
+            "DeleteItem",
+            format!(r#"{key},"ReturnValues":"ALL_NEW","ReturnConsumedCapacity":"BOGUS""#),
+            rcc,
+        ),
+    ] {
+        let (status, body) = send(
+            &url,
+            operation,
+            format!(r#"{{"TableName":"Deep",{expected_deep},{members}}}"#),
+        )
+        .await;
+        assert_validation(
+            status,
+            &body,
+            &format!("1 validation error detected: {expected}"),
+        );
     }
 }
 

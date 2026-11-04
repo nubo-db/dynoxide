@@ -819,3 +819,159 @@ fn number_sort_key_unions_end_after_their_last_row() {
         );
     }
 }
+
+/// Small items in partition `k`, with an LSI on `l` where `row-2` and `row-3`
+/// share the key `b`.
+fn small_items() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(json!({
+            "TableName": "Small", "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [
+                {"AttributeName":"pk","AttributeType":"S"},
+                {"AttributeName":"sk","AttributeType":"S"},
+                {"AttributeName":"l","AttributeType":"S"}
+            ],
+            "KeySchema": [{"AttributeName":"pk","KeyType":"HASH"},
+                          {"AttributeName":"sk","KeyType":"RANGE"}],
+            "LocalSecondaryIndexes": [{"IndexName":"l-all",
+                "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                             {"AttributeName":"l","KeyType":"RANGE"}],
+                "Projection":{"ProjectionType":"ALL"}}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (sk, l) in [("row-1", "a"), ("row-2", "b"), ("row-3", "b")] {
+        db.put_item(
+            serde_json::from_value(json!({"TableName":"Small", "Item":{
+                "pk":{"S":"k"},"sk":{"S":sk},"l":{"S":l}
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+#[test]
+fn sort_key_branches_are_charged_one_read_each() {
+    // Captured eu-west-2 and us-east-1, 2026-11-04, ConsistentRead: each
+    // branch rounds its own rows up, a branch that found nothing costs a unit,
+    // and the same rows read as one range cost one.
+    let db = small_items();
+    for (clause, rows, cost) in [
+        (
+            "(sk = 'row-1' OR sk = 'row-2')",
+            &["k/row-1", "k/row-2"][..],
+            2.0,
+        ),
+        (
+            "(sk = 'row-1' OR sk = 'row-2' OR sk = 'row-3')",
+            &["k/row-1", "k/row-2", "k/row-3"],
+            3.0,
+        ),
+        ("(sk = 'row-0' OR sk = 'row-2')", &["k/row-2"], 2.0),
+        ("(sk < 'row-0' OR sk > 'row-2')", &["k/row-3"], 2.0),
+        (
+            "(sk < 'row-2' OR sk > 'row-2')",
+            &["k/row-1", "k/row-3"],
+            2.0,
+        ),
+        (
+            "(sk = 'row-1' OR sk > 'row-2')",
+            &["k/row-1", "k/row-3"],
+            2.0,
+        ),
+        (
+            "((sk = 'row-0' AND sk = 'row-0') OR sk = 'row-2')",
+            &["k/row-2"],
+            2.0,
+        ),
+        ("sk > 'row-0'", &["k/row-1", "k/row-2", "k/row-3"], 1.0),
+    ] {
+        let sql = format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+        assert_eq!(
+            walk(&db, &sql, None, true),
+            [page(rows, false, cost)],
+            "{clause}"
+        );
+    }
+    let page_of = |sql: &str| walk(&db, sql, None, true);
+    assert_eq!(
+        page_of("SELECT * FROM \"Small\" WHERE pk = 'k'"),
+        [page(&["k/row-1", "k/row-2", "k/row-3"], false, 1.0)]
+    );
+    // Eventually consistent, two keys cost a unit.
+    assert_eq!(
+        walk(
+            &db,
+            "SELECT * FROM \"Small\" WHERE pk = 'k' AND (sk = 'row-1' OR sk = 'row-2')",
+            None,
+            false
+        ),
+        [page(&["k/row-1", "k/row-2"], false, 1.0)]
+    );
+}
+
+#[test]
+fn a_range_beside_an_or_filter_pages_as_a_union() {
+    // Captured eu-west-2 and us-east-1, 2026-11-04: the filter's OR splits the
+    // read into two branches over one range, which ends after its last row,
+    // where the range alone keeps its token for an empty last page.
+    let db = small_items();
+    let sql =
+        |filter: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND sk > 'row-1'{filter}");
+    assert_eq!(
+        walk(&db, &sql(" AND (l = 'b' OR l = 'z')"), Some(1), false),
+        [
+            page(&["k/row-2"], true, 0.5),
+            page(&["k/row-3"], false, 0.5)
+        ]
+    );
+    assert_eq!(
+        walk(&db, &sql(""), Some(1), false),
+        [
+            page(&["k/row-2"], true, 0.5),
+            page(&["k/row-3"], true, 0.5),
+            page(&[], false, 0.5)
+        ]
+    );
+}
+
+#[test]
+fn an_lsi_key_set_charges_and_pages_like_the_table() {
+    // Captured eu-west-2 and us-east-1, 2026-11-04.
+    let db = small_items();
+    let lsi =
+        |clause: &str| format!("SELECT * FROM \"Small\".\"l-all\" WHERE pk = 'k' AND {clause}");
+    // A missing key holds the token until the read passes it, and costs a
+    // unit there.
+    assert_eq!(
+        walk(&db, &lsi("(l = 'z' OR l = 'a')"), Some(1), false),
+        [page(&["k/row-1"], true, 0.5), page(&[], false, 0.5)]
+    );
+    assert_eq!(
+        walk(&db, &lsi("(l = 'a' OR l = 'z')"), None, true),
+        [page(&["k/row-1"], false, 2.0)]
+    );
+    // Two items under one LSI key both come back, one a page, and the
+    // continuation outlasts the first. AWS returned them in the other order,
+    // and for the two-key set added an empty page after them.
+    for clause in ["l = 'b'", "(l = 'a' OR l = 'b')"] {
+        let pages = walk(&db, &lsi(clause), Some(1), false);
+        let mut rows: Vec<String> = pages.iter().flat_map(|(rows, _, _)| rows.clone()).collect();
+        rows.sort();
+        let mut expected = vec!["k/row-2".to_string(), "k/row-3".to_string()];
+        if clause.contains("'a'") {
+            expected.insert(0, "k/row-1".to_string());
+        }
+        assert_eq!(rows, expected, "{clause}");
+        assert!(
+            pages
+                .iter()
+                .all(|(rows, _, cost)| rows.len() <= 1 && *cost == 0.5)
+        );
+        assert!(pages[..pages.len() - 1].iter().all(|(_, token, _)| *token));
+    }
+}

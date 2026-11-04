@@ -161,6 +161,7 @@ pub async fn execute<S: StorageBackend>(
     let partiql::executor::StatementPage {
         items,
         size,
+        read_units,
         capacity,
         next_token,
         read_index,
@@ -177,10 +178,12 @@ pub async fn execute<S: StorageBackend>(
     // index, exactly as the equivalent `PutItem`.
     let consumed_capacity = partiql::parser::table_name(&stmt).and_then(|table| {
         let Some(capacity) = capacity else {
-            let units = crate::types::read_capacity_units_with_consistency(
-                size,
-                request.consistent_read.unwrap_or(false),
-            );
+            let consistent = request.consistent_read.unwrap_or(false);
+            let units = match read_units {
+                Some(strong) if consistent => strong,
+                Some(strong) => strong / 2.0,
+                None => crate::types::read_capacity_units_with_consistency(size, consistent),
+            };
             // A read served from an index is charged against that index's arm
             // with the table arm at zero, the same shape Query and Scan already
             // report. Captured eu-west-2 2026-08-15: a keyed GSI select is

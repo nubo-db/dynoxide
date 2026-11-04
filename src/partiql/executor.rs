@@ -28,6 +28,10 @@ pub struct StatementPage {
     pub items: Option<Vec<Item>>,
     /// Total item bytes touched, for `ConsumedCapacity`.
     pub size: usize,
+    /// What a `SELECT` costs in strongly consistent read units when it is
+    /// charged per sort-key branch rather than on `size`. A batch or a
+    /// transaction reads a single key, where the two agree.
+    pub read_units: Option<f64>,
     /// What a write statement contributed to `ConsumedCapacity`: the images
     /// either side and the per-index units. `None` for a `SELECT`, which is
     /// charged from `size` at read granularity instead.
@@ -1016,17 +1020,12 @@ async fn read_in_order<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     index: Option<&ResolvedIndex>,
-    where_clause: Option<&WhereClause>,
-    parameters: &[AttributeValue],
-    read_pk: &str,
-    read_sk: Option<&str>,
+    sort_keys: &SortKeyPlan,
     cursor: Option<&Cursor>,
     limit: Option<usize>,
     plan: &OrderPlan,
 ) -> Result<Vec<(String, String, String)>> {
-    let (sk_condition_sql, sk_param_values) =
-        read_sk_sql(where_clause, read_pk, read_sk, parameters);
-    let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+    let sk_params_refs: Vec<&str> = sort_keys.params.iter().map(|s| s.as_str()).collect();
 
     let first = match cursor {
         Some(c) => plan
@@ -1045,7 +1044,7 @@ async fn read_in_order<S: StorageBackend>(
         }
         let resume = cursor.filter(|_| i == first);
         let params = crate::storage::QueryParams {
-            sk_condition: sk_condition_sql.as_deref(),
+            sk_condition: sort_keys.sql.as_deref(),
             sk_params: &sk_params_refs,
             forward: plan.forward,
             limit: remaining,
@@ -1420,6 +1419,7 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
             Ok(StatementPage {
                 items: Some(outcome.items),
                 size: outcome.evaluated_bytes,
+                read_units: outcome.read_units,
                 capacity: None,
                 next_token: outcome.next_token,
                 read_index: outcome.index.map(|i| ReadIndex {
@@ -1801,6 +1801,7 @@ async fn execute_select<S: StorageBackend>(
     Ok(SelectOutcome {
         items,
         evaluated_bytes: window.evaluated_bytes,
+        read_units: window.read_units,
         next_token: token,
         index,
         base_read_units,
@@ -1816,6 +1817,9 @@ struct SelectOutcome {
     /// `items`: a filter and a projection both narrow the rows after the read
     /// has already paid for them.
     evaluated_bytes: usize,
+    /// What the read costs in strongly consistent units, when it is charged
+    /// per sort-key branch (see `Window::read_units`).
+    read_units: Option<f64>,
     next_token: Option<String>,
     index: Option<ResolvedIndex>,
     /// What an LSI reach-back cost on the base table, in read units. It lands
@@ -1831,6 +1835,9 @@ struct Window {
     last_evaluated: Option<Cursor>,
     /// Whether the read owes a continuation from `last_evaluated`.
     continues: bool,
+    /// What the read costs in strongly consistent units, when it is charged
+    /// per sort-key branch rather than on `evaluated_bytes`.
+    read_units: Option<f64>,
     /// What those rows weighed as they were read, before the WHERE clause and
     /// before any projection. This is what the read is charged on.
     evaluated_bytes: usize,
@@ -1870,7 +1877,7 @@ async fn evaluate_window<S: StorageBackend>(
     // filter (captured eu-west-2 and us-east-1, 2026-10-23:
     // `pk = 'k' AND (x = 1 OR x = 2)` costs what `pk = 'k'` costs, on a table,
     // an ALL GSI and an LSI). When every branch bounds the sort key, the union
-    // of those ranges is pushed into the read too (see `read_sk_sql`, #271).
+    // of those ranges is pushed into the read too (see `sort_key_plan`, #271).
     // Its key is refused for size as a single-group read's is (captured
     // eu-west-2 and us-east-1, 2026-10-10: `pk = <2,049 bytes> AND
     // (x = 1 OR x = 2)` on a table).
@@ -1913,39 +1920,25 @@ async fn evaluate_window<S: StorageBackend>(
     // limit to find out, which also keeps a continuation for the rest of an
     // index sort key shared by several items. A fixed set of sort keys ends
     // once the read has passed the last of them.
-    let exact_keys = pk_key
-        .as_ref()
-        .and_then(|_| exact_sort_keys(where_clause, read_pk, read_sk, parameters));
-    let peek = limit.is_some()
-        && (exact_keys.is_some()
-            || (pk_key.is_some() && sort_key_union(where_clause, read_pk, read_sk, parameters)));
+    let sort_keys = sort_key_plan(where_clause, read_pk, read_sk, parameters);
+    let keyed_branches = pk_key.is_some() && !sort_keys.branches.is_empty();
+    let peek = limit.is_some() && keyed_branches && (sort_keys.union || sort_keys.exact());
     let read_limit = limit.map(|lim| if peek { lim.saturating_add(1) } else { lim });
 
     let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
         read_in_order(
-            storage,
-            table_name,
-            index,
-            where_clause,
-            parameters,
-            read_pk,
-            read_sk,
-            cursor,
-            read_limit,
-            plan,
+            storage, table_name, index, &sort_keys, cursor, read_limit, plan,
         )
         .await?
     } else if let Some(None) = pk_key {
         Vec::new()
     } else if let Some(Some(pk_str)) = pk_key {
-        let (sk_condition_sql, sk_param_values) =
-            read_sk_sql(where_clause, read_pk, read_sk, parameters);
-        let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+        let sk_params_refs: Vec<&str> = sort_keys.params.iter().map(|s| s.as_str()).collect();
 
         // Ascending, so this path and the scan below agree on row order and a
         // continuation resumes the same way on either.
         let params = crate::storage::QueryParams {
-            sk_condition: sk_condition_sql.as_deref(),
+            sk_condition: sort_keys.sql.as_deref(),
             sk_params: &sk_params_refs,
             forward: true,
             limit: read_limit,
@@ -2048,60 +2041,23 @@ async fn evaluate_window<S: StorageBackend>(
     // sk > 'row-2'`). A requested key that is missing still holds the token
     // until the read has passed it.
     let forward = order.is_none_or(|plan| plan.forward);
-    let passed = |key: &str, stop: &Cursor| {
-        if forward {
-            key <= stop.sk.as_str()
-        } else {
-            key >= stop.sk.as_str()
-        }
-    };
     let continues = match (limit, &last_evaluated) {
         (Some(lim), Some(stop)) if evaluated >= lim => {
             !peek
                 || more_rows
-                || exact_keys
-                    .as_ref()
-                    .is_some_and(|keys| keys.iter().any(|key| !passed(key, stop)))
+                || (sort_keys.exact()
+                    && sort_keys
+                        .branches
+                        .iter()
+                        .any(|branch| branch.extends_past(&stop.sk, forward)))
         }
         _ => false,
     };
+    // What the rows of each branch weighed, and whether it had any.
+    let mut branch_reads = vec![(0usize, false); sort_keys.branches.len()];
+    let mut stray_bytes = 0usize;
 
-    // Each requested key is charged whether or not it exists: a read unit for
-    // a missing one, on the page that reaches it, on the table and on an index
-    // alike (captured eu-west-2 and us-east-1, 2026-11-03: `sk = 'row-0' OR
-    // sk = 'row-2'` with only `row-2` stored costs 1.0 eventually consistent
-    // and 2 consistent, where `row-2` alone costs 0.5, and two missing keys
-    // cost 1.0). It is added as a read unit's worth of bytes, which rounds to
-    // exactly one more unit whatever the rows found weigh.
-    if let Some(keys) = &exact_keys {
-        let found: std::collections::HashSet<&str> =
-            rows.iter().map(|(_, sk, _)| sk.as_str()).collect();
-        let after_cursor = |key: &str| {
-            cursor.is_none_or(|c| {
-                if forward {
-                    key > c.sk.as_str()
-                } else {
-                    key < c.sk.as_str()
-                }
-            })
-        };
-        let missing = first_of_each(keys.iter().map(String::as_str), |key| {
-            Some(key.as_bytes().to_vec())
-        })
-        .into_iter()
-        .filter(|key| {
-            after_cursor(key)
-                && !found.contains(key)
-                && (!continues
-                    || last_evaluated
-                        .as_ref()
-                        .is_some_and(|stop| passed(key, stop)))
-        })
-        .count();
-        evaluated_bytes += missing * crate::types::READ_UNIT_BYTES;
-    }
-
-    for (_, _, json) in rows {
+    for (_, sk, json) in rows {
         // A row that will not deserialise is a storage fault, and it is reported
         // rather than walked past. Skipping it left the row counted in
         // `evaluated`, which paces the limit and mints the continuation, but not
@@ -2114,11 +2070,19 @@ async fn evaluate_window<S: StorageBackend>(
         // A row of the table itself is charged on its billed size, a vector at
         // four bytes per dimension (captured eu-west-2 and us-east-1,
         // 2026-10-23). An index row stays sized by its numbers.
-        evaluated_bytes += if index.is_none() {
+        let bytes = if index.is_none() {
             crate::types::billed_item_size(&item, vector_defs)
         } else {
             crate::types::item_size(&item)
         };
+        evaluated_bytes += bytes;
+        match sort_keys.branches.iter().position(|b| b.contains(&sk)) {
+            Some(i) if keyed_branches => {
+                branch_reads[i].0 += bytes;
+                branch_reads[i].1 = true;
+            }
+            _ => stray_bytes += bytes,
+        }
 
         // The reach-back runs on every row walked, not on the rows the filter
         // keeps. Charging only the survivors made a filter that matched nothing
@@ -2154,13 +2118,72 @@ async fn evaluate_window<S: StorageBackend>(
         }
     }
 
+    let read_units = keyed_branches.then(|| {
+        branch_read_units(
+            &sort_keys.branches,
+            &branch_reads,
+            stray_bytes,
+            cursor,
+            last_evaluated.as_ref().filter(|_| continues),
+            forward,
+        )
+    });
+
     Ok(Window {
         matched,
         last_evaluated,
         continues,
         evaluated_bytes,
+        read_units,
         base_read_units,
     })
+}
+
+/// A keyed read of sort-key branches is charged per branch, as one read
+/// each: the rows a branch found rounded up on their own, and a read unit
+/// for a branch the page reached that found nothing, a missing key among
+/// them, on the table and on either kind of index (captured eu-west-2 and
+/// us-east-1, 2026-11-03 and 2026-11-04: two small keys cost 2 consistent
+/// where the whole partition of three costs 1, `sk = 'row-0' OR
+/// sk = 'row-2'` with only `row-2` stored costs 2, and `sk < 'row-0' OR
+/// sk > 'row-2'` costs 2 for one row). An empty branch belongs to the page
+/// that first reaches it: one the read stopped short of waits for the next
+/// page, and one an earlier page already read into isn't charged again
+/// (`sk < 'row-2' OR sk > 'row-2'` under `Limit: 1` costs 0.5 a page).
+///
+/// `reads` holds each branch's bytes and whether it found a row; `stop` is
+/// where the page ends when it continues.
+fn branch_read_units(
+    branches: &[SortKeyBranch],
+    reads: &[(usize, bool)],
+    stray_bytes: usize,
+    cursor: Option<&Cursor>,
+    stop: Option<&Cursor>,
+    forward: bool,
+) -> f64 {
+    let reached = |branch: &SortKeyBranch| {
+        cursor.is_none_or(|c| !branch.starts_by(&c.sk, forward))
+            && stop.is_none_or(|stop| branch.starts_by(&stop.sk, forward))
+    };
+    let units: f64 = branches
+        .iter()
+        .zip(reads)
+        .map(|(branch, &(bytes, found))| {
+            if found {
+                crate::types::read_capacity_units(bytes)
+            } else if reached(branch) {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    let stray = if stray_bytes > 0 {
+        crate::types::read_capacity_units(stray_bytes)
+    } else {
+        0.0
+    };
+    (units + stray).max(1.0)
 }
 
 /// Read the base table item an index row points at, for an LSI projection the
@@ -2572,15 +2595,39 @@ fn read_groups<'a>(
     }
 }
 
-/// Push the union of branch ranges down into the keyed read. If any branch
-/// has no translatable range, the whole partition remains eligible. SQL OR
-/// naturally deduplicates rows in overlapping ranges and preserves cursors.
-fn read_sk_sql(
+/// How a keyed read of one partition bounds its sort key, worked out once
+/// for the read, its paging and its charge.
+#[derive(Default)]
+struct SortKeyPlan {
+    /// The union of the branch ranges, pushed down into the read. `None` reads
+    /// the whole partition, as it does when any branch leaves the sort key
+    /// unbounded. SQL OR naturally deduplicates rows in overlapping ranges and
+    /// preserves cursors.
+    sql: Option<String>,
+    params: Vec<String>,
+    /// Each distinct branch's bounds. Empty when the read isn't bounded.
+    branches: Vec<SortKeyBranch>,
+    /// Whether two or more OR groups each bound the sort key. Counted before
+    /// identical branches are merged: `sk > 'row-1' AND (l = 'b' OR l = 'z')`
+    /// pages as a union, ending after its last row where `sk > 'row-1'` alone
+    /// keeps its token (captured eu-west-2 and us-east-1, 2026-11-04).
+    union: bool,
+}
+
+impl SortKeyPlan {
+    /// Whether every branch pins one stored key, as `pk = 'k' AND (sk = 'a'
+    /// OR sk = 'b')` does.
+    fn exact(&self) -> bool {
+        !self.branches.is_empty() && self.branches.iter().all(|b| b.key().is_some())
+    }
+}
+
+fn sort_key_plan(
     where_clause: Option<&WhereClause>,
     pk_name: &str,
     sk_name: Option<&str>,
     parameters: &[AttributeValue],
-) -> (Option<String>, Vec<String>) {
+) -> SortKeyPlan {
     let groups = match (where_clause, sk_name) {
         (Some(wc), Some(sk)) => read_groups(wc, pk_name, sk).and_then(|groups| {
             groups
@@ -2590,55 +2637,79 @@ fn read_sk_sql(
         }),
         _ => None,
     };
-    match groups {
-        Some(groups) => sk_condition_groups_to_sql(&groups),
-        None => (None, Vec::new()),
-    }
-}
-
-/// Whether a keyed read's OR branches each bound the sort key, so the read is
-/// a union of two or more sort-key ranges rather than the whole partition.
-fn sort_key_union(
-    where_clause: Option<&WhereClause>,
-    pk_name: &str,
-    sk_name: Option<&str>,
-    parameters: &[AttributeValue],
-) -> bool {
-    let (Some(wc), Some(sk_name)) = (where_clause, sk_name) else {
-        return false;
+    let Some(groups) =
+        groups.filter(|groups| !groups.is_empty() && groups.iter().all(|g| !g.is_empty()))
+    else {
+        return SortKeyPlan::default();
     };
-    read_groups(wc, pk_name, sk_name).is_some_and(|groups| {
-        groups.len() > 1
-            && groups.iter().all(|group| {
-                translate_sk_conditions(group, sk_name, parameters)
-                    .is_some_and(|conditions| !conditions.is_empty())
-            })
-    })
+    let (sql, params) = sk_condition_groups_to_sql(&groups);
+    let mut branches: Vec<SortKeyBranch> = Vec::new();
+    for group in &groups {
+        let mut bounds: Vec<(String, String)> =
+            group.iter().flat_map(|c| c.to_sql_conditions()).collect();
+        bounds.sort();
+        bounds.dedup();
+        let branch = SortKeyBranch(bounds);
+        if !branches.contains(&branch) {
+            branches.push(branch);
+        }
+    }
+    SortKeyPlan {
+        sql,
+        params,
+        branches,
+        union: groups.len() > 1,
+    }
 }
 
-/// The stored sort keys a clause reads when every OR group pins the sort key
-/// with a single equality and nothing else, as `pk = 'k' AND (sk = 'a' OR
-/// sk = 'b')` does. Stored keys compare the way the read orders its rows.
-fn exact_sort_keys(
-    where_clause: Option<&WhereClause>,
-    pk_name: &str,
-    sk_name: Option<&str>,
-    parameters: &[AttributeValue],
-) -> Option<Vec<String>> {
-    let (wc, sk_name) = (where_clause?, sk_name?);
-    let groups = read_groups(wc, pk_name, sk_name)?;
-    if groups.is_empty() {
-        return None;
+/// One OR branch's bounds on the stored sort key: `(operator, key)` pairs
+/// that all hold, as the SQL builder renders them. Stored keys compare the
+/// way the read orders its rows.
+#[derive(PartialEq)]
+struct SortKeyBranch(Vec<(String, String)>);
+
+impl SortKeyBranch {
+    /// The one key the branch pins, when every bound is the same equality.
+    fn key(&self) -> Option<&str> {
+        let (first, rest) = self.0.split_first()?;
+        (first.0 == "=" && rest.iter().all(|bound| bound == first)).then_some(first.1.as_str())
     }
-    groups
-        .iter()
-        .map(
-            |group| match translate_sk_conditions(group, sk_name, parameters)?.as_slice() {
-                [ResolvedSortKeyCondition::Eq(_, value)] => value.to_key_string(),
-                _ => None,
-            },
-        )
-        .collect()
+
+    fn contains(&self, key: &str) -> bool {
+        self.0.iter().all(|(op, bound)| match op.as_str() {
+            "=" => key == bound,
+            "<" => key < bound.as_str(),
+            "<=" => key <= bound.as_str(),
+            ">" => key > bound.as_str(),
+            ">=" => key >= bound.as_str(),
+            _ => true,
+        })
+    }
+
+    /// Whether the branch can hold a key beyond `key`, in the read's direction.
+    fn extends_past(&self, key: &str, forward: bool) -> bool {
+        self.0
+            .iter()
+            .all(|(op, bound)| match (forward, op.as_str()) {
+                (true, "=" | "<" | "<=") => bound.as_str() > key,
+                (false, "=" | ">" | ">=") => bound.as_str() < key,
+                _ => true,
+            })
+    }
+
+    /// Whether the branch can hold a key at or before `key`, in the read's
+    /// direction.
+    fn starts_by(&self, key: &str, forward: bool) -> bool {
+        self.0
+            .iter()
+            .all(|(op, bound)| match (forward, op.as_str()) {
+                (true, "=" | ">=") => bound.as_str() <= key,
+                (true, ">") => bound.as_str() < key,
+                (false, "=" | "<=") => bound.as_str() >= key,
+                (false, "<") => bound.as_str() > key,
+                _ => true,
+            })
+    }
 }
 
 /// Translate a single AND-group's sort-key conditions into the resolved form

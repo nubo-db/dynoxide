@@ -5,7 +5,9 @@
 use crate::actions::index_capacity::WriteCapacity;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
-use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_condition_groups_to_sql};
+use crate::expressions::key_condition::{
+    ResolvedSortKeyCondition, SortKeyBound, sk_condition_groups_to_sql,
+};
 use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
     WhereClause, WhereCondition,
@@ -26,15 +28,16 @@ pub struct StatementPage {
     /// for an UPDATE or DELETE with a `RETURNING` clause (the deleted item or
     /// the requested projection), `None` for a write without one.
     pub items: Option<Vec<Item>>,
-    /// Total item bytes touched, for `ConsumedCapacity`.
+    /// Total item bytes touched. A batch or a transaction charges a `SELECT`
+    /// on it, since each reads a single key and the per-branch charge of
+    /// `read_units` comes to the same.
     pub size: usize,
-    /// What a `SELECT` costs in strongly consistent read units when it is
-    /// charged per sort-key branch rather than on `size`. A batch or a
-    /// transaction reads a single key, where the two agree.
-    pub read_units: Option<f64>,
+    /// What a `SELECT` costs in strongly consistent read units, per sort-key
+    /// branch for a keyed read of branches. 0 for a write.
+    pub read_units: f64,
     /// What a write statement contributed to `ConsumedCapacity`: the images
     /// either side and the per-index units. `None` for a `SELECT`, which is
-    /// charged from `size` at read granularity instead.
+    /// charged `read_units` instead.
     pub capacity: Option<WriteCapacity>,
     /// Where to resume, when more rows matched than this page returned.
     pub next_token: Option<String>,
@@ -1813,13 +1816,13 @@ async fn execute_select<S: StorageBackend>(
 /// rather than to the table, and the caller has no other way to know.
 struct SelectOutcome {
     items: Vec<Item>,
-    /// What the read walked, which is what it is charged on. Not the weight of
-    /// `items`: a filter and a projection both narrow the rows after the read
-    /// has already paid for them.
+    /// What the read walked. Not the weight of `items`: a filter and a
+    /// projection both narrow the rows after the read has already paid for
+    /// them.
     evaluated_bytes: usize,
-    /// What the read costs in strongly consistent units, when it is charged
-    /// per sort-key branch (see `Window::read_units`).
-    read_units: Option<f64>,
+    /// What the read costs in strongly consistent units (see
+    /// `Window::read_units`).
+    read_units: f64,
     next_token: Option<String>,
     index: Option<ResolvedIndex>,
     /// What an LSI reach-back cost on the base table, in read units. It lands
@@ -1835,11 +1838,11 @@ struct Window {
     last_evaluated: Option<Cursor>,
     /// Whether the read owes a continuation from `last_evaluated`.
     continues: bool,
-    /// What the read costs in strongly consistent units, when it is charged
-    /// per sort-key branch rather than on `evaluated_bytes`.
-    read_units: Option<f64>,
+    /// What the read costs in strongly consistent units: per sort-key branch
+    /// for a keyed read of branches, otherwise on `evaluated_bytes`.
+    read_units: f64,
     /// What those rows weighed as they were read, before the WHERE clause and
-    /// before any projection. This is what the read is charged on.
+    /// before any projection.
     evaluated_bytes: usize,
     /// What an LSI reach-back cost on the base table, in read units, summed over
     /// every row walked rather than every row kept.
@@ -1915,14 +1918,13 @@ async fn evaluate_window<S: StorageBackend>(
         None => None,
     };
 
-    // A read of one partition whose OR branches each bound the sort key ends
-    // once nothing in their union is left (#271): it reads one row past its
-    // limit to find out, which also keeps a continuation for the rest of an
-    // index sort key shared by several items. A fixed set of sort keys ends
-    // once the read has passed the last of them.
+    // A read of one partition whose OR branches each bound the sort key reads
+    // one row past its limit, so a page ending on a key an index shares with
+    // more items keeps its continuation.
     let sort_keys = sort_key_plan(where_clause, read_pk, read_sk, parameters);
-    let keyed_branches = pk_key.is_some() && !sort_keys.branches.is_empty();
-    let peek = limit.is_some() && keyed_branches && (sort_keys.union || sort_keys.exact());
+    let mut charge = (matches!(pk_key, Some(Some(_))) && !sort_keys.branches.is_empty())
+        .then(|| BranchCharge::new(&sort_keys.branches));
+    let peek = limit.is_some() && charge.is_some();
     let read_limit = limit.map(|lim| if peek { lim.saturating_add(1) } else { lim });
 
     let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
@@ -2033,30 +2035,28 @@ async fn evaluate_window<S: StorageBackend>(
     // A continuation is owed whenever the read stopped because it hit the
     // limit, whether or not anything in the window matched. That is why a page
     // can come back short, or empty, and still carry a token. The exception is
-    // a read of a union of sort-key branches with nothing after it: DynamoDB
-    // hands back no token (#271, captured eu-west-2 and us-east-1, 2026-10-23
-    // and 2026-11-03: two OR'd sort-key equalities under `Limit: 1` come back
-    // over two pages, not three, on a table, an ALL GSI and under `ORDER BY sk
-    // DESC`, and so do `sk < 'row-2' OR sk > 'row-2'` and `sk = 'row-1' OR
-    // sk > 'row-2'`). A requested key that is missing still holds the token
-    // until the read has passed it.
+    // a read of sort-key branches that ends on a key with no branch able to
+    // hold one after it: DynamoDB hands back no token (#271, captured
+    // eu-west-2 and us-east-1, 2026-10-23 and 2026-11-03: two OR'd sort-key
+    // equalities under `Limit: 1` come back over two pages, not three, on a
+    // table, an ALL GSI and under `ORDER BY sk DESC`). A branch the read hasn't
+    // reached still holds the token, whether a missing key or an empty range.
+    // A page ending inside a range keeps it too: DynamoDB keeps it on most
+    // reads and drops it on some, the same query either way (captured five
+    // times in each region, 2026-11-04: `sk < 'row-2' OR sk > 'row-2'` kept it
+    // on seven of ten walks), so the read keeps it every time.
     let forward = order.is_none_or(|plan| plan.forward);
     let continues = match (limit, &last_evaluated) {
         (Some(lim), Some(stop)) if evaluated >= lim => {
             !peek
                 || more_rows
-                || (sort_keys.exact()
-                    && sort_keys
-                        .branches
-                        .iter()
-                        .any(|branch| branch.extends_past(&stop.sk, forward)))
+                || sort_keys
+                    .branches
+                    .iter()
+                    .any(|branch| branch.extends_past(&stop.sk, forward))
         }
         _ => false,
     };
-    // What the rows of each branch weighed, and whether it had any.
-    let mut branch_reads = vec![(0usize, false); sort_keys.branches.len()];
-    let mut stray_bytes = 0usize;
-
     for (_, sk, json) in rows {
         // A row that will not deserialise is a storage fault, and it is reported
         // rather than walked past. Skipping it left the row counted in
@@ -2076,12 +2076,8 @@ async fn evaluate_window<S: StorageBackend>(
             crate::types::item_size(&item)
         };
         evaluated_bytes += bytes;
-        match sort_keys.branches.iter().position(|b| b.contains(&sk)) {
-            Some(i) if keyed_branches => {
-                branch_reads[i].0 += bytes;
-                branch_reads[i].1 = true;
-            }
-            _ => stray_bytes += bytes,
+        if let Some(charge) = charge.as_mut() {
+            charge.record(&sk, bytes);
         }
 
         // The reach-back runs on every row walked, not on the rows the filter
@@ -2118,16 +2114,14 @@ async fn evaluate_window<S: StorageBackend>(
         }
     }
 
-    let read_units = keyed_branches.then(|| {
-        branch_read_units(
-            &sort_keys.branches,
-            &branch_reads,
-            stray_bytes,
+    let read_units = match &charge {
+        Some(charge) => charge.units(
             cursor,
             last_evaluated.as_ref().filter(|_| continues),
             forward,
-        )
-    });
+        ),
+        None => crate::types::read_capacity_units(evaluated_bytes),
+    };
 
     Ok(Window {
         matched,
@@ -2137,53 +2131,6 @@ async fn evaluate_window<S: StorageBackend>(
         read_units,
         base_read_units,
     })
-}
-
-/// A keyed read of sort-key branches is charged per branch, as one read
-/// each: the rows a branch found rounded up on their own, and a read unit
-/// for a branch the page reached that found nothing, a missing key among
-/// them, on the table and on either kind of index (captured eu-west-2 and
-/// us-east-1, 2026-11-03 and 2026-11-04: two small keys cost 2 consistent
-/// where the whole partition of three costs 1, `sk = 'row-0' OR
-/// sk = 'row-2'` with only `row-2` stored costs 2, and `sk < 'row-0' OR
-/// sk > 'row-2'` costs 2 for one row). An empty branch belongs to the page
-/// that first reaches it: one the read stopped short of waits for the next
-/// page, and one an earlier page already read into isn't charged again
-/// (`sk < 'row-2' OR sk > 'row-2'` under `Limit: 1` costs 0.5 a page).
-///
-/// `reads` holds each branch's bytes and whether it found a row; `stop` is
-/// where the page ends when it continues.
-fn branch_read_units(
-    branches: &[SortKeyBranch],
-    reads: &[(usize, bool)],
-    stray_bytes: usize,
-    cursor: Option<&Cursor>,
-    stop: Option<&Cursor>,
-    forward: bool,
-) -> f64 {
-    let reached = |branch: &SortKeyBranch| {
-        cursor.is_none_or(|c| !branch.starts_by(&c.sk, forward))
-            && stop.is_none_or(|stop| branch.starts_by(&stop.sk, forward))
-    };
-    let units: f64 = branches
-        .iter()
-        .zip(reads)
-        .map(|(branch, &(bytes, found))| {
-            if found {
-                crate::types::read_capacity_units(bytes)
-            } else if reached(branch) {
-                1.0
-            } else {
-                0.0
-            }
-        })
-        .sum();
-    let stray = if stray_bytes > 0 {
-        crate::types::read_capacity_units(stray_bytes)
-    } else {
-        0.0
-    };
-    (units + stray).max(1.0)
 }
 
 /// Read the base table item an index row points at, for an LSI projection the
@@ -2605,21 +2552,8 @@ struct SortKeyPlan {
     /// preserves cursors.
     sql: Option<String>,
     params: Vec<String>,
-    /// Each distinct branch's bounds. Empty when the read isn't bounded.
+    /// Each distinct OR branch's bounds. Empty when the read isn't bounded.
     branches: Vec<SortKeyBranch>,
-    /// Whether two or more OR groups each bound the sort key. Counted before
-    /// identical branches are merged: `sk > 'row-1' AND (l = 'b' OR l = 'z')`
-    /// pages as a union, ending after its last row where `sk > 'row-1'` alone
-    /// keeps its token (captured eu-west-2 and us-east-1, 2026-11-04).
-    union: bool,
-}
-
-impl SortKeyPlan {
-    /// Whether every branch pins one stored key, as `pk = 'k' AND (sk = 'a'
-    /// OR sk = 'b')` does.
-    fn exact(&self) -> bool {
-        !self.branches.is_empty() && self.branches.iter().all(|b| b.key().is_some())
-    }
 }
 
 fn sort_key_plan(
@@ -2628,15 +2562,15 @@ fn sort_key_plan(
     sk_name: Option<&str>,
     parameters: &[AttributeValue],
 ) -> SortKeyPlan {
-    let groups = match (where_clause, sk_name) {
-        (Some(wc), Some(sk)) => read_groups(wc, pk_name, sk).and_then(|groups| {
-            groups
-                .iter()
-                .map(|group| translate_sk_conditions(group, sk, parameters))
-                .collect::<Option<Vec<_>>>()
-        }),
-        _ => None,
+    let (Some(wc), Some(sk)) = (where_clause, sk_name) else {
+        return SortKeyPlan::default();
     };
+    let groups = read_groups(wc, pk_name, sk).and_then(|groups| {
+        groups
+            .iter()
+            .map(|group| translate_sk_conditions(group, sk, parameters))
+            .collect::<Option<Vec<_>>>()
+    });
     let Some(groups) =
         groups.filter(|groups| !groups.is_empty() && groups.iter().all(|g| !g.is_empty()))
     else {
@@ -2645,11 +2579,7 @@ fn sort_key_plan(
     let (sql, params) = sk_condition_groups_to_sql(&groups);
     let mut branches: Vec<SortKeyBranch> = Vec::new();
     for group in &groups {
-        let mut bounds: Vec<(String, String)> =
-            group.iter().flat_map(|c| c.to_sql_conditions()).collect();
-        bounds.sort();
-        bounds.dedup();
-        let branch = SortKeyBranch(bounds);
+        let branch = SortKeyBranch(group.iter().flat_map(|c| c.bounds()).collect());
         if !branches.contains(&branch) {
             branches.push(branch);
         }
@@ -2658,57 +2588,111 @@ fn sort_key_plan(
         sql,
         params,
         branches,
-        union: groups.len() > 1,
     }
 }
 
-/// One OR branch's bounds on the stored sort key: `(operator, key)` pairs
-/// that all hold, as the SQL builder renders them. Stored keys compare the
-/// way the read orders its rows.
+/// One OR branch's bounds on the stored sort key, which all hold.
 #[derive(PartialEq)]
-struct SortKeyBranch(Vec<(String, String)>);
+struct SortKeyBranch(Vec<SortKeyBound>);
 
 impl SortKeyBranch {
-    /// The one key the branch pins, when every bound is the same equality.
-    fn key(&self) -> Option<&str> {
-        let (first, rest) = self.0.split_first()?;
-        (first.0 == "=" && rest.iter().all(|bound| bound == first)).then_some(first.1.as_str())
+    fn contains(&self, key: &str) -> bool {
+        self.0.iter().all(|bound| bound.admits(key))
     }
 
-    fn contains(&self, key: &str) -> bool {
-        self.0.iter().all(|(op, bound)| match op.as_str() {
-            "=" => key == bound,
-            "<" => key < bound.as_str(),
-            "<=" => key <= bound.as_str(),
-            ">" => key > bound.as_str(),
-            ">=" => key >= bound.as_str(),
-            _ => true,
+    /// Whether the branch can hold a key beyond `key`, in the read's
+    /// direction: its upper bounds reading forward, its lower ones backward.
+    fn extends_past(&self, key: &str, forward: bool) -> bool {
+        self.0.iter().all(|bound| match (forward, bound) {
+            (true, SortKeyBound::Eq(b) | SortKeyBound::Lt(b) | SortKeyBound::Le(b)) => {
+                b.as_str() > key
+            }
+            (true, SortKeyBound::Gt(_) | SortKeyBound::Ge(_)) => true,
+            (false, SortKeyBound::Eq(b) | SortKeyBound::Gt(b) | SortKeyBound::Ge(b)) => {
+                b.as_str() < key
+            }
+            (false, SortKeyBound::Lt(_) | SortKeyBound::Le(_)) => true,
         })
     }
 
-    /// Whether the branch can hold a key beyond `key`, in the read's direction.
-    fn extends_past(&self, key: &str, forward: bool) -> bool {
-        self.0
-            .iter()
-            .all(|(op, bound)| match (forward, op.as_str()) {
-                (true, "=" | "<" | "<=") => bound.as_str() > key,
-                (false, "=" | ">" | ">=") => bound.as_str() < key,
-                _ => true,
-            })
+    /// Whether the branch can hold a key at or before `key`, in the read's
+    /// direction: its lower bounds reading forward, its upper ones backward.
+    fn starts_by(&self, key: &str, forward: bool) -> bool {
+        self.0.iter().all(|bound| match (forward, bound) {
+            (true, SortKeyBound::Eq(b) | SortKeyBound::Ge(b)) => b.as_str() <= key,
+            (true, SortKeyBound::Gt(b)) => b.as_str() < key,
+            (true, SortKeyBound::Lt(_) | SortKeyBound::Le(_)) => true,
+            (false, SortKeyBound::Eq(b) | SortKeyBound::Le(b)) => b.as_str() >= key,
+            (false, SortKeyBound::Lt(b)) => b.as_str() > key,
+            (false, SortKeyBound::Gt(_) | SortKeyBound::Ge(_)) => true,
+        })
+    }
+}
+
+/// What a keyed read of sort-key branches costs, gathered row by row.
+///
+/// Each branch is charged as one read: the rows it found rounded up on their
+/// own, and a read unit for a branch the page reached that found nothing, a
+/// missing key among them, on the table and on either kind of index (captured
+/// eu-west-2 and us-east-1, 2026-11-03 and 2026-11-04: two small keys cost 2
+/// consistent where the whole partition of three costs 1, `sk = 'row-0' OR
+/// sk = 'row-2'` with only `row-2` stored costs 2, and `sk < 'row-0' OR
+/// sk > 'row-2'` costs 2 for one row). An empty branch belongs to the page
+/// that first reaches it: one the read stopped short of waits for the next
+/// page, and one an earlier page already read into isn't charged again
+/// (`sk < 'row-2' OR sk > 'row-2'` under `Limit: 1` costs 0.5 a page).
+struct BranchCharge<'a> {
+    branches: &'a [SortKeyBranch],
+    /// What each branch's rows weighed. A stored row always weighs something,
+    /// so zero means the branch found nothing.
+    bytes: Vec<usize>,
+    /// Rows outside every branch, rounded up together.
+    stray: usize,
+}
+
+impl<'a> BranchCharge<'a> {
+    fn new(branches: &'a [SortKeyBranch]) -> Self {
+        Self {
+            branches,
+            bytes: vec![0; branches.len()],
+            stray: 0,
+        }
     }
 
-    /// Whether the branch can hold a key at or before `key`, in the read's
-    /// direction.
-    fn starts_by(&self, key: &str, forward: bool) -> bool {
-        self.0
+    fn record(&mut self, sk: &str, bytes: usize) {
+        match self.branches.iter().position(|b| b.contains(sk)) {
+            Some(i) => self.bytes[i] += bytes,
+            None => self.stray += bytes,
+        }
+    }
+
+    /// Strongly consistent units for a page read after `cursor`, ending at
+    /// `stop` when it continues.
+    fn units(&self, cursor: Option<&Cursor>, stop: Option<&Cursor>, forward: bool) -> f64 {
+        let reached = |branch: &SortKeyBranch| {
+            cursor.is_none_or(|c| !branch.starts_by(&c.sk, forward))
+                && stop.is_none_or(|stop| branch.starts_by(&stop.sk, forward))
+        };
+        let units: f64 = self
+            .branches
             .iter()
-            .all(|(op, bound)| match (forward, op.as_str()) {
-                (true, "=" | ">=") => bound.as_str() <= key,
-                (true, ">") => bound.as_str() < key,
-                (false, "=" | "<=") => bound.as_str() >= key,
-                (false, "<") => bound.as_str() > key,
-                _ => true,
+            .zip(&self.bytes)
+            .map(|(branch, &bytes)| {
+                if bytes > 0 {
+                    crate::types::read_capacity_units(bytes)
+                } else if reached(branch) {
+                    1.0
+                } else {
+                    0.0
+                }
             })
+            .sum();
+        let stray = if self.stray > 0 {
+            crate::types::read_capacity_units(self.stray)
+        } else {
+            0.0
+        };
+        (units + stray).max(1.0)
     }
 }
 

@@ -140,7 +140,11 @@ pub async fn execute<S: StorageBackend>(
         &request.statement,
         &stmt,
         &params,
-        request.limit,
+        // A Limit past what a 32-bit integer holds is read as the largest one,
+        // as Query and Scan read it. DynamoDB accepts 2147483648 and reads as
+        // usual (captured eu-west-2 and us-east-1, 2026-11-04), where passing
+        // the value on overflowed SQLite's integer for a read past 2^63 - 1.
+        request.limit.map(|l| l.min(i32::MAX as usize)),
         request.next_token.as_deref(),
         request.consistent_read.unwrap_or(false),
         request.return_consumed_capacity.as_deref(),
@@ -160,7 +164,7 @@ pub async fn execute<S: StorageBackend>(
     };
     let partiql::executor::StatementPage {
         items,
-        size,
+        size: _,
         read_units,
         capacity,
         next_token,
@@ -179,10 +183,10 @@ pub async fn execute<S: StorageBackend>(
     let consumed_capacity = partiql::parser::table_name(&stmt).and_then(|table| {
         let Some(capacity) = capacity else {
             let consistent = request.consistent_read.unwrap_or(false);
-            let units = match read_units {
-                Some(strong) if consistent => strong,
-                Some(strong) => strong / 2.0,
-                None => crate::types::read_capacity_units_with_consistency(size, consistent),
+            let units = if consistent {
+                read_units
+            } else {
+                read_units / 2.0
             };
             // A read served from an index is charged against that index's arm
             // with the table arm at zero, the same shape Query and Scan already

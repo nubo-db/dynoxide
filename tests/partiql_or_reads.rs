@@ -540,8 +540,9 @@ fn page(rows: &[&str], token: bool, cost: f64) -> (Vec<String>, bool, f64) {
 
 #[test]
 fn a_union_of_sort_key_branches_ends_after_its_last_row() {
-    // #271, captured eu-west-2 and us-east-1 on 2026-11-03: under `Limit: 1`
-    // each of these comes back over two pages, the second with no token.
+    // #271, captured eu-west-2 and us-east-1 on 2026-11-03 and, five times in
+    // each region, on 2026-11-04: under `Limit: 1` each of these comes back
+    // over two pages, the second with no token.
     let db = setup("ALL");
     for (sql, first, second) in [
         (
@@ -555,14 +556,14 @@ fn a_union_of_sort_key_branches_ends_after_its_last_row() {
             "k/row-1",
         ),
         (
-            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk < 'row-2' OR sk > 'row-2')",
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk = 'row-3')",
             "k/row-1",
             "k/row-3",
         ),
         (
-            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk > 'row-2')",
-            "k/row-1",
+            "SELECT * FROM \"OrReads\" WHERE pk = 'k' AND (sk = 'row-1' OR sk > 'row-2') ORDER BY sk DESC",
             "k/row-3",
+            "k/row-1",
         ),
     ] {
         assert_eq!(
@@ -889,6 +890,23 @@ fn sort_key_branches_are_charged_one_read_each() {
             2.0,
         ),
         ("sk > 'row-0'", &["k/row-1", "k/row-2", "k/row-3"], 1.0),
+        // An empty branch under begins_with, BETWEEN and a descending read
+        // costs a unit too (captured 2026-11-04).
+        (
+            "(begins_with(sk, 'row-1') OR begins_with(sk, 'zz'))",
+            &["k/row-1"],
+            2.0,
+        ),
+        (
+            "(sk BETWEEN 'row-0' AND 'row-1' OR sk BETWEEN 'x' AND 'y')",
+            &["k/row-1"],
+            2.0,
+        ),
+        (
+            "(sk < 'row-0' OR sk > 'row-2') ORDER BY sk DESC",
+            &["k/row-3"],
+            2.0,
+        ),
     ] {
         let sql = format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
         assert_eq!(
@@ -915,27 +933,72 @@ fn sort_key_branches_are_charged_one_read_each() {
 }
 
 #[test]
-fn a_range_beside_an_or_filter_pages_as_a_union() {
-    // Captured eu-west-2 and us-east-1, 2026-11-04: the filter's OR splits the
-    // read into two branches over one range, which ends after its last row,
-    // where the range alone keeps its token for an empty last page.
+fn a_page_ending_inside_a_range_keeps_its_token() {
+    // DynamoDB keeps the token on most walks of these and drops it on some,
+    // the same query either way: 33 of 50 walks kept it across eu-west-2 and
+    // us-east-1, captured five times in each region on 2026-11-04. Dynoxide
+    // keeps it every time, and the next page finds nothing.
     let db = small_items();
-    let sql =
-        |filter: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND sk > 'row-1'{filter}");
+    let small = |clause: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+    for (clause, first, second) in [
+        ("sk > 'row-1'", "k/row-2", "k/row-3"),
+        (
+            "sk > 'row-1' AND (l = 'b' OR l = 'z')",
+            "k/row-2",
+            "k/row-3",
+        ),
+        ("(sk < 'row-2' OR sk > 'row-2')", "k/row-1", "k/row-3"),
+        ("(sk = 'row-1' OR sk > 'row-2')", "k/row-1", "k/row-3"),
+        (
+            "(sk < 'row-2' OR sk > 'row-2') ORDER BY sk DESC",
+            "k/row-3",
+            "k/row-1",
+        ),
+    ] {
+        assert_eq!(
+            walk(&db, &small(clause), Some(1), false),
+            [
+                page(&[first], true, 0.5),
+                page(&[second], true, 0.5),
+                page(&[], false, 0.5)
+            ],
+            "{clause}"
+        );
+    }
+    // Beside a filter too wide to expand as well.
+    let wide: String = (0..8)
+        .map(|i| format!(" AND (f{i} IS MISSING OR f{i} = 2)"))
+        .collect();
     assert_eq!(
-        walk(&db, &sql(" AND (l = 'b' OR l = 'z')"), Some(1), false),
-        [
-            page(&["k/row-2"], true, 0.5),
-            page(&["k/row-3"], false, 0.5)
-        ]
-    );
-    assert_eq!(
-        walk(&db, &sql(""), Some(1), false),
+        walk(
+            &db,
+            &small(&format!("sk > 'row-1' AND (l = 'b' OR l = 'z'){wide}")),
+            Some(1),
+            false
+        ),
         [
             page(&["k/row-2"], true, 0.5),
             page(&["k/row-3"], true, 0.5),
             page(&[], false, 0.5)
         ]
+    );
+}
+
+#[test]
+fn a_branch_the_page_has_not_reached_holds_the_token() {
+    // Captured eu-west-2 and us-east-1, 2026-11-04, five times in each region:
+    // an empty range after the page's last row keeps the token for an empty
+    // page, as a missing key does.
+    let db = small_items();
+    let small = |clause: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+    assert_eq!(
+        walk(
+            &db,
+            &small("(sk BETWEEN 'row-0' AND 'row-1' OR sk BETWEEN 'x' AND 'y')"),
+            Some(1),
+            false
+        ),
+        [page(&["k/row-1"], true, 0.5), page(&[], false, 0.5)]
     );
 }
 
@@ -955,6 +1018,13 @@ fn an_lsi_key_set_charges_and_pages_like_the_table() {
         walk(&db, &lsi("(l = 'a' OR l = 'z')"), None, true),
         [page(&["k/row-1"], false, 2.0)]
     );
+    // Two found keys cost a unit each, three items between them.
+    let pages = walk(&db, &lsi("(l = 'a' OR l = 'b')"), None, true);
+    assert_eq!(pages.len(), 1);
+    let mut rows = pages[0].0.clone();
+    rows.sort();
+    assert_eq!(rows, ["k/row-1", "k/row-2", "k/row-3"]);
+    assert_eq!((pages[0].1, pages[0].2), (false, 2.0));
     // Two items under one LSI key both come back, one a page, and the
     // continuation outlasts the first. AWS returned them in the other order,
     // and for the two-key set added an empty page after them.
@@ -973,5 +1043,63 @@ fn an_lsi_key_set_charges_and_pages_like_the_table() {
                 .all(|(rows, _, cost)| rows.len() <= 1 && *cost == 0.5)
         );
         assert!(pages[..pages.len() - 1].iter().all(|(_, token, _)| *token));
+        assert!(!pages.last().unwrap().1, "{clause} ended without a token");
+        assert!(pages.len() <= expected.len() + 1, "{clause}");
+    }
+}
+
+#[test]
+fn a_descending_key_set_charges_a_missing_key_where_it_is_reached() {
+    // Captured eu-west-2 and us-east-1, 2026-11-03, under `Limit: 1`.
+    let db = setup("ALL");
+    let desc = |keys: &str| {
+        format!("SELECT * FROM \"OrReads\" WHERE pk = 'k' AND ({keys}) ORDER BY sk DESC")
+    };
+    // A missing key between two found ones costs a unit on the page that
+    // reaches it.
+    assert_eq!(
+        walk(
+            &db,
+            &desc("sk = 'row-1' OR sk = 'row-15' OR sk = 'row-2'"),
+            Some(1),
+            false
+        ),
+        [
+            page(&["k/row-2"], true, 0.5),
+            page(&["k/row-1"], false, 1.0)
+        ]
+    );
+    // A missing last key keeps the token for an empty page.
+    assert_eq!(
+        walk(&db, &desc("sk = 'row-0' OR sk = 'row-2'"), Some(1), false),
+        [page(&["k/row-2"], true, 0.5), page(&[], false, 0.5)]
+    );
+    // A missing first key is charged on the one page.
+    assert_eq!(
+        walk(&db, &desc("sk = 'row-2' OR sk = 'row-9'"), Some(1), false),
+        [page(&["k/row-2"], false, 1.0)]
+    );
+}
+
+#[test]
+fn a_limit_past_the_integer_range_reads_as_usual() {
+    // DynamoDB accepts a Limit of 2147483648 (captured eu-west-2 and
+    // us-east-1, 2026-11-04). One past 2^63 - 1 used to overflow the read.
+    let db = setup("ALL");
+    for limit in [2_147_483_648, i64::MAX as usize, usize::MAX] {
+        for (clause, rows) in [
+            ("", &["k/row-1", "k/row-2", "k/row-3"][..]),
+            (
+                " AND (sk = 'row-1' OR sk = 'row-3')",
+                &["k/row-1", "k/row-3"],
+            ),
+            (" AND sk = 'row-2'", &["k/row-2"]),
+        ] {
+            let sql = format!("SELECT * FROM \"OrReads\" WHERE pk = 'k'{clause}");
+            let pages = walk(&db, &sql, Some(limit), false);
+            assert_eq!(pages.len(), 1, "{limit} {clause}");
+            assert_eq!(pages[0].0, rows, "{limit} {clause}");
+            assert!(!pages[0].1, "{limit} {clause}");
+        }
     }
 }

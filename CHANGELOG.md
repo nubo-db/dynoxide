@@ -34,13 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#269](https://github.com/nubo-db/dynoxide/pull/269), thanks
   [@jay23606](https://github.com/jay23606)).
 - A PartiQL OR of sort-key conditions reads only their union within the
-  shared partition, on tables and global secondary indexes, including beside
-  a filter too wide to expand. A `Limit` read with nothing left in that union
-  returns no `NextToken`, so two keys under `Limit: 1` take two pages rather
-  than three, on an index and under `ORDER BY` too. Read capacity is charged
-  per OR branch, as DynamoDB charges it, so each requested key costs a read
-  whether or not it exists. Captured against eu-west-2 and us-east-1 on 3
-  and 4 November 2026
+  shared partition, on tables and on global and local secondary indexes,
+  including beside a filter too wide to expand. A `Limit` read that ends on
+  the last of a set of sort keys returns no `NextToken`, so two keys under
+  `Limit: 1` take two pages rather than three, on an index and under
+  `ORDER BY` too.
+  Read capacity is charged per OR branch, as DynamoDB charges it, so each
+  requested key costs a read whether or not it exists. Captured against
+  eu-west-2 and us-east-1 on 3 and 4 November 2026
   ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
 - PartiQL accepts `ORDER BY` on the sort key when OR branches share one
   partition. It used to count that partition more than once and demand the
@@ -61,10 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Request-member errors follow DynamoDB's wording and order for deep
   `DeleteItem`, `PutItem` and `UpdateItem` requests. An `UpdateItem` without
   a key joins an empty table name or invalid `ConditionalOperator` with the
-  missing-key error, a deep `PutItem` or `UpdateItem` joins an invalid
-  `ReturnValues` with an invalid `ConditionalOperator`, and Query reports a misused `ConditionalOperator` before
-  an invalid `Select`
+  missing-key error, a deep `PutItem`, `UpdateItem` or `DeleteItem` with an
+  invalid `ReturnValues` reports every invalid `ConditionalOperator`,
+  `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics` beside it, and
+  Query reports a misused `ConditionalOperator` before an invalid `Select`
   ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
+- PartiQL reads a `Limit` past 2147483647 as that number, as Query and Scan
+  do. A `Limit` near or past 9223372036854775807 used to fail the read.
 
 ## [1.5.0] - 2026-10-23
 

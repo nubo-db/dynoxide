@@ -117,7 +117,7 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     }
     if let Err(e) = check_members(operation, &rewritten) {
         let e = older_return_values_wording(operation, &rewritten, e);
-        let e = join_older_conditional_operator(operation, &rewritten, e);
+        let e = older_member_errors(operation, &rewritten, e);
         return DeepBody::Refuse(crate::validation::resolve_request_validation_tag(
             operation, e,
         ));
@@ -177,41 +177,73 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
     }
 }
 
-/// The older layer reports an unknown `ReturnValues` and an unknown
-/// `ConditionalOperator` together, where the decoder stops at the first
-/// (captured eu-west-2 and us-east-1, 2026-11-03: a PutItem or UpdateItem with
-/// an `Expected` value nested 100 levels, `XOR` and `ReturnValues` of `BOGUS`
-/// gets `2 validation errors detected:`, `returnValues` first).
-fn join_older_conditional_operator(
-    operation: &str,
-    body: &str,
-    err: DynoxideError,
-) -> DynoxideError {
-    if !matches!(operation, "PutItem" | "UpdateItem") {
-        return err;
-    }
+/// The older layer checks a deep write's enum members in an order of its own
+/// and reports each one that fails, where the decoder stops at the first and
+/// skips `ConditionalOperator` (captured eu-west-2 and us-east-1, 2026-11-03
+/// and 2026-11-04, with an `Expected` value nested 100 levels: `ReturnValues`
+/// of `BOGUS` beside `XOR` gets `2 validation errors detected:` on PutItem,
+/// UpdateItem and DeleteItem alike, and beside a bad `ReturnConsumedCapacity`
+/// or `ReturnItemCollectionMetrics` too, three). Only the older layer's
+/// wording names the `returnValues` member, so a list that holds it and
+/// nothing but these members is rebuilt from the request in that order. Any
+/// other error in the list leaves it as it is.
+fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
+    // The request member and the name the message gives it, in the order the
+    // older layer reports them.
+    let order: &[(&str, &str)] = match operation {
+        "PutItem" => &[
+            ("ReturnValues", "returnValues"),
+            ("ConditionalOperator", "conditionalOperator"),
+            ("ReturnConsumedCapacity", "returnConsumedCapacity"),
+            ("ReturnItemCollectionMetrics", "returnItemCollectionMetrics"),
+        ],
+        "UpdateItem" => &[
+            ("ReturnConsumedCapacity", "returnConsumedCapacity"),
+            ("ReturnValues", "returnValues"),
+            ("ConditionalOperator", "conditionalOperator"),
+        ],
+        "DeleteItem" => &[
+            ("ReturnValues", "returnValues"),
+            ("ConditionalOperator", "conditionalOperator"),
+        ],
+        _ => return err,
+    };
     let DynoxideError::ValidationException(message) = &err else {
         return err;
     };
-    let Some(return_values) = message
-        .strip_prefix("1 validation error detected: ")
-        .filter(|rest| rest.contains(" at 'returnValues' "))
-    else {
+    let errors: Vec<&str> = match message.split_once(" detected: ") {
+        Some((count, list)) if count.ends_with("validation error") => vec![list],
+        Some((count, list)) if count.ends_with("validation errors") => list.split("; ").collect(),
+        _ => return err,
+    };
+    let names = |error: &str, wire: &str| error.contains(&format!(" at '{wire}' "));
+    let only_members = errors
+        .iter()
+        .all(|error| order.iter().any(|(_, wire)| names(error, wire)));
+    if !only_members || !errors.iter().any(|error| names(error, "returnValues")) {
+        return err;
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
         return err;
     };
-    let operator = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|request| {
-            request
-                .get("ConditionalOperator")?
-                .as_str()
-                .map(str::to_string)
-        });
-    match crate::validation::conditional_operator_rejection(operator.as_deref()) {
-        Some(rejection) => DynoxideError::ValidationException(
-            crate::validation::format_validation_errors(&[return_values.to_string(), rejection])
-                .expect("two errors"),
-        ),
+    let rebuilt: Vec<String> = order
+        .iter()
+        .filter_map(|(member, _)| {
+            let value = request.get(*member).and_then(|v| v.as_str());
+            match *member {
+                "ReturnValues" => value
+                    .filter(|v| !crate::validation::RETURN_VALUES.contains(v))
+                    .map(crate::validation::return_values_value_rejection),
+                "ConditionalOperator" => crate::validation::conditional_operator_rejection(value),
+                "ReturnConsumedCapacity" => {
+                    crate::validation::return_consumed_capacity_rejection(value)
+                }
+                _ => crate::validation::return_item_collection_metrics_rejection(value),
+            }
+        })
+        .collect();
+    match crate::validation::format_validation_errors(&rebuilt) {
+        Some(message) => DynoxideError::ValidationException(message),
         None => err,
     }
 }

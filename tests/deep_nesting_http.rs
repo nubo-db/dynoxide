@@ -1364,16 +1364,53 @@ async fn older_member_errors_win_over_deep_values() {
             assert_validation(status, &body, xor);
         }
     }
-    // Both members wrong at 100 levels: joined, ReturnValues first (captured
-    // eu-west-2 and us-east-1, 2026-11-03).
+    // Several members wrong at 100 levels: each reported, in the older
+    // layer's order for the operation (captured eu-west-2 and us-east-1,
+    // 2026-11-03 and 2026-11-04).
     let v = deep_map(100);
-    let joined = "2 validation errors detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]; Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
-    for (operation, member) in [
-        ("PutItem", r#""Item":{"pk":{"S":"a"}}"#),
-        ("UpdateItem", r#""Key":{"pk":{"S":"a"}}"#),
+    let rv = "Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]";
+    let xor = "Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
+    let rcc = "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let ricm = "Value 'BOGUS' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]";
+    let put = r#""Item":{"pk":{"S":"a"}}"#;
+    let key = r#""Key":{"pk":{"S":"a"}}"#;
+    let xor_rv = r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS""#;
+    for (operation, member, extra, expected) in [
+        ("PutItem", put, xor_rv, vec![rv, xor]),
+        ("UpdateItem", key, xor_rv, vec![rv, xor]),
+        ("DeleteItem", key, xor_rv, vec![rv, xor]),
+        (
+            "PutItem",
+            put,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rv, xor, rcc],
+        ),
+        (
+            "UpdateItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rcc, rv, xor],
+        ),
+        (
+            "PutItem",
+            put,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, ricm],
+        ),
+        (
+            "PutItem",
+            put,
+            r#""ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rv, rcc],
+        ),
     ] {
-        let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},"ConditionalOperator":"XOR","ReturnValues":"BOGUS"}}"#)).await;
-        assert_validation(status, &body, joined);
+        let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},{extra}}}"#)).await;
+        let message = format!(
+            "{} validation errors detected: {}",
+            expected.len(),
+            expected.join("; ")
+        );
+        assert_validation(status, &body, &message);
     }
 }
 

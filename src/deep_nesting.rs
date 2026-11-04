@@ -177,50 +177,36 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
     }
 }
 
-/// The older layer checks a deep write's enum members in an order of its own
-/// and reports each one that fails, where the decoder stops at the first and
-/// skips `ConditionalOperator` (captured eu-west-2 and us-east-1, 2026-11-03
-/// and 2026-11-04, with an `Expected` value nested 100 levels: `ReturnValues`
-/// of `BOGUS` beside `XOR` gets `2 validation errors detected:` on PutItem,
-/// UpdateItem and DeleteItem alike, and beside a bad `ReturnConsumedCapacity`
-/// or `ReturnItemCollectionMetrics` too, three). Only the older layer's
-/// wording names the `returnValues` member, so a list that holds it and
-/// nothing but these members is rebuilt from the request in that order. Any
-/// other error in the list leaves it as it is.
+/// The older layer checks a deep write's members in an order of its own and
+/// reports each one that fails, where the decoder stops at the first and
+/// skips `ConditionalOperator`. Captured eu-west-2 and us-east-1, 2026-11-03
+/// and 2026-11-04, with an `Expected` value nested 100 levels and every member
+/// wrong, they come in the order of [`OLDER_MEMBERS`]. A DeleteItem
+/// `ReturnValues` of `ALL_NEW` beside `XOR` gets the `XOR` error alone.
+///
+/// So when every error the decoder reported is about one of these members,
+/// the list is rebuilt from the request in that order. Any other error in it
+/// leaves it as it is.
 fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
-    // The request member and the name the message gives it, in the order the
-    // older layer reports them.
-    let order: &[(&str, &str)] = match operation {
-        "PutItem" => &[
-            ("ReturnValues", "returnValues"),
-            ("ConditionalOperator", "conditionalOperator"),
-            ("ReturnConsumedCapacity", "returnConsumedCapacity"),
-            ("ReturnItemCollectionMetrics", "returnItemCollectionMetrics"),
-        ],
-        "UpdateItem" => &[
-            ("ReturnConsumedCapacity", "returnConsumedCapacity"),
-            ("ReturnValues", "returnValues"),
-            ("ConditionalOperator", "conditionalOperator"),
-        ],
-        "DeleteItem" => &[
-            ("ReturnValues", "returnValues"),
-            ("ConditionalOperator", "conditionalOperator"),
-        ],
-        _ => return err,
+    let Some((_, order)) = OLDER_MEMBERS.iter().find(|(op, _)| *op == operation) else {
+        return err;
     };
     let DynoxideError::ValidationException(message) = &err else {
         return err;
     };
-    let errors: Vec<&str> = match message.split_once(" detected: ") {
+    let reported: Vec<&str> = match message.split_once(" detected: ") {
         Some((count, list)) if count.ends_with("validation error") => vec![list],
         Some((count, list)) if count.ends_with("validation errors") => list.split("; ").collect(),
-        _ => return err,
+        _ => vec![message.as_str()],
     };
-    let names = |error: &str, wire: &str| error.contains(&format!(" at '{wire}' "));
-    let only_members = errors
-        .iter()
-        .all(|error| order.iter().any(|(_, wire)| names(error, wire)));
-    if !only_members || !errors.iter().any(|error| names(error, "returnValues")) {
+    let about_a_member = |error: &str| {
+        error == RETURN_VALUES_NOT_HONOURED
+            || error.contains(crate::validation::RETURN_VALUES_REJECTION)
+            || order
+                .iter()
+                .any(|member| error.contains(&format!(" at '{}' ", member.wire)))
+    };
+    if !reported.iter().all(|error| about_a_member(error)) {
         return err;
     }
     let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -228,25 +214,124 @@ fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> Dynox
     };
     let rebuilt: Vec<String> = order
         .iter()
-        .filter_map(|(member, _)| {
-            let value = request.get(*member).and_then(|v| v.as_str());
-            match *member {
-                "ReturnValues" => value
-                    .filter(|v| !crate::validation::RETURN_VALUES.contains(v))
-                    .map(crate::validation::return_values_value_rejection),
-                "ConditionalOperator" => crate::validation::conditional_operator_rejection(value),
-                "ReturnConsumedCapacity" => {
-                    crate::validation::return_consumed_capacity_rejection(value)
-                }
-                _ => crate::validation::return_item_collection_metrics_rejection(value),
-            }
-        })
+        .filter_map(|member| member.rejection(request.get(member.name)))
         .collect();
     match crate::validation::format_validation_errors(&rebuilt) {
         Some(message) => DynoxideError::ValidationException(message),
         None => err,
     }
 }
+
+/// A request member the older layer checks, and how it refuses one.
+struct OlderMember {
+    name: &'static str,
+    /// What the message calls it.
+    wire: &'static str,
+    check: OlderCheck,
+}
+
+enum OlderCheck {
+    ReturnValues,
+    ConditionalOperator,
+    ReturnValuesOnConditionCheckFailure,
+    ReturnConsumedCapacity,
+    ReturnItemCollectionMetrics,
+    Required,
+}
+
+impl OlderMember {
+    const fn new(name: &'static str, wire: &'static str, check: OlderCheck) -> Self {
+        Self { name, wire, check }
+    }
+
+    fn rejection(&self, value: Option<&serde_json::Value>) -> Option<String> {
+        use crate::validation::*;
+        let text = value.and_then(|v| v.as_str());
+        match self.check {
+            // One DeleteItem doesn't honour is in the enum, so it isn't
+            // rejected here.
+            OlderCheck::ReturnValues => text
+                .filter(|v| !RETURN_VALUES.contains(v))
+                .map(return_values_value_rejection),
+            OlderCheck::ConditionalOperator => conditional_operator_rejection(text),
+            OlderCheck::ReturnValuesOnConditionCheckFailure => {
+                return_values_on_condition_check_failure_rejection(text, self.wire)
+            }
+            OlderCheck::ReturnConsumedCapacity => return_consumed_capacity_rejection(text),
+            OlderCheck::ReturnItemCollectionMetrics => {
+                return_item_collection_metrics_rejection(text)
+            }
+            OlderCheck::Required => value.is_none().then(|| {
+                format!(
+                    "Value null at '{}' failed to satisfy constraint: Member must not be null",
+                    self.wire
+                )
+            }),
+        }
+    }
+}
+
+/// The members the older layer checks on each deep write, in the order it
+/// reports them.
+const OLDER_MEMBERS: [(&str, [OlderMember; 6]); 3] = {
+    use OlderCheck::*;
+    const RV: OlderMember = OlderMember::new("ReturnValues", "returnValues", ReturnValues);
+    const CO: OlderMember = OlderMember::new(
+        "ConditionalOperator",
+        "conditionalOperator",
+        ConditionalOperator,
+    );
+    const RVOCCF: OlderMember = OlderMember::new(
+        "ReturnValuesOnConditionCheckFailure",
+        "returnValuesOnConditionCheckFailure",
+        ReturnValuesOnConditionCheckFailure,
+    );
+    const RCC: OlderMember = OlderMember::new(
+        "ReturnConsumedCapacity",
+        "returnConsumedCapacity",
+        ReturnConsumedCapacity,
+    );
+    const RICM: OlderMember = OlderMember::new(
+        "ReturnItemCollectionMetrics",
+        "returnItemCollectionMetrics",
+        ReturnItemCollectionMetrics,
+    );
+    [
+        (
+            "PutItem",
+            [
+                RV,
+                CO,
+                OlderMember::new("Item", "item", Required),
+                RVOCCF,
+                RCC,
+                RICM,
+            ],
+        ),
+        (
+            "UpdateItem",
+            [
+                RCC,
+                RV,
+                CO,
+                RVOCCF,
+                RICM,
+                OlderMember::new("Key", "key", Required),
+            ],
+        ),
+        (
+            "DeleteItem",
+            [
+                RV,
+                CO,
+                RVOCCF,
+                RCC,
+                RICM,
+                OlderMember::new("Key", "key", Required),
+            ],
+        ),
+    ]
+};
 
 /// A value wrapped in one more map than DynamoDB accepts in a PartiQL
 /// parameter, which the operation refuses with the same message a far deeper

@@ -1043,7 +1043,6 @@ fn an_lsi_key_set_charges_and_pages_like_the_table() {
                 .all(|(rows, _, cost)| rows.len() <= 1 && *cost == 0.5)
         );
         assert!(pages[..pages.len() - 1].iter().all(|(_, token, _)| *token));
-        assert!(!pages.last().unwrap().1, "{clause} ended without a token");
         assert!(pages.len() <= expected.len() + 1, "{clause}");
     }
 }
@@ -1101,5 +1100,78 @@ fn a_limit_past_the_integer_range_reads_as_usual() {
             assert_eq!(pages[0].0, rows, "{limit} {clause}");
             assert!(!pages[0].1, "{limit} {clause}");
         }
+    }
+}
+
+#[test]
+fn a_page_ending_on_a_closed_bound_ends_the_read() {
+    // Captured eu-west-2 and us-east-1, 2026-11-04, five times in each region:
+    // every walk of these ended without a token, where a range that could
+    // hold a later key keeps one on most walks.
+    let db = small_items();
+    let small = |clause: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+    for (clause, limit, pages) in [
+        (
+            "sk BETWEEN 'row-1' AND 'row-2'",
+            1,
+            vec![
+                page(&["k/row-1"], true, 0.5),
+                page(&["k/row-2"], false, 0.5),
+            ],
+        ),
+        (
+            "sk <= 'row-2'",
+            2,
+            vec![page(&["k/row-1", "k/row-2"], false, 0.5)],
+        ),
+        (
+            "sk BETWEEN 'row-1' AND 'row-3'",
+            3,
+            vec![page(&["k/row-1", "k/row-2", "k/row-3"], false, 0.5)],
+        ),
+        (
+            "sk >= 'row-2' ORDER BY sk DESC",
+            1,
+            vec![
+                page(&["k/row-3"], true, 0.5),
+                page(&["k/row-2"], false, 0.5),
+            ],
+        ),
+        (
+            "(sk BETWEEN 'row-0' AND 'row-1' OR sk BETWEEN 'row-3' AND 'row-3')",
+            1,
+            vec![
+                page(&["k/row-1"], true, 0.5),
+                page(&["k/row-3"], false, 0.5),
+            ],
+        ),
+        ("sk = 'row-2'", 1, vec![page(&["k/row-2"], false, 0.5)]),
+    ] {
+        assert_eq!(
+            walk(&db, &small(clause), Some(limit), false),
+            pages,
+            "{clause}"
+        );
+    }
+}
+
+#[test]
+fn a_range_written_two_ways_is_one_branch() {
+    // The filter's OR repeats the range, which is charged once as `f1` shows
+    // (captured eu-west-2 and us-east-1, 2026-11-04), whichever order its
+    // bounds are written in.
+    let db = small_items();
+    let rows = ["k/row-1", "k/row-2", "k/row-3"];
+    for clause in [
+        "((sk >= 'row-1' AND sk <= 'row-3' AND l = 'a') OR (sk >= 'row-1' AND sk <= 'row-3' AND l = 'b'))",
+        "((sk >= 'row-1' AND sk <= 'row-3' AND l = 'a') OR (sk <= 'row-3' AND sk >= 'row-1' AND l = 'b'))",
+        "((sk BETWEEN 'row-1' AND 'row-3' AND l = 'a') OR (sk <= 'row-3' AND l = 'b' AND sk >= 'row-1'))",
+    ] {
+        let sql = format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+        assert_eq!(
+            walk(&db, &sql, None, true),
+            [page(&rows, false, 1.0)],
+            "{clause}"
+        );
     }
 }

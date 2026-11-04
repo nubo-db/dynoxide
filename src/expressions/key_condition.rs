@@ -472,7 +472,7 @@ impl ResolvedSortKeyCondition {
 
 /// One bound on a stored sort key, in the stored form that compares the way
 /// rows are ordered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SortKeyBound {
     Eq(String),
     Lt(String),

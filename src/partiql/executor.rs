@@ -1918,13 +1918,14 @@ async fn evaluate_window<S: StorageBackend>(
         None => None,
     };
 
-    // A read of one partition whose OR branches each bound the sort key reads
-    // one row past its limit, so a page ending on a key an index shares with
-    // more items keeps its continuation.
+    // A read of one partition that bounds its sort key reads one row past its
+    // limit, so it knows whether a page ending where no branch can hold a
+    // later key really has nothing after it: an index can share that key with
+    // more items. It is charged per branch.
     let sort_keys = sort_key_plan(where_clause, read_pk, read_sk, parameters);
-    let mut charge = (matches!(pk_key, Some(Some(_))) && !sort_keys.branches.is_empty())
-        .then(|| BranchCharge::new(&sort_keys.branches));
-    let peek = limit.is_some() && charge.is_some();
+    let keyed_branches = matches!(pk_key, Some(Some(_))) && !sort_keys.branches.is_empty();
+    let mut charge = keyed_branches.then(|| BranchCharge::new(&sort_keys.branches));
+    let peek = limit.is_some() && keyed_branches;
     let read_limit = limit.map(|lim| if peek { lim.saturating_add(1) } else { lim });
 
     let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
@@ -2037,10 +2038,12 @@ async fn evaluate_window<S: StorageBackend>(
     // can come back short, or empty, and still carry a token. The exception is
     // a read of sort-key branches that ends on a key with no branch able to
     // hold one after it: DynamoDB hands back no token (#271, captured
-    // eu-west-2 and us-east-1, 2026-10-23 and 2026-11-03: two OR'd sort-key
+    // eu-west-2 and us-east-1, 2026-10-23 to 2026-11-04: two OR'd sort-key
     // equalities under `Limit: 1` come back over two pages, not three, on a
-    // table, an ALL GSI and under `ORDER BY sk DESC`). A branch the read hasn't
-    // reached still holds the token, whether a missing key or an empty range.
+    // table, an ALL GSI and under `ORDER BY sk DESC`, and a page ending on a
+    // range's closed bound, `sk BETWEEN 'row-1' AND 'row-2'` or `sk <= 'row-2'`,
+    // ended without one on every walk). A branch the read hasn't reached still
+    // holds the token, whether a missing key or an empty range.
     // A page ending inside a range keeps it too: DynamoDB keeps it on most
     // reads and drops it on some, the same query either way (captured five
     // times in each region, 2026-11-04: `sk < 'row-2' OR sk > 'row-2'` kept it
@@ -2060,9 +2063,9 @@ async fn evaluate_window<S: StorageBackend>(
     for (_, sk, json) in rows {
         // A row that will not deserialise is a storage fault, and it is reported
         // rather than walked past. Skipping it left the row counted in
-        // `evaluated`, which paces the limit and mints the continuation, but not
-        // in `evaluated_bytes`, which is what the read is charged on, so the two
-        // halves of the same page disagreed about it. `actions::scan` reports the
+        // `evaluated`, which paces the limit and mints the continuation, but out
+        // of what the read is charged, so the two halves of the same page
+        // disagreed about it. `actions::scan` reports the
         // same fault on the same JSON.
         let item: Item = serde_json::from_str(&json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
@@ -2579,7 +2582,12 @@ fn sort_key_plan(
     let (sql, params) = sk_condition_groups_to_sql(&groups);
     let mut branches: Vec<SortKeyBranch> = Vec::new();
     for group in &groups {
-        let branch = SortKeyBranch(group.iter().flat_map(|c| c.bounds()).collect());
+        // In a set order, so the same range written two ways is one branch
+        // and charged once.
+        let mut bounds: Vec<SortKeyBound> = group.iter().flat_map(|c| c.bounds()).collect();
+        bounds.sort();
+        bounds.dedup();
+        let branch = SortKeyBranch(bounds);
         if !branches.contains(&branch) {
             branches.push(branch);
         }

@@ -1403,8 +1403,119 @@ async fn older_member_errors_win_over_deep_values() {
             r#""ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
             vec![rv, rcc],
         ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rv, xor, rcc],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, ricm],
+        ),
+        (
+            "UpdateItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, ricm],
+        ),
+        (
+            "PutItem",
+            put,
+            r#""ConditionalOperator":"XOR","ReturnValues":"NONE","ReturnConsumedCapacity":"BOGUS""#,
+            vec![xor, rcc],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"ALL_NEW""#,
+            vec![xor],
+        ),
+        (
+            "UpdateItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rcc, rv, xor, ricm],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, rcc, ricm],
+        ),
     ] {
         let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},{extra}}}"#)).await;
+        let message = match expected.as_slice() {
+            [single] => format!("1 validation error detected: {single}"),
+            _ => format!(
+                "{} validation errors detected: {}",
+                expected.len(),
+                expected.join("; ")
+            ),
+        };
+        assert_validation(status, &body, &message);
+    }
+    // Every member wrong, with and without the key or item, and a member the
+    // older layer names beside the ones above (captured eu-west-2 and
+    // us-east-1, 2026-11-04).
+    let rvoccf = "Value 'BOGUS' at 'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]";
+    let no_key = "Value null at 'key' failed to satisfy constraint: Member must not be null";
+    let no_item = "Value null at 'item' failed to satisfy constraint: Member must not be null";
+    let all = r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS","ReturnItemCollectionMetrics":"BOGUS","ReturnValuesOnConditionCheckFailure":"BOGUS""#;
+    let expected_deep =
+        format!(r#""Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}}"#);
+    for (operation, members, expected) in [
+        (
+            "UpdateItem",
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS""#.to_string(),
+            vec![rv, xor, no_key],
+        ),
+        (
+            "DeleteItem",
+            format!(
+                r#"{key},"ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnValuesOnConditionCheckFailure":"BOGUS""#
+            ),
+            vec![rv, xor, rvoccf],
+        ),
+        (
+            "UpdateItem",
+            all.to_string(),
+            vec![rcc, rv, xor, rvoccf, ricm, no_key],
+        ),
+        (
+            "UpdateItem",
+            format!("{key},{all}"),
+            vec![rcc, rv, xor, rvoccf, ricm],
+        ),
+        (
+            "PutItem",
+            format!("{put},{all}"),
+            vec![rv, xor, rvoccf, rcc, ricm],
+        ),
+        (
+            "PutItem",
+            all.to_string(),
+            vec![rv, xor, no_item, rvoccf, rcc, ricm],
+        ),
+        (
+            "DeleteItem",
+            format!("{key},{all}"),
+            vec![rv, xor, rvoccf, rcc, ricm],
+        ),
+        (
+            "DeleteItem",
+            all.to_string(),
+            vec![rv, xor, rvoccf, rcc, ricm, no_key],
+        ),
+    ] {
+        let (status, body) = send(
+            &url,
+            operation,
+            format!(r#"{{"TableName":"Deep",{expected_deep},{members}}}"#),
+        )
+        .await;
         let message = format!(
             "{} validation errors detected: {}",
             expected.len(),

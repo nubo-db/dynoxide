@@ -62,12 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Request-member errors follow DynamoDB's wording and order for deep
   `DeleteItem`, `PutItem` and `UpdateItem` requests. An `UpdateItem` without
   a key joins an empty table name or invalid `ConditionalOperator` with the
-  missing-key error, a deep `PutItem`, `UpdateItem` or `DeleteItem` reports
-  each invalid `ReturnValues`, `ConditionalOperator`,
-  `ReturnValuesOnConditionCheckFailure`, `ReturnConsumedCapacity` and
-  `ReturnItemCollectionMetrics` and a missing `Item` or `Key` together, in
-  DynamoDB's order, and Query reports a misused `ConditionalOperator` before
-  an invalid `Select`
+  missing-key error, and Query reports a misused `ConditionalOperator` before
+  an invalid `Select`. A deep `PutItem`, `UpdateItem` or `DeleteItem` reports
+  every invalid member together, in DynamoDB's order: the enum members, a
+  missing `Item` or `Key`, and a missing or empty table name. As in DynamoDB,
+  a table name's length and pattern are reported only once those pass
   ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
 - PartiQL reads a `Limit` past 2147483647 as that number, as Query and Scan
   do. A `Limit` near or past 9223372036854775807 used to fail the read.

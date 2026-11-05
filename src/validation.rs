@@ -92,11 +92,7 @@ pub fn table_name_constraint_errors(
             }
             TableNameContext::ReadWrite => {
                 if name.is_empty() {
-                    errors.push(
-                        "Value '' at 'tableName' failed to satisfy constraint: \
-                         Member must have length greater than or equal to 1"
-                            .to_string(),
-                    );
+                    errors.push(older_empty_table_name_rejection());
                 } else if !name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
@@ -166,6 +162,36 @@ pub(crate) fn first_table_name_error(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The older layer's answer for an empty table name, which it checks with a
+/// write's other members (captured on deep PutItem, UpdateItem and DeleteItem
+/// requests, eu-west-2 and us-east-1, 2026-11-05).
+pub(crate) fn older_empty_table_name_rejection() -> String {
+    "Value '' at 'tableName' failed to satisfy constraint: \
+     Member must have length greater than or equal to 1"
+        .to_string()
+}
+
+/// Every length and pattern constraint a non-empty table name breaks, the
+/// length first, as the older layer reports them once a write's members pass
+/// (captured on deep PutItem, UpdateItem and DeleteItem requests, eu-west-2
+/// and us-east-1, 2026-11-05). Compiled where deep requests are read.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn older_table_name_errors(name: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    if name.is_empty() {
+        return errors;
+    }
+    if name.len() < 3 {
+        errors.push(short_table_name_error(name));
+    } else if name.len() > 255 {
+        errors.push(long_table_name_error(name));
+    }
+    if !table_name_pattern_holds(name) {
+        errors.push(table_name_pattern_error(name));
+    }
+    errors
 }
 
 /// The table-name errors for PutItem, DeleteItem, GetItem and Query: a missing

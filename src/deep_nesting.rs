@@ -182,11 +182,13 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
 /// skips `ConditionalOperator`. Captured eu-west-2 and us-east-1, 2026-11-03
 /// and 2026-11-04, with an `Expected` value nested 100 levels and every member
 /// wrong, they come in the order of [`OLDER_MEMBERS`]. A DeleteItem
-/// `ReturnValues` of `ALL_NEW` beside `XOR` gets the `XOR` error alone.
+/// `ReturnValues` of `ALL_NEW` beside `XOR` gets the `XOR` error alone. A
+/// table name that is missing or empty is a member error, and its length and
+/// pattern are checked only once the members pass.
 ///
-/// So when every error the decoder reported is about one of these members,
-/// the list is rebuilt from the request in that order. Any other error in it
-/// leaves it as it is.
+/// So when every error the decoder reported is one of those, the list is
+/// rebuilt from the request in that order. Any other error in it leaves it as
+/// it is.
 fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
     let Some((_, order)) = OLDER_MEMBERS.iter().find(|(op, _)| *op == operation) else {
         return err;
@@ -194,20 +196,14 @@ fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> Dynox
     let DynoxideError::ValidationException(message) = &err else {
         return err;
     };
-    let reported: Vec<&str> = match message.split_once(" detected: ") {
-        Some((count, list)) if count.ends_with("validation error") => vec![list],
-        Some((count, list)) if count.ends_with("validation errors") => list.split("; ").collect(),
-        _ => vec![message.as_str()],
+    let reported = match message.split_once(" detected: ") {
+        Some((count, list))
+            if count.ends_with("validation error") || count.ends_with("validation errors") =>
+        {
+            list
+        }
+        _ => message.as_str(),
     };
-    let about_a_member = |error: &str| {
-        error == RETURN_VALUES_NOT_HONOURED
-            || order
-                .iter()
-                .any(|member| error.contains(&format!(" at '{}' ", member.wire)))
-    };
-    if !reported.iter().all(|error| about_a_member(error)) {
-        return err;
-    }
     let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
         return err;
     };
@@ -215,10 +211,42 @@ fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> Dynox
         .iter()
         .filter_map(|member| member.rejection(request.get(member.name)))
         .collect();
+    let table_name = request.get("TableName").and_then(serde_json::Value::as_str);
+    // The table name's errors as the decoder words them, which the older
+    // layer's take the place of.
+    let decoded = match (operation, table_name) {
+        (_, None) => Vec::new(),
+        ("UpdateItem", name) => crate::validation::update_item_table_name_errors(name),
+        (_, name) => crate::validation::item_table_name_errors(name),
+    };
+    // Matched whole rather than split on "; ", which a value can hold.
+    let mut known: Vec<&str> = rebuilt.iter().chain(&decoded).map(String::as_str).collect();
+    known.push(RETURN_VALUES_NOT_HONOURED);
+    if !made_of(reported, &known) {
+        return err;
+    }
+    // A name's length and pattern are checked once the members pass.
+    let rebuilt = match table_name {
+        Some(name) if rebuilt.is_empty() => crate::validation::older_table_name_errors(name),
+        _ => rebuilt,
+    };
     match crate::validation::format_validation_errors(&rebuilt) {
         Some(message) => DynoxideError::ValidationException(message),
         None => err,
     }
+}
+
+/// Whether `list` is some of `errors`, each at most once, joined by "; ".
+fn made_of(list: &str, errors: &[&str]) -> bool {
+    errors.iter().enumerate().any(|(i, error)| {
+        list.strip_prefix(error).is_some_and(|rest| {
+            let others: Vec<&str> = [&errors[..i], &errors[i + 1..]].concat();
+            rest.is_empty()
+                || rest
+                    .strip_prefix("; ")
+                    .is_some_and(|rest| made_of(rest, &others))
+        })
+    })
 }
 
 /// A request member the older layer checks, and how it refuses one.
@@ -236,6 +264,7 @@ enum OlderCheck {
     ReturnConsumedCapacity,
     ReturnItemCollectionMetrics,
     Required,
+    TableName,
 }
 
 impl OlderMember {
@@ -260,20 +289,23 @@ impl OlderMember {
             OlderCheck::ReturnItemCollectionMetrics => {
                 return_item_collection_metrics_rejection(text)
             }
+            OlderCheck::TableName if text == Some("") => Some(older_empty_table_name_rejection()),
             // A null member is read as a missing one.
-            OlderCheck::Required => value.is_none_or(serde_json::Value::is_null).then(|| {
-                format!(
-                    "Value null at '{}' failed to satisfy constraint: Member must not be null",
-                    self.wire
-                )
-            }),
+            OlderCheck::Required | OlderCheck::TableName => {
+                value.is_none_or(serde_json::Value::is_null).then(|| {
+                    format!(
+                        "Value null at '{}' failed to satisfy constraint: Member must not be null",
+                        self.wire
+                    )
+                })
+            }
         }
     }
 }
 
 /// The members the older layer checks on each deep write, in the order it
 /// reports them.
-const OLDER_MEMBERS: [(&str, [OlderMember; 6]); 3] = {
+const OLDER_MEMBERS: [(&str, [OlderMember; 7]); 3] = {
     use OlderCheck::*;
     const RV: OlderMember = OlderMember::new("ReturnValues", "returnValues", ReturnValues);
     const CO: OlderMember = OlderMember::new(
@@ -296,6 +328,7 @@ const OLDER_MEMBERS: [(&str, [OlderMember; 6]); 3] = {
         "returnItemCollectionMetrics",
         ReturnItemCollectionMetrics,
     );
+    const TABLE: OlderMember = OlderMember::new("TableName", "tableName", TableName);
     [
         (
             "PutItem",
@@ -306,12 +339,14 @@ const OLDER_MEMBERS: [(&str, [OlderMember; 6]); 3] = {
                 RVOCCF,
                 RCC,
                 RICM,
+                TABLE,
             ],
         ),
         (
             "UpdateItem",
             [
                 RCC,
+                TABLE,
                 RV,
                 CO,
                 RVOCCF,
@@ -328,6 +363,7 @@ const OLDER_MEMBERS: [(&str, [OlderMember; 6]); 3] = {
                 RCC,
                 RICM,
                 OlderMember::new("Key", "key", Required),
+                TABLE,
             ],
         ),
     ]
@@ -805,5 +841,28 @@ mod tests {
         let stand_in = just_past_the_limit();
         let values = scan(&format!(r#"{{"Parameters":[{stand_in}]}}"#)).unwrap();
         assert_eq!(values[0].nesting, MAX_NESTING + 1);
+    }
+
+    #[test]
+    fn an_error_the_older_layer_does_not_give_leaves_the_list_alone() {
+        let body = r#"{"TableName":"Deep","Key":{"pk":{"S":"a"}},"ConditionalOperator":"XOR"}"#;
+        let rejected = |message: &str| match older_member_errors(
+            "DeleteItem",
+            body,
+            DynoxideError::ValidationException(message.to_string()),
+        ) {
+            DynoxideError::ValidationException(message) => message,
+            other => panic!("not a validation error: {other:?}"),
+        };
+        let xor = crate::validation::conditional_operator_rejection(Some("XOR")).unwrap();
+        let other =
+            "Value 'x' at 'somethingElse' failed to satisfy constraint: Member must not be odd";
+        let mixed = format!("2 validation errors detected: {other}; {xor}");
+        assert_eq!(rejected(&mixed), mixed);
+        // And one it does give is rebuilt in the older layer's form.
+        assert_eq!(
+            rejected(&xor),
+            format!("1 validation error detected: {xor}")
+        );
     }
 }

@@ -1511,6 +1511,19 @@ async fn older_member_errors_win_over_deep_values() {
         ),
         // A null key or item is read as a missing one.
         (
+            "DeleteItem",
+            r#""Key":null,"ConditionalOperator":"XOR""#.to_string(),
+            vec![xor, no_key],
+        ),
+        // A value holding "; " is still one error.
+        (
+            "DeleteItem",
+            format!(
+                r#"{key},"ConditionalOperator":"XOR","ReturnValues":"A; B","ReturnConsumedCapacity":"BOGUS""#
+            ),
+            vec![&rv.replace("'BOGUS'", "'A; B'"), xor, rcc],
+        ),
+        (
             "UpdateItem",
             r#""Key":null,"ConditionalOperator":"XOR","ReturnValues":"BOGUS""#.to_string(),
             vec![rv, xor, no_key],
@@ -1570,6 +1583,161 @@ async fn older_member_errors_win_over_deep_values() {
             &body,
             &format!("1 validation error detected: {expected}"),
         );
+    }
+    // A missing table name is checked with the members, its length and
+    // pattern only once they pass (captured eu-west-2 and us-east-1,
+    // 2026-11-04 and 2026-11-05).
+    let no_table =
+        "Value null at 'tableName' failed to satisfy constraint: Member must not be null";
+    let short = "Value 'ab' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3";
+    let long_name = "x".repeat(300);
+    let empty = "Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1";
+    let bad_pattern = |name: &str| {
+        format!(
+            "Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        )
+    };
+    let short_bad = "Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3".to_string();
+    let bangs = "!".repeat(300);
+    let long_bad = format!(
+        "Value '{bangs}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+    );
+    for (operation, table, members, expected) in [
+        (
+            "PutItem",
+            None,
+            format!("{put},{all}"),
+            vec![rv, xor, rvoccf, rcc, ricm, no_table],
+        ),
+        (
+            "PutItem",
+            None,
+            all.to_string(),
+            vec![rv, xor, no_item, rvoccf, rcc, ricm, no_table],
+        ),
+        (
+            "UpdateItem",
+            None,
+            all.to_string(),
+            vec![rcc, no_table, rv, xor, rvoccf, ricm, no_key],
+        ),
+        (
+            "DeleteItem",
+            None,
+            all.to_string(),
+            vec![rv, xor, rvoccf, rcc, ricm, no_key, no_table],
+        ),
+        (
+            "DeleteItem",
+            None,
+            format!(r#"{key},"ConditionalOperator":"XOR""#),
+            vec![xor, no_table],
+        ),
+        (
+            "PutItem",
+            Some("ab"),
+            format!(r#"{put},"ReturnValues":"BOGUS""#),
+            vec![rv],
+        ),
+        (
+            "PutItem",
+            Some("bad name!"),
+            format!(r#"{put},"ReturnValues":"BOGUS""#),
+            vec![rv],
+        ),
+        (
+            "UpdateItem",
+            Some("ab"),
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            vec![rcc],
+        ),
+        (
+            "PutItem",
+            Some(long_name.as_str()),
+            format!(r#"{put},"ConditionalOperator":"XOR","ReturnValues":"BOGUS""#),
+            vec![rv, xor],
+        ),
+        ("PutItem", Some("ab"), String::new(), vec![no_item]),
+        (
+            "UpdateItem",
+            Some(long_name.as_str()),
+            String::new(),
+            vec![no_key],
+        ),
+        ("PutItem", None, put.to_string(), vec![no_table]),
+        (
+            "UpdateItem",
+            Some("a!"),
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            vec![rcc],
+        ),
+        (
+            "UpdateItem",
+            Some("a!"),
+            key.to_string(),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "PutItem",
+            Some("a!"),
+            put.to_string(),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "DeleteItem",
+            Some("a!"),
+            key.to_string(),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "PutItem",
+            Some(bangs.as_str()),
+            put.to_string(),
+            vec![&long_bad, &bad_pattern(&bangs)],
+        ),
+        (
+            "UpdateItem",
+            Some(bangs.as_str()),
+            key.to_string(),
+            vec![&long_bad, &bad_pattern(&bangs)],
+        ),
+        (
+            "DeleteItem",
+            Some("bad name!"),
+            key.to_string(),
+            vec![&bad_pattern("bad name!")],
+        ),
+        (
+            "PutItem",
+            Some(""),
+            format!(r#"{put},"ReturnValues":"BOGUS""#),
+            vec![rv, empty],
+        ),
+        (
+            "UpdateItem",
+            Some(""),
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            vec![rcc, empty],
+        ),
+        ("DeleteItem", Some(""), key.to_string(), vec![empty]),
+        ("PutItem", Some(""), String::new(), vec![no_item, empty]),
+        ("PutItem", Some("ab"), put.to_string(), vec![short]),
+    ] {
+        let mut fields = vec![expected_deep.clone()];
+        if let Some(table) = table {
+            fields.push(format!(r#""TableName":"{table}""#));
+        }
+        if !members.is_empty() {
+            fields.push(members);
+        }
+        let (status, body) = send(&url, operation, format!("{{{}}}", fields.join(","))).await;
+        let message = format!(
+            "{} validation error{} detected: {}",
+            expected.len(),
+            if expected.len() == 1 { "" } else { "s" },
+            expected.join("; ")
+        );
+        assert_validation(status, &body, &message);
     }
 }
 

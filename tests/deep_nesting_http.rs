@@ -1600,6 +1600,10 @@ async fn older_member_errors_win_over_deep_values() {
     let short_bad = "Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3".to_string();
     let bangs = "!".repeat(300);
     let accented = "é".repeat(200);
+    let emoji = "😀".repeat(128);
+    let long_emoji = format!(
+        "Value '{emoji}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+    );
     let long_alone = format!(
         "Value '{long_name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
     );
@@ -1705,6 +1709,24 @@ async fn older_member_errors_win_over_deep_values() {
             Some("😀😀"),
             put.to_string(),
             vec![&bad_pattern("😀😀")],
+        ),
+        (
+            "UpdateItem",
+            Some("😀😀"),
+            key.to_string(),
+            vec![&bad_pattern("😀😀")],
+        ),
+        (
+            "DeleteItem",
+            Some("😀😀"),
+            key.to_string(),
+            vec![&bad_pattern("😀😀")],
+        ),
+        (
+            "DeleteItem",
+            Some(emoji.as_str()),
+            key.to_string(),
+            vec![&long_emoji, &bad_pattern(&emoji)],
         ),
         ("PutItem", None, put.to_string(), vec![no_table]),
         (

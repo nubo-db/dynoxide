@@ -882,11 +882,23 @@ async fn table_name_length_counts_characters() {
         ("PutItem", "😀😀", one(&short("😀😀"))),
         ("PutItem", emoji.as_str(), one(&pattern(&emoji))),
         ("UpdateItem", "😀😀", two(&pattern("😀😀"), &short("😀😀"))),
+        ("GetItem", "😀😀", one(&short("😀😀"))),
+        ("DeleteItem", "😀😀", one(&short("😀😀"))),
+        ("Query", "😀😀", one(&short("😀😀"))),
+        ("Scan", "😀😀", one(&short("😀😀"))),
+        ("GetItem", emoji.as_str(), one(&pattern(&emoji))),
+        ("Scan", emoji.as_str(), one(&pattern(&emoji))),
     ] {
-        let mut body = serde_json::json!({"TableName": name, "Key": key()});
-        if operation == "PutItem" {
-            body = serde_json::json!({"TableName": name, "Item": key()});
-        }
+        let body = match operation {
+            "PutItem" => serde_json::json!({"TableName": name, "Item": key()}),
+            "Scan" => serde_json::json!({"TableName": name}),
+            "Query" => serde_json::json!({
+                "TableName": name,
+                "KeyConditionExpression": "pk = :p",
+                "ExpressionAttributeValues": {":p": {"S": "a"}},
+            }),
+            _ => serde_json::json!({"TableName": name, "Key": key()}),
+        };
         assert_eq!(
             refused(&url, operation, body).await,
             expected,

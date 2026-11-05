@@ -1599,6 +1599,11 @@ async fn older_member_errors_win_over_deep_values() {
     };
     let short_bad = "Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3".to_string();
     let bangs = "!".repeat(300);
+    let accented = "é".repeat(200);
+    let long_alone = format!(
+        "Value '{long_name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+    );
+    let short_accented = "Value 'éé' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3".to_string();
     let long_bad = format!(
         "Value '{bangs}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
     );
@@ -1663,6 +1668,43 @@ async fn older_member_errors_win_over_deep_values() {
             Some(long_name.as_str()),
             String::new(),
             vec![no_key],
+        ),
+        (
+            "DeleteItem",
+            Some("a!"),
+            format!(r#"{key},"ConditionalOperator":"XOR""#),
+            vec![xor],
+        ),
+        (
+            "DeleteItem",
+            Some("a!"),
+            format!(r#"{key},"ReturnValues":"ALL_NEW""#),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "PutItem",
+            Some(long_name.as_str()),
+            put.to_string(),
+            vec![&long_alone],
+        ),
+        // Measured in UTF-16 units: two emoji are four.
+        (
+            "PutItem",
+            Some("éé"),
+            put.to_string(),
+            vec![&short_accented, &bad_pattern("éé")],
+        ),
+        (
+            "PutItem",
+            Some(accented.as_str()),
+            put.to_string(),
+            vec![&bad_pattern(&accented)],
+        ),
+        (
+            "PutItem",
+            Some("😀😀"),
+            put.to_string(),
+            vec![&bad_pattern("😀😀")],
         ),
         ("PutItem", None, put.to_string(), vec![no_table]),
         (
@@ -1738,6 +1780,36 @@ async fn older_member_errors_win_over_deep_values() {
             expected.join("; ")
         );
         assert_validation(status, &body, &message);
+    }
+    // A null table name is a missing one, an `ALL_NEW` alone keeps
+    // DeleteItem's own sentence, and a value holding " detected: " is still
+    // one error.
+    for (operation, body, expected) in [
+        (
+            "DeleteItem",
+            format!(
+                r#"{{"TableName":null,{expected_deep},{key},"ReturnValues":"ALL_NEW","ConditionalOperator":"XOR"}}"#
+            ),
+            format!("2 validation errors detected: {xor}; {no_table}"),
+        ),
+        (
+            "DeleteItem",
+            format!(r#"{{"TableName":"Deep",{expected_deep},{key},"ReturnValues":"ALL_NEW"}}"#),
+            "ReturnValues can only be ALL_OLD or NONE".to_string(),
+        ),
+        (
+            "UpdateItem",
+            format!(
+                r#"{{"TableName":"Deep",{expected_deep},{key},"ReturnConsumedCapacity":"1 validation error detected: z"}}"#
+            ),
+            format!(
+                "1 validation error detected: {}",
+                rcc.replace("'BOGUS'", "'1 validation error detected: z'")
+            ),
+        ),
+    ] {
+        let (status, body) = send(&url, operation, body).await;
+        assert_validation(status, &body, &expected);
     }
 }
 

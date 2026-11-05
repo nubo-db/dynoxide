@@ -70,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
 - PartiQL reads a `Limit` past 2147483647 as that number, as Query and Scan
   do. A `Limit` near or past 9223372036854775807 used to fail the read.
+- A `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem` or `Query` table name
+  is measured in characters, as DynamoDB measures it, so `éé` is too short
+  and 200 `é`s aren't too long. A deep write measures it in UTF-16 units, as
+  DynamoDB does there.
 
 ## [1.5.0] - 2026-10-23
 

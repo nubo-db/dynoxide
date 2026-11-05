@@ -868,3 +868,29 @@ async fn search_vectors_reports_its_other_members_before_a_short_name() {
         );
     }
 }
+
+/// The newer layer measures a table name in characters (captured eu-west-2
+/// and us-east-1, 2026-11-05).
+#[tokio::test]
+async fn table_name_length_counts_characters() {
+    let url = start_server().await;
+    let accented = "é".repeat(200);
+    let emoji = "😀".repeat(128);
+    for (operation, name, expected) in [
+        ("PutItem", "éé", one(&short("éé"))),
+        ("PutItem", accented.as_str(), one(&pattern(&accented))),
+        ("PutItem", "😀😀", one(&short("😀😀"))),
+        ("PutItem", emoji.as_str(), one(&pattern(&emoji))),
+        ("UpdateItem", "😀😀", two(&pattern("😀😀"), &short("😀😀"))),
+    ] {
+        let mut body = serde_json::json!({"TableName": name, "Key": key()});
+        if operation == "PutItem" {
+            body = serde_json::json!({"TableName": name, "Item": key()});
+        }
+        assert_eq!(
+            refused(&url, operation, body).await,
+            expected,
+            "{operation} {name}"
+        );
+    }
+}

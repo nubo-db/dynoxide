@@ -196,9 +196,14 @@ fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> Dynox
     let DynoxideError::ValidationException(message) = &err else {
         return err;
     };
+    // A bare error's value can hold " detected: " too, so only a count
+    // makes a header.
     let reported = match message.split_once(" detected: ") {
-        Some((count, list))
-            if count.ends_with("validation error") || count.ends_with("validation errors") =>
+        Some((header, list))
+            if header
+                .strip_suffix(" validation errors")
+                .or_else(|| header.strip_suffix(" validation error"))
+                .is_some_and(|count| count.parse::<usize>().is_ok()) =>
         {
             list
         }

@@ -5,7 +5,9 @@
 use crate::actions::index_capacity::WriteCapacity;
 use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
-use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
+use crate::expressions::key_condition::{
+    ResolvedSortKeyCondition, SortKeyBound, sk_condition_groups_to_sql,
+};
 use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
     WhereClause, WhereCondition,
@@ -26,11 +28,16 @@ pub struct StatementPage {
     /// for an UPDATE or DELETE with a `RETURNING` clause (the deleted item or
     /// the requested projection), `None` for a write without one.
     pub items: Option<Vec<Item>>,
-    /// Total item bytes touched, for `ConsumedCapacity`.
+    /// Total item bytes touched. A batch or a transaction charges a `SELECT`
+    /// on it, since each reads a single key and the per-branch charge of
+    /// `read_units` comes to the same.
     pub size: usize,
+    /// What a `SELECT` costs in strongly consistent read units, per sort-key
+    /// branch for a keyed read of branches. 0 for a write.
+    pub read_units: f64,
     /// What a write statement contributed to `ConsumedCapacity`: the images
     /// either side and the per-index units. `None` for a `SELECT`, which is
-    /// charged from `size` at read granularity instead.
+    /// charged `read_units` instead.
     pub capacity: Option<WriteCapacity>,
     /// Where to resume, when more rows matched than this page returned.
     pub next_token: Option<String>,
@@ -258,12 +265,20 @@ fn first_of_each<T: PartialEq>(
 }
 
 /// Append an S, N or B value to `key` as a tag and its length-prefixed bytes,
-/// so two encodings match exactly when the values are equal. `false` for any
-/// other type.
+/// so two encodings match exactly when the values are equal. A number is
+/// encoded by value, as its stored key is, so `1` and `1.0` are one condition
+/// and the same partition `pk_in_every_group` reads (captured eu-west-2 and
+/// us-east-1, 2026-11-03: `pk = 1 AND pk = 1.0` reads that key on a number
+/// key and is refused for its type on a string key). `false` for any other
+/// type.
 fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
+    let number;
     let (tag, bytes) = match value {
         AttributeValue::S(s) => (b'S', s.as_bytes()),
-        AttributeValue::N(n) => (b'N', n.as_bytes()),
+        AttributeValue::N(n) => {
+            number = crate::types::normalize_number_for_sort(n);
+            (b'N', number.as_bytes())
+        }
         AttributeValue::B(b) => (b'B', b.as_slice()),
         _ => return false,
     };
@@ -294,7 +309,16 @@ fn check_read_key_types(
     let Some(wc) = where_clause else {
         return Ok(());
     };
-    for group in &wc.groups {
+    // Planning may keep only common predicates. Validation must still see
+    // every key alternative, without distributing unrelated filter ORs.
+    let projected;
+    let groups = if wc.fully_expanded {
+        &wc.groups
+    } else {
+        projected = key_groups(wc, read_pk, read_sk)?;
+        &projected
+    };
+    for group in groups {
         let Some(pk) = key_conditions(group, read_pk, false, parameters) else {
             return Ok(());
         };
@@ -350,6 +374,9 @@ pub(crate) fn keyed_select(
     else {
         return KeyedSelect::NotByPrimaryKey;
     };
+    if !wc.fully_expanded {
+        return KeyedSelect::NotByPrimaryKey;
+    }
     let [group] = wc.groups.as_slice() else {
         return KeyedSelect::NotByPrimaryKey;
     };
@@ -508,7 +535,8 @@ pub(crate) fn delete_has_condition(stmt: &Statement, resolved: &ResolvedTable) -
         WhereCondition::In(path, values) => values.len() == 1 && is_key(path),
         _ => false,
     };
-    !matches!(wc.groups.as_slice(), [group] if group.iter().all(|c| names_key(c)))
+    !wc.fully_expanded
+        || !matches!(wc.groups.as_slice(), [group] if group.iter().all(|c| names_key(c)))
 }
 
 /// Check one statement parameter as any attribute value is checked, with no
@@ -575,7 +603,7 @@ fn reject_overlapping_key_conditions(
         Ok(keys)
     };
 
-    let groups = key_groups(wc, read_pk, read_sk);
+    let groups = key_groups(wc, read_pk, read_sk)?;
     let mut branches = Vec::with_capacity(groups.len());
     for group in &groups {
         let mut partitions: Option<Vec<String>> = None;
@@ -705,7 +733,7 @@ fn key_groups(
     wc: &WhereClause,
     read_pk: &str,
     read_sk: Option<&str>,
-) -> Vec<Vec<Arc<WhereCondition>>> {
+) -> Result<Vec<Vec<Arc<WhereCondition>>>> {
     use crate::partiql::parser::ConditionTree;
     let is_key = |cond: &WhereCondition| {
         condition_path(cond).is_some_and(|path| {
@@ -721,37 +749,29 @@ fn key_groups(
             }
         }
     }
-    fn flatten(
-        tree: &ConditionTree,
-        is_key: &dyn Fn(&WhereCondition) -> bool,
-    ) -> Vec<Vec<Arc<WhereCondition>>> {
+    fn project(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> ConditionTree {
         match tree {
-            ConditionTree::Leaf(cond) => vec![vec![cond.clone()]],
-            // A filter: it narrows no key range, so it contributes nothing.
-            ConditionTree::Or(terms) if !terms.iter().any(|t| mentions_key(t, is_key)) => {
-                vec![Vec::new()]
+            ConditionTree::Leaf(cond) if is_key(cond) => ConditionTree::Leaf(cond.clone()),
+            ConditionTree::Leaf(_) => ConditionTree::And(Vec::new()),
+            // Keep the branch structure when any alternative names a key.
+            // An empty alternative then still represents a scan branch.
+            ConditionTree::Or(terms) if terms.iter().any(|t| mentions_key(t, is_key)) => {
+                ConditionTree::Or(terms.iter().map(|t| project(t, is_key)).collect())
             }
-            ConditionTree::Or(terms) => terms.iter().flat_map(|t| flatten(t, is_key)).collect(),
+            ConditionTree::Or(_) => ConditionTree::And(Vec::new()),
             ConditionTree::And(terms) => {
-                let mut out = vec![Vec::new()];
-                for term in terms {
-                    let term_groups = flatten(term, is_key);
-                    out = out
-                        .iter()
-                        .flat_map(|held: &Vec<Arc<WhereCondition>>| {
-                            term_groups.iter().map(move |group| {
-                                let mut joined = held.clone();
-                                joined.extend(group.iter().cloned());
-                                joined
-                            })
-                        })
-                        .collect();
-                }
-                out
+                ConditionTree::And(terms.iter().map(|t| project(t, is_key)).collect())
             }
         }
     }
-    flatten(&wc.tree, &is_key)
+    // Reuse the parser's allocation bounds. Large non-key filters disappear
+    // before expansion; a key-only explosion is refused rather than silently
+    // skipping validation or allocating its exponential product.
+    crate::partiql::parser::to_dnf(&project(&wc.tree, &is_key)).map_err(|message| {
+        DynoxideError::ValidationException(
+            crate::partiql::parser::ParseError::Syntax(message).into_message(),
+        )
+    })
 }
 
 /// The atoms of one sort key condition as bytes, equal exactly when the atoms
@@ -964,22 +984,21 @@ fn plan_order(
     let pk_term = order_by
         .iter()
         .find(|term| names_attribute(&term.path, read_pk));
-    if partition_values.len() > 1 && pk_term.is_none() {
-        return Err(reject(
-            "Must have hash key in ORDER BY clause when more than one hash key condition \
-             specified in WHERE clause."
-                .to_string(),
-        ));
-    }
-
-    // A stored partition key sorts the way its type orders, so sorting the
-    // stored form is sorting the keys.
+    // OR branches may repeat a partition. Compare resolved storage keys so
+    // parameter aliases and equivalent numeric spellings count only once too.
     let mut partitions = Vec::with_capacity(partition_values.len());
     for value in partition_values {
         partitions.push(key_string(&resolve_value(value, parameters)?, read_pk)?);
     }
     partitions.sort();
     partitions.dedup();
+    if partitions.len() > 1 && pk_term.is_none() {
+        return Err(reject(
+            "Must have hash key in ORDER BY clause when more than one hash key condition \
+             specified in WHERE clause."
+                .to_string(),
+        ));
+    }
     if pk_term.is_some_and(|term| term.descending) {
         partitions.reverse();
     }
@@ -1004,24 +1023,12 @@ async fn read_in_order<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     index: Option<&ResolvedIndex>,
-    where_clause: Option<&WhereClause>,
-    parameters: &[AttributeValue],
-    read_sk: Option<&str>,
+    sort_keys: &SortKeyPlan,
     cursor: Option<&Cursor>,
     limit: Option<usize>,
     plan: &OrderPlan,
 ) -> Result<Vec<(String, String, String)>> {
-    // Sort-key conditions are pushed into each Query only when the clause is a
-    // single AND group, so they hold in every partition the read visits.
-    let sk_conditions = match (read_sk, where_clause) {
-        (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
-            translate_sk_conditions(&wc.groups[0], sk_name, parameters)
-        }
-        _ => None,
-    }
-    .unwrap_or_default();
-    let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
-    let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+    let sk_params_refs: Vec<&str> = sort_keys.params.iter().map(|s| s.as_str()).collect();
 
     let first = match cursor {
         Some(c) => plan
@@ -1040,7 +1047,7 @@ async fn read_in_order<S: StorageBackend>(
         }
         let resume = cursor.filter(|_| i == first);
         let params = crate::storage::QueryParams {
-            sk_condition: sk_condition_sql.as_deref(),
+            sk_condition: sort_keys.sql.as_deref(),
             sk_params: &sk_params_refs,
             forward: plan.forward,
             limit: remaining,
@@ -1293,10 +1300,8 @@ fn validate_operand_types(
     let Some(wc) = where_clause else {
         return Ok(());
     };
-    for group in &wc.groups {
-        for condition in group {
-            check(condition, parameters)?;
-        }
+    for condition in wc.tree.conditions() {
+        check(condition, parameters)?;
     }
     Ok(())
 }
@@ -1417,6 +1422,7 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
             Ok(StatementPage {
                 items: Some(outcome.items),
                 size: outcome.evaluated_bytes,
+                read_units: outcome.read_units,
                 capacity: None,
                 next_token: outcome.next_token,
                 read_index: outcome.index.map(|i| ReadIndex {
@@ -1690,7 +1696,7 @@ async fn execute_select<S: StorageBackend>(
             }
         }
 
-        if keys_index(where_clause, read_pk) {
+        if keys_index(where_clause, read_pk, parameters) {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
                 .filter(|attr| !idx.projects(attr, table_key_schema))
@@ -1768,13 +1774,8 @@ async fn execute_select<S: StorageBackend>(
     )
     .await?;
 
-    // A continuation is owed whenever the read stopped because it hit the
-    // limit, whether or not anything in the window matched. That is why a page
-    // can come back short, or empty, and still carry a token.
-    let token = match (limit, &window.last_evaluated) {
-        (Some(lim), Some(stop)) if window.evaluated >= lim => {
-            Some(encode_next_token(table_name, fingerprint, stop))
-        }
+    let token = match &window.last_evaluated {
+        Some(stop) if window.continues => Some(encode_next_token(table_name, fingerprint, stop)),
         _ => None,
     };
 
@@ -1803,6 +1804,7 @@ async fn execute_select<S: StorageBackend>(
     Ok(SelectOutcome {
         items,
         evaluated_bytes: window.evaluated_bytes,
+        read_units: window.read_units,
         next_token: token,
         index,
         base_read_units,
@@ -1814,10 +1816,13 @@ async fn execute_select<S: StorageBackend>(
 /// rather than to the table, and the caller has no other way to know.
 struct SelectOutcome {
     items: Vec<Item>,
-    /// What the read walked, which is what it is charged on. Not the weight of
-    /// `items`: a filter and a projection both narrow the rows after the read
-    /// has already paid for them.
+    /// What the read walked. Not the weight of `items`: a filter and a
+    /// projection both narrow the rows after the read has already paid for
+    /// them.
     evaluated_bytes: usize,
+    /// What the read costs in strongly consistent units (see
+    /// `Window::read_units`).
+    read_units: f64,
     next_token: Option<String>,
     index: Option<ResolvedIndex>,
     /// What an LSI reach-back cost on the base table, in read units. It lands
@@ -1831,10 +1836,13 @@ struct Window {
     /// Where the last row read sat, matching or not. The cursor a continuation
     /// resumes from, so no row is evaluated twice.
     last_evaluated: Option<Cursor>,
-    /// How many rows were read, matching or not.
-    evaluated: usize,
+    /// Whether the read owes a continuation from `last_evaluated`.
+    continues: bool,
+    /// What the read costs in strongly consistent units: per sort-key branch
+    /// for a keyed read of branches, otherwise on `evaluated_bytes`.
+    read_units: f64,
     /// What those rows weighed as they were read, before the WHERE clause and
-    /// before any projection. This is what the read is charged on.
+    /// before any projection.
     evaluated_bytes: usize,
     /// What an LSI reach-back cost on the base table, in read units, summed over
     /// every row walked rather than every row kept.
@@ -1871,11 +1879,12 @@ async fn evaluate_window<S: StorageBackend>(
     // same partition key reads that partition too, with the whole clause as a
     // filter (captured eu-west-2 and us-east-1, 2026-10-23:
     // `pk = 'k' AND (x = 1 OR x = 2)` costs what `pk = 'k'` costs, on a table,
-    // an ALL GSI and an LSI). Its key is refused for size as a single-group
-    // read's is (captured eu-west-2 and us-east-1, 2026-10-10:
-    // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table).
-    let pk_condition = where_clause
-        .and_then(|wc| find_pk_condition(wc, read_pk).or_else(|| pk_in_every_group(wc, read_pk)));
+    // an ALL GSI and an LSI). When every branch bounds the sort key, the union
+    // of those ranges is pushed into the read too (see `sort_key_plan`, #271).
+    // Its key is refused for size as a single-group read's is (captured
+    // eu-west-2 and us-east-1, 2026-10-10: `pk = <2,049 bytes> AND
+    // (x = 1 OR x = 2)` on a table).
+    let pk_condition = where_clause.and_then(|wc| pk_in_every_group(wc, read_pk, parameters));
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
@@ -1889,12 +1898,12 @@ async fn evaluate_window<S: StorageBackend>(
             if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
                 return Err(refusal);
             }
-            if let (Some(sk_name), Some(wc)) =
-                (read_sk, where_clause.filter(|wc| wc.groups.len() == 1))
+            // AWS measures sort-key bounds only for a single AND group.
+            // An OR of sort-key equalities is accepted even when one bound
+            // exceeds the stored-key limit (2026-10-10 capture k19).
+            if let (Some(sk_name), Some(wc)) = (read_sk, where_clause)
+                && wc.groups.len() == 1
             {
-                // With multiple OR groups, the read uses the shared partition
-                // and evaluates the full condition as a filter. Sort-key
-                // values in one group are not key conditions for that read.
                 let sk_conditions =
                     translate_sk_conditions(&wc.groups[0], sk_name, parameters).unwrap_or_default();
                 for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
@@ -1909,49 +1918,33 @@ async fn evaluate_window<S: StorageBackend>(
         None => None,
     };
 
-    let rows: Vec<(String, String, String)> = if let Some(plan) = order {
+    // A read of one partition that bounds its sort key reads one row past its
+    // limit, so it knows whether a page ending where no branch can hold a
+    // later key really has nothing after it: an index can share that key with
+    // more items. It is charged per branch.
+    let sort_keys = sort_key_plan(where_clause, read_pk, read_sk, parameters);
+    let keyed_branches = matches!(pk_key, Some(Some(_))) && !sort_keys.branches.is_empty();
+    let mut charge = keyed_branches.then(|| BranchCharge::new(&sort_keys.branches));
+    let peek = limit.is_some() && keyed_branches;
+    let read_limit = limit.map(|lim| if peek { lim.saturating_add(1) } else { lim });
+
+    let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
         read_in_order(
-            storage,
-            table_name,
-            index,
-            where_clause,
-            parameters,
-            read_sk,
-            cursor,
-            limit,
-            plan,
+            storage, table_name, index, &sort_keys, cursor, read_limit, plan,
         )
         .await?
     } else if let Some(None) = pk_key {
         Vec::new()
     } else if let Some(Some(pk_str)) = pk_key {
-        // Sort-key conditions from a single OR group can be pushed into the
-        // SQL, so `limit` counts rows within the key-condition range. With
-        // multiple groups, read the shared partition and apply the whole WHERE
-        // clause as a filter instead; no one group's sort-key conditions apply
-        // to every row in the partition.
-        let sk_conditions = match (read_sk, where_clause) {
-            (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
-                translate_sk_conditions(&wc.groups[0], sk_name, parameters)
-            }
-            _ => None,
-        }
-        .unwrap_or_default();
-
-        // The shared helper numbers placeholders after the pk (?1), and the
-        // SQL builder appends the cursor's exclusive-start comparison after
-        // them, so a pushed-down range and a continuation compose the same
-        // way they do for Query.
-        let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
-        let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+        let sk_params_refs: Vec<&str> = sort_keys.params.iter().map(|s| s.as_str()).collect();
 
         // Ascending, so this path and the scan below agree on row order and a
         // continuation resumes the same way on either.
         let params = crate::storage::QueryParams {
-            sk_condition: sk_condition_sql.as_deref(),
+            sk_condition: sort_keys.sql.as_deref(),
             sk_params: &sk_params_refs,
             forward: true,
-            limit,
+            limit: read_limit,
             exclusive_start_sk: cursor.map(|c| c.sk.as_str()),
             exclusive_start_base_pk: cursor.and_then(|c| c.base_pk.as_deref()),
             exclusive_start_base_sk: cursor.and_then(|c| c.base_sk.as_deref()),
@@ -1993,6 +1986,13 @@ async fn evaluate_window<S: StorageBackend>(
         }
     };
 
+    let more_rows = match limit {
+        Some(lim) if peek && rows.len() > lim => {
+            rows.truncate(lim);
+            true
+        }
+        _ => false,
+    };
     let evaluated = rows.len();
     // The stop position is read off the last row whether or not it matched.
     // An index read needs the base table key with it, and the index row holds
@@ -2032,12 +2032,40 @@ async fn evaluate_window<S: StorageBackend>(
     let mut evaluated_bytes = 0usize;
     let mut base_read_units = 0f64;
     let mut matched = Vec::new();
-    for (_, _, json) in rows {
+
+    // A continuation is owed whenever the read stopped because it hit the
+    // limit, whether or not anything in the window matched. That is why a page
+    // can come back short, or empty, and still carry a token. The exception is
+    // a read of sort-key branches that ends on a key with no branch able to
+    // hold one after it: DynamoDB hands back no token (#271, captured
+    // eu-west-2 and us-east-1, 2026-10-23 to 2026-11-04: two OR'd sort-key
+    // equalities under `Limit: 1` come back over two pages, not three, on a
+    // table, an ALL GSI and under `ORDER BY sk DESC`, and a page ending on a
+    // range's closed bound, `sk BETWEEN 'row-1' AND 'row-2'` or `sk <= 'row-2'`,
+    // ended without one on every walk). A branch the read hasn't reached still
+    // holds the token, whether a missing key or an empty range.
+    // A page ending inside a range keeps it too: DynamoDB keeps it on most
+    // reads and drops it on some, the same query either way (captured five
+    // times in each region, 2026-11-04: `sk < 'row-2' OR sk > 'row-2'` kept it
+    // on seven of ten walks), so the read keeps it every time.
+    let forward = order.is_none_or(|plan| plan.forward);
+    let continues = match (limit, &last_evaluated) {
+        (Some(lim), Some(stop)) if evaluated >= lim => {
+            !peek
+                || more_rows
+                || sort_keys
+                    .branches
+                    .iter()
+                    .any(|branch| branch.extends_past(&stop.sk, forward))
+        }
+        _ => false,
+    };
+    for (_, sk, json) in rows {
         // A row that will not deserialise is a storage fault, and it is reported
         // rather than walked past. Skipping it left the row counted in
-        // `evaluated`, which paces the limit and mints the continuation, but not
-        // in `evaluated_bytes`, which is what the read is charged on, so the two
-        // halves of the same page disagreed about it. `actions::scan` reports the
+        // `evaluated`, which paces the limit and mints the continuation, but out
+        // of what the read is charged, so the two halves of the same page
+        // disagreed about it. `actions::scan` reports the
         // same fault on the same JSON.
         let item: Item = serde_json::from_str(&json).map_err(|e| {
             DynoxideError::InternalServerError(format!("Bad item JSON in storage: {e}"))
@@ -2045,11 +2073,15 @@ async fn evaluate_window<S: StorageBackend>(
         // A row of the table itself is charged on its billed size, a vector at
         // four bytes per dimension (captured eu-west-2 and us-east-1,
         // 2026-10-23). An index row stays sized by its numbers.
-        evaluated_bytes += if index.is_none() {
+        let bytes = if index.is_none() {
             crate::types::billed_item_size(&item, vector_defs)
         } else {
             crate::types::item_size(&item)
         };
+        evaluated_bytes += bytes;
+        if let Some(charge) = charge.as_mut() {
+            charge.record(&sk, bytes);
+        }
 
         // The reach-back runs on every row walked, not on the rows the filter
         // keeps. Charging only the survivors made a filter that matched nothing
@@ -2085,11 +2117,21 @@ async fn evaluate_window<S: StorageBackend>(
         }
     }
 
+    let read_units = match &charge {
+        Some(charge) => charge.units(
+            cursor,
+            last_evaluated.as_ref().filter(|_| continues),
+            forward,
+        ),
+        None => crate::types::read_capacity_units(evaluated_bytes),
+    };
+
     Ok(Window {
         matched,
         last_evaluated,
-        evaluated,
+        continues,
         evaluated_bytes,
+        read_units,
         base_read_units,
     })
 }
@@ -2281,13 +2323,11 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for group in &wc.groups {
-        for condition in group {
-            for path in condition_paths(condition) {
-                let root = root_attribute(path).to_string();
-                if !out.contains(&root) {
-                    out.push(root);
-                }
+    for condition in wc.tree.conditions() {
+        for path in condition_paths(condition) {
+            let root = root_attribute(path).to_string();
+            if !out.contains(&root) {
+                out.push(root);
             }
         }
     }
@@ -2484,6 +2524,186 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
     })
 }
 
+/// The OR-groups a keyed read takes its sort-key ranges from. A clause too
+/// wide to expand keeps only its common conditions in `groups`, which would
+/// drop an OR of sort-key conditions beside the wide filter, so the read uses
+/// the clause's key-only projection instead (captured eu-west-2 and
+/// us-east-1, 2026-11-03: `pk = 'k' AND (sk = 'row-1' OR sk = 'row-2')`
+/// beside nine wide filter pairs costs what the two keys cost). `None` when
+/// even that projection is too large, which reads the whole partition.
+fn read_groups<'a>(
+    wc: &'a WhereClause,
+    read_pk: &str,
+    read_sk: &str,
+) -> Option<std::borrow::Cow<'a, [Vec<Arc<WhereCondition>>]>> {
+    if wc.fully_expanded {
+        Some(std::borrow::Cow::Borrowed(&wc.groups))
+    } else {
+        key_groups(wc, read_pk, Some(read_sk))
+            .ok()
+            .map(std::borrow::Cow::Owned)
+    }
+}
+
+/// How a keyed read of one partition bounds its sort key, worked out once
+/// for the read, its paging and its charge.
+#[derive(Default)]
+struct SortKeyPlan {
+    /// The union of the branch ranges, pushed down into the read. `None` reads
+    /// the whole partition, as it does when any branch leaves the sort key
+    /// unbounded. SQL OR naturally deduplicates rows in overlapping ranges and
+    /// preserves cursors.
+    sql: Option<String>,
+    params: Vec<String>,
+    /// Each distinct OR branch's bounds. Empty when the read isn't bounded.
+    branches: Vec<SortKeyBranch>,
+}
+
+fn sort_key_plan(
+    where_clause: Option<&WhereClause>,
+    pk_name: &str,
+    sk_name: Option<&str>,
+    parameters: &[AttributeValue],
+) -> SortKeyPlan {
+    let (Some(wc), Some(sk)) = (where_clause, sk_name) else {
+        return SortKeyPlan::default();
+    };
+    let groups = read_groups(wc, pk_name, sk).and_then(|groups| {
+        groups
+            .iter()
+            .map(|group| translate_sk_conditions(group, sk, parameters))
+            .collect::<Option<Vec<_>>>()
+    });
+    let Some(groups) =
+        groups.filter(|groups| !groups.is_empty() && groups.iter().all(|g| !g.is_empty()))
+    else {
+        return SortKeyPlan::default();
+    };
+    let (sql, params) = sk_condition_groups_to_sql(&groups);
+    let mut branches: Vec<SortKeyBranch> = Vec::new();
+    for group in &groups {
+        // In a set order, so the same range written two ways is one branch
+        // and charged once.
+        let mut bounds: Vec<SortKeyBound> = group.iter().flat_map(|c| c.bounds()).collect();
+        bounds.sort();
+        bounds.dedup();
+        let branch = SortKeyBranch(bounds);
+        if !branches.contains(&branch) {
+            branches.push(branch);
+        }
+    }
+    SortKeyPlan {
+        sql,
+        params,
+        branches,
+    }
+}
+
+/// One OR branch's bounds on the stored sort key, which all hold.
+#[derive(PartialEq)]
+struct SortKeyBranch(Vec<SortKeyBound>);
+
+impl SortKeyBranch {
+    fn contains(&self, key: &str) -> bool {
+        self.0.iter().all(|bound| bound.admits(key))
+    }
+
+    /// Whether the branch can hold a key beyond `key`, in the read's
+    /// direction: its upper bounds reading forward, its lower ones backward.
+    fn extends_past(&self, key: &str, forward: bool) -> bool {
+        self.0.iter().all(|bound| match (forward, bound) {
+            (true, SortKeyBound::Eq(b) | SortKeyBound::Lt(b) | SortKeyBound::Le(b)) => {
+                b.as_str() > key
+            }
+            (true, SortKeyBound::Gt(_) | SortKeyBound::Ge(_)) => true,
+            (false, SortKeyBound::Eq(b) | SortKeyBound::Gt(b) | SortKeyBound::Ge(b)) => {
+                b.as_str() < key
+            }
+            (false, SortKeyBound::Lt(_) | SortKeyBound::Le(_)) => true,
+        })
+    }
+
+    /// Whether the branch can hold a key at or before `key`, in the read's
+    /// direction: its lower bounds reading forward, its upper ones backward.
+    fn starts_by(&self, key: &str, forward: bool) -> bool {
+        self.0.iter().all(|bound| match (forward, bound) {
+            (true, SortKeyBound::Eq(b) | SortKeyBound::Ge(b)) => b.as_str() <= key,
+            (true, SortKeyBound::Gt(b)) => b.as_str() < key,
+            (true, SortKeyBound::Lt(_) | SortKeyBound::Le(_)) => true,
+            (false, SortKeyBound::Eq(b) | SortKeyBound::Le(b)) => b.as_str() >= key,
+            (false, SortKeyBound::Lt(b)) => b.as_str() > key,
+            (false, SortKeyBound::Gt(_) | SortKeyBound::Ge(_)) => true,
+        })
+    }
+}
+
+/// What a keyed read of sort-key branches costs, gathered row by row.
+///
+/// Each branch is charged as one read: the rows it found rounded up on their
+/// own, and a read unit for a branch the page reached that found nothing, a
+/// missing key among them, on the table and on either kind of index (captured
+/// eu-west-2 and us-east-1, 2026-11-03 and 2026-11-04: two small keys cost 2
+/// consistent where the whole partition of three costs 1, `sk = 'row-0' OR
+/// sk = 'row-2'` with only `row-2` stored costs 2, and `sk < 'row-0' OR
+/// sk > 'row-2'` costs 2 for one row). An empty branch belongs to the page
+/// that first reaches it: one the read stopped short of waits for the next
+/// page, and one an earlier page already read into isn't charged again
+/// (`sk < 'row-2' OR sk > 'row-2'` under `Limit: 1` costs 0.5 a page).
+struct BranchCharge<'a> {
+    branches: &'a [SortKeyBranch],
+    /// What each branch's rows weighed. A stored row always weighs something,
+    /// so zero means the branch found nothing.
+    bytes: Vec<usize>,
+    /// Rows outside every branch, rounded up together.
+    stray: usize,
+}
+
+impl<'a> BranchCharge<'a> {
+    fn new(branches: &'a [SortKeyBranch]) -> Self {
+        Self {
+            branches,
+            bytes: vec![0; branches.len()],
+            stray: 0,
+        }
+    }
+
+    fn record(&mut self, sk: &str, bytes: usize) {
+        match self.branches.iter().position(|b| b.contains(sk)) {
+            Some(i) => self.bytes[i] += bytes,
+            None => self.stray += bytes,
+        }
+    }
+
+    /// Strongly consistent units for a page read after `cursor`, ending at
+    /// `stop` when it continues.
+    fn units(&self, cursor: Option<&Cursor>, stop: Option<&Cursor>, forward: bool) -> f64 {
+        let reached = |branch: &SortKeyBranch| {
+            cursor.is_none_or(|c| !branch.starts_by(&c.sk, forward))
+                && stop.is_none_or(|stop| branch.starts_by(&stop.sk, forward))
+        };
+        let units: f64 = self
+            .branches
+            .iter()
+            .zip(&self.bytes)
+            .map(|(branch, &bytes)| {
+                if bytes > 0 {
+                    crate::types::read_capacity_units(bytes)
+                } else if reached(branch) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        let stray = if self.stray > 0 {
+            crate::types::read_capacity_units(self.stray)
+        } else {
+            0.0
+        };
+        (units + stray).max(1.0)
+    }
+}
+
 /// Translate a single AND-group's sort-key conditions into the resolved form
 /// the Query action feeds its SQL builder, so a pk-bound SELECT reads only the
 /// key-condition range and `limit` paces the way DynamoDB's does.
@@ -2574,28 +2794,23 @@ fn translate_sk_conditions(
     Some(resolved)
 }
 
-/// Find a partition key equality condition, searching across all OR groups.
-/// Whether the WHERE clause keys this index, which is what decides between a
-/// query and a scan and so whether an unprojected filter attribute is rejected.
-///
-/// Broader than `find_pk_condition` on one axis and identical on the other. An
-/// `IN` on the index partition key counts: one value reads as `=` and queries
-/// the index, while several can't be pushed down as a single key and still
-/// scan; AWS rejects an unprojected filter alongside either. An index key reached through OR does not count, and AWS
-/// accepts an unprojected filter there. Captured eu-west-2 2026-08-15.
-///
-/// "Reached through OR" is the presence of an alternation, not the absence of
-/// the key from some branch of it. Case R11 in that capture ran
-/// `(gsiPk='x' AND nonproj='N1') OR (gsiPk='y')`, where every branch does name
-/// the key, and AWS still accepted the unprojected filter. So the group count is
-/// the test, and a rule reading the key off every group would reject what AWS
-/// allows.
-fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
+/// An index filter is keyed for a single pinned group (including IN), or
+/// when every OR branch pins the same partitions. Different partitions retain
+/// the scan behaviour captured in August; the shared-partition case was
+/// captured in eu-west-2 and us-east-1 on 2026-10-23 (#272), and a shared
+/// multi-value `IN` on 2026-11-03 (`g IN ['k', 'a'] AND (x = 1 OR x = 2)` is
+/// refused as `g IN ['k', 'a'] AND x = 1` is).
+fn keys_index(
+    where_clause: Option<&WhereClause>,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> bool {
     let Some(wc) = where_clause else {
         return false;
     };
     if wc.groups.len() != 1 {
-        return false;
+        return pk_in_every_group(wc, pk_name, parameters).is_some()
+            || same_partitions_in_every_group(wc, pk_name, parameters);
     }
     wc.groups[0].iter().any(|c| match &**c {
         WhereCondition::Comparison(cond) => {
@@ -2606,36 +2821,92 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     })
 }
 
-/// The one value a single-group WHERE clause pins the partition key to, when
-/// it pins one: an `=`, or an `IN` with one value, which DynamoDB reads exactly
-/// as `=` (captured eu-west-2 and us-east-1, 2026-10-10: `pk IN ['a']` costs
-/// what `pk = 'a'` costs, where a scan costs more).
-fn find_pk_condition<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
-    // Only optimise to a Query when there is a single OR group
-    // (multi-group OR with pk in only one group would need a union approach).
-    // A partition key named by more than one condition isn't a key read either
-    // (captured eu-west-2 and us-east-1, 2026-10-09: `pk = true AND pk = 'x'`
-    // is served as a scan and returns nothing).
-    let [group] = wc.groups.as_slice() else {
-        return None;
+/// Whether every group pins the partition key to the same set of stored
+/// keys, through one `=` or `IN` each: `pk IN ['a', 'b'] AND (x = 1 OR x = 2)`
+/// flattens to two groups that both name partitions `a` and `b`.
+fn same_partitions_in_every_group(
+    wc: &WhereClause,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> bool {
+    let partitions = |group: &[Arc<WhereCondition>]| -> Option<Vec<String>> {
+        let mut pinning = group.iter().filter_map(|c| match &**c {
+            WhereCondition::Comparison(cond)
+                if names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq =>
+            {
+                Some(std::slice::from_ref(&cond.value))
+            }
+            WhereCondition::In(path, values) if names_attribute(path, pk_name) => {
+                Some(values.as_slice())
+            }
+            _ => None,
+        });
+        let values = pinning.next()?;
+        if pinning.next().is_some() {
+            return None;
+        }
+        let mut keys = values
+            .iter()
+            .map(|v| resolve_value(v, parameters).ok()?.to_key_string())
+            .collect::<Option<Vec<_>>>()?;
+        keys.sort();
+        keys.dedup();
+        Some(keys)
     };
-    group_pk_value(group, pk_name)
+    let Some((first, rest)) = wc.groups.split_first() else {
+        return false;
+    };
+    let Some(shared) = partitions(first) else {
+        return false;
+    };
+    rest.iter()
+        .all(|group| partitions(group).as_ref() == Some(&shared))
 }
 
 /// The one value every group of a clause pins the partition key to, when
 /// they all pin the same one: `pk = 'a' AND (x = 1 OR x = 2)` flattens to two
-/// groups that both name partition `a`.
-fn pk_in_every_group<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
+/// groups that both name partition `a`. A partition pinned this way is read
+/// by key, with the full WHERE clause kept as a post-read filter.
+fn pk_in_every_group<'a>(
+    wc: &'a WhereClause,
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> Option<&'a PartiqlValue> {
     let (first, rest) = wc.groups.split_first()?;
-    let value = group_pk_value(first, pk_name)?;
+    let value = group_pk_value(first, pk_name, parameters)?;
     rest.iter()
-        .all(|group| group_pk_value(group, pk_name) == Some(value))
+        .all(|group| {
+            group_pk_value(group, pk_name, parameters)
+                .is_some_and(|other| same_partition_value(value, other, parameters))
+        })
         .then_some(value)
 }
 
-/// The one value a group pins the partition key to, as `find_pk_condition`
+/// Compare resolved storage keys so separate placeholders and equivalent
+/// numeric spellings name the same partition. Identical syntax also keeps
+/// unresolved values on their existing validation path.
+fn same_partition_value(
+    left: &PartiqlValue,
+    right: &PartiqlValue,
+    parameters: &[AttributeValue],
+) -> bool {
+    if left == right {
+        return true;
+    }
+    let stored = |value| resolve_value(value, parameters).ok()?.to_key_string();
+    match (stored(left), stored(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The one value a group pins the partition key to, as `pk_in_every_group`
 /// reads it.
-fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option<&'a PartiqlValue> {
+fn group_pk_value<'a>(
+    group: &'a [Arc<WhereCondition>],
+    pk_name: &str,
+    parameters: &[AttributeValue],
+) -> Option<&'a PartiqlValue> {
     let mut pinning = group.iter().filter_map(|c| match &**c {
         WhereCondition::Comparison(cond)
             if names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq =>
@@ -2647,15 +2918,13 @@ fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option
         }
         _ => None,
     });
-    let values = pinning.next()?;
-    if pinning.any(|other| other != values) {
-        return None;
-    }
     // An IN with several values names several partitions; it stays a scan.
-    match values {
-        [value] => Some(value),
-        _ => None,
-    }
+    let [value] = pinning.next()? else {
+        return None;
+    };
+    pinning
+        .all(|other| matches!(other, [other] if same_partition_value(value, other, parameters)))
+        .then_some(value)
 }
 
 /// A table's metadata and its parsed key schema, worked out once.
@@ -3928,18 +4197,32 @@ fn matches_where(
     // negated forms), and a statement short of its parameters mustn't read or
     // delete an item on that account.
     if wc
-        .groups
+        .tree
+        .conditions()
         .iter()
-        .flatten()
         .any(|condition| has_unbound_parameter(condition, parameters.len()))
     {
         return false;
     }
-
-    // OR semantics: any group matching is sufficient
-    wc.groups
-        .iter()
-        .any(|group| matches_conditions(item, group, parameters))
+    fn matches_tree(
+        item: &Item,
+        tree: &crate::partiql::parser::ConditionTree,
+        parameters: &[AttributeValue],
+    ) -> bool {
+        use crate::partiql::parser::ConditionTree;
+        match tree {
+            ConditionTree::Leaf(condition) => {
+                matches_conditions(item, std::slice::from_ref(condition), parameters)
+            }
+            ConditionTree::And(terms) => terms
+                .iter()
+                .all(|term| matches_tree(item, term, parameters)),
+            ConditionTree::Or(terms) => terms
+                .iter()
+                .any(|term| matches_tree(item, term, parameters)),
+        }
+    }
+    matches_tree(item, &wc.tree, parameters)
 }
 
 /// Whether `condition` names a parameter at or past `bound`, the number

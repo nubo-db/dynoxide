@@ -888,6 +888,21 @@ names = { "#a" = "email", "#b" = "phone" }
     }
 
     #[test]
+    fn a_match_on_an_underscore_name_needs_an_alias() {
+        // The match expression is parsed as DynamoDB parses a condition, which
+        // refuses a leading `_` (#274). The path is the rule's own syntax.
+        let rule = |match_expr: &str, names: &str| {
+            parsed_rule(&format!(
+                "[[rules]]\nmatch = \"{match_expr}\"\npath = \"_x\"\n\
+                 action = {{ type = \"redact\" }}\n{names}"
+            ))
+        };
+        let err = rule("attribute_exists(_x)", "").unwrap_err();
+        assert!(err.contains("Syntax error; token: \"_\""), "{err}");
+        rule("attribute_exists(#x)", "names = { \"#x\" = \"_x\" }").unwrap();
+    }
+
+    #[test]
     fn a_value_the_match_expression_never_uses_is_rejected() {
         let err = parsed_rule(
             r##"

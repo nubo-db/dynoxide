@@ -346,6 +346,10 @@ pub struct WhereClause {
     /// or path written once would otherwise be held once per group; shared, it
     /// is held once however many groups name it.
     pub groups: Vec<Vec<Arc<WhereCondition>>>,
+    /// False when expansion exceeded the planning budget. `groups` then
+    /// contains only conditions required by every branch; `tree` remains the
+    /// complete filter and must be used for evaluation and operand checks.
+    pub(crate) fully_expanded: bool,
     /// The equalities among the clause's top-level conditions: those joined to
     /// the rest by `AND` alone, outside any `OR` or `NOT`, parentheses aside.
     /// An UPDATE or DELETE takes its key from these and only these, as
@@ -384,6 +388,43 @@ impl ConditionTree {
             // push_not_down replaces it with a refused condition.
             BoolExpr::NonBoolean(_) => {
                 ConditionTree::Leaf(Arc::new(WhereCondition::Exists(String::new())))
+            }
+        }
+    }
+
+    /// Every condition, once, in statement order, without distributing AND.
+    pub(crate) fn conditions(&self) -> Vec<&WhereCondition> {
+        fn visit<'a>(tree: &'a ConditionTree, out: &mut Vec<&'a WhereCondition>) {
+            match tree {
+                ConditionTree::Leaf(condition) => out.push(condition),
+                ConditionTree::And(terms) | ConditionTree::Or(terms) => {
+                    for term in terms {
+                        visit(term, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(self, &mut out);
+        out
+    }
+
+    /// Conditions that hold on every matching row. Used as a conservative
+    /// read plan when the exact OR-of-ANDs would exceed the expansion budget.
+    fn required_conditions(&self) -> Vec<Arc<WhereCondition>> {
+        match self {
+            Self::Leaf(condition) => vec![condition.clone()],
+            Self::And(terms) => terms.iter().flat_map(Self::required_conditions).collect(),
+            Self::Or(terms) => {
+                let Some((first, rest)) = terms.split_first() else {
+                    return Vec::new();
+                };
+                let mut common = first.required_conditions();
+                for term in rest {
+                    let required = term.required_conditions();
+                    common.retain(|condition| required.contains(condition));
+                }
+                common
             }
         }
     }
@@ -2313,6 +2354,7 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
             let parsed = parse_conditions_with_or(t)?;
             Ok(Some(WhereClause {
                 groups: parsed.groups,
+                fully_expanded: parsed.fully_expanded,
                 top_level_equalities: parsed.top_level_equalities,
                 tree: parsed.tree,
             }))
@@ -2347,6 +2389,7 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
     // refuses for another reason (too many operators, too many IN operands).
     let refused = || ParsedConditions {
         groups: Vec::new(),
+        fully_expanded: true,
         top_level_equalities: Vec::new(),
         tree: ConditionTree::And(Vec::new()),
     };
@@ -2358,12 +2401,15 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
         if tree.bytes() > MAX_CLAUSE_BYTES {
             return Err(TOO_COMPLEX.to_string());
         }
-        let groups = to_dnf(&tree)?;
-        Ok((tree, groups))
+        let expanded = to_dnf(&tree);
+        let fully_expanded = expanded.is_ok();
+        let groups = expanded.unwrap_or_else(|_| vec![tree.required_conditions()]);
+        Ok((tree, groups, fully_expanded))
     });
-    let (tree, groups) = flattened?;
+    let (tree, groups, fully_expanded) = flattened?;
     Ok(ParsedConditions {
         groups,
+        fully_expanded,
         top_level_equalities,
         tree,
     })
@@ -2373,6 +2419,7 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
 /// top-level conditions, and its tree.
 struct ParsedConditions {
     groups: Vec<Vec<Arc<WhereCondition>>>,
+    fully_expanded: bool,
     top_level_equalities: Vec<Condition>,
     tree: ConditionTree,
 }
@@ -3491,7 +3538,7 @@ fn slots(groups: &Groups) -> usize {
 /// slots to `MAX_OR_SLOTS` between them, checking each arm before adding it.
 /// The conditions themselves are shared, so a slot costs a pointer however
 /// long the path or literal it names.
-fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
+pub(crate) fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
     let too_complex = || Err(TOO_COMPLEX.to_string());
     match tree {
         ConditionTree::Leaf(cond) => Ok(vec![vec![Arc::clone(cond)]]),
@@ -5433,7 +5480,7 @@ mod tests {
     /// statement limit keeps such a clause out of the parser now, so this
     /// guards the cap behind it.
     #[test]
-    fn a_clause_too_wide_to_flatten_is_rejected_rather_than_grinding() {
+    fn a_clause_too_wide_to_flatten_keeps_its_tree_without_grinding() {
         let values = (0..MAX_IN_OPERANDS)
             .map(|i| format!("'v{i}'"))
             .collect::<Vec<_>>()
@@ -5443,8 +5490,15 @@ mod tests {
             clause.push_str(&format!(" AND NOT (b='p{i}' AND b='q{i}')"));
         }
         let start = std::time::Instant::now();
-        let err = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap_err();
-        assert!(err.to_string().contains("too complex"), "got {err}");
+        let parsed = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap();
+        let Statement::Select {
+            where_clause: Some(wc),
+            ..
+        } = parsed
+        else {
+            panic!("SELECT")
+        };
+        assert!(!wc.fully_expanded);
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 

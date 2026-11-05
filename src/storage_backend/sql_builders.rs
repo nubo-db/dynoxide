@@ -1017,10 +1017,12 @@ pub fn query_gsi_items<'a>(
     let mut out = vec![SqlParam::text(gsi_pk)];
 
     if let Some(cond) = params.sk_condition {
-        // The key-condition builder emits ` sk ` / ` sk>` forms only, so this
-        // targeted rewrite is safe; threading the column name through would be
-        // a larger refactor.
-        let gsi_cond = cond.replace(" sk ", " gsi_sk ").replace(" sk>", " gsi_sk>");
+        // The key-condition builder emits ` sk ` / ` sk>` bounds and `(sk `
+        // inside range unions. All values are separate bound parameters.
+        let gsi_cond = cond
+            .replace(" sk ", " gsi_sk ")
+            .replace("(sk ", "(gsi_sk ")
+            .replace(" sk>", " gsi_sk>");
         sql.push(' ');
         sql.push_str(&gsi_cond);
         for &p in params.sk_params {

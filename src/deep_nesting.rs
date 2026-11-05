@@ -117,6 +117,7 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     }
     if let Err(e) = check_members(operation, &rewritten) {
         let e = older_return_values_wording(operation, &rewritten, e);
+        let e = older_member_errors(operation, &rewritten, e);
         return DeepBody::Refuse(crate::validation::resolve_request_validation_tag(
             operation, e,
         ));
@@ -136,17 +137,17 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
     // 2026-10-09, for ALL_NEW and UPDATED_NEW).
     if operation == "DeleteItem" {
         let enveloped = crate::validation::envelope_message(RETURN_VALUES_NOT_HONOURED);
-        return match err {
+        match &err {
             DynoxideError::ValidationException(message)
             | DynoxideError::EnvelopedValidation(message)
-                if message == enveloped || message == RETURN_VALUES_NOT_HONOURED =>
+                if message == &enveloped || message == RETURN_VALUES_NOT_HONOURED =>
             {
-                DynoxideError::ValidationException(RETURN_VALUES_NOT_HONOURED.to_string())
+                return DynoxideError::ValidationException(RETURN_VALUES_NOT_HONOURED.to_string());
             }
-            other => other,
-        };
+            _ => {}
+        }
     }
-    if !matches!(operation, "PutItem" | "UpdateItem") {
+    if !matches!(operation, "PutItem" | "UpdateItem" | "DeleteItem") {
         return err;
     }
     let generic = crate::validation::RETURN_VALUES_REJECTION;
@@ -175,6 +176,203 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
         other => other,
     }
 }
+
+/// The older layer checks a deep write's members in an order of its own and
+/// reports each one that fails, where the decoder stops at the first and
+/// skips `ConditionalOperator`. Captured eu-west-2 and us-east-1, 2026-11-03
+/// and 2026-11-04, with an `Expected` value nested 100 levels and every member
+/// wrong, they come in the order of [`OLDER_MEMBERS`]. A DeleteItem
+/// `ReturnValues` of `ALL_NEW` beside `XOR` gets the `XOR` error alone. A
+/// table name that is missing or empty is a member error, and its length and
+/// pattern are checked only once the members pass.
+///
+/// So when every error the decoder reported is one of those, the list is
+/// rebuilt from the request in that order. Any other error in it leaves it as
+/// it is.
+fn older_member_errors(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
+    let Some((_, order)) = OLDER_MEMBERS.iter().find(|(op, _)| *op == operation) else {
+        return err;
+    };
+    let DynoxideError::ValidationException(message) = &err else {
+        return err;
+    };
+    // A bare error's value can hold " detected: " too, so only a count
+    // makes a header.
+    let reported = match message.split_once(" detected: ") {
+        Some((header, list))
+            if header
+                .strip_suffix(" validation errors")
+                .or_else(|| header.strip_suffix(" validation error"))
+                .is_some_and(|count| count.parse::<usize>().is_ok()) =>
+        {
+            list
+        }
+        _ => message.as_str(),
+    };
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+        return err;
+    };
+    let rebuilt: Vec<String> = order
+        .iter()
+        .filter_map(|member| member.rejection(request.get(member.name)))
+        .collect();
+    let table_name = request.get("TableName").and_then(serde_json::Value::as_str);
+    // The table name's errors as the decoder words them, which the older
+    // layer's take the place of.
+    let decoded = match (operation, table_name) {
+        (_, None) => Vec::new(),
+        ("UpdateItem", name) => crate::validation::update_item_table_name_errors(name),
+        (_, name) => crate::validation::item_table_name_errors(name),
+    };
+    // Matched whole rather than split on "; ", which a value can hold.
+    let mut known: Vec<&str> = rebuilt.iter().chain(&decoded).map(String::as_str).collect();
+    known.push(RETURN_VALUES_NOT_HONOURED);
+    if !made_of(reported, &known) {
+        return err;
+    }
+    // A name's length and pattern are checked once the members pass.
+    let rebuilt = match table_name {
+        Some(name) if rebuilt.is_empty() => crate::validation::older_table_name_errors(name),
+        _ => rebuilt,
+    };
+    match crate::validation::format_validation_errors(&rebuilt) {
+        Some(message) => DynoxideError::ValidationException(message),
+        None => err,
+    }
+}
+
+/// Whether `list` is some of `errors`, each at most once, joined by "; ".
+fn made_of(list: &str, errors: &[&str]) -> bool {
+    errors.iter().enumerate().any(|(i, error)| {
+        list.strip_prefix(error).is_some_and(|rest| {
+            let others: Vec<&str> = [&errors[..i], &errors[i + 1..]].concat();
+            rest.is_empty()
+                || rest
+                    .strip_prefix("; ")
+                    .is_some_and(|rest| made_of(rest, &others))
+        })
+    })
+}
+
+/// A request member the older layer checks, and how it refuses one.
+struct OlderMember {
+    name: &'static str,
+    /// What the message calls it.
+    wire: &'static str,
+    check: OlderCheck,
+}
+
+enum OlderCheck {
+    ReturnValues,
+    ConditionalOperator,
+    ReturnValuesOnConditionCheckFailure,
+    ReturnConsumedCapacity,
+    ReturnItemCollectionMetrics,
+    Required,
+    TableName,
+}
+
+impl OlderMember {
+    const fn new(name: &'static str, wire: &'static str, check: OlderCheck) -> Self {
+        Self { name, wire, check }
+    }
+
+    fn rejection(&self, value: Option<&serde_json::Value>) -> Option<String> {
+        use crate::validation::*;
+        let text = value.and_then(|v| v.as_str());
+        match self.check {
+            // `ALL_NEW` and the other values DeleteItem refuses are in the
+            // enum, so the older layer doesn't reject them here.
+            OlderCheck::ReturnValues => text
+                .filter(|v| !RETURN_VALUES.contains(v))
+                .map(return_values_value_rejection),
+            OlderCheck::ConditionalOperator => conditional_operator_rejection(text),
+            OlderCheck::ReturnValuesOnConditionCheckFailure => {
+                return_values_on_condition_check_failure_rejection(text, self.wire)
+            }
+            OlderCheck::ReturnConsumedCapacity => return_consumed_capacity_rejection(text),
+            OlderCheck::ReturnItemCollectionMetrics => {
+                return_item_collection_metrics_rejection(text)
+            }
+            OlderCheck::TableName if text == Some("") => Some(older_empty_table_name_rejection()),
+            // A null member is read as a missing one.
+            OlderCheck::Required | OlderCheck::TableName => {
+                value.is_none_or(serde_json::Value::is_null).then(|| {
+                    format!(
+                        "Value null at '{}' failed to satisfy constraint: Member must not be null",
+                        self.wire
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// The members the older layer checks on each deep write, in the order it
+/// reports them.
+const OLDER_MEMBERS: [(&str, [OlderMember; 7]); 3] = {
+    use OlderCheck::*;
+    const RV: OlderMember = OlderMember::new("ReturnValues", "returnValues", ReturnValues);
+    const CO: OlderMember = OlderMember::new(
+        "ConditionalOperator",
+        "conditionalOperator",
+        ConditionalOperator,
+    );
+    const RVOCCF: OlderMember = OlderMember::new(
+        "ReturnValuesOnConditionCheckFailure",
+        "returnValuesOnConditionCheckFailure",
+        ReturnValuesOnConditionCheckFailure,
+    );
+    const RCC: OlderMember = OlderMember::new(
+        "ReturnConsumedCapacity",
+        "returnConsumedCapacity",
+        ReturnConsumedCapacity,
+    );
+    const RICM: OlderMember = OlderMember::new(
+        "ReturnItemCollectionMetrics",
+        "returnItemCollectionMetrics",
+        ReturnItemCollectionMetrics,
+    );
+    const TABLE: OlderMember = OlderMember::new("TableName", "tableName", TableName);
+    [
+        (
+            "PutItem",
+            [
+                RV,
+                CO,
+                OlderMember::new("Item", "item", Required),
+                RVOCCF,
+                RCC,
+                RICM,
+                TABLE,
+            ],
+        ),
+        (
+            "UpdateItem",
+            [
+                RCC,
+                TABLE,
+                RV,
+                CO,
+                RVOCCF,
+                RICM,
+                OlderMember::new("Key", "key", Required),
+            ],
+        ),
+        (
+            "DeleteItem",
+            [
+                RV,
+                CO,
+                RVOCCF,
+                RCC,
+                RICM,
+                OlderMember::new("Key", "key", Required),
+                TABLE,
+            ],
+        ),
+    ]
+};
 
 /// A value wrapped in one more map than DynamoDB accepts in a PartiQL
 /// parameter, which the operation refuses with the same message a far deeper
@@ -216,10 +414,16 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
 
     crate::serialization_checks::pre_check_serialization_types(operation, body)?;
     match operation {
-        "PutItem" => deserialize::<put_item::PutItemRequest>(body).map(drop),
+        "PutItem" => deserialize::<put_item::PutItemRequest>(body).and_then(|request| {
+            check_older_conditional_operator(request.conditional_operator.as_deref())
+        }),
         "GetItem" => deserialize::<get_item::GetItemRequest>(body).map(drop),
-        "DeleteItem" => deserialize::<delete_item::DeleteItemRequest>(body).map(drop),
-        "UpdateItem" => deserialize::<update_item::UpdateItemRequest>(body).map(drop),
+        "DeleteItem" => deserialize::<delete_item::DeleteItemRequest>(body).and_then(|request| {
+            check_older_conditional_operator(request.conditional_operator.as_deref())
+        }),
+        "UpdateItem" => deserialize::<update_item::UpdateItemRequest>(body).and_then(|request| {
+            check_older_conditional_operator(request.conditional_operator.as_deref())
+        }),
         "Query" => deserialize::<query::QueryRequest>(body).map(drop),
         "Scan" => deserialize::<scan::ScanRequest>(body).map(drop),
         "BatchGetItem" => deserialize::<batch_get_item::BatchGetItemRequest>(body).map(drop),
@@ -233,6 +437,15 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
                 .and_then(|request| transact_write_items::check_request(&request))
         }
         _ => Ok(()),
+    }
+}
+
+fn check_older_conditional_operator(operator: Option<&str>) -> crate::Result<()> {
+    match crate::validation::conditional_operator_rejection(operator) {
+        Some(message) => Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&message),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -633,5 +846,28 @@ mod tests {
         let stand_in = just_past_the_limit();
         let values = scan(&format!(r#"{{"Parameters":[{stand_in}]}}"#)).unwrap();
         assert_eq!(values[0].nesting, MAX_NESTING + 1);
+    }
+
+    #[test]
+    fn an_error_the_older_layer_does_not_give_leaves_the_list_alone() {
+        let body = r#"{"TableName":"Deep","Key":{"pk":{"S":"a"}},"ConditionalOperator":"XOR"}"#;
+        let rejected = |message: &str| match older_member_errors(
+            "DeleteItem",
+            body,
+            DynoxideError::ValidationException(message.to_string()),
+        ) {
+            DynoxideError::ValidationException(message) => message,
+            other => panic!("not a validation error: {other:?}"),
+        };
+        let xor = crate::validation::conditional_operator_rejection(Some("XOR")).unwrap();
+        let other =
+            "Value 'x' at 'somethingElse' failed to satisfy constraint: Member must not be odd";
+        let mixed = format!("2 validation errors detected: {other}; {xor}");
+        assert_eq!(rejected(&mixed), mixed);
+        // And one it does give is rebuilt in the older layer's form.
+        assert_eq!(
+            rejected(&xor),
+            format!("1 validation error detected: {xor}")
+        );
     }
 }

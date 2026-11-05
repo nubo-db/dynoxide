@@ -292,7 +292,7 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
 }
 
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+    c.is_ascii_alphabetic()
 }
 
 fn is_name_byte(b: u8) -> bool {

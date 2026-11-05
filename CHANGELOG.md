@@ -19,17 +19,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`--port 0` reports the port the server bound.** The OS picks a free port
-  when the server is started with `--port 0`, but the startup line printed
-  `Dynoxide listening on http://127.0.0.1:0`, so nothing outside the process
-  could find the server. It now prints the port that was assigned. The line is
-  unchanged for any other port.
-- **PartiQL reads a shared partition when every OR branch pins the same key.**
-  A condition such as `pk = 'k' AND (x = 1 OR x = 2)` used to scan the table,
-  so it could return short pages and charge for every partition. It now reads
-  that partition on both tables and indexes, while applying the full condition
-  as a filter. Captured against eu-west-2 and us-east-1 on 23 October 2026;
-  the earlier scan behaviour was captured in both regions on 10 October 2026.
+- Expressions refuse attribute names starting with `_` unless they use an
+  `ExpressionAttributeNames` alias, as DynamoDB does, in key condition,
+  filter, projection, condition and update expressions alike. This includes
+  an import rule's `match` expression, so a rule matching such an attribute
+  now needs an alias in its `names`. A rule's `path` is unaffected
+  ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
+- PartiQL `SELECT` reads one partition when every OR branch names the same
+  partition key. It used to scan the table, charging for unrelated rows and
+  counting them towards `Limit`. Separate parameters holding the same key,
+  including equivalent numeric spellings, use the same partition read.
+  Captured against eu-west-2 and us-east-1 on 23 October 2026
+  ([#229](https://github.com/nubo-db/dynoxide/issues/229),
+  [#269](https://github.com/nubo-db/dynoxide/pull/269), thanks
+  [@jay23606](https://github.com/jay23606)).
+- A PartiQL OR of sort-key conditions reads only their union within the
+  shared partition, on tables and on global and local secondary indexes,
+  including beside a filter too wide to expand. A `Limit` read that ends on
+  the last of a set of sort keys, or on a range's closed bound, returns no
+  `NextToken`, so two keys under `Limit: 1` take two pages rather than
+  three, on an index and under `ORDER BY` too.
+  Read capacity is charged per OR branch, as DynamoDB charges it, so each
+  requested key costs a read whether or not it exists. Captured against
+  eu-west-2 and us-east-1 on 3 and 4 November 2026
+  ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
+- PartiQL accepts `ORDER BY` on the sort key when OR branches share one
+  partition. It used to count that partition more than once and demand the
+  partition key in `ORDER BY`
+  ([#273](https://github.com/nubo-db/dynoxide/issues/273)).
+- A PartiQL filter on an attribute an index doesn't project is refused when
+  OR branches share the index partition key, including through one
+  multi-value `IN`. It used to return no items
+  ([#272](https://github.com/nubo-db/dynoxide/issues/272)).
+- PartiQL evaluates large OR filters as a tree when expanding their
+  combinations would exceed the read planner's budget. A partition key
+  equality beside the filter still reads that partition. Nine, sixteen and
+  forty pairs of OR conditions now run, with key-type and overlapping-range
+  checks preserved when the filter exceeds the expansion budget. A string
+  partition key given `1` and `1.0` is refused for its type, where it used to
+  read nothing
+  ([#225](https://github.com/nubo-db/dynoxide/issues/225)).
+- Request-member errors follow DynamoDB's wording and order for deep
+  `DeleteItem`, `PutItem` and `UpdateItem` requests. An `UpdateItem` without
+  a key joins an empty table name or invalid `ConditionalOperator` with the
+  missing-key error, and Query reports a misused `ConditionalOperator` before
+  an invalid `Select`. A deep `PutItem`, `UpdateItem` or `DeleteItem` reports
+  every invalid member together, in DynamoDB's order: the enum members, a
+  missing `Item` or `Key`, and a missing or empty table name. As in DynamoDB,
+  a table name's length and pattern are reported only once those pass
+  ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
+- PartiQL reads a `Limit` past 2147483647 as that number, as Query and Scan
+  do. A `Limit` near or past 9223372036854775807 used to fail the read.
+- A `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem`, `Query` or `Scan`
+  table name is measured in characters, as DynamoDB measures it, so `😀😀` is
+  too short and 128 emoji aren't too long. `SearchVectors` shares the check.
+  A deep `PutItem`, `UpdateItem` or `DeleteItem` measures it in UTF-16 units,
+  as DynamoDB does there.
+- `--port 0` reports the port the server bound. The startup line used to
+  print the requested address, `Dynoxide listening on http://127.0.0.1:0`, so
+  nothing outside the process could tell which port the OS had assigned. The
+  line is unchanged for any other port
+  ([#277](https://github.com/nubo-db/dynoxide/pull/277), thanks
+  [@samchungy](https://github.com/samchungy)).
 
 ## [1.5.0] - 2026-10-23
 

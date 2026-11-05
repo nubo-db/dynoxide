@@ -120,24 +120,20 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             return Err(serde::de::Error::custom(message));
         }
 
-        // Without its key, UpdateItem falls back to the older layer in all seven
-        // regions captured on 2026-10-09: every enum error in the older
-        // per-value wording, then the key, and no table name error beside
-        // them unless the name is missing altogether. The enums' order is the
-        // older layer's (ReturnConsumedCapacity, ReturnValues,
-        // ReturnValuesOnConditionCheckFailure, ReturnItemCollectionMetrics),
-        // with a missing name's error right after ReturnConsumedCapacity's
-        // (captured eu-west-2 and us-east-1, 2026-10-09). An empty name is
-        // still checked first.
-        if raw.key.is_none() && raw.table_name.as_deref() != Some("") {
+        // A missing key hands the request to the older member-validation
+        // layer, including an empty table name and ConditionalOperator (#262).
+        if raw.key.is_none() {
             let mut errors: Vec<String> = Vec::new();
             if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
                 raw.return_consumed_capacity.as_deref(),
             ) {
                 errors.push(msg);
             }
-            if raw.table_name.is_none() {
-                errors.extend(crate::validation::update_item_table_name_errors(None));
+            if raw.table_name.as_deref().is_none_or(str::is_empty) {
+                errors.extend(crate::validation::table_name_constraint_errors(
+                    raw.table_name.as_deref(),
+                    crate::validation::TableNameContext::ReadWrite,
+                ));
             }
             if let Some(rv) = raw.return_values.as_deref()
                 && !crate::validation::RETURN_VALUES.contains(&rv)
@@ -155,6 +151,9 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             ) {
                 errors.push(msg);
             }
+            errors.extend(crate::validation::conditional_operator_rejection(
+                raw.conditional_operator.as_deref(),
+            ));
             errors.push(
                 "Value null at 'key' failed to satisfy constraint: Member must not be null"
                     .to_string(),

@@ -1319,3 +1319,546 @@ async fn a_batch_statement_parameter_at_32_levels_runs_beside_a_63_level_one() {
     assert_eq!(responses[1]["Error"]["Message"], NEST, "{body}");
     assert!(item_exists(&url, "base").await);
 }
+
+// #262, captured eu-west-2 and us-east-1 on 9 October 2026.
+#[tokio::test]
+async fn older_member_errors_win_over_deep_values() {
+    let url = start().await;
+    let rv = "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]";
+    let xor = "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
+    // Shallower requests keep the newer wording, so the rewording must not
+    // reach them: the generic ReturnValues set at 40 levels, [ALL, OR] at 33
+    // and 40.
+    let generic_rv = "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+    let newer_xor = "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]";
+    for depth in [33, 40, 63, 100] {
+        let v = deep_map(depth);
+        let (rv, xor) = if depth < 63 {
+            (generic_rv, newer_xor)
+        } else {
+            (rv, xor)
+        };
+        // DeleteItem's shallow wording at 33 levels was captured on
+        // 2026-11-03.
+        let delete_members = [
+            format!(r#""Key":{{"pk":{v}}}"#),
+            format!(
+                r#""Key":{{"pk":{{"S":"a"}}}},"ExpressionAttributeValues":{{":v":{v}}},"ConditionExpression":"pk = :v""#
+            ),
+            format!(r#""Key":{{"pk":{{"S":"a"}}}},"Expected":{{"data":{{"Value":{v}}}}}"#),
+        ];
+        for member in delete_members {
+            let (status, body) = send(
+                &url,
+                "DeleteItem",
+                format!(r#"{{"TableName":"Deep",{member},"ReturnValues":"BOGUS"}}"#),
+            )
+            .await;
+            assert_validation(status, &body, rv);
+        }
+        for (operation, member) in [
+            ("PutItem", r#""Item":{"pk":{"S":"a"}}"#),
+            ("UpdateItem", r#""Key":{"pk":{"S":"a"}}"#),
+        ] {
+            let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},"ConditionalOperator":"XOR"}}"#)).await;
+            assert_validation(status, &body, xor);
+        }
+    }
+    // Several members wrong at 100 levels: each reported, in the older
+    // layer's order for the operation (captured eu-west-2 and us-east-1,
+    // 2026-11-03 and 2026-11-04).
+    let v = deep_map(100);
+    let rv = "Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]";
+    let xor = "Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
+    let rcc = "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let ricm = "Value 'BOGUS' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]";
+    let put = r#""Item":{"pk":{"S":"a"}}"#;
+    let key = r#""Key":{"pk":{"S":"a"}}"#;
+    let xor_rv = r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS""#;
+    for (operation, member, extra, expected) in [
+        ("PutItem", put, xor_rv, vec![rv, xor]),
+        ("UpdateItem", key, xor_rv, vec![rv, xor]),
+        ("DeleteItem", key, xor_rv, vec![rv, xor]),
+        (
+            "PutItem",
+            put,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rv, xor, rcc],
+        ),
+        (
+            "UpdateItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rcc, rv, xor],
+        ),
+        (
+            "PutItem",
+            put,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, ricm],
+        ),
+        (
+            "PutItem",
+            put,
+            r#""ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rv, rcc],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#,
+            vec![rv, xor, rcc],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, ricm],
+        ),
+        (
+            "UpdateItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, ricm],
+        ),
+        (
+            "PutItem",
+            put,
+            r#""ConditionalOperator":"XOR","ReturnValues":"NONE","ReturnConsumedCapacity":"BOGUS""#,
+            vec![xor, rcc],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"ALL_NEW""#,
+            vec![xor],
+        ),
+        (
+            "UpdateItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rcc, rv, xor, ricm],
+        ),
+        (
+            "DeleteItem",
+            key,
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS","ReturnItemCollectionMetrics":"BOGUS""#,
+            vec![rv, xor, rcc, ricm],
+        ),
+    ] {
+        let (status, body) = send(&url, operation, format!(r#"{{"TableName":"Deep",{member},"Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}},{extra}}}"#)).await;
+        let message = match expected.as_slice() {
+            [single] => format!("1 validation error detected: {single}"),
+            _ => format!(
+                "{} validation errors detected: {}",
+                expected.len(),
+                expected.join("; ")
+            ),
+        };
+        assert_validation(status, &body, &message);
+    }
+    // Every member wrong, with and without the key or item, and a member the
+    // older layer names beside the ones above (captured eu-west-2 and
+    // us-east-1, 2026-11-04).
+    let rvoccf = "Value 'BOGUS' at 'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]";
+    let no_key = "Value null at 'key' failed to satisfy constraint: Member must not be null";
+    let no_item = "Value null at 'item' failed to satisfy constraint: Member must not be null";
+    let all = r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS","ReturnItemCollectionMetrics":"BOGUS","ReturnValuesOnConditionCheckFailure":"BOGUS""#;
+    let expected_deep =
+        format!(r#""Expected":{{"data":{{"Value":{v}}},"other":{{"Value":{{"S":"a"}}}}}}"#);
+    for (operation, members, expected) in [
+        (
+            "UpdateItem",
+            r#""ConditionalOperator":"XOR","ReturnValues":"BOGUS""#.to_string(),
+            vec![rv, xor, no_key],
+        ),
+        (
+            "DeleteItem",
+            format!(
+                r#"{key},"ConditionalOperator":"XOR","ReturnValues":"BOGUS","ReturnValuesOnConditionCheckFailure":"BOGUS""#
+            ),
+            vec![rv, xor, rvoccf],
+        ),
+        (
+            "UpdateItem",
+            all.to_string(),
+            vec![rcc, rv, xor, rvoccf, ricm, no_key],
+        ),
+        (
+            "UpdateItem",
+            format!("{key},{all}"),
+            vec![rcc, rv, xor, rvoccf, ricm],
+        ),
+        (
+            "PutItem",
+            format!("{put},{all}"),
+            vec![rv, xor, rvoccf, rcc, ricm],
+        ),
+        (
+            "PutItem",
+            all.to_string(),
+            vec![rv, xor, no_item, rvoccf, rcc, ricm],
+        ),
+        (
+            "DeleteItem",
+            format!("{key},{all}"),
+            vec![rv, xor, rvoccf, rcc, ricm],
+        ),
+        (
+            "DeleteItem",
+            all.to_string(),
+            vec![rv, xor, rvoccf, rcc, ricm, no_key],
+        ),
+        // A null key or item is read as a missing one.
+        (
+            "DeleteItem",
+            r#""Key":null,"ConditionalOperator":"XOR""#.to_string(),
+            vec![xor, no_key],
+        ),
+        // A value holding "; " is still one error.
+        (
+            "DeleteItem",
+            format!(
+                r#"{key},"ConditionalOperator":"XOR","ReturnValues":"A; B","ReturnConsumedCapacity":"BOGUS""#
+            ),
+            vec![&rv.replace("'BOGUS'", "'A; B'"), xor, rcc],
+        ),
+        (
+            "UpdateItem",
+            r#""Key":null,"ConditionalOperator":"XOR","ReturnValues":"BOGUS""#.to_string(),
+            vec![rv, xor, no_key],
+        ),
+        (
+            "PutItem",
+            r#""Item":null,"ReturnValues":"BOGUS","ReturnConsumedCapacity":"BOGUS""#.to_string(),
+            vec![rv, no_item, rcc],
+        ),
+    ] {
+        let (status, body) = send(
+            &url,
+            operation,
+            format!(r#"{{"TableName":"Deep",{expected_deep},{members}}}"#),
+        )
+        .await;
+        let message = format!(
+            "{} validation errors detected: {}",
+            expected.len(),
+            expected.join("; ")
+        );
+        assert_validation(status, &body, &message);
+    }
+    // One member wrong is still the older layer's, enveloped, and a
+    // DeleteItem `XOR` alone is reported rather than the nesting (captured
+    // eu-west-2 and us-east-1, 2026-11-04).
+    for (operation, members, expected) in [
+        (
+            "UpdateItem",
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            rcc,
+        ),
+        (
+            "UpdateItem",
+            format!(r#"{key},"ReturnValuesOnConditionCheckFailure":"BOGUS""#),
+            rvoccf,
+        ),
+        (
+            "DeleteItem",
+            format!(r#"{key},"ConditionalOperator":"XOR""#),
+            xor,
+        ),
+        (
+            "DeleteItem",
+            format!(r#"{key},"ReturnValues":"ALL_NEW","ReturnConsumedCapacity":"BOGUS""#),
+            rcc,
+        ),
+    ] {
+        let (status, body) = send(
+            &url,
+            operation,
+            format!(r#"{{"TableName":"Deep",{expected_deep},{members}}}"#),
+        )
+        .await;
+        assert_validation(
+            status,
+            &body,
+            &format!("1 validation error detected: {expected}"),
+        );
+    }
+    // A missing table name is checked with the members, its length and
+    // pattern only once they pass (captured eu-west-2 and us-east-1,
+    // 2026-11-04 and 2026-11-05).
+    let no_table =
+        "Value null at 'tableName' failed to satisfy constraint: Member must not be null";
+    let short = "Value 'ab' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3";
+    let long_name = "x".repeat(300);
+    let empty = "Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1";
+    let bad_pattern = |name: &str| {
+        format!(
+            "Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        )
+    };
+    let short_bad = "Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3".to_string();
+    let bangs = "!".repeat(300);
+    let accented = "é".repeat(200);
+    let emoji = "😀".repeat(128);
+    let long_emoji = format!(
+        "Value '{emoji}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+    );
+    let long_alone = format!(
+        "Value '{long_name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+    );
+    let short_accented = "Value 'éé' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3".to_string();
+    let long_bad = format!(
+        "Value '{bangs}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
+    );
+    for (operation, table, members, expected) in [
+        (
+            "PutItem",
+            None,
+            format!("{put},{all}"),
+            vec![rv, xor, rvoccf, rcc, ricm, no_table],
+        ),
+        (
+            "PutItem",
+            None,
+            all.to_string(),
+            vec![rv, xor, no_item, rvoccf, rcc, ricm, no_table],
+        ),
+        (
+            "UpdateItem",
+            None,
+            all.to_string(),
+            vec![rcc, no_table, rv, xor, rvoccf, ricm, no_key],
+        ),
+        (
+            "DeleteItem",
+            None,
+            all.to_string(),
+            vec![rv, xor, rvoccf, rcc, ricm, no_key, no_table],
+        ),
+        (
+            "DeleteItem",
+            None,
+            format!(r#"{key},"ConditionalOperator":"XOR""#),
+            vec![xor, no_table],
+        ),
+        (
+            "PutItem",
+            Some("ab"),
+            format!(r#"{put},"ReturnValues":"BOGUS""#),
+            vec![rv],
+        ),
+        (
+            "PutItem",
+            Some("bad name!"),
+            format!(r#"{put},"ReturnValues":"BOGUS""#),
+            vec![rv],
+        ),
+        (
+            "UpdateItem",
+            Some("ab"),
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            vec![rcc],
+        ),
+        (
+            "PutItem",
+            Some(long_name.as_str()),
+            format!(r#"{put},"ConditionalOperator":"XOR","ReturnValues":"BOGUS""#),
+            vec![rv, xor],
+        ),
+        ("PutItem", Some("ab"), String::new(), vec![no_item]),
+        (
+            "UpdateItem",
+            Some(long_name.as_str()),
+            String::new(),
+            vec![no_key],
+        ),
+        (
+            "DeleteItem",
+            Some("a!"),
+            format!(r#"{key},"ConditionalOperator":"XOR""#),
+            vec![xor],
+        ),
+        (
+            "DeleteItem",
+            Some("a!"),
+            format!(r#"{key},"ReturnValues":"ALL_NEW""#),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "PutItem",
+            Some(long_name.as_str()),
+            put.to_string(),
+            vec![&long_alone],
+        ),
+        // Measured in UTF-16 units: two emoji are four.
+        (
+            "PutItem",
+            Some("éé"),
+            put.to_string(),
+            vec![&short_accented, &bad_pattern("éé")],
+        ),
+        (
+            "PutItem",
+            Some(accented.as_str()),
+            put.to_string(),
+            vec![&bad_pattern(&accented)],
+        ),
+        (
+            "PutItem",
+            Some("😀😀"),
+            put.to_string(),
+            vec![&bad_pattern("😀😀")],
+        ),
+        (
+            "UpdateItem",
+            Some("😀😀"),
+            key.to_string(),
+            vec![&bad_pattern("😀😀")],
+        ),
+        (
+            "DeleteItem",
+            Some("😀😀"),
+            key.to_string(),
+            vec![&bad_pattern("😀😀")],
+        ),
+        (
+            "DeleteItem",
+            Some(emoji.as_str()),
+            key.to_string(),
+            vec![&long_emoji, &bad_pattern(&emoji)],
+        ),
+        ("PutItem", None, put.to_string(), vec![no_table]),
+        (
+            "UpdateItem",
+            Some("a!"),
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            vec![rcc],
+        ),
+        (
+            "UpdateItem",
+            Some("a!"),
+            key.to_string(),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "PutItem",
+            Some("a!"),
+            put.to_string(),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "DeleteItem",
+            Some("a!"),
+            key.to_string(),
+            vec![&short_bad, &bad_pattern("a!")],
+        ),
+        (
+            "PutItem",
+            Some(bangs.as_str()),
+            put.to_string(),
+            vec![&long_bad, &bad_pattern(&bangs)],
+        ),
+        (
+            "UpdateItem",
+            Some(bangs.as_str()),
+            key.to_string(),
+            vec![&long_bad, &bad_pattern(&bangs)],
+        ),
+        (
+            "DeleteItem",
+            Some("bad name!"),
+            key.to_string(),
+            vec![&bad_pattern("bad name!")],
+        ),
+        (
+            "PutItem",
+            Some(""),
+            format!(r#"{put},"ReturnValues":"BOGUS""#),
+            vec![rv, empty],
+        ),
+        (
+            "UpdateItem",
+            Some(""),
+            format!(r#"{key},"ReturnConsumedCapacity":"BOGUS""#),
+            vec![rcc, empty],
+        ),
+        ("DeleteItem", Some(""), key.to_string(), vec![empty]),
+        ("PutItem", Some(""), String::new(), vec![no_item, empty]),
+        ("PutItem", Some("ab"), put.to_string(), vec![short]),
+    ] {
+        let mut fields = vec![expected_deep.clone()];
+        if let Some(table) = table {
+            fields.push(format!(r#""TableName":"{table}""#));
+        }
+        if !members.is_empty() {
+            fields.push(members);
+        }
+        let (status, body) = send(&url, operation, format!("{{{}}}", fields.join(","))).await;
+        let message = format!(
+            "{} validation error{} detected: {}",
+            expected.len(),
+            if expected.len() == 1 { "" } else { "s" },
+            expected.join("; ")
+        );
+        assert_validation(status, &body, &message);
+    }
+    // A null table name is a missing one, an `ALL_NEW` alone keeps
+    // DeleteItem's own sentence, and a value holding " detected: " is still
+    // one error.
+    for (operation, body, expected) in [
+        (
+            "DeleteItem",
+            format!(
+                r#"{{"TableName":null,{expected_deep},{key},"ReturnValues":"ALL_NEW","ConditionalOperator":"XOR"}}"#
+            ),
+            format!("2 validation errors detected: {xor}; {no_table}"),
+        ),
+        (
+            "DeleteItem",
+            format!(r#"{{"TableName":"Deep",{expected_deep},{key},"ReturnValues":"ALL_NEW"}}"#),
+            "ReturnValues can only be ALL_OLD or NONE".to_string(),
+        ),
+        (
+            "UpdateItem",
+            format!(
+                r#"{{"TableName":"Deep",{expected_deep},{key},"ReturnConsumedCapacity":"1 validation error detected: z"}}"#
+            ),
+            format!(
+                "1 validation error detected: {}",
+                rcc.replace("'BOGUS'", "'1 validation error detected: z'")
+            ),
+        ),
+    ] {
+        let (status, body) = send(&url, operation, body).await;
+        assert_validation(status, &body, &expected);
+    }
+}
+
+#[tokio::test]
+async fn missing_update_key_joins_older_member_errors() {
+    let url = start().await;
+    for (body, expected) in [
+        (
+            r#"{"TableName":""}"#,
+            "2 validation errors detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1; Value null at 'key' failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            r#"{"TableName":"","ReturnConsumedCapacity":"BOGUS","ReturnValues":"BOGUS"}"#,
+            "4 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1; Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]; Value null at 'key' failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            r#"{"TableName":"Deep","Expected":{"a":{"Exists":false},"b":{"Exists":false}},"ConditionalOperator":"XOR"}"#,
+            "2 validation errors detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]; Value null at 'key' failed to satisfy constraint: Member must not be null",
+        ),
+    ] {
+        let (status, body) = send(&url, "UpdateItem", body.into()).await;
+        assert_validation(status, &body, expected);
+    }
+    let (status, body) = send(&url, "Query", r#"{"TableName":"Deep","Select":"BOGUS","ConditionalOperator":"XOR","QueryFilter":{"a":{"ComparisonOperator":"NULL"},"b":{"ComparisonOperator":"NULL"}}}"#.into()).await;
+    assert_validation(
+        status,
+        &body,
+        "Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]",
+    );
+}

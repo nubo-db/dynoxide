@@ -92,11 +92,7 @@ pub fn table_name_constraint_errors(
             }
             TableNameContext::ReadWrite => {
                 if name.is_empty() {
-                    errors.push(
-                        "Value '' at 'tableName' failed to satisfy constraint: \
-                         Member must have length greater than or equal to 1"
-                            .to_string(),
-                    );
+                    errors.push(older_empty_table_name_rejection());
                 } else if !name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
@@ -155,17 +151,52 @@ fn table_name_pattern_error(name: &str) -> String {
 /// reports it: one error per name, the length (3 to 255) before the pattern.
 /// A name both short and malformed (`a!`) gets the length error alone
 /// (captured 2026-10-09 on PutItem, DeleteItem, GetItem, Query and
-/// SearchVectors).
+/// SearchVectors). The length is in characters: `😀😀` is too short and 128
+/// of them aren't too long (captured eu-west-2 and us-east-1, 2026-11-05).
 pub(crate) fn first_table_name_error(name: &str) -> Option<String> {
-    if name.len() < 3 {
+    let length = name.chars().count();
+    if length < 3 {
         Some(short_table_name_error(name))
-    } else if name.len() > 255 {
+    } else if length > 255 {
         Some(long_table_name_error(name))
     } else if !table_name_pattern_holds(name) {
         Some(table_name_pattern_error(name))
     } else {
         None
     }
+}
+
+/// The older layer's answer for an empty table name, which it checks with a
+/// write's other members (captured on deep PutItem, UpdateItem and DeleteItem
+/// requests, eu-west-2 and us-east-1, 2026-11-05).
+pub(crate) fn older_empty_table_name_rejection() -> String {
+    "Value '' at 'tableName' failed to satisfy constraint: \
+     Member must have length greater than or equal to 1"
+        .to_string()
+}
+
+/// Every length and pattern constraint a non-empty table name breaks, the
+/// length first, as the older layer reports them once a write's members pass
+/// (captured on deep PutItem, UpdateItem and DeleteItem requests, eu-west-2
+/// and us-east-1, 2026-11-05). The length is in UTF-16 units, where the
+/// newer layer counts characters: `😀😀` isn't too short here. Compiled where
+/// deep requests are read.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn older_table_name_errors(name: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    if name.is_empty() {
+        return errors;
+    }
+    let length = name.encode_utf16().count();
+    if length < 3 {
+        errors.push(short_table_name_error(name));
+    } else if length > 255 {
+        errors.push(long_table_name_error(name));
+    }
+    if !table_name_pattern_holds(name) {
+        errors.push(table_name_pattern_error(name));
+    }
+    errors
 }
 
 /// The table-name errors for PutItem, DeleteItem, GetItem and Query: a missing
@@ -205,9 +236,10 @@ pub(crate) fn update_item_table_name_errors(table_name: Option<&str>) -> Vec<Str
     if !table_name_pattern_holds(name) {
         errors.push(table_name_pattern_error(name));
     }
-    if name.len() < 3 {
+    let length = name.chars().count();
+    if length < 3 {
         errors.push(short_table_name_error(name));
-    } else if name.len() > 255 {
+    } else if length > 255 {
         errors.push(long_table_name_error(name));
     }
     errors

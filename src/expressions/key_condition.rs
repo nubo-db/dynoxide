@@ -5,7 +5,7 @@
 
 use crate::expressions::condition::parse_raw_path;
 use crate::expressions::tokenizer::{
-    Token, TokenSpan, TokenStream, check_redundant_parens, tokenize,
+    Token, TokenSpan, TokenStream, check_redundant_parens, tokenize, tokenizer_syntax_error,
 };
 use crate::expressions::{PathElement, TrackedExpressionAttributes};
 use crate::types::AttributeValue;
@@ -62,7 +62,12 @@ pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCon
     // real DynamoDB (eu-west-2).
     super::check_expression_size(expr)
         .map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
-    let tokens = tokenize(expr).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
+    let tokens = tokenize(expr).map_err(|e| {
+        format!(
+            "Invalid KeyConditionExpression: {}",
+            tokenizer_syntax_error(expr, &e)
+        )
+    })?;
     // Reject redundant parens before stripping outer ones (strip_outer_parens
     // would otherwise silently accept `((pk = :pk))`).
     check_redundant_parens(&tokens).map_err(|e| format!("Invalid KeyConditionExpression: {e}"))?;
@@ -422,19 +427,19 @@ impl ResolvedSortKeyCondition {
         }
     }
 
-    /// Convert to SQL WHERE clause components for sk column.
-    /// Returns (operator, value_string) pairs.
-    /// For BETWEEN, returns two conditions.
-    pub fn to_sql_conditions(&self) -> Vec<(String, String)> {
+    /// The bounds this condition puts on the stored sort key, which all hold.
+    /// BETWEEN gives two, and so does begins_with unless its prefix has no
+    /// upper bound.
+    pub fn bounds(&self) -> Vec<SortKeyBound> {
         match self {
-            Self::Eq(_, v) => vec![("=".into(), val_to_key_string(v))],
-            Self::Lt(_, v) => vec![("<".into(), val_to_key_string(v))],
-            Self::Le(_, v) => vec![("<=".into(), val_to_key_string(v))],
-            Self::Gt(_, v) => vec![(">".into(), val_to_key_string(v))],
-            Self::Ge(_, v) => vec![(">=".into(), val_to_key_string(v))],
+            Self::Eq(_, v) => vec![SortKeyBound::Eq(val_to_key_string(v))],
+            Self::Lt(_, v) => vec![SortKeyBound::Lt(val_to_key_string(v))],
+            Self::Le(_, v) => vec![SortKeyBound::Le(val_to_key_string(v))],
+            Self::Gt(_, v) => vec![SortKeyBound::Gt(val_to_key_string(v))],
+            Self::Ge(_, v) => vec![SortKeyBound::Ge(val_to_key_string(v))],
             Self::Between(_, lo, hi) => vec![
-                (">=".into(), val_to_key_string(lo)),
-                ("<=".into(), val_to_key_string(hi)),
+                SortKeyBound::Ge(val_to_key_string(lo)),
+                SortKeyBound::Le(val_to_key_string(hi)),
             ],
             // A range rather than LIKE: SQLite's LIKE folds ASCII case, and
             // DynamoDB compares key bytes exactly, so `begins_with(sk, "abc")`
@@ -443,11 +448,65 @@ impl ResolvedSortKeyCondition {
                 let start = val_to_key_string(prefix);
                 let mut out = Vec::new();
                 if let Some(end) = prefix_upper_bound(&start) {
-                    out.push(("<".into(), end));
+                    out.push(SortKeyBound::Lt(end));
                 }
-                out.push((">=".into(), start));
+                out.push(SortKeyBound::Ge(start));
                 out
             }
+        }
+    }
+
+    /// Convert to SQL WHERE clause components for sk column.
+    /// Returns (operator, value_string) pairs.
+    /// For BETWEEN, returns two conditions.
+    pub fn to_sql_conditions(&self) -> Vec<(String, String)> {
+        self.bounds()
+            .into_iter()
+            .map(|bound| {
+                let operator = bound.operator().to_string();
+                (operator, bound.into_key())
+            })
+            .collect()
+    }
+}
+
+/// One bound on a stored sort key, in the stored form that compares the way
+/// rows are ordered.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SortKeyBound {
+    Eq(String),
+    Lt(String),
+    Le(String),
+    Gt(String),
+    Ge(String),
+}
+
+impl SortKeyBound {
+    /// The SQL comparison operator.
+    pub fn operator(&self) -> &'static str {
+        match self {
+            Self::Eq(_) => "=",
+            Self::Lt(_) => "<",
+            Self::Le(_) => "<=",
+            Self::Gt(_) => ">",
+            Self::Ge(_) => ">=",
+        }
+    }
+
+    fn into_key(self) -> String {
+        match self {
+            Self::Eq(k) | Self::Lt(k) | Self::Le(k) | Self::Gt(k) | Self::Ge(k) => k,
+        }
+    }
+
+    /// Whether a stored key satisfies the bound.
+    pub fn admits(&self, key: &str) -> bool {
+        match self {
+            Self::Eq(b) => key == b,
+            Self::Lt(b) => key < b.as_str(),
+            Self::Le(b) => key <= b.as_str(),
+            Self::Gt(b) => key > b.as_str(),
+            Self::Ge(b) => key >= b.as_str(),
         }
     }
 }
@@ -464,6 +523,35 @@ pub fn sk_conditions_to_sql(
         .flat_map(|c| c.to_sql_conditions())
         .collect();
     pairs_to_sql(&pairs)
+}
+
+/// Render a union of sort-key ranges. Every group must constrain the sort key;
+/// an unconstrained branch requires reading the whole partition instead.
+pub fn sk_condition_groups_to_sql(
+    groups: &[Vec<ResolvedSortKeyCondition>],
+) -> (Option<String>, Vec<String>) {
+    if let [group] = groups {
+        return sk_conditions_to_sql(group);
+    }
+    let mut branches = Vec::new();
+    let mut values = Vec::new();
+    for group in groups {
+        let pairs: Vec<_> = group.iter().flat_map(|c| c.to_sql_conditions()).collect();
+        if pairs.is_empty() {
+            return (None, Vec::new());
+        }
+        let mut bounds = Vec::new();
+        for (op, value) in pairs {
+            bounds.push(format!("sk {op} ?{}", values.len() + 2));
+            values.push(value);
+        }
+        branches.push(format!("({})", bounds.join(" AND ")));
+    }
+    if branches.is_empty() {
+        (None, values)
+    } else {
+        (Some(format!("AND ({})", branches.join(" OR "))), values)
+    }
 }
 
 /// Render `(operator, value)` bounds on the sk column as SQL, numbering the

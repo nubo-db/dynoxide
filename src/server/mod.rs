@@ -83,9 +83,13 @@ pub async fn start_with_options(
     let std_listener = bind_exclusive(addr)?;
     let listener = tokio::net::TcpListener::from_std(std_listener)
         .map_err(|e| format!("failed to create async listener: {e}"))?;
+    // With `--port 0` the OS picks the port, so `addr` would report `:0`.
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read listener address: {e}"))?;
 
     if !options.suppresses_informational_messages() {
-        eprintln!("Dynoxide listening on http://{addr}");
+        eprintln!("Dynoxide listening on http://{local_addr}");
     }
 
     serve_with_shutdown(

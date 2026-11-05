@@ -296,3 +296,61 @@ fn the_startup_line_is_exact_and_goes_to_stderr() {
     }
     panic!("the server exited before printing the startup line three times: {lost:?}");
 }
+
+/// Kills the child when dropped, so a failed assertion does not leave the
+/// server running after the test.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn port_zero_reports_the_port_it_was_assigned() {
+    // A harness running several servers starts each with `--port 0` and reads
+    // the port back from the startup line, which only works if the line names
+    // the port the OS assigned rather than the `0` it was given. There is no
+    // port race to lose here, so unlike the test above this does not retry.
+    let (child, stderr, mut stdout) = spawn_serve(0);
+    let _child = KillOnDrop(child);
+
+    // Drained for the same reason as in `read_startup_line`.
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let prefix = "Dynoxide listening on http://127.0.0.1:";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw: Vec<String> = Vec::new();
+    let port = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => match line.strip_prefix(prefix) {
+                Some(port) => break port.parse::<u16>().expect("a numeric port"),
+                None => saw.push(line),
+            },
+            Err(e) => panic!("no startup line ({e:?}); saw {saw:?}"),
+        }
+    };
+
+    assert_ne!(port, 0, "the startup line reported the requested port 0");
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("the reported port should accept connections");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), HEALTH_BODY);
+}

@@ -73,4 +73,10 @@ Quiet mode removes the `Dynoxide listening on ...` line, so a script that waits
 for Dynoxide to come up should wait on the port or on `GET /` rather than on
 that line.
 
+With `--port 0` the OS assigns a free port, and the startup line reports the
+port it assigned. A test harness that runs several servers at once can start
+each on port 0 and read its port from that line, rather than choosing a free
+port itself and racing other processes to bind it. That needs the default
+logging mode, since quiet mode removes the line.
+
 `RUST_LOG` continues to control tracing independently.

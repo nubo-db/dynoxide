@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--port 0` reports the port the server bound.** The OS picks a free port
+  when the server is started with `--port 0`, but the startup line printed
+  `Dynoxide listening on http://127.0.0.1:0`, so nothing outside the process
+  could find the server. It now prints the port that was assigned. The line is
+  unchanged for any other port.
 - **PartiQL reads a shared partition when every OR branch pins the same key.**
   A condition such as `pk = 'k' AND (x = 1 OR x = 2)` used to scan the table,
   so it could return short pages and charge for every partition. It now reads

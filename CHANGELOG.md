@@ -75,6 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too short and 128 emoji aren't too long. `SearchVectors` shares the check.
   A deep `PutItem`, `UpdateItem` or `DeleteItem` measures it in UTF-16 units,
   as DynamoDB does there.
+- `--port 0` reports the port the server bound. The startup line used to
+  print the requested address, `Dynoxide listening on http://127.0.0.1:0`, so
+  nothing outside the process could tell which port the OS had assigned. The
+  line is unchanged for any other port
+  ([#277](https://github.com/nubo-db/dynoxide/pull/277), thanks
+  [@samchungy](https://github.com/samchungy)).
 
 ## [1.5.0] - 2026-10-23
 

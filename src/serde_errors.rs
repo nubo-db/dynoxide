@@ -72,11 +72,12 @@ pub(crate) fn is_number_out_of_range(err: &serde_json::Error) -> bool {
 
 /// A request body as a JSON value, for the checks that read its shape before
 /// the typed read. A number past f64's range is well-formed JSON that DynamoDB
-/// reads, so the body is read again with each such number standing in as
-/// `0.0`: these checks look at what type a member is, never at a number's
-/// value, and DynamoDB reads such a number as a decimal, as it does `1e300`
-/// (captured eu-west-2 and us-east-1, 6 November 2026). The member's own
-/// reader takes the number from the body as written.
+/// reads, so the body is read again with each such number standing in as a
+/// zero written the same way: these checks look at what type a member is,
+/// never at a number's value, and DynamoDB names a number by how it is
+/// written, a decimal with a point or an exponent and a whole number without,
+/// whatever its size (captured eu-west-2 and us-east-1, 6 November 2026). The
+/// member's own reader takes the number from the body as written.
 pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Error> {
     match serde_json::from_str(body) {
         Err(e) if is_number_out_of_range(&e) => {
@@ -86,9 +87,10 @@ pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Er
     }
 }
 
-/// `body` with every number serde_json can't hold written as `0.0`. Strings are
-/// skipped whole, escapes included, so text that looks like a number inside
-/// one is left alone.
+/// `body` with every number serde_json can't hold written as `0.0`, or as `0`
+/// when it was written with no point or exponent. Strings are skipped whole,
+/// escapes included, so text that looks like a number inside one is left
+/// alone.
 fn zero_out_of_range_numbers(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
@@ -112,7 +114,13 @@ fn zero_out_of_range_numbers(body: &str) -> String {
                 }
                 let token = &body[start..i];
                 match serde_json::from_str::<serde_json::Number>(token) {
-                    Err(e) if is_number_out_of_range(&e) => out.push_str("0.0"),
+                    Err(e) if is_number_out_of_range(&e) => {
+                        out.push_str(if token.contains(['.', 'e', 'E']) {
+                            "0.0"
+                        } else {
+                            "0"
+                        })
+                    }
                     _ => out.push_str(token),
                 }
             }
@@ -680,6 +688,13 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(body).unwrap()
         );
         assert!(body_value("{").is_err());
+    }
+
+    #[test]
+    fn a_long_whole_number_stays_whole() {
+        let digits = format!("1{}", "0".repeat(400));
+        let body = format!(r#"{{"a":{digits},"b":-{digits},"c":{digits}.0}}"#);
+        assert_eq!(zero_out_of_range_numbers(&body), r#"{"a":0,"b":0,"c":0.0}"#);
     }
 
     #[test]

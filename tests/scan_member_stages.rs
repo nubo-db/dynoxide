@@ -1297,14 +1297,33 @@ async fn integer_members_past_the_range_of_a_double_saturate() {
     }
 }
 
-/// A number past a double's range in a member that isn't a number is refused
-/// as a decimal, as `1e300` is (captured eu-west-2 and us-east-1, 6 November
-/// 2026, where both regions gave the same answers).
+/// A number past a double's range in a member that isn't a number is named by
+/// how it is written, whatever its size: a decimal with a point or an
+/// exponent, as `1e300` is, and a whole number without (captured eu-west-2
+/// and us-east-1, 6 November 2026, where both regions gave the same answers).
 #[tokio::test]
-async fn numbers_past_the_range_of_a_double_are_decimals_elsewhere() {
+async fn numbers_past_the_range_of_a_double_are_named_as_written_elsewhere() {
     let url = start_server().await;
     let to_string = "DECIMAL_VALUE cannot be converted to String";
+    let digits = format!("1{}", "0".repeat(400));
     for (body, expected) in [
+        (
+            format!(r#"{{"TableName":{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":-{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (format!(r#"{{"TableName":{digits}.0}}"#), to_string),
+        (
+            format!(r#"{{"TableName":"{TABLE}","Select":{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","ConsistentRead":{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to Boolean",
+        ),
         (r#"{"TableName":1e400}"#.to_string(), to_string),
         (r#"{"TableName":-1e400}"#.to_string(), to_string),
         (r#"{"TableName":1e300}"#.to_string(), to_string),

@@ -12,7 +12,9 @@
 
 #![cfg(all(feature = "http-server", feature = "mcp-server", feature = "cli"))]
 
-use std::io::{Read, Write};
+mod common;
+
+use common::{Listener, Readiness, Server, Startup};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -27,76 +29,14 @@ fn data_model_fixture() -> String {
         .into_owned()
 }
 
-/// Obtain `n` distinct free loopback ports. Every listener is held until all
-/// are bound, so two calls cannot hand back the same port.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: Vec<_> = (0..N)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    std::array::from_fn(|i| listeners[i].local_addr().unwrap().port())
-}
-
-/// Send one `GET <path>` and report whether an HTTP status line came back.
-fn answers_http(port: u16, path: &str) -> bool {
-    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+/// Announced runs read their ports from the listening lines; quiet ones print
+/// none, so they are given ports picked up front.
+fn startup(quiet: bool) -> Startup {
+    if quiet {
+        Startup::Silent
+    } else {
+        Startup::Announced
     }
-    let mut head = [0u8; 9];
-    stream.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.")
-}
-
-/// How a freshly spawned server got on.
-enum HttpStartup {
-    /// It answers HTTP and is still running.
-    Ready,
-    /// It exited first, which is what a child that lost the race for its port
-    /// does: the port was free when it was chosen and taken before the child
-    /// bound it.
-    Exited,
-    /// It neither answered nor exited in time.
-    TimedOut,
-}
-
-/// Poll until `port` answers an HTTP request for `path`, `child` exits, or
-/// `timeout` elapses.
-///
-/// A bare TCP connect is not enough. Both servers bind before they print
-/// their listening line and before they start serving, so a connect can
-/// succeed while the line is still unprinted. An HTTP answer means the serve
-/// loop is running, which comes after the line.
-fn wait_until_http_ready(
-    child: &mut Child,
-    port: u16,
-    path: &str,
-    timeout: Duration,
-) -> HttpStartup {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child.try_wait().expect("poll dynoxide").is_some() {
-            return HttpStartup::Exited;
-        }
-        if answers_http(port, path) {
-            // Something answers. A child that lost the race for the port is
-            // still on its way to exiting, and the answer is another
-            // process's, so watch it for a moment before believing it.
-            for _ in 0..12 {
-                if child.try_wait().expect("poll dynoxide").is_some() {
-                    return HttpStartup::Exited;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            return HttpStartup::Ready;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    HttpStartup::TimedOut
 }
 
 #[test]
@@ -106,16 +46,109 @@ fn a_child_that_loses_its_port_is_reported_as_exited_not_as_slow() {
     // and not as a server that never came up.
     let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let taken = holder.local_addr().unwrap().port();
-    let mut child = spawn(
+    let mut server = Server::spawn(command(
         &args(&["mcp", "--http", "--port", &taken.to_string()]),
         &[("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")],
-    );
-    let startup = wait_until_http_ready(&mut child, taken, "/mcp", Duration::from_secs(10));
-    let _ = child.kill();
-    let _ = child.wait();
+    ));
+    let startup = server.wait_until_answering(&[(taken, "/mcp")], Duration::from_secs(10));
     assert!(
-        matches!(startup, HttpStartup::Exited),
+        matches!(startup, Readiness::Exited),
         "a child that cannot bind its port exits"
+    );
+}
+
+#[test]
+fn a_child_that_exits_before_its_listening_line_fails_with_its_stderr() {
+    // The wait for a port must end when the child does, and say why, rather
+    // than run out its timeout or hang on a read.
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = holder.local_addr().unwrap().port();
+    let server = Server::spawn(command(
+        &args(&["serve", "--port", &taken.to_string()]),
+        &[],
+    ));
+    let started = Instant::now();
+    let err = server
+        .try_port(Listener::Http, Duration::from_secs(30))
+        .expect_err("a child that cannot bind prints no listening line");
+    assert!(
+        matches!(err, common::WaitError::Exited { .. }),
+        "the child exited, so the wait should say so: {err}"
+    );
+    assert!(
+        common::is_bind_error(err.stderr()),
+        "the failure should carry the child's bind error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the wait should end when the child exits, not at its timeout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_listening_line_that_never_comes_fails_with_the_stderr_so_far() {
+    // A child that stays up without printing the line must fail the wait at
+    // its timeout, carrying whatever it did print, rather than block forever.
+    let mut sh = Command::new("sh");
+    sh.args(["-c", "echo 'not a listening line' >&2; exec sleep 60"]);
+    let server = Server::spawn(sh);
+    let started = Instant::now();
+    let err = server
+        .try_port(Listener::Http, Duration::from_millis(500))
+        .expect_err("no listening line was printed");
+    assert!(
+        matches!(err, common::WaitError::TimedOut { .. }),
+        "the child is still running, so the wait should time out: {err}"
+    );
+    assert!(
+        err.stderr().contains("not a listening line"),
+        "the failure should carry the child's stderr: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the wait should end at its timeout"
+    );
+}
+
+#[test]
+fn a_quiet_child_that_loses_its_port_is_started_again_on_another() {
+    // Another process holds the first port offered. The quiet child prints no
+    // listening line, cannot bind the port and exits with a bind error, so it
+    // has to be started again on a fresh port rather than fail the test.
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = holder.local_addr().unwrap().port();
+    let offered = std::cell::RefCell::new(Vec::new());
+    let envs = [("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")];
+
+    let (ports, server) = common::start(
+        |ports| {
+            offered.borrow_mut().push(ports[0]);
+            let port = if offered.borrow().len() == 1 {
+                taken
+            } else {
+                ports[0]
+            };
+            command(
+                &with_quiet(args(&["mcp", "--http", "--port", &port.to_string()])),
+                &envs,
+            )
+        },
+        &[Listener::Mcp],
+        Startup::Silent,
+    );
+    let output = server.kill_and_collect();
+
+    assert_eq!(
+        offered.borrow().len(),
+        2,
+        "the child should have been started exactly twice"
+    );
+    assert_ne!(ports[0], taken, "the second start is on a fresh port");
+    assert!(
+        !common::is_bind_error(&stderr_of(&output)),
+        "the second start bound its port. stderr:\n{}",
+        stderr_of(&output)
     );
 }
 
@@ -166,8 +199,9 @@ fn run_stdio_to_exit(args: &[String], timeout: Duration) -> String {
     stderr
 }
 
-/// Spawn `dynoxide` with stdin closed and stdout and stderr piped.
-fn spawn(args: &[String], envs: &[(&str, &str)]) -> Child {
+/// The command for `dynoxide` with stdin closed, stdout and stderr piped, and
+/// no MCP token inherited from the environment.
+fn command(args: &[String], envs: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(dynoxide_bin());
     cmd.args(args)
         .env_remove("DYNOXIDE_MCP_AUTH_TOKEN")
@@ -177,60 +211,28 @@ fn spawn(args: &[String], envs: &[(&str, &str)]) -> Child {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn dynoxide")
+    cmd
 }
 
-/// Start a long-running server, wait until every `(port, path)` in `ready`
-/// answers HTTP, stop it with SIGTERM and return its output.
-///
-/// If a port never answers, or the process exits first, the server is still
-/// stopped with SIGTERM before the test fails, so whatever it printed on the
-/// way out (a bind error, say) is in the failure message.
+/// Spawn `dynoxide` as [`command`] describes it.
+fn spawn(args: &[String], envs: &[(&str, &str)]) -> Child {
+    command(args, envs).spawn().expect("spawn dynoxide")
+}
+
+/// Start a long-running server, wait until every listener answers HTTP, stop
+/// it with SIGTERM and return its output. `build` gets one port per listener,
+/// in order, and returns the arguments to run.
 ///
 /// Unix only: off unix the HTTP server listens for Ctrl+C alone, which a test
 /// cannot easily send to a child process.
 #[cfg(unix)]
 fn run_until_ready_then_term(
-    args: &[String],
+    build: impl Fn(&[u16]) -> Vec<String>,
     envs: &[(&str, &str)],
-    ready: &[(u16, &str)],
+    listeners: &[Listener],
+    startup: Startup,
 ) -> Output {
-    let mut child = spawn(args, envs);
-    let not_ready = ready.iter().find(|&&(port, path)| {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if answers_http(port, path) {
-                return false;
-            }
-            if Instant::now() >= deadline || child.try_wait().ok().flatten().is_some() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    });
-    if not_ready.is_none() {
-        // The SIGTERM handler is installed by a task the HTTP server spawns
-        // as it starts serving. An answered request means that task has been
-        // spawned, and this pause gives the runtime time to have polled it,
-        // so the signal reaches the handler rather than the default action.
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if child.try_wait().ok().flatten().is_none() {
-        let signal = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .expect("send SIGTERM");
-        assert!(signal.success(), "failed to send SIGTERM");
-    }
-    let output = wait_with_timeout(child, Duration::from_secs(15));
-    if let Some((port, path)) = not_ready {
-        panic!(
-            "dynoxide never answered on {port}{path} with args {args:?}; exit {:?}; stderr:\n{}",
-            output.status,
-            stderr_of(&output)
-        );
-    }
-    output
+    common::run_until_ready_then_term(|ports| command(&build(ports), envs), listeners, startup)
 }
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -292,21 +294,25 @@ fn serve_mcp_quiet_suppresses_every_informational_line() {
     let model = data_model_fixture();
 
     let run = |quiet: bool| {
-        let [port, mcp_port] = free_ports();
-        let mut a = args(&[
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--mcp",
-            "--mcp-port",
-            &mcp_port.to_string(),
-            "--mcp-data-model",
-            &model,
-        ]);
-        if quiet {
-            a = with_quiet(a);
-        }
-        let output = run_until_ready_then_term(&a, &envs, &[(port, "/"), (mcp_port, "/mcp")]);
+        let build = |ports: &[u16]| {
+            let a = args(&[
+                "serve",
+                "--port",
+                &ports[0].to_string(),
+                "--mcp",
+                "--mcp-port",
+                &ports[1].to_string(),
+                "--mcp-data-model",
+                &model,
+            ]);
+            if quiet { with_quiet(a) } else { a }
+        };
+        let output = run_until_ready_then_term(
+            build,
+            &envs,
+            &[Listener::Http, Listener::Mcp],
+            startup(quiet),
+        );
         assert!(
             output.status.success(),
             "serve --mcp did not shut down cleanly: {:?}\n{}",
@@ -325,20 +331,22 @@ fn serve_mcp_quiet_suppresses_every_informational_line() {
 #[cfg(unix)]
 #[test]
 fn serve_mcp_quiet_keeps_the_auth_disabled_warning() {
-    let [port, mcp_port] = free_ports();
-    let a = with_quiet(args(&[
-        "serve",
-        "--port",
-        &port.to_string(),
-        "--mcp",
-        "--mcp-port",
-        &mcp_port.to_string(),
-        "--mcp-no-auth",
-    ]));
+    let build = |ports: &[u16]| {
+        with_quiet(args(&[
+            "serve",
+            "--port",
+            &ports[0].to_string(),
+            "--mcp",
+            "--mcp-port",
+            &ports[1].to_string(),
+            "--mcp-no-auth",
+        ]))
+    };
     let stderr = stderr_of(&run_until_ready_then_term(
-        &a,
+        build,
         &[],
-        &[(port, "/"), (mcp_port, "/mcp")],
+        &[Listener::Http, Listener::Mcp],
+        Startup::Silent,
     ));
     assert!(
         stderr.contains("MCP auth disabled"),
@@ -353,36 +361,43 @@ fn serve_mcp_quiet_keeps_the_auth_disabled_warning() {
 
 /// The first-run message is the only place a generated token is shown, so
 /// quiet mode keeps it. `HOME` and `XDG_CONFIG_HOME` point at a temp dir so
-/// the token lands there rather than in the real per-user config.
+/// the token lands there rather than in the real per-user config. Every start
+/// gets its own temp dir, so a start on fresh ports after a lost one is still
+/// a first run.
 #[cfg(unix)]
 #[test]
 fn serve_mcp_quiet_keeps_the_first_run_token_message() {
-    let home = tempfile::tempdir().unwrap();
-    let home_path = home.path().to_string_lossy().into_owned();
-    let config_path = home.path().join(".config").to_string_lossy().into_owned();
-    let envs = [
-        ("HOME", home_path.as_str()),
-        ("XDG_CONFIG_HOME", config_path.as_str()),
-    ];
-    let [port, mcp_port] = free_ports();
-    let a = with_quiet(args(&[
-        "serve",
-        "--port",
-        &port.to_string(),
-        "--mcp",
-        "--mcp-port",
-        &mcp_port.to_string(),
-    ]));
-    let stderr = stderr_of(&run_until_ready_then_term(
-        &a,
-        &envs,
-        &[(port, "/"), (mcp_port, "/mcp")],
+    let homes = std::cell::RefCell::new(Vec::new());
+    let build = |ports: &[u16]| {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_string_lossy().into_owned();
+        let config_path = home.path().join(".config").to_string_lossy().into_owned();
+        homes.borrow_mut().push(home);
+        let a = with_quiet(args(&[
+            "serve",
+            "--port",
+            &ports[0].to_string(),
+            "--mcp",
+            "--mcp-port",
+            &ports[1].to_string(),
+        ]));
+        let mut cmd = command(&a, &[]);
+        cmd.env("HOME", home_path)
+            .env("XDG_CONFIG_HOME", config_path);
+        cmd
+    };
+    let stderr = stderr_of(&common::run_until_ready_then_term(
+        build,
+        &[Listener::Http, Listener::Mcp],
+        Startup::Silent,
     ));
 
     assert!(
         stderr.contains("Generated an MCP auth token"),
         "quiet mode dropped the first-run token message. stderr:\n{stderr}"
     );
+    let homes = homes.borrow();
+    let home = homes.last().expect("the server was started");
     let token_file = walk(home.path())
         .into_iter()
         .find(|p| p.file_name().is_some_and(|n| n == "mcp-token"));
@@ -435,16 +450,17 @@ fn quiet_mode_still_reports_an_mcp_auth_configuration_error() {
         ("HOME", home_path.as_str()),
         ("XDG_CONFIG_HOME", config_path.as_str()),
     ];
-    let [port, mcp_port] = free_ports();
+    // The configuration is refused before either server binds, so port 0 is
+    // never bound and there is no port to lose.
     let a = with_quiet(args(&[
         "serve",
         "--port",
-        &port.to_string(),
+        "0",
         "--mcp",
         "--mcp-host",
         "0.0.0.0",
         "--mcp-port",
-        &mcp_port.to_string(),
+        "0",
     ]));
     let output = wait_with_timeout(spawn(&a, &envs), Duration::from_secs(15));
     let stderr = stderr_of(&output);
@@ -468,31 +484,21 @@ fn quiet_mode_still_reports_an_mcp_auth_configuration_error() {
 #[test]
 fn mcp_http_quiet_suppresses_the_listener_line() {
     let envs = [("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")];
-    // `free_ports` releases the port before the child binds it, so another
-    // process can take it in between and the child exits. That is a lost race,
-    // not a regression, and is tried again on a fresh port.
+    // The default run is on port 0 and its port comes from the listening
+    // line. The quiet run prints no line, so it is given a port picked up
+    // front, and another process can take that port before the child binds
+    // it. That is a lost race, not a regression, and is tried again on a fresh
+    // port.
     let run = |quiet: bool| {
-        let mut lost = Vec::new();
-        for _ in 0..5 {
-            let [port] = free_ports();
-            let mut a = args(&["mcp", "--http", "--port", &port.to_string()]);
-            if quiet {
-                a = with_quiet(a);
-            }
-            let mut child = spawn(&a, &envs);
-            let startup = wait_until_http_ready(&mut child, port, "/mcp", Duration::from_secs(30));
-            let _ = child.kill();
-            let output = child.wait_with_output().expect("collect dynoxide output");
-            match startup {
-                HttpStartup::Ready => return stderr_of(&output),
-                HttpStartup::Exited => lost.push(stderr_of(&output)),
-                HttpStartup::TimedOut => panic!(
-                    "mcp --http did not listen with args {a:?}; stderr:\n{}",
-                    stderr_of(&output)
-                ),
-            }
-        }
-        panic!("mcp --http exited before it listened on five different ports: {lost:?}");
+        let (_, server) = common::start(
+            |ports| {
+                let a = args(&["mcp", "--http", "--port", &ports[0].to_string()]);
+                command(&if quiet { with_quiet(a) } else { a }, &envs)
+            },
+            &[Listener::Mcp],
+            startup(quiet),
+        );
+        stderr_of(&server.kill_and_collect())
     };
 
     let needles = ["MCP HTTP server listening"];
@@ -605,12 +611,11 @@ mod import {
 fn import_serve_quiet_suppresses_server_lines_and_keeps_the_report() {
     let e = import::export();
     let run = |quiet: bool| {
-        let [port] = free_ports();
-        let mut a = import::import_args(&e, &["--serve", "--port", &port.to_string()]);
-        if quiet {
-            a = with_quiet(a);
-        }
-        let output = run_until_ready_then_term(&a, &[], &[(port, "/")]);
+        let build = |ports: &[u16]| {
+            let a = import::import_args(&e, &["--serve", "--port", &ports[0].to_string()]);
+            if quiet { with_quiet(a) } else { a }
+        };
+        let output = run_until_ready_then_term(build, &[], &[Listener::Http], startup(quiet));
         assert!(
             output.status.success(),
             "import --serve did not shut down cleanly: {:?}\n{}",
@@ -637,22 +642,26 @@ fn import_serve_mcp_quiet_suppresses_every_server_line() {
     let e = import::export();
     let envs = [("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")];
     let run = |quiet: bool| {
-        let [port, mcp_port] = free_ports();
-        let mut a = import::import_args(
-            &e,
-            &[
-                "--serve",
-                "--port",
-                &port.to_string(),
-                "--mcp",
-                "--mcp-port",
-                &mcp_port.to_string(),
-            ],
+        let build = |ports: &[u16]| {
+            let a = import::import_args(
+                &e,
+                &[
+                    "--serve",
+                    "--port",
+                    &ports[0].to_string(),
+                    "--mcp",
+                    "--mcp-port",
+                    &ports[1].to_string(),
+                ],
+            );
+            if quiet { with_quiet(a) } else { a }
+        };
+        let output = run_until_ready_then_term(
+            build,
+            &envs,
+            &[Listener::Http, Listener::Mcp],
+            startup(quiet),
         );
-        if quiet {
-            a = with_quiet(a);
-        }
-        let output = run_until_ready_then_term(&a, &envs, &[(port, "/"), (mcp_port, "/mcp")]);
         assert!(
             output.status.success(),
             "import --serve --mcp did not shut down cleanly: {:?}\n{}",
@@ -708,10 +717,11 @@ fn import_mcp_stdio_quiet_suppresses_the_data_model_line() {
 #[test]
 fn import_serve_quiet_still_stops_on_an_exposure() {
     let e = import::export();
-    let [port] = free_ports();
+    // The exposure gate stops the run before the server binds, so port 0 is
+    // never bound and there is no port to lose.
     let a = with_quiet(import::import_args(
         &e,
-        &["--rules", &e.rules, "--serve", "--port", &port.to_string()],
+        &["--rules", &e.rules, "--serve", "--port", "0"],
     ));
     let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
     let stderr = stderr_of(&output);

@@ -5,9 +5,11 @@
 
 #![cfg(all(feature = "http-server", feature = "import"))]
 
-use std::io::{BufRead, BufReader};
-use std::process::{Child, ChildStderr, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
+
+use common::{Listener, Server};
+use std::process::Command;
+use std::time::Duration;
 
 fn dynoxide_bin() -> &'static str {
     env!("CARGO_BIN_EXE_dynoxide")
@@ -25,74 +27,25 @@ fn write_schema_file(path: &std::path::Path, table_name: &str) {
     std::fs::write(path, serde_json::to_string_pretty(&schema).unwrap()).unwrap();
 }
 
-/// Bind and immediately release a loopback listener to obtain a free port.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
-/// Poll `GET /` until the server answers or `timeout` elapses.
-#[cfg(unix)]
-async fn wait_until_http_ready(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    let client = reqwest::Client::new();
-
-    while Instant::now() < deadline {
-        if client
-            .get(format!("http://127.0.0.1:{port}/"))
-            .send()
-            .await
-            .is_ok()
-        {
-            return true;
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    false
-}
-
-/// Spawn `dynoxide` with the given args and a piped stderr stream.
-fn spawn_dynoxide(args: &[&str]) -> (Child, BufReader<ChildStderr>) {
-    let mut child = Command::new(dynoxide_bin())
-        .args(args)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn dynoxide");
-    let stderr = child.stderr.take().unwrap();
-    (child, BufReader::new(stderr))
-}
-
-/// Read lines from `reader` until one contains `needle` or `timeout` elapses.
-fn wait_for_line(reader: &mut impl BufRead, needle: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) if line.contains(needle) => return true,
-            Ok(_) => {}
-        }
-    }
-    false
+/// The command for `dynoxide` with the given args.
+fn dynoxide(args: &[&str]) -> Command {
+    let mut command = Command::new(dynoxide_bin());
+    command.args(args);
+    command
 }
 
 /// Spawn `dynoxide` with the given args, wait up to `timeout` for a line on
-/// stderr matching `needle`, kill the process, then return whether it was found.
+/// stderr containing `needle`, kill the process, then return whether it was
+/// found.
 fn spawn_and_wait_for_stderr(args: &[&str], needle: &str, timeout: Duration) -> bool {
-    let (mut child, mut reader) = spawn_dynoxide(args);
-    let found = wait_for_line(&mut reader, needle, timeout);
-    let _ = child.kill();
-    let _ = child.wait();
-    found
+    Server::spawn(dynoxide(args))
+        .wait_for_line(|line| line.contains(needle), timeout)
+        .is_ok()
 }
 
 /// Send a minimal DynamoDB `DescribeTable` request. Dynoxide doesn't verify
 /// SigV4 signatures, so a well-formed-but-fake Authorization header is enough.
-async fn describe_table(port: u16, table_name: &str) -> serde_json::Value {
+async fn describe_table(port: u16, table_name: &str) -> reqwest::Result<serde_json::Value> {
     reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}"))
         .header("x-amz-target", "DynamoDB_20120810.DescribeTable")
@@ -104,11 +57,9 @@ async fn describe_table(port: u16, table_name: &str) -> serde_json::Value {
         .header("x-amz-date", "20260101T000000Z")
         .json(&serde_json::json!({ "TableName": table_name }))
         .send()
-        .await
-        .expect("send DescribeTable request")
+        .await?
         .json()
         .await
-        .expect("parse DescribeTable response")
 }
 
 #[test]
@@ -167,12 +118,11 @@ fn serve_schema_scaffolds_tables_on_startup() {
     let schema_file = tmp.path().join("schema.json");
     write_schema_file(&schema_file, "Widgets");
 
-    let port = free_port();
     let found = spawn_and_wait_for_stderr(
         &[
             "serve",
             "--port",
-            &port.to_string(),
+            "0",
             "--schema",
             schema_file.to_str().unwrap(),
         ],
@@ -191,14 +141,8 @@ fn root_schema_scaffolds_tables_on_startup() {
     let schema_file = tmp.path().join("schema.json");
     write_schema_file(&schema_file, "Gadgets");
 
-    let port = free_port();
     let found = spawn_and_wait_for_stderr(
-        &[
-            "--port",
-            &port.to_string(),
-            "--schema",
-            schema_file.to_str().unwrap(),
-        ],
+        &["--port", "0", "--schema", schema_file.to_str().unwrap()],
         "Scaffolded 1 table(s) from schema",
         Duration::from_secs(10),
     );
@@ -210,46 +154,38 @@ fn root_schema_scaffolds_tables_on_startup() {
 
 /// Unix only: the server is stopped with `kill -TERM`. Off unix it only
 /// listens for Ctrl+C, which a test cannot easily send to a child process.
+///
+/// Quiet mode prints no listening line to read a port from, so the port is
+/// picked up front, and the run is started again on a fresh one if another
+/// process takes it before the child binds it.
 #[cfg(unix)]
-#[tokio::test]
-async fn log_quiet_suppresses_startup_and_shutdown_messages() {
+#[test]
+fn log_quiet_suppresses_startup_and_shutdown_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let schema_file = tmp.path().join("schema.json");
     write_schema_file(&schema_file, "QuietTable");
 
     for uses_subcommand in [true, false] {
-        let port = free_port();
-        let mut args = Vec::new();
-        if uses_subcommand {
-            args.push("serve".to_owned());
-        }
-        args.extend([
-            "--log".to_owned(),
-            "quiet".to_owned(),
-            "--port".to_owned(),
-            port.to_string(),
-            "--schema".to_owned(),
-            schema_file.to_string_lossy().into_owned(),
-        ]);
+        let build = |ports: &[u16]| {
+            let mut args = Vec::new();
+            if uses_subcommand {
+                args.push("serve".to_owned());
+            }
+            args.extend([
+                "--log".to_owned(),
+                "quiet".to_owned(),
+                "--port".to_owned(),
+                ports[0].to_string(),
+                "--schema".to_owned(),
+                schema_file.to_string_lossy().into_owned(),
+            ]);
+            let mut command = Command::new(dynoxide_bin());
+            command.args(&args);
+            command
+        };
 
-        let child = Command::new(dynoxide_bin())
-            .args(&args)
-            .stderr(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn dynoxide");
-
-        assert!(
-            wait_until_http_ready(port, Duration::from_secs(10)).await,
-            "dynoxide did not become ready with args {args:?}"
-        );
-        let signal = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .expect("send SIGTERM");
-        assert!(signal.success(), "failed to send SIGTERM");
-
-        let output = child.wait_with_output().expect("collect dynoxide output");
+        let output =
+            common::run_until_ready_then_term(build, &[Listener::Http], common::Startup::Silent);
         assert!(
             output.status.success(),
             "dynoxide did not shut down gracefully: {:?}",
@@ -305,24 +241,28 @@ async fn serve_schema_scaffolds_lsi_with_orphaned_attribute() {
     }]);
     std::fs::write(&schema_file, serde_json::to_string_pretty(&schema).unwrap()).unwrap();
 
-    let port = free_port();
-    let (mut child, mut reader) = spawn_dynoxide(&[
+    let server = Server::spawn(dynoxide(&[
         "serve",
         "--port",
-        &port.to_string(),
+        "0",
         "--schema",
         schema_file.to_str().unwrap(),
-    ]);
-    let scaffolded = wait_for_line(
-        &mut reader,
-        "Scaffolded 1 table(s) from schema",
-        Duration::from_secs(10),
-    );
+    ]));
+    let scaffolded = server
+        .wait_for_line(
+            |line| line.contains("Scaffolded 1 table(s) from schema"),
+            Duration::from_secs(10),
+        )
+        .is_ok();
     assert!(scaffolded, "server did not report scaffolding the table");
 
-    let body = describe_table(port, "Orders").await;
-    let _ = child.kill();
-    let _ = child.wait();
+    // The scaffold line comes before the bind, so the port is read from the
+    // listening line, which comes after it.
+    let port = server.port(Listener::Http);
+    let body = describe_table(port, "Orders")
+        .await
+        .unwrap_or_else(|e| panic!("DescribeTable failed ({e}); stderr:\n{}", server.stderr()));
+    drop(server);
 
     let lsis = &body["Table"]["LocalSecondaryIndexes"];
     assert!(

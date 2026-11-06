@@ -2644,3 +2644,107 @@ fn test_update_oversized_item_stays_bare() {
         "Item size to update has exceeded the maximum allowed size"
     );
 }
+
+// ---------------------------------------------------------------------------
+// UpdateItem: ReturnValues when the update creates the item. Captured
+// against eu-west-2 and us-east-1 on 5 November 2026: the old image of an
+// item that didn't exist is empty, so ALL_OLD and UPDATED_OLD return no
+// Attributes, whatever the update expression.
+// ---------------------------------------------------------------------------
+
+fn upsert_returning(
+    db: &Database,
+    update_expression: Option<&str>,
+    with_value: bool,
+    return_values: &str,
+) -> Option<HashMap<String, AttributeValue>> {
+    db.update_item(UpdateItemRequest {
+        table_name: "Tbl".to_string(),
+        key: key_map(&[("pk", AttributeValue::S("missing".into()))]),
+        update_expression: update_expression.map(str::to_string),
+        expression_attribute_values: with_value
+            .then(|| make_item(&[(":v", AttributeValue::S("new".into()))])),
+        return_values: Some(return_values.to_string()),
+        ..Default::default()
+    })
+    .unwrap()
+    .attributes
+}
+
+#[test]
+fn all_old_on_an_upsert_with_set_returns_no_attributes() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    assert_eq!(
+        upsert_returning(&db, Some("SET a = :v"), true, "ALL_OLD"),
+        None
+    );
+}
+
+#[test]
+fn all_old_on_an_upsert_with_remove_returns_no_attributes() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    assert_eq!(
+        upsert_returning(&db, Some("REMOVE a"), false, "ALL_OLD"),
+        None
+    );
+}
+
+#[test]
+fn all_old_on_an_upsert_with_no_update_expression_returns_no_attributes() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    assert_eq!(upsert_returning(&db, None, false, "ALL_OLD"), None);
+}
+
+#[test]
+fn updated_old_on_an_upsert_returns_no_attributes() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    assert_eq!(
+        upsert_returning(&db, Some("SET a = :v"), true, "UPDATED_OLD"),
+        None
+    );
+}
+
+#[test]
+fn all_new_and_updated_new_on_an_upsert_return_the_new_image() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    assert_eq!(
+        upsert_returning(&db, Some("SET a = :v"), true, "ALL_NEW"),
+        Some(make_item(&[
+            ("pk", AttributeValue::S("missing".into())),
+            ("a", AttributeValue::S("new".into())),
+        ]))
+    );
+
+    let db = make_db();
+    create_table(&db, "Tbl");
+    assert_eq!(
+        upsert_returning(&db, Some("SET a = :v"), true, "UPDATED_NEW"),
+        Some(make_item(&[("a", AttributeValue::S("new".into()))]))
+    );
+}
+
+#[test]
+fn all_old_on_an_existing_item_still_returns_the_old_item() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", AttributeValue::S("missing".into())),
+            ("a", AttributeValue::S("old".into())),
+        ],
+    );
+    assert_eq!(
+        upsert_returning(&db, Some("SET a = :v"), true, "ALL_OLD"),
+        Some(make_item(&[
+            ("pk", AttributeValue::S("missing".into())),
+            ("a", AttributeValue::S("old".into())),
+        ]))
+    );
+}

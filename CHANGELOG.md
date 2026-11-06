@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an import rule's `match` expression, so a rule matching such an attribute
   now needs an alias in its `names`. A rule's `path` is unaffected
   ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
+- An `UpdateItem` that creates its item returns no `Attributes` for
+  `ReturnValues: ALL_OLD`, whether it uses `SET`, `REMOVE` or no update
+  expression. It used to return the key attributes as the old image.
+  Captured against eu-west-2 and us-east-1 on 5 November 2026
+  ([#278](https://github.com/nubo-db/dynoxide/issues/278)).
 - PartiQL `SELECT` reads one partition when every OR branch names the same
   partition key. It used to scan the table, charging for unrelated rows and
   counting them towards `Limit`. Separate parameters holding the same key,

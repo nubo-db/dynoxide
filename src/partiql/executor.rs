@@ -289,13 +289,16 @@ fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
 }
 
 /// Refuse the filter DynamoDB refuses on a SELECT that reads one partition: a
-/// `NOT` over a condition on a key attribute of the read target, inside an OR
-/// with a branch naming no key attribute. A `NOT` wrapping such an OR counts,
-/// since it negates every branch. `<>` isn't a `NOT`; a `NOT` alone or under
-/// AND runs, as does an OR whose branches all name a key attribute. On an
-/// index the keys are the index's, so the table's sort key is any other
-/// attribute there. A clause with no partition-key equality beside the OR is
-/// a scan, and runs (captured eu-west-2 and us-east-1, 2026-11-05).
+/// `NOT` written over a condition on a key attribute of the read target, inside
+/// a group with a branch naming no key attribute. A group is an OR, or an AND
+/// under a `NOT`, which De Morgan makes an OR. Any `NOT` counts, two as much as
+/// one, and so does a form spelt with one: `NOT IN`, `NOT BETWEEN`, `IS NOT
+/// MISSING` or `IS NOT <type>`. `attribute_not_exists` and `<>` are not a
+/// `NOT`. A `NOT` alone or under AND runs, as does a group whose branches all
+/// name a key attribute. On an index the keys are the index's, so the table's
+/// sort key is any other attribute there. A clause with no partition-key
+/// equality beside the group is a scan, and runs (captured eu-west-2 and
+/// us-east-1, 5 and 6 November 2026).
 fn reject_negated_key_filters(
     where_clause: Option<&WhereClause>,
     read_pk: &str,
@@ -319,46 +322,49 @@ fn reject_negated_key_filters(
             .map(|root| root.into_owned())
     };
 
-    // The ORs joined to the rest of the clause by AND, each with whether a
-    // `NOT` wraps it.
-    fn top_level_ors(clause: &WrittenClause, negated: bool) -> Vec<(&[WrittenClause], bool)> {
+    // The groups joined to the rest of the clause by AND: each OR, and each
+    // AND under a `NOT`, with whether a `NOT` is written above it.
+    fn groups(clause: &WrittenClause, under_not: bool) -> Vec<(&[WrittenClause], bool)> {
         match clause {
-            WrittenClause::And(terms) if !negated => terms
-                .iter()
-                .flat_map(|term| top_level_ors(term, false))
-                .collect(),
-            WrittenClause::Not(inner) => top_level_ors(inner, !negated),
-            WrittenClause::Or(branches) => vec![(branches.as_slice(), negated)],
-            _ => Vec::new(),
+            WrittenClause::And(terms) if !under_not => {
+                terms.iter().flat_map(|term| groups(term, false)).collect()
+            }
+            WrittenClause::And(branches) | WrittenClause::Or(branches) => {
+                vec![(branches.as_slice(), under_not)]
+            }
+            WrittenClause::Not(inner) => groups(inner, true),
+            WrittenClause::Leaf(_) => Vec::new(),
         }
     }
-    // Each condition in a clause, with whether it is negated: by the `NOT`s
-    // above it, or by being written as a negation.
+    // Each condition in a clause, with whether a `NOT` is written over it or
+    // in it.
     fn leaves<'a>(
         clause: &'a WrittenClause,
-        negated: bool,
+        under_not: bool,
         out: &mut Vec<(&'a WhereCondition, bool)>,
     ) {
         match clause {
             WrittenClause::Leaf(cond) => {
-                let written_negated = matches!(
+                let spelt_with_not = matches!(
                     **cond,
                     WhereCondition::NotComparison(_)
                         | WhereCondition::NotBeginsWith(..)
                         | WhereCondition::NotBetween(..)
                         | WhereCondition::NotContains(..)
+                        | WhereCondition::IsNotMissing(_)
+                        | WhereCondition::IsNotType(..)
                         | WhereCondition::Not(_)
                 );
-                out.push((cond, negated != written_negated));
+                out.push((cond, under_not || spelt_with_not));
             }
             WrittenClause::And(terms) | WrittenClause::Or(terms) => {
-                terms.iter().for_each(|term| leaves(term, negated, out))
+                terms.iter().for_each(|term| leaves(term, under_not, out))
             }
-            WrittenClause::Not(inner) => leaves(inner, !negated, out),
+            WrittenClause::Not(inner) => leaves(inner, true, out),
         }
     }
 
-    for (branches, negated) in top_level_ors(&wc.written, false) {
+    for (branches, negated) in groups(&wc.written, false) {
         let branch_leaves: Vec<Vec<(&WhereCondition, bool)>> = branches
             .iter()
             .map(|branch| {
@@ -415,7 +421,14 @@ fn check_read_key_types(
     let groups = if wc.fully_expanded {
         &wc.groups
     } else {
-        projected = key_groups(wc, read_pk, read_sk)?;
+        // A clause too wide to expand is reported by
+        // [`reject_overlapping_key_conditions`], after the filter refusal:
+        // nine ANDed `(NOT sk = 's0' OR x = 0)` pairs are refused for the
+        // filter (captured eu-west-2 and us-east-1, 3 November 2026).
+        let Ok(groups) = key_groups(wc, read_pk, read_sk) else {
+            return Ok(());
+        };
+        projected = groups;
         &projected
     };
     for group in groups {
@@ -835,8 +848,19 @@ fn key_groups(
     read_sk: Option<&str>,
 ) -> Result<Vec<Vec<Arc<WhereCondition>>>> {
     use crate::partiql::parser::ConditionTree;
+    // A test of whether a key is there, or of its type, narrows no range and
+    // stays in the filter: `pk = 'a' AND (attribute_not_exists(sk) OR x = 1)`
+    // runs, on a table or an index (captured eu-west-2 and us-east-1,
+    // 6 November 2026). `IS <type>` is read as `attribute_type`, which runs
+    // there too.
     let is_key = |cond: &WhereCondition| {
-        condition_path(cond).is_some_and(|path| {
+        !matches!(
+            cond,
+            WhereCondition::Exists(_)
+                | WhereCondition::NotExists(_)
+                | WhereCondition::IsMissing(_)
+                | WhereCondition::IsType(..)
+        ) && condition_path(cond).is_some_and(|path| {
             let root = root_attribute(path);
             root == read_pk || read_sk == Some(&*root)
         })
@@ -1740,8 +1764,10 @@ async fn execute_select<S: StorageBackend>(
         None => table_key_schema.sort_key_type.clone(),
         Some(_) => declared_attribute_type(meta, attr),
     };
-    reject_negated_key_filters(where_clause, read_pk, read_sk)?;
+    // A key of the wrong type is reported before a refused filter (captured
+    // eu-west-2 and us-east-1, 6 November 2026).
     check_read_key_types(where_clause, parameters, read_pk, read_sk, &declared)?;
+    reject_negated_key_filters(where_clause, read_pk, read_sk)?;
     reject_overlapping_key_conditions(where_clause, parameters, read_pk, read_sk)?;
     let order = if order_by.is_empty() {
         None

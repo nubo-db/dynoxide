@@ -1,6 +1,7 @@
 //! A PartiQL SELECT that reads one partition refuses a negated condition on a
 //! key attribute inside an OR with a branch naming no key attribute, as
-//! DynamoDB does. Captured against eu-west-2 and us-east-1 on 5 November 2026.
+//! DynamoDB does, and runs a test of whether a key is there as a filter.
+//! Captured against eu-west-2 and us-east-1 on 5 and 6 November 2026.
 use dynoxide::Database;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
 use serde_json::json;
@@ -84,6 +85,145 @@ fn a_negated_sort_key_in_an_or_with_a_non_key_branch_is_refused() {
         let sql = format!("SELECT * FROM \"T\" WHERE pk = 'k' AND {clause}");
         assert_eq!(run(&db, &sql), Err(refusal("sk")), "{clause}");
     }
+}
+
+/// Any written `NOT` counts, including the ones spelt into a form and a second
+/// `NOT` that cancels the first, and so does a `NOT` over an AND, which De
+/// Morgan makes an OR.
+#[test]
+fn every_written_not_on_the_sort_key_is_refused() {
+    let db = setup();
+    for clause in [
+        "(sk NOT IN ['s0', 's1'] OR x = 0)",
+        "(sk NOT BETWEEN 'a' AND 'b' OR x = 0)",
+        "(NOT contains(sk, 's') OR x = 0)",
+        "(NOT attribute_exists(sk) OR x = 0)",
+        "(sk IS NOT MISSING OR x = 0)",
+        "(sk IS NOT NULL OR x = 0)",
+        "(sk IS NOT STRING OR x = 0)",
+        "NOT (NOT (sk = 's0' OR x = 0))",
+        "NOT (sk = 's0' AND x = 0)",
+    ] {
+        let sql = format!("SELECT * FROM \"T\" WHERE pk = 'k' AND {clause}");
+        assert_eq!(run(&db, &sql), Err(refusal("sk")), "{clause}");
+    }
+    assert_eq!(
+        run(
+            &db,
+            "SELECT * FROM \"T\".\"l-all\" WHERE pk = 'k' AND (l NOT IN ['a'] OR x = 0)"
+        ),
+        Err(refusal("l"))
+    );
+}
+
+#[test]
+fn a_key_of_the_wrong_type_is_reported_before_the_refusal() {
+    let db = setup();
+    assert_eq!(
+        run(
+            &db,
+            "SELECT * FROM \"T\" WHERE pk = true AND (NOT sk = 's0' OR x = 0)"
+        ),
+        Err(
+            "ValidationException: Key value must be of type S, N, or B. \
+             Key name: pk, Key type: BOOL"
+                .to_string()
+        )
+    );
+}
+
+/// `attribute_exists`, `attribute_not_exists` and `IS MISSING` on a key don't
+/// narrow the read, so beside a non-key branch they filter rather than meet
+/// as key ranges. `begins_with` does narrow it, and is still refused for
+/// overlapping.
+#[test]
+fn a_test_of_whether_a_key_is_there_filters_beside_a_non_key_branch() {
+    let db = setup();
+    for (source, clause, rows) in [
+        (
+            "\"T\"",
+            "pk = 'k' AND (attribute_not_exists(sk) OR x = 1)",
+            1,
+        ),
+        (
+            "\"T\"",
+            "pk = 'k' AND (attribute_not_exists(sk) OR x = 0)",
+            0,
+        ),
+        ("\"T\"", "pk = 'k' AND (attribute_exists(sk) OR x = 0)", 4),
+        ("\"T\"", "pk = 'k' AND (sk IS MISSING OR x = 1)", 1),
+        (
+            "\"T\"",
+            "pk = 'k' AND (attribute_not_exists(pk) OR x = 1)",
+            1,
+        ),
+        (
+            "\"T\"",
+            "pk = 'k' AND (attribute_not_exists(sk) OR attribute_not_exists(x))",
+            0,
+        ),
+        (
+            "\"T\"",
+            "pk = 'k' AND (attribute_type(sk, 'S') OR x = 0)",
+            4,
+        ),
+        (
+            "\"T\".\"l-all\"",
+            "pk = 'k' AND (attribute_not_exists(l) OR x = 1)",
+            1,
+        ),
+        (
+            "\"T\".\"g-all\"",
+            "g = 'k' AND (attribute_not_exists(l) OR x = 1)",
+            1,
+        ),
+    ] {
+        let sql = format!("SELECT * FROM {source} WHERE {clause}");
+        assert_eq!(run(&db, &sql), Ok(rows), "{source} {clause}");
+    }
+    assert_eq!(
+        run(
+            &db,
+            "SELECT * FROM \"T\" WHERE pk = 'k' AND (begins_with(sk, 'row') OR x = 0)"
+        ),
+        Err(
+            "ValidationException: Overlapping conditions with range keys are not \
+             supported in where clause"
+                .to_string()
+        )
+    );
+}
+
+/// Under `Limit: 1` the filter reads one row a page and ends on an empty page
+/// with no token, the matching row on the first.
+#[test]
+fn a_key_test_beside_a_non_key_branch_pages_through_the_partition() {
+    let db = setup();
+    let mut pages = Vec::new();
+    let mut next_token = None;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: "SELECT * FROM \"KeyFilters\" WHERE pk = 'k' \
+                            AND (attribute_not_exists(sk) OR x = 1)"
+                    .to_string(),
+                limit: Some(1),
+                next_token: next_token.take(),
+                ..Default::default()
+            })
+            .unwrap();
+        let rows = response.items.unwrap_or_default().len();
+        let more = response.next_token.is_some();
+        pages.push((rows, more));
+        if !more || pages.len() > 8 {
+            break;
+        }
+        next_token = response.next_token;
+    }
+    assert_eq!(
+        pages,
+        [(1, true), (0, true), (0, true), (0, true), (0, false)]
+    );
 }
 
 #[test]

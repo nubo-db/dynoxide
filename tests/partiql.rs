@@ -4552,6 +4552,9 @@ mod limit_over_the_wire {
             "1e+20",
             "100000000000000000000",
             "18446744073709551617",
+            // Past f64's range too (captured eu-west-2 and us-east-1,
+            // 6 November 2026).
+            "1e400",
         ] {
             assert_eq!(walk(&url, limit).await, Ok(vec![4]), "Limit {limit}");
         }
@@ -4562,6 +4565,27 @@ mod limit_over_the_wire {
         let url = start_server().await;
         assert_eq!(walk(&url, "0").await, Err(below_one("0")));
         assert_eq!(walk(&url, "-1").await, Err(below_one("-1")));
+    }
+
+    /// The value reported is the one left after truncating and saturating
+    /// (captured eu-west-2 and us-east-1, 6 November 2026).
+    #[tokio::test]
+    async fn a_limit_that_truncates_or_saturates_below_one_reports_what_is_left() {
+        let url = start_server().await;
+        for (limit, left) in [
+            ("0.5", "0"),
+            ("-0.5", "0"),
+            ("0.0", "0"),
+            ("-0.0", "0"),
+            ("-1.5", "-1"),
+            ("-1e400", "-2147483648"),
+        ] {
+            assert_eq!(
+                walk(&url, limit).await,
+                Err(below_one(left)),
+                "Limit {limit}"
+            );
+        }
     }
 
     /// A negative `Limit` joins the other member errors in their usual order,

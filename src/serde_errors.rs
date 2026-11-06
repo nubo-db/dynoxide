@@ -35,6 +35,12 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
         if let Some(classified) = classify_marked_serde_error(&msg) {
             return classified;
         }
+        // A member read as a fixed-width number gets a bare
+        // SerializationException for one past f64's range, as every member
+        // did before `Limit`, `Segment` and `TotalSegments` read their text.
+        if is_number_out_of_range(&e) {
+            return crate::DynoxideError::SerializationException(String::new());
+        }
         // DynamoDB returns ValidationException for missing required fields,
         // null values, and unrecognised enum variants. Only true JSON type
         // mismatches (e.g. number where string is expected) produce a
@@ -55,6 +61,70 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
             crate::DynoxideError::SerializationException(map_serde_to_dynamodb_message(&msg, body))
         }
     })
+}
+
+/// Whether serde_json refused a number for being past f64's range. The JSON is
+/// well formed, and DynamoDB reads such a number (captured eu-west-2 and
+/// us-east-1, 6 November 2026).
+pub(crate) fn is_number_out_of_range(err: &serde_json::Error) -> bool {
+    err.to_string().starts_with("number out of range")
+}
+
+/// A request body as a JSON value, for the checks that read its shape before
+/// the typed read. A number past f64's range is well-formed JSON that DynamoDB
+/// reads, so the body is read again with each such number standing in as `0`:
+/// these checks look at what type a member is, never at a number's value, and
+/// the member's own reader takes the number from the body as written.
+pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match serde_json::from_str(body) {
+        Err(e) if is_number_out_of_range(&e) => {
+            serde_json::from_str(&zero_out_of_range_numbers(body))
+        }
+        read => read,
+    }
+}
+
+/// `body` with every number serde_json can't hold written as `0`. Strings are
+/// skipped whole, escapes included, so text that looks like a number inside
+/// one is left alone.
+fn zero_out_of_range_numbers(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(bytes.len());
+                out.push_str(&body[start..i]);
+            }
+            b'-' | b'0'..=b'9' => {
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let token = &body[start..i];
+                match serde_json::from_str::<serde_json::Number>(token) {
+                    Err(e) if is_number_out_of_range(&e) => out.push('0'),
+                    _ => out.push_str(token),
+                }
+            }
+            _ => {
+                // Copy up to the next string or number, keeping UTF-8 whole.
+                i += 1;
+                while i < bytes.len() && !matches!(bytes[i], b'"' | b'-' | b'0'..=b'9') {
+                    i += 1;
+                }
+                out.push_str(&body[start..i]);
+            }
+        }
+    }
+    out
 }
 
 /// Classify a raw serde error message by its marker prefix, stripping the

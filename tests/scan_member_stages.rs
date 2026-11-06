@@ -62,6 +62,12 @@ async fn start_server() -> String {
 /// The ValidationException (or SerializationException) message a Scan is refused with, or an empty string
 /// when it is accepted.
 async fn answer(url: &str, body: &serde_json::Value) -> String {
+    answer_raw(url, body.to_string()).await
+}
+
+/// [`answer`] for a body sent as written, for a number a JSON value can't
+/// hold.
+async fn answer_raw(url: &str, body: String) -> String {
     let resp = reqwest::Client::new()
         .post(url)
         .header("x-amz-target", "DynamoDB_20120810.Scan")
@@ -72,7 +78,7 @@ async fn answer(url: &str, body: &serde_json::Value) -> String {
              SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
         )
         .header("x-amz-date", "20260101T000000Z")
-        .json(body)
+        .body(body.clone())
         .send()
         .await
         .unwrap();
@@ -1252,6 +1258,52 @@ async fn each_request_is_answered_as_the_newer_layer_answers_it() {
 /// in a value or a starting key is refused bare. eu-west-2, 20 October 2026;
 /// 19 of the 33 observed regions answered this way for the numbers and sets, and
 /// 20 for the empty names.
+/// Scan's integer members written as numbers a JSON value can't hold, or as
+/// a zero with a fraction, sent as written. Each saturates or truncates and is
+/// reported as read (captured eu-west-2 and us-east-1, 6 November 2026, where
+/// both regions gave the same answers).
+#[tokio::test]
+async fn integer_members_past_the_range_of_a_double_saturate() {
+    let url = start_server().await;
+    let below_one = |value: &str, member: &str| {
+        format!(
+            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+             constraint: Member must have value greater than or equal to 1"
+        )
+    };
+    for (members, expected) in [
+        (r#""Limit":1e400"#, String::new()),
+        (r#""Limit":-1e400"#, below_one("-2147483648", "limit")),
+        (r#""Limit":0.0"#, below_one("0", "limit")),
+        (r#""Limit":-0.0"#, below_one("0", "limit")),
+        (
+            r#""Segment":0,"TotalSegments":1e400"#,
+            "1 validation error detected: Value '2147483647' at 'totalSegments' failed to \
+             satisfy constraint: Member must have value less than or equal to 1000000"
+                .to_string(),
+        ),
+        (
+            r#""Segment":0,"TotalSegments":-1e400"#,
+            below_one("-2147483648", "totalSegments"),
+        ),
+        (
+            r#""Segment":1e400,"TotalSegments":2"#,
+            "1 validation error detected: Value '2147483647' at 'segment' failed to satisfy \
+             constraint: Member must have value less than or equal to 999999"
+                .to_string(),
+        ),
+        (
+            r#""Segment":-1e400,"TotalSegments":2"#,
+            "1 validation error detected: Value '-2147483648' at 'segment' failed to satisfy \
+             constraint: Member must have value greater than or equal to 0"
+                .to_string(),
+        ),
+    ] {
+        let body = format!(r#"{{"TableName":"{TABLE}",{members}}}"#);
+        assert_eq!(answer_raw(&url, body).await, expected, "{members}");
+    }
+}
+
 const VALUE_CASES: &[(&str, &str, &str)] = &[
     (
         r##"exprEmptyNumber"##,

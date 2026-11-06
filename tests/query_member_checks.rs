@@ -57,6 +57,12 @@ async fn start_server() -> String {
 /// The ValidationException (or SerializationException) message a Query is
 /// refused with, or an empty string when it is accepted.
 async fn answer(url: &str, body: &serde_json::Value) -> String {
+    answer_raw(url, body.to_string()).await
+}
+
+/// [`answer`] for a body sent as written, for a number a JSON value can't
+/// hold.
+async fn answer_raw(url: &str, body: String) -> String {
     let resp = reqwest::Client::new()
         .post(url)
         .header("x-amz-target", "DynamoDB_20120810.Query")
@@ -67,7 +73,7 @@ async fn answer(url: &str, body: &serde_json::Value) -> String {
              SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
         )
         .header("x-amz-date", "20260101T000000Z")
-        .json(body)
+        .body(body.clone())
         .send()
         .await
         .unwrap();
@@ -210,6 +216,18 @@ const CASES: &[(&str, &str, &str)] = &[
         r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":0.5}"##,
         r##"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
     ),
+    // Captured eu-west-2 and us-east-1, 6 November 2026: a zero written with
+    // a fraction is reported as read.
+    (
+        r##"Limit 0.0"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":0.0}"##,
+        r##"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"Limit -0.0"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":-0.0}"##,
+        r##"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
     (
         r##"Limit as a string"##,
         r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":"5"}"##,
@@ -309,7 +327,7 @@ const CASES: &[(&str, &str, &str)] = &[
 
 #[tokio::test]
 async fn each_request_is_answered_as_dynamodb_answers_it() {
-    assert_eq!(CASES.len(), 42, "a case was added or lost");
+    assert_eq!(CASES.len(), 44, "a case was added or lost");
     let url = start_server().await;
     let mut wrong = Vec::new();
     for (case, members, expected) in CASES {
@@ -336,6 +354,24 @@ async fn each_request_is_answered_as_dynamodb_answers_it() {
         wrong.len(),
         CASES.len(),
         wrong.join("\n")
+    );
+}
+
+/// A `Limit` past f64's range saturates, read as written (captured eu-west-2
+/// and us-east-1, 6 November 2026).
+#[tokio::test]
+async fn a_limit_past_the_range_of_a_double_saturates() {
+    let url = start_server().await;
+    let body = |limit: &str| {
+        format!(
+            r#"{{"TableName":"{TABLE}","KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{{":p":{{"S":"a"}}}},"Limit":{limit}}}"#
+        )
+    };
+    assert_eq!(answer_raw(&url, body("1e400")).await, "");
+    assert_eq!(
+        answer_raw(&url, body("-1e400")).await,
+        "1 validation error detected: Value '-2147483648' at 'limit' failed to satisfy \
+         constraint: Member must have value greater than or equal to 1"
     );
 }
 

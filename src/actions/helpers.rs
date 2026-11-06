@@ -2557,9 +2557,11 @@ fn validate_filter_attribute_value(
 
 /// An integer member as DynamoDB reads it: a 32-bit signed integer that
 /// saturates at either end, truncating a fraction. A value that saturated or
-/// lost a fraction is flagged, because the member is then checked by the older
-/// layer, which reports the value as read (captured eu-west-2 and eu-central-1,
-/// 20 October 2026).
+/// was written with a fraction or exponent is flagged, because the member is
+/// then checked by the older layer, which reports the value as read (captured
+/// eu-west-2 and eu-central-1, 20 October 2026). `0.0` is flagged though it
+/// loses nothing: Query reports it as read, as it does `0.5` (captured
+/// eu-west-2 and us-east-1, 6 November 2026).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Int32 {
     pub(crate) value: i64,
@@ -2569,12 +2571,34 @@ pub(crate) struct Int32 {
 pub(crate) fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Int32>, D::Error> {
-    let Some(number) =
-        <Option<serde_json::Number> as serde::Deserialize>::deserialize(deserializer)?
+    use serde::de::Error as _;
+    // Read as text first: serde_json refuses a number past f64's range, such
+    // as `1e400`, which DynamoDB reads and saturates (captured eu-west-2 and
+    // us-east-1, 6 November 2026).
+    let Some(raw) = <Option<Box<serde_json::value::RawValue>> as serde::Deserialize>::deserialize(
+        deserializer,
+    )?
     else {
         return Ok(None);
     };
-    let mut fraction = false;
+    let number = match serde_json::from_str::<serde_json::Number>(raw.get()) {
+        Ok(number) => number,
+        Err(e) if crate::serde_errors::is_number_out_of_range(&e) => {
+            let value = if raw.get().starts_with('-') {
+                i32::MIN
+            } else {
+                i32::MAX
+            };
+            return Ok(Some(Int32 {
+                value: i64::from(value),
+                coerced: true,
+            }));
+        }
+        // Anything other than a number keeps serde's own wording, which the
+        // caller maps as it did when the member was read as a number.
+        Err(e) => return Err(D::Error::custom(e)),
+    };
+    let mut float = false;
     let wide = if let Some(i) = number.as_i64() {
         i128::from(i)
     } else if let Some(u) = number.as_u64() {
@@ -2582,14 +2606,13 @@ pub(crate) fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
     } else {
         // A fraction truncates toward zero; NaN and the infinities cannot
         // appear in JSON.
-        let float = number.as_f64().unwrap_or(0.0);
-        fraction = float.fract() != 0.0;
-        float.trunc() as i128
+        float = true;
+        number.as_f64().unwrap_or(0.0).trunc() as i128
     };
     let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
     Ok(Some(Int32 {
         value: clamped as i64,
-        coerced: fraction || clamped != wide,
+        coerced: float || clamped != wide,
     }))
 }
 

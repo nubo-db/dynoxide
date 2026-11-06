@@ -311,7 +311,7 @@ async fn handle_request(
     // `deep_nesting`.
     let mut too_deep = false;
     if !body.is_empty()
-        && let Err(e) = serde_json::from_str::<serde_json::Value>(&body)
+        && let Err(e) = crate::serde_errors::body_value(&body)
     {
         if crate::deep_nesting::is_depth_failure(&e) {
             too_deep = true;

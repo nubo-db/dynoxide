@@ -1,6 +1,6 @@
-//! Regressions for #229 and #271–#273, captured in eu-west-2 and us-east-1
-//! on 10 and 23 October and 3 November 2026 (see the corresponding GitHub
-//! issues).
+//! Regressions for #229, #271–#273 and #289, captured in eu-west-2 and
+//! us-east-1 on 10 and 23 October and 3 and 5 November 2026 (see the
+//! corresponding GitHub issues).
 use dynoxide::Database;
 use dynoxide::actions::execute_statement::{ExecuteStatementRequest, ExecuteStatementResponse};
 use serde_json::json;
@@ -789,6 +789,10 @@ fn number_sort_key_unions_end_after_their_last_row() {
     for (clause, first, second) in [
         ("(sk = 2 OR sk = 10)", "2", "10"),
         ("(sk = -1 OR sk = 1.5)", "-1", "1.5"),
+        // The IN form of the same keys pages alike (#289, inferred from the
+        // OR form above and the IN form on a string key, captured eu-west-2
+        // and us-east-1, 2026-11-05).
+        ("sk IN [-1, 1.5]", "-1", "1.5"),
     ] {
         let sql = format!("SELECT * FROM \"NumberSk\" WHERE pk = 'k' AND {clause}");
         let mut seen = Vec::new();
@@ -1175,4 +1179,158 @@ fn a_range_written_two_ways_is_one_branch() {
             "{clause}"
         );
     }
+}
+
+#[test]
+fn a_sort_key_in_reads_charges_and_pages_like_its_or() {
+    // #289, captured eu-west-2 and us-east-1 on 2026-11-05: beside a partition
+    // key equality, DynamoDB reads `sk IN [...]` as the OR of its keys. Each
+    // requested key is charged whether or not it exists, a set ends on its
+    // last found key, and a missing last key keeps the token for one empty
+    // page.
+    let db = small_items();
+    let small = |clause: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+    let cases = [
+        (
+            "sk IN ['row-1', 'row-3']",
+            "(sk = 'row-1' OR sk = 'row-3')",
+            None,
+            true,
+            vec![page(&["k/row-1", "k/row-3"], false, 2.0)],
+        ),
+        (
+            "sk IN ['row-1', 'row-2', 'row-3']",
+            "(sk = 'row-1' OR sk = 'row-2' OR sk = 'row-3')",
+            None,
+            true,
+            vec![page(&["k/row-1", "k/row-2", "k/row-3"], false, 3.0)],
+        ),
+        (
+            "sk IN ['row-0', 'row-3']",
+            "(sk = 'row-0' OR sk = 'row-3')",
+            None,
+            true,
+            vec![page(&["k/row-3"], false, 2.0)],
+        ),
+        (
+            "sk IN ['row-1', 'row-3']",
+            "(sk = 'row-1' OR sk = 'row-3')",
+            None,
+            false,
+            vec![page(&["k/row-1", "k/row-3"], false, 1.0)],
+        ),
+        (
+            "sk IN ['row-1', 'row-3']",
+            "(sk = 'row-1' OR sk = 'row-3')",
+            Some(1),
+            false,
+            vec![
+                page(&["k/row-1"], true, 0.5),
+                page(&["k/row-3"], false, 0.5),
+            ],
+        ),
+        (
+            "sk IN ['row-1', 'row-9']",
+            "(sk = 'row-1' OR sk = 'row-9')",
+            Some(1),
+            false,
+            vec![page(&["k/row-1"], true, 0.5), page(&[], false, 0.5)],
+        ),
+        (
+            "sk IN ['row-1', 'row-3'] ORDER BY sk DESC",
+            "(sk = 'row-1' OR sk = 'row-3') ORDER BY sk DESC",
+            Some(1),
+            false,
+            vec![
+                page(&["k/row-3"], true, 0.5),
+                page(&["k/row-1"], false, 0.5),
+            ],
+        ),
+        // A one-value IN reads as its equality.
+        (
+            "sk IN ['row-2']",
+            "sk = 'row-2'",
+            Some(1),
+            true,
+            vec![page(&["k/row-2"], false, 1.0)],
+        ),
+    ];
+    for (keys, or, limit, consistent, expected) in cases {
+        assert_eq!(
+            walk(&db, &small(keys), limit, consistent),
+            expected,
+            "{keys}"
+        );
+        assert_eq!(walk(&db, &small(or), limit, consistent), expected, "{or}");
+    }
+}
+
+#[test]
+fn a_sort_key_in_on_an_index_reads_like_its_or() {
+    // Captured eu-west-2 and us-east-1 on 2026-11-05 for the OR form on an LSI
+    // and a GSI. The IN form is expected to match it, as it does on the table.
+    let db = small_items();
+    let lsi =
+        |clause: &str| format!("SELECT * FROM \"Small\".\"l-all\" WHERE pk = 'k' AND {clause}");
+    assert_eq!(
+        walk(&db, &lsi("l IN ['a', 'z']"), Some(1), false),
+        [page(&["k/row-1"], true, 0.5), page(&[], false, 0.5)]
+    );
+    assert_eq!(
+        walk(&db, &lsi("l IN ['a', 'z']"), None, true),
+        [page(&["k/row-1"], false, 2.0)]
+    );
+    // Each of these rows weighs about 3 KB, so the whole partition would cost
+    // 1.5 where the two keys cost 0.5 each.
+    let db = setup("ALL");
+    let gsi = "SELECT * FROM \"OrReads\".\"g-keys\" WHERE g = 'k' AND sk IN ['row-1', 'row-2']";
+    assert_eq!(
+        walk(&db, gsi, Some(1), false),
+        [
+            page(&["k/row-1"], true, 0.5),
+            page(&["k/row-2"], false, 0.5)
+        ]
+    );
+    assert_eq!(
+        walk(&db, gsi, None, false),
+        [page(&["k/row-1", "k/row-2"], false, 1.0)]
+    );
+}
+
+#[test]
+fn two_sort_key_ins_read_the_keys_both_allow() {
+    let db = small_items();
+    let small = |clause: &str| format!("SELECT * FROM \"Small\" WHERE pk = 'k' AND {clause}");
+    let rows = |sql: &str| -> Vec<String> {
+        walk(&db, sql, None, true)
+            .into_iter()
+            .flat_map(|(rows, _, _)| rows)
+            .collect()
+    };
+    assert_eq!(
+        rows(&small(
+            "sk IN ['row-1', 'row-2'] AND sk IN ['row-2', 'row-3']"
+        )),
+        ["k/row-2"]
+    );
+    assert_eq!(
+        rows(&small("sk IN ['row-1', 'row-3'] AND sk > 'row-1'")),
+        ["k/row-3"]
+    );
+    // Two lists whose combinations pass the planner's group budget read the
+    // whole partition and filter it, so the answer is still right.
+    let list = |known: [&str; 2], prefix: &str| {
+        let mut keys: Vec<String> = known.iter().map(|k| format!("'{k}'")).collect();
+        keys.extend((0..15).map(|i| format!("'{prefix}{i:02}'")));
+        keys.join(", ")
+    };
+    let sql = small(&format!(
+        "sk IN [{}] AND sk IN [{}]",
+        list(["row-1", "row-2"], "a"),
+        list(["row-2", "row-3"], "b")
+    ));
+    assert_eq!(
+        walk(&db, &sql, None, true),
+        [page(&["k/row-2"], false, 1.0)]
+    );
 }

@@ -2669,12 +2669,14 @@ fn sort_key_plan(
     let (Some(wc), Some(sk)) = (where_clause, sk_name) else {
         return SortKeyPlan::default();
     };
-    let groups = read_groups(wc, pk_name, sk).and_then(|groups| {
-        groups
-            .iter()
-            .map(|group| translate_sk_conditions(group, sk, parameters))
-            .collect::<Option<Vec<_>>>()
-    });
+    let groups = read_groups(wc, pk_name, sk)
+        .and_then(|groups| expand_sort_key_ins(&groups, sk))
+        .and_then(|groups| {
+            groups
+                .iter()
+                .map(|group| translate_sk_conditions(group, sk, parameters))
+                .collect::<Option<Vec<_>>>()
+        });
     let Some(groups) =
         groups.filter(|groups| !groups.is_empty() && groups.iter().all(|g| !g.is_empty()))
     else {
@@ -2698,6 +2700,52 @@ fn sort_key_plan(
         params,
         branches,
     }
+}
+
+/// Split each group's multi-value `IN` on the sort key into one group per
+/// value, so the read, its charge and its paging treat `sk IN ['a', 'b']` as
+/// `sk = 'a' OR sk = 'b'` (captured eu-west-2 and us-east-1, 2026-11-05: two
+/// keys cost 2.0 under ConsistentRead either way, and under `Limit: 1` a
+/// missing last key keeps the token for one empty page). A group with two
+/// such lists takes every pairing of their values. Past the planner's group
+/// budget the expansion gives up with `None`, which reads the whole partition
+/// with the clause as its filter.
+fn expand_sort_key_ins(
+    groups: &[Vec<Arc<WhereCondition>>],
+    sk_name: &str,
+) -> Option<Vec<Vec<Arc<WhereCondition>>>> {
+    let budget = crate::partiql::parser::MAX_OR_GROUPS;
+    let mut out: Vec<Vec<Arc<WhereCondition>>> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut expanded = vec![Vec::with_capacity(group.len())];
+        for cond in group {
+            match &**cond {
+                WhereCondition::In(path, values)
+                    if values.len() > 1 && names_attribute(path, sk_name) =>
+                {
+                    if out.len() + expanded.len().saturating_mul(values.len()) > budget {
+                        return None;
+                    }
+                    expanded = expanded
+                        .iter()
+                        .flat_map(|prefix| {
+                            values.iter().map(move |value| {
+                                let mut next = prefix.clone();
+                                next.push(Arc::new(WhereCondition::In(
+                                    path.clone(),
+                                    vec![value.clone()],
+                                )));
+                                next
+                            })
+                        })
+                        .collect();
+                }
+                _ => expanded.iter_mut().for_each(|g| g.push(Arc::clone(cond))),
+            }
+        }
+        out.extend(expanded);
+    }
+    (out.len() <= budget).then_some(out)
 }
 
 /// One OR branch's bounds on the stored sort key, which all hold.

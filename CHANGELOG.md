@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested key costs a read whether or not it exists. Captured against
   eu-west-2 and us-east-1 on 3 and 4 November 2026
   ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
+- A PartiQL sort-key `IN` with more than one value reads, charges and pages
+  like the OR of its keys, on tables and on global and local secondary
+  indexes. It used to read the whole partition, so `pk = 'k' AND
+  sk IN ['row-1', 'row-3']` cost what the partition did and a `Limit` walk
+  kept its token past the last key. Each listed key is charged a read whether
+  or not it exists, and a last listed key with no item keeps the token for one
+  empty page, as the OR form does. Captured against eu-west-2 and us-east-1 on
+  5 November 2026
+  ([#289](https://github.com/nubo-db/dynoxide/issues/289)).
 - PartiQL accepts `ORDER BY` on the sort key when OR branches share one
   partition. It used to count that partition more than once and demand the
   partition key in `ORDER BY`

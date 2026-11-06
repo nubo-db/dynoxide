@@ -3445,7 +3445,7 @@ impl From<WhereCondition> for BoolExpr {
 /// Distributing an AND over ORs multiplies group counts, so a clause built from
 /// nested alternations can expand far beyond what was written. The cap keeps a
 /// pathological statement a rejection rather than an allocation.
-const MAX_OR_GROUPS: usize = 256;
+pub(crate) const MAX_OR_GROUPS: usize = 256;
 
 /// How deeply a statement may nest.
 ///

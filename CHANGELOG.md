@@ -81,8 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing `Item` or `Key`, and a missing or empty table name. As in DynamoDB,
   a table name's length and pattern are reported only once those pass
   ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
-- PartiQL reads a `Limit` past 2147483647 as that number, as Query and Scan
-  do. A `Limit` near or past 9223372036854775807 used to fail the read.
+- ExecuteStatement reads `Limit` as any JSON number, as DynamoDB does. A
+  fraction truncates, so `1.5` and `1.0` read as 1, and a value past
+  2147483647, such as `1e+20` or one near or past 9223372036854775807, reads
+  every row. These used to be refused with serde's own message or fail the
+  read. A `Limit` of `-1` is refused with `Member must have value greater
+  than or equal to 1`, echoing the value and listed with the request's other
+  member errors. Captured against eu-west-2 and us-east-1 on 5 November 2026
+  ([#287](https://github.com/nubo-db/dynoxide/issues/287)).
 - A `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem`, `Query` or `Scan`
   table name is measured in characters, as DynamoDB measures it, so `😀😀` is
   too short and 128 emoji aren't too long. `SearchVectors` shares the check.

@@ -464,31 +464,64 @@ pub fn start(
 
 /// Start the child `build` describes as [`start`] does, stop it with SIGTERM
 /// once every listener answers, and return its output.
-///
-/// A silent child that lost one of two ports can still pass the readiness
-/// check, since the lost port answers from whichever process took it, so a
-/// bind error in its output after the stop also starts it again on fresh
-/// ports.
 #[cfg(unix)]
 pub fn run_until_ready_then_term(
     build: impl Fn(&[u16]) -> Command,
     listeners: &[Listener],
     startup: Startup,
 ) -> Output {
-    let mut lost = Vec::new();
-    for _ in 0..ATTEMPTS {
-        let (ports, mut server) = start(&build, listeners, startup);
+    run_until_ready(build, listeners, startup, |mut server| {
         // The SIGTERM handler is installed by a task the HTTP server spawns
         // as it starts serving. An answered request means that task has been
         // spawned, and this pause gives the runtime time to have polled it,
         // so the signal reaches the handler rather than the default action.
         std::thread::sleep(Duration::from_millis(100));
         server.terminate();
-        let output = server.wait_with_output(Duration::from_secs(15));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if startup == Startup::Silent && is_bind_error(&stderr) {
-            lost.push(format!("ports {ports:?}: {stderr}"));
-            continue;
+        server.wait_with_output(Duration::from_secs(15))
+    })
+}
+
+/// Start the child `build` describes as [`start`] does, kill it once every
+/// listener answers, and return its output.
+pub fn run_until_ready_then_kill(
+    build: impl Fn(&[u16]) -> Command,
+    listeners: &[Listener],
+    startup: Startup,
+) -> Output {
+    run_until_ready(build, listeners, startup, Server::kill_and_collect)
+}
+
+/// Start, wait for every listener to answer, then `stop` the child.
+///
+/// A silent child that lost a port it was given can still pass the
+/// readiness check, since the lost port answers from whichever process took
+/// it. So once the child has stopped, a port that still answers, or a bind
+/// error in its output, means the answer was another process's, and it is
+/// started again on fresh ports. Without that, a test that only looks for a
+/// line's absence would pass on a child that never served, including one
+/// still starting up when it was stopped.
+fn run_until_ready(
+    build: impl Fn(&[u16]) -> Command,
+    listeners: &[Listener],
+    startup: Startup,
+    stop: impl Fn(Server) -> Output,
+) -> Output {
+    let mut lost = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let (ports, server) = start(&build, listeners, startup);
+        let output = stop(server);
+        if startup == Startup::Silent {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let still_answering = ports
+                .iter()
+                .zip(listeners)
+                .any(|(&port, l)| answers_http(port, l.path()));
+            if still_answering || is_bind_error(&stderr) {
+                lost.push(format!(
+                    "ports {ports:?}, still answering: {still_answering}: {stderr}"
+                ));
+                continue;
+            }
         }
         return output;
     }

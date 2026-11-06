@@ -111,6 +111,78 @@ fn a_listening_line_that_never_comes_fails_with_the_stderr_so_far() {
     );
 }
 
+/// Another process takes the first port offered and answers HTTP on it, and
+/// the quiet child is still starting when that answer arrives, so it is
+/// stopped before it ever tries the port. The port answering after the stop
+/// shows the answer wasn't the child's, and it is started again.
+#[cfg(unix)]
+#[test]
+fn a_quiet_child_stopped_while_another_process_answers_its_port_is_started_again() {
+    use std::io::{Read as _, Write as _};
+
+    // What each start was: a stand-in answering on its port while the child
+    // is still starting, a port another test took first, or the real child.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Start {
+        StandIn,
+        PortTaken,
+        Child,
+    }
+    let starts = std::cell::RefCell::new(Vec::new());
+    let envs = [("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")];
+
+    let output = common::run_until_ready_then_kill(
+        |ports| {
+            if !starts.borrow().contains(&Start::StandIn) {
+                // The port can go to another test between being picked and
+                // bound here, the race this test is about. That start is
+                // answered as a lost bind, and the next one tries again.
+                let Ok(holder) = std::net::TcpListener::bind(("127.0.0.1", ports[0])) else {
+                    starts.borrow_mut().push(Start::PortTaken);
+                    let mut sh = Command::new("sh");
+                    sh.args(["-c", "echo 'Address already in use' >&2; exit 1"]);
+                    return sh;
+                };
+                starts.borrow_mut().push(Start::StandIn);
+                std::thread::spawn(move || {
+                    for mut stream in holder.incoming().flatten() {
+                        let mut request = [0u8; 512];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    }
+                });
+                // Still starting long after the readiness wait has its answer.
+                let mut sh = Command::new("sh");
+                sh.args(["-c", "exec sleep 30"]);
+                return sh;
+            }
+            starts.borrow_mut().push(Start::Child);
+            command(
+                &with_quiet(args(&["mcp", "--http", "--port", &ports[0].to_string()])),
+                &envs,
+            )
+        },
+        &[Listener::Mcp],
+        Startup::Silent,
+    );
+
+    let starts = starts.borrow();
+    assert!(
+        starts.contains(&Start::StandIn),
+        "the stand-in never got a port: {starts:?}"
+    );
+    assert_eq!(
+        starts.last(),
+        Some(&Start::Child),
+        "the run returned was the stand-in's, not the child's: {starts:?}"
+    );
+    assert!(
+        !common::is_bind_error(&stderr_of(&output)),
+        "the child bound its port. stderr:\n{}",
+        stderr_of(&output)
+    );
+}
+
 #[test]
 fn a_quiet_child_that_loses_its_port_is_started_again_on_another() {
     // Another process holds the first port offered. The quiet child prints no
@@ -488,17 +560,16 @@ fn mcp_http_quiet_suppresses_the_listener_line() {
     // line. The quiet run prints no line, so it is given a port picked up
     // front, and another process can take that port before the child binds
     // it. That is a lost race, not a regression, and is tried again on a fresh
-    // port.
+    // port, including when the race shows only in the output after the stop.
     let run = |quiet: bool| {
-        let (_, server) = common::start(
+        stderr_of(&common::run_until_ready_then_kill(
             |ports| {
                 let a = args(&["mcp", "--http", "--port", &ports[0].to_string()]);
                 command(&if quiet { with_quiet(a) } else { a }, &envs)
             },
             &[Listener::Mcp],
             startup(quiet),
-        );
-        stderr_of(&server.kill_and_collect())
+        ))
     };
 
     let needles = ["MCP HTTP server listening"];

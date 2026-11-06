@@ -71,27 +71,38 @@ pub(crate) fn is_number_out_of_range(err: &serde_json::Error) -> bool {
 }
 
 /// A request body as a JSON value, for the checks that read its shape before
-/// the typed read. A number past f64's range is well-formed JSON that DynamoDB
-/// reads, so the body is read again with each such number standing in as a
-/// zero written the same way: these checks look at what type a member is,
-/// never at a number's value, and DynamoDB names a number by how it is
-/// written, a decimal with a point or an exponent and a whole number without,
-/// whatever its size (captured eu-west-2 and us-east-1, 6 November 2026). The
-/// member's own reader takes the number from the body as written.
+/// the typed read. These checks look at what type a member is, never at a
+/// number's value, and DynamoDB names a number by how it is written, a decimal
+/// with a point or an exponent and a whole number without, whatever its size
+/// (captured eu-west-2 and us-east-1, 6 November 2026). serde_json keeps no
+/// text for a number: it refuses one past f64's range, though that is
+/// well-formed JSON DynamoDB reads, and reads `-0` and a whole number past 64
+/// bits as floats. So when the body holds either, it is read again with each
+/// such number standing in as a zero written the same way. The member's own
+/// reader takes the number from the body as written.
 pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Error> {
     match serde_json::from_str(body) {
-        Err(e) if is_number_out_of_range(&e) => {
-            serde_json::from_str(&zero_out_of_range_numbers(body))
-        }
+        Err(e) if is_number_out_of_range(&e) => serde_json::from_str(&numbers_as_written(body)),
+        Ok(value) if holds_float(&value) => serde_json::from_str(&numbers_as_written(body)),
         read => read,
     }
 }
 
-/// `body` with every number serde_json can't hold written as `0.0`, or as `0`
-/// when it was written with no point or exponent. Strings are skipped whole,
-/// escapes included, so text that looks like a number inside one is left
-/// alone.
-fn zero_out_of_range_numbers(body: &str) -> String {
+/// Whether a JSON value holds a number serde_json read as a float.
+fn holds_float(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(n) => n.is_f64(),
+        serde_json::Value::Array(items) => items.iter().any(holds_float),
+        serde_json::Value::Object(map) => map.values().any(holds_float),
+        _ => false,
+    }
+}
+
+/// `body` with every number serde_json can't hold, or would read as a float
+/// though it was written whole, standing in as `0.0`, or as `0` when it was
+/// written with no point or exponent. Strings are skipped whole, escapes
+/// included, so text that looks like a number inside one is left alone.
+fn numbers_as_written(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
@@ -113,14 +124,12 @@ fn zero_out_of_range_numbers(body: &str) -> String {
                     i += 1;
                 }
                 let token = &body[start..i];
+                let whole = !token.contains(['.', 'e', 'E']);
                 match serde_json::from_str::<serde_json::Number>(token) {
                     Err(e) if is_number_out_of_range(&e) => {
-                        out.push_str(if token.contains(['.', 'e', 'E']) {
-                            "0.0"
-                        } else {
-                            "0"
-                        })
+                        out.push_str(if whole { "0" } else { "0.0" })
                     }
+                    Ok(n) if whole && n.is_f64() => out.push('0'),
                     _ => out.push_str(token),
                 }
             }
@@ -670,7 +679,7 @@ mod tests {
         // string are copied whole; the numbers outside become `0.0`.
         let body = r#"{"a":"x\"1e400","b":-1e400,"c":"é1e400ü","d":[1e400,2,1.5e3],"e":"\\"}"#;
         assert_eq!(
-            zero_out_of_range_numbers(body),
+            numbers_as_written(body),
             r#"{"a":"x\"1e400","b":0.0,"c":"é1e400ü","d":[0.0,2,1.5e3],"e":"\\"}"#
         );
         let value = body_value(body).unwrap();
@@ -694,7 +703,20 @@ mod tests {
     fn a_long_whole_number_stays_whole() {
         let digits = format!("1{}", "0".repeat(400));
         let body = format!(r#"{{"a":{digits},"b":-{digits},"c":{digits}.0}}"#);
-        assert_eq!(zero_out_of_range_numbers(&body), r#"{"a":0,"b":0,"c":0.0}"#);
+        assert_eq!(numbers_as_written(&body), r#"{"a":0,"b":0,"c":0.0}"#);
+    }
+
+    #[test]
+    fn whole_numbers_read_as_floats_stay_whole() {
+        // `-0` and whole numbers past 64 bits are floats to serde_json; the
+        // rest are left as written.
+        let body = r#"{"a":-0,"b":100000000000000000000,"c":-100000000000000000000,"d":1.5,"e":-0.0,"f":18446744073709551615}"#;
+        assert_eq!(
+            numbers_as_written(body),
+            r#"{"a":0,"b":0,"c":0,"d":1.5,"e":-0.0,"f":18446744073709551615}"#
+        );
+        let value = body_value(body).unwrap();
+        assert!(value["b"].is_u64() && value["d"].is_f64());
     }
 
     #[test]

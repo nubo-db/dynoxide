@@ -1299,8 +1299,9 @@ async fn integer_members_past_the_range_of_a_double_saturate() {
 
 /// A number past a double's range in a member that isn't a number is named by
 /// how it is written, whatever its size: a decimal with a point or an
-/// exponent, as `1e300` is, and a whole number without (captured eu-west-2
-/// and us-east-1, 6 November 2026, where both regions gave the same answers).
+/// exponent, as `1e300` is, and a whole number without, `-0` and numbers past
+/// 64 bits included (captured eu-west-2 and us-east-1, 6 November 2026, where
+/// both regions gave the same answers).
 #[tokio::test]
 async fn numbers_past_the_range_of_a_double_are_named_as_written_elsewhere() {
     let url = start_server().await;
@@ -1316,6 +1317,23 @@ async fn numbers_past_the_range_of_a_double_are_named_as_written_elsewhere() {
             "NUMBER_VALUE cannot be converted to String",
         ),
         (format!(r#"{{"TableName":{digits}.0}}"#), to_string),
+        // serde_json reads these whole numbers as floats too.
+        (
+            r#"{"TableName":100000000000000000000}"#.to_string(),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            r#"{"TableName":-100000000000000000000}"#.to_string(),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            r#"{"TableName":-0}"#.to_string(),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","Select":100000000000000000000}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
         (
             format!(r#"{{"TableName":"{TABLE}","Select":{digits}}}"#),
             "NUMBER_VALUE cannot be converted to String",

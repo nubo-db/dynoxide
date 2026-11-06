@@ -10,7 +10,7 @@ use crate::expressions::key_condition::{
 };
 use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
-    WhereClause, WhereCondition,
+    WhereClause, WhereCondition, WrittenClause,
 };
 use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
@@ -286,6 +286,106 @@ fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
     key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     key.extend_from_slice(bytes);
     true
+}
+
+/// Refuse the filter DynamoDB refuses on a SELECT that reads one partition: a
+/// `NOT` over a condition on a key attribute of the read target, inside an OR
+/// with a branch naming no key attribute. A `NOT` wrapping such an OR counts,
+/// since it negates every branch. `<>` isn't a `NOT`; a `NOT` alone or under
+/// AND runs, as does an OR whose branches all name a key attribute. On an
+/// index the keys are the index's, so the table's sort key is any other
+/// attribute there. A clause with no partition-key equality beside the OR is
+/// a scan, and runs (captured eu-west-2 and us-east-1, 2026-11-05).
+fn reject_negated_key_filters(
+    where_clause: Option<&WhereClause>,
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    if !wc
+        .top_level_equalities
+        .iter()
+        .any(|c| names_attribute(&c.path, read_pk))
+    {
+        return Ok(());
+    }
+    let key_named = |cond: &WhereCondition| {
+        condition_paths(cond)
+            .into_iter()
+            .map(root_attribute)
+            .find(|root| root == read_pk || Some(root.as_ref()) == read_sk)
+            .map(|root| root.into_owned())
+    };
+
+    // The ORs joined to the rest of the clause by AND, each with whether a
+    // `NOT` wraps it.
+    fn top_level_ors(clause: &WrittenClause, negated: bool) -> Vec<(&[WrittenClause], bool)> {
+        match clause {
+            WrittenClause::And(terms) if !negated => terms
+                .iter()
+                .flat_map(|term| top_level_ors(term, false))
+                .collect(),
+            WrittenClause::Not(inner) => top_level_ors(inner, !negated),
+            WrittenClause::Or(branches) => vec![(branches.as_slice(), negated)],
+            _ => Vec::new(),
+        }
+    }
+    // Each condition in a clause, with whether it is negated: by the `NOT`s
+    // above it, or by being written as a negation.
+    fn leaves<'a>(
+        clause: &'a WrittenClause,
+        negated: bool,
+        out: &mut Vec<(&'a WhereCondition, bool)>,
+    ) {
+        match clause {
+            WrittenClause::Leaf(cond) => {
+                let written_negated = matches!(
+                    **cond,
+                    WhereCondition::NotComparison(_)
+                        | WhereCondition::NotBeginsWith(..)
+                        | WhereCondition::NotBetween(..)
+                        | WhereCondition::NotContains(..)
+                        | WhereCondition::Not(_)
+                );
+                out.push((cond, negated != written_negated));
+            }
+            WrittenClause::And(terms) | WrittenClause::Or(terms) => {
+                terms.iter().for_each(|term| leaves(term, negated, out))
+            }
+            WrittenClause::Not(inner) => leaves(inner, !negated, out),
+        }
+    }
+
+    for (branches, negated) in top_level_ors(&wc.written, false) {
+        let branch_leaves: Vec<Vec<(&WhereCondition, bool)>> = branches
+            .iter()
+            .map(|branch| {
+                let mut out = Vec::new();
+                leaves(branch, negated, &mut out);
+                out
+            })
+            .collect();
+        let has_non_key_branch = branch_leaves
+            .iter()
+            .any(|conds| conds.iter().all(|(cond, _)| key_named(cond).is_none()));
+        if !has_non_key_branch {
+            continue;
+        }
+        if let Some(key) = branch_leaves
+            .iter()
+            .flatten()
+            .filter(|(_, negated)| *negated)
+            .find_map(|(cond, _)| key_named(cond))
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Filter Expression can only contain non-primary key attributes: \
+                 Primary key attribute: {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a SELECT key value DynamoDB can't read the key by, as
@@ -1640,6 +1740,7 @@ async fn execute_select<S: StorageBackend>(
         None => table_key_schema.sort_key_type.clone(),
         Some(_) => declared_attribute_type(meta, attr),
     };
+    reject_negated_key_filters(where_clause, read_pk, read_sk)?;
     check_read_key_types(where_clause, parameters, read_pk, read_sk, &declared)?;
     reject_overlapping_key_conditions(where_clause, parameters, read_pk, read_sk)?;
     let order = if order_by.is_empty() {

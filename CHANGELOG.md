@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expression. It used to return the key attributes as the old image.
   Captured against eu-west-2 and us-east-1 on 5 November 2026
   ([#278](https://github.com/nubo-db/dynoxide/issues/278)).
+- A PartiQL `SELECT` on one partition refuses a `NOT` over a key attribute
+  inside an OR whose other branch names no key attribute, such as
+  `pk = 'k' AND (NOT sk = 's0' OR x = 0)`, with DynamoDB's `Filter Expression
+  can only contain non-primary key attributes` error. A `NOT` wrapping such an
+  OR is refused too. On an index the check uses the index's keys. These used
+  to run, or fail as too complex or as overlapping key conditions. Captured
+  against eu-west-2 and us-east-1 on 5 November 2026
+  ([#282](https://github.com/nubo-db/dynoxide/issues/282)).
 - PartiQL `SELECT` reads one partition when every OR branch names the same
   partition key. It used to scan the table, charging for unrelated rows and
   counting them towards `Limit`. Separate parameters holding the same key,

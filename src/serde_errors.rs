@@ -72,9 +72,11 @@ pub(crate) fn is_number_out_of_range(err: &serde_json::Error) -> bool {
 
 /// A request body as a JSON value, for the checks that read its shape before
 /// the typed read. A number past f64's range is well-formed JSON that DynamoDB
-/// reads, so the body is read again with each such number standing in as `0`:
-/// these checks look at what type a member is, never at a number's value, and
-/// the member's own reader takes the number from the body as written.
+/// reads, so the body is read again with each such number standing in as
+/// `0.0`: these checks look at what type a member is, never at a number's
+/// value, and DynamoDB reads such a number as a decimal, as it does `1e300`
+/// (captured eu-west-2 and us-east-1, 6 November 2026). The member's own
+/// reader takes the number from the body as written.
 pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Error> {
     match serde_json::from_str(body) {
         Err(e) if is_number_out_of_range(&e) => {
@@ -84,7 +86,7 @@ pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Er
     }
 }
 
-/// `body` with every number serde_json can't hold written as `0`. Strings are
+/// `body` with every number serde_json can't hold written as `0.0`. Strings are
 /// skipped whole, escapes included, so text that looks like a number inside
 /// one is left alone.
 fn zero_out_of_range_numbers(body: &str) -> String {
@@ -110,7 +112,7 @@ fn zero_out_of_range_numbers(body: &str) -> String {
                 }
                 let token = &body[start..i];
                 match serde_json::from_str::<serde_json::Number>(token) {
-                    Err(e) if is_number_out_of_range(&e) => out.push('0'),
+                    Err(e) if is_number_out_of_range(&e) => out.push_str("0.0"),
                     _ => out.push_str(token),
                 }
             }
@@ -653,6 +655,32 @@ pub(crate) fn serialize<T: serde::Serialize>(val: &T) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_range_numbers_are_zeroed_outside_strings_only() {
+        // Escaped quotes, number-like text and multi-byte characters inside a
+        // string are copied whole; the numbers outside become `0.0`.
+        let body = r#"{"a":"x\"1e400","b":-1e400,"c":"é1e400ü","d":[1e400,2,1.5e3],"e":"\\"}"#;
+        assert_eq!(
+            zero_out_of_range_numbers(body),
+            r#"{"a":"x\"1e400","b":0.0,"c":"é1e400ü","d":[0.0,2,1.5e3],"e":"\\"}"#
+        );
+        let value = body_value(body).unwrap();
+        assert_eq!(value["a"], "x\"1e400");
+        assert_eq!(value["c"], "é1e400ü");
+        assert!(value["b"].is_f64() && !value["b"].is_i64());
+        assert_eq!(value["e"], "\\");
+    }
+
+    #[test]
+    fn a_body_without_out_of_range_numbers_reads_as_written() {
+        let body = r#"{"Limit":10,"x":"1e400"}"#;
+        assert_eq!(
+            body_value(body).unwrap(),
+            serde_json::from_str::<serde_json::Value>(body).unwrap()
+        );
+        assert!(body_value("{").is_err());
+    }
 
     #[test]
     fn test_request_marker_maps_to_enveloped_validation() {

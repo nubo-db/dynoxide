@@ -167,6 +167,7 @@ fn a_test_of_whether_a_key_is_there_filters_beside_a_non_key_branch() {
             "pk = 'k' AND (attribute_type(sk, 'S') OR x = 0)",
             4,
         ),
+        ("\"T\"", "pk = 'k' AND (sk IS STRING OR x = 0)", 4),
         (
             "\"T\".\"l-all\"",
             "pk = 'k' AND (attribute_not_exists(l) OR x = 1)",

@@ -1251,13 +1251,6 @@ async fn each_request_is_answered_as_the_newer_layer_answers_it() {
     );
 }
 
-/// Scan reads its attribute values on the newer layer as well: a number that
-/// does not parse is refused with the value and nothing around it, a repeated
-/// set member is quoted, and an expression value is not wrapped in
-/// `ExpressionAttributeValues contains invalid value`. An empty attribute name
-/// in a value or a starting key is refused bare. eu-west-2, 20 October 2026;
-/// 19 of the 33 observed regions answered this way for the numbers and sets, and
-/// 20 for the empty names.
 /// Scan's integer members written as numbers a JSON value can't hold, or as
 /// a zero with a fraction, sent as written. Each saturates or truncates and is
 /// reported as read (captured eu-west-2 and us-east-1, 6 November 2026, where
@@ -1304,6 +1297,37 @@ async fn integer_members_past_the_range_of_a_double_saturate() {
     }
 }
 
+/// A number past a double's range in a member that isn't a number is refused
+/// as a decimal, as `1e300` is (captured eu-west-2 and us-east-1, 6 November
+/// 2026, where both regions gave the same answers).
+#[tokio::test]
+async fn numbers_past_the_range_of_a_double_are_decimals_elsewhere() {
+    let url = start_server().await;
+    let to_string = "DECIMAL_VALUE cannot be converted to String";
+    for (body, expected) in [
+        (r#"{"TableName":1e400}"#.to_string(), to_string),
+        (r#"{"TableName":-1e400}"#.to_string(), to_string),
+        (r#"{"TableName":1e300}"#.to_string(), to_string),
+        (
+            format!(r#"{{"TableName":"{TABLE}","ConsistentRead":1e400}}"#),
+            "DECIMAL_VALUE cannot be converted to Boolean",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","Select":1e400}}"#),
+            to_string,
+        ),
+    ] {
+        assert_eq!(answer_raw(&url, body.clone()).await, expected, "{body}");
+    }
+}
+
+/// Scan reads its attribute values on the newer layer as well: a number that
+/// does not parse is refused with the value and nothing around it, a repeated
+/// set member is quoted, and an expression value is not wrapped in
+/// `ExpressionAttributeValues contains invalid value`. An empty attribute name
+/// in a value or a starting key is refused bare. eu-west-2, 20 October 2026;
+/// 19 of the 33 observed regions answered this way for the numbers and sets, and
+/// 20 for the empty names.
 const VALUE_CASES: &[(&str, &str, &str)] = &[
     (
         r##"exprEmptyNumber"##,

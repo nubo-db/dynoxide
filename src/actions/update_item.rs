@@ -892,7 +892,7 @@ async fn execute_inner<S: StorageBackend>(
     // Handle ReturnValues
     let return_values = request.return_values.as_deref().unwrap_or("NONE");
     let attributes = match return_values.to_uppercase().as_str() {
-        "ALL_OLD" => Some(old_item),
+        "ALL_OLD" => old_size.is_some().then_some(old_item),
         "ALL_NEW" => Some(item),
         "UPDATED_OLD" => {
             if let Some(ref update_expr) = request.update_expression {

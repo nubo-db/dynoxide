@@ -373,18 +373,16 @@ fn test_update_item_all_old_on_upsert() {
     let db = make_db();
     create_hash_only_table(&db, "Items");
 
-    let update = |value: &str| {
-        dynoxide::actions::update_item::UpdateItemRequest {
-            table_name: "Items".to_string(),
-            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
-            update_expression: Some("SET val = :v".into()),
-            expression_attribute_values: Some(HashMap::from([(
-                ":v".into(),
-                AttributeValue::S(value.into()),
-            )])),
-            return_values: Some("ALL_OLD".into()),
-            ..Default::default()
-        }
+    let update = |value: &str| dynoxide::actions::update_item::UpdateItemRequest {
+        table_name: "Items".to_string(),
+        key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+        update_expression: Some("SET val = :v".into()),
+        expression_attribute_values: Some(HashMap::from([(
+            ":v".into(),
+            AttributeValue::S(value.into()),
+        )])),
+        return_values: Some("ALL_OLD".into()),
+        ..Default::default()
     };
 
     // No item exists before the first update: Attributes must be absent.

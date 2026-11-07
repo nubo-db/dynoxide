@@ -28,7 +28,7 @@ pub(crate) fn pre_check_and_read_layer(
     operation: &str,
     body: &str,
 ) -> crate::Result<crate::validation::ValueLayer> {
-    let json: serde_json::Value = serde_json::from_str(body)
+    let json: serde_json::Value = crate::serde_errors::body_value(body)
         .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
     check_types(operation, &json)?;
     Ok(if crate::types::reads_on_older_layer(&json) {

@@ -35,6 +35,12 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
         if let Some(classified) = classify_marked_serde_error(&msg) {
             return classified;
         }
+        // A member read as a fixed-width number gets a bare
+        // SerializationException for one past f64's range, as every member
+        // did before `Limit`, `Segment` and `TotalSegments` read their text.
+        if is_number_out_of_range(&e) {
+            return crate::DynoxideError::SerializationException(String::new());
+        }
         // DynamoDB returns ValidationException for missing required fields,
         // null values, and unrecognised enum variants. Only true JSON type
         // mismatches (e.g. number where string is expected) produce a
@@ -55,6 +61,92 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
             crate::DynoxideError::SerializationException(map_serde_to_dynamodb_message(&msg, body))
         }
     })
+}
+
+/// Whether serde_json refused a number for being past f64's range. The JSON is
+/// well formed, and DynamoDB reads such a number (captured eu-west-2 and
+/// us-east-1, 6 November 2026).
+pub(crate) fn is_number_out_of_range(err: &serde_json::Error) -> bool {
+    err.to_string().starts_with("number out of range")
+}
+
+/// A request body as a JSON value, for the checks that read its shape before
+/// the typed read. These checks look at what type a member is, never at a
+/// number's value, and DynamoDB names a number by how it is written, a decimal
+/// with a point or an exponent and a whole number without, whatever its size
+/// (captured eu-west-2 and us-east-1, 6 November 2026). serde_json keeps no
+/// text for a number: it refuses one past f64's range, though that is
+/// well-formed JSON DynamoDB reads, and reads `-0` and a whole number past 64
+/// bits as floats. So when the body holds either, it is read again with each
+/// such number standing in as a zero written the same way. The member's own
+/// reader takes the number from the body as written.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match serde_json::from_str(body) {
+        Err(e) if is_number_out_of_range(&e) => serde_json::from_str(&numbers_as_written(body)),
+        Ok(value) if holds_float(&value) => serde_json::from_str(&numbers_as_written(body)),
+        read => read,
+    }
+}
+
+/// Whether a JSON value holds a number serde_json read as a float.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn holds_float(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(n) => n.is_f64(),
+        serde_json::Value::Array(items) => items.iter().any(holds_float),
+        serde_json::Value::Object(map) => map.values().any(holds_float),
+        _ => false,
+    }
+}
+
+/// `body` with every number serde_json can't hold, or would read as a float
+/// though it was written whole, standing in as `0.0`, or as `0` when it was
+/// written with no point or exponent. Strings are skipped whole, escapes
+/// included, so text that looks like a number inside one is left alone.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn numbers_as_written(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(bytes.len());
+                out.push_str(&body[start..i]);
+            }
+            b'-' | b'0'..=b'9' => {
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let token = &body[start..i];
+                let whole = !token.contains(['.', 'e', 'E']);
+                match serde_json::from_str::<serde_json::Number>(token) {
+                    Err(e) if is_number_out_of_range(&e) => {
+                        out.push_str(if whole { "0" } else { "0.0" })
+                    }
+                    Ok(n) if whole && n.is_f64() => out.push('0'),
+                    _ => out.push_str(token),
+                }
+            }
+            _ => {
+                // Copy up to the next string or number, keeping UTF-8 whole.
+                i += 1;
+                while i < bytes.len() && !matches!(bytes[i], b'"' | b'-' | b'0'..=b'9') {
+                    i += 1;
+                }
+                out.push_str(&body[start..i]);
+            }
+        }
+    }
+    out
 }
 
 /// Classify a raw serde error message by its marker prefix, stripping the
@@ -583,6 +675,52 @@ pub(crate) fn serialize<T: serde::Serialize>(val: &T) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_range_numbers_are_zeroed_outside_strings_only() {
+        // Escaped quotes, number-like text and multi-byte characters inside a
+        // string are copied whole; the numbers outside become `0.0`.
+        let body = r#"{"a":"x\"1e400","b":-1e400,"c":"é1e400ü","d":[1e400,2,1.5e3],"e":"\\"}"#;
+        assert_eq!(
+            numbers_as_written(body),
+            r#"{"a":"x\"1e400","b":0.0,"c":"é1e400ü","d":[0.0,2,1.5e3],"e":"\\"}"#
+        );
+        let value = body_value(body).unwrap();
+        assert_eq!(value["a"], "x\"1e400");
+        assert_eq!(value["c"], "é1e400ü");
+        assert!(value["b"].is_f64() && !value["b"].is_i64());
+        assert_eq!(value["e"], "\\");
+    }
+
+    #[test]
+    fn a_body_without_out_of_range_numbers_reads_as_written() {
+        let body = r#"{"Limit":10,"x":"1e400"}"#;
+        assert_eq!(
+            body_value(body).unwrap(),
+            serde_json::from_str::<serde_json::Value>(body).unwrap()
+        );
+        assert!(body_value("{").is_err());
+    }
+
+    #[test]
+    fn a_long_whole_number_stays_whole() {
+        let digits = format!("1{}", "0".repeat(400));
+        let body = format!(r#"{{"a":{digits},"b":-{digits},"c":{digits}.0}}"#);
+        assert_eq!(numbers_as_written(&body), r#"{"a":0,"b":0,"c":0.0}"#);
+    }
+
+    #[test]
+    fn whole_numbers_read_as_floats_stay_whole() {
+        // `-0` and whole numbers past 64 bits are floats to serde_json; the
+        // rest are left as written.
+        let body = r#"{"a":-0,"b":100000000000000000000,"c":-100000000000000000000,"d":1.5,"e":-0.0,"f":18446744073709551615}"#;
+        assert_eq!(
+            numbers_as_written(body),
+            r#"{"a":0,"b":0,"c":0,"d":1.5,"e":-0.0,"f":18446744073709551615}"#
+        );
+        let value = body_value(body).unwrap();
+        assert!(value["b"].is_u64() && value["d"].is_f64());
+    }
 
     #[test]
     fn test_request_marker_maps_to_enveloped_validation() {

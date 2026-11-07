@@ -10,7 +10,7 @@ use crate::expressions::key_condition::{
 };
 use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
-    WhereClause, WhereCondition,
+    WhereClause, WhereCondition, WrittenClause,
 };
 use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
@@ -288,6 +288,112 @@ fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
     true
 }
 
+/// Refuse the filter DynamoDB refuses on a SELECT that reads one partition: a
+/// `NOT` written over a condition on a key attribute of the read target, inside
+/// a group with a branch naming no key attribute. A group is an OR, or an AND
+/// under a `NOT`, which De Morgan makes an OR. Any `NOT` counts, two as much as
+/// one, and so does a form spelt with one: `NOT IN`, `NOT BETWEEN`, `IS NOT
+/// MISSING` or `IS NOT <type>`. `attribute_not_exists` and `<>` are not a
+/// `NOT`. A `NOT` alone or under AND runs, as does a group whose branches all
+/// name a key attribute. On an index the keys are the index's, so the table's
+/// sort key is any other attribute there. A clause with no partition-key
+/// equality beside the group is a scan, and runs (captured eu-west-2 and
+/// us-east-1, 5 and 6 November 2026).
+fn reject_negated_key_filters(
+    where_clause: Option<&WhereClause>,
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    if !wc
+        .top_level_equalities
+        .iter()
+        .any(|c| names_attribute(&c.path, read_pk))
+    {
+        return Ok(());
+    }
+    let key_named = |cond: &WhereCondition| {
+        condition_paths(cond)
+            .into_iter()
+            .map(root_attribute)
+            .find(|root| root == read_pk || Some(root.as_ref()) == read_sk)
+            .map(|root| root.into_owned())
+    };
+
+    // The groups joined to the rest of the clause by AND: each OR, and each
+    // AND under a `NOT`, with whether a `NOT` is written above it.
+    fn groups(clause: &WrittenClause, under_not: bool) -> Vec<(&[WrittenClause], bool)> {
+        match clause {
+            WrittenClause::And(terms) if !under_not => {
+                terms.iter().flat_map(|term| groups(term, false)).collect()
+            }
+            WrittenClause::And(branches) | WrittenClause::Or(branches) => {
+                vec![(branches.as_slice(), under_not)]
+            }
+            WrittenClause::Not(inner) => groups(inner, true),
+            WrittenClause::Leaf(_) => Vec::new(),
+        }
+    }
+    // Each condition in a clause, with whether a `NOT` is written over it or
+    // in it.
+    fn leaves<'a>(
+        clause: &'a WrittenClause,
+        under_not: bool,
+        out: &mut Vec<(&'a WhereCondition, bool)>,
+    ) {
+        match clause {
+            WrittenClause::Leaf(cond) => {
+                let spelt_with_not = matches!(
+                    **cond,
+                    WhereCondition::NotComparison(_)
+                        | WhereCondition::NotBeginsWith(..)
+                        | WhereCondition::NotBetween(..)
+                        | WhereCondition::NotContains(..)
+                        | WhereCondition::IsNotMissing(_)
+                        | WhereCondition::IsNotType(..)
+                        | WhereCondition::Not(_)
+                );
+                out.push((cond, under_not || spelt_with_not));
+            }
+            WrittenClause::And(terms) | WrittenClause::Or(terms) => {
+                terms.iter().for_each(|term| leaves(term, under_not, out))
+            }
+            WrittenClause::Not(inner) => leaves(inner, true, out),
+        }
+    }
+
+    for (branches, negated) in groups(&wc.written, false) {
+        let branch_leaves: Vec<Vec<(&WhereCondition, bool)>> = branches
+            .iter()
+            .map(|branch| {
+                let mut out = Vec::new();
+                leaves(branch, negated, &mut out);
+                out
+            })
+            .collect();
+        let has_non_key_branch = branch_leaves
+            .iter()
+            .any(|conds| conds.iter().all(|(cond, _)| key_named(cond).is_none()));
+        if !has_non_key_branch {
+            continue;
+        }
+        if let Some(key) = branch_leaves
+            .iter()
+            .flatten()
+            .filter(|(_, negated)| *negated)
+            .find_map(|(cond, _)| key_named(cond))
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Filter Expression can only contain non-primary key attributes: \
+                 Primary key attribute: {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a SELECT key value DynamoDB can't read the key by, as
 /// [`typed_key`] words it (captured eu-west-2 and us-east-1, 2026-10-09).
 ///
@@ -315,7 +421,14 @@ fn check_read_key_types(
     let groups = if wc.fully_expanded {
         &wc.groups
     } else {
-        projected = key_groups(wc, read_pk, read_sk)?;
+        // A clause too wide to expand is reported by
+        // [`reject_overlapping_key_conditions`], after the filter refusal:
+        // nine ANDed `(NOT sk = 's0' OR x = 0)` pairs are refused for the
+        // filter (captured eu-west-2 and us-east-1, 3 November 2026).
+        let Ok(groups) = key_groups(wc, read_pk, read_sk) else {
+            return Ok(());
+        };
+        projected = groups;
         &projected
     };
     for group in groups {
@@ -735,8 +848,19 @@ fn key_groups(
     read_sk: Option<&str>,
 ) -> Result<Vec<Vec<Arc<WhereCondition>>>> {
     use crate::partiql::parser::ConditionTree;
+    // A test of whether a key is there, or of its type, narrows no range and
+    // stays in the filter: `pk = 'a' AND (attribute_not_exists(sk) OR x = 1)`
+    // runs, on a table or an index (captured eu-west-2 and us-east-1,
+    // 6 November 2026). `IS <type>` is read as `attribute_type`, which runs
+    // there too.
     let is_key = |cond: &WhereCondition| {
-        condition_path(cond).is_some_and(|path| {
+        !matches!(
+            cond,
+            WhereCondition::Exists(_)
+                | WhereCondition::NotExists(_)
+                | WhereCondition::IsMissing(_)
+                | WhereCondition::IsType(..)
+        ) && condition_path(cond).is_some_and(|path| {
             let root = root_attribute(path);
             root == read_pk || read_sk == Some(&*root)
         })
@@ -1640,7 +1764,10 @@ async fn execute_select<S: StorageBackend>(
         None => table_key_schema.sort_key_type.clone(),
         Some(_) => declared_attribute_type(meta, attr),
     };
+    // A key of the wrong type is reported before a refused filter (captured
+    // eu-west-2 and us-east-1, 6 November 2026).
     check_read_key_types(where_clause, parameters, read_pk, read_sk, &declared)?;
+    reject_negated_key_filters(where_clause, read_pk, read_sk)?;
     reject_overlapping_key_conditions(where_clause, parameters, read_pk, read_sk)?;
     let order = if order_by.is_empty() {
         None
@@ -2568,12 +2695,14 @@ fn sort_key_plan(
     let (Some(wc), Some(sk)) = (where_clause, sk_name) else {
         return SortKeyPlan::default();
     };
-    let groups = read_groups(wc, pk_name, sk).and_then(|groups| {
-        groups
-            .iter()
-            .map(|group| translate_sk_conditions(group, sk, parameters))
-            .collect::<Option<Vec<_>>>()
-    });
+    let groups = read_groups(wc, pk_name, sk)
+        .and_then(|groups| expand_sort_key_ins(&groups, sk))
+        .and_then(|groups| {
+            groups
+                .iter()
+                .map(|group| translate_sk_conditions(group, sk, parameters))
+                .collect::<Option<Vec<_>>>()
+        });
     let Some(groups) =
         groups.filter(|groups| !groups.is_empty() && groups.iter().all(|g| !g.is_empty()))
     else {
@@ -2597,6 +2726,52 @@ fn sort_key_plan(
         params,
         branches,
     }
+}
+
+/// Split each group's multi-value `IN` on the sort key into one group per
+/// value, so the read, its charge and its paging treat `sk IN ['a', 'b']` as
+/// `sk = 'a' OR sk = 'b'` (captured eu-west-2 and us-east-1, 2026-11-05: two
+/// keys cost 2.0 under ConsistentRead either way, and under `Limit: 1` a
+/// missing last key keeps the token for one empty page). A group with two
+/// such lists takes every pairing of their values. Past the planner's group
+/// budget the expansion gives up with `None`, which reads the whole partition
+/// with the clause as its filter.
+fn expand_sort_key_ins(
+    groups: &[Vec<Arc<WhereCondition>>],
+    sk_name: &str,
+) -> Option<Vec<Vec<Arc<WhereCondition>>>> {
+    let budget = crate::partiql::parser::MAX_OR_GROUPS;
+    let mut out: Vec<Vec<Arc<WhereCondition>>> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut expanded = vec![Vec::with_capacity(group.len())];
+        for cond in group {
+            match &**cond {
+                WhereCondition::In(path, values)
+                    if values.len() > 1 && names_attribute(path, sk_name) =>
+                {
+                    if out.len() + expanded.len().saturating_mul(values.len()) > budget {
+                        return None;
+                    }
+                    expanded = expanded
+                        .iter()
+                        .flat_map(|prefix| {
+                            values.iter().map(move |value| {
+                                let mut next = prefix.clone();
+                                next.push(Arc::new(WhereCondition::In(
+                                    path.clone(),
+                                    vec![value.clone()],
+                                )));
+                                next
+                            })
+                        })
+                        .collect();
+                }
+                _ => expanded.iter_mut().for_each(|g| g.push(Arc::clone(cond))),
+            }
+        }
+        out.extend(expanded);
+    }
+    (out.len() <= budget).then_some(out)
 }
 
 /// One OR branch's bounds on the stored sort key, which all hold.

@@ -892,6 +892,8 @@ async fn execute_inner<S: StorageBackend>(
     // Handle ReturnValues
     let return_values = request.return_values.as_deref().unwrap_or("NONE");
     let attributes = match return_values.to_uppercase().as_str() {
+        // An update that creates its item has no old image, even though
+        // `old_item` already holds the key attributes it was seeded with.
         "ALL_OLD" => old_size.is_some().then_some(old_item),
         "ALL_NEW" => Some(item),
         "UPDATED_OLD" => {

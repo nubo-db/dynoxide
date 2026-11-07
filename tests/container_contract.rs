@@ -11,10 +11,12 @@
 
 #![cfg(all(feature = "http-server", feature = "cli"))]
 
+mod common;
+
+use common::{Listener, Server};
 use dynoxide::Database;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
-use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 /// The exact `GET /` body, trailing space included.
@@ -146,15 +148,6 @@ async fn a_healthy_answer_means_the_engine_will_serve() {
     );
 }
 
-/// Bind and release a loopback listener to find a port nothing is using.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Spawn the built binary with both output streams piped.
 fn spawn_serve(port: u16) -> (Child, BufReader<ChildStderr>, ChildStdout) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
@@ -168,133 +161,45 @@ fn spawn_serve(port: u16) -> (Child, BufReader<ChildStderr>, ChildStdout) {
     (child, BufReader::new(stderr), stdout)
 }
 
-/// What one spawn produced, kept apart so a lost port race does not read as a
-/// regression in the line itself.
-enum Attempt {
-    Found,
-    /// The child closed stderr and exited without printing it. Losing the port
-    /// to another test in this binary looks like this.
-    Exited {
-        status: String,
-        saw: Vec<String>,
-    },
-    /// The child stayed up for the whole window and never printed it.
-    TimedOut {
-        saw: Vec<String>,
-    },
-}
-
-/// Spawn on `port`, watch stderr for `expected`, and return what happened
-/// alongside everything the child wrote to stdout.
-fn read_startup_line(port: u16, expected: &str) -> (Attempt, String) {
-    let (mut child, mut stderr, mut stdout) = spawn_serve(port);
-
-    // Drain stdout on its own thread rather than after the kill below. Tracing
-    // writes there, so a contributor running with `RUST_LOG=trace` fills the
-    // pipe buffer; the child then blocks on write and never reaches the
-    // `eprintln!` this test waits for, which would read as the startup line
-    // regressing rather than as a stalled pipe.
-    let stdout_thread = std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        out
-    });
-
-    // Read on a worker thread and time out on the channel. `read_line` blocks
-    // until a line arrives, so a deadline checked between reads never fires on
-    // the one failure this test exists to catch: a startup line that never
-    // reaches stderr at all. That hangs the run instead of failing it.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stderr.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if tx.send(line.trim_end().to_string()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut saw: Vec<String> = Vec::new();
-    let mut found = false;
-    let mut exited = false;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line == expected => {
-                found = true;
-                break;
-            }
-            Ok(line) => saw.push(line),
-            Err(RecvTimeoutError::Timeout) => break,
-            // The reader ended, so the child closed stderr and is on its way out.
-            Err(RecvTimeoutError::Disconnected) => {
-                exited = true;
-                break;
-            }
-        }
-    }
-
-    let _ = child.kill();
-    let status = child.wait().ok();
-
-    // The draining thread ends when the child closes stdout, which the kill
-    // above guarantees.
-    let out = stdout_thread.join().unwrap_or_default();
-
-    let attempt = if found {
-        Attempt::Found
-    } else if exited {
-        Attempt::Exited {
-            status: status.map_or_else(|| "unknown".to_owned(), |s| s.to_string()),
-            saw,
-        }
-    } else {
-        Attempt::TimedOut { saw }
-    };
-    (attempt, out)
-}
-
 #[test]
 fn the_startup_line_is_exact_and_goes_to_stderr() {
     // A log-based wait matches this line, so both its text and its stream are
     // promises. The binary prints it with `eprintln!` while tracing events go
     // to stdout, and a wait strategy pointed at the wrong stream never returns.
     //
-    // `free_port()` releases the port before the child binds it, and the other
-    // tests here bind ephemeral ports in parallel, so the child can lose that
-    // race and exit. That is retried; a child that stays up without printing
-    // the line is the real regression and fails immediately.
-    let mut lost = Vec::new();
-    for _ in 0..3 {
-        let port = free_port();
-        let expected = format!("Dynoxide listening on http://127.0.0.1:{port}");
-        let (attempt, stdout) = read_startup_line(port, &expected);
+    // The server is started on port 0 and the port it reports is read back,
+    // so no other test can take the port first. The line is then held to the
+    // exact text that port implies. `Server` drains stdout on its own thread:
+    // tracing writes there, so with `RUST_LOG=trace` a full pipe would block
+    // the child before it reaches the `eprintln!` this test waits for. Its
+    // waits time out rather than block on a read, so a line that never
+    // reaches stderr fails the test instead of hanging the run.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dynoxide"));
+    command.args(["serve", "--host", "127.0.0.1", "--port", "0"]);
+    let server = Server::spawn(command);
 
-        match attempt {
-            Attempt::Found => {
-                assert!(
-                    !stdout.contains("Dynoxide listening"),
-                    "the startup line reached stdout as well as stderr: {stdout:?}"
-                );
-                return;
-            }
-            Attempt::TimedOut { saw } => {
-                panic!("the server stayed up without printing `{expected}`; saw {saw:?}")
-            }
-            Attempt::Exited { status, saw } => lost.push(format!("{status}, saw {saw:?}")),
-        }
-    }
-    panic!("the server exited before printing the startup line three times: {lost:?}");
+    let port = server
+        .try_port(Listener::Http, Duration::from_secs(10))
+        .unwrap_or_else(|e| panic!("no startup line: {e}"));
+    let expected = format!("Dynoxide listening on http://127.0.0.1:{port}");
+    let line = server
+        .wait_for_line(
+            |l| l.starts_with(common::HTTP_LISTENING),
+            Duration::from_secs(10),
+        )
+        .expect("the line the port was read from");
+    assert_eq!(
+        line.trim_end(),
+        expected,
+        "the startup line is not exactly `{expected}`"
+    );
+
+    let output = server.kill_and_collect();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Dynoxide listening"),
+        "the startup line reached stdout as well as stderr: {stdout:?}"
+    );
 }
 
 /// Kills the child when dropped, so a failed assertion does not leave the

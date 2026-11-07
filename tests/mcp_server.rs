@@ -5,6 +5,8 @@
 
 #![cfg(all(feature = "mcp-server", feature = "cli"))]
 
+mod common;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -4656,18 +4658,6 @@ fn test_import_mcp_read_only_rejects_writes() {
     let _ = child.wait();
 }
 
-/// Two loopback ports that are free at the same moment, so the pair cannot
-/// collide with each other.
-#[cfg(all(feature = "import", feature = "http-server"))]
-fn two_free_ports() -> (u16, u16) {
-    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    (
-        a.local_addr().unwrap().port(),
-        b.local_addr().unwrap().port(),
-    )
-}
-
 /// One JSON-RPC request over the streamable HTTP transport. The server runs
 /// stateless with JSON responses, so every call is a single POST.
 #[cfg(all(feature = "import", feature = "http-server"))]
@@ -4694,9 +4684,11 @@ async fn mcp_http(client: &reqwest::Client, url: &str, body: Value) -> Value {
 async fn test_import_serve_mcp_reports_accepted_exposure_over_http() {
     let tmp = tempfile::tempdir().unwrap();
     let (source, schema_file, rules_file) = write_exposed_export(tmp.path());
-    let (http_port, mcp_port) = two_free_ports();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+    // Both servers start on port 0, so no other test can take a port first,
+    // and the MCP port is read from its own listening line.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dynoxide"));
+    command
         .args([
             "import",
             "--serve",
@@ -4704,36 +4696,21 @@ async fn test_import_serve_mcp_reports_accepted_exposure_over_http() {
             "--mcp-no-auth",
             "--accept-exposure",
         ])
-        .args(["--port", &http_port.to_string()])
-        .args(["--mcp-port", &mcp_port.to_string()])
+        .args(["--port", "0"])
+        .args(["--mcp-port", "0"])
         .arg("--source")
         .arg(&source)
         .arg("--schema")
         .arg(&schema_file)
         .arg("--rules")
         .arg(&rules_file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn dynoxide import --serve --mcp");
+        .stdin(Stdio::null());
+    let server = common::Server::spawn(command);
 
-    // Wait for the MCP listener rather than sleeping: the import runs first
-    // and the two servers bind after it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        if std::net::TcpStream::connect(("127.0.0.1", mcp_port)).is_ok() {
-            break;
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("the process exited before serving: {status}");
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the MCP HTTP server did not start"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    // The import runs first and the two servers bind after it. The line is
+    // printed once the listener is bound, so connections made from here on
+    // queue until the server takes them.
+    let mcp_port = server.port(common::Listener::Mcp);
 
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{mcp_port}/mcp");
@@ -4778,6 +4755,5 @@ async fn test_import_serve_mcp_reports_accepted_exposure_over_http() {
     );
     assert_accepted_exposure_report(&tool_content(&resp));
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(server);
 }

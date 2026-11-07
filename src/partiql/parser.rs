@@ -362,6 +362,35 @@ pub struct WhereClause {
     /// reads it, because DynamoDB splits a read only on an OR with a key
     /// condition under it (captured eu-west-2 and us-east-1, 2026-10-09).
     pub(crate) tree: ConditionTree,
+    /// The clause as written, before `NOT` is pushed down. A `NOT` over an OR
+    /// pushed down reads as an AND of negations, which can't be told apart
+    /// from the same AND written out, yet DynamoDB refuses one and runs the
+    /// other when they name a key attribute (captured eu-west-2 and
+    /// us-east-1, 2026-11-05). The key-filter check reads this instead.
+    pub(crate) written: WrittenClause,
+}
+
+/// A WHERE clause's shape as written: its ANDs, ORs and `NOT`s, with each
+/// condition as parsed. Parentheses leave no node of their own.
+#[derive(Debug, Clone)]
+pub(crate) enum WrittenClause {
+    Leaf(Arc<WhereCondition>),
+    And(Vec<WrittenClause>),
+    Or(Vec<WrittenClause>),
+    Not(Box<WrittenClause>),
+}
+
+impl WrittenClause {
+    fn of(expr: &BoolExpr) -> Self {
+        match expr {
+            BoolExpr::Leaf(cond) => WrittenClause::Leaf(Arc::new(cond.clone())),
+            BoolExpr::And(terms) => WrittenClause::And(terms.iter().map(Self::of).collect()),
+            BoolExpr::Or(terms) => WrittenClause::Or(terms.iter().map(Self::of).collect()),
+            BoolExpr::Not(inner) => WrittenClause::Not(Box::new(Self::of(inner))),
+            // Refused once the clause is read, so its shape never matters.
+            BoolExpr::NonBoolean(_) => WrittenClause::And(Vec::new()),
+        }
+    }
 }
 
 /// A WHERE clause as written, with every `NOT` pushed down to a condition.
@@ -2357,6 +2386,7 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
                 fully_expanded: parsed.fully_expanded,
                 top_level_equalities: parsed.top_level_equalities,
                 tree: parsed.tree,
+                written: parsed.written,
             }))
         }
         _ => Ok(None),
@@ -2392,10 +2422,12 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
         fully_expanded: true,
         top_level_equalities: Vec::new(),
         tree: ConditionTree::And(Vec::new()),
+        written: WrittenClause::And(Vec::new()),
     };
     if t.holds_refusal() {
         return Ok(refused());
     }
+    let written = WrittenClause::of(&expr);
     let flattened = push_not_down(expr, false).and_then(|expr| {
         let tree = ConditionTree::of(expr);
         if tree.bytes() > MAX_CLAUSE_BYTES {
@@ -2412,6 +2444,7 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
         fully_expanded,
         top_level_equalities,
         tree,
+        written,
     })
 }
 
@@ -2422,6 +2455,7 @@ struct ParsedConditions {
     fully_expanded: bool,
     top_level_equalities: Vec<Condition>,
     tree: ConditionTree,
+    written: WrittenClause,
 }
 
 /// Collect the `path = value` conditions joined to the rest of the clause by
@@ -3411,7 +3445,7 @@ impl From<WhereCondition> for BoolExpr {
 /// Distributing an AND over ORs multiplies group counts, so a clause built from
 /// nested alternations can expand far beyond what was written. The cap keeps a
 /// pathological statement a rejection rather than an allocation.
-const MAX_OR_GROUPS: usize = 256;
+pub(crate) const MAX_OR_GROUPS: usize = 256;
 
 /// How deeply a statement may nest.
 ///

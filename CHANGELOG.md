@@ -19,15 +19,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `UpdateItem` with `ReturnValues: ALL_OLD` omits `Attributes` when the
-  update creates a new item, instead of returning a key-only image as though
-  the item already existed ([#278](https://github.com/nubo-db/dynoxide/issues/278)).
 - Expressions refuse attribute names starting with `_` unless they use an
   `ExpressionAttributeNames` alias, as DynamoDB does, in key condition,
   filter, projection, condition and update expressions alike. This includes
   an import rule's `match` expression, so a rule matching such an attribute
   now needs an alias in its `names`. A rule's `path` is unaffected
   ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
+- An `UpdateItem` that creates its item returns no `Attributes` for
+  `ReturnValues: ALL_OLD`, whether it uses `SET`, `REMOVE` or no update
+  expression. It used to return the key attributes as the old image.
+  Captured against eu-west-2 and us-east-1 on 5 November 2026
+  ([#278](https://github.com/nubo-db/dynoxide/issues/278),
+  [#292](https://github.com/nubo-db/dynoxide/pull/292), thanks
+  [@alfaproject](https://github.com/alfaproject)).
+- A PartiQL `SELECT` on one partition refuses a `NOT` written over a key
+  attribute inside an OR whose other branch names no key attribute, such as
+  `pk = 'k' AND (NOT sk = 's0' OR x = 0)`, with DynamoDB's `Filter Expression
+  can only contain non-primary key attributes` error. Every written `NOT`
+  counts, two as much as one, and so do `NOT IN`, `NOT BETWEEN`, `IS NOT
+  MISSING` and `IS NOT <type>`. A `NOT` wrapping such an OR is refused too, as
+  is one over an AND such as `NOT (sk = 's0' AND x = 0)`. A partition key of
+  the wrong type is reported first. On an index the check uses the index's
+  keys. These used to run, or fail as too complex or as overlapping key
+  conditions. Captured against eu-west-2 and us-east-1 on 5 and 6 November
+  2026 ([#282](https://github.com/nubo-db/dynoxide/issues/282)).
+- A PartiQL `SELECT` runs `attribute_exists`, `attribute_not_exists` or `IS
+  MISSING` on a key beside a branch naming no key attribute, such as
+  `pk = 'k' AND (attribute_not_exists(sk) OR x = 1)`, as a filter over the
+  partition, on tables and on both kinds of index. It used to be refused for
+  overlapping key conditions. Captured against eu-west-2 and us-east-1 on
+  6 November 2026.
 - PartiQL `SELECT` reads one partition when every OR branch names the same
   partition key. It used to scan the table, charging for unrelated rows and
   counting them towards `Limit`. Separate parameters holding the same key,
@@ -46,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested key costs a read whether or not it exists. Captured against
   eu-west-2 and us-east-1 on 3 and 4 November 2026
   ([#271](https://github.com/nubo-db/dynoxide/issues/271)).
+- A PartiQL sort-key `IN` with more than one value reads, charges and pages
+  like the OR of its keys, on tables and on global and local secondary
+  indexes. It used to read the whole partition, so `pk = 'k' AND
+  sk IN ['row-1', 'row-3']` cost what the partition did and a `Limit` walk
+  kept its token past the last key. Each listed key is charged a read whether
+  or not it exists, and a last listed key with no item keeps the token for one
+  empty page, as the OR form does. Captured against eu-west-2 and us-east-1 on
+  5 November 2026
+  ([#289](https://github.com/nubo-db/dynoxide/issues/289)).
 - PartiQL accepts `ORDER BY` on the sort key when OR branches share one
   partition. It used to count that partition more than once and demand the
   partition key in `ORDER BY`
@@ -71,8 +101,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing `Item` or `Key`, and a missing or empty table name. As in DynamoDB,
   a table name's length and pattern are reported only once those pass
   ([#262](https://github.com/nubo-db/dynoxide/issues/262)).
-- PartiQL reads a `Limit` past 2147483647 as that number, as Query and Scan
-  do. A `Limit` near or past 9223372036854775807 used to fail the read.
+- ExecuteStatement reads `Limit` as any JSON number, as DynamoDB does. A
+  fraction truncates, so `1.5` and `1.0` read as 1, and a value past
+  2147483647, such as `1e+20`, one near or past 9223372036854775807, or
+  `1e400`, reads every row. These used to be refused with serde's own message
+  or fail the read. A `Limit` of `-1` is refused with `Member must have value
+  greater than or equal to 1`, echoing the value and listed with the
+  request's other member errors, and `-1e400` echoes `-2147483648`. Captured
+  against eu-west-2 and us-east-1 on 5 and 6 November 2026
+  ([#287](https://github.com/nubo-db/dynoxide/issues/287)).
+- Query's `Limit` and Scan's `Limit`, `Segment` and `TotalSegments` read a
+  number past the range of a double, such as `1e400` or `-1e400`, as the
+  32-bit integer it saturates to, and check it as they check any other
+  value. They used to answer with a bare `SerializationException`. A `Limit`
+  of `0.0` or `-0.0` is reported as `Value '0' at 'limit'`, as `0.5` is,
+  where it used to get the message for a `Limit` of `0`. Captured against
+  eu-west-2 and us-east-1 on 6 November 2026.
+- A number where a string or boolean member belongs, such as `TableName`,
+  `Select` or `ConsistentRead`, is named by how it is written, as DynamoDB
+  names it. A whole number gets `NUMBER_VALUE cannot be converted to String`
+  (or `Boolean`) at any size, including `-0`, `100000000000000000000` and a
+  400-digit number, and one written with a point or an exponent gets
+  `DECIMAL_VALUE`, including `1e400`. In a string member, `-0` and whole
+  numbers past 64 bits used to get `DECIMAL_VALUE`, and anywhere, a number
+  past the range of a double got a bare `SerializationException`. Captured against eu-west-2 and us-east-1 on
+  6 November 2026.
 - A `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem`, `Query` or `Scan`
   table name is measured in characters, as DynamoDB measures it, so `😀😀` is
   too short and 128 emoji aren't too long. `SearchVectors` shares the check.

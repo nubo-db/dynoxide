@@ -4371,3 +4371,272 @@ fn a_replayed_transaction_still_rejects_an_unknown_return_consumed_capacity() {
         "a replay should reject an unknown mode, got {msg}"
     );
 }
+
+/// A `Limit` built into the request in code still reads that many rows.
+#[test]
+fn a_limit_built_in_code_reads_that_many_rows() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "LimitInCode");
+    for i in 0..4 {
+        put_test_item(&db, "LimitInCode", &format!("k{i}"), "n");
+    }
+    let page = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"LimitInCode\"".to_string(),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.items.map(|items| items.len()), Some(2));
+    assert!(page.next_token.is_some(), "two rows remain");
+}
+
+/// ExecuteStatement's `Limit` sent over the wire, with the number spelt as the
+/// client spelt it. DynamoDB reads any JSON number, truncating a fraction and
+/// reading a value past the 32-bit range as every row; below 1 it is refused
+/// with the value echoed, and a string is a serialisation error (captured
+/// eu-west-2 and us-east-1, 5 November 2026; the regions agree on every case).
+#[cfg(feature = "http-server")]
+mod limit_over_the_wire {
+    use dynoxide::Database;
+    use dynoxide::actions::create_table::CreateTableRequest;
+    use dynoxide::actions::put_item::PutItemRequest;
+    use serde_json::json;
+
+    const TABLE: &str = "LimitWire";
+    /// The statement as it sits inside a JSON string.
+    const SELECT: &str = r#"SELECT * FROM \"LimitWire\" WHERE pk = 'k'"#;
+
+    /// A server over a table holding four rows under one partition key.
+    async fn start_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value::<CreateTableRequest>(json!({
+                "TableName": TABLE,
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"}
+                ],
+                "BillingMode": "PAY_PER_REQUEST"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for row in 1..=4 {
+            db.put_item(
+                serde_json::from_value::<PutItemRequest>(json!({
+                    "TableName": TABLE,
+                    "Item": {"pk": {"S": "k"}, "sk": {"S": format!("row-{row}")}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        tokio::spawn(async move {
+            dynoxide::server::serve_on(listener, db).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        url
+    }
+
+    /// Posts a raw body, so the number reaches the server spelt as written.
+    /// Returns the response's JSON, or the error's message after its
+    /// exception name.
+    async fn post(url: &str, body: String) -> Result<serde_json::Value, String> {
+        let resp = reqwest::Client::new()
+            .post(url)
+            .header("x-amz-target", "DynamoDB_20120810.ExecuteStatement")
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                 SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+            )
+            .header("x-amz-date", "20260101T000000Z")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let ok = resp.status() == 200;
+        let text = resp.text().await.unwrap();
+        assert!(
+            !text.contains("VALIDATION") && !text.contains(" at line "),
+            "internal marker or serde position leaked: {text}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if ok {
+            return Ok(parsed);
+        }
+        let name = parsed["__type"]
+            .as_str()
+            .unwrap()
+            .rsplit('#')
+            .next()
+            .unwrap();
+        let message = parsed["message"]
+            .as_str()
+            .or_else(|| parsed["Message"].as_str())
+            .unwrap();
+        Err(format!("{name}: {message}"))
+    }
+
+    /// Walks the select with `Limit` spelt as `limit`, returning the row count
+    /// of each page that carries rows, or the error the first page was refused
+    /// with.
+    ///
+    /// A trailing empty page is left out. DynamoDB ends this keyed walk on its
+    /// fourth page with `Limit` 1, where Dynoxide still hands back a token
+    /// there and ends on a fifth, empty, page. That is a difference in where a
+    /// walk stops, not in how `Limit` is read, so it is not pinned here.
+    async fn walk(url: &str, limit: &str) -> Result<Vec<usize>, String> {
+        let mut pages = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let next = token
+                .as_ref()
+                .map(|t| format!(r#","NextToken":{}"#, serde_json::to_string(t).unwrap()))
+                .unwrap_or_default();
+            let body = format!(r#"{{"Statement":"{SELECT}","Limit":{limit}{next}}}"#);
+            let page = post(url, body).await?;
+            pages.push(page["Items"].as_array().map_or(0, Vec::len));
+            match page["NextToken"].as_str() {
+                Some(t) => token = Some(t.to_string()),
+                None => {
+                    if pages.len() > 1 && pages.last() == Some(&0) {
+                        pages.pop();
+                    }
+                    return Ok(pages);
+                }
+            }
+            assert!(pages.len() <= 10, "the walk did not end: {pages:?}");
+        }
+    }
+
+    fn below_one(value: &str) -> String {
+        format!(
+            "ValidationException: 1 validation error detected: Value '{value}' at 'limit' failed \
+             to satisfy constraint: Member must have value greater than or equal to 1"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_whole_number_limit_pages_one_row_at_a_time() {
+        let url = start_server().await;
+        assert_eq!(walk(&url, "1").await, Ok(vec![1, 1, 1, 1]));
+    }
+
+    #[tokio::test]
+    async fn a_fractional_limit_truncates() {
+        let url = start_server().await;
+        for limit in ["1.5", "1.0"] {
+            assert_eq!(
+                walk(&url, limit).await,
+                Ok(vec![1, 1, 1, 1]),
+                "Limit {limit}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_past_the_32_bit_range_reads_every_row() {
+        let url = start_server().await;
+        for limit in [
+            "2147483648",
+            "1E+2",
+            "1e+20",
+            "100000000000000000000",
+            "18446744073709551617",
+            // Past f64's range too (captured eu-west-2 and us-east-1,
+            // 6 November 2026).
+            "1e400",
+        ] {
+            assert_eq!(walk(&url, limit).await, Ok(vec![4]), "Limit {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_below_one_is_refused_with_its_value() {
+        let url = start_server().await;
+        assert_eq!(walk(&url, "0").await, Err(below_one("0")));
+        assert_eq!(walk(&url, "-1").await, Err(below_one("-1")));
+    }
+
+    /// The value reported is the one left after truncating and saturating
+    /// (captured eu-west-2 and us-east-1, 6 November 2026).
+    #[tokio::test]
+    async fn a_limit_that_truncates_or_saturates_below_one_reports_what_is_left() {
+        let url = start_server().await;
+        for (limit, left) in [
+            ("0.5", "0"),
+            ("-0.5", "0"),
+            ("0.0", "0"),
+            ("-0.0", "0"),
+            ("-1.5", "-1"),
+            ("-1e400", "-2147483648"),
+        ] {
+            assert_eq!(
+                walk(&url, limit).await,
+                Err(below_one(left)),
+                "Limit {limit}"
+            );
+        }
+    }
+
+    /// A negative `Limit` joins the other member errors in their usual order,
+    /// after `ReturnValuesOnConditionCheckFailure` and ahead of
+    /// `ReturnConsumedCapacity` and the parameters.
+    #[tokio::test]
+    async fn a_negative_limit_is_listed_with_the_other_member_errors() {
+        let url = start_server().await;
+        let body = format!(
+            r#"{{"Statement":"{SELECT}","Limit":-1,"ReturnValuesOnConditionCheckFailure":"BOGUS","ReturnConsumedCapacity":"BOGUS","Parameters":[]}}"#
+        );
+        assert_eq!(
+            post(&url, body).await.map(|_| ()),
+            Err(
+                "ValidationException: 4 validation errors detected: Value 'BOGUS' at \
+                 'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must \
+                 satisfy enum value set: [ALL_OLD, NONE]; Value '-1' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1; Value 'BOGUS' at \
+                 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum \
+                 value set: [INDEXES, TOTAL, NONE]; Value '[]' at 'parameters' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 1"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A zero `Limit` takes the same place in the list.
+    #[tokio::test]
+    async fn a_zero_limit_is_listed_with_the_other_member_errors() {
+        let url = start_server().await;
+        let body = format!(
+            r#"{{"Statement":"{SELECT}","Limit":0,"ReturnValuesOnConditionCheckFailure":"BOGUS"}}"#
+        );
+        assert_eq!(
+            post(&url, body).await.map(|_| ()),
+            Err(
+                "ValidationException: 2 validation errors detected: Value 'BOGUS' at \
+                 'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must \
+                 satisfy enum value set: [ALL_OLD, NONE]; Value '0' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1"
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_string_limit_is_a_serialisation_error() {
+        let url = start_server().await;
+        assert_eq!(
+            walk(&url, r#""2""#).await,
+            Err("SerializationException: STRING_VALUE cannot be converted to Integer".to_string())
+        );
+    }
+}

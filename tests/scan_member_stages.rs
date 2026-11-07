@@ -62,6 +62,12 @@ async fn start_server() -> String {
 /// The ValidationException (or SerializationException) message a Scan is refused with, or an empty string
 /// when it is accepted.
 async fn answer(url: &str, body: &serde_json::Value) -> String {
+    answer_raw(url, body.to_string()).await
+}
+
+/// [`answer`] for a body sent as written, for a number a JSON value can't
+/// hold.
+async fn answer_raw(url: &str, body: String) -> String {
     let resp = reqwest::Client::new()
         .post(url)
         .header("x-amz-target", "DynamoDB_20120810.Scan")
@@ -72,7 +78,7 @@ async fn answer(url: &str, body: &serde_json::Value) -> String {
              SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
         )
         .header("x-amz-date", "20260101T000000Z")
-        .json(body)
+        .body(body.clone())
         .send()
         .await
         .unwrap();
@@ -1243,6 +1249,113 @@ async fn each_request_is_answered_as_the_newer_layer_answers_it() {
         CASES.len(),
         wrong.join("\n")
     );
+}
+
+/// Scan's integer members written as numbers a JSON value can't hold, or as
+/// a zero with a fraction, sent as written. Each saturates or truncates and is
+/// reported as read (captured eu-west-2 and us-east-1, 6 November 2026, where
+/// both regions gave the same answers).
+#[tokio::test]
+async fn integer_members_past_the_range_of_a_double_saturate() {
+    let url = start_server().await;
+    let below_one = |value: &str, member: &str| {
+        format!(
+            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+             constraint: Member must have value greater than or equal to 1"
+        )
+    };
+    for (members, expected) in [
+        (r#""Limit":1e400"#, String::new()),
+        (r#""Limit":-1e400"#, below_one("-2147483648", "limit")),
+        (r#""Limit":0.0"#, below_one("0", "limit")),
+        (r#""Limit":-0.0"#, below_one("0", "limit")),
+        (
+            r#""Segment":0,"TotalSegments":1e400"#,
+            "1 validation error detected: Value '2147483647' at 'totalSegments' failed to \
+             satisfy constraint: Member must have value less than or equal to 1000000"
+                .to_string(),
+        ),
+        (
+            r#""Segment":0,"TotalSegments":-1e400"#,
+            below_one("-2147483648", "totalSegments"),
+        ),
+        (
+            r#""Segment":1e400,"TotalSegments":2"#,
+            "1 validation error detected: Value '2147483647' at 'segment' failed to satisfy \
+             constraint: Member must have value less than or equal to 999999"
+                .to_string(),
+        ),
+        (
+            r#""Segment":-1e400,"TotalSegments":2"#,
+            "1 validation error detected: Value '-2147483648' at 'segment' failed to satisfy \
+             constraint: Member must have value greater than or equal to 0"
+                .to_string(),
+        ),
+    ] {
+        let body = format!(r#"{{"TableName":"{TABLE}",{members}}}"#);
+        assert_eq!(answer_raw(&url, body).await, expected, "{members}");
+    }
+}
+
+/// A number past a double's range in a member that isn't a number is named by
+/// how it is written, whatever its size: a decimal with a point or an
+/// exponent, as `1e300` is, and a whole number without, `-0` and numbers past
+/// 64 bits included (captured eu-west-2 and us-east-1, 6 November 2026, where
+/// both regions gave the same answers).
+#[tokio::test]
+async fn numbers_past_the_range_of_a_double_are_named_as_written_elsewhere() {
+    let url = start_server().await;
+    let to_string = "DECIMAL_VALUE cannot be converted to String";
+    let digits = format!("1{}", "0".repeat(400));
+    for (body, expected) in [
+        (
+            format!(r#"{{"TableName":{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":-{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (format!(r#"{{"TableName":{digits}.0}}"#), to_string),
+        // serde_json reads these whole numbers as floats too.
+        (
+            r#"{"TableName":100000000000000000000}"#.to_string(),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            r#"{"TableName":-100000000000000000000}"#.to_string(),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            r#"{"TableName":-0}"#.to_string(),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","Select":100000000000000000000}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","Select":{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","ConsistentRead":{digits}}}"#),
+            "NUMBER_VALUE cannot be converted to Boolean",
+        ),
+        (r#"{"TableName":1e400}"#.to_string(), to_string),
+        (r#"{"TableName":-1e400}"#.to_string(), to_string),
+        (r#"{"TableName":1e300}"#.to_string(), to_string),
+        (
+            format!(r#"{{"TableName":"{TABLE}","ConsistentRead":1e400}}"#),
+            "DECIMAL_VALUE cannot be converted to Boolean",
+        ),
+        (
+            format!(r#"{{"TableName":"{TABLE}","Select":1e400}}"#),
+            to_string,
+        ),
+    ] {
+        assert_eq!(answer_raw(&url, body.clone()).await, expected, "{body}");
+    }
 }
 
 /// Scan reads its attribute values on the newer layer as well: a number that

@@ -369,6 +369,36 @@ fn test_put_item_eav_null_false_enveloped() {
 }
 
 #[test]
+fn test_update_item_all_old_on_upsert() {
+    let db = make_db();
+    create_hash_only_table(&db, "Items");
+
+    let update = |value: &str| {
+        dynoxide::actions::update_item::UpdateItemRequest {
+            table_name: "Items".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET val = :v".into()),
+            expression_attribute_values: Some(HashMap::from([(
+                ":v".into(),
+                AttributeValue::S(value.into()),
+            )])),
+            return_values: Some("ALL_OLD".into()),
+            ..Default::default()
+        }
+    };
+
+    // No item exists before the first update: Attributes must be absent.
+    let first = db.update_item(update("first")).unwrap();
+    assert!(first.attributes.is_none());
+
+    // The second update must return the complete previous item.
+    let second = db.update_item(update("second")).unwrap();
+    let old = second.attributes.unwrap();
+    assert_eq!(old["pk"], AttributeValue::S("k1".into()));
+    assert_eq!(old["val"], AttributeValue::S("first".into()));
+}
+
+#[test]
 fn test_update_item_return_values_invalid_enveloped_exactly_once() {
     // The in-process backstop for an invalid ReturnValues enum produces the
     // same enveloped message as the request deserialiser, with exactly one

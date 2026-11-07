@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReturnValues: ALL_OLD`, whether it uses `SET`, `REMOVE` or no update
   expression. It used to return the key attributes as the old image.
   Captured against eu-west-2 and us-east-1 on 5 November 2026
-  ([#278](https://github.com/nubo-db/dynoxide/issues/278)).
+  ([#278](https://github.com/nubo-db/dynoxide/issues/278),
+  [#292](https://github.com/nubo-db/dynoxide/pull/292), thanks
+  [@alfaproject](https://github.com/alfaproject)).
 - A PartiQL `SELECT` on one partition refuses a `NOT` written over a key
   attribute inside an OR whose other branch names no key attribute, such as
   `pk = 'k' AND (NOT sk = 's0' OR x = 0)`, with DynamoDB's `Filter Expression

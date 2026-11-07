@@ -14,6 +14,39 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 Conformance fixes ship as minor releases, so behaviour moves within a major line. This is the cumulative record: if something answers differently after an upgrade, look here first. `docs/versioning.md` explains the rule and how to pin if you would rather behaviour held still.
 
+### 1.6.0
+
+- **Results change without an error.**
+  - A PartiQL `SELECT` whose OR branches all name the same partition key, or
+    whose sort key is matched with `IN`, reads only those keys. Its charge and
+    its `Limit` pages change, and each requested key is charged a read whether
+    or not it exists.
+  - A PartiQL read under `Limit` that ends on the last of a set of sort keys,
+    or on a range's closed bound, returns no `NextToken`.
+  - `UpdateItem` with `ReturnValues: ALL_OLD` returns no `Attributes` when it
+    creates the item.
+  - ExecuteStatement reads a `Limit` with a fraction by truncating it, so
+    `1.5` reads one row.
+- **Requests that used to be accepted are now rejected**, matching DynamoDB:
+  - an attribute name starting with `_` in any expression without an
+    `ExpressionAttributeNames` alias, including an import rule's `match`;
+  - a PartiQL `NOT` over a key attribute inside an OR whose other branch names
+    no key attribute;
+  - a PartiQL filter on an attribute an index doesn't project, when OR
+    branches share the index partition key;
+  - a string partition key given a number such as `1` in a large PartiQL OR;
+  - a table name under three characters counted as characters, such as `😀😀`.
+- **Requests that used to be refused are now accepted**: `attribute_exists`,
+  `attribute_not_exists` or `IS MISSING` on a key beside a non-key OR branch,
+  `ORDER BY` on the sort key across OR branches on one partition, PartiQL OR
+  filters too large to expand, any JSON number as ExecuteStatement's `Limit`,
+  and a number past the range of a double as a `Limit`, `Segment` or
+  `TotalSegments`.
+- **Messages move.** Deep `PutItem`, `UpdateItem` and `DeleteItem` requests
+  report every invalid member together in DynamoDB's order. A number where a
+  string or boolean member belongs is named as written, `NUMBER_VALUE` for a
+  whole number and `DECIMAL_VALUE` for one with a point or exponent.
+
 ### 1.4.0
 
 - **Results change without an error.**
@@ -369,7 +402,7 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
-- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally, under three limits of Dynoxide's own: at most 256 alternatives, at most 4,096 condition slots in any AND product, and at most 16,384 slots across an alternation. A clause past any of them is rejected as too complex. DynamoDB evaluates a condition as a tree and runs clauses far larger than these (40 pairs of `(a = 1 OR a = 2)` run on eu-west-2), so this is a known difference
+- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs to plan its reads, and evaluated as a tree whenever flattening it would pass Dynoxide's planner budget, so no clause DynamoDB accepts is refused for its size (40 pairs of `(a = 1 OR a = 2)` run, as they do on eu-west-2). A partition key equality beside such a clause still reads only that partition
 - **Projections:** Nested dot-notation paths
 - **Aggregates:** Not supported, matching DynamoDB: a `COUNT(...)` projection is rejected with DynamoDB's `Unexpected path component` message carrying the token's position (captured against eu-west-2)
 - **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement must stay identical character for character across pages, and so must the parameters, though `Limit` may change; a token replayed with any difference is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2). A statement with a list or map parameter is never resumed, even with the same parameter sent again (captured against eu-west-2 and us-east-1)

@@ -115,6 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of `0.0` or `-0.0` is reported as `Value '0' at 'limit'`, as `0.5` is,
   where it used to get the message for a `Limit` of `0`. Captured against
   eu-west-2 and us-east-1 on 6 November 2026.
+- A number where a string or boolean member belongs, such as `TableName`,
+  `Select` or `ConsistentRead`, is named by how it is written, as DynamoDB
+  names it. A whole number gets `NUMBER_VALUE cannot be converted to String`
+  (or `Boolean`) at any size, including `-0`, `100000000000000000000` and a
+  400-digit number, and one written with a point or an exponent gets
+  `DECIMAL_VALUE`, including `1e400`. In a string member, `-0` and whole
+  numbers past 64 bits used to get `DECIMAL_VALUE`, and anywhere, a number
+  past the range of a double got a bare `SerializationException`. Captured against eu-west-2 and us-east-1 on
+  6 November 2026.
 - A `PutItem`, `UpdateItem`, `DeleteItem`, `GetItem`, `Query` or `Scan`
   table name is measured in characters, as DynamoDB measures it, so `😀😀` is
   too short and 128 emoji aren't too long. `SearchVectors` shares the check.

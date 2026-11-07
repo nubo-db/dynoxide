@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-07
+
+The crate moves to `dynoxide-rs` 3.3.0, which adds public items and removes
+none. Everything else a user installs carries 1.6.0. The release brings PartiQL
+reads, request validation and number handling closer to DynamoDB, so some
+requests answer differently: see Behaviour changes and
+`docs/compatibility-summary.md`.
+
 ### Security
 
 - **`zstd` moves to 0.13.4, `zstd-safe` to 7.4.0 and `zstd-sys` to 2.1.2** for
@@ -15,16 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy-frame decompression, and the wasm32 allocator shim. Dynoxide only
   compresses import output with a fresh `zstd::Encoder` on native targets, so
   none of them reach its code, but zstd is built into the binary with the
-  `import` feature, so the fix ships in the next release.
+  `import` feature, so it ships in this release.
 
-### Fixed
+### Behaviour changes
 
-- Expressions refuse attribute names starting with `_` unless they use an
-  `ExpressionAttributeNames` alias, as DynamoDB does, in key condition,
+- **Expressions refuse attribute names starting with `_` unless they use an
+  `ExpressionAttributeNames` alias**, as DynamoDB does, in key condition,
   filter, projection, condition and update expressions alike. This includes
   an import rule's `match` expression, so a rule matching such an attribute
   now needs an alias in its `names`. A rule's `path` is unaffected
   ([#274](https://github.com/nubo-db/dynoxide/issues/274)).
+- **PartiQL reads one partition where DynamoDB does.** A `SELECT` whose OR
+  branches all name the same partition key, or whose sort key is matched with
+  `IN`, now reads and charges only those keys, and `Limit` counts only their
+  rows. These used to scan the table or read the whole partition, so their
+  charges and page counts change. The entries under Fixed give the detail.
+
+### Fixed
+
 - An `UpdateItem` that creates its item returns no `Attributes` for
   `ReturnValues: ALL_OLD`, whether it uses `SET`, `REMOVE` or no update
   expression. It used to return the key attributes as the old image.
@@ -2112,7 +2128,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/nubo-db/dynoxide/compare/v1.2.1...v1.3.0

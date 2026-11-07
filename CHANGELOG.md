@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `UpdateItem` with `ReturnValues: ALL_OLD` omits `Attributes` when the
+  update creates a new item, instead of returning a key-only image as though
+  the item already existed ([#278](https://github.com/nubo-db/dynoxide/issues/278)).
 - Expressions refuse attribute names starting with `_` unless they use an
   `ExpressionAttributeNames` alias, as DynamoDB does, in key condition,
   filter, projection, condition and update expressions alike. This includes

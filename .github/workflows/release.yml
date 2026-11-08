@@ -362,7 +362,7 @@ jobs:
           BASE="https://github.com/nubo-db/dynoxide/releases/download/v${VERSION}"
           cat <<FORMULA | sed 's/^  //' > formula.rb
             class Dynoxide < Formula
-              desc "Fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite"
+              desc "DynamoDB emulator, verified against AWS, backed by SQLite"
               homepage "https://dynoxide.dev"
               version "${VERSION}"
               license any_of: ["MIT", "Apache-2.0"]

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
+  emulator verified against AWS**, rather than a drop-in replacement for
+  DynamoDB Local.
+
 ## [1.6.0] - 2026-11-07
 
 The crate moves to `dynoxide-rs` 3.3.0, which adds public items and removes

@@ -32,7 +32,7 @@ enum LogMode {
 
     name = "dynoxide",
     version = dynoxide::PRODUCT_VERSION,
-    about = "A fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite",
+    about = "A DynamoDB emulator, verified against AWS, backed by SQLite",
     after_help = after_help_text(),
     args_conflicts_with_subcommands = true,
 )]
@@ -1393,6 +1393,20 @@ mod tests {
                 Some(Commands::Serve(args)) => assert_eq!(args.port, 8893),
                 _ => panic!("expected serve subcommand"),
             }
+        }
+
+        #[test]
+        fn help_describes_an_emulator_verified_against_aws() {
+            use clap::CommandFactory;
+            let help = Cli::command().render_help().to_string();
+            assert!(
+                help.contains("DynamoDB emulator, verified against AWS"),
+                "--help should describe Dynoxide as an emulator verified against AWS:\n{help}"
+            );
+            assert!(
+                !help.contains("drop-in"),
+                "--help still calls Dynoxide a drop-in replacement:\n{help}"
+            );
         }
 
         #[test]

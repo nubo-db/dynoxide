@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An attribute value with a member of the wrong JSON type is refused with
+  DynamoDB's `SerializationException` message, which names what was found and
+  what was expected. A number where `S` or `N` belongs gives `NUMBER_VALUE
+  cannot be converted to String`, or `DECIMAL_VALUE` for one written with a
+  point or an exponent, `1e400` included. A non-string in `B` or `BS` gives
+  `only base-64-encoded strings are convertible to bytes`, a scalar where `SS`,
+  `NS`, `BS`, `L` or `M` belongs gives `Unexpected field type`, and a scalar
+  inside `L` or `M` gives `Unexpected value type in payload`. This holds in
+  items, keys, expression values, PartiQL parameters, legacy conditions and a
+  Query or Scan `ExclusiveStartKey`, at any depth in an `L` or `M`, and ahead
+  of the "more than one datatypes" check. A `BOOL` or `NULL` given a decimal
+  past a double's range, such as `1e400`, gives `DECIMAL_VALUE cannot be
+  converted to Boolean`. Most of these used to say `TRUE_VALUE`, give no message, leak an
+  internal message, or come back as a `ValidationException`. Captured against
+  eu-west-2 and us-east-1 on 6 and 8 November 2026
+  ([#294](https://github.com/nubo-db/dynoxide/issues/294)).
+
 ## [1.6.0] - 2026-11-07
 
 The crate moves to `dynoxide-rs` 3.3.0, which adds public items and removes

@@ -250,6 +250,17 @@ impl<'de> Deserialize<'de> for AttributeValue {
             None => None,
         };
 
+        // A member of the wrong JSON type is refused as the value is parsed,
+        // ahead of the checks made on a parsed value: an empty set, a number
+        // that doesn't read, a false NULL and a second member (captured
+        // eu-west-2 and us-east-1, 2026-11-08, for the second member).
+        if let Some(refusal) = wrong_json_type_in(obj) {
+            return Err(de::Error::custom(format!(
+                "{}{refusal}",
+                crate::serde_errors::SERIALIZATION_MARKER
+            )));
+        }
+
         // A value with more than one member is read by DynamoDB's older
         // validation layer, and so is every other value in its request (see
         // `reads_on_older_layer`): its refusals are bare. An empty set comes
@@ -332,19 +343,19 @@ impl<'de> Deserialize<'de> for AttributeValue {
             "S" => {
                 let s = val
                     .as_str()
-                    .ok_or_else(|| de::Error::custom("expected string for S"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 Ok(AttributeValue::S(s.to_string()))
             }
             "N" => {
                 let n = val
                     .as_str()
-                    .ok_or_else(|| de::Error::custom("expected string for N"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 Ok(AttributeValue::N(n.to_string()))
             }
             "B" => {
                 let encoded = val
                     .as_str()
-                    .ok_or_else(|| de::Error::custom("expected string for B"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 let bytes = BASE64
                     .decode(encoded)
                     .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
@@ -356,7 +367,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
             "SS" => {
                 let arr = val
                     .as_array()
-                    .ok_or_else(|| de::Error::custom("expected array for SS"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 let ss: Result<Vec<String>, _> = arr
                     .iter()
                     .map(|v| {
@@ -370,7 +381,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
             "NS" => {
                 let arr = val
                     .as_array()
-                    .ok_or_else(|| de::Error::custom("expected array for NS"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 let ns: Result<Vec<String>, _> = arr
                     .iter()
                     .map(|v| {
@@ -384,7 +395,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
             "BS" => {
                 let arr = val
                     .as_array()
-                    .ok_or_else(|| de::Error::custom("expected array for BS"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 let mut decoded = Vec::with_capacity(arr.len());
                 for item in arr {
                     let encoded = item
@@ -401,7 +412,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
             "L" => {
                 let arr = val
                     .as_array()
-                    .ok_or_else(|| de::Error::custom("expected array for L"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 let list: Result<Vec<AttributeValue>, _> = arr
                     .iter()
                     .map(|v| serde_json::from_value(v.clone()).map_err(de::Error::custom))
@@ -411,7 +422,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
             "M" => {
                 let map_val = val
                     .as_object()
-                    .ok_or_else(|| de::Error::custom("expected object for M"))?;
+                    .expect("a member of the wrong JSON type is refused above");
                 let mut result = std::collections::HashMap::new();
                 for (k, v) in map_val {
                     let av: AttributeValue =
@@ -422,6 +433,97 @@ impl<'de> Deserialize<'de> for AttributeValue {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+/// What an attribute value member, or a member of one of its lists or maps,
+/// holds as JSON.
+#[derive(Clone, Copy)]
+enum JsonSlot {
+    /// A string: `S`, `N`, and the members of `SS` and `NS`.
+    Text,
+    /// A base64 string: `B`, and the members of `BS`.
+    Bytes,
+    /// An array: `SS`, `NS`, `BS` and `L`.
+    List,
+    /// An object: `M`.
+    Map,
+    /// A whole attribute value, an object: the members of `L` and the values
+    /// of `M`.
+    Value,
+}
+
+impl JsonSlot {
+    /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong
+    /// (captured eu-west-2 and us-east-1, 2026-11-08); `None` when the type is
+    /// right, or for JSON null, which the readers below deal with. An empty
+    /// refusal is a `SerializationException` with no message.
+    fn refusal(self, value: &serde_json::Value) -> Option<&'static str> {
+        use serde_json::Value;
+        const MAP_HERE: &str = "Start of structure or map found where not expected";
+        match (self, value) {
+            (_, Value::Null)
+            | (Self::Text | Self::Bytes, Value::String(_))
+            | (Self::List, Value::Array(_))
+            | (Self::Map | Self::Value, Value::Object(_)) => None,
+            (Self::Text | Self::Bytes | Self::Map | Self::Value, Value::Array(_)) => Some(""),
+            (_, Value::Object(_)) => Some(MAP_HERE),
+            (Self::Text, Value::Bool(true)) => Some("TRUE_VALUE cannot be converted to String"),
+            (Self::Text, Value::Bool(false)) => Some("FALSE_VALUE cannot be converted to String"),
+            // A number is named by how it was written: with a point or an
+            // exponent it is a decimal. The wire seams write the numbers
+            // serde_json would misread in these places as ones it reads the
+            // same way (`serde_errors::misread_numbers_as_written`).
+            (Self::Text, Value::Number(n)) if n.is_f64() => {
+                Some("DECIMAL_VALUE cannot be converted to String")
+            }
+            (Self::Text, Value::Number(_)) => Some("NUMBER_VALUE cannot be converted to String"),
+            (Self::Bytes, _) => Some("only base-64-encoded strings are convertible to bytes"),
+            (Self::List | Self::Map, _) => Some("Unexpected field type"),
+            (Self::Value, _) => Some("Unexpected value type in payload"),
+        }
+    }
+}
+
+/// DynamoDB's refusal of an attribute value, written as the JSON object
+/// `value`, when one of its type members, or anything nested in its `L` or
+/// `M`, has the wrong JSON type; `None` when the JSON types are right.
+/// DynamoDB refuses these as it parses the whole value, so a fault nested in
+/// an `L` or `M` comes ahead of the outer value's own faults, such as a second
+/// member. Members are looked at in key order, which serde_json keeps sorted.
+fn wrong_json_type_in(value: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+    value
+        .iter()
+        .find_map(|(type_key, member)| wrong_json_type(type_key, member))
+}
+
+/// DynamoDB's refusal of an attribute value's `type_key` member when it, or
+/// anything in it, has the wrong JSON type; `None` when the JSON types are
+/// right, and for a member that isn't one of these types.
+fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<&'static str> {
+    let (slot, members) = match type_key {
+        "S" | "N" => (JsonSlot::Text, None),
+        "B" => (JsonSlot::Bytes, None),
+        "SS" | "NS" => (JsonSlot::List, Some(JsonSlot::Text)),
+        "BS" => (JsonSlot::List, Some(JsonSlot::Bytes)),
+        "L" => (JsonSlot::List, Some(JsonSlot::Value)),
+        "M" => (JsonSlot::Map, Some(JsonSlot::Value)),
+        _ => return None,
+    };
+    if let Some(refusal) = slot.refusal(value) {
+        return Some(refusal);
+    }
+    let members = members?;
+    let member_refusal = |item: &serde_json::Value| {
+        members.refusal(item).or_else(|| match item {
+            serde_json::Value::Object(nested) => wrong_json_type_in(nested),
+            _ => None,
+        })
+    };
+    match value {
+        serde_json::Value::Array(items) => items.iter().find_map(member_refusal),
+        serde_json::Value::Object(map) => map.values().find_map(member_refusal),
+        _ => None,
     }
 }
 
@@ -457,7 +559,7 @@ fn read_lenient_bool(value: &serde_json::Value) -> Result<LenientBool, String> {
         // is NUMBER_VALUE and one with a point or an exponent DECIMAL_VALUE
         // (captured eu-west-2 and us-east-1, 2026-10-10). serde_json reads
         // `-0` and integers past 64 bits as floats, so the wire seams rewrite
-        // those first (`serde_errors::boolean_numbers_as_written`) and a float
+        // those first (`serde_errors::misread_numbers_as_written`) and a float
         // here was written as one.
         serde_json::Value::Number(n) if n.is_f64() => {
             Err(refused("DECIMAL_VALUE cannot be converted to Boolean"))
@@ -494,15 +596,14 @@ pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
 }
 
 /// The malformed-request error, marked for a `SerializationException`, for the
-/// first `BOOL` or `NULL` member, or `Exists`, in a legacy condition map
-/// (`QueryFilter`, `ScanFilter`, `KeyConditions`, `Expected`) that doesn't read
-/// as a boolean; `None` when every one reads. DynamoDB fails the whole request
-/// as it is read (captured eu-west-2 and us-east-1, 2026-10-10), and the map's
-/// values are read later than the request's own members, so the request
-/// decoders look here first.
-pub(crate) fn malformed_condition_boolean(
-    conditions: Option<&serde_json::Value>,
-) -> Option<String> {
+/// first `Exists` or value in a legacy condition map (`QueryFilter`,
+/// `ScanFilter`, `KeyConditions`, `Expected`) that can't be read: a `BOOL`,
+/// `NULL` or `Exists` that doesn't read as a boolean, or a member of the wrong
+/// JSON type; `None` when every one reads. DynamoDB fails the whole request as
+/// it is read (captured eu-west-2 and us-east-1, 2026-10-10, for booleans),
+/// and the map's values are read later than the request's own members, so the
+/// request decoders look here first.
+pub(crate) fn malformed_condition_value(conditions: Option<&serde_json::Value>) -> Option<String> {
     let malformed = |message: String| {
         message
             .starts_with(crate::serde_errors::SERIALIZATION_MARKER)
@@ -2492,6 +2593,26 @@ impl TryFrom<AttributeValue> for Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_type_member_of_the_wrong_json_type_is_refused_not_panicked() {
+        // Each type member reaches its arm only once its JSON type is right,
+        // so a type added without a shape rule would panic here instead.
+        for type_key in TYPE_MEMBERS {
+            for wrong in [
+                serde_json::json!(5),
+                serde_json::json!("x"),
+                serde_json::json!([5]),
+                serde_json::json!({"a": 5}),
+            ] {
+                let value = serde_json::json!({ type_key: wrong });
+                let read = std::panic::catch_unwind(|| {
+                    serde_json::from_value::<AttributeValue>(value.clone())
+                });
+                assert!(read.is_ok(), "{value} panicked");
+            }
+        }
+    }
+
     use super::*;
 
     /// A future that reports the layer in force at each of its polls, and

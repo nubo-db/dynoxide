@@ -93,7 +93,8 @@ to get it into the Community list in the README and on
 
 - be public
 - have a licence
-- work with a currently supported Dynoxide 1.x release
+- work with the latest Dynoxide release (it can let users pin an
+  older one, as long as the latest works)
 - be maintained
 
 A listing isn't an endorsement or a compatibility guarantee.

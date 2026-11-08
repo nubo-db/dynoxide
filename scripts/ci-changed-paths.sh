@@ -37,8 +37,10 @@ else
 fi
 
 # Count the files that are not docs rather than branching on grep's exit
-# status: under `set -e`, a grep that selects nothing exits 1.
-not_docs=$(grep -cvE "$DOCS_ONLY" <<< "$changed" || true)
+# status. Exit 1 only means grep selected nothing, which here means every file
+# is docs; any other failure stops the script, so the step goes red rather
+# than printing code=false from an empty count.
+not_docs=$(grep -cvE "$DOCS_ONLY" <<< "$changed") || [ $? -eq 1 ]
 if [ -z "$changed" ] || [ "$not_docs" -gt 0 ]; then
   echo "code=true"
 else

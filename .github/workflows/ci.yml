@@ -284,9 +284,9 @@ jobs:
       - name: Clippy (every target, iai-callgrind)
         run: cargo clippy --all-targets --features iai-callgrind -- -D warnings
 
+  # Not gated on the changes job: ReadmeMarkersTest reads the root README.md,
+  # which a docs-only PR can change, and the job takes seconds.
   benchmark-scripts:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
     name: Benchmark script tests
     runs-on: ubuntu-latest
 
@@ -574,6 +574,8 @@ jobs:
   changes:
     name: Detect what changed
     runs-on: ubuntu-latest
+    # Every build and test job waits on this one.
+    timeout-minutes: 5
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
       code: ${{ steps.filter.outputs.code }}
@@ -592,14 +594,30 @@ jobs:
           # --no-renames lists both sides of a rename, so moving a source file
           # into docs/ still counts as a code change.
           if [ -z "${BASE_SHA:-}" ] || ! changed=$(git diff --name-only --no-renames "$BASE_SHA" HEAD 2>/dev/null); then
+            echo "::notice::No diff base to compare against, so every job runs."
             echo "docker=true" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "No diff base: every job runs." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "Changed files:"; echo "$changed"
           decision=$(printf '%s\n' "$changed" | scripts/ci-changed-paths.sh)
           echo "Decision:"; echo "$decision"
+          # A missing line would read as false in the gated jobs and skip them
+          # quietly, so an incomplete decision fails here instead.
+          if ! grep -qxE 'docker=(true|false)' <<< "$decision" || ! grep -qxE 'code=(true|false)' <<< "$decision"; then
+            echo "::error::scripts/ci-changed-paths.sh gave an incomplete decision"
+            exit 1
+          fi
           echo "$decision" >> "$GITHUB_OUTPUT"
+          {
+            echo "$(grep -c . <<< "$changed") changed files."
+            if grep -qx 'code=false' <<< "$decision"; then
+              echo "All of them are docs, so the build and test jobs are skipped."
+            else
+              echo "Not all of them are docs, so the build and test jobs run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   docker-smoke:
     name: Docker MCP smoke test

@@ -54,14 +54,43 @@ expect true true "workflow file" ".github/workflows/ci.yml"
 expect true true "manifest" "Cargo.toml"
 expect false true "empty list" ""
 
+# Each path the Docker recipe depends on runs the smoke test, and a neighbour
+# that isn't one of them doesn't.
+expect true true "Dockerfile" "Dockerfile"
+expect true true "lockfile" "Cargo.lock"
+expect true true "CLI entry point" "src/main.rs"
+expect true true "MCP server module" "src/mcp/server.rs"
+expect false true "file named like the MCP directory" "src/mcp.rs"
+
+# If the count itself fails, the gate must stop rather than print code=false.
+# A stand-in grep fails only the counting call, the way a broken pattern would.
+STUB=$(mktemp -d)
+trap 'rm -rf "$STUB"' EXIT
+printf '#!/bin/sh\ncase "$1" in -cvE) exit 2;; esac\nexec %s "$@"\n' "$(command -v grep)" > "$STUB/grep"
+chmod +x "$STUB/grep"
+checked=$((checked + 1))
+got=0
+out=$(printf 'src/lib.rs\n' | PATH="$STUB:$PATH" bash "$GATE" 2>&1) || got=$?
+if [ "$got" -eq 0 ] || grep -qx 'code=false' <<< "$out"; then
+  echo "FAIL  - grep failure: wanted a non-zero exit and no code=false, got exit $got"
+  failures=$((failures + 1))
+else
+  echo "ok    - grep failure stops the gate (exit $got)"
+fi
+
 # benchmark-regression.yml skips on its own copy of the docs list. An entry
 # there that this gate would treat as code would skip the benchmarks on a code
 # change, so every entry has to come out as docs here. A narrower copy only
 # costs runner time, so that direction isn't checked.
 BENCH="$SCRIPTS/../.github/workflows/benchmark-regression.yml"
-entries=$(sed -n '/paths-ignore:/,/^[^ ]/p' "$BENCH" | sed -n 's/^ *- "\(.*\)"$/\1/p')
+block=$(sed -n '/paths-ignore:/,/^[^ ]/p' "$BENCH")
+entries=$(sed -n 's/^ *- "\(.*\)"$/\1/p' <<< "$block")
+items=$(grep -c '^ *- ' <<< "$block" || true)
 if [ -z "$entries" ]; then
   echo "FAIL  - benchmark paths-ignore: found no entries in $BENCH"
+  failures=$((failures + 1))
+elif [ "$items" -ne "$(wc -l <<< "$entries")" ]; then
+  echo "FAIL  - benchmark paths-ignore: $items list items but only $(wc -l <<< "$entries" | tr -d ' ') read; write each as - \"path\""
   failures=$((failures + 1))
 fi
 while IFS= read -r entry; do

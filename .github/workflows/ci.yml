@@ -611,11 +611,12 @@ jobs:
           fi
           echo "$decision" >> "$GITHUB_OUTPUT"
           {
-            echo "$(grep -c . <<< "$changed") changed files."
-            if grep -qx 'code=false' <<< "$decision"; then
-              echo "All of them are docs, so the build and test jobs are skipped."
+            if [ -z "$changed" ]; then
+              echo "No changed files, so every job runs."
+            elif grep -qx 'code=false' <<< "$decision"; then
+              echo "$(grep -c . <<< "$changed") changed files, all of them docs, so the build and test jobs are skipped."
             else
-              echo "Not all of them are docs, so the build and test jobs run."
+              echo "$(grep -c . <<< "$changed") changed files, not all of them docs, so the build and test jobs run."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

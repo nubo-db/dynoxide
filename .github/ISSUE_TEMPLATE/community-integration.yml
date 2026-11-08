@@ -1,0 +1,56 @@
+name: Community integration
+description: Propose a library, plugin or tool built on Dynoxide for the community list.
+title: "Community integration: "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The list in the README and on dynoxide.dev links to integrations built outside the project. Check the [listing criteria](https://github.com/nubo-db/dynoxide/blob/main/CONTRIBUTING.md#listing-a-community-integration) before proposing one. A listing isn't an endorsement or a compatibility guarantee.
+  - type: input
+    id: name
+    attributes:
+      label: Name
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Link
+      description: The repository or package page.
+    validations:
+      required: true
+  - type: input
+    id: ecosystem
+    attributes:
+      label: Ecosystem or language
+      description: e.g. JavaScript / TypeScript, JVM, Python, PHP.
+    validations:
+      required: true
+  - type: input
+    id: description
+    attributes:
+      label: What it does, in one line
+    validations:
+      required: true
+  - type: input
+    id: maintainer
+    attributes:
+      label: Maintainer
+      description: Who maintains it, and the organisation that publishes it if there is one.
+    validations:
+      required: true
+  - type: input
+    id: licence
+    attributes:
+      label: Licence
+      description: e.g. MIT, Apache-2.0.
+    validations:
+      required: true
+  - type: input
+    id: dynoxide-versions
+    attributes:
+      label: Supported Dynoxide versions
+      description: The Dynoxide version range it works with, e.g. ^1.5.0.
+    validations:
+      required: true

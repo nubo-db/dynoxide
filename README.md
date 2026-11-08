@@ -98,6 +98,7 @@ unchanged.
 - [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker
 - [HTTP server](https://github.com/nubo-db/dynoxide/blob/main/docs/http-server.md) - running the DynamoDB-compatible HTTP API
 - [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
+- [Writing a launcher](https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md) - how a wrapper for another language finds, starts and stops the binary
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
 - [Import CLI](https://github.com/nubo-db/dynoxide/blob/main/docs/import.md) - loading data, table filtering, and anonymisation
@@ -116,6 +117,8 @@ These integrations are built and maintained by people outside the project. There
 - [dynoxide-scala-core](https://github.com/Hapag-Lloyd/dynoxide-scala-core) - the build-tool-agnostic library behind sbt-dynoxide, for wiring Dynoxide into other JVM build tools (Hapag-Lloyd, maintained by [Marcin Szałomski](https://github.com/baldram))
 
 Built something on top of Dynoxide? [Propose it for the list](https://github.com/nubo-db/dynoxide/issues/new?template=community-integration.yml).
+
+Wrapping Dynoxide for another language? [Writing a launcher](https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md) covers finding, starting and stopping the binary the same way every other wrapper does.
 
 ## Supported Operations
 

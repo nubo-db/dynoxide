@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mcp` refuses it, because stdio mode already exits when stdin closes. The
   library gains `ServerOptions::with_shutdown_trigger`, which stops the HTTP
   server when a `tokio::sync::watch` channel says so.
+- **`docs/launcher.md` describes how a wrapper for another language finds,
+  verifies, starts and stops Dynoxide**, so wrappers behave alike. It is a
+  draft for now.
 
 ### Changed
 

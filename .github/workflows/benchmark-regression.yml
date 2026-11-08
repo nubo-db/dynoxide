@@ -1,6 +1,21 @@
 name: Benchmark Regression Check
 
-on: [pull_request]
+on:
+  pull_request:
+    # Docs-only PRs skip this workflow. The list is a copy of DOCS_ONLY in
+    # scripts/ci-changed-paths.sh, which ci.yml uses to skip its build and test
+    # jobs; change both together. A path listed here but not there would skip
+    # the benchmarks on a change that could affect them.
+    paths-ignore:
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "AGENTS.md"
+      - "CHANGELOG.md"
+      - "SECURITY.md"
+      - "CODE_OF_CONDUCT.md"
 
 permissions:
   contents: read

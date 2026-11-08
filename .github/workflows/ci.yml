@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
 
@@ -55,6 +57,8 @@ jobs:
   # sorts keys itself so it doesn't depend on that. Its test can only fail with
   # the feature on, so it runs here with it.
   map-key-order:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Map key order (serde_json preserve_order)
     runs-on: ubuntu-latest
     steps:
@@ -77,6 +81,8 @@ jobs:
   # SO_EXCLUSIVEADDRUSE on Windows), so the unit tests need a Windows run;
   # test-build.yml only builds there.
   test-windows:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Test (windows)
     runs-on: windows-latest
 
@@ -99,6 +105,8 @@ jobs:
   # the floor. The toolchain here is read from the manifest rather than pinned
   # literally, so the check and the promise cannot disagree.
   msrv:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: MSRV
     runs-on: ubuntu-latest
 
@@ -215,6 +223,12 @@ jobs:
       - name: Check the release helper scripts can still fail
         run: scripts/release-helpers.test.sh
 
+      # The changes job lets docs-only PRs skip the build and test jobs. If it
+      # ever called a code change "docs", the tests would quietly not run, so
+      # its rules are pinned here, including the cases that only look like docs.
+      - name: Check the changed-paths gate still runs code changes
+        run: scripts/ci-changed-paths.test.sh
+
       # The Trusted Publishing probe passes by reading a refusal from
       # crates.io, which is easy to get wrong in the direction that always
       # says yes. Every answer crates.io can give is replayed against it here,
@@ -234,6 +248,8 @@ jobs:
         run: cargo doc --no-deps --lib
 
   benchmarks-lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Benchmarks lint
     runs-on: ubuntu-latest
 
@@ -269,6 +285,8 @@ jobs:
         run: cargo clippy --all-targets --features iai-callgrind -- -D warnings
 
   benchmark-scripts:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Benchmark script tests
     runs-on: ubuntu-latest
 
@@ -282,6 +300,8 @@ jobs:
         run: python3 -m unittest discover -s benchmarks/scripts -p 'test_*.py' -v
 
   package:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Package
     runs-on: ubuntu-latest
 
@@ -300,6 +320,8 @@ jobs:
         run: cargo package --locked
 
   cargo-deny:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: cargo-deny
     runs-on: ubuntu-latest
 
@@ -310,6 +332,8 @@ jobs:
           command: check
 
   feature-guards:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Feature guard checks
     runs-on: ubuntu-latest
 
@@ -439,6 +463,8 @@ jobs:
           done
 
   wasm-check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: wasm-sqlite build check
     runs-on: ubuntu-latest
 
@@ -469,6 +495,8 @@ jobs:
         run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib -- -D warnings
 
   engine-client:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Engine client tests
     runs-on: ubuntu-latest
 
@@ -493,6 +521,8 @@ jobs:
         run: scripts/check-contract-version.sh
 
   browser-engine:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Browser engine tests (real SQLite-wasm + OPFS)
     runs-on: ubuntu-latest
 
@@ -535,16 +565,18 @@ jobs:
       - name: Run the browser engine tests
         run: npm run test:browser
 
-  # Gate the Docker smoke test on the paths that can actually break the
-  # documented MCP-in-Docker recipe. src/main.rs carries the ServeArgs/McpArgs
-  # flag plumbing and Cargo.{toml,lock} the feature set / rmcp version - both can
-  # break the recipe without touching src/mcp/, so a src/mcp-only gate is too
-  # narrow. Implemented with git diff (no third-party action).
+  # Decides which jobs this PR needs, from its changed files. `docker` gates the
+  # Docker smoke test on the paths that can break the documented MCP-in-Docker
+  # recipe. `code` gates the build and test jobs, and is false only when every
+  # changed file is documentation, so a docs-only PR runs lint and little else.
+  # The rules live in scripts/ci-changed-paths.sh, which lint tests. Implemented
+  # with git diff (no third-party action).
   changes:
-    name: Detect recipe-affecting changes
+    name: Detect what changed
     runs-on: ubuntu-latest
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -556,17 +588,18 @@ jobs:
         run: |
           set -euo pipefail
           # workflow_dispatch has no PR base, and a missing/unreachable base ref
-          # should fail open - run the smoke job rather than skip it silently.
-          if [ -z "${BASE_SHA:-}" ] || ! changed=$(git diff --name-only "$BASE_SHA" HEAD 2>/dev/null); then
+          # should fail open - run everything rather than skip it silently.
+          # --no-renames lists both sides of a rename, so moving a source file
+          # into docs/ still counts as a code change.
+          if [ -z "${BASE_SHA:-}" ] || ! changed=$(git diff --name-only --no-renames "$BASE_SHA" HEAD 2>/dev/null); then
             echo "docker=true" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "Changed files:"; echo "$changed"
-          if echo "$changed" | grep -qE '^(Dockerfile|Cargo\.(toml|lock)|src/main\.rs|src/mcp/|README\.md|\.github/workflows/ci\.yml)'; then
-            echo "docker=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docker=false" >> "$GITHUB_OUTPUT"
-          fi
+          decision=$(printf '%s\n' "$changed" | scripts/ci-changed-paths.sh)
+          echo "Decision:"; echo "$decision"
+          echo "$decision" >> "$GITHUB_OUTPUT"
 
   docker-smoke:
     name: Docker MCP smoke test

@@ -233,8 +233,15 @@ fn the_ready_line_is_the_only_stdout_line_and_names_the_endpoint() {
     );
     // Launchers must not depend on field order, but the documented examples
     // show this one, so the line should match them.
+    let keys = [
+        "event", "schema", "version", "endpoint", "host", "port", "pid",
+    ];
+    let positions: Vec<_> = keys
+        .iter()
+        .map(|k| stdout[0].find(&format!("\"{k}\":")))
+        .collect();
     assert!(
-        stdout[0].starts_with(r#"{"event":"ready","schema":1,"version":"#),
+        positions.iter().all(Option::is_some) && positions.is_sorted(),
         "fields are not in the documented order: {}",
         stdout[0]
     );

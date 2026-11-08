@@ -250,9 +250,9 @@ The line covers the DynamoDB listener only. The arguments above never include
 `--mcp`; if you add it, the MCP listener binds after the line is printed, and a
 failure to bind it shows up later rather than as a startup error.
 
-With `--exit-with-parent`, a server whose stdin is already closed, or isn't a
-pipe at all, prints the ready line and then shuts down straight away, exiting
-`0`. If the process exits soon after a ready line, check that its stdin is a
+With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
+(already closed, `/dev/null`, or a file) prints the ready line and then shuts
+down straight away, exiting `0`. If the process exits soon after a ready line, check that its stdin is a
 pipe you're still holding open.
 
 Treat as errors, never warnings:

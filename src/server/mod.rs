@@ -91,13 +91,56 @@ pub async fn start_with_options(
     if !options.suppresses_informational_messages() {
         eprintln!("Dynoxide listening on http://{local_addr}");
     }
+    if options.prints_ready_line() {
+        print_ready_line(local_addr)?;
+    }
 
     serve_with_shutdown(
         listener,
         db,
-        shutdown_signal(options.suppresses_informational_messages()),
+        shutdown_signal(
+            options.suppresses_informational_messages(),
+            options.shutdown_trigger(),
+        ),
     )
     .await
+}
+
+/// The version of the ready line's shape. Adding a field keeps it; removing,
+/// renaming or changing the meaning of one is a product major and bumps it
+/// (`docs/versioning.md`).
+const READY_LINE_SCHEMA: u32 = 1;
+
+/// The JSON object `--ready-json` prints once the listener is bound.
+///
+/// `host` is the address actually bound. `endpoint` is the URL to hand an
+/// SDK, so a wildcard bind is reported on the loopback address of the same
+/// family: a client can't connect to `0.0.0.0` everywhere.
+fn ready_line(local_addr: SocketAddr) -> serde_json::Value {
+    let reachable = match local_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    serde_json::json!({
+        "event": "ready",
+        "schema": READY_LINE_SCHEMA,
+        "version": crate::PRODUCT_VERSION,
+        "endpoint": format!("http://{}", SocketAddr::new(reachable, local_addr.port())),
+        "host": local_addr.ip().to_string(),
+        "port": local_addr.port(),
+        "pid": std::process::id(),
+    })
+}
+
+/// Write the ready line to stdout and flush it, because a launcher reading a
+/// pipe would otherwise wait on the buffer.
+fn print_ready_line(local_addr: SocketAddr) -> Result<(), String> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", ready_line(local_addr))
+        .and_then(|()| stdout.flush())
+        .map_err(|e| format!("failed to write the ready line: {e}"))
 }
 
 /// Start on a specific listener (for tests).
@@ -248,7 +291,22 @@ async fn handle_fallback() -> Response {
     dynamo_response_raw(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
 }
 
-async fn shutdown_signal(suppress_informational_messages: bool) {
+async fn shutdown_signal(
+    suppress_informational_messages: bool,
+    trigger: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let triggered = async move {
+        match trigger {
+            // An error means the sender went away without firing, which is
+            // not a request to stop.
+            Some(mut rx) => {
+                if rx.wait_for(|fired| *fired).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -257,13 +315,15 @@ async fn shutdown_signal(suppress_informational_messages: bool) {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = sigterm.recv() => {},
+            () = triggered => {},
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install CTRL+C handler");
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r.expect("failed to install CTRL+C handler"),
+            () = triggered => {},
+        }
     }
     if !suppress_informational_messages {
         eprintln!("\nShutting down...");

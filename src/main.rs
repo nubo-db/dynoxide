@@ -66,10 +66,30 @@ struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     log: Option<LogMode>,
 
+    /// Print one JSON line to stdout once the server is ready, and send log
+    /// output to stderr, for launchers that start Dynoxide (see docs/launcher.md)
+    #[arg(long)]
+    ready_json: bool,
+
     /// Schema file (JSON with DescribeTable responses): scaffolds empty tables on startup
     #[cfg(feature = "import")]
     #[arg(long, value_name = "PATH")]
     schema: Option<PathBuf>,
+}
+
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+impl Cli {
+    /// Whether this invocation prints the ready line, which reserves stdout
+    /// for it.
+    fn wants_ready_line(&self) -> bool {
+        match &self.command {
+            #[cfg(feature = "http-server")]
+            None => self.ready_json,
+            #[cfg(feature = "http-server")]
+            Some(Commands::Serve(args)) => args.ready_json,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -113,6 +133,11 @@ struct ServeArgs {
     /// Logging mode
     #[arg(long, value_enum, value_name = "MODE")]
     log: Option<LogMode>,
+
+    /// Print one JSON line to stdout once the server is ready, and send log
+    /// output to stderr, for launchers that start Dynoxide (see docs/launcher.md)
+    #[arg(long)]
+    ready_json: bool,
 
     /// Also start MCP server over Streamable HTTP (for Claude Code integration)
     #[cfg(feature = "mcp-server")]
@@ -201,6 +226,10 @@ struct McpArgs {
     /// Use Streamable HTTP transport instead of stdio
     #[arg(long)]
     http: bool,
+
+    /// Accepted only to refuse it with an explanation (see `run_mcp`)
+    #[arg(long, hide = true)]
+    ready_json: bool,
 
     /// Host to bind the HTTP transport to (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1", requires = "http")]
@@ -389,11 +418,22 @@ compile_error!(
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Parsed before the log subscriber is installed, because `--ready-json`
+    // decides which stream the log goes to.
+    let cli = Cli::parse();
+    if cli.wants_ready_line() {
+        // stdout is reserved for the ready line.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .init();
+    }
 
-    if let Err(e) = run().await {
+    if let Err(e) = run(cli).await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -413,9 +453,7 @@ fn main() {
 }
 
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         #[cfg(feature = "http-server")]
         Some(Commands::Serve(args)) => run_serve(args).await,
@@ -438,6 +476,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 db_path: cli.db_path,
                 encryption_key_file: cli.encryption_key_file,
                 log: cli.log,
+                ready_json: cli.ready_json,
                 #[cfg(feature = "mcp-server")]
                 mcp: false,
                 #[cfg(feature = "mcp-server")]
@@ -538,7 +577,10 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let server_options = server_options(args.log);
+    let mut server_options = server_options(args.log);
+    if args.ready_json {
+        server_options = server_options.with_ready_line();
+    }
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {
@@ -909,6 +951,15 @@ fn resolve_mcp_http_options(
 
 #[cfg(feature = "mcp-server")]
 async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.ready_json {
+        return Err(
+            "`dynoxide mcp` does not take --ready-json: in stdio mode its stdout \
+             carries the MCP protocol. Use `dynoxide serve --ready-json` (with --mcp \
+             for the MCP HTTP transport) instead."
+                .into(),
+        );
+    }
+
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
 

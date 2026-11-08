@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--ready-json` prints one JSON line to stdout once the server is ready**,
+  so a launcher in another language can read the endpoint, port and process ID
+  without parsing the human startup line. With the flag, stdout carries only
+  that line and log output moves to stderr. It works on `serve` and the
+  no-subcommand form, and `dynoxide mcp` refuses it. The line's fields and how
+  they may change are in `docs/versioning.md`. The library gains
+  `ServerOptions::with_ready_line`.
+
 ### Changed
 
 - **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB

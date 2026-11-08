@@ -231,6 +231,13 @@ fn the_ready_line_is_the_only_stdout_line_and_names_the_endpoint() {
         1,
         "stdout carried more than the ready line: {stdout:?}"
     );
+    // Launchers must not depend on field order, but the documented examples
+    // show this one, so the line should match them.
+    assert!(
+        stdout[0].starts_with(r#"{"event":"ready","schema":1,"version":"#),
+        "fields are not in the documented order: {}",
+        stdout[0]
+    );
 }
 
 #[test]
@@ -298,11 +305,14 @@ fn without_the_flag_there_is_no_ready_line_and_logging_stays_on_stdout() {
 
 #[test]
 fn the_ready_line_still_prints_under_quiet_logging() {
-    let server = Launched::spawn(
+    let mut server = Launched::spawn(
         serve(&["--port", "0", "--ready-json", "--log", "quiet"]),
         Stdio::piped(),
     );
     assert_eq!(server.ready_line()["event"], "ready");
+    // Collect everything stderr carried before looking for what shouldn't be
+    // there, or the check could run before the line had been read.
+    server.finish();
     assert!(
         !server.stderr_text().contains("Dynoxide listening"),
         "quiet still printed the startup line:\n{}",
@@ -399,24 +409,6 @@ fn the_ready_line_reports_the_product_version() {
     assert_eq!(server.ready_line()["version"], product_version());
 }
 
-#[cfg(feature = "mcp-server")]
-#[test]
-fn the_stdio_mcp_server_refuses_the_ready_line() {
-    let out = dynoxide()
-        .args(["mcp", "--ready-json"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("stdio"), "stderr: {stderr}");
-    assert!(
-        out.stdout.is_empty(),
-        "stdout: {:?}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-}
-
 // --- Shutting down when stdin closes --------------------------------------
 
 /// How long a server is given to shut down once asked.
@@ -452,20 +444,22 @@ fn the_server_exits_when_its_launcher_is_killed() {
     // The launcher is killed outright, so no shutdown code of its own runs.
     // The only thing that can tell the server is the operating system closing
     // the launcher's end of the stdin pipe.
-    let mut launcher = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "stand_in_launcher", "--nocapture"])
-        .env(LAUNCHER_ENV, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the stand-in launcher");
+    let mut launcher = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "stand_in_launcher", "--nocapture"])
+            .env(LAUNCHER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in launcher"),
+    );
 
     // The server shares this pipe with the launcher, so it reaches end-of-file
     // only once both have exited. The test harness prints its own lines on it
     // too, so look for the one that parses as the ready line.
     let (tx, lines) = channel();
-    let stdout = launcher.stdout.take().unwrap();
+    let stdout = launcher.0.stdout.take().unwrap();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -475,20 +469,25 @@ fn the_server_exits_when_its_launcher_is_killed() {
         }
     });
     let deadline = Instant::now() + READY_TIMEOUT;
-    let endpoint = loop {
+    // The server is stopped by its pid if the test fails with it still
+    // running, since this test has no handle to it.
+    let (endpoint, server) = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = lines.recv_timeout(remaining).unwrap_or_else(|e| {
-            let _ = launcher.kill();
-            panic!("no ready line from the server ({e:?})")
-        });
+        let line = lines
+            .recv_timeout(remaining)
+            .unwrap_or_else(|e| panic!("no ready line from the server ({e:?})"));
         if let Ok(ready) = serde_json::from_str::<serde_json::Value>(&line) {
-            break ready["endpoint"].as_str().unwrap().to_owned();
+            let pid = ready["pid"].as_u64().unwrap() as u32;
+            break (
+                ready["endpoint"].as_str().unwrap().to_owned(),
+                KillPidOnDrop(pid),
+            );
         }
     };
     assert_eq!(list_tables(&endpoint).0, 200);
 
-    launcher.kill().unwrap();
-    launcher.wait().unwrap();
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
 
     let deadline = Instant::now() + STOP_TIMEOUT;
     loop {
@@ -506,6 +505,33 @@ fn the_server_exits_when_its_launcher_is_killed() {
         TcpStream::connect(authority).is_err(),
         "something still answers on {authority}"
     );
+    // It exited on its own, so there's nothing left to stop, and its pid may
+    // already belong to something else.
+    std::mem::forget(server);
+}
+
+/// Kills a child this test spawned, if the test ends with it still running.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Kills a process by id when the test has no handle to it: the server a
+/// stand-in launcher started, if the test fails before it has exited.
+struct KillPidOnDrop(u32);
+
+impl Drop for KillPidOnDrop {
+    fn drop(&mut self) {
+        let pid = self.0.to_string();
+        #[cfg(unix)]
+        let _ = Command::new("kill").args(["-9", &pid]).status();
+        #[cfg(windows)]
+        let _ = Command::new("taskkill").args(["/F", "/PID", &pid]).status();
+    }
 }
 
 #[test]
@@ -701,15 +727,58 @@ fn closing_stdin_stops_the_mcp_listener_too() {
     assert!(status.success(), "exit status {status}");
 }
 
+// --- The MCP server -------------------------------------------------------
+
+/// Run `dynoxide mcp` with `args` and check it refuses `flag`, naming the
+/// flag and the reason `reason`, with the exit code of a run-time refusal and
+/// nothing on stdout.
 #[cfg(feature = "mcp-server")]
-#[test]
-fn the_stdio_mcp_server_refuses_exit_with_parent() {
+fn assert_mcp_refuses(args: &[&str], flag: &str, reason: &str) {
     let out = dynoxide()
-        .args(["mcp", "--exit-with-parent"])
+        .arg("mcp")
+        .args(args)
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("stdio"), "stderr: {stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "dynoxide mcp {args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains(flag),
+        "the refusal doesn't name {flag}: {stderr}"
+    );
+    assert!(
+        stderr.contains(reason),
+        "the refusal doesn't say {reason:?}: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[cfg(feature = "mcp-server")]
+#[test]
+fn the_stdio_mcp_server_refuses_the_launcher_flags() {
+    assert_mcp_refuses(&["--ready-json"], "--ready-json", "stdio");
+    assert_mcp_refuses(&["--exit-with-parent"], "--exit-with-parent", "stdio");
+}
+
+#[cfg(feature = "mcp-server")]
+#[test]
+fn the_mcp_http_transport_refuses_the_launcher_flags_and_points_to_serve() {
+    assert_mcp_refuses(
+        &["--http", "--port", "0", "--ready-json"],
+        "--ready-json",
+        "dynoxide serve --mcp",
+    );
+    assert_mcp_refuses(
+        &["--http", "--port", "0", "--exit-with-parent"],
+        "--exit-with-parent",
+        "dynoxide serve --mcp",
+    );
 }

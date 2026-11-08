@@ -116,21 +116,34 @@ const READY_LINE_SCHEMA: u32 = 1;
 /// `host` is the address actually bound. `endpoint` is the URL to hand an
 /// SDK, so a wildcard bind is reported on the loopback address of the same
 /// family: a client can't connect to `0.0.0.0` everywhere.
-fn ready_line(local_addr: SocketAddr) -> serde_json::Value {
+fn ready_line(local_addr: SocketAddr) -> ReadyLine {
     let reachable = match local_addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
         ip => ip,
     };
-    serde_json::json!({
-        "event": "ready",
-        "schema": READY_LINE_SCHEMA,
-        "version": crate::PRODUCT_VERSION,
-        "endpoint": format!("http://{}", SocketAddr::new(reachable, local_addr.port())),
-        "host": local_addr.ip().to_string(),
-        "port": local_addr.port(),
-        "pid": std::process::id(),
-    })
+    ReadyLine {
+        event: "ready",
+        schema: READY_LINE_SCHEMA,
+        version: crate::PRODUCT_VERSION,
+        endpoint: format!("http://{}", SocketAddr::new(reachable, local_addr.port())),
+        host: local_addr.ip().to_string(),
+        port: local_addr.port(),
+        pid: std::process::id(),
+    }
+}
+
+/// The ready line's fields, in the order the documentation shows them. A
+/// struct rather than `json!`, which sorts its keys.
+#[derive(serde::Serialize)]
+struct ReadyLine {
+    event: &'static str,
+    schema: u32,
+    version: &'static str,
+    endpoint: String,
+    host: String,
+    port: u16,
+    pid: u32,
 }
 
 /// Write the ready line to stdout and flush it, because a launcher reading a
@@ -138,7 +151,9 @@ fn ready_line(local_addr: SocketAddr) -> serde_json::Value {
 fn print_ready_line(local_addr: SocketAddr) -> Result<(), String> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{}", ready_line(local_addr))
+    let line = serde_json::to_string(&ready_line(local_addr))
+        .map_err(|e| format!("failed to encode the ready line: {e}"))?;
+    writeln!(stdout, "{line}")
         .and_then(|()| stdout.flush())
         .map_err(|e| format!("failed to write the ready line: {e}"))
 }

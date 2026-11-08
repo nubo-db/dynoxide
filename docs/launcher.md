@@ -9,7 +9,7 @@ endpoint and stop it again, including when the test runner is killed. This
 page says how, so every wrapper gets those details right in the same way and a
 developer moving between languages sees the same behaviour.
 
-It is a draft until the npm package implements it and the PHP behaviour below
+It is a draft until a published wrapper implements it and the behaviour below
 has been checked in practice. Until then the rules can still change, and
 feedback is welcome as an issue on the repository.
 `docs/versioning.md` covers what the engine itself promises.
@@ -62,6 +62,11 @@ contract needs, the binary doesn't know `--ready-json` or `--exit-with-parent`.
 Start it without both, wait for the stderr line `Dynoxide listening on
 http://<host>:<port>` and then for `GET /` to answer `200`, and stop it with
 the procedure for servers started without `--exit-with-parent`.
+
+That fallback needs 1.6.0 or later. Earlier versions print the port you asked
+for rather than the one they bound, so under `--port 0` the line says `:0`.
+Refuse anything older with an error that names the version found and the
+version needed.
 
 ## The cache
 
@@ -232,12 +237,23 @@ once the server is listening:
 
 Read the fields you need and ignore the rest. New fields can arrive in any
 minor release, and anything that removes or changes a field bumps `schema`.
+Parse the line as JSON rather than matching its text: field order isn't part
+of the contract.
 
 The line means requests will be served: the database is open and any
 `--schema` tables exist before it's printed, so send the first request
 straight away. With the flag, stdout carries nothing but this line. Logging,
 however `RUST_LOG` is set, goes to stderr. Anything else on stdout is a bug to
 report.
+
+The line covers the DynamoDB listener only. The arguments above never include
+`--mcp`; if you add it, the MCP listener binds after the line is printed, and a
+failure to bind it shows up later rather than as a startup error.
+
+With `--exit-with-parent`, a server whose stdin is already closed, or isn't a
+pipe at all, prints the ready line and then shuts down straight away, exiting
+`0`. If the process exits soon after a ready line, check that its stdin is a
+pipe you're still holding open.
 
 Treat as errors, never warnings:
 
@@ -311,7 +327,10 @@ Started with `--exit-with-parent`:
 1. Close the server's stdin. It shuts down cleanly and exits `0`, on Windows
    too.
 2. Wait up to 5 seconds.
-3. On Linux and macOS, send SIGTERM and wait up to another 5 seconds.
+3. On Linux and macOS, send SIGTERM and wait up to another 5 seconds. A
+   shutdown that closing stdin has already started, and that is waiting on a
+   request that never finishes, won't be hurried by SIGTERM. That's what step
+   4 is for.
 4. Kill it.
 
 Started without it, for a binary older than this contract:

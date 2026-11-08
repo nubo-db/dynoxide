@@ -67,7 +67,8 @@ struct Cli {
     log: Option<LogMode>,
 
     /// Print one JSON line to stdout once the server is ready, and send log
-    /// output to stderr, for launchers that start Dynoxide (see docs/launcher.md)
+    /// output to stderr, for launchers that start Dynoxide. See
+    /// https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md
     #[arg(long)]
     ready_json: bool,
 
@@ -140,7 +141,8 @@ struct ServeArgs {
     log: Option<LogMode>,
 
     /// Print one JSON line to stdout once the server is ready, and send log
-    /// output to stderr, for launchers that start Dynoxide (see docs/launcher.md)
+    /// output to stderr, for launchers that start Dynoxide. See
+    /// https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md
     #[arg(long)]
     ready_json: bool,
 
@@ -999,23 +1001,33 @@ fn resolve_mcp_http_options(
     })
 }
 
+/// Why `dynoxide mcp` turns down a launcher flag. The flags belong to the
+/// DynamoDB HTTP server, which `dynoxide mcp` doesn't start.
+#[cfg(feature = "mcp-server")]
+fn refuse_launcher_flag_on_mcp(flag: &str, http: bool) -> String {
+    if http {
+        format!(
+            "`dynoxide mcp --http` does not take {flag}: it applies to the DynamoDB \
+             HTTP server. Use `dynoxide serve --mcp {flag}` to run both."
+        )
+    } else {
+        format!(
+            "`dynoxide mcp` does not take {flag}: in stdio mode, stdin and stdout \
+             carry the MCP protocol, and the server already exits when stdin closes. \
+             Use `dynoxide serve {flag}` for the DynamoDB HTTP server."
+        )
+    }
+}
+
 #[cfg(feature = "mcp-server")]
 async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if args.ready_json {
-        return Err(
-            "`dynoxide mcp` does not take --ready-json: in stdio mode its stdout \
-             carries the MCP protocol. Use `dynoxide serve --ready-json` (with --mcp \
-             for the MCP HTTP transport) instead."
-                .into(),
-        );
-    }
-    if args.exit_with_parent {
-        return Err(
-            "`dynoxide mcp` does not take --exit-with-parent: in stdio mode it \
-             already exits when stdin closes, because stdin is its transport. Use \
-             `dynoxide serve --exit-with-parent` for the HTTP server."
-                .into(),
-        );
+    for (given, flag) in [
+        (args.ready_json, "--ready-json"),
+        (args.exit_with_parent, "--exit-with-parent"),
+    ] {
+        if given {
+            return Err(refuse_launcher_flag_on_mcp(flag, args.http).into());
+        }
     }
 
     #[cfg(not(feature = "encryption"))]
@@ -1457,6 +1469,8 @@ mod tests {
                 vec!["dynoxide", "--port", "8893", "serve"],
                 vec!["dynoxide", "--host", "0.0.0.0", "serve"],
                 vec!["dynoxide", "--encryption-key-file", "key.hex", "serve"],
+                vec!["dynoxide", "--ready-json", "serve"],
+                vec!["dynoxide", "--exit-with-parent", "serve"],
             ] {
                 assert!(
                     Cli::try_parse_from(&argv).is_err(),

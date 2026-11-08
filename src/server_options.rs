@@ -11,8 +11,21 @@
 pub struct ServerOptions {
     suppress_informational_messages: bool,
     ready_line: bool,
-    shutdown_trigger: Option<tokio::sync::watch::Receiver<bool>>,
+    shutdown_trigger: Option<ShutdownTrigger>,
 }
+
+/// The receiving end of a shutdown request.
+///
+/// A wrapper rather than the bare receiver so `ServerOptions` keeps the
+/// unwind-safety auto traits it has always had: the receiver's shared state
+/// holds an `UnsafeCell`, which opts it out of both. Asserting them back is
+/// sound because nothing here can be left half-updated by a panic: the only
+/// shared value is the `bool` the sender writes, which is read whole.
+#[derive(Debug, Clone)]
+struct ShutdownTrigger(tokio::sync::watch::Receiver<bool>);
+
+impl std::panic::UnwindSafe for ShutdownTrigger {}
+impl std::panic::RefUnwindSafe for ShutdownTrigger {}
 
 impl ServerOptions {
     /// Suppress informational server output: the listening lines and the
@@ -39,7 +52,7 @@ impl ServerOptions {
     /// dropped without sending `true` never fires. The MCP transport ignores
     /// this option.
     pub fn with_shutdown_trigger(mut self, trigger: tokio::sync::watch::Receiver<bool>) -> Self {
-        self.shutdown_trigger = Some(trigger);
+        self.shutdown_trigger = Some(ShutdownTrigger(trigger));
         self
     }
 
@@ -54,6 +67,17 @@ impl ServerOptions {
 
     #[cfg_attr(not(feature = "http-server"), allow(dead_code))]
     pub(crate) fn shutdown_trigger(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.shutdown_trigger.clone()
+        self.shutdown_trigger.as_ref().map(|t| t.0.clone())
     }
 }
+
+// `ServerOptions` is public, so the auto traits it had before are part of the
+// crate's API. Losing one is a breaking change even when only methods are
+// added, and nothing else in the build would notice.
+const _: () = {
+    fn assert_auto_traits<
+        T: Send + Sync + Unpin + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+    >() {
+    }
+    let _ = assert_auto_traits::<ServerOptions>;
+};

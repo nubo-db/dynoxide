@@ -157,6 +157,12 @@ impl Drop for Launched {
 /// POST a `ListTables` to `endpoint` (`http://host:port`) and return the
 /// status code and body.
 fn list_tables(endpoint: &str) -> (u16, String) {
+    dynamo(endpoint, "ListTables", "{}")
+}
+
+/// POST one DynamoDB operation to `endpoint` (`http://host:port`) and return
+/// the status code and body.
+fn dynamo(endpoint: &str, operation: &str, body: &str) -> (u16, String) {
     let authority = endpoint
         .strip_prefix("http://")
         .unwrap_or_else(|| panic!("endpoint is not http://: {endpoint}"));
@@ -165,10 +171,9 @@ fn list_tables(endpoint: &str) -> (u16, String) {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let body = "{}";
     let request = format!(
         "POST / HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/x-amz-json-1.0\r\n\
-         X-Amz-Target: DynamoDB_20120810.ListTables\r\nX-Amz-Date: 20260101T000000Z\r\n\
+         X-Amz-Target: DynamoDB_20120810.{operation}\r\nX-Amz-Date: 20260101T000000Z\r\n\
          Authorization: {AUTHORIZATION}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -410,4 +415,301 @@ fn the_stdio_mcp_server_refuses_the_ready_line() {
         "stdout: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+// --- Shutting down when stdin closes --------------------------------------
+
+/// How long a server is given to shut down once asked.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set on the copy of this test binary that stands in for a launcher.
+const LAUNCHER_ENV: &str = "DYNOXIDE_TEST_STAND_IN_LAUNCHER";
+
+/// Not a test of its own. With `LAUNCHER_ENV` set, this process plays a
+/// launcher: it starts a server with its stdin on a pipe this process holds,
+/// hands the server its own stdout, and waits to be killed. Without the
+/// variable, which is every normal run, it returns at once.
+#[test]
+fn stand_in_launcher() {
+    if std::env::var_os(LAUNCHER_ENV).is_none() {
+        return;
+    }
+    let mut server = dynoxide()
+        .args(["serve", "--port", "0", "--ready-json", "--exit-with-parent"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dynoxide");
+    // Taken out so `wait` can't close it: only this process dying closes the
+    // pipe, and the server runs until then, so the wait never returns.
+    let _stdin = server.stdin.take();
+    let _ = server.wait();
+}
+
+#[test]
+fn the_server_exits_when_its_launcher_is_killed() {
+    // The launcher is killed outright, so no shutdown code of its own runs.
+    // The only thing that can tell the server is the operating system closing
+    // the launcher's end of the stdin pipe.
+    let mut launcher = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "stand_in_launcher", "--nocapture"])
+        .env(LAUNCHER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the stand-in launcher");
+
+    // The server shares this pipe with the launcher, so it reaches end-of-file
+    // only once both have exited. The test harness prints its own lines on it
+    // too, so look for the one that parses as the ready line.
+    let (tx, lines) = channel();
+    let stdout = launcher.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let endpoint = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = lines.recv_timeout(remaining).unwrap_or_else(|e| {
+            let _ = launcher.kill();
+            panic!("no ready line from the server ({e:?})")
+        });
+        if let Ok(ready) = serde_json::from_str::<serde_json::Value>(&line) {
+            break ready["endpoint"].as_str().unwrap().to_owned();
+        }
+    };
+    assert_eq!(list_tables(&endpoint).0, 200);
+
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(remaining) {
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the server was still running {STOP_TIMEOUT:?} after its launcher died")
+            }
+        }
+    }
+    let authority = endpoint.strip_prefix("http://").unwrap();
+    assert!(
+        TcpStream::connect(authority).is_err(),
+        "something still answers on {authority}"
+    );
+}
+
+#[test]
+fn closing_stdin_shuts_the_server_down_cleanly() {
+    let mut server = Launched::spawn(
+        serve(&["--port", "0", "--ready-json", "--exit-with-parent"]),
+        Stdio::piped(),
+    );
+    server.ready_line();
+    drop(server.child.stdin.take());
+
+    let status = server
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the server kept running after stdin closed");
+    assert!(status.success(), "exit status {status}");
+    server.finish();
+    assert!(
+        server.stderr_text().contains("Shutting down"),
+        "no shutdown line:\n{}",
+        server.stderr_text()
+    );
+}
+
+#[test]
+fn closing_stdin_under_quiet_logging_prints_no_shutdown_line() {
+    let mut server = Launched::spawn(
+        serve(&[
+            "--port",
+            "0",
+            "--ready-json",
+            "--exit-with-parent",
+            "--log",
+            "quiet",
+        ]),
+        Stdio::piped(),
+    );
+    server.ready_line();
+    drop(server.child.stdin.take());
+
+    let status = server
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the server kept running after stdin closed");
+    assert!(status.success(), "exit status {status}");
+    server.finish();
+    assert!(
+        !server.stderr_text().contains("Shutting down"),
+        "quiet printed the shutdown line:\n{}",
+        server.stderr_text()
+    );
+}
+
+#[test]
+fn the_server_keeps_serving_while_stdin_stays_open() {
+    let mut server = Launched::spawn(
+        serve(&["--port", "0", "--ready-json", "--exit-with-parent"]),
+        Stdio::piped(),
+    );
+    let line = server.ready_line();
+    // Anything a launcher writes is read and thrown away.
+    server
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"ignored\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        server.child.try_wait().unwrap().is_none(),
+        "the server exited"
+    );
+    assert_eq!(list_tables(line["endpoint"].as_str().unwrap()).0, 200);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_server_while_stdin_is_still_open() {
+    // The stdin reader must not hold shutdown up. A launcher that keeps the
+    // pipe open and stops the server with SIGTERM has to see it exit.
+    let mut server = Launched::spawn(
+        serve(&["--port", "0", "--ready-json", "--exit-with-parent"]),
+        Stdio::piped(),
+    );
+    server.ready_line();
+    let status = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let status = server
+        .wait_exit(STOP_TIMEOUT)
+        .expect("SIGTERM did not stop the server while its stdin was open");
+    assert!(status.success(), "exit status {status}");
+}
+
+#[test]
+fn writes_survive_a_shutdown_through_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("data.db");
+    let db = db.to_str().unwrap();
+    let args = [
+        "--port",
+        "0",
+        "--ready-json",
+        "--exit-with-parent",
+        "--db-path",
+        db,
+    ];
+
+    let mut first = Launched::spawn(serve(&args), Stdio::piped());
+    let endpoint = first.ready_line()["endpoint"].as_str().unwrap().to_owned();
+    let create = r#"{"TableName":"Kept","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+    assert_eq!(dynamo(&endpoint, "CreateTable", create).0, 200);
+    let put = r#"{"TableName":"Kept","Item":{"pk":{"S":"one"}}}"#;
+    assert_eq!(dynamo(&endpoint, "PutItem", put).0, 200);
+    drop(first.child.stdin.take());
+    let status = first
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the first server kept running");
+    assert!(status.success());
+    first.finish();
+
+    let second = Launched::spawn(serve(&args), Stdio::piped());
+    let endpoint = second.ready_line()["endpoint"].as_str().unwrap().to_owned();
+    let get = r#"{"TableName":"Kept","Key":{"pk":{"S":"one"}}}"#;
+    let (status, body) = dynamo(&endpoint, "GetItem", get);
+    assert_eq!(status, 200);
+    assert!(body.contains("\"one\""), "the item was lost: {body}");
+}
+
+#[test]
+fn a_server_started_with_stdin_already_closed_stops_at_once() {
+    // Passing the flag with no stdin is a launcher bug, and it shows up as a
+    // server that stops as soon as it starts, rather than as a hang.
+    let mut server = Launched::spawn(
+        serve(&["--port", "0", "--ready-json", "--exit-with-parent"]),
+        Stdio::null(),
+    );
+    let status = server
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the server kept running with stdin closed");
+    assert!(status.success(), "exit status {status}");
+}
+
+#[test]
+fn without_the_flag_a_closed_stdin_changes_nothing() {
+    let mut server = Launched::spawn(serve(&["--port", "0", "--ready-json"]), Stdio::null());
+    let line = server.ready_line();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        server.child.try_wait().unwrap().is_none(),
+        "the server exited"
+    );
+    assert_eq!(list_tables(line["endpoint"].as_str().unwrap()).0, 200);
+}
+
+#[test]
+fn the_no_subcommand_form_exits_when_stdin_closes() {
+    let mut command = dynoxide();
+    command.args(["--port", "0", "--ready-json", "--exit-with-parent"]);
+    let mut server = Launched::spawn(command, Stdio::piped());
+    server.ready_line();
+    drop(server.child.stdin.take());
+    let status = server
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the server kept running after stdin closed");
+    assert!(status.success(), "exit status {status}");
+}
+
+#[cfg(feature = "mcp-server")]
+#[test]
+fn closing_stdin_stops_the_mcp_listener_too() {
+    let mut server = Launched::spawn(
+        serve(&[
+            "--port",
+            "0",
+            "--ready-json",
+            "--exit-with-parent",
+            "--mcp",
+            "--mcp-port",
+            "0",
+            "--mcp-no-auth",
+        ]),
+        Stdio::piped(),
+    );
+    server.ready_line();
+    server.wait_for_stderr("MCP HTTP server listening on");
+    drop(server.child.stdin.take());
+    let status = server
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the servers kept running after stdin closed");
+    assert!(status.success(), "exit status {status}");
+}
+
+#[cfg(feature = "mcp-server")]
+#[test]
+fn the_stdio_mcp_server_refuses_exit_with_parent() {
+    let out = dynoxide()
+        .args(["mcp", "--exit-with-parent"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("stdio"), "stderr: {stderr}");
 }

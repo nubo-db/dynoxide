@@ -99,6 +99,14 @@ jobs:
       - name: Test the embedded server's shutdown
         run: cargo test --test graceful_shutdown
 
+      # Closing stdin is the only graceful stop a launcher has on Windows, so
+      # it is tested here as well as on Unix. One test at a time: a process
+      # spawned on Windows can pick up handles another thread is passing to
+      # its own child, and a stray copy of the server's stdin pipe would keep
+      # it open after the launcher has gone.
+      - name: Test the launcher contract
+        run: cargo test --test launcher_contract -- --test-threads=1
+
   # `rust-version` is part of the published Rust API contract in
   # docs/versioning.md, so it is a promise rather than a description. Every
   # other job runs on stable, which cannot see a language feature that raises

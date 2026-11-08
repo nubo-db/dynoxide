@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-subcommand form, and `dynoxide mcp` refuses it. The line's fields and how
   they may change are in `docs/versioning.md`. The library gains
   `ServerOptions::with_ready_line`.
+- **`--exit-with-parent` shuts the server down gracefully when stdin closes**,
+  so a server started by a test runner stops when the runner exits, even if
+  the runner is killed outright. Closing stdin is also a graceful way to stop
+  the server on Windows, where there is no SIGTERM. Only pass it with stdin on
+  a pipe: with stdin closed, the server stops as soon as it starts. `dynoxide
+  mcp` refuses it, because stdio mode already exits when stdin closes. The
+  library gains `ServerOptions::with_shutdown_trigger`, which stops the HTTP
+  server when a `tokio::sync::watch` channel says so.
 
 ### Changed
 

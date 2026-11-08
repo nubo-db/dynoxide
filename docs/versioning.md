@@ -26,7 +26,7 @@ finished.
 | Contract | Surface | Stream |
 |---|---|---|
 | Rust API | Public types, traits, signatures, feature flags, MSRV | Crate |
-| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` and `Server` headers, container entrypoint and port, the `GET /` health response, the startup line and the `--ready-json` ready line | Product |
+| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` and `Server` headers, container entrypoint and port, the `GET /` health response, the startup line, the `--ready-json` ready line, `--exit-with-parent` and the `--version` output | Product |
 | Browser JS API | The Worker client API and message protocol | Product |
 | Engine behaviour | How the engine answers, across every surface above | Both |
 
@@ -113,8 +113,19 @@ release, so read the fields you need and ignore the rest. Removing or renaming
 a field, or changing what one means, bumps `schema` and is a product major.
 Without the flag nothing changes: no line, and tracing stays on stdout.
 
-`tests/launcher_contract.rs` holds this, and `docs/launcher.md` describes the
-rest of what a launcher does.
+`--exit-with-parent` makes the server treat stdin closing as a request to
+stop: it shuts down the way it does on SIGTERM and exits `0`. A launcher keeps
+stdin on a pipe it holds, so the server stops when the launcher closes the
+pipe or dies, on Windows as well as Unix. With stdin closed or at `/dev/null`
+the server stops as soon as it starts, so only pass the flag with a pipe
+attached. Without the flag, stdin is ignored, as before.
+
+A launcher handed a binary of unknown version reads `dynoxide --version`, which
+prints `dynoxide <product version>` on one line. That format is part of this
+contract too.
+
+`tests/launcher_contract.rs` holds all three, and `docs/launcher.md` describes
+the rest of what a launcher does.
 
 ## The storage backend seam
 

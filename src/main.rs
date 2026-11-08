@@ -71,6 +71,11 @@ struct Cli {
     #[arg(long)]
     ready_json: bool,
 
+    /// Shut down gracefully when stdin closes, so the server stops with the
+    /// process that started it. Don't pass it with stdin closed or at /dev/null
+    #[arg(long)]
+    exit_with_parent: bool,
+
     /// Schema file (JSON with DescribeTable responses): scaffolds empty tables on startup
     #[cfg(feature = "import")]
     #[arg(long, value_name = "PATH")]
@@ -138,6 +143,11 @@ struct ServeArgs {
     /// output to stderr, for launchers that start Dynoxide (see docs/launcher.md)
     #[arg(long)]
     ready_json: bool,
+
+    /// Shut down gracefully when stdin closes, so the server stops with the
+    /// process that started it. Don't pass it with stdin closed or at /dev/null
+    #[arg(long)]
+    exit_with_parent: bool,
 
     /// Also start MCP server over Streamable HTTP (for Claude Code integration)
     #[cfg(feature = "mcp-server")]
@@ -230,6 +240,10 @@ struct McpArgs {
     /// Accepted only to refuse it with an explanation (see `run_mcp`)
     #[arg(long, hide = true)]
     ready_json: bool,
+
+    /// Accepted only to refuse it with an explanation (see `run_mcp`)
+    #[arg(long, hide = true)]
+    exit_with_parent: bool,
 
     /// Host to bind the HTTP transport to (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1", requires = "http")]
@@ -477,6 +491,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 encryption_key_file: cli.encryption_key_file,
                 log: cli.log,
                 ready_json: cli.ready_json,
+                exit_with_parent: cli.exit_with_parent,
                 #[cfg(feature = "mcp-server")]
                 mcp: false,
                 #[cfg(feature = "mcp-server")]
@@ -581,6 +596,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.ready_json {
         server_options = server_options.with_ready_line();
     }
+    if args.exit_with_parent {
+        server_options = server_options.with_shutdown_trigger(watch_stdin_for_eof());
+    }
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {
@@ -636,6 +654,38 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
     Ok(())
+}
+
+/// Read stdin until it closes, on a thread of its own, and return a trigger
+/// that fires then.
+///
+/// A plain thread rather than `tokio::io::stdin`: tokio reads stdin with a
+/// blocking read it can't cancel, which can hold up runtime shutdown until
+/// stdin closes, so a SIGTERM would hang while the pipe is still open. The
+/// process doesn't wait for this thread when `main` returns.
+#[cfg(feature = "http-server")]
+fn watch_stdin_for_eof() -> tokio::sync::watch::Receiver<bool> {
+    use std::io::{ErrorKind, Read};
+
+    let (closed, trigger) = tokio::sync::watch::channel(false);
+    std::thread::Builder::new()
+        .name("stdin-watch".into())
+        .spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut discard = [0u8; 1024];
+            loop {
+                match stdin.read(&mut discard) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    // Any other error means nothing more will arrive.
+                    Err(_) => break,
+                }
+            }
+            let _ = closed.send(true);
+        })
+        .expect("failed to start the stdin watcher thread");
+    trigger
 }
 
 /// Whether `--log` asks for quiet mode, for the lines this binary prints
@@ -956,6 +1006,14 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
             "`dynoxide mcp` does not take --ready-json: in stdio mode its stdout \
              carries the MCP protocol. Use `dynoxide serve --ready-json` (with --mcp \
              for the MCP HTTP transport) instead."
+                .into(),
+        );
+    }
+    if args.exit_with_parent {
+        return Err(
+            "`dynoxide mcp` does not take --exit-with-parent: in stdio mode it \
+             already exits when stdin closes, because stdin is its transport. Use \
+             `dynoxide serve --exit-with-parent` for the HTTP server."
                 .into(),
         );
     }

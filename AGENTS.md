@@ -70,6 +70,11 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   anything cross-cutting, running the relevant matrix leg locally
   saves a CI round-trip. `.github/workflows/ci.yml` is the
   authoritative list.
+- A pull request that changes only documentation skips the build and
+  test jobs and the benchmark workflow; `lint` still runs. The list of
+  paths that count as documentation is in
+  `scripts/ci-changed-paths.sh`, and anything not on it runs the full
+  suite.
 - The external conformance suite lives at
   <https://github.com/paritysuite/dynamodb-conformance>. It is run in CI
   for release candidates; you do not need to run it locally for every

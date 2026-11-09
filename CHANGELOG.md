@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Opening a database checks what it reads before it changes anything.** A
+  schema version that isn't a whole number, or is too large to be one, is
+  refused rather than read as no version, which ran every migration on the
+  file. A newer build writing the file while it opens is now caught under each
+  write lock the open takes, before any migration step runs. A schema change
+  the open needs that fails, on a full disk for example, now fails the open
+  instead of being ignored, and each migration step records its version in the
+  same transaction as its changes, so the recorded version can't go backwards
+  when two processes open one file. A file refused when it is first read
+  keeps its `-wal` as it was, rather than having it written into the main
+  file as the refused connection closes. Files left with a table listed whose
+  data or index table is missing still open. A write whose transaction SQLite
+  had already ended now says it was not committed, and what SQLite kept,
+  rather than giving SQLite's bare commit error
+  ([#235](https://github.com/nubo-db/dynoxide/issues/235)).
+
 ## [1.6.0] - 2026-11-07
 
 The crate moves to `dynoxide-rs` 3.3.0, which adds public items and removes

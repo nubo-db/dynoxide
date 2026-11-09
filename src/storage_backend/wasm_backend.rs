@@ -344,7 +344,8 @@ async fn refuse_newer_schema(handle: &JsValue) -> Result<(), BackendError> {
         .iter()
         .next()
         .and_then(|row| col_text(&js_sys::Array::from(&row), 0));
-    super::schema::refuse_newer(super::schema::parse_recorded(value.as_deref()))
+    super::schema::accept_recorded(value.as_deref())
+        .map(|_| ())
         .map_err(BackendError::Other)
 }
 
@@ -744,6 +745,17 @@ impl StorageBackend for WasmBridgeBackend {
         Ok(col_i64(&row, 0) > 0)
     }
 
+    async fn data_table_exists(&self, table_name: &str) -> Result<bool, BackendError> {
+        let rows = self
+            .query(sql_builders::TABLE_EXISTS, vec![SqlParam::text(table_name)])
+            .await?;
+        if rows.length() == 0 {
+            return Ok(false);
+        }
+        let row: js_sys::Array = rows.get(0).unchecked_into();
+        Ok(col_i64(&row, 0) == 1)
+    }
+
     // --- Data tables -----------------------------------------------------
 
     async fn create_data_table(&self, table_name: &str) -> Result<(), BackendError> {
@@ -1065,7 +1077,7 @@ impl StorageBackend for WasmBridgeBackend {
             .iter()
             .next()
             .and_then(|row| col_text(&js_sys::Array::from(&row), 0));
-        Ok(super::schema::parse_recorded(value.as_deref()))
+        super::schema::parse_recorded(value.as_deref()).map_err(BackendError::Other)
     }
 
     async fn record_schema_version(&self, version: u32) -> Result<(), BackendError> {

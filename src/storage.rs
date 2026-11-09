@@ -288,6 +288,37 @@ pub struct Storage {
     /// fires. Compiled out of every build but the crate's own unit tests.
     #[cfg(test)]
     item_size_fault: RefCell<Option<u32>>,
+    /// Countdown to a forced failure of a schema change an open makes, for
+    /// tests that need one to fail for a reason other than a column already
+    /// being there. `None` never fires.
+    #[cfg(test)]
+    schema_change_fault: RefCell<Option<u32>>,
+    /// Something a test runs when an open reaches a point, such as another
+    /// process writing the file, before the open takes its next write lock.
+    #[cfg(test)]
+    open_hook: RefCell<Option<OpenHook>>,
+}
+
+/// A native migration step's body: the schema changes that bring a database to
+/// the step's version, run inside the step's transaction.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+type NativeStep = fn(&Storage) -> Result<()>;
+
+/// What a test runs when an open reaches a point.
+#[cfg(test)]
+type OpenHook = (OpenPoint, Box<dyn FnOnce() + Send>);
+
+/// A point in an open where a test can act. Each is reached just before the
+/// write lock it names is taken.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenPoint {
+    /// Before `create_metadata_tables` takes its lock.
+    MetadataLock,
+    /// Before the native step to this version takes its lock.
+    Step(u32),
+    /// Before the steps shared with the wasm backend.
+    SharedSteps,
 }
 
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
@@ -303,9 +334,15 @@ impl Storage {
             gsi_insert_fault: RefCell::new(None),
             #[cfg(test)]
             item_size_fault: RefCell::new(None),
+            #[cfg(test)]
+            schema_change_fault: RefCell::new(None),
+            #[cfg(test)]
+            open_hook: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
-        storage.initialize().map_err(Self::maybe_encrypted_error)?;
+        storage
+            .open_checked()
+            .map_err(Self::maybe_encrypted_error)?;
         storage.conn.busy_timeout(REQUEST_BUSY_TIMEOUT)?;
         Ok(storage)
     }
@@ -323,6 +360,26 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn check_gsi_insert_fault(&self) -> Result<()> {
         Self::count_down(&self.gsi_insert_fault, "injected GSI insert failure")
+    }
+
+    /// `sql`, or once the schema change countdown runs out, a schema change
+    /// SQLite refuses for a reason other than a column already being there.
+    #[cfg(test)]
+    fn schema_change_or_fault<'a>(&self, sql: &'a str) -> &'a str {
+        if Self::count_down(&self.schema_change_fault, "").is_err() {
+            "ALTER TABLE injected_schema_change_failure ADD COLUMN x TEXT"
+        } else {
+            sql
+        }
+    }
+
+    /// Run the test's open hook if it waits for `point`.
+    #[cfg(test)]
+    fn reach_open_point(&self, point: OpenPoint) {
+        let due = matches!(&*self.open_hook.borrow(), Some((at, _)) if *at == point);
+        if due && let Some((_, hook)) = self.open_hook.borrow_mut().take() {
+            hook();
+        }
     }
 
     #[cfg(test)]
@@ -398,9 +455,13 @@ impl Storage {
             gsi_insert_fault: RefCell::new(None),
             #[cfg(test)]
             item_size_fault: RefCell::new(None),
+            #[cfg(test)]
+            schema_change_fault: RefCell::new(None),
+            #[cfg(test)]
+            open_hook: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
-        storage.initialize()?;
+        storage.open_checked()?;
         storage.conn.busy_timeout(REQUEST_BUSY_TIMEOUT)?;
         Ok(storage)
     }
@@ -415,10 +476,31 @@ impl Storage {
             gsi_insert_fault: RefCell::new(None),
             #[cfg(test)]
             item_size_fault: RefCell::new(None),
+            #[cfg(test)]
+            schema_change_fault: RefCell::new(None),
+            #[cfg(test)]
+            open_hook: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
         Ok(storage)
+    }
+
+    /// Initialise a database file, with no checkpoint as the connection
+    /// closes until the open is accepted. A file refused when it is first
+    /// read then keeps its `-wal` as it was, for the next open to recover,
+    /// rather than having it written into the main file by a connection that
+    /// was turned away. (An open that fails later may already have
+    /// checkpointed as its steps committed.) An accepted open closes as
+    /// usual.
+    fn open_checked(&mut self) -> Result<()> {
+        use rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
+        self.conn
+            .set_db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        self.initialize()?;
+        self.conn
+            .set_db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
+        Ok(())
     }
 
     /// Initialize the database: WAL mode, metadata tables, config.
@@ -475,38 +557,32 @@ impl Storage {
     /// copy a restore brings up to date before it replaces this database.
     fn migrate_to_current(&self) -> Result<()> {
         // A database with tables and no recorded version, which the browser
-        // build wrote from Dynoxide 0.10 to 0.13, or one whose version isn't a
-        // number, runs every step. Each is safe on a database that already
-        // has what it adds: a column already there is left alone, an index is
-        // created only where it is missing, only a table without an id is
-        // given one, and the steps from version 10 on rebuild from the base
-        // table.
+        // build wrote from Dynoxide 0.10 to 0.13, runs every step; a version
+        // that isn't one was refused before this. Each step is safe on a
+        // database that already has what it adds: a column already there is
+        // left alone, an index is created only where it is missing, only a
+        // table without an id is given one, and the steps from version 10 on
+        // rebuild from the base table.
         let version = self.create_metadata_tables()?.unwrap_or(1);
 
-        if version < 2 {
-            self.migrate_v1_to_v2()?;
+        // Each step runs in its own write transaction (see `native_step`).
+        let steps: [(u32, NativeStep); 8] = [
+            (2, Self::migrate_v1_to_v2),
+            (3, Self::migrate_v2_to_v3),
+            (4, Self::migrate_v3_to_v4),
+            (5, Self::migrate_v4_to_v5),
+            (6, Self::migrate_v5_to_v6),
+            (7, Self::migrate_v6_to_v7),
+            (8, Self::migrate_v7_to_v8),
+            (9, Self::migrate_v8_to_v9),
+        ];
+        for (step_version, step) in steps {
+            if version < step_version {
+                self.native_step(step_version, step)?;
+            }
         }
-        if version < 3 {
-            self.migrate_v2_to_v3()?;
-        }
-        if version < 4 {
-            self.migrate_v3_to_v4()?;
-        }
-        if version < 5 {
-            self.migrate_v4_to_v5()?;
-        }
-        if version < 6 {
-            self.migrate_v5_to_v6()?;
-        }
-        if version < 7 {
-            self.migrate_v6_to_v7()?;
-        }
-        if version < 8 {
-            self.migrate_v7_to_v8()?;
-        }
-        if version < 9 {
-            self.migrate_v8_to_v9()?;
-        }
+        #[cfg(test)]
+        self.reach_open_point(OpenPoint::SharedSteps);
         // The steps from version 10 on are shared with the wasm backend and run
         // each in its own write transaction. The native futures never suspend,
         // so `block_on` returns as soon as they do.
@@ -521,18 +597,22 @@ impl Storage {
     /// process opening the same file never finds the tables without the
     /// version. Returns the version recorded once that is done.
     fn create_metadata_tables(&self) -> Result<Option<u32>> {
+        #[cfg(test)]
+        self.reach_open_point(OpenPoint::MetadataLock);
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        // A newer build may have written the file since the open first checked
+        // it; now that this open holds the write lock, nothing can change it
+        // before this reads, and nothing has been written yet.
+        refuse_newer_schema(&self.conn)?;
         let new_database = !table_exists(&self.conn, "_tables")?;
         // The metadata tables, shared with the wasm backend.
         self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
         // A stream record table made before records carried a user identity
-        // gains the column; one that has it fails the ALTER harmlessly.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
+        // gains the column.
+        self.add_column("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT")?;
         // Likewise the event id; records written before it existed keep the
         // id they always reported.
         let has_event_id: bool =
@@ -556,65 +636,107 @@ impl Storage {
         Ok(recorded)
     }
 
+    /// Run the native migration step to `version` and record that version, in
+    /// one write transaction.
+    ///
+    /// The recorded version is read again once the transaction holds the
+    /// write lock (`BEGIN IMMEDIATE`), as the shared steps from version 10 on
+    /// do: a step another process has finished in the meantime is skipped, so
+    /// the recorded version never goes down, and a version a newer build
+    /// recorded in the meantime is refused. A step that fails part way rolls
+    /// back and leaves the old version recorded, so the next open runs it
+    /// again from the start.
+    fn native_step(&self, version: u32, step: NativeStep) -> Result<()> {
+        #[cfg(test)]
+        self.reach_open_point(OpenPoint::Step(version));
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let recorded = self.recorded_schema_version()?;
+        crate::storage_backend::schema::refuse_newer_mid_migration(recorded)
+            .map_err(DynoxideError::InternalServerError)?;
+        if recorded.is_some_and(|recorded| recorded >= version) {
+            return Ok(());
+        }
+        step(self)?;
+        self.record_schema_version(version)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Run an `ALTER TABLE ... ADD COLUMN`, treating a column that is already
+    /// there as done: a step re-run after it added the column but before its
+    /// version was recorded finds it. Any other failure is returned.
+    fn add_column(&self, sql: &str) -> Result<()> {
+        #[cfg(test)]
+        let sql = self.schema_change_or_fault(sql);
+        match self.conn.execute_batch(sql) {
+            Err(e) if sql_builders::is_duplicate_column_error(&e.to_string()) => Ok(()),
+            result => Ok(result?),
+        }
+    }
+
+    /// Run a schema change that is safe to repeat as written, such as
+    /// `CREATE INDEX IF NOT EXISTS`, returning any failure.
+    fn change_schema(&self, sql: &str) -> Result<()> {
+        #[cfg(test)]
+        let sql = self.schema_change_or_fault(sql);
+        Ok(self.conn.execute_batch(sql)?)
+    }
+
+    /// Whether the data table of a listed table is there (see
+    /// `StorageBackend::data_table_exists`).
+    pub(crate) fn data_table_exists(&self, table_name: &str) -> Result<bool> {
+        table_exists(&self.conn, table_name)
+    }
+
+    /// The tables `_tables` lists whose data table is there. A table whose
+    /// data table is missing is one an interrupted CreateTable or DeleteTable
+    /// left behind, which neither runs in a transaction; the steps leave it
+    /// alone rather than fail every open of the file.
+    fn tables_with_data(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT table_name FROM _tables")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut present = Vec::with_capacity(names.len());
+        for name in names {
+            if table_exists(&self.conn, &name)? {
+                present.push(name);
+            }
+        }
+        Ok(present)
+    }
+
     /// Migrate from schema v1 to v2: add `cached_at REAL` column to all data tables.
     fn migrate_v1_to_v2(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare("SELECT table_name FROM _tables")?;
-        let table_names: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        for table_name in &table_names {
-            let escaped = format!("\"{}\"", table_name.replace('"', "\"\""));
-            let _ = self.conn.execute(
-                &format!("ALTER TABLE {escaped} ADD COLUMN cached_at REAL"),
-                [],
-            );
+        for table_name in self.tables_with_data()? {
+            let escaped = escape_table_name(&table_name);
+            self.add_column(&format!(
+                "ALTER TABLE \"{escaped}\" ADD COLUMN cached_at REAL"
+            ))?;
         }
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '2')",
-            [],
-        )?;
-
         Ok(())
     }
 
     /// Migrate from schema v2 to v3: add `tags TEXT` column to `_tables`.
     fn migrate_v2_to_v3(&self) -> Result<()> {
-        let _ = self
-            .conn
-            .execute("ALTER TABLE _tables ADD COLUMN tags TEXT", []);
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '3')",
-            [],
-        )?;
-
-        Ok(())
+        self.add_column("ALTER TABLE _tables ADD COLUMN tags TEXT")
     }
 
     /// Migrate from schema v3 to v4: add SSE, table class, and deletion protection columns.
     fn migrate_v3_to_v4(&self) -> Result<()> {
-        let _ = self
-            .conn
-            .execute("ALTER TABLE _tables ADD COLUMN sse_specification TEXT", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE _tables ADD COLUMN table_class TEXT", []);
-        let _ = self.conn.execute(
+        self.add_column("ALTER TABLE _tables ADD COLUMN sse_specification TEXT")?;
+        self.add_column("ALTER TABLE _tables ADD COLUMN table_class TEXT")?;
+        self.add_column(
             "ALTER TABLE _tables ADD COLUMN deletion_protection_enabled INTEGER DEFAULT 0",
-            [],
-        );
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '4')",
-            [],
-        )?;
-
-        Ok(())
+        )
     }
 
-    /// Migrate from schema v4 to v5: add secondary indexes on GSI and LSI base-key columns.
+    /// Migrate from schema v4 to v5: add secondary indexes on GSI and LSI
+    /// base-key columns. An index table that is missing, as an interrupted
+    /// CreateTable or DeleteTable can leave, is left alone.
     fn migrate_v4_to_v5(&self) -> Result<()> {
         let mut stmt = self
             .conn
@@ -624,82 +746,47 @@ impl Storage {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         for (table_name, gsi_json, lsi_json) in &tables {
-            if let Some(json) = gsi_json
-                && let Ok(gsis) = serde_json::from_str::<Vec<serde_json::Value>>(json)
-            {
-                for gsi in &gsis {
-                    if let Some(idx) = gsi.get("IndexName").and_then(|v| v.as_str()) {
-                        let gsi_table = escape_table_name(&format!("{table_name}::gsi::{idx}"));
-                        let idx_name =
-                            escape_table_name(&format!("{table_name}::gsi::{idx}::base_key"));
-                        let _ = self.conn.execute_batch(&format!(
-                                "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{gsi_table}\" (table_pk, table_sk)"
-                            ));
+            for (definitions, kind, columns) in [
+                (gsi_json, "gsi", "table_pk, table_sk"),
+                (lsi_json, "lsi", "base_pk, base_sk"),
+            ] {
+                let Some(json) = definitions else { continue };
+                let Ok(indexes) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+                    continue;
+                };
+                for index in &indexes {
+                    let Some(idx) = index.get("IndexName").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let index_table = format!("{table_name}::{kind}::{idx}");
+                    if !table_exists(&self.conn, &index_table)? {
+                        continue;
                     }
-                }
-            }
-            if let Some(json) = lsi_json
-                && let Ok(lsis) = serde_json::from_str::<Vec<serde_json::Value>>(json)
-            {
-                for lsi in &lsis {
-                    if let Some(idx) = lsi.get("IndexName").and_then(|v| v.as_str()) {
-                        let lsi_table = escape_table_name(&format!("{table_name}::lsi::{idx}"));
-                        let idx_name =
-                            escape_table_name(&format!("{table_name}::lsi::{idx}::base_key"));
-                        let _ = self.conn.execute_batch(&format!(
-                                "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{lsi_table}\" (base_pk, base_sk)"
-                            ));
-                    }
+                    let escaped_table = escape_table_name(&index_table);
+                    let idx_name = escape_table_name(&format!("{index_table}::base_key"));
+                    self.change_schema(&format!(
+                        "CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{escaped_table}\" ({columns})"
+                    ))?;
                 }
             }
         }
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '5')",
-            [],
-        )?;
-
         Ok(())
     }
 
     /// Migrate from schema v5 to v6: add `hash_prefix TEXT` column to all data tables.
     fn migrate_v5_to_v6(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare("SELECT table_name FROM _tables")?;
-        let table_names: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        for table_name in &table_names {
-            let escaped = escape_table_name(table_name);
-            let _ = self.conn.execute(
-                &format!(
-                    "ALTER TABLE \"{escaped}\" ADD COLUMN hash_prefix TEXT NOT NULL DEFAULT ''"
-                ),
-                [],
-            );
+        for table_name in self.tables_with_data()? {
+            let escaped = escape_table_name(&table_name);
+            self.add_column(&format!(
+                "ALTER TABLE \"{escaped}\" ADD COLUMN hash_prefix TEXT NOT NULL DEFAULT ''"
+            ))?;
         }
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '6')",
-            [],
-        )?;
-
         Ok(())
     }
 
     /// Migrate from schema v6 to v7: add `on_demand_throughput TEXT` column to `_tables`.
     fn migrate_v6_to_v7(&self) -> Result<()> {
-        let _ = self.conn.execute(
-            "ALTER TABLE _tables ADD COLUMN on_demand_throughput TEXT",
-            [],
-        );
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '7')",
-            [],
-        )?;
-
-        Ok(())
+        self.add_column("ALTER TABLE _tables ADD COLUMN on_demand_throughput TEXT")
     }
 
     /// Migrate from schema v7 to v8: add a `table_id TEXT` column to `_tables`
@@ -707,15 +794,9 @@ impl Storage {
     ///
     /// TableId must stay stable between reads of the same table (#55). New
     /// tables get their id at insert time; tables created before this column
-    /// existed are assigned a persisted id here, once. The backfill `SELECT`
-    /// references `table_id`, so if the `ALTER` did not actually add the column
-    /// (a genuine failure, swallowed below for the duplicate-column re-run case)
-    /// this step errors out before the version is stamped, rather than stamping
-    /// a half-applied migration.
+    /// existed are assigned a persisted id here, once.
     fn migrate_v7_to_v8(&self) -> Result<()> {
-        let _ = self
-            .conn
-            .execute("ALTER TABLE _tables ADD COLUMN table_id TEXT", []);
+        self.add_column("ALTER TABLE _tables ADD COLUMN table_id TEXT")?;
 
         let names: Vec<String> = {
             let mut stmt = self
@@ -731,37 +812,13 @@ impl Storage {
                 params![id, name],
             )?;
         }
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '8')",
-            [],
-        )?;
-
         Ok(())
     }
 
     /// Migrate from schema v8 to v9: add a `vector_index_definitions TEXT`
     /// column to `_tables`.
-    ///
-    /// Only the duplicate-column error (a re-run over a half-applied
-    /// migration whose version stamp did not land) is tolerated; any other
-    /// failure propagates rather than stamping a version whose column is
-    /// silently absent.
     fn migrate_v8_to_v9(&self) -> Result<()> {
-        if let Err(e) = self
-            .conn
-            .execute(sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN, [])
-            && !sql_builders::is_duplicate_column_error(&e.to_string())
-        {
-            return Err(e.into());
-        }
-
-        self.conn.execute(
-            "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', '9')",
-            [],
-        )?;
-
-        Ok(())
+        self.add_column(sql_builders::ADD_VECTOR_INDEX_DEFINITIONS_COLUMN)
     }
 
     /// Get a reference to the underlying connection (for transactions, etc.).
@@ -1388,16 +1445,16 @@ impl Storage {
     }
 
     /// The schema version the database records, or `None` when it records
-    /// none, or one that isn't a number.
+    /// none. A value that isn't a whole number, or is too large to be a
+    /// version, is an error.
     pub(crate) fn recorded_schema_version(&self) -> Result<Option<u32>> {
         use rusqlite::OptionalExtension;
         let value: Option<String> = self
             .conn
             .query_row(sql_builders::GET_SCHEMA_VERSION, [], |r| r.get(0))
             .optional()?;
-        Ok(crate::storage_backend::schema::parse_recorded(
-            value.as_deref(),
-        ))
+        crate::storage_backend::schema::parse_recorded(value.as_deref())
+            .map_err(DynoxideError::InternalServerError)
     }
 
     /// Record `version` as the database's schema version, replacing any
@@ -1884,6 +1941,10 @@ impl Storage {
             gsi_insert_fault: RefCell::new(self.gsi_insert_fault.take()),
             #[cfg(test)]
             item_size_fault: RefCell::new(self.item_size_fault.take()),
+            #[cfg(test)]
+            schema_change_fault: RefCell::new(None),
+            #[cfg(test)]
+            open_hook: RefCell::new(None),
             clock: Arc::clone(&self.clock),
         };
         let copied = match rusqlite::backup::Backup::new(source, &mut staged.conn) {
@@ -2446,10 +2507,9 @@ fn refuse_newer_schema(conn: &Connection) -> Result<()> {
     let value: Option<String> = conn
         .query_row(sql_builders::GET_SCHEMA_VERSION, [], |row| row.get(0))
         .optional()?;
-    crate::storage_backend::schema::refuse_newer(crate::storage_backend::schema::parse_recorded(
-        value.as_deref(),
-    ))
-    .map_err(DynoxideError::InternalServerError)
+    crate::storage_backend::schema::accept_recorded(value.as_deref())
+        .map(|_| ())
+        .map_err(DynoxideError::InternalServerError)
 }
 
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
@@ -2556,6 +2616,462 @@ mod tests {
             )
             .unwrap();
         assert!(col.is_none());
+    }
+
+    /// A database with only `_config`, recording `version` as given.
+    fn database_recording(path: &str, version: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO _config (key, value) VALUES ('schema_version', ?1)",
+            [version],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_recorded_version_that_isnt_one_this_build_reads_is_refused_untouched() {
+        for (version, says) in [
+            (
+                "99999999999",
+                "written by a newer version of Dynoxide (schema version 99999999999;",
+            ),
+            ("-1", "can't read (\"-1\")"),
+            ("eleven", "can't read (\"eleven\")"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db").to_str().unwrap().to_string();
+            database_recording(&path, version);
+            let before = std::fs::read(&path).unwrap();
+            let Err(err) = Storage::new(&path) else {
+                panic!("{version} opened");
+            };
+            assert!(err.to_string().contains(says), "{version}: {err}");
+            assert!(
+                err.to_string().contains("The file has not been changed."),
+                "{version}: {err}"
+            );
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "{version} changed the file"
+            );
+        }
+    }
+
+    /// A version 1 database made by hand: `_config`, a `_tables` without the
+    /// columns later versions add, and a `_stream_records` without
+    /// `user_identity` and `event_id`. Each of `tables` is listed with the GSI
+    /// and LSI definitions given; no data or index table is made for it.
+    fn version_1_database(path: &str, tables: &[(&str, Option<&str>, Option<&str>)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO _config (key, value) VALUES ('schema_version', '1');
+             CREATE TABLE _tables (
+                table_name TEXT PRIMARY KEY,
+                key_schema TEXT NOT NULL,
+                attribute_definitions TEXT NOT NULL,
+                gsi_definitions TEXT,
+                lsi_definitions TEXT,
+                stream_enabled INTEGER DEFAULT 0,
+                stream_view_type TEXT,
+                stream_label TEXT,
+                ttl_attribute TEXT,
+                ttl_enabled INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                table_status TEXT NOT NULL DEFAULT 'ACTIVE',
+                billing_mode TEXT DEFAULT 'PAY_PER_REQUEST',
+                provisioned_throughput TEXT
+             );
+             CREATE TABLE _stream_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                keys_json TEXT NOT NULL,
+                new_image TEXT,
+                old_image TEXT,
+                sequence_number TEXT NOT NULL,
+                shard_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        for (name, gsis, lsis) in tables {
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, \
+                 gsi_definitions, lsi_definitions, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    name,
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                    gsis,
+                    lsis,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn recorded(path: &str) -> String {
+        Connection::open(path)
+            .unwrap()
+            .query_row(sql_builders::GET_SCHEMA_VERSION, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn has_column(path: &str, table: &str, column: &str) -> bool {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                [table, column],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_schema_change_that_fails_fails_the_open_and_records_nothing() {
+        // With no tables listed, the countdown's first change is the
+        // `user_identity` ALTER the metadata step makes, the second version 2
+        // to 3's, and the next three version 3 to 4's.
+        for (successes, version) in [(0, "1"), (1, "2"), (2, "3"), (4, "3")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db").to_str().unwrap().to_string();
+            version_1_database(&path, &[]);
+            let Err(err) = open_with_hook(&path, Some(successes), None) else {
+                panic!("opened with schema change {successes} failing");
+            };
+            assert!(
+                err.to_string()
+                    .contains("no such table: injected_schema_change_failure"),
+                "{err}"
+            );
+            assert_eq!(recorded(&path), version, "schema change {successes}");
+            // Version 3 to 4 added its first two columns before its third
+            // failed, and they went with the step's transaction.
+            if successes == 4 {
+                assert!(!has_column(&path, "_tables", "sse_specification"));
+                assert!(!has_column(&path, "_tables", "table_class"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_index_creation_fails_the_open_at_version_4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(&path, &[("T", Some(r#"[{"IndexName":"byX"}]"#), None)]);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE "T" (pk TEXT, sk TEXT, item_json TEXT);
+                   CREATE TABLE "T::gsi::byX" (table_pk TEXT, table_sk TEXT);"#,
+            )
+            .unwrap();
+        }
+        // user_identity, cached_at on T, tags and three for version 4 come
+        // first; the seventh change is the index.
+        let Err(err) = open_with_hook(&path, Some(6), None) else {
+            panic!("opened");
+        };
+        assert!(
+            err.to_string()
+                .contains("no such table: injected_schema_change_failure"),
+            "{err}"
+        );
+        assert_eq!(recorded(&path), "4");
+    }
+
+    #[test]
+    fn a_table_an_interrupted_create_or_delete_left_listed_still_migrates() {
+        // CreateTable lists a table before making its tables, and DeleteTable
+        // drops them before unlisting it, neither in a transaction, so a file
+        // can list a table, or index, whose table is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(
+            &path,
+            &[(
+                "Gone",
+                Some(
+                    r#"[{"IndexName":"byX","KeySchema":[{"AttributeName":"x","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}]"#,
+                ),
+                Some(
+                    r#"[{"IndexName":"byY","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"y","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]"#,
+                ),
+            )],
+        );
+        Storage::new(&path).unwrap();
+        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn an_orphaned_table_with_a_multi_attribute_gsi_still_migrates() {
+        // The rebuild of multi-attribute GSIs, at version 10, reads each
+        // listed table's items; a listed table whose data table is gone is
+        // left alone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(
+            &path,
+            &[(
+                "Gone",
+                Some(
+                    r#"[{"IndexName":"byAB","KeySchema":[{"AttributeName":"a","KeyType":"HASH"},{"AttributeName":"b","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}]"#,
+                ),
+                None,
+            )],
+        );
+        Storage::new(&path).unwrap();
+        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn an_orphaned_table_with_a_vector_index_still_migrates() {
+        // The recount of vector index sizes, at version 11, reads each listed
+        // table's items in the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        drop(Storage::new(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO _tables (table_name, key_schema, attribute_definitions, \
+                 vector_index_definitions, created_at) VALUES ('Gone', ?1, ?2, ?3, 0)",
+                params![
+                    r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+                    r#"[{"AttributeName":"pk","AttributeType":"S"}]"#,
+                    r#"[{"IndexName":"byV","VectorAttribute":{"AttributeName":"v","AttributeType":"VECTOR"},"Projection":{"ProjectionType":"ALL"},"Dimensions":3,"DistanceFunction":"COSINE"}]"#,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE _config SET value = '10' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        Storage::new(&path).unwrap();
+        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn an_old_step_on_a_database_at_this_version_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        let storage = Storage::new(&path).unwrap();
+        // A second process that read version 2 earlier would run this step.
+        storage
+            .native_step(3, |storage| {
+                storage
+                    .conn
+                    .execute_batch("CREATE TABLE ran_the_step (x)")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+        assert!(!table_exists(&storage.conn, "ran_the_step").unwrap());
+    }
+
+    #[test]
+    fn two_opens_of_one_old_file_both_end_at_this_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(&path, &[]);
+        // Every build switches a file to WAL as it opens it, and the mode
+        // stays with the file.
+        in_wal_mode(&path);
+        let opens: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Storage::new(&path).map(|_| ()))
+            })
+            .collect();
+        for open in opens {
+            open.join().unwrap().unwrap();
+        }
+        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+    }
+
+    fn in_wal_mode(path: &str) {
+        Connection::open(path)
+            .unwrap()
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_step_another_process_holds_the_lock_for_reads_the_version_it_recorded() {
+        // Another process takes the write lock just before this open's step to
+        // version 4, brings the file up to this build's version, and commits.
+        // The open waits for the lock, reads that version, and runs no more
+        // steps. The countdown fails any schema change after the first two
+        // (the metadata step's and version 2 to 3's), so a step that read the
+        // version before it held the lock, and ran, would fail the open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(&path, &[]);
+        in_wal_mode(&path);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = path.clone();
+        let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+            std::thread::spawn(move || {
+                let conn = Connection::open(&other).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                conn.execute(
+                    "UPDATE _config SET value = ?1 WHERE key = 'schema_version'",
+                    [SCHEMA_VERSION.to_string()],
+                )
+                .unwrap();
+                conn.execute_batch("COMMIT").unwrap();
+                done_tx.send(()).unwrap();
+            });
+            locked_rx.recv().unwrap();
+        });
+        open_with_hook(&path, Some(2), Some((OpenPoint::Step(4), hook))).unwrap();
+        done_rx.recv().unwrap();
+        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn a_native_step_refuses_a_version_a_newer_build_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        let storage = Storage::new(&path).unwrap();
+        record_elsewhere(&path, "999")();
+        let err = storage
+            .native_step(3, |_| panic!("the step ran"))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("while this build was bringing it up to date"),
+            "{err}"
+        );
+        assert_eq!(recorded(&path), "999");
+    }
+
+    /// Record `version` through a connection of its own, as another process
+    /// would.
+    fn record_elsewhere(path: &str, version: &'static str) -> Box<dyn FnOnce() + Send> {
+        let path = path.to_string();
+        Box::new(move || {
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)",
+                    [version],
+                )
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn a_newer_build_writing_before_the_metadata_lock_is_refused_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(&path, &[]);
+        let hook = (OpenPoint::MetadataLock, record_elsewhere(&path, "999"));
+        let Err(err) = open_with_hook(&path, None, Some(hook)) else {
+            panic!("opened");
+        };
+        assert!(err.to_string().contains("schema version 999;"), "{err}");
+        assert_eq!(recorded(&path), "999");
+        assert!(!has_column(&path, "_stream_records", "user_identity"));
+        assert!(!has_column(&path, "_stream_records", "event_id"));
+    }
+
+    #[test]
+    fn a_newer_build_writing_between_steps_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(&path, &[]);
+        let hook = (OpenPoint::Step(5), record_elsewhere(&path, "999"));
+        let Err(err) = open_with_hook(&path, None, Some(hook)) else {
+            panic!("opened");
+        };
+        assert!(err.to_string().contains("schema version 999;"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("while this build was bringing it up to date"),
+            "{err}"
+        );
+        assert_eq!(recorded(&path), "999");
+    }
+
+    #[test]
+    fn a_refused_file_with_a_live_wal_is_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        let wal = format!("{path}-wal");
+        {
+            // A newer build's write that is still only in the `-wal`: its
+            // connection closed without checkpointing.
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO _config (key, value) VALUES ('schema_version', '1');
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA wal_autocheckpoint = 0;",
+            )
+            .unwrap();
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE _config SET value = '999' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(std::path::Path::new(&wal).exists());
+
+        let Err(err) = Storage::new(&path) else {
+            panic!("opened");
+        };
+        assert!(err.to_string().contains("schema version 999;"), "{err}");
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "the main file changed"
+        );
+        assert!(
+            std::path::Path::new(&wal).exists(),
+            "the -wal was checkpointed"
+        );
+    }
+
+    #[test]
+    fn an_accepted_open_still_checkpoints_as_it_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        drop(Storage::new(&path).unwrap());
+        assert!(!std::path::Path::new(&format!("{path}-wal")).exists());
+    }
+
+    #[test]
+    fn a_newer_build_writing_before_the_shared_steps_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        version_1_database(&path, &[]);
+        let hook = (OpenPoint::SharedSteps, record_elsewhere(&path, "999"));
+        let Err(err) = open_with_hook(&path, None, Some(hook)) else {
+            panic!("opened");
+        };
+        assert!(err.to_string().contains("schema version 999;"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("while this build was bringing it up to date"),
+            "{err}"
+        );
+        assert_eq!(recorded(&path), "999");
     }
 
     /// #55: the v7 -> v8 migration adds the `table_id` column and backfills any
@@ -3055,8 +3571,31 @@ mod tests {
             metadata_cache: RefCell::new(HashMap::new()),
             gsi_insert_fault: RefCell::new(gsi_insert),
             item_size_fault: RefCell::new(item_size),
+            schema_change_fault: RefCell::new(None),
+            open_hook: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
+        storage.initialize()?;
+        Ok(storage)
+    }
+
+    /// Open `path` as [`Storage::new`] does, with the schema change countdown
+    /// armed and `hook` run when the open reaches its point.
+    fn open_with_hook(
+        path: &str,
+        schema_change: Option<u32>,
+        hook: Option<OpenHook>,
+    ) -> Result<Storage> {
+        let mut storage = Storage {
+            conn: Connection::open(path)?,
+            metadata_cache: RefCell::new(HashMap::new()),
+            gsi_insert_fault: RefCell::new(None),
+            item_size_fault: RefCell::new(None),
+            schema_change_fault: RefCell::new(schema_change),
+            open_hook: RefCell::new(hook),
+            clock: Arc::new(SystemClock),
+        };
+        storage.conn.busy_timeout(OPEN_BUSY_TIMEOUT)?;
         storage.initialize()?;
         Ok(storage)
     }

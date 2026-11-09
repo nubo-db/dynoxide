@@ -107,6 +107,16 @@ unchanged.
 - [Versioning](https://github.com/nubo-db/dynoxide/blob/main/docs/versioning.md) - what the version number promises and what forces a major
 - [Releasing](https://github.com/nubo-db/dynoxide/blob/main/docs/RELEASING.md) - release cadence and process
 
+## Community
+
+These integrations are built and maintained by people outside the project. There's a bit more on each at [dynoxide.dev/community](https://dynoxide.dev/community).
+
+- [vitest-dynoxide](https://github.com/seek-oss/vitest-dynoxide) - runs Vitest integration tests against Dynoxide, with an in-memory instance per test file (SEEK, maintained by [Sam Chung](https://github.com/samchungy))
+- [sbt-dynoxide](https://github.com/Hapag-Lloyd/sbt-dynoxide) - an sbt plugin for Scala builds that downloads Dynoxide and runs it around `test` and `testOnly` (Hapag-Lloyd, maintained by [Marcin Szałomski](https://github.com/baldram))
+- [dynoxide-scala-core](https://github.com/Hapag-Lloyd/dynoxide-scala-core) - the build-tool-agnostic library behind sbt-dynoxide, for wiring Dynoxide into other JVM build tools (Hapag-Lloyd, maintained by [Marcin Szałomski](https://github.com/baldram))
+
+Built something on top of Dynoxide? [Propose it for the list](https://github.com/nubo-db/dynoxide/issues/new?template=community-integration.yml).
+
 ## Supported Operations
 
 Dynoxide implements the DynamoDB API across tables, items, query and scan, batches, transactions, PartiQL, streams, TTL, and tags, with GSI and LSI support, the full expression syntax, and DynamoDB-compatible pagination, validation, and error codes. For the operation-by-operation breakdown and a comparison, see the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).

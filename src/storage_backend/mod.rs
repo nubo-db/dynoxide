@@ -387,6 +387,11 @@ pub trait StorageBackend: private::Sealed {
 
     async fn table_exists(&self, table_name: &str) -> Result<bool, BackendError>;
 
+    /// Whether the data table of a listed table is there. CreateTable lists a
+    /// table before it makes its data table, and DeleteTable drops the data
+    /// table before it unlists it, so a listed table can lack one.
+    async fn data_table_exists(&self, table_name: &str) -> Result<bool, BackendError>;
+
     // -----------------------------------------------------------------------
     // Dynamic data tables (DDL)
     // -----------------------------------------------------------------------
@@ -674,7 +679,8 @@ pub trait StorageBackend: private::Sealed {
     // -----------------------------------------------------------------------
 
     /// The schema version the database records, or `None` when it records
-    /// none, or one that isn't a number.
+    /// none. A value that isn't a whole number, or is too large to be a
+    /// version, is an error.
     async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError>;
 
     /// Record `version` as the database's schema version, replacing any

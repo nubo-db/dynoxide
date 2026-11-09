@@ -84,6 +84,21 @@ Commits-style prefix (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`,
 subject is fine if no prefix fits. Bodies are welcome for anything
 non-obvious.
 
+## Listing a community integration
+
+Built something on top of Dynoxide? Open a
+[community integration issue](https://github.com/nubo-db/dynoxide/issues/new?template=community-integration.yml)
+to get it into the Community list in the README and on
+[dynoxide.dev](https://dynoxide.dev/community). To be listed, it needs to:
+
+- be public
+- have a licence
+- work with the latest Dynoxide release (it can let users pin an
+  older one, as long as the latest works)
+- be maintained
+
+A listing isn't an endorsement or a compatibility guarantee.
+
 ## Licensing of contributions
 
 Dynoxide is dual-licensed under the MIT License and the Apache License,

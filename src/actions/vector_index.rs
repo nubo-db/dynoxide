@@ -97,7 +97,9 @@ pub(crate) async fn recompute_vector_table_sizes<S: StorageBackend>(storage: &S)
             continue;
         };
         let vector_indexes = parse_vector_defs(&meta)?;
-        if vector_indexes.is_empty() {
+        // A listed table without its data table, as an interrupted CreateTable
+        // or DeleteTable can leave, has no items to recount.
+        if vector_indexes.is_empty() || !storage.data_table_exists(&table_name).await? {
             continue;
         }
         recompute_billed_sizes(storage, &table_name, &vector_indexes).await?;

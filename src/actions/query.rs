@@ -116,11 +116,11 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         let raw = QueryRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
-        // A BOOL or NULL in a legacy condition that doesn't read as a boolean
-        // makes the whole request malformed, ahead of everything else.
-        if let Some(message) =
-            crate::types::malformed_condition_boolean(raw.key_conditions.as_ref())
-                .or_else(|| crate::types::malformed_condition_boolean(raw.query_filter.as_ref()))
+        // A legacy condition value that can't be read (a boolean that doesn't
+        // read as one, or a member of the wrong JSON type) makes the whole
+        // request malformed, ahead of everything else.
+        if let Some(message) = crate::types::malformed_condition_value(raw.key_conditions.as_ref())
+            .or_else(|| crate::types::malformed_condition_value(raw.query_filter.as_ref()))
         {
             return Err(serde::de::Error::custom(message));
         }

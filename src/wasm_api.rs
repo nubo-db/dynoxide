@@ -301,9 +301,10 @@ async fn route<S: StorageBackend>(
     // failure classifies exactly as it does over HTTP), run the shared handler,
     // then serialise the response.
     //
-    // A number given for a boolean is named by how it was written, which
-    // serde_json forgets for `-0` and integers past 64 bits.
-    let request_json = crate::serde_errors::boolean_numbers_as_written(request_json);
+    // A number given where it fails the request whatever its value, for a
+    // boolean or in an attribute value, is named by how it was written,
+    // which serde_json forgets for some numbers.
+    let request_json = crate::serde_errors::misread_numbers_as_written(request_json);
     let request_json = request_json.as_ref();
     // The same pre-deserialisation type checks the HTTP server runs. Request
     // structs hold several fields as `serde_json::Value`, which accepts any
@@ -647,6 +648,42 @@ mod tests {
                 r#"{{"TableName":"Music","Item":{{"artist":{{"S":"a"}},"song":{{"S":"{song}"}},"genre":{{"S":"{genre}"}}}}}}"#
             );
             run(backend, "PutItem", &put).expect("put item");
+        }
+    }
+
+    #[test]
+    fn numbers_given_where_any_number_fails_are_named_as_written() {
+        // The wasm surface runs the same number rewrite and shape check as the
+        // HTTP server, so `-0` and decimals past a double's range are named by
+        // how they were written (captured eu-west-2 and us-east-1, 6 and 8
+        // November 2026), and a wrong JSON type nested in `L` comes ahead of
+        // a second member, as over HTTP (not captured).
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for (body, expected) in [
+            (
+                r#"{"TableName":"Music","Item":{"artist":{"S":-0},"song":{"S":"a"}}}"#,
+                "NUMBER_VALUE cannot be converted to String",
+            ),
+            (
+                r#"{"TableName":"Music","Item":{"artist":{"S":1e400},"song":{"S":"a"}}}"#,
+                "DECIMAL_VALUE cannot be converted to String",
+            ),
+            (
+                r#"{"TableName":"Music","Item":{"artist":{"S":"a"},"song":{"S":"a"},"x":{"L":[{"S":5}],"N":"1"}}}"#,
+                "NUMBER_VALUE cannot be converted to String",
+            ),
+        ] {
+            let err = run(&backend, "PutItem", body).unwrap_err();
+            let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert!(
+                v["__type"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SerializationException"),
+                "{body}: got {v}"
+            );
+            assert_eq!(v["Message"], expected, "{body}");
         }
     }
 

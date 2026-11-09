@@ -113,10 +113,10 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         let raw = UpdateItemRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
-        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
-        // read as a boolean makes the whole request malformed, ahead of
-        // everything else.
-        if let Some(message) = crate::types::malformed_condition_boolean(raw.expected.as_ref()) {
+        // A legacy condition value that can't be read (a boolean that doesn't
+        // read as one, or a member of the wrong JSON type) makes the whole
+        // request malformed, ahead of everything else.
+        if let Some(message) = crate::types::malformed_condition_value(raw.expected.as_ref()) {
             return Err(serde::de::Error::custom(message));
         }
 

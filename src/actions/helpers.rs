@@ -18,6 +18,9 @@ use std::future::Future;
 /// itself (it rolls the whole transaction back on a full disk, among other
 /// errors) adds nothing, and the error that stopped the write is returned as
 /// it is.
+/// A commit that fails for the same reason, after a body that got past the
+/// error, is reported as a write that was not committed, naming what SQLite
+/// kept and what it rolled back.
 ///
 /// This is the single place the write-transaction lifecycle policy lives, so
 /// every write path handles a failed commit or rollback identically.
@@ -30,8 +33,18 @@ where
     match body.await {
         Ok(value) => match storage.commit().await {
             Ok(()) => Ok(value),
+            // SQLite ended the transaction itself after an earlier error the
+            // body got past, so there is nothing to commit or roll back.
+            Err(commit_err) if found_no_transaction(&commit_err) => {
+                Err(DynoxideError::InternalServerError(
+                    "the write was not committed: SQLite ended its transaction after an \
+                     earlier error, so what ran before that error was rolled back, and \
+                     anything run after it was applied on its own"
+                        .to_string(),
+                ))
+            }
             Err(commit_err) => match storage.rollback().await {
-                Err(rb_err) if !rollback_found_no_transaction(&rb_err) => {
+                Err(rb_err) if !found_no_transaction(&rb_err) => {
                     Err(DynoxideError::InternalServerError(format!(
                         "commit failed ({commit_err}) and rollback also failed ({rb_err})"
                     )))
@@ -40,7 +53,7 @@ where
             },
         },
         Err(e) => match storage.rollback().await {
-            Err(rb_err) if !rollback_found_no_transaction(&rb_err) => {
+            Err(rb_err) if !found_no_transaction(&rb_err) => {
                 Err(DynoxideError::InternalServerError(format!(
                     "operation failed ({e}) and rollback also failed ({rb_err})"
                 )))
@@ -50,10 +63,10 @@ where
     }
 }
 
-/// Whether a rollback failed only because no transaction was active: SQLite's
-/// `cannot rollback - no transaction is active`, which both backends pass on
-/// in SQLite's own words.
-fn rollback_found_no_transaction(err: &crate::storage_backend::BackendError) -> bool {
+/// Whether a commit or rollback failed only because no transaction was
+/// active: SQLite's `cannot commit - no transaction is active` or `cannot
+/// rollback - ...`, which both backends pass on in SQLite's own words.
+fn found_no_transaction(err: &crate::storage_backend::BackendError) -> bool {
     matches!(
         err,
         crate::storage_backend::BackendError::Other(message)
@@ -2662,18 +2675,58 @@ pub(crate) fn select_projection_rejection(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_rollback_that_found_no_transaction_is_told_apart() {
+    fn a_commit_or_rollback_that_found_no_transaction_is_told_apart() {
         use crate::storage_backend::BackendError;
-        let found_none = |message: &str| {
-            super::rollback_found_no_transaction(&BackendError::Other(message.to_string()))
-        };
+        let found_none =
+            |message: &str| super::found_no_transaction(&BackendError::Other(message.to_string()));
         // As the native backend and the wasm one pass SQLite's message on.
         assert!(found_none("cannot rollback - no transaction is active"));
         assert!(found_none(
             "sqlite-wasm: SQLITE_ERROR: sqlite3 result code 1: cannot rollback - no transaction is active"
         ));
+        assert!(found_none("cannot commit - no transaction is active"));
         assert!(!found_none("disk I/O error"));
-        assert!(!super::rollback_found_no_transaction(&BackendError::Locked));
+        assert!(!super::found_no_transaction(&BackendError::Locked));
+    }
+
+    /// SQLite ends a transaction itself after some errors (a full disk, an
+    /// I/O error). A write that carries on regardless reaches a commit with no
+    /// transaction to commit, and says so rather than passing on SQLite's
+    /// bare commit error.
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+    #[test]
+    fn a_commit_sqlite_had_already_ended_is_named() {
+        let storage = crate::storage::Storage::memory().unwrap();
+        storage
+            .conn()
+            .execute_batch("CREATE TABLE w (x TEXT)")
+            .unwrap();
+        let result = pollster::block_on(super::with_write_transaction(&storage, async {
+            let conn = storage.conn();
+            conn.execute_batch(
+                "INSERT INTO w VALUES ('before'); ROLLBACK; INSERT INTO w VALUES ('after');",
+            )
+            .unwrap();
+            Ok(())
+        }));
+        match result {
+            Err(crate::DynoxideError::InternalServerError(message)) => assert_eq!(
+                message,
+                "the write was not committed: SQLite ended its transaction after an earlier \
+                 error, so what ran before that error was rolled back, and anything run after \
+                 it was applied on its own"
+            ),
+            other => panic!("expected the ended-transaction error, got {other:?}"),
+        }
+        let rows: Vec<String> = {
+            let mut stmt = storage.conn().prepare("SELECT x FROM w").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        // The statement after the transaction ended ran on its own.
+        assert_eq!(rows, ["after"]);
     }
 
     #[test]

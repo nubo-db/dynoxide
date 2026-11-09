@@ -393,6 +393,11 @@ pub(crate) async fn rebuild_multi_attribute_gsis<S: StorageBackend>(storage: &S)
         let Some(meta) = storage.get_table_metadata(&table_name).await? else {
             continue;
         };
+        // A listed table an interrupted CreateTable or DeleteTable left
+        // without its data table has no items to rebuild from.
+        if !storage.data_table_exists(&table_name).await? {
+            continue;
+        }
         let key_schema = super::helpers::parse_key_schema(&meta)?;
         for def in parse_gsi_defs(&meta)? {
             if def.hash_attrs.len() <= 1 && def.range_attrs.len() <= 1 {

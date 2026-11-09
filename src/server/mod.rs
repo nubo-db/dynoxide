@@ -357,6 +357,16 @@ async fn handle_request(
     tracing::debug!(operation, body_len = body.len(), "request");
     tracing::trace!(operation, body = %body, "request body");
 
+    // PartiQL parameters fail on whichever fault is written first. A rewrite can leave the body shallow enough to parse, so whether
+    // it is too deep is decided again.
+    let body = match crate::deep_nesting::in_written_order(operation, &body) {
+        Some((rewritten, still_too_deep)) => {
+            too_deep = still_too_deep;
+            rewritten
+        }
+        None => body,
+    };
+
     let result = if too_deep {
         match crate::deep_nesting::resolve(operation, &body) {
             crate::deep_nesting::DeepBody::Unreadable => {

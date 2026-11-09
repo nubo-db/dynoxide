@@ -202,6 +202,16 @@ pub async fn dispatch_http<S: StorageBackend>(
         return HttpOutcome::new(501, unsupported_envelope(operation));
     }
 
+    // PartiQL parameters fail on whichever fault is written first. A rewrite can leave the body shallow enough to parse, so whether
+    // it is too deep is decided again.
+    let in_order = crate::deep_nesting::in_written_order(operation, body);
+    if let Some((_, still_too_deep)) = &in_order {
+        too_deep = *still_too_deep;
+    }
+    let body = in_order
+        .as_ref()
+        .map_or(body, |(rewritten, _)| rewritten.as_str());
+
     let rewritten;
     let body = if too_deep {
         match crate::deep_nesting::resolve(operation, body) {
@@ -263,6 +273,12 @@ pub async fn dispatch<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
+    // PartiQL parameters fail on whichever fault is written
+    // first.
+    let in_order = crate::deep_nesting::in_written_order(op, request_json);
+    let request_json = in_order
+        .as_ref()
+        .map_or(request_json, |(rewritten, _)| rewritten.as_str());
     match route(backend, ctx, op, request_json).await {
         Ok(json) => Ok(json),
         // A request nested deeper than the parser follows fails to decode before
@@ -1289,6 +1305,46 @@ mod tests {
         );
         let err = run(&backend, "PutItem", &deep_music_item(2001)).unwrap_err();
         assert_eq!(err, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    /// An ExecuteStatement on Music with these two parameters.
+    fn two_parameter_statement(first: &str, second: &str) -> String {
+        format!(
+            r#"{{"Statement":"SELECT * FROM \"Music\" WHERE artist = 'a' AND x = ? AND y = ?","Parameters":[{first},{second}]}}"#
+        )
+    }
+
+    #[test]
+    fn a_deep_parameter_and_a_bad_number_are_reported_in_written_order_on_both_entry_points() {
+        // Captured eu-west-2 and us-east-1, 2026-10-09: the first fault in
+        // written order wins, at a depth the parser follows and one it doesn't.
+        const ABC: &str = "The parameter cannot be converted to a numeric value: abc";
+        const BAD: &str = r#"{"N":"abc"}"#;
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for depth in [40, 100] {
+            let deep = format!(
+                "{}{{\"S\":\"leaf\"}}{}",
+                "{\"M\":{\"n\":".repeat(depth),
+                "}}".repeat(depth)
+            );
+            for (body, answer) in [
+                (
+                    two_parameter_statement(&deep, BAD),
+                    crate::validation::NESTING_LIMIT_MESSAGE,
+                ),
+                (two_parameter_statement(BAD, &deep), ABC),
+            ] {
+                let out = http(&backend, Some("DynamoDB_20120810.ExecuteStatement"), &body);
+                assert_eq!(out.status, 400, "{}", out.body);
+                let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+                assert_eq!(v["message"], answer, "depth {depth}: {}", out.body);
+
+                let err = run(&backend, "ExecuteStatement", &body).unwrap_err();
+                let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+                assert_eq!(v["message"], answer, "depth {depth}: {err}");
+            }
+        }
     }
 
     #[test]

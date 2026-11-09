@@ -189,6 +189,12 @@ Add `--db-path <file>` for a database that survives a restart, and
 `--schema <file>` to create tables at startup. Everything else stays at its
 default.
 
+Give each server its own `--db-path`. Two servers on one file aren't
+supported: if they start together, one can fail with `database is locked`, and
+if both start, a table one of them deletes shows up in the other as an internal
+error. Parallel test workers each need a file of their own, or no `--db-path`
+at all.
+
 - **No shell.** Spawning through `sh -c`, `cmd /c` or PHP's string form of
   `proc_open` leaves your process handle pointing at the shell, so stopping it
   can leave Dynoxide running.

@@ -410,9 +410,10 @@ fn unknown_operation_response(content_type: &str) -> Response {
 }
 
 fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
-    // A number given for a boolean is named by how it was written, which
-    // serde_json forgets for `-0` and integers past 64 bits.
-    let body = crate::serde_errors::boolean_numbers_as_written(body);
+    // A number given where it fails the request whatever its value, for a
+    // boolean or in an attribute value, is named by how it was written,
+    // which serde_json forgets for some numbers.
+    let body = crate::serde_errors::misread_numbers_as_written(body);
     let body = body.as_ref();
     // Pre-check JSON field types for operations that use serde_json::Value
     // internally. These checks must run before serde deserialisation because

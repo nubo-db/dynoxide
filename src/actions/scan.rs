@@ -244,10 +244,10 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
-        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
-        // read as a boolean makes the whole request malformed, ahead of
-        // everything else.
-        if let Some(message) = crate::types::malformed_condition_boolean(raw.scan_filter.as_ref()) {
+        // A legacy condition value that can't be read (a boolean that doesn't
+        // read as one, or a member of the wrong JSON type) makes the whole
+        // request malformed, ahead of everything else.
+        if let Some(message) = crate::types::malformed_condition_value(raw.scan_filter.as_ref()) {
             return Err(serde::de::Error::custom(message));
         }
 

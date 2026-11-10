@@ -31,9 +31,9 @@ struct ExecuteStatementRequestRaw {
     #[serde(
         rename = "Parameters",
         default,
-        deserialize_with = "crate::types::deserialize_parameters"
+        deserialize_with = "crate::types::deserialize_held_parameters"
     )]
-    parameters: Option<Vec<AttributeValue>>,
+    parameters: crate::types::HeldParameters,
     #[serde(
         rename = "Limit",
         default,
@@ -62,15 +62,17 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
         // a fraction or saturated is checked like any other.
         let limit = raw.limit.map(|n| n.value);
         // A Limit below 1 can't be carried on to `execute`, whose field holds
-        // no negative, so the request's member errors are listed here, with
-        // the value echoed as read, in the order `execute` lists them.
-        if let Some(below_one) = limit.filter(|l| *l < 1) {
+        // no negative, and a refused parameter is answered only after the
+        // member errors, so in either case they are listed here, with the
+        // value echoed as read, in the order `execute` lists them.
+        let refusal = raw.parameters.refusal;
+        if refusal.is_some() || limit.is_some_and(|l| l < 1) {
             let violations = member_violations(
                 raw.return_values_on_condition_check_failure.as_deref(),
-                Some(below_one),
+                limit,
                 &raw.statement,
                 raw.return_consumed_capacity.as_deref(),
-                raw.parameters.as_deref(),
+                raw.parameters.values.as_deref(),
             );
             if let Some(msg) = crate::validation::format_validation_errors(&violations) {
                 return Err(serde::de::Error::custom(format!(
@@ -79,9 +81,12 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
                 )));
             }
         }
+        if let Some(refusal) = refusal {
+            return Err(serde::de::Error::custom(refusal));
+        }
         Ok(ExecuteStatementRequest {
             statement: raw.statement,
-            parameters: raw.parameters,
+            parameters: raw.parameters.values,
             // At least 1 here, and at most i32::MAX.
             limit: limit.map(|l| l as usize),
             next_token: raw.next_token,

@@ -41,26 +41,48 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
         if is_number_out_of_range(&e) {
             return crate::DynoxideError::SerializationException(String::new());
         }
-        // DynamoDB returns ValidationException for missing required fields,
-        // null values, and unrecognised enum variants. Only true JSON type
-        // mismatches (e.g. number where string is expected) produce a
-        // SerializationException.
-        if msg.contains("missing field")
-            || msg.contains("unknown variant")
-            || msg.contains("invalid type: null")
-        {
-            crate::DynoxideError::ValidationException(msg)
-        } else if msg.contains("empty AttributeValue") {
-            crate::DynoxideError::ValidationException(
-                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes".to_string(),
-            )
-        } else if msg.contains("Supplied AttributeValue") {
-            // Multi-datatype or empty AV error: strip position info and return as-is
-            crate::DynoxideError::ValidationException(strip_position(&msg).to_string())
-        } else {
+        unmarked_validation(&msg).unwrap_or_else(|| {
             crate::DynoxideError::SerializationException(map_serde_to_dynamodb_message(&msg, body))
-        }
+        })
     })
+}
+
+/// The `ValidationException` an unmarked serde message is answered with, or
+/// `None` when it is a `SerializationException`.
+///
+/// DynamoDB returns ValidationException for missing required fields, null
+/// values, and unrecognised enum variants. Only true JSON type mismatches
+/// (e.g. number where string is expected) produce a SerializationException.
+fn unmarked_validation(msg: &str) -> Option<crate::DynoxideError> {
+    if msg.contains("missing field")
+        || msg.contains("unknown variant")
+        || msg.contains("invalid type: null")
+    {
+        Some(crate::DynoxideError::ValidationException(msg.to_string()))
+    } else if msg.contains("empty AttributeValue") {
+        Some(crate::DynoxideError::ValidationException(
+            EMPTY_VALUE.to_string(),
+        ))
+    } else if msg.contains("Supplied AttributeValue") {
+        // Multi-datatype or empty AV error: strip position info and return as-is
+        Some(crate::DynoxideError::ValidationException(
+            strip_position(msg).to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether [`deserialize`] answers a raw serde message with a validation
+/// error rather than a `SerializationException`. A PartiQL parameter refused
+/// this way waits for the request's member checks; one refused as malformed
+/// does not.
+pub(crate) fn is_validation_refusal(msg: &str) -> bool {
+    match classify_marked_serde_error(msg) {
+        Some(crate::DynoxideError::SerializationException(_)) => false,
+        Some(_) => true,
+        None => unmarked_validation(msg).is_some(),
+    }
 }
 
 /// Whether serde_json refused a number for being past f64's range. The JSON is

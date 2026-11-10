@@ -970,6 +970,65 @@ pub(crate) fn deserialize_parameters<'de, D: serde::Deserializer<'de>>(
     reading_parameters(|| Option::<Vec<AttributeValue>>::deserialize(deserializer))
 }
 
+/// A statement's `Parameters` as read off the wire, with the first value
+/// DynamoDB refuses held back.
+///
+/// DynamoDB reads the whole request, then checks its members (`Limit`, the
+/// modes, the statement, the token), then walks the parameters, so a member
+/// error comes back ahead of a parameter it refuses, while a parameter of the
+/// wrong JSON type fails the request ahead of both, even after one refused
+/// for its value (captured eu-west-2, 10 November 2026). The request decoder
+/// raises [`HeldParameters::refusal`] once its member checks pass.
+#[derive(Debug, Default)]
+pub(crate) struct HeldParameters {
+    /// The parameters, each refused one replaced by `{"NULL": true}` so the
+    /// list keeps the length it was sent with. Never run: the refusal is
+    /// raised first.
+    pub(crate) values: Option<Vec<AttributeValue>>,
+    /// The first refusal, as the decoder raised it, marker and all.
+    pub(crate) refusal: Option<String>,
+}
+
+/// Deserialise a statement's `Parameters`, reading their numbers as PartiQL
+/// parameters, into [`HeldParameters`]. Each value is read on its own, in
+/// order, so one refused for its value doesn't stop a later one failing the
+/// request as malformed.
+pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HeldParameters, D::Error> {
+    let Some(raw) = Option::<Vec<serde_json::Value>>::deserialize(deserializer)? else {
+        return Ok(HeldParameters::default());
+    };
+    let mut values = Vec::with_capacity(raw.len());
+    let mut refusal = None;
+    for value in raw {
+        // A parameter that isn't an object (or null) is malformed, as an `L`
+        // or `M` member would be: `"str"` answers `Unexpected value type in
+        // payload`, ahead of `Limit` (captured eu-west-2, 10 November 2026).
+        if let Some(malformed) = JsonSlot::Value.refusal(&value) {
+            return Err(de::Error::custom(format!(
+                "{}{malformed}",
+                crate::serde_errors::SERIALIZATION_MARKER
+            )));
+        }
+        match reading_parameters(|| serde_json::from_value::<AttributeValue>(value)) {
+            Ok(value) => values.push(value),
+            Err(e) => {
+                let message = e.to_string();
+                if !crate::serde_errors::is_validation_refusal(&message) {
+                    return Err(de::Error::custom(message));
+                }
+                refusal.get_or_insert(message);
+                values.push(AttributeValue::NULL(true));
+            }
+        }
+    }
+    Ok(HeldParameters {
+        values: Some(values),
+        refusal,
+    })
+}
+
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's
 /// `BigDecimal(String)` does, so an exponent outside an `int`, or a scale (the
 /// digits after the point less the exponent) outside one, is a value it cannot

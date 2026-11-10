@@ -139,7 +139,7 @@ pub async fn serve_http_with_options(
         c.max_request_body_bytes = MAX_REQUEST_BODY_BYTES;
         // Explicit DNS rebinding defences. Stating the lists protects against an
         // rmcp default flip. Native clients pass because rmcp skips Origin
-        // validation when the header is absent (rmcp 1.6.0 tower.rs:385-387).
+        // validation when the header is absent.
         // Bearer-token auth (the .layer below) is the primary control once the
         // bind widens; this allowlist is defense-in-depth for browser origins.
         c.allowed_hosts = allowed_hosts;

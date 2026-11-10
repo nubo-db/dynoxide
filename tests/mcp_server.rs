@@ -4910,29 +4910,52 @@ fn http_accepts_an_allowed_origin_on_any_port() {
             "Origin {origin} should be accepted, got: {resp}"
         );
     }
+    // `:*` widens the port only: another scheme, or a host that merely starts
+    // with an allowed one, is still refused.
+    for origin in [
+        "https://localhost:3000",
+        "http://localhost.evil.example:3000",
+    ] {
+        let resp = mcp_post(
+            port,
+            &format!("Origin: {origin}\r\n"),
+            &list_tables_call(1, json!({})).to_string(),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403") && resp.contains("Origin header is not allowed"),
+            "Origin {origin} should be refused, got: {resp}"
+        );
+    }
 }
 
 #[test]
 fn http_request_bodies_up_to_16_mib_are_accepted_and_larger_ones_refused() {
+    const LIMIT: usize = 16 * 1024 * 1024;
     let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
     // list_tables ignores arguments it does not know, so padding one out
-    // makes a body of the wanted size without depending on tool behaviour.
-    let padded = |bytes: usize| {
-        list_tables_call(1, json!({"arguments": {"padding": "x".repeat(bytes)}})).to_string()
+    // makes a body of exactly the wanted size without depending on tool
+    // behaviour.
+    let body_of = |total: usize| {
+        let with_padding = |n: usize| {
+            list_tables_call(1, json!({"arguments": {"padding": "x".repeat(n)}})).to_string()
+        };
+        let body = with_padding(total - with_padding(0).len());
+        assert_eq!(body.len(), total);
+        body
     };
 
-    let six_mib = mcp_post(port, "", &padded(6 * 1024 * 1024));
+    let at_limit = mcp_post(port, "", &body_of(LIMIT));
     assert!(
-        six_mib.starts_with("HTTP/1.1 200"),
-        "a 6 MiB body should be accepted, got: {}",
-        &six_mib[..six_mib.len().min(300)]
+        at_limit.starts_with("HTTP/1.1 200"),
+        "a body of exactly 16 MiB should be accepted, got: {}",
+        &at_limit[..at_limit.len().min(300)]
     );
 
-    let seventeen_mib = mcp_post(port, "", &padded(17 * 1024 * 1024));
+    let over_limit = mcp_post(port, "", &body_of(LIMIT + 1));
     assert!(
-        seventeen_mib.starts_with("HTTP/1.1 413"),
-        "a 17 MiB body should be refused with 413, got: {}",
-        &seventeen_mib[..seventeen_mib.len().min(300)]
+        over_limit.starts_with("HTTP/1.1 413"),
+        "a body one byte over 16 MiB should be refused with 413, got: {}",
+        &over_limit[..over_limit.len().min(300)]
     );
 }
 
@@ -4941,30 +4964,44 @@ fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
     // Protocol 2026-07-28 has no initialize: each request carries its version
     // and client capabilities in `_meta`, and names its method and tool in
     // headers. The tool result must match the one a client gets after a
-    // 2025-03-26 initialize.
+    // 2025-03-26 initialize. The 2026-07-28 call goes first, to a server that
+    // has seen no initialize at all.
     let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
-
-    assert!(
-        mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN))
-            .starts_with("HTTP/1.1 200")
-    );
-    let old = mcp_post(port, "", &list_tables_call(2, json!({})).to_string());
+    let call_2026 = list_tables_call(
+        2,
+        json!({"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}),
+    )
+    .to_string();
 
     let new = mcp_post(
         port,
         "MCP-Protocol-Version: 2026-07-28\r\n\
          Mcp-Method: tools/call\r\n\
          Mcp-Name: list_tables\r\n",
-        &list_tables_call(
-            2,
-            json!({"_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {}
-            }}),
-        )
-        .to_string(),
+        &call_2026,
     );
     assert!(new.starts_with("HTTP/1.1 200"), "got: {new}");
+
+    // The same call without its method header is refused, which shows the
+    // request really took the 2026-07-28 path rather than the legacy one.
+    let no_method = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Name: list_tables\r\n",
+        &call_2026,
+    );
+    assert!(
+        no_method.starts_with("HTTP/1.1 400") && no_method.contains("Mcp-Method"),
+        "got: {no_method}"
+    );
+
+    assert!(
+        mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN))
+            .starts_with("HTTP/1.1 200")
+    );
+    let old = mcp_post(port, "", &list_tables_call(2, json!({})).to_string());
     assert_eq!(
         json_rpc_body(&new)["result"]["content"],
         json_rpc_body(&old)["result"]["content"],

@@ -254,6 +254,38 @@ async fn execute_transaction_member_errors_beat_a_refused_parameter() {
 }
 
 #[tokio::test]
+async fn parameters_that_are_not_a_list_fail_first() {
+    let url = start().await;
+    let mut cases = Vec::new();
+    for (parameters, message) in [
+        (r#""x""#, "Unexpected field type"),
+        ("5", "Unexpected field type"),
+        ("true", "Unexpected field type"),
+        ("{}", "Start of structure or map found where not expected"),
+        (
+            r#"{"N":"1"}"#,
+            "Start of structure or map found where not expected",
+        ),
+    ] {
+        for members in ["", r#","Limit":0"#] {
+            cases.push((
+                "ExecuteStatement",
+                format!(r#"{{{SELECT},"Parameters":{parameters}{members}}}"#),
+                SERIALIZATION,
+                message,
+            ));
+        }
+        cases.push((
+            "ExecuteTransaction",
+            format!(r#"{{"TransactStatements":[{{{SELECT},"Parameters":{parameters}}}]}}"#),
+            SERIALIZATION,
+            message,
+        ));
+    }
+    expect(&url, &cases).await;
+}
+
+#[tokio::test]
 async fn a_parameter_of_the_wrong_json_type_fails_first() {
     let url = start().await;
     let cases = [

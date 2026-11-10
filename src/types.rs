@@ -1003,7 +1003,8 @@ pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
         type Value = HeldParameters;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a list of attribute values")
+            // `serde_errors` maps a wrong-type list by this exact wording.
+            f.write_str("a sequence")
         }
 
         fn visit_none<E: de::Error>(self) -> std::result::Result<HeldParameters, E> {

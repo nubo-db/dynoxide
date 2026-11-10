@@ -84,6 +84,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   internal message, or come back as a `ValidationException`. Captured against
   eu-west-2 and us-east-1 on 6 and 8 November 2026
   ([#294](https://github.com/nubo-db/dynoxide/issues/294)).
+- A PartiQL statement whose parameters hold both a value nested past 32 levels
+  and a number DynamoDB can't read, such as `abc` or `1e126`, is refused for
+  whichever DynamoDB meets first. It walks a list in written order and a map's
+  members in the order a Java `HashMap` holding them iterates, which is
+  usually not the order they were written in. Dynoxide used to give the number
+  error whenever the value was shallow enough to parse, and past that lost a
+  bad number written inside or after the deep value. This holds on
+  ExecuteStatement and per statement on BatchExecuteStatement.
+  ExecuteTransaction reads every statement's parameters as one list, so a deep
+  value in the first statement now comes ahead of a bad number in the second.
+  It holds over HTTP and in the wasm engine. Captured against eu-west-2 and
+  us-east-1 on 9 October 2026, and the map order against eu-west-2 on
+  9 November 2026 ([#261](https://github.com/nubo-db/dynoxide/issues/261)).
 
 ## [1.6.0] - 2026-11-07
 

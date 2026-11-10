@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0-rc.1] - 2026-11-10
+
+A release candidate, so wrappers in other languages can be tested against a
+published build before 1.7.0. The crate stays at `dynoxide-rs` 3.3.0 and is not
+published from it.
+
 ### Added
 
 - **`--ready-json` prints one JSON line to stdout once the server is ready**,
@@ -2155,7 +2161,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.7.0-rc.1...HEAD
+[1.7.0-rc.1]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...v1.7.0-rc.1
 [1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0

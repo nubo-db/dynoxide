@@ -53,21 +53,16 @@ impl<'de> Deserialize<'de> for ExecuteTransactionRequest {
         // one answered, and only when no member error is (captured
         // eu-west-2, 10 November 2026).
         let mut refusal = None;
-        let transact_statements = wire
-            .transact_statements
-            .into_iter()
-            .map(|s| {
-                if refusal.is_none() {
-                    refusal = s.parameters.refusal;
-                }
-                ParameterizedStatement {
-                    statement: s.statement,
-                    parameters: s.parameters.values,
-                    return_values_on_condition_check_failure: s
-                        .return_values_on_condition_check_failure,
-                }
-            })
-            .collect();
+        let mut transact_statements = Vec::with_capacity(wire.transact_statements.len());
+        for s in wire.transact_statements {
+            refusal = refusal.or(s.parameters.refusal);
+            transact_statements.push(ParameterizedStatement {
+                statement: s.statement,
+                parameters: s.parameters.values,
+                return_values_on_condition_check_failure: s
+                    .return_values_on_condition_check_failure,
+            });
+        }
         let request = ExecuteTransactionRequest {
             transact_statements,
             client_request_token: wire.client_request_token,

@@ -992,41 +992,72 @@ pub(crate) struct HeldParameters {
 /// Deserialise a statement's `Parameters`, reading their numbers as PartiQL
 /// parameters, into [`HeldParameters`]. Each value is read on its own, in
 /// order, so one refused for its value doesn't stop a later one failing the
-/// request as malformed.
+/// request as malformed. Values are read one at a time off the stream, so
+/// only one parameter's JSON is held at once.
 pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<HeldParameters, D::Error> {
-    let Some(raw) = Option::<Vec<serde_json::Value>>::deserialize(deserializer)? else {
-        return Ok(HeldParameters::default());
-    };
-    let mut values = Vec::with_capacity(raw.len());
-    let mut refusal = None;
-    for value in raw {
-        // A parameter that isn't an object (or null) is malformed, as an `L`
-        // or `M` member would be: `"str"` answers `Unexpected value type in
-        // payload`, ahead of `Limit` (captured eu-west-2, 10 November 2026).
-        if let Some(malformed) = JsonSlot::Value.refusal(&value) {
-            return Err(de::Error::custom(format!(
-                "{}{malformed}",
-                crate::serde_errors::SERIALIZATION_MARKER
-            )));
+    struct List;
+
+    impl<'de> de::Visitor<'de> for List {
+        type Value = HeldParameters;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of attribute values")
         }
-        match reading_parameters(|| serde_json::from_value::<AttributeValue>(value)) {
-            Ok(value) => values.push(value),
-            Err(e) => {
-                let message = e.to_string();
-                if !crate::serde_errors::is_validation_refusal(&message) {
-                    return Err(de::Error::custom(message));
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<HeldParameters, E> {
+            Ok(HeldParameters::default())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<HeldParameters, E> {
+            Ok(HeldParameters::default())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<HeldParameters, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<HeldParameters, A::Error> {
+            let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(256));
+            let mut refusal = None;
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                // A parameter that isn't an object (or null) is malformed, as
+                // an `L` or `M` member would be: `"str"` answers `Unexpected
+                // value type in payload`, ahead of `Limit` (captured
+                // eu-west-2, 10 November 2026).
+                if let Some(malformed) = JsonSlot::Value.refusal(&value) {
+                    return Err(de::Error::custom(format!(
+                        "{}{malformed}",
+                        crate::serde_errors::SERIALIZATION_MARKER
+                    )));
                 }
-                refusal.get_or_insert(message);
-                values.push(AttributeValue::NULL(true));
+                match reading_parameters(|| serde_json::from_value::<AttributeValue>(value)) {
+                    Ok(value) => values.push(value),
+                    Err(e) => {
+                        let message = e.to_string();
+                        if !crate::serde_errors::is_validation_refusal(&message) {
+                            return Err(de::Error::custom(message));
+                        }
+                        refusal.get_or_insert(message);
+                        values.push(AttributeValue::NULL(true));
+                    }
+                }
             }
+            Ok(HeldParameters {
+                values: Some(values),
+                refusal,
+            })
         }
     }
-    Ok(HeldParameters {
-        values: Some(values),
-        refusal,
-    })
+
+    deserializer.deserialize_option(List)
 }
 
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's

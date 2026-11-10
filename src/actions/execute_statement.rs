@@ -61,10 +61,10 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
         // us-east-1, 5 November 2026). Unlike Query and Scan, a value that lost
         // a fraction or saturated is checked like any other.
         let limit = raw.limit.map(|n| n.value);
-        // A Limit below 1 can't be carried on to `execute`, whose field holds
-        // no negative, and a refused parameter is answered only after the
-        // member errors, so in either case they are listed here, with the
-        // value echoed as read, in the order `execute` lists them.
+        // The member errors are listed here, in the order `execute` lists
+        // them, when a Limit below 1 can't be carried on to `execute` (its
+        // field holds no negative), or when a refused parameter must wait for
+        // them. The Limit is echoed as read.
         let refusal = raw.parameters.refusal;
         if refusal.is_some() || limit.is_some_and(|l| l < 1) {
             let violations = member_violations(

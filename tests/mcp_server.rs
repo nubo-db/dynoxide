@@ -3562,9 +3562,14 @@ fn mcp_request(connect_port: u16, host: &str, auth: Option<&str>) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Split a raw HTTP response into (head, body) at the blank line.
+/// The body of a raw HTTP response: everything after the blank line.
 fn response_body(resp: &str) -> &str {
     resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}
+
+/// The status line and headers of a raw HTTP response.
+fn response_head(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(resp)
 }
 
 /// Run the binary expecting it to exit non-zero before serving; returns
@@ -4807,9 +4812,7 @@ fn json_rpc_body(resp: &str) -> Value {
 }
 
 fn content_type(resp: &str) -> String {
-    resp.split_once("\r\n\r\n")
-        .map(|(head, _)| head)
-        .unwrap_or("")
+    response_head(resp)
         .lines()
         .find_map(|l| {
             l.to_ascii_lowercase()
@@ -4817,18 +4820,6 @@ fn content_type(resp: &str) -> String {
                 .map(|v| v.trim().to_string())
         })
         .unwrap_or_default()
-}
-
-fn initialize_over_http(port: u16) -> String {
-    let body = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "1.0"}
-        }
-    });
-    mcp_post(port, "", &body.to_string())
 }
 
 fn list_tables_call(id: u64, extra_params: Value) -> Value {
@@ -4856,7 +4847,7 @@ fn tool_names(list: &Value) -> Vec<String> {
 fn http_lists_the_same_tools_as_stdio_and_answers_in_json() {
     let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
 
-    let init = initialize_over_http(port);
+    let init = mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN));
     assert!(init.starts_with("HTTP/1.1 200"), "got: {init}");
     assert_eq!(
         json_rpc_body(&init)["result"]["serverInfo"]["name"],
@@ -4953,7 +4944,10 @@ fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
     // 2025-03-26 initialize.
     let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
 
-    assert!(initialize_over_http(port).starts_with("HTTP/1.1 200"));
+    assert!(
+        mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN))
+            .starts_with("HTTP/1.1 200")
+    );
     let old = mcp_post(port, "", &list_tables_call(2, json!({})).to_string());
 
     let new = mcp_post(

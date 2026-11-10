@@ -301,6 +301,10 @@ The export call sets:
 - `AWS_REGION` and `AWS_DEFAULT_REGION` to `us-east-1`. Some SDKs read one and
   some the other, so set both.
 
+It removes `AWS_SESSION_TOKEN`. Left in place, a real session token from CI
+would be sent with the dummy pair, to Dynoxide and to any other AWS client in
+the process.
+
 It never sets `AWS_ENDPOINT_URL`, which would send every AWS service to
 Dynoxide. It may set framework variables too, such as Laravel's
 `DYNAMODB_ENDPOINT`, as long as it documents which.

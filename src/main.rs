@@ -389,11 +389,15 @@ compile_error!(
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let cli = Cli::parse();
+    let logs = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    if speaks_mcp_over_stdio(&cli) {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
 
-    if let Err(e) = run().await {
+    if let Err(e) = run(cli).await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -412,10 +416,27 @@ fn main() {
     }
 }
 
+/// Whether this run serves MCP over stdin and stdout. Its stdout then carries
+/// only JSON-RPC messages, so log lines have to go to stderr instead.
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn speaks_mcp_over_stdio(cli: &Cli) -> bool {
+    match &cli.command {
+        #[cfg(feature = "mcp-server")]
+        Some(Commands::Mcp(args)) => !args.http,
+        #[cfg(all(feature = "mcp-server", feature = "import"))]
+        Some(Commands::Import(args)) => {
+            #[cfg(feature = "http-server")]
+            let serve = args.serve;
+            #[cfg(not(feature = "http-server"))]
+            let serve = false;
+            args.mcp && !serve
+        }
+        _ => false,
+    }
+}
 
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         #[cfg(feature = "http-server")]
         Some(Commands::Serve(args)) => run_serve(args).await,
@@ -1370,6 +1391,24 @@ mod tests {
         fn mcp_max_items_must_be_at_least_one() {
             assert!(Cli::try_parse_from(["dynoxide", "mcp", "--max-items", "0"]).is_err());
             assert!(Cli::try_parse_from(["dynoxide", "mcp", "--max-items", "1"]).is_ok());
+        }
+
+        // Only a stdio MCP server keeps stdout for JSON-RPC alone, so only it
+        // sends log output to stderr.
+        #[cfg(all(feature = "mcp-server", feature = "import"))]
+        #[test]
+        fn only_a_stdio_mcp_server_logs_to_stderr() {
+            let stdio = |argv: &[&str]| speaks_mcp_over_stdio(&Cli::try_parse_from(argv).unwrap());
+            assert!(stdio(&["dynoxide", "mcp"]));
+            assert!(!stdio(&["dynoxide", "mcp", "--http"]));
+            assert!(stdio(&[
+                "dynoxide", "import", "--source", "x", "--schema", "s", "--mcp"
+            ]));
+            assert!(!stdio(&[
+                "dynoxide", "import", "--source", "x", "--schema", "s", "--mcp", "--serve"
+            ]));
+            assert!(!stdio(&["dynoxide", "serve"]));
+            assert!(!stdio(&["dynoxide"]));
         }
 
         #[test]

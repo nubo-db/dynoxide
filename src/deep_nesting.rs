@@ -31,7 +31,7 @@
 
 mod parameter_order;
 
-pub(crate) use parameter_order::in_written_order;
+pub(crate) use parameter_order::in_walk_order;
 
 use crate::errors::DynoxideError;
 use crate::validation::{NESTING_LIMIT_MESSAGE, RETURN_VALUES_NOT_HONOURED};

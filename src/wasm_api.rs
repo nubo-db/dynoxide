@@ -202,13 +202,14 @@ pub async fn dispatch_http<S: StorageBackend>(
         return HttpOutcome::new(501, unsupported_envelope(operation));
     }
 
-    // PartiQL parameters fail on whichever fault is written first. A rewrite can leave the body shallow enough to parse, so whether
-    // it is too deep is decided again.
-    let in_order = crate::deep_nesting::in_written_order(operation, body);
-    if let Some((_, still_too_deep)) = &in_order {
+    // PartiQL parameters fail on whichever fault DynamoDB's walk meets first
+    // (see `deep_nesting::parameter_order`). A rewrite can leave the body
+    // shallow enough to parse, so whether it is too deep is decided again.
+    let in_walk_order = crate::deep_nesting::in_walk_order(operation, body);
+    if let Some((_, still_too_deep)) = &in_walk_order {
         too_deep = *still_too_deep;
     }
-    let body = in_order
+    let body = in_walk_order
         .as_ref()
         .map_or(body, |(rewritten, _)| rewritten.as_str());
 
@@ -273,10 +274,10 @@ pub async fn dispatch<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
-    // PartiQL parameters fail on whichever fault is written
-    // first.
-    let in_order = crate::deep_nesting::in_written_order(op, request_json);
-    let request_json = in_order
+    // PartiQL parameters fail on whichever fault DynamoDB's walk meets first
+    // (see `deep_nesting::parameter_order`).
+    let in_walk_order = crate::deep_nesting::in_walk_order(op, request_json);
+    let request_json = in_walk_order
         .as_ref()
         .map_or(request_json, |(rewritten, _)| rewritten.as_str());
     match route(backend, ctx, op, request_json).await {
@@ -1315,9 +1316,9 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_parameter_and_a_bad_number_are_reported_in_written_order_on_both_entry_points() {
+    fn a_deep_parameter_and_a_bad_number_are_reported_in_walk_order_on_both_entry_points() {
         // Captured eu-west-2 and us-east-1, 2026-10-09: the first fault in
-        // written order wins, at a depth the parser follows and one it doesn't.
+        // the list wins, at a depth the parser follows and one it doesn't.
         const ABC: &str = "The parameter cannot be converted to a numeric value: abc";
         const BAD: &str = r#"{"N":"abc"}"#;
         let backend = Storage::memory().unwrap();

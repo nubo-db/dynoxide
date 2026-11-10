@@ -1,10 +1,12 @@
 //! A PartiQL statement whose parameters hold both a value nested too deep and
-//! a number DynamoDB can't read is refused for whichever comes first in
-//! written order, member order inside a map included.
+//! a number DynamoDB can't read is refused for whichever DynamoDB's walk meets
+//! first: list elements in written order, a map's members in the order a Java
+//! `HashMap` sized for them iterates.
 //!
 //! Captured against DynamoDB in eu-west-2 and us-east-1 on 2026-10-09, at 40
 //! levels (inside what serde_json parses) and 100 (past it), on
-//! ExecuteStatement, ExecuteTransaction and BatchExecuteStatement.
+//! ExecuteStatement, ExecuteTransaction and BatchExecuteStatement, and the map
+//! order in eu-west-2 on 2026-11-09.
 //! ExecuteTransaction reads every statement's parameters as one list, and a
 //! bad `Limit` comes ahead of both faults (captured eu-west-2, 2026-11-09).
 //! Dynoxide still reads a bad number ahead of `Limit`, so only the order with
@@ -96,8 +98,8 @@ async fn execute_statement(url: &str, statement: &str, parameters: &str) -> Stri
     refusal(status, &body)
 }
 
-/// The six orders from the capture, as (statement, parameters, answer).
-fn the_six_orders(depth: usize) -> Vec<(&'static str, String, &'static str)> {
+/// The orders from the captures, as (statement, parameters, answer).
+fn the_orders(depth: usize) -> Vec<(&'static str, String, &'static str)> {
     let d = leaf_deep(depth);
     vec![
         (PAIR, format!("{d},{BAD}"), NEST),
@@ -106,14 +108,19 @@ fn the_six_orders(depth: usize) -> Vec<(&'static str, String, &'static str)> {
         (SINGLE, format!(r#"{{"M":{{"bad":{BAD},"d":{d}}}}}"#), ABC),
         (SINGLE, deep(depth, BAD), NEST),
         (PAIR, format!(r#"{d},{{"N":"1e126"}}"#), NEST),
+        // `p` is met ahead of `a`, and `d` ahead of `b`, wherever written.
+        (SINGLE, format!(r#"{{"M":{{"a":{d},"p":{BAD}}}}}"#), ABC),
+        (SINGLE, format!(r#"{{"M":{{"p":{BAD},"a":{d}}}}}"#), ABC),
+        (SINGLE, format!(r#"{{"M":{{"b":{BAD},"d":{d}}}}}"#), NEST),
+        (SINGLE, format!(r#"{{"M":{{"d":{d},"b":{BAD}}}}}"#), NEST),
     ]
 }
 
 #[tokio::test]
-async fn execute_statement_reports_the_first_fault_in_written_order() {
+async fn execute_statement_reports_the_first_fault_in_walk_order() {
     let url = start().await;
     for depth in [40, 100] {
-        for (statement, parameters, answer) in the_six_orders(depth) {
+        for (statement, parameters, answer) in the_orders(depth) {
             assert_eq!(
                 execute_statement(&url, statement, &parameters).await,
                 answer,
@@ -125,7 +132,7 @@ async fn execute_statement_reports_the_first_fault_in_written_order() {
 }
 
 #[tokio::test]
-async fn execute_transaction_reports_the_first_fault_in_written_order() {
+async fn execute_transaction_reports_the_first_fault_in_walk_order() {
     let url = start().await;
     for depth in [40, 100] {
         let d = leaf_deep(depth);
@@ -285,6 +292,23 @@ async fn a_parameter_value_with_two_members_is_answered_and_the_server_stays_up(
     )
     .await;
     assert_eq!(status, 400, "{body}");
+    let (status, body) = send(&url, "ListTables", "{}".to_string()).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn a_map_member_with_no_name_is_answered_and_the_server_stays_up() {
+    let url = start().await;
+    for depth in [40, 100] {
+        let parameters = format!(r#"{},{{"M":{{{BAD}}}}}"#, leaf_deep(depth));
+        let (status, body) = send(
+            &url,
+            "ExecuteStatement",
+            format!(r#"{{"Statement":"{PAIR}","Parameters":[{parameters}]}}"#),
+        )
+        .await;
+        assert_eq!(status, 400, "depth {depth}: {body}");
+    }
     let (status, body) = send(&url, "ListTables", "{}".to_string()).await;
     assert_eq!(status, 200, "{body}");
 }

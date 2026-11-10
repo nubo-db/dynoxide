@@ -58,7 +58,10 @@ starts, so a test log shows which binary ran.
 A binary from step 1 or 2 could be any version, and it isn't checksum-verified
 (say so in your docs). Run `<binary> --version` first. It prints
 `dynoxide <version>` on one line. Compare only the `X.Y.Z` part: a
-pre-release counts as its release, so `1.7.0-rc.1` has everything 1.7.0 has.
+pre-release counts as its release. That holds for the flags this contract
+needs: every 1.7.0 pre-release has `--ready-json` and `--exit-with-parent`, and
+a flag the contract comes to depend on ships in the first pre-release of the
+version that adds it.
 If that's older than the version this
 contract needs, the binary doesn't know `--ready-json` or `--exit-with-parent`.
 Start it without both, wait for the stderr line `Dynoxide listening on
@@ -121,7 +124,10 @@ what your tests run.
   this, and the error should make the fix obvious.
 - Create temporary files with random names, exclusively.
 - Use an existing install only if the binary's SHA-256 matches its
-  `dynoxide.sha256`.
+  `dynoxide.sha256` and, when you embed one, the expected binary hash for that
+  version and target. Another wrapper may have written the install, so
+  `dynoxide.sha256` alone catches a damaged file, not a replaced one. Without
+  embedded binary hashes, say that in your docs.
 - On Windows, rely on `%LOCALAPPDATA%` being per-user.
 
 ### Installing when several processes race
@@ -433,7 +439,8 @@ Fixed, so wrappers behave alike:
 - [ ] The cache uses the shared location and layout, and fails loudly when it
       can't be written.
 - [ ] Cache directories are `0700`, checked before use, and an existing
-      install is re-verified against its `dynoxide.sha256`.
+      install is re-verified against its `dynoxide.sha256` and any embedded
+      binary hash.
 - [ ] Concurrent installs go through a temporary directory and a rename.
 - [ ] Downloads are checked against `sha256sums.txt` before unpacking.
 - [ ] A mirror must be `https`, except on loopback.
@@ -449,6 +456,11 @@ Fixed, so wrappers behave alike:
 - [ ] No other process holds the stdin pipe, forks included.
 
 ## Changes to this contract
+
+A flag this contract depends on ships in the first pre-release of the engine
+version that adds it, and a later pre-release of that version never adds one.
+Wrappers compare only `X.Y.Z`, so a flag that arrived in `rc.2` would crash
+them on `rc.1`.
 
 - **Launcher contract 1** (Dynoxide 1.7.0): first draft. Corrected after the
   first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the

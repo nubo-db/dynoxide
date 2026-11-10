@@ -57,7 +57,9 @@ starts, so a test log shows which binary ran.
 
 A binary from step 1 or 2 could be any version, and it isn't checksum-verified
 (say so in your docs). Run `<binary> --version` first. It prints
-`dynoxide <version>` on one line. If that's older than the version this
+`dynoxide <version>` on one line. Compare only the `X.Y.Z` part: a
+pre-release counts as its release, so `1.7.0-rc.1` has everything 1.7.0 has.
+If that's older than the version this
 contract needs, the binary doesn't know `--ready-json` or `--exit-with-parent`.
 Start it without both, wait for the stderr line `Dynoxide listening on
 http://<host>:<port>` and then for `GET /` to answer `200`, and stop it with
@@ -81,8 +83,14 @@ Inside it, the binary lives at:
 
 ```text
 <cache>/<version>/<target>/dynoxide        (dynoxide.exe on Windows)
-<cache>/<version>/<target>/dynoxide.sha256 (the checksum it was verified against)
+<cache>/<version>/<target>/dynoxide.sha256 (the binary's SHA-256)
 ```
+
+`<version>` is the full version, including any pre-release part, so
+`1.7.0-rc.1` never shares a directory with `1.7.0`. `dynoxide.sha256` holds the
+SHA-256 of the binary itself (not of the archive it came in) as lowercase hex,
+followed by a newline. Read it leniently, taking the first word in any case,
+so an install another wrapper wrote as `<hash>  dynoxide` still counts.
 
 The layout is fixed, so a PHP wrapper and a Python wrapper find each other's
 installs and a machine downloads each version once. The target is in the path
@@ -210,6 +218,15 @@ at all.
   port, so parallel test processes never collide. Don't reuse a server you
   find already listening on a fixed port: you can't tell it's yours, or even
   that it's Dynoxide.
+- **Check the binary exists first.** Some runtimes report a successful spawn
+  for a missing file and let the child exit `127` (PHP 8.1 and 8.2 do). Check
+  the file before spawning, and treat an exit of `126` or `127` before the
+  ready line as "couldn't run it", not as a crash.
+- **Hold on to the process.** Keep the process handle and your end of the
+  stdin pipe referenced for as long as the server should run, somewhere that
+  outlives the call that started it. A runtime that closes pipes when their
+  object is garbage-collected (PHP does) will otherwise close stdin, and with
+  `--exit-with-parent` the server stops.
 
 ### Keep reading its output
 
@@ -305,6 +322,10 @@ It removes `AWS_SESSION_TOKEN`. Left in place, a real session token from CI
 would be sent with the dummy pair, to Dynoxide and to any other AWS client in
 the process.
 
+Set them everywhere your runtime reads the environment from. In PHP that's
+`putenv()`, `$_ENV` and `$_SERVER`, because PHPUnit builds some child
+processes' environments from `$_SERVER`.
+
 It never sets `AWS_ENDPOINT_URL`, which would send every AWS service to
 Dynoxide. It may set framework variables too, such as Laravel's
 `DYNAMODB_ENDPOINT`, as long as it documents which.
@@ -315,7 +336,7 @@ that read it:
 | Language | Package | First version |
 |---|---|---|
 | JavaScript | `@aws-sdk/client-dynamodb` | 3.428.0 |
-| PHP | `aws/aws-sdk-php` | 3.281.0 |
+| PHP | `aws/aws-sdk-php` | 3.298.9 |
 | Python | `boto3` / `botocore` | 1.28.0 / 1.31.0 |
 | Java | AWS SDK for Java 2.x | 2.28.1 |
 | Go | `github.com/aws/aws-sdk-go-v2/config` | 1.21.0 |
@@ -323,12 +344,19 @@ that read it:
 | Ruby | `aws-sdk-core` | 3.178.0 |
 | Rust | `aws-config` | 1.1.10 |
 
+PHP's SDK reads the variable from 3.281.0, but before 3.298.9 its requests
+still go to AWS, with only the scheme taken from the variable. The client's
+reported endpoint looks right, so check where a request actually lands.
+
 The AWS SDK for Java 1.x, JavaScript v2 and Go v1 never read it. With those,
 pass the endpoint to the client yourself.
 
 ## Stopping the server
 
 Signal the server only through the process handle your spawn call returned.
+Keep the first exit status you're given: some runtimes report a status only
+once (PHP's `proc_get_status()` reports a signal death, and on 8.1 and 8.2 any
+exit, on one call only).
 Never use the `pid` from the ready line: process IDs get reused, and a stale
 one can belong to something else.
 
@@ -368,7 +396,8 @@ of the pipe's write end is closed. If another process holds a copy, stopping
 waits out the grace period and a dead runner leaves the server running until
 that process exits too.
 
-- Spawned children don't inherit the pipe by default in Node, Python and Java.
+- Spawned children don't inherit the pipe by default in Node, Python, Java and
+  PHP.
   Check your runtime's behaviour if it isn't one of those.
 - Forking copies every descriptor: `os.fork`, `multiprocessing` with the fork
   start method, PHP's `pcntl_fork`. Where the runtime has a fork hook, register
@@ -421,4 +450,8 @@ Fixed, so wrappers behave alike:
 
 ## Changes to this contract
 
-- **Launcher contract 1** (Dynoxide 1.7.0): first draft.
+- **Launcher contract 1** (Dynoxide 1.7.0): first draft. Corrected after the
+  first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the
+  cache path, pre-releases in the version check, spawns that report success
+  for a missing binary, holding the process, exit statuses reported once,
+  where to export the environment, and PHP's first working SDK version.

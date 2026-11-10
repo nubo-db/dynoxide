@@ -2538,7 +2538,7 @@ impl McpServer {
 
 #[tool_handler]
 impl ServerHandler for McpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let base_instructions = "\
             Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. \
             All data is local: no AWS credentials required.\n\n\
@@ -2583,7 +2583,7 @@ impl ServerHandler for McpServer {
             instructions.push_str(&summary);
         }
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("dynoxide", crate::PRODUCT_VERSION))
             .with_instructions(instructions)
     }

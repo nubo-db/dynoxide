@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`rusqlite` moves to 0.41.1, which brings `libsqlite3-sys` 0.39.1 and
+  SQLite 3.54.1,** for RUSTSEC-2026-0459 (CVE-2026-119375). SQLite before
+  3.54.0 can return stale memory when it opens a database together with a
+  `-wal` file whose page size differs, so a crafted pair of files could leak
+  bytes from the process. Every native build bundles SQLite, so this reaches
+  any Dynoxide that opens a database file someone else could have written.
+  The encrypted builds (the `encryption`, `encryption-cc` and
+  `encrypted-full` features) are not fixed yet: `libsqlite3-sys` 0.39.1 pins
+  SQLCipher 4.19.0, which bundles SQLite 3.53.4. They move when `rusqlite`
+  takes a SQLCipher built on 3.54. Crate users get the fix from
+  `dynoxide-rs` 4.0.0, since the `rusqlite` move changes public types (see
+  Breaking below).
+- **`rmcp` moves to 3.9.0** for RUSTSEC-2026-0457 and RUSTSEC-2026-0462.
+  Both are in `rmcp`'s HTTP client code, which Dynoxide does not compile: the
+  MCP server uses only `rmcp`'s server features. cargo-deny checks the whole
+  dependency, so it moves anyway.
+
+### Behaviour changes
+
+- **The MCP HTTP server refuses request bodies over 16 MiB with a 413**, the
+  same limit as the DynamoDB endpoint. `rmcp` 2 had no limit, and `rmcp` 3
+  defaults to 4 MiB, which would have refused a large `bulk_put_items`. Over
+  stdio, `rmcp` 3 now drops a single message line longer than 16 MiB.
+- **A stdio MCP server (`dynoxide mcp`, `dynoxide import --mcp`) writes its
+  log output to stderr**, so stdout carries only MCP messages. Before, a log
+  line could reach the client mixed in with them. Every other mode still logs
+  to stdout.
+- MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
+  serves without an `initialize` step. Clients on earlier versions see no
+  change.
+
+### Changed
+
+- The declared MSRV is now 1.89, which `rusqlite` 0.41 needs.
+
+#### Breaking (Rust API)
+
+- `Storage::conn()`, `DynoxideError::SqliteError` and
+  `storage_backend::from_rusqlite` now use `rusqlite` 0.41's types, so code
+  that passes them to or from its own `rusqlite` needs 0.41 too. The next
+  crate release is `dynoxide-rs` 4.0.0.
+
 ### Fixed
 
 - **Opening a database checks what it reads before it changes anything.** A

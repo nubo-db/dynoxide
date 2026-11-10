@@ -3048,9 +3048,9 @@ fn test_http_transport_dns_rebinding_defences() {
         String::from_utf8_lossy(&buf).into_owned()
     };
 
-    // Ordering is load-bearing: with stateful_mode=false the Host and Origin
-    // checks run before session lookup, so per-request rejection cannot leak
-    // state. If stateful_mode ever flips, revisit this ordering.
+    // Ordering is load-bearing: with legacy_session_mode=false the Host and
+    // Origin checks run before session lookup, so per-request rejection cannot
+    // leak state. If legacy_session_mode ever flips, revisit this ordering.
     let loopback = send(&format!("127.0.0.1:{port}"), None);
     assert!(
         loopback.starts_with("HTTP/1.1 2"),
@@ -3562,9 +3562,14 @@ fn mcp_request(connect_port: u16, host: &str, auth: Option<&str>) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Split a raw HTTP response into (head, body) at the blank line.
+/// The body of a raw HTTP response: everything after the blank line.
 fn response_body(resp: &str) -> &str {
     resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}
+
+/// The status line and headers of a raw HTTP response.
+fn response_head(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(resp)
 }
 
 /// Run the binary expecting it to exit non-zero before serving; returns
@@ -4756,4 +4761,305 @@ async fn test_import_serve_mcp_reports_accepted_exposure_over_http() {
     assert_accepted_exposure_report(&tool_content(&resp));
 
     drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP transport behaviour: response format, origins, body size, protocol
+// versions. These pin what an MCP client sees over HTTP, so an rmcp upgrade
+// that changes any of it fails here rather than in a client.
+// ---------------------------------------------------------------------------
+
+const HTTP_TOKEN: &str = "http-behaviour-token";
+
+/// POST a JSON-RPC body to `/mcp` with the bearer token and return the raw
+/// HTTP response. `extra_headers` is inserted verbatim, one `Name: value\r\n`
+/// per header. A write error is ignored so a server that refuses a large body
+/// early still has its response read.
+fn mcp_post(port: u16, extra_headers: &str, body: &str) -> String {
+    use std::io::Read;
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {HTTP_TOKEN}\r\n\
+         {extra_headers}\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let _ = stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(body.as_bytes()));
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The JSON-RPC message in a JSON (not event-stream) response body.
+fn json_rpc_body(resp: &str) -> Value {
+    let body = response_body(resp);
+    let start = body
+        .find('{')
+        .unwrap_or_else(|| panic!("no JSON in: {resp}"));
+    let end = body.rfind('}').unwrap();
+    serde_json::from_str(&body[start..=end]).unwrap_or_else(|e| panic!("{e}: {resp}"))
+}
+
+fn content_type(resp: &str) -> String {
+    response_head(resp)
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-type:")
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn list_tables_call(id: u64, extra_params: Value) -> Value {
+    let mut params = json!({"name": "list_tables", "arguments": {}});
+    if let (Some(p), Some(extra)) = (params.as_object_mut(), extra_params.as_object()) {
+        for (k, v) in extra {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params})
+}
+
+fn tool_names(list: &Value) -> Vec<String> {
+    let mut names: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tools in {list}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn http_lists_the_same_tools_as_stdio_and_answers_in_json() {
+    let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
+
+    let init = mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN));
+    assert!(init.starts_with("HTTP/1.1 200"), "got: {init}");
+    assert_eq!(
+        json_rpc_body(&init)["result"]["serverInfo"]["name"],
+        "dynoxide"
+    );
+
+    let list = mcp_post(
+        port,
+        "",
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string(),
+    );
+    assert!(list.starts_with("HTTP/1.1 200"), "got: {list}");
+    let http_tools = tool_names(&json_rpc_body(&list));
+
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let stdio_list = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(http_tools, tool_names(&stdio_list));
+
+    // A tool call is answered with a single JSON body, not an event stream.
+    let call = mcp_post(port, "", &list_tables_call(3, json!({})).to_string());
+    assert!(call.starts_with("HTTP/1.1 200"), "got: {call}");
+    assert!(
+        content_type(&call).starts_with("application/json"),
+        "expected a JSON response, got: {call}"
+    );
+    assert!(
+        json_rpc_body(&call)["result"]["content"].is_array(),
+        "got: {call}"
+    );
+}
+
+#[test]
+fn http_accepts_an_allowed_origin_on_any_port() {
+    // Browser clients send an Origin with the page's port. The allowlist
+    // entries are written with an explicit `:*`, so a dev server on 3000 and
+    // an --allowed-host name on another port both pass.
+    let (port, _srv) = spawn_authed_mcp_host(
+        HTTP_TOKEN,
+        "127.0.0.1",
+        &["--allowed-host", "dynoxide.test"],
+    );
+    for origin in [
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://dynoxide.test:8080",
+    ] {
+        let resp = mcp_post(
+            port,
+            &format!("Origin: {origin}\r\n"),
+            &list_tables_call(1, json!({})).to_string(),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "Origin {origin} should be accepted, got: {resp}"
+        );
+    }
+    // `:*` widens the port only: another scheme, or a host that merely starts
+    // with an allowed one, is still refused.
+    for origin in [
+        "https://localhost:3000",
+        "http://localhost.evil.example:3000",
+    ] {
+        let resp = mcp_post(
+            port,
+            &format!("Origin: {origin}\r\n"),
+            &list_tables_call(1, json!({})).to_string(),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403") && resp.contains("Origin header is not allowed"),
+            "Origin {origin} should be refused, got: {resp}"
+        );
+    }
+}
+
+#[test]
+fn http_request_bodies_up_to_16_mib_are_accepted_and_larger_ones_refused() {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
+    // list_tables ignores arguments it does not know, so padding one out
+    // makes a body of exactly the wanted size without depending on tool
+    // behaviour.
+    let body_of = |total: usize| {
+        let with_padding = |n: usize| {
+            list_tables_call(1, json!({"arguments": {"padding": "x".repeat(n)}})).to_string()
+        };
+        let body = with_padding(total - with_padding(0).len());
+        assert_eq!(body.len(), total);
+        body
+    };
+
+    let at_limit = mcp_post(port, "", &body_of(LIMIT));
+    assert!(
+        at_limit.starts_with("HTTP/1.1 200"),
+        "a body of exactly 16 MiB should be accepted, got: {}",
+        &at_limit[..at_limit.len().min(300)]
+    );
+
+    let over_limit = mcp_post(port, "", &body_of(LIMIT + 1));
+    assert!(
+        over_limit.starts_with("HTTP/1.1 413"),
+        "a body one byte over 16 MiB should be refused with 413, got: {}",
+        &over_limit[..over_limit.len().min(300)]
+    );
+}
+
+#[test]
+fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
+    // Protocol 2026-07-28 has no initialize: each request carries its version
+    // and client capabilities in `_meta`, and names its method and tool in
+    // headers. The tool result must match the one a client gets after a
+    // 2025-03-26 initialize. The 2026-07-28 call goes first, to a server that
+    // has seen no initialize at all.
+    let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
+    let call_2026 = list_tables_call(
+        2,
+        json!({"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}),
+    )
+    .to_string();
+
+    let new = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: tools/call\r\n\
+         Mcp-Name: list_tables\r\n",
+        &call_2026,
+    );
+    assert!(new.starts_with("HTTP/1.1 200"), "got: {new}");
+
+    // A 2026-07-28 request must name its method in a header.
+    let no_method = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Name: list_tables\r\n",
+        &call_2026,
+    );
+    assert!(
+        no_method.starts_with("HTTP/1.1 400") && no_method.contains("Mcp-Method"),
+        "got: {no_method}"
+    );
+
+    // The server reads the version in `_meta`: one that disagrees with the
+    // header is refused, so the call above was checked as a 2026-07-28 request
+    // rather than served as a legacy one.
+    let mismatched = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: tools/call\r\n\
+         Mcp-Name: list_tables\r\n",
+        &list_tables_call(
+            3,
+            json!({"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2025-03-26",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}),
+        )
+        .to_string(),
+    );
+    assert!(
+        mismatched.starts_with("HTTP/1.1 400") && mismatched.contains("_meta"),
+        "got: {mismatched}"
+    );
+
+    assert!(
+        mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN))
+            .starts_with("HTTP/1.1 200")
+    );
+    let old = mcp_post(port, "", &list_tables_call(2, json!({})).to_string());
+    assert_eq!(
+        json_rpc_body(&new)["result"]["content"],
+        json_rpc_body(&old)["result"]["content"],
+        "2026-07-28: {new}\n2025-03-26: {old}"
+    );
+}
+
+#[test]
+fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
+    // rmcp discards a stdio line over 16 MiB and logs an error as it does.
+    // That log must not land on stdout, where the client expects only
+    // JSON-RPC: the next response read here would fail to parse. RUST_LOG is
+    // pinned so an inherited `off` cannot silence the log and pass vacuously.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .arg("mcp")
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp");
+    init_mcp(&mut child);
+
+    let stdin = child.stdin.as_mut().unwrap();
+    let oversized = "x".repeat(17 * 1024 * 1024);
+    writeln!(stdin, "{oversized}").unwrap();
+    stdin.flush().unwrap();
+
+    let resp = call_tool(&mut child, 2, "list_tables", json!({}));
+    assert_eq!(resp["id"], 2, "got: {resp}");
+    assert_eq!(tool_content(&resp)["TableNames"], json!([]));
+
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeded the maximum line length"),
+        "the dropped line should be logged on stderr, got: {stderr}"
+    );
 }

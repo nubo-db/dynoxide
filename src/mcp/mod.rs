@@ -60,6 +60,11 @@ fn bracket_ipv6(host: &str) -> String {
     }
 }
 
+/// Largest MCP request body the HTTP transport accepts; rmcp answers anything
+/// bigger with 413. rmcp's own default is 4 MiB. This matches the DynamoDB
+/// listener's 16 MiB so a large `bulk_put_items` fits on either server.
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Format a `host:port` bind address, bracketing bare IPv6 literals.
 fn format_bind_addr(host: &str, port: u16) -> String {
     format!("{}:{}", bracket_ipv6(host), port)
@@ -107,13 +112,16 @@ pub async fn serve_http_with_options(
     let db = Arc::new(db);
 
     // Loopback defaults, plus any operator-added hosts (for non-loopback binds
-    // reached by name). Each added host gets a matching http:// origin.
+    // reached by name). Each added host gets a matching http:// origin. The
+    // origins say `:*` because rmcp deprecates entries without a port: they
+    // match any port today but will match only port 80 in a later release,
+    // which would refuse a browser page served from localhost:3000.
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
     let mut allowed_origins: Vec<String> =
-        vec!["http://localhost".into(), "http://127.0.0.1".into()];
+        vec!["http://localhost:*".into(), "http://127.0.0.1:*".into()];
     for host in &opts.extra_allowed_hosts {
         allowed_hosts.push(host.clone());
-        allowed_origins.push(format!("http://{}", bracket_ipv6(host)));
+        allowed_origins.push(format!("http://{}:*", bracket_ipv6(host)));
     }
 
     // load-bearing: rmcp's config struct is #[non_exhaustive], so struct-literal
@@ -121,13 +129,17 @@ pub async fn serve_http_with_options(
     #[allow(clippy::field_reassign_with_default)]
     let http_config = {
         let mut c = StreamableHttpServerConfig::default();
-        c.stateful_mode = false;
+        // Stateless, with one JSON body per response: no session to look up,
+        // so every request is checked and answered on its own. Requests on
+        // protocol 2026-07-28 are always served this way.
+        c.legacy_session_mode = false;
         c.json_response = true;
         c.sse_keep_alive = None;
         c.cancellation_token = ct.clone();
+        c.max_request_body_bytes = MAX_REQUEST_BODY_BYTES;
         // Explicit DNS rebinding defences. Stating the lists protects against an
         // rmcp default flip. Native clients pass because rmcp skips Origin
-        // validation when the header is absent (rmcp 1.6.0 tower.rs:385-387).
+        // validation when the header is absent.
         // Bearer-token auth (the .layer below) is the primary control once the
         // bind widens; this allowlist is defense-in-depth for browser origins.
         c.allowed_hosts = allowed_hosts;

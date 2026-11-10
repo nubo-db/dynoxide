@@ -45,8 +45,8 @@ or behaviour note that motivates the change. Cleaner ergonomics or
 
 ## Local setup
 
-- Rust 2024 edition, MSRV 1.88 (both declared in `Cargo.toml`). The crate
-  builds on 1.88, but the test suite's AWS SDK dev-dependencies need Rust
+- Rust 2024 edition, MSRV 1.89 (both declared in `Cargo.toml`). The crate
+  builds on 1.89, but the test suite's AWS SDK dev-dependencies need Rust
   1.94.1 or later, so use a recent stable toolchain to run the tests.
 - `cargo build` to compile, `cargo test` to run the test suite.
 - `cargo fmt --check` and `cargo clippy -- -D warnings` must pass

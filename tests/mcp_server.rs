@@ -4985,8 +4985,7 @@ fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
     );
     assert!(new.starts_with("HTTP/1.1 200"), "got: {new}");
 
-    // The same call without its method header is refused, which shows the
-    // request really took the 2026-07-28 path rather than the legacy one.
+    // A 2026-07-28 request must name its method in a header.
     let no_method = mcp_post(
         port,
         "MCP-Protocol-Version: 2026-07-28\r\nMcp-Name: list_tables\r\n",
@@ -4995,6 +4994,28 @@ fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
     assert!(
         no_method.starts_with("HTTP/1.1 400") && no_method.contains("Mcp-Method"),
         "got: {no_method}"
+    );
+
+    // The server reads the version in `_meta`: one that disagrees with the
+    // header is refused, so the call above was checked as a 2026-07-28 request
+    // rather than served as a legacy one.
+    let mismatched = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: tools/call\r\n\
+         Mcp-Name: list_tables\r\n",
+        &list_tables_call(
+            3,
+            json!({"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2025-03-26",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}),
+        )
+        .to_string(),
+    );
+    assert!(
+        mismatched.starts_with("HTTP/1.1 400") && mismatched.contains("_meta"),
+        "got: {mismatched}"
     );
 
     assert!(

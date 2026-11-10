@@ -188,3 +188,32 @@ fn encrypted_database_file_is_not_readable_as_plaintext() {
         "Encrypted database should not have standard SQLite header"
     );
 }
+
+/// The fixture was written by an older SQLCipher (create_fixtures.rs). A
+/// SQLCipher upgrade must still open it with its key and read its rows.
+#[test]
+fn encrypted_fixture_from_an_older_build_opens_with_its_key() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/option-a-encrypted.db"
+    );
+    // Work on a copy: opening may write WAL files beside the database.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("option-a-encrypted.db");
+    std::fs::copy(fixture, &path).unwrap();
+
+    let db = Database::new_encrypted(path.to_str().unwrap(), TEST_KEY).unwrap();
+    let item = db
+        .get_item(dynoxide::actions::get_item::GetItemRequest {
+            table_name: "Users".to_string(),
+            key: dynoxide::item! { "pk" => "user#1" },
+            ..Default::default()
+        })
+        .unwrap()
+        .item
+        .expect("the fixture's row should be readable");
+    assert_eq!(
+        item.get("name").unwrap(),
+        &dynoxide::AttributeValue::S("Alice".to_string())
+    );
+}

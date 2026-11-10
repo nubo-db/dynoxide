@@ -1036,6 +1036,34 @@ mod tests {
     }
 
     #[test]
+    fn a_partiql_member_error_comes_before_a_refused_parameter() {
+        // Captured eu-west-2, 10 November 2026.
+        let backend = Storage::memory().unwrap();
+        let select = r#""Statement":"SELECT * FROM \"Missing\" WHERE pk = ?""#;
+        for (op, body, message) in [
+            (
+                "ExecuteStatement",
+                format!(r#"{{{select},"Parameters":[{{"N":"abc"}}],"Limit":0}}"#),
+                "1 validation error detected: Value '0' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1",
+            ),
+            (
+                "ExecuteTransaction",
+                format!(
+                    r#"{{"TransactStatements":[{{{select},"Parameters":[{{}}]}}],"ReturnConsumedCapacity":"BAD"}}"#
+                ),
+                "1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed \
+                 to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, \
+                 NONE]",
+            ),
+        ] {
+            let err = run(&backend, op, &body).unwrap_err();
+            let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert_eq!(v["message"], message, "{op}: {err}");
+        }
+    }
+
+    #[test]
     fn malformed_request_json_is_a_serialization_error() {
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "PutItem", "{ this is not json").unwrap_err();

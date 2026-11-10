@@ -68,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had already ended now says it was not committed, and what SQLite kept,
   rather than giving SQLite's bare commit error
   ([#235](https://github.com/nubo-db/dynoxide/issues/235)).
+- ExecuteStatement and ExecuteTransaction report a request's member errors
+  (`Limit`, `ReturnConsumedCapacity`, a statement's mode or text, the token,
+  an empty `Parameters`) ahead of a parameter they refuse, as DynamoDB does.
+  `Limit: 0` beside `{"N":"abc"}` used to come back as the number error, and
+  so did any other parameter refused for its value: an empty one, one with
+  two types, a `NULL` that isn't true. A parameter of the wrong JSON type,
+  such as `{"N":1}` or a bare string, still fails the request first, now even
+  when an earlier parameter was refused for its value. A bare string now
+  answers `Unexpected value type in payload`
+  ([#308](https://github.com/nubo-db/dynoxide/issues/308)).
 - An attribute value with a member of the wrong JSON type is refused with
   DynamoDB's `SerializationException` message, which names what was found and
   what was expected. A number where `S` or `N` belongs gives `NUMBER_VALUE

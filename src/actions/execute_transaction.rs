@@ -10,14 +10,76 @@ use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecuteTransactionRequest {
-    #[serde(rename = "TransactStatements")]
     pub transact_statements: Vec<ParameterizedStatement>,
-    #[serde(rename = "ClientRequestToken", default)]
     pub client_request_token: Option<String>,
-    #[serde(rename = "ReturnConsumedCapacity", default)]
     pub return_consumed_capacity: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ExecuteTransactionRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        /// The request as it arrives on the wire.
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "TransactStatements")]
+            transact_statements: Vec<WireStatement>,
+            #[serde(rename = "ClientRequestToken", default)]
+            client_request_token: Option<String>,
+            #[serde(rename = "ReturnConsumedCapacity", default)]
+            return_consumed_capacity: Option<String>,
+        }
+        /// A [`ParameterizedStatement`] as it arrives on the wire, with a
+        /// refused parameter held back.
+        #[derive(Deserialize)]
+        struct WireStatement {
+            #[serde(rename = "Statement")]
+            statement: String,
+            #[serde(
+                rename = "Parameters",
+                default,
+                deserialize_with = "crate::types::deserialize_held_parameters"
+            )]
+            parameters: crate::types::HeldParameters,
+            #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
+            return_values_on_condition_check_failure: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        // DynamoDB walks every statement's parameters as one list, after the
+        // request's member errors, so the first statement's refusal is the
+        // one answered, and only when no member error is (captured
+        // eu-west-2, 10 November 2026).
+        let mut refusal = None;
+        let mut transact_statements = Vec::with_capacity(wire.transact_statements.len());
+        for s in wire.transact_statements {
+            refusal = refusal.or(s.parameters.refusal);
+            transact_statements.push(ParameterizedStatement {
+                statement: s.statement,
+                parameters: s.parameters.values,
+                return_values_on_condition_check_failure: s
+                    .return_values_on_condition_check_failure,
+            });
+        }
+        let request = ExecuteTransactionRequest {
+            transact_statements,
+            client_request_token: wire.client_request_token,
+            return_consumed_capacity: wire.return_consumed_capacity,
+        };
+        if let Some(refusal) = refusal {
+            let violations = member_violations(&request);
+            if let Some(msg) = crate::validation::format_validation_errors(&violations) {
+                return Err(serde::de::Error::custom(format!(
+                    "{}{msg}",
+                    crate::serde_errors::VALIDATION_MARKER
+                )));
+            }
+            return Err(serde::de::Error::custom(refusal));
+        }
+        Ok(request)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

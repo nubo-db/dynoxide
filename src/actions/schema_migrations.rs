@@ -50,9 +50,10 @@ pub(crate) async fn run_open_migrations<S: StorageBackend>(
 /// The recorded version is read again once the transaction holds the write
 /// lock (`BEGIN IMMEDIATE` on both backends), so a second process opening the
 /// same file can't run the step alongside this one: it waits for the lock, or
-/// fails to get it, and then finds the step done. A failure part way through
-/// rolls back the step and leaves the old version recorded, so the next open
-/// runs it again from the start.
+/// fails to get it, and then finds the step done. A version a newer build
+/// recorded in the meantime is refused, not taken as the step being done. A
+/// failure part way through rolls back the step and leaves the old version
+/// recorded, so the next open runs it again from the start.
 async fn migrate_step<S, F, Fut>(storage: &S, version: u32, step: F) -> Result<()>
 where
     S: StorageBackend,
@@ -60,11 +61,9 @@ where
     Fut: Future<Output = Result<()>>,
 {
     with_write_transaction(storage, async {
-        if storage
-            .recorded_schema_version()
-            .await?
-            .is_some_and(|recorded| recorded >= version)
-        {
+        let recorded = storage.recorded_schema_version().await?;
+        schema::refuse_newer_mid_migration(recorded).map_err(DynoxideError::InternalServerError)?;
+        if recorded.is_some_and(|recorded| recorded >= version) {
             return Ok(());
         }
         step().await?;

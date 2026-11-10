@@ -292,7 +292,7 @@ pub(crate) const VALIDATION_AS_READ_MARKER: &str = "VALIDATION_AS_READ:";
 pub(crate) const REQUEST_VALIDATION_MARKER: &str = "VALIDATION_REQUEST:";
 
 /// The members a request reads as booleans, whose numbers
-/// [`boolean_numbers_as_written`] looks at.
+/// [`misread_numbers_as_written`] looks at.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 const BOOLEAN_MEMBERS: [&str; 5] = [
     "BOOL",
@@ -302,28 +302,58 @@ const BOOLEAN_MEMBERS: [&str; 5] = [
     "Exists",
 ];
 
-/// A request body with each whole number serde_json would read as a float,
-/// `-0` and an integer past 64 bits, written as `0` where it is the value of a
-/// member read as a boolean (`BOOL`, `NULL`, `ConsistentRead`,
-/// `ScanIndexForward`, `Exists`).
+/// The attribute value members that hold something other than a boolean, whose
+/// numbers [`misread_numbers_as_written`] looks at.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+const VALUE_MEMBERS: [&str; 8] = ["S", "N", "B", "SS", "NS", "BS", "L", "M"];
+
+/// The attribute value members holding an array, whose own members' numbers
+/// [`misread_numbers_as_written`] looks at too.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+const LIST_MEMBERS: [&str; 4] = ["SS", "NS", "BS", "L"];
+
+/// A request body with each number serde_json would misread written as one it
+/// reads the same way, where a number fails the request whatever its value:
 ///
-/// DynamoDB names a number given for a boolean by how it is written: a whole
-/// number of any size, `-0` included, is `NUMBER_VALUE`, and one with a point
-/// or an exponent `DECIMAL_VALUE` (captured eu-west-2 and us-east-1,
-/// 2026-10-10). serde_json keeps no text for a number and reads those two as
-/// floats, which would name them `DECIMAL_VALUE`; as `0` they read as the
-/// whole numbers they were written as. A number in one of these members fails
-/// the request whatever its value, so nothing else reads it. The body comes
+/// - the value of a member read as a boolean (`BOOL`, `NULL`,
+///   `ConsistentRead`, `ScanIndexForward`, `Exists`);
+/// - the value of an attribute value's other members (`S`, `N`, `B`, `SS`,
+///   `NS`, `BS`, `L`, `M`), a member of its `SS`, `NS`, `BS` or `L` array, or
+///   a value in its `M` object.
+///
+/// DynamoDB names a number given in these places by how it is written: a
+/// whole number of any size, `-0` included, is `NUMBER_VALUE`, and one with a
+/// point or an exponent `DECIMAL_VALUE` (captured eu-west-2 and us-east-1,
+/// 2026-10-10 for booleans and 2026-11-08 for attribute values). serde_json
+/// keeps no text for a number: it reads `-0` and integers past 64 bits as
+/// floats, which would name them `DECIMAL_VALUE`, so they are written as `0`.
+/// It refuses a decimal past f64's range outright, so that is written as
+/// `0.0`. Nothing else reads these numbers. The body comes
 /// back as it is when there is nothing to rewrite.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
-pub(crate) fn boolean_numbers_as_written(body: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn misread_numbers_as_written(body: &str) -> std::borrow::Cow<'_, str> {
     let bytes = body.as_bytes();
-    let mut rewrites: Vec<(usize, usize)> = Vec::new();
+    let mut rewrites: Vec<(usize, usize, &str)> = Vec::new();
     // The key whose value comes next, once its colon has been read.
     let mut key: Option<&str> = None;
+    // For each open array or object, whether its members are an attribute
+    // value's list or map members.
+    let mut containers: Vec<bool> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            b'[' => {
+                containers.push(key.is_some_and(|key| LIST_MEMBERS.contains(&key)));
+                key = None;
+            }
+            b'{' => {
+                containers.push(key == Some("M"));
+                key = None;
+            }
+            b']' | b'}' => {
+                containers.pop();
+                key = None;
+            }
             b'"' => {
                 let start = i + 1;
                 i = start;
@@ -354,10 +384,14 @@ pub(crate) fn boolean_numbers_as_written(body: &str) -> std::borrow::Cow<'_, str
                 {
                     i += 1;
                 }
-                if key.is_some_and(|key| BOOLEAN_MEMBERS.contains(&key))
-                    && whole_number_read_as_float(&body[start..i])
-                {
-                    rewrites.push((start, i));
+                let token = &body[start..i];
+                let in_value = key.is_some_and(|key| VALUE_MEMBERS.contains(&key))
+                    || containers.last() == Some(&true);
+                let in_boolean = key.is_some_and(|key| BOOLEAN_MEMBERS.contains(&key));
+                if (in_value || in_boolean) && whole_number_read_as_float(token) {
+                    rewrites.push((start, i, "0"));
+                } else if (in_value || in_boolean) && decimal_past_f64(token) {
+                    rewrites.push((start, i, "0.0"));
                 }
                 key = None;
                 continue;
@@ -372,13 +406,61 @@ pub(crate) fn boolean_numbers_as_written(body: &str) -> std::borrow::Cow<'_, str
     }
     let mut rewritten = String::with_capacity(body.len());
     let mut copied = 0;
-    for (start, end) in rewrites {
+    for (start, end, stand_in) in rewrites {
         rewritten.push_str(&body[copied..start]);
-        rewritten.push('0');
+        rewritten.push_str(stand_in);
         copied = end;
     }
     rewritten.push_str(&body[copied..]);
     std::borrow::Cow::Owned(rewritten)
+}
+
+/// Whether a number token is a well-formed JSON number written with a point
+/// or an exponent that serde_json refuses to read as out of range. That is
+/// asked of serde_json itself, whose reading near f64's limit differs from a
+/// correctly rounded parse. Anything that isn't a well-formed number is left
+/// for the parser to refuse.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn decimal_past_f64(token: &str) -> bool {
+    json_number(token)
+        && token.contains(['.', 'e', 'E'])
+        && serde_json::from_str::<f64>(token).is_err()
+}
+
+/// Whether a token follows JSON's number grammar: an optional `-`, an integer
+/// part with no leading zero, then optionally a point with digits and an
+/// exponent with digits.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn json_number(token: &str) -> bool {
+    fn digits(text: &str) -> (&str, &str) {
+        let end = text.bytes().take_while(u8::is_ascii_digit).count();
+        text.split_at(end)
+    }
+    let (int, rest) = digits(token.strip_prefix('-').unwrap_or(token));
+    if int.is_empty() || (int.len() > 1 && int.starts_with('0')) {
+        return false;
+    }
+    let rest = match rest.strip_prefix('.') {
+        Some(fraction) => {
+            let (fraction, rest) = digits(fraction);
+            if fraction.is_empty() {
+                return false;
+            }
+            rest
+        }
+        None => rest,
+    };
+    let rest = match rest.strip_prefix(['e', 'E']) {
+        Some(exponent) => {
+            let (exponent, rest) = digits(exponent.strip_prefix(['+', '-']).unwrap_or(exponent));
+            if exponent.is_empty() {
+                return false;
+            }
+            rest
+        }
+        None => rest,
+    };
+    rest.is_empty()
 }
 
 /// Whether a number token is a JSON integer that serde_json reads as a float:
@@ -475,11 +557,6 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
             }
         }
         return "Start of structure or map found where not expected".to_string();
-    }
-
-    // "expected string for X at line N column N" → wrong type inside AttributeValue
-    if msg.starts_with("expected string for ") {
-        return infer_type_conversion_error(msg, body, "String");
     }
 
     // "expected value at line N column N" → wrong value type at position
@@ -791,13 +868,13 @@ mod tests {
         // A whole number past 64 bits, or `-0`, in a boolean member reads as
         // the integer it was written as.
         assert_eq!(
-            boolean_numbers_as_written(
+            misread_numbers_as_written(
                 r#"{"v": {"BOOL": -0}, "w": {"NULL" : 18446744073709551616}}"#
             ),
             r#"{"v": {"BOOL": 0}, "w": {"NULL" : 0}}"#
         );
         assert_eq!(
-            boolean_numbers_as_written(r#"{"ConsistentRead":-9223372036854775809}"#),
+            misread_numbers_as_written(r#"{"ConsistentRead":-9223372036854775809}"#),
             r#"{"ConsistentRead":0}"#
         );
         // Integers serde reads as integers, decimals, other members and
@@ -806,13 +883,64 @@ mod tests {
             r#"{"v": {"BOOL": 9223372036854775807}}"#,
             r#"{"v": {"BOOL": 18446744073709551615}}"#,
             r#"{"v": {"BOOL": -0.0}, "w": {"NULL": 1e30}}"#,
+            r#"{"v": {"BOOL": 1.5e300}}"#,
+            r#"{"v": {"S": 1.7976931348623157e308}}"#,
             r#"{"Limit": -0, "v": {"N": "18446744073709551616"}}"#,
             r#"{"s": "\"BOOL\": -0", "t": ["BOOL", -0]}"#,
             r#"{"v": {"BOOL": 01}}"#,
         ] {
             assert!(
                 matches!(
-                    boolean_numbers_as_written(body),
+                    misread_numbers_as_written(body),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_value_numbers_are_rewritten_as_written() {
+        // Whole numbers serde reads as floats become `0`, and decimals past
+        // f64's range `0.0`, in an attribute value's members, its list members
+        // and its map values.
+        assert_eq!(
+            misread_numbers_as_written(
+                r#"{"a":{"S":-0},"b":{"N":1e400},"c":{"SS":[1, 99999999999999999999, 1.5E999]},"d":{"L":[-0,{"S":-1e400}]},"e":{"M":{"x":-0,"y":{"S":1e400}}}}"#
+            ),
+            r#"{"a":{"S":0},"b":{"N":0.0},"c":{"SS":[1, 0, 0.0]},"d":{"L":[0,{"S":0.0}]},"e":{"M":{"x":0,"y":{"S":0.0}}}}"#
+        );
+        // A decimal serde_json refuses although it rounds to a finite double.
+        assert_eq!(
+            misread_numbers_as_written(r#"{"v":{"S":1.7976931348623158e308}}"#),
+            r#"{"v":{"S":0.0}}"#
+        );
+        // An attribute named for a type, deep nesting, a string holding
+        // brackets and a decimal past f64's range for a boolean.
+        assert_eq!(
+            misread_numbers_as_written(
+                r#"{"Item":{"M":{"M":{"a":{"L":[{"M":{"b":{"NS":[-0]}}}]}}},"s":{"S":"]}["},"t":{"BOOL":1e400},"ConsistentRead":-1E999}"#
+            ),
+            r#"{"Item":{"M":{"M":{"a":{"L":[{"M":{"b":{"NS":[0]}}}]}}},"s":{"S":"]}["},"t":{"BOOL":0.0},"ConsistentRead":0.0}"#
+        );
+        // Numbers in an ordinary member, in an array or object that isn't an
+        // attribute value's, or inside a string are left alone, as are
+        // decimals serde reads.
+        for body in [
+            r#"{"Limit": 1e400, "Segment": -0}"#,
+            r#"{"t": ["SS", -0], "u": {"x": 1e400}}"#,
+            r#"{"v": {"S": "1e400"}, "w": {"SS": ["-0"]}}"#,
+            r#"{"v": {"S": 1e300}, "w": {"L": [1.5, 7]}}"#,
+            r#"{"M": [1e400], "L": {"x": 1e400}}"#,
+            // Numbers in a string member's array or object, a key that only
+            // looks like a type once unescaped, and malformed numbers.
+            r#"{"v": {"S": [1e400, -0]}, "w": {"N": {"x": -0}}}"#,
+            r#"{"v": {"S\"": -0}, "w": {"\u0053": -0}}"#,
+            r#"{"v": {"S": 01.5e400}, "w": {"N": 1.e400}, "x": {"BOOL": 1e}}"#,
+        ] {
+            assert!(
+                matches!(
+                    misread_numbers_as_written(body),
                     std::borrow::Cow::Borrowed(_)
                 ),
                 "{body}"

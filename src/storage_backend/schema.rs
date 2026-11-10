@@ -64,8 +64,34 @@ pub fn refuse_newer(recorded: Option<u32>) -> Result<(), String> {
     }
 }
 
-/// What an open says of a database a newer build wrote at `version`.
-pub fn newer_than_this_build(version: u32) -> String {
+/// Refuse a version past [`SCHEMA_VERSION`] that a migration step finds once it
+/// holds the write lock: a newer build wrote the file after this open began
+/// bringing it up to date. Unlike [`refuse_newer`], the steps this open had
+/// already finished are kept.
+pub fn refuse_newer_mid_migration(recorded: Option<u32>) -> Result<(), String> {
+    match recorded {
+        Some(version) if version > SCHEMA_VERSION => Err(format!(
+            "this database was written by a newer version of Dynoxide (schema version \
+             {version}; this build reads up to schema version {SCHEMA_VERSION}) while \
+             this build was bringing it up to date. Upgrade Dynoxide to open it. The \
+             steps this build had finished are kept, and it ran no others."
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Read a recorded schema version as [`parse_recorded`] does and refuse one a
+/// newer build wrote, as [`refuse_newer`] does: the version an open may go on
+/// with.
+pub fn accept_recorded(value: Option<&str>) -> Result<Option<u32>, String> {
+    let recorded = parse_recorded(value)?;
+    refuse_newer(recorded)?;
+    Ok(recorded)
+}
+
+/// What an open says of a database a newer build wrote at `version`, given
+/// as it was recorded.
+pub fn newer_than_this_build(version: impl std::fmt::Display) -> String {
     format!(
         "this database was written by a newer version of Dynoxide (schema version \
          {version}; this build reads up to schema version {SCHEMA_VERSION}). Upgrade \
@@ -73,10 +99,31 @@ pub fn newer_than_this_build(version: u32) -> String {
     )
 }
 
-/// Read a recorded schema version. A value that isn't a number reads as no
-/// version, so the open runs every migration rather than skipping them.
-pub fn parse_recorded(value: Option<&str>) -> Option<u32> {
-    value.and_then(|v| v.trim().parse().ok())
+/// Read a recorded schema version: `Ok(None)` when none is recorded, and the
+/// version when the value is digits that fit one. Digits past that were
+/// written by a newer build, and anything else by no build at all, so both are
+/// refused rather than read as no version, which would run every migration on
+/// a file this build doesn't understand.
+pub fn parse_recorded(value: Option<&str>) -> Result<Option<u32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let digits = value.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(unreadable_version(value));
+    }
+    digits
+        .parse()
+        .map(Some)
+        .map_err(|_| newer_than_this_build(digits))
+}
+
+/// What an open says of a recorded schema version that isn't one.
+fn unreadable_version(value: &str) -> String {
+    format!(
+        "this database records a schema version Dynoxide can't read ({value:?}). It was \
+         not written by any build of Dynoxide. The file has not been changed."
+    )
 }
 
 #[cfg(test)]
@@ -155,9 +202,37 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_version_that_is_not_a_number_reads_as_none() {
-        assert_eq!(parse_recorded(Some("11")), Some(11));
-        assert_eq!(parse_recorded(Some("eleven")), None);
-        assert_eq!(parse_recorded(None), None);
+    fn a_recorded_version_reads_only_as_digits() {
+        assert_eq!(parse_recorded(None), Ok(None));
+        assert_eq!(parse_recorded(Some("11")), Ok(Some(11)));
+        assert_eq!(parse_recorded(Some(" 11 ")), Ok(Some(11)));
+        assert_eq!(parse_recorded(Some("4294967295")), Ok(Some(u32::MAX)));
+    }
+
+    #[test]
+    fn digits_past_the_version_type_are_a_newer_build() {
+        for value in ["4294967296", "99999999999"] {
+            assert_eq!(
+                parse_recorded(Some(value)),
+                Err(newer_than_this_build(value)),
+                "{value}"
+            );
+        }
+        assert!(newer_than_this_build("99999999999").contains("schema version 99999999999;"));
+    }
+
+    #[test]
+    fn a_recorded_version_that_is_not_a_number_is_refused() {
+        for value in ["eleven", "-1", "+11", "", "1.5", "1 1"] {
+            let message = parse_recorded(Some(value)).unwrap_err();
+            assert_eq!(
+                message,
+                format!(
+                    "this database records a schema version Dynoxide can't read ({value:?}). \
+                     It was not written by any build of Dynoxide. The file has not been changed."
+                ),
+                "{value}"
+            );
+        }
     }
 }

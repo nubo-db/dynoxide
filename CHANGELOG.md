@@ -40,6 +40,40 @@ published from it.
   emulator verified against AWS**, rather than a drop-in replacement for
   DynamoDB Local.
 
+### Fixed
+
+- **Opening a database checks what it reads before it changes anything.** A
+  schema version that isn't a whole number, or is too large to be one, is
+  refused rather than read as no version, which ran every migration on the
+  file. A newer build writing the file while it opens is now caught under each
+  write lock the open takes, before any migration step runs. A schema change
+  the open needs that fails, on a full disk for example, now fails the open
+  instead of being ignored, and each migration step records its version in the
+  same transaction as its changes, so the recorded version can't go backwards
+  when two processes open one file. A file refused when it is first read
+  keeps its `-wal` as it was, rather than having it written into the main
+  file as the refused connection closes. Files left with a table listed whose
+  data or index table is missing still open. A write whose transaction SQLite
+  had already ended now says it was not committed, and what SQLite kept,
+  rather than giving SQLite's bare commit error
+  ([#235](https://github.com/nubo-db/dynoxide/issues/235)).
+- An attribute value with a member of the wrong JSON type is refused with
+  DynamoDB's `SerializationException` message, which names what was found and
+  what was expected. A number where `S` or `N` belongs gives `NUMBER_VALUE
+  cannot be converted to String`, or `DECIMAL_VALUE` for one written with a
+  point or an exponent, `1e400` included. A non-string in `B` or `BS` gives
+  `only base-64-encoded strings are convertible to bytes`, a scalar where `SS`,
+  `NS`, `BS`, `L` or `M` belongs gives `Unexpected field type`, and a scalar
+  inside `L` or `M` gives `Unexpected value type in payload`. This holds in
+  items, keys, expression values, PartiQL parameters, legacy conditions and a
+  Query or Scan `ExclusiveStartKey`, at any depth in an `L` or `M`, and ahead
+  of the "more than one datatypes" check. A `BOOL` or `NULL` given a decimal
+  past a double's range, such as `1e400`, gives `DECIMAL_VALUE cannot be
+  converted to Boolean`. Most of these used to say `TRUE_VALUE`, give no message, leak an
+  internal message, or come back as a `ValidationException`. Captured against
+  eu-west-2 and us-east-1 on 6 and 8 November 2026
+  ([#294](https://github.com/nubo-db/dynoxide/issues/294)).
+
 ## [1.6.0] - 2026-11-07
 
 The crate moves to `dynoxide-rs` 3.3.0, which adds public items and removes

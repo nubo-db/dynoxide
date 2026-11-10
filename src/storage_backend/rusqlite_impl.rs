@@ -156,6 +156,10 @@ impl StorageBackend for Storage {
         Storage::table_exists(self, table_name).map_err(dyno_to_backend)
     }
 
+    async fn data_table_exists(&self, table_name: &str) -> Result<bool, BackendError> {
+        Storage::data_table_exists(self, table_name).map_err(dyno_to_backend)
+    }
+
     async fn create_data_table(&self, table_name: &str) -> Result<(), BackendError> {
         Storage::create_data_table(self, table_name).map_err(dyno_to_backend)
     }

@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same limit as the DynamoDB endpoint. `rmcp` 2 had no limit, and `rmcp` 3
   defaults to 4 MiB, which would have refused a large `bulk_put_items`. Over
   stdio, `rmcp` 3 now drops a single message line longer than 16 MiB.
+- **A stdio MCP server (`dynoxide mcp`, `dynoxide import --mcp`) writes its
+  log output to stderr**, so stdout carries only MCP messages. Before, a log
+  line could reach the client mixed in with them. Every other mode still logs
+  to stdout.
 - MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
   serves without an `initialize` step. Clients on earlier versions see no
   change.

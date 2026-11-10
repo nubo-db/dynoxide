@@ -389,11 +389,15 @@ compile_error!(
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let cli = Cli::parse();
+    let logs = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    if speaks_mcp_over_stdio(&cli) {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
 
-    if let Err(e) = run().await {
+    if let Err(e) = run(cli).await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -412,10 +416,27 @@ fn main() {
     }
 }
 
+/// Whether this run serves MCP over stdin and stdout. Its stdout then carries
+/// only JSON-RPC messages, so log lines have to go to stderr instead.
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn speaks_mcp_over_stdio(cli: &Cli) -> bool {
+    match &cli.command {
+        #[cfg(feature = "mcp-server")]
+        Some(Commands::Mcp(args)) => !args.http,
+        #[cfg(all(feature = "mcp-server", feature = "import"))]
+        Some(Commands::Import(args)) => {
+            #[cfg(feature = "http-server")]
+            let serve = args.serve;
+            #[cfg(not(feature = "http-server"))]
+            let serve = false;
+            args.mcp && !serve
+        }
+        _ => false,
+    }
+}
 
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         #[cfg(feature = "http-server")]
         Some(Commands::Serve(args)) => run_serve(args).await,

@@ -5029,3 +5029,22 @@ fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
         "2026-07-28: {new}\n2025-03-26: {old}"
     );
 }
+
+#[test]
+fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
+    // rmcp discards a stdio line over 16 MiB and logs an error as it does.
+    // That log must not land on stdout, where the client expects only
+    // JSON-RPC: the next response read here would fail to parse.
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let stdin = child.stdin.as_mut().unwrap();
+    let oversized = "x".repeat(17 * 1024 * 1024);
+    writeln!(stdin, "{oversized}").unwrap();
+    stdin.flush().unwrap();
+
+    let resp = call_tool(&mut child, 2, "list_tables", json!({}));
+    assert_eq!(resp["id"], 2, "got: {resp}");
+    assert_eq!(tool_content(&resp)["TableNames"], json!([]));
+    child.kill().ok();
+}

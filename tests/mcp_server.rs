@@ -5034,8 +5034,16 @@ fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
 fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
     // rmcp discards a stdio line over 16 MiB and logs an error as it does.
     // That log must not land on stdout, where the client expects only
-    // JSON-RPC: the next response read here would fail to parse.
-    let mut child = spawn_mcp();
+    // JSON-RPC: the next response read here would fail to parse. RUST_LOG is
+    // pinned so an inherited `off` cannot silence the log and pass vacuously.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .arg("mcp")
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp");
     init_mcp(&mut child);
 
     let stdin = child.stdin.as_mut().unwrap();
@@ -5046,5 +5054,12 @@ fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
     let resp = call_tool(&mut child, 2, "list_tables", json!({}));
     assert_eq!(resp["id"], 2, "got: {resp}");
     assert_eq!(tool_content(&resp)["TableNames"], json!([]));
-    child.kill().ok();
+
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeded the maximum line length"),
+        "the dropped line should be logged on stderr, got: {stderr}"
+    );
 }

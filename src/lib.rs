@@ -114,6 +114,8 @@ pub mod streams;
 pub mod ttl;
 pub mod types;
 pub mod validation;
+// How DynamoDB reads the base64 text of a binary value in a request.
+pub(crate) mod wire_base64;
 // The single source of truth for DynamoDB operation names, shared by the HTTP
 // server and the wasm engine API so the two lists cannot drift. Compiled only
 // for the builds that consume it.

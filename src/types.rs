@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::de;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -253,7 +254,9 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // A member of the wrong JSON type is refused as the value is parsed,
         // ahead of the checks made on a parsed value: an empty set, a number
         // that doesn't read, a false NULL and a second member (captured
-        // eu-west-2 and us-east-1, 2026-11-08, for the second member).
+        // eu-west-2 and us-east-1, 2026-11-08, for the second member). Base64
+        // that DynamoDB doesn't read is refused here too, in the same order
+        // (captured eu-west-2, 2026-11-11).
         if let Some(refusal) = wrong_json_type_in(obj) {
             return Err(de::Error::custom(format!(
                 "{}{refusal}",
@@ -356,9 +359,8 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 let encoded = val
                     .as_str()
                     .expect("a member of the wrong JSON type is refused above");
-                let bytes = BASE64
-                    .decode(encoded)
-                    .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
+                let bytes = crate::wire_base64::decode(encoded)
+                    .expect("base64 DynamoDB refuses is refused above");
                 Ok(AttributeValue::B(bytes))
             }
             // Both were read above; a NULL that reached here reads as true.
@@ -402,9 +404,8 @@ impl<'de> Deserialize<'de> for AttributeValue {
                         .as_str()
                         .ok_or_else(|| de::Error::custom("expected string in BS"))?;
                     decoded.push(
-                        BASE64
-                            .decode(encoded)
-                            .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?,
+                        crate::wire_base64::decode(encoded)
+                            .expect("base64 DynamoDB refuses is refused above"),
                     );
                 }
                 Ok(AttributeValue::BS(decoded))
@@ -442,7 +443,8 @@ impl<'de> Deserialize<'de> for AttributeValue {
 enum JsonSlot {
     /// A string: `S`, `N`, and the members of `SS` and `NS`.
     Text,
-    /// A base64 string: `B`, and the members of `BS`.
+    /// A base64 string: `B`, and the members of `BS`. The text is read as
+    /// DynamoDB reads it (`wire_base64`), and refused in its words.
     Bytes,
     /// An array: `SS`, `NS`, `BS` and `L`.
     List,
@@ -455,10 +457,24 @@ enum JsonSlot {
 
 impl JsonSlot {
     /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong
-    /// (captured eu-west-2 and us-east-1, 2026-11-08); `None` when the type is
-    /// right, or for JSON null, which the readers below deal with. An empty
-    /// refusal is a `SerializationException` with no message.
-    fn refusal(self, value: &serde_json::Value) -> Option<&'static str> {
+    /// (captured eu-west-2 and us-east-1, 2026-11-08), or when it is base64
+    /// text DynamoDB doesn't read (captured eu-west-2, 2026-11-11); `None`
+    /// when the value reads, or for JSON null, which the readers below deal
+    /// with. An empty refusal is a `SerializationException` with no message.
+    fn refusal(self, value: &serde_json::Value) -> Option<Cow<'static, str>> {
+        self.json_type_refusal(value)
+            .map(Cow::Borrowed)
+            .or_else(|| match (self, value) {
+                (Self::Bytes, serde_json::Value::String(text)) => {
+                    crate::wire_base64::check(text).err().map(|r| r.message())
+                }
+                _ => None,
+            })
+    }
+
+    /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong;
+    /// `None` when the type is right, or for JSON null.
+    fn json_type_refusal(self, value: &serde_json::Value) -> Option<&'static str> {
         use serde_json::Value;
         const MAP_HERE: &str = "Start of structure or map found where not expected";
         match (self, value) {
@@ -487,20 +503,23 @@ impl JsonSlot {
 
 /// DynamoDB's refusal of an attribute value, written as the JSON object
 /// `value`, when one of its type members, or anything nested in its `L` or
-/// `M`, has the wrong JSON type; `None` when the JSON types are right.
+/// `M`, has the wrong JSON type or is base64 DynamoDB doesn't read; `None`
+/// when every member reads.
 /// DynamoDB refuses these as it parses the whole value, so a fault nested in
 /// an `L` or `M` comes ahead of the outer value's own faults, such as a second
 /// member. Members are looked at in key order, which serde_json keeps sorted.
-fn wrong_json_type_in(value: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+fn wrong_json_type_in(
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Cow<'static, str>> {
     value
         .iter()
         .find_map(|(type_key, member)| wrong_json_type(type_key, member))
 }
 
 /// DynamoDB's refusal of an attribute value's `type_key` member when it, or
-/// anything in it, has the wrong JSON type; `None` when the JSON types are
-/// right, and for a member that isn't one of these types.
-fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<&'static str> {
+/// anything in it, has the wrong JSON type or is base64 DynamoDB doesn't
+/// read; `None` when it reads, and for a member that isn't one of these types.
+fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<Cow<'static, str>> {
     let (slot, members) = match type_key {
         "S" | "N" => (JsonSlot::Text, None),
         "B" => (JsonSlot::Bytes, None),

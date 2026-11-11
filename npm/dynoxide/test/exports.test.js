@@ -5,6 +5,7 @@
 // dynoxide/bin/dynoxide, so the exports map must keep that path.
 
 const test = require("node:test");
+const { before, after } = test;
 const assert = require("node:assert");
 const fs = require("fs");
 const os = require("os");
@@ -33,7 +34,7 @@ const npm = (args, cwd) =>
 
 let project;
 
-test.before(() => {
+before(() => {
   project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "dynoxide-exports-")));
   const packed = JSON.parse(npm(["pack", "--json", "--pack-destination", project], PACKAGE));
   fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ name: "consumer", private: true }));
@@ -43,7 +44,7 @@ test.before(() => {
   );
 });
 
-test.after(() => {
+after(() => {
   if (project) fs.rmSync(project, { recursive: true, force: true });
 });
 

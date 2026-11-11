@@ -198,6 +198,20 @@ pub async fn execute<S: StorageBackend>(
             ));
         }
 
+        // The projection is checked through ahead of the keys: a fault in it
+        // comes before a bad key value or a repeated key (captured eu-west-2
+        // and us-east-1, 2026-11-11).
+        if let Some(parsed) = helpers::validate_read_expressions(
+            &keys_and_attrs.expression_attribute_names,
+            &None, // BatchGetItem has no ExpressionAttributeValues
+            helpers::ReadExpressions {
+                projection: keys_and_attrs.projection_expression.as_deref(),
+                ..Default::default()
+            },
+        )? {
+            projections.insert(table_name, parsed);
+        }
+
         // Duplicate AttributesToGet check (must come before duplicate keys check)
         if let Some(ref atg) = keys_and_attrs.attributes_to_get {
             let mut seen = std::collections::HashSet::new();
@@ -239,17 +253,6 @@ pub async fn execute<S: StorageBackend>(
                     ));
                 }
             }
-        }
-
-        if let Some(parsed) = helpers::validate_read_expressions(
-            &keys_and_attrs.expression_attribute_names,
-            &None, // BatchGetItem has no ExpressionAttributeValues
-            helpers::ReadExpressions {
-                projection: keys_and_attrs.projection_expression.as_deref(),
-                ..Default::default()
-            },
-        )? {
-            projections.insert(table_name, parsed);
         }
     }
 

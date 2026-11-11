@@ -72,8 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   syntax, a name or value nobody defined, overlapping projection paths, and
   then a name or value no expression uses. A filter value nobody defined used
   to go unnoticed when no item was read. A key condition value nobody defined
-  is named as the key condition's, and a projection such as `#a,,` is a
-  syntax error in DynamoDB's usual form. `ExpressionAttributeValues` on a Query or Scan
+  is named as the key condition's, and a projection syntax error, such as
+  `#a,,` or `a[-1]`, names the offending token and where it sits, in
+  DynamoDB's usual form. A BatchGetItem reports a fault in a table's
+  projection ahead of a repeated key. `ExpressionAttributeValues` on a Query or Scan
   with only a `ProjectionExpression` is now refused, and on Query and Scan the
   refusal no longer ends with `: FilterExpression is null`
   ([#319](https://github.com/nubo-db/dynoxide/issues/319)).

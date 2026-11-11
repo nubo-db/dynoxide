@@ -579,6 +579,78 @@ jobs:
   # changed file is documentation, so a docs-only PR runs lint and little else.
   # The rules live in scripts/ci-changed-paths.sh, which lint tests. Implemented
   # with git diff (no third-party action).
+  # The npm package's start(), against a binary built here. Node 18 is the
+  # oldest the tests run on (node:test); Node 24 also runs the README's AWS SDK
+  # example and the type checks, which need Node 20 or later and network
+  # installs that the other legs skip.
+  npm-start:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: npm start() (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, node: "18.x", skips: 3 }
+          - { os: macos-latest, node: "18.x", skips: 3 }
+          # SIGTERM is a kill on Windows, so that test is skipped there too.
+          - { os: windows-latest, node: "18.x", skips: 4 }
+          - { os: ubuntu-latest, node: "24", skips: 0, extra: true }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binary
+        run: cargo build --release
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install the AWS SDK and TypeScript for the extra checks
+        if: matrix.extra
+        working-directory: npm/dynoxide
+        run: npm install --prefix test-fixtures --no-save --no-package-lock --no-audit --no-fund @aws-sdk/client-dynamodb@3.1158.0 typescript@6.0.3
+
+      - name: Test
+        working-directory: npm/dynoxide
+        env:
+          DYNOXIDE_BINARY: ${{ github.workspace }}/target/release/dynoxide${{ runner.os == 'Windows' && '.exe' || '' }}
+          DYNOXIDE_EXTRA_CHECKS: ${{ matrix.extra && '1' || '' }}
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap test/binary.test.js test/start.test.js test/exports.test.js | tee "$RUNNER_TEMP/tap.txt"
+
+      - name: Record the leg
+        run: |
+          mkdir leg
+          { echo "expected_skips=${{ matrix.skips }}"; grep -E '^# (tests|fail|skipped) ' "$RUNNER_TEMP/tap.txt"; } > leg/leg.txt
+          cat leg/leg.txt
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: npm-leg-${{ runner.os }}-node${{ matrix.node }}
+          path: leg/leg.txt
+
+  npm-start-legs:
+    name: npm start() every leg ran
+    needs: [changes, npm-start]
+    if: always() && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: npm-leg-*
+          path: legs
+      - name: Check each leg
+        run: scripts/check-npm-legs.sh legs Linux-node18.x macOS-node18.x Windows-node18.x Linux-node24
+
   changes:
     name: Detect what changed
     runs-on: ubuntu-latest

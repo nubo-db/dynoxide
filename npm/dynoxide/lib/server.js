@@ -25,7 +25,8 @@ function watchExit() {
 // Starts a server. `seam` is for the tests: a command prefix to run a fake
 // binary through Node, extra environment for it, shorter grace periods, and a
 // stand-in for the binary lookup.
-async function launch(options = {}, seam = {}) {
+async function launch(options, seam = {}) {
+  options = options || {};
   const found = seam.resolve ? seam.resolve() : resolveBinary(options);
   const command = seam.command || [];
   if (found.source !== "package") {
@@ -37,11 +38,18 @@ async function launch(options = {}, seam = {}) {
   if (options.schema != null) args.push(`--schema=${options.schema}`);
 
   const [cmd, ...prefix] = [...command, found.path];
-  const child = spawn(cmd, [...prefix, ...args], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...withoutKey(process.env), ...seam.env },
-    windowsHide: true,
-  });
+  let child;
+  try {
+    child = spawn(cmd, [...prefix, ...args], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...withoutKey(process.env), ...seam.env },
+      windowsHide: true,
+    });
+  } catch (err) {
+    // spawn() throws rather than emitting 'error' for an argument it can't
+    // pass at all, such as one containing a NUL byte.
+    throw coded("DYNOXIDE_SPAWN_FAILED", `Couldn't run Dynoxide: ${err.message}`);
+  }
 
   const watcher = watch(child, seam.graceMs || GRACE_MS);
   let ready;

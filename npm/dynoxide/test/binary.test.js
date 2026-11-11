@@ -31,17 +31,29 @@ test("a relative path is made absolute, so it runs the file that was checked", (
   assert.deepStrictEqual(resolveBinary({ binary: relative }), { path: FAKE, source: "option" });
 });
 
+test("a directory or a non-string binary is refused with a code", () => {
+  assert.throws(() => resolveBinary({ binary: __dirname }), { code: "DYNOXIDE_BINARY_MISSING", message: /isn't a file/ });
+  assert.throws(() => resolveBinary({ binary: 42 }), { code: "DYNOXIDE_BINARY_MISSING", message: /given as a string/ });
+});
+
+test("a bare command name is explained as needing a path", () => {
+  assert.throws(() => resolveBinary({}, { env: { DYNOXIDE_BINARY: "dynoxide-nowhere" } }), {
+    code: "DYNOXIDE_BINARY_MISSING",
+    message: /takes a path, not a command name/,
+  });
+});
+
 test("a missing option path fails rather than falling through", () => {
   assert.throws(
     () => resolveBinary({ binary: "/no/such/dynoxide" }, { env: { DYNOXIDE_BINARY: FAKE } }),
-    /\/no\/such\/dynoxide, from the binary option, doesn't exist/
+    /no.such.dynoxide, from the binary option, isn't a file/
   );
 });
 
 test("a missing DYNOXIDE_BINARY path fails", () => {
   assert.throws(() => resolveBinary({}, { env: { DYNOXIDE_BINARY: "/no/such/dynoxide" } }), {
     code: "DYNOXIDE_BINARY_MISSING",
-    message: /from DYNOXIDE_BINARY, doesn't exist/,
+    message: /from DYNOXIDE_BINARY, isn't a file/,
   });
 });
 

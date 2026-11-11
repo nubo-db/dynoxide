@@ -13,7 +13,8 @@ const MINIMUM = [1, 7, 0];
 // DYNOXIDE_BINARY, then the platform package. A path that was asked for but
 // doesn't exist is an error rather than a reason to try the next step.
 // `host` stands in for the environment and platform in tests.
-function resolveBinary(options = {}, host = {}) {
+function resolveBinary(options, host = {}) {
+  options = options || {};
   const env = host.env || process.env;
   if (options.binary) {
     return { path: existing(options.binary, "the binary option"), source: "option" };
@@ -27,10 +28,21 @@ function resolveBinary(options = {}, host = {}) {
 // Returns the absolute path, so what runs is the file that was checked rather
 // than whatever a bare name finds on PATH.
 function existing(file, from) {
+  if (typeof file !== "string") {
+    throw coded("DYNOXIDE_BINARY_MISSING", `${from} must be a path to a dynoxide executable, given as a string.`);
+  }
   const absolute = path.resolve(file);
-  if (!fs.existsSync(absolute)) {
-    throw coded("DYNOXIDE_BINARY_MISSING",
-      `The dynoxide binary at ${file}, from ${from}, doesn't exist. ` +
+  let isFile = false;
+  try {
+    isFile = fs.statSync(absolute).isFile();
+  } catch {}
+  if (!isFile) {
+    const bare = !file.includes("/") && !file.includes("\\")
+      ? ` It takes a path, not a command name to look up on PATH.`
+      : "";
+    throw coded(
+      "DYNOXIDE_BINARY_MISSING",
+      `The dynoxide binary at ${absolute}, from ${from}, isn't a file.${bare} ` +
         `Point it at a dynoxide executable, or leave it unset to use the one npm installed.`
     );
   }

@@ -133,6 +133,20 @@ test("a binary that can't be spawned is its own error", async () => {
   );
 });
 
+test("an argument spawn can't pass is a spawn failure, not an uncoded error", async () => {
+  await assert.rejects(fake("ready", { options: { dbPath: "a\0b" } }), { code: "DYNOXIDE_SPAWN_FAILED" });
+});
+
+test("null options are treated as no options", async () => {
+  const server = await launch(null, {
+    command: [process.execPath],
+    env: { FAKE_MODE: "ready" },
+    resolve: () => ({ path: FAKE, source: "package" }),
+  });
+  assert.ok(server.port > 0);
+  await server.stop();
+});
+
 test("port 0 in the ready line is its own error", async () => {
   await assert.rejects(fake("port-zero"), { code: "DYNOXIDE_PORT_ZERO" });
 });

@@ -76,6 +76,14 @@ pub fn to_tool_error(err: DynoxideError) -> CallToolResult {
     if let Some(item) = item {
         error_json["item"] = item;
     }
+    // A cancelled transaction carries one reason per action or statement, as
+    // the HTTP API's `CancellationReasons` does, `Code: None` entries
+    // included so the positions line up and each item in hash order.
+    if let DynoxideError::TransactionCanceledException(_, reasons) = &err
+        && let Ok(reasons) = serde_json::to_value(reasons)
+    {
+        error_json["cancellation_reasons"] = reasons;
+    }
 
     CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
 }

@@ -558,6 +558,104 @@ fn a_failed_condition_writes_number_sets_in_the_operations_order() {
     let _ = child.wait();
 }
 
+/// `ALL_OLD` through the batch and transaction tools hands back the item a
+/// failed condition was evaluated against where the HTTP API does: on the
+/// member's `Error` for `batch_execute_partiql`, and on the statement's or
+/// action's cancellation reason for `execute_transaction_partiql` and
+/// `transact_write_items`, one reason per entry with `Code: None` for those
+/// that would have succeeded. Each expectation is the HTTP API's answer for
+/// the same request on this build.
+#[test]
+fn all_old_reaches_the_batch_and_transaction_tools_as_over_http() {
+    let mut child = mcp_with_table("Guarded");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Guarded",
+            "item": {"pk": {"S": "a"}, "ns": {"NS": ["3", "1", "2"]}, "v": {"N": "1"}}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    // Hash order, as every one of these writes the item over HTTP.
+    let item = json!({"pk": {"S": "a"}, "ns": {"NS": ["3", "2", "1"]}, "v": {"N": "1"}});
+    let failed = json!({
+        "Code": "ConditionalCheckFailed",
+        "Message": "The conditional request failed",
+        "Item": item
+    });
+    let update = r#"UPDATE "Guarded" SET v = 2 WHERE pk = 'a' AND v = 9"#;
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "batch_execute_partiql",
+        json!({"statements": [
+            {"Statement": update, "ReturnValuesOnConditionCheckFailure": "ALL_OLD"}
+        ]}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(
+        tool_content(&resp),
+        json!({"Responses": [{"Error": failed, "TableName": "Guarded"}]})
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "execute_transaction_partiql",
+        json!({"transact_statements": [
+            {"Statement": update, "ReturnValuesOnConditionCheckFailure": "ALL_OLD"},
+            {"Statement": r#"INSERT INTO "Guarded" VALUE {'pk': 'b'}"#}
+        ]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        (
+            "TransactionCanceledException".to_string(),
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [ConditionalCheckFailed, None]"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        tool_content(&resp)["cancellation_reasons"],
+        json!([failed, {"Code": "None"}])
+    );
+
+    let resp = call_tool(
+        &mut child,
+        5,
+        "transact_write_items",
+        json!({"transact_items": [
+            {"Put": {"TableName": "Guarded", "Item": {"pk": {"S": "c"}}}},
+            {"ConditionCheck": {
+                "TableName": "Guarded", "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": "v = :n",
+                "ExpressionAttributeValues": {":n": {"N": "9"}},
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+            }}
+        ]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        (
+            "TransactionCanceledException".to_string(),
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [None, ConditionalCheckFailed]"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        tool_content(&resp)["cancellation_reasons"],
+        json!([{"Code": "None"}, failed])
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn the_instructions_say_capacity_can_be_requested() {
     let mut child = spawn_mcp();

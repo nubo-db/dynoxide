@@ -1327,6 +1327,48 @@ fn validate_operand_types(
         }
         Ok(())
     }
+    // An operand's value when it is the same for every item, for the checks
+    // of the operator it stands under: a literal or a parameter, or a call as
+    // the boolean it returns. A path, or a size, has none until an item is
+    // read.
+    fn fixed_value(
+        operand: &Operand,
+        parameters: &[AttributeValue],
+    ) -> Result<Option<AttributeValue>> {
+        Ok(match operand {
+            Operand::Value(value) => Some(resolve_value(value, parameters)?),
+            Operand::Condition(_) => Some(AttributeValue::BOOL(true)),
+            Operand::Path(_) | Operand::Size(_) => None,
+        })
+    }
+    // A call's own operands are checked before the operator it stands under,
+    // in the order written, so `n BETWEEN size(attribute_exists(n)) AND 5` is
+    // refused as size's (captured eu-west-2, 2026-11-11). `size` measures a
+    // string, a binary, a list, a map or a set: a number, a boolean or a null
+    // is refused whatever the item holds, a call being a boolean and a size a
+    // number (captured eu-west-2, 2026-11-11).
+    fn check_operand(operand: &Operand, parameters: &[AttributeValue]) -> Result<()> {
+        match operand {
+            Operand::Size(inner) => {
+                check_operand(inner, parameters)?;
+                let measured = match inner.as_ref() {
+                    Operand::Size(_) => Some(AttributeValue::N("0".to_string())),
+                    other => fixed_value(other, parameters)?,
+                };
+                if let Some(value) = measured.filter(|value| {
+                    matches!(
+                        value,
+                        AttributeValue::N(_) | AttributeValue::BOOL(_) | AttributeValue::NULL(_)
+                    )
+                }) {
+                    return Err(reject("size", &value));
+                }
+            }
+            Operand::Condition(inner) => check(inner, parameters)?,
+            Operand::Path(_) | Operand::Value(_) => {}
+        }
+        Ok(())
+    }
     fn check(condition: &WhereCondition, parameters: &[AttributeValue]) -> Result<()> {
         match condition {
             // A negated comparison is checked too: `NOT a < ?` reads the
@@ -1356,19 +1398,16 @@ fn validate_operand_types(
                 // A condition function compared is checked as it would be on
                 // its own: `attribute_type(a, ?) = b` checks the type.
                 for side in [left, right] {
-                    if let Operand::Condition(inner) = side {
-                        check(inner, parameters)?;
-                    }
+                    check_operand(side, parameters)?;
                 }
                 let Some(op) = ordering_op(op) else {
                     return Ok(());
                 };
                 for side in [left, right] {
-                    if let Operand::Value(value) = side {
-                        let value = resolve_value(value, parameters)?;
-                        if !orderable(&value) {
-                            return Err(reject(op, &value));
-                        }
+                    if let Some(value) = fixed_value(side, parameters)?
+                        && !orderable(&value)
+                    {
+                        return Err(reject(op, &value));
                     }
                 }
             }
@@ -1377,34 +1416,41 @@ fn validate_operand_types(
             // `size()`, 2026-10-10). A bound that isn't a value, such as a path,
             // can't be checked until an item is read; a value beside it is still
             // held to the orderable types (inferred, not captured).
-            WhereCondition::CompareBetween(_, low, high) => match (low, high) {
-                (Operand::Value(low), Operand::Value(high)) => check_bounds(
-                    &resolve_value(low, parameters)?,
-                    &resolve_value(high, parameters)?,
-                )?,
-                _ => {
-                    for bound in [low, high] {
-                        if let Operand::Value(value) = bound {
-                            let value = resolve_value(value, parameters)?;
-                            if !orderable(&value) {
+            // A call as a bound is a boolean, refused as `true` is there
+            // (captured eu-west-2, 2026-11-11).
+            WhereCondition::CompareBetween(operand, low, high) => {
+                for side in [operand, low, high] {
+                    check_operand(side, parameters)?;
+                }
+                match (low, high) {
+                    (Operand::Value(low), Operand::Value(high)) => check_bounds(
+                        &resolve_value(low, parameters)?,
+                        &resolve_value(high, parameters)?,
+                    )?,
+                    _ => {
+                        for bound in [low, high] {
+                            if let Some(value) = fixed_value(bound, parameters)?
+                                && !orderable(&value)
+                            {
                                 return Err(reject("BETWEEN", &value));
                             }
                         }
                     }
                 }
-            },
+            }
             WhereCondition::CompareIn(operand, members) => {
                 for side in std::iter::once(operand).chain(members) {
-                    if let Operand::Condition(inner) = side {
-                        check(inner, parameters)?;
-                    }
+                    check_operand(side, parameters)?;
                 }
             }
             // A type given to `attribute_type` as a parameter is checked
             // once it is bound, negated or not (captured eu-west-2 and
-            // us-east-1, 2026-10-09).
-            WhereCondition::AttributeType(_, kind @ PartiqlValue::Parameter(_)) => {
-                check_attribute_type_parameter(kind, parameters, reject)?;
+            // us-east-1, 2026-10-09), after the operand it tests.
+            WhereCondition::AttributeType(operand, kind) => {
+                check_operand(operand, parameters)?;
+                if let PartiqlValue::Parameter(_) = kind {
+                    check_attribute_type_parameter(kind, parameters, reject)?;
+                }
             }
             // A condition with no negated form of its own is checked as it
             // would be without the NOT. Inferred, not captured: no capture

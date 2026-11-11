@@ -3444,18 +3444,22 @@ async fn execute_update<S: StorageBackend>(
     // A key attribute can't be set or removed: the item would be stored under
     // its old key with another key value in it. Refused in UpdateItem's words
     // before the item is read, so a missing item or a false condition makes no
-    // difference (captured eu-west-2 and us-east-1, 10 October 2026).
-    let paths = set_clauses
+    // difference (captured eu-west-2 and us-east-1, 10 October 2026). A path
+    // into a key, `pk.x` or `pk[0]`, is an update of that key too, and with
+    // both keys named the sort key is the one reported, whichever is written
+    // first (captured eu-west-2, 2026-11-11).
+    let roots: Vec<_> = set_clauses
         .iter()
-        .map(|clause| clause.path.as_str())
-        .chain(remove_paths.iter().map(String::as_str));
-    for path in paths {
-        let key = std::iter::once(key_schema.partition_key.as_str())
-            .chain(key_schema.sort_key.as_deref())
-            .find(|key| names_attribute(path, key));
-        if let Some(key) = key {
-            return Err(crate::actions::helpers::key_attribute_update_refusal(key));
-        }
+        .map(|clause| root_attribute(&clause.path))
+        .chain(remove_paths.iter().map(|path| root_attribute(path)))
+        .collect();
+    let updated_key = key_schema
+        .sort_key
+        .iter()
+        .chain(std::iter::once(&key_schema.partition_key))
+        .find(|key| roots.iter().any(|root| root == key.as_str()));
+    if let Some(key) = updated_key {
+        return Err(crate::actions::helpers::key_attribute_update_refusal(key));
     }
 
     // No two paths of one statement may overlap, the later clause being `path

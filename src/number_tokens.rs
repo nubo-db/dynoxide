@@ -1,0 +1,615 @@
+//! Number tokens DynamoDB reads that JSON doesn't.
+//!
+//! DynamoDB's request parser takes any run of digits, `.`, `e`, `E`, `+` and
+//! `-` that starts with a digit or `-` as a number token, and reads its text
+//! only when the member it sits in is read (captured eu-west-2, 9 and 10
+//! November 2026):
+//!
+//! - in a member it doesn't read, any such token is accepted;
+//! - in a member of another type it is named by how it is written,
+//!   `DECIMAL_VALUE` when it holds `.`, `e` or `E` and `NUMBER_VALUE`
+//!   otherwise, as a well-formed number is;
+//! - in an integer member it is read by a looser rule than JSON's (see
+//!   [`read_integer`]), and refused as `Bad number format` when that fails.
+//!
+//! serde_json refuses the whole body on such a token, so before the body is
+//! parsed each one is swapped for a stand-in number of the same kind
+//! ([`stand_in_malformed_numbers`]), and the token's text is kept in a table
+//! the integer readers consult for the request in hand. A stand-in is
+//! negative and its digits appear nowhere else in the body, so a reader that
+//! doesn't consult the table and quotes the number it was given can be caught
+//! ([`quotes_stand_in`]) and answered as the token was before: a bare
+//! `SerializationException`.
+
+use std::borrow::Cow;
+
+/// What DynamoDB answers for a number token an integer member can't read.
+pub(crate) const BAD_NUMBER_FORMAT: &str = "Bad number format";
+
+/// The stand-ins in one request body, each with the token it replaced.
+#[derive(Debug, Default)]
+pub(crate) struct StandIns {
+    whole: Vec<(i64, String)>,
+    decimal: Vec<(u64, String)>,
+    /// The digits each stand-in is written with, which the body doesn't
+    /// otherwise hold.
+    #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+    digits: Vec<String>,
+}
+
+impl StandIns {
+    /// The token a number stands in for, or `None` for a number the client
+    /// sent.
+    fn token(&self, number: &serde_json::Number) -> Option<&str> {
+        if let Some(whole) = number.as_i64() {
+            self.whole
+                .iter()
+                .find(|(value, _)| *value == whole)
+                .map(|(_, token)| token.as_str())
+        } else if number.is_f64() {
+            let bits = number.as_f64()?.to_bits();
+            self.decimal
+                .iter()
+                .find(|(value, _)| *value == bits)
+                .map(|(_, token)| token.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+thread_local! {
+    /// The stand-ins of the request being answered on this thread, if it has
+    /// any. Set around the request by the wire seam; empty outside one.
+    static STAND_INS: std::cell::RefCell<Option<std::rc::Rc<StandIns>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The token a number written as `text` stands in for, when the request in
+/// hand holds stand-ins and this is one of them.
+fn token_for(text: &str) -> Option<String> {
+    STAND_INS.with(|cell| {
+        let stand_ins = cell.borrow();
+        let stand_ins = stand_ins.as_ref()?;
+        let number = serde_json::from_str::<serde_json::Number>(text).ok()?;
+        stand_ins.token(&number).map(str::to_string)
+    })
+}
+
+/// Whether `text` quotes a stand-in, so that an answer holding it would give
+/// away a number the client never sent. Always false outside a request with
+/// stand-ins.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn quotes_stand_in(text: &str) -> bool {
+    STAND_INS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|stand_ins| stand_ins.digits.iter().any(|d| text.contains(d.as_str())))
+    })
+}
+
+/// Run `read` with `stand_ins` as the request's table, restoring the table in
+/// force before however `read` ends. `read` must not await: the table belongs
+/// to the thread.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn with_stand_ins<T>(
+    stand_ins: Option<std::rc::Rc<StandIns>>,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::rc::Rc<StandIns>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STAND_INS.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(STAND_INS.with(|cell| cell.replace(stand_ins)));
+    read()
+}
+
+/// Run `future` with `stand_ins` as the request's table, set around each of
+/// its polls and restored after, so the table holds across the future's
+/// awaits without reaching anything polled in between. The wasm engine's
+/// single thread runs other requests between those polls.
+#[cfg(any(feature = "wasm-sqlite", test))]
+pub(crate) async fn with_stand_ins_async<F: std::future::Future>(
+    stand_ins: Option<std::rc::Rc<StandIns>>,
+    future: F,
+) -> F::Output {
+    struct Tabled<F> {
+        stand_ins: Option<std::rc::Rc<StandIns>>,
+        future: std::pin::Pin<Box<F>>,
+    }
+    impl<F: std::future::Future> std::future::Future for Tabled<F> {
+        type Output = F::Output;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            let stand_ins = self.stand_ins.clone();
+            with_stand_ins(stand_ins, || self.future.as_mut().poll(cx))
+        }
+    }
+    Tabled {
+        stand_ins,
+        future: Box::pin(future),
+    }
+    .await
+}
+
+/// `body` with each number token that isn't valid JSON replaced by a stand-in
+/// number of the same kind, and the table of what each stand-in replaced; or
+/// `None`, without copying the body, when every token is valid JSON.
+///
+/// A token is the maximal run of `-`, `+`, `.`, `e`, `E` and digits starting
+/// at a `-` or a digit outside a string, as [`crate::serde_errors`] reads
+/// them. A token that follows JSON's number grammar is left alone whatever
+/// its size. One starting with `.` or `+`, or running into a letter, is left
+/// for the parser to refuse, as DynamoDB refuses it.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn stand_in_malformed_numbers(body: &str) -> Option<(String, StandIns)> {
+    let mut malformed = Vec::new();
+    for_each_token(body, |start, end| {
+        if !crate::serde_errors::json_number(&body[start..end]) {
+            malformed.push((start, end));
+        }
+    });
+    if malformed.is_empty() {
+        return None;
+    }
+
+    // A stand-in mustn't equal a number the client sent, by value as well as
+    // by text, so a reader that meets either after a round trip through
+    // `serde_json::Value` can tell them apart.
+    let mut whole_values = std::collections::HashSet::new();
+    let mut decimal_values = std::collections::HashSet::new();
+    for_each_token(body, |start, end| {
+        if let Ok(number) = serde_json::from_str::<serde_json::Number>(&body[start..end]) {
+            if let Some(whole) = number.as_i64() {
+                whole_values.insert(whole);
+            } else if let Some(decimal) = number.as_f64() {
+                decimal_values.insert(decimal.to_bits());
+            }
+        }
+    });
+
+    let mut stand_ins = StandIns::default();
+    let mut next: i64 = 7_310_000_001;
+    let mut out = String::with_capacity(body.len() + malformed.len() * 16);
+    let mut copied = 0;
+    for (start, end) in malformed {
+        let token = &body[start..end];
+        let decimal = token.contains(['.', 'e', 'E']);
+        let (text, digits) = loop {
+            let candidate = next;
+            next += 1;
+            let digits = candidate.to_string();
+            if body.contains(digits.as_str()) {
+                continue;
+            }
+            if decimal {
+                let value = (-(candidate as f64) - 0.5).to_bits();
+                if !decimal_values.contains(&value) {
+                    stand_ins.decimal.push((value, token.to_string()));
+                    break (format!("-{digits}.5"), digits);
+                }
+            } else if !whole_values.contains(&-candidate) {
+                stand_ins.whole.push((-candidate, token.to_string()));
+                break (format!("-{digits}"), digits);
+            }
+        };
+        out.push_str(&body[copied..start]);
+        out.push_str(&text);
+        // Keep the columns after a short token where they were.
+        for _ in text.len()..token.len() {
+            out.push(' ');
+        }
+        copied = end;
+        stand_ins.digits.push(digits);
+    }
+    out.push_str(&body[copied..]);
+    Some((out, stand_ins))
+}
+
+/// Call `token` with the start and end of each number token in `body`.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn for_each_token(body: &str, mut token: impl FnMut(usize, usize)) {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                token(start, i);
+            }
+            // Letters run on, so `x1` and `e5` start no token: JSON has no
+            // bare words beyond `true`, `false` and `null`.
+            b'a'..=b'z' | b'A'..=b'Z' | b'+' | b'.' | b'_' => {
+                while i < bytes.len()
+                    && matches!(bytes[i], b'a'..=b'z' | b'A'..=b'Z' | b'+' | b'.' | b'_' | b'0'..=b'9' | b'-')
+                {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// The text an integer member reads a number as: the number as written, or,
+/// for a stand-in, the well-formed twin of the token it replaced. `Err` when
+/// the token is one an integer member refuses.
+///
+/// DynamoDB's integer members read `-` alone, or a token with a sign, digits,
+/// a point and an exponent where JSON is stricter: the integer part may have
+/// leading zeros or be empty, and the point may have no digits after it, but
+/// the mantissa needs a digit and an exponent needs one too. Such a token is
+/// read as its twin: `-` as `0`, `01` as `1`, `-.5` as `-0.5`, `1.` as `1.0`,
+/// `1.e5` as `1.0e5` (captured eu-west-2, 9 and 10 November 2026).
+pub(crate) fn integer_text(raw: &str) -> Result<Cow<'_, str>, ()> {
+    match token_for(raw) {
+        None => Ok(Cow::Borrowed(raw)),
+        Some(token) => twin(&token).map(Cow::Owned).ok_or(()),
+    }
+}
+
+/// The well-formed number an integer member reads `token` as, or `None` when
+/// it refuses it.
+fn twin(token: &str) -> Option<String> {
+    if token == "-" {
+        return Some("0".to_string());
+    }
+    let (sign, rest) = match token.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", token),
+    };
+    let digits = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
+    let int_len = digits(rest);
+    let (int, rest) = rest.split_at(int_len);
+    let (fraction, rest) = match rest.strip_prefix('.') {
+        Some(after) => {
+            let len = digits(after);
+            (Some(&after[..len]), &after[len..])
+        }
+        None => (None, rest),
+    };
+    if int.is_empty() && fraction.is_none_or(str::is_empty) {
+        return None;
+    }
+    let exponent = match rest.strip_prefix(['e', 'E']) {
+        Some(after) => {
+            let signed = after.strip_prefix(['+', '-']).unwrap_or(after);
+            if digits(signed) == 0 || digits(signed) != signed.len() {
+                return None;
+            }
+            rest
+        }
+        None if rest.is_empty() => "",
+        None => return None,
+    };
+    let int = int.trim_start_matches('0');
+    let mut twin = format!("{sign}{}", if int.is_empty() { "0" } else { int });
+    if let Some(fraction) = fraction {
+        twin.push('.');
+        twin.push_str(if fraction.is_empty() { "0" } else { fraction });
+    }
+    twin.push_str(exponent);
+    Some(twin)
+}
+
+/// An integer member's reading of a number: its value, truncated toward zero
+/// and held wide enough to clamp to the member's range, and whether it was
+/// read leniently: written as a fraction, past f64's range, or as a token JSON
+/// doesn't allow. DynamoDB checks a member read leniently on its older
+/// validation layer (`Limit` `-` and `00` answer `Value '0' at 'limit'`, as
+/// `0.5` does; captured eu-west-2, 10 November 2026).
+pub(crate) struct Integer {
+    pub(crate) value: i128,
+    pub(crate) lenient: bool,
+}
+
+/// Why an integer member couldn't read what it was given.
+pub(crate) enum IntegerFault {
+    /// A number token the member refuses: `Bad number format`.
+    BadNumber,
+    /// Not a number at all, with serde's reason.
+    NotANumber(serde_json::Error),
+}
+
+/// Read `raw`, a JSON value's text, as an integer member reads it.
+///
+/// A fraction truncates toward zero and one past f64's range saturates, as
+/// DynamoDB reads them (captured eu-west-2 and us-east-1, 6 November 2026).
+pub(crate) fn read_integer(raw: &str) -> Result<Integer, IntegerFault> {
+    let text = integer_text(raw).map_err(|()| IntegerFault::BadNumber)?;
+    let token = matches!(text, Cow::Owned(_));
+    let number = match serde_json::from_str::<serde_json::Number>(&text) {
+        Ok(number) => number,
+        Err(e) if crate::serde_errors::is_number_out_of_range(&e) => {
+            let value = if text.starts_with('-') {
+                i128::MIN
+            } else {
+                i128::MAX
+            };
+            return Ok(Integer {
+                value,
+                lenient: true,
+            });
+        }
+        Err(e) => return Err(IntegerFault::NotANumber(e)),
+    };
+    Ok(if let Some(i) = number.as_i64() {
+        Integer {
+            value: i128::from(i),
+            lenient: token,
+        }
+    } else if let Some(u) = number.as_u64() {
+        Integer {
+            value: i128::from(u),
+            lenient: token,
+        }
+    } else {
+        // NaN and the infinities cannot appear in JSON; `as` saturates.
+        Integer {
+            value: number.as_f64().unwrap_or(0.0).trunc() as i128,
+            lenient: true,
+        }
+    })
+}
+
+/// The `SERIALIZATION:`-marked refusal of a number token an integer member
+/// can't read, for a `Deserialize` impl to raise.
+pub(crate) fn bad_number<E: serde::de::Error>() -> E {
+    E::custom(format!(
+        "{}{BAD_NUMBER_FORMAT}",
+        crate::serde_errors::SERIALIZATION_MARKER
+    ))
+}
+
+/// Deserialise a throughput unit (`ReadCapacityUnits`, `WriteCapacityUnits`,
+/// `MaxReadRequestUnits`, `MaxWriteRequestUnits`), a Long, as an integer
+/// member reads it: a fraction truncates and a number past the range
+/// saturates (`0.5` and `-.5` read as 0, captured eu-west-2, 10 November
+/// 2026). Anything other than a number keeps serde's own wording.
+pub(crate) fn deserialize_units<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    use serde::Deserialize as _;
+    use serde::de::Error as _;
+    let Some(raw) = Option::<Box<serde_json::value::RawValue>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match read_integer(raw.get()) {
+        Ok(integer) => Ok(Some(saturate_i64(integer.value))),
+        Err(IntegerFault::BadNumber) => Err(bad_number()),
+        Err(IntegerFault::NotANumber(_)) => serde_json::from_str::<i64>(raw.get())
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
+}
+
+fn saturate_i64(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+/// Read the throughput units in a `ProvisionedThroughput` or
+/// `OnDemandThroughput` object held as JSON as [`deserialize_units`] does,
+/// writing each back as the whole number it reads as, so every later check
+/// sees what DynamoDB reads. `Err` when one is a token an integer member
+/// refuses.
+pub(crate) fn read_units_in(throughput: &mut serde_json::Value) -> Result<(), ()> {
+    let Some(members) = throughput.as_object_mut() else {
+        return Ok(());
+    };
+    for unit in [
+        "ReadCapacityUnits",
+        "WriteCapacityUnits",
+        "MaxReadRequestUnits",
+        "MaxWriteRequestUnits",
+    ] {
+        if let Some(value) = members.get_mut(unit)
+            && let serde_json::Value::Number(number) = value
+        {
+            match read_integer(&number.to_string()) {
+                Ok(integer) => *value = saturate_i64(integer.value).into(),
+                Err(IntegerFault::BadNumber) => return Err(()),
+                Err(IntegerFault::NotANumber(_)) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replaced(body: &str) -> (String, StandIns) {
+        stand_in_malformed_numbers(body).expect("a malformed token")
+    }
+
+    #[test]
+    fn a_body_of_valid_numbers_is_not_copied() {
+        for body in [
+            r#"{"Limit":5,"X":1.5,"Y":-0,"Z":1e400,"W":18446744073709551616,"V":-1E-5}"#,
+            r#"{"S":"1.5.5","K":"a\"1.5.5","1e":true,"L":[0,-1,2.5]}"#,
+            // Tokens DynamoDB refuses outright stay for the parser to refuse.
+            r#"{"A":.5}"#,
+            r#"{"A":+1}"#,
+            r#"{"A":0x10}"#,
+            r#"{"A":1.5x}"#,
+            "",
+        ] {
+            assert!(stand_in_malformed_numbers(body).is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn each_malformed_token_gets_a_stand_in_of_its_kind() {
+        let tokens = [
+            ("1.5.5", true),
+            ("1..5", true),
+            ("1e", true),
+            ("1e+", true),
+            ("-1e", true),
+            ("1ee5", true),
+            ("1e5e5", true),
+            ("1.5-", true),
+            ("1e400.5", true),
+            ("-.5", true),
+            ("1.", true),
+            ("01", false),
+            ("00", false),
+            ("-", false),
+            ("--1", false),
+            ("1-2", false),
+        ];
+        let mut seen = 0;
+        for (token, decimal) in tokens {
+            let body = format!(r#"{{"A":{token},"B":[{token}]}}"#);
+            let (out, stand_ins) = replaced(&body);
+            let value: serde_json::Value = serde_json::from_str(&out).expect(&out);
+            assert_eq!(
+                stand_ins.whole.len() + stand_ins.decimal.len(),
+                2,
+                "{token}"
+            );
+            for number in [&value["A"], &value["B"][0]] {
+                let number = number.as_number().expect("a number");
+                assert_eq!(number.is_f64(), decimal, "{token}");
+                assert_eq!(stand_ins.token(number), Some(token));
+                seen += 1;
+            }
+            assert_ne!(value["A"], value["B"][0], "{token}: stand-ins are unique");
+        }
+        assert_eq!(seen, tokens.len() * 2);
+    }
+
+    #[test]
+    fn strings_and_keys_are_left_alone() {
+        let (out, stand_ins) = replaced(r#"{"1.5.5":"1.5.5","K":"a\"1.5.5","N":1.5.5}"#);
+        assert!(out.starts_with(r#"{"1.5.5":"1.5.5","K":"a\"1.5.5","N":-"#));
+        assert_eq!(stand_ins.decimal.len() + stand_ins.whole.len(), 1);
+    }
+
+    #[test]
+    fn a_stand_in_never_matches_a_number_or_text_in_the_body() {
+        // The first candidate's digits are in a string, the second's value
+        // is a number the client sent, so the third is chosen.
+        let body = r#"{"S":"7310000001","N":-7310000002,"A":01}"#;
+        let (out, _) = replaced(body);
+        assert!(out.ends_with(r#""A":-7310000003}"#), "{out}");
+        let body = r#"{"N":-7310000001.5,"M":-7.3100000025e9,"A":1.5.5}"#;
+        let (out, _) = replaced(body);
+        assert!(out.contains(r#""A":-7310000003.5"#), "{out}");
+    }
+
+    #[test]
+    fn a_token_longer_than_its_stand_in_keeps_the_columns_after_it() {
+        let body = r#"{"A":-.50000000000000000,"B":true}"#;
+        let (out, _) = replaced(body);
+        assert_eq!(out.len(), body.len());
+        assert_eq!(out.find(r#""B""#), body.find(r#""B""#));
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+    }
+
+    #[test]
+    fn the_twin_follows_dynamodbs_integer_rule() {
+        for (token, twin_text) in [
+            ("-", Some("0")),
+            ("01", Some("1")),
+            ("00", Some("0")),
+            ("-00", Some("-0")),
+            ("-.5", Some("-0.5")),
+            ("1.", Some("1.0")),
+            ("1.e5", Some("1.0e5")),
+            ("01.50E+2", Some("1.50E+2")),
+            ("1.5.5", None),
+            ("1..5", None),
+            ("1e", None),
+            ("1e+", None),
+            ("-1e", None),
+            ("--1", None),
+            ("1-2", None),
+            ("1ee5", None),
+            ("1e5e5", None),
+            ("1.5-", None),
+            ("1e400.5", None),
+            ("-e5", None),
+            ("-.", None),
+            ("-.e5", None),
+            ("-.e", None),
+            ("-e", None),
+        ] {
+            assert_eq!(twin(token).as_deref(), twin_text, "{token}");
+            if let Some(text) = twin_text {
+                assert!(crate::serde_errors::json_number(text), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn integer_members_read_the_token_behind_a_stand_in() {
+        let (out, stand_ins) = replaced(r#"{"A":01,"B":1.5.5,"C":-.5}"#);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let stand_ins = std::rc::Rc::new(stand_ins);
+        let read = |key: &str| {
+            with_stand_ins(Some(stand_ins.clone()), || {
+                read_integer(&value[key].to_string())
+            })
+        };
+        assert!(matches!(
+            read("A"),
+            Ok(Integer {
+                value: 1,
+                lenient: true
+            })
+        ));
+        assert!(matches!(read("B"), Err(IntegerFault::BadNumber)));
+        assert!(matches!(
+            read("C"),
+            Ok(Integer {
+                value: 0,
+                lenient: true
+            })
+        ));
+        // Outside the request the stand-in is an ordinary number.
+        assert!(matches!(
+            read_integer(&value["A"].to_string()),
+            Ok(Integer {
+                value: -7_310_000_001,
+                lenient: false
+            })
+        ));
+        assert!(matches!(
+            read_integer("1"),
+            Ok(Integer {
+                value: 1,
+                lenient: false
+            })
+        ));
+    }
+
+    #[test]
+    fn an_answer_quoting_a_stand_in_is_caught_only_inside_its_request() {
+        let (out, stand_ins) = replaced(r#"{"A":01}"#);
+        let digits = stand_ins.digits[0].clone();
+        assert!(!quotes_stand_in(&out));
+        with_stand_ins(Some(std::rc::Rc::new(stand_ins)), || {
+            assert!(quotes_stand_in(&out));
+            assert!(quotes_stand_in(&format!("Value '{digits}' at 'limit'")));
+            assert!(!quotes_stand_in("Value '1' at 'limit'"));
+        });
+    }
+}

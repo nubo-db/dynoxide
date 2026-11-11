@@ -69,7 +69,20 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let raw = RawRequest::deserialize(deserializer)?;
+        let mut raw = RawRequest::deserialize(deserializer)?;
+        // The units held as JSON are read before anything checks them, so a
+        // malformed one is refused as the deserialisation fault it is.
+        let gsi_throughputs = raw
+            .global_secondary_indexes
+            .as_mut()
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(|gsi| gsi.get_mut("ProvisionedThroughput"));
+        for throughput in raw.provisioned_throughput.iter_mut().chain(gsi_throughputs) {
+            crate::number_tokens::read_units_in(throughput)
+                .map_err(|()| crate::number_tokens::bad_number::<D::Error>())?;
+        }
         match validate_raw_and_build(raw) {
             Ok(req) => Ok(req),
             Err(msg) => Err(serde::de::Error::custom(format!("VALIDATION:{}", msg))),

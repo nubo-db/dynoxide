@@ -323,6 +323,15 @@ The export call sets:
 - `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to `dynoxide`
 - `AWS_REGION` and `AWS_DEFAULT_REGION` to `us-east-1`. Some SDKs read one and
   some the other, so set both.
+- `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` to `false`. Set to `true`, in the
+  environment or as `ignore_configured_endpoint_urls` in the shared config
+  file, it makes the SDKs ignore `AWS_ENDPOINT_URL_DYNAMODB` and call AWS. The
+  SDKs read the environment before the config file, so `false` overrides both.
+  Removing the variable isn't enough, because the config file still applies.
+  The Java SDK checks the system property `aws.ignoreConfiguredEndpointUrls`
+  first, so a JVM wrapper sets that to `false` as well. Like the credentials,
+  this applies to the whole process: endpoints configured for other services,
+  which the user had switched off, are used again. Say so in your docs.
 
 It removes `AWS_SESSION_TOKEN`. Left in place, a real session token from CI
 would be sent with the dummy pair, to Dynoxide and to any other AWS client in
@@ -450,7 +459,8 @@ Fixed, so wrappers behave alike:
 - [ ] stdout and stderr are read for the life of the process.
 - [ ] Readiness comes from the first stdout line, with a timeout that fails.
 - [ ] Start returns the endpoint, region and the `dynoxide` credentials.
-- [ ] Exporting is a separate call, sets both region variables and never
+- [ ] Exporting is a separate call, sets both region variables and
+      `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=false`, and never
       `AWS_ENDPOINT_URL`.
 - [ ] Stopping closes stdin, waits, then signals through the process handle.
 - [ ] No other process holds the stdin pipe, forks included.
@@ -466,4 +476,6 @@ them on `rc.1`.
   first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the
   cache path, pre-releases in the version check, spawns that report success
   for a missing binary, holding the process, exit statuses reported once,
-  where to export the environment, and PHP's first working SDK version.
+  where to export the environment, and PHP's first working SDK version. The
+  export also sets `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` to `false`, which the
+  first version missed: with it set to `true`, tests reached AWS.

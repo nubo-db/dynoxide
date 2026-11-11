@@ -1540,6 +1540,18 @@ fn validate_operand_types(
     }
 }
 
+/// The refusal a statement's WHERE clause check gives with no parameters, for
+/// the parser's tests.
+#[cfg(test)]
+pub(crate) fn where_clause_refusal(stmt: &Statement) -> Option<String> {
+    validate_operand_types(statement_where_clause(stmt), &[])
+        .err()
+        .map(|error| match error {
+            DynoxideError::ValidationException(message) => message,
+            other => other.to_string(),
+        })
+}
+
 /// Which request a statement arrived in, for the checks that differ between
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1551,25 +1563,28 @@ pub(crate) enum StatementSource {
 
 /// Read a statement and make DynamoDB's checks of a statement as such, in
 /// DynamoDB's order: a term or literal it refuses as it reads, a write naming
-/// an index, the parameter count, a read of an index with a multi-attribute
-/// key (not in a transaction, and only when the table and the index exist),
-/// the WHERE clause's operands in the order written, and an UPDATE's
+/// an index, a read of an index with a multi-attribute key (not in a
+/// transaction, and only when the table and the index exist), the parameter
+/// count, the WHERE clause's operands in the order written, and an UPDATE's
 /// `set_add` or `set_delete` calls. Everything about the table, the key,
 /// ORDER BY and RETURNING comes after (captured eu-west-2, 2026-11-11).
 ///
-/// A failure is the statement's own: ExecuteStatement reports it as it is,
+/// A refusal is the statement's own: ExecuteStatement reports it as it is,
 /// a batch member fails alone and takes no part in the batch's checks, and a
 /// transaction reports it against the statement's index, never as a
-/// cancellation reason. Every statement a request runs is read here, so no
+/// cancellation reason. Any other failure, such as one reading the table, is
+/// passed on as it is. Every statement a request runs is read here, so no
 /// clause reaches evaluation without its operands checked.
 pub(crate) async fn checked_statement<S: StorageBackend>(
     storage: &S,
     input: &str,
     parameters: &[AttributeValue],
     source: StatementSource,
-) -> std::result::Result<Statement, ParseFailure> {
-    let refuse = |message: String| ParseFailure::Statement(ParseError::Validation(message));
-    let parsed = crate::partiql::parser::parse_statement(input)?;
+) -> std::result::Result<CheckedStatement, CheckFailure> {
+    let refuse = |message: String| {
+        CheckFailure::Refused(ParseFailure::Statement(ParseError::Validation(message)))
+    };
+    let parsed = crate::partiql::parser::parse_statement(input).map_err(CheckFailure::Refused)?;
     let stmt = parsed.statement;
     // A write naming an index is refused before its table is resolved, so a
     // qualified UPDATE against a table that does not exist reports the index
@@ -1580,13 +1595,14 @@ pub(crate) async fn checked_statement<S: StorageBackend>(
     {
         return Err(refuse(WRITE_ON_INDEX_REFUSAL.to_string()));
     }
-    // More parameters than placeholders are accepted and the extra ignored
-    // (captured eu-west-2 and us-east-1, 2026-10-10).
-    if parsed.placeholders > parameters.len() {
-        return Err(refuse(
-            crate::partiql::parser::PARAMETER_COUNT_MISMATCH.to_string(),
-        ));
-    }
+    // A read of an index whose key has more than one attribute on either side
+    // is refused ahead of the parameter count and its operands, outside a
+    // transaction, when the table and the index exist; a table that doesn't
+    // is left to the checks that report it, in their usual order (captured
+    // eu-west-2 and us-east-1, 2026-10-09, and eu-west-2, 2026-11-11). In a
+    // transaction the read is refused later, after the statement checks. The
+    // table is kept, so the read resolves it once.
+    let mut table = None;
     if source != StatementSource::TransactionMember
         && let Statement::Select {
             table_name,
@@ -1594,23 +1610,55 @@ pub(crate) async fn checked_statement<S: StorageBackend>(
             ..
         } = &stmt
     {
-        reject_multi_attribute_index_by_name(storage, table_name, index_name)
-            .await
-            .map_err(statement_refusal)?;
+        match ResolvedTable::load(storage, table_name).await {
+            Ok(resolved) => {
+                reject_multi_attribute_index(&resolved, index_name).map_err(statement_refusal)?;
+                table = Some(resolved);
+            }
+            Err(DynoxideError::ResourceNotFoundException(_)) => {}
+            Err(other) => return Err(CheckFailure::Failed(other)),
+        }
+    }
+    // More parameters than placeholders are accepted and the extra ignored
+    // (captured eu-west-2 and us-east-1, 2026-10-10).
+    if parsed.placeholders > parameters.len() {
+        return Err(refuse(
+            crate::partiql::parser::PARAMETER_COUNT_MISMATCH.to_string(),
+        ));
     }
     validate_operand_types(statement_where_clause(&stmt), parameters).map_err(statement_refusal)?;
     if let Some(message) = parsed.set_refusal {
         return Err(refuse(message));
     }
-    Ok(stmt)
+    Ok(CheckedStatement {
+        statement: stmt,
+        table,
+    })
 }
 
-/// A statement check's refusal as the statement's own.
-fn statement_refusal(error: DynoxideError) -> ParseFailure {
-    ParseFailure::Statement(ParseError::Validation(match error {
-        DynoxideError::ValidationException(message) => message,
-        other => other.to_string(),
-    }))
+/// A statement that passed [`checked_statement`], with the table it loaded
+/// for an index read, when it loaded one.
+pub(crate) struct CheckedStatement {
+    pub(crate) statement: Statement,
+    pub(crate) table: Option<ResolvedTable>,
+}
+
+/// Why [`checked_statement`] stopped: a refusal of the statement, or a failure
+/// that isn't about the statement at all, passed on as it is.
+pub(crate) enum CheckFailure {
+    Refused(ParseFailure),
+    Failed(DynoxideError),
+}
+
+/// A statement check's refusal as the statement's own. A check's failure
+/// that isn't a refusal is passed on as it is.
+fn statement_refusal(error: DynoxideError) -> CheckFailure {
+    match error {
+        DynoxideError::ValidationException(message) => {
+            CheckFailure::Refused(ParseFailure::Statement(ParseError::Validation(message)))
+        }
+        other => CheckFailure::Failed(other),
+    }
 }
 
 /// DynamoDB's refusal of an UPDATE or DELETE naming an index.
@@ -1642,50 +1690,15 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
     resolved: Option<&ResolvedTable>,
     old_on_condition_failure: bool,
 ) -> Result<StatementPage> {
-    // An UPDATE takes a NextToken and runs as it would without one (captured
-    // eu-west-2, 2026-11-11); an INSERT or a DELETE with one is refused.
-    if next_token.is_some() && !matches!(stmt, Statement::Select { .. } | Statement::Update { .. })
-    {
-        return Err(DynoxideError::ValidationException(
-            "NextToken is only valid on a SELECT statement".to_string(),
-        ));
-    }
-    // A read of an index whose key has more than one attribute on either side
-    // is refused before anything else about the read is checked, its operands
-    // included. The table is loaded for it here and passed on, so the read
-    // resolves it once; a table that cannot be loaded is left to the checks
-    // that report it, in their usual order (captured eu-west-2 and us-east-1,
-    // 2026-10-09).
-    let loaded;
-    let resolved = match (stmt, resolved) {
-        (
-            Statement::Select {
-                table_name,
-                index_name: Some(_),
-                ..
-            },
-            None,
-        ) => {
-            loaded = ResolvedTable::load(storage, table_name).await.ok();
-            loaded.as_ref()
-        }
-        (_, resolved) => resolved,
-    };
-    if let (
-        Statement::Select {
-            table_name,
-            index_name: Some(index_name),
-            ..
-        },
-        Some(table),
-    ) = (stmt, resolved)
-        && table.table_name == *table_name
-    {
-        reject_multi_attribute_index(table, index_name)?;
-    }
+    // A write takes a NextToken and runs as it would without one; only a
+    // SELECT reads it (captured eu-west-2, 2026-11-11, for UPDATE, DELETE and
+    // INSERT).
+    let next_token = next_token.filter(|_| matches!(stmt, Statement::Select { .. }));
 
-    // Every statement is read through `checked_statement`, which checks the
-    // WHERE clause's operands and refuses a write naming an index.
+    // Every statement is read through `checked_statement` first, which
+    // refuses a write naming an index, then a read of a multi-attribute
+    // index, then checks the WHERE clause's operands, so none of those is
+    // checked again here.
     debug_assert!(validate_operand_types(statement_where_clause(stmt), parameters).is_ok());
     debug_assert!(
         matches!(stmt, Statement::Select { .. })
@@ -2516,8 +2529,8 @@ pub(crate) fn reject_multi_attribute_index(
 }
 
 /// [`reject_multi_attribute_index`] for a statement refused before it is
-/// parsed. A table that cannot be loaded is left to the statement's own
-/// rejection.
+/// parsed. A table that doesn't exist is left to the statement's own
+/// rejection; any other failure to read it is passed on.
 pub(crate) async fn reject_multi_attribute_index_by_name<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -2525,7 +2538,8 @@ pub(crate) async fn reject_multi_attribute_index_by_name<S: StorageBackend>(
 ) -> Result<()> {
     match ResolvedTable::load(storage, table_name).await {
         Ok(resolved) => reject_multi_attribute_index(&resolved, index_name),
-        Err(_) => Ok(()),
+        Err(DynoxideError::ResourceNotFoundException(_)) => Ok(()),
+        Err(other) => Err(other),
     }
 }
 
@@ -4946,7 +4960,6 @@ fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partiql::parser::parse;
 
     /// `set_add` appends the members it doesn't hold, in the order written,
     /// once each; `set_delete` keeps the held members it doesn't name. A
@@ -4995,8 +5008,14 @@ mod tests {
         }
     }
 
+    /// A statement's WHERE clause as read, without the statement check, so a
+    /// clause can be evaluated with fewer parameters than it holds.
     fn where_of(statement: &str) -> WhereClause {
-        match parse(statement).unwrap() {
+        match crate::partiql::parser::parse_statement(statement)
+            .ok()
+            .expect("parses")
+            .statement
+        {
             Statement::Select {
                 where_clause: Some(wc),
                 ..

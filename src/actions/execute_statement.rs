@@ -210,19 +210,23 @@ pub async fn execute<S: StorageBackend>(
     // reports on its own terms, the statement checks' among them, is passed
     // through bare.
     let params = request.parameters.unwrap_or_default();
-    let stmt = partiql::executor::checked_statement(
+    let checked = partiql::executor::checked_statement(
         storage,
         &request.statement,
         &params,
         partiql::executor::StatementSource::ExecuteStatement,
     )
     .await
-    .map_err(|failure| {
-        DynoxideError::ValidationException(match failure {
-            partiql::parser::ParseFailure::Statement(e) => e.into_message(),
-            partiql::parser::ParseFailure::Literal(message) => message,
-        })
+    .map_err(|failure| match failure {
+        partiql::executor::CheckFailure::Refused(refusal) => {
+            DynoxideError::ValidationException(match refusal {
+                partiql::parser::ParseFailure::Statement(e) => e.into_message(),
+                partiql::parser::ParseFailure::Literal(message) => message,
+            })
+        }
+        partiql::executor::CheckFailure::Failed(error) => error,
     })?;
+    let stmt = checked.statement;
 
     // The statement's text goes with it, so a continuation token is bound to
     // the statement as written, as DynamoDB binds it.
@@ -239,9 +243,9 @@ pub async fn execute<S: StorageBackend>(
         request.next_token.as_deref(),
         request.consistent_read.unwrap_or(false),
         request.return_consumed_capacity.as_deref(),
-        // A single statement has no preparation pass to share a resolution
-        // with, so the executor resolves the table itself, once.
-        None,
+        // The table the statement check loaded for an index read, if it
+        // loaded one; otherwise the executor resolves the table itself, once.
+        checked.table.as_ref(),
         request.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"),
     );
     // Base write, index fan-out and stream record are one atomic unit, as they

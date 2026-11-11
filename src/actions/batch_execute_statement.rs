@@ -291,14 +291,31 @@ pub async fn execute<S: StorageBackend>(
     // that member and runs the rest. Parse failure and an unresolvable target
     // are different things, which is why they are a `Result` and an `Option`
     // rather than one fallible value.
-    let (prepared, tables) = prepare(storage, &request.statements).await;
+    let (prepared, tables) = prepare(storage, &request.statements).await?;
 
     // A statement refused for its own parameters, or for anything else about
     // it alone, fails on its own and takes no part in the batch-wide checks
     // below, as one that does not parse doesn't (captured eu-west-2 and
     // us-east-1, 2026-10-09, for a parameter nested 63 levels and for an empty
     // attribute name in a parameter; inferred for the other refusals here).
-    let own_refusals: Vec<Option<String>> = request.statements.iter().map(own_refusal).collect();
+    let mut own_refusals: Vec<Option<String>> =
+        request.statements.iter().map(own_refusal).collect();
+    // A COUNT projection reading a multi-attribute index is refused for the
+    // index, as on ExecuteStatement (captured eu-west-2, 2026-11-11).
+    for (stmt_req, refusal) in request.statements.iter().zip(&mut own_refusals) {
+        if refusal.is_some()
+            && *refusal == partiql::parser::count_projection_rejection(&stmt_req.statement)
+            && let Some((table, Some(index))) = partiql::parser::select_target(&stmt_req.statement)
+        {
+            match partiql::executor::reject_multi_attribute_index_by_name(storage, &table, &index)
+                .await
+            {
+                Ok(()) => {}
+                Err(DynoxideError::ValidationException(message)) => *refusal = Some(message),
+                Err(other) => return Err(other),
+            }
+        }
+    }
     let counted = || {
         prepared
             .iter()
@@ -377,7 +394,8 @@ pub async fn execute<S: StorageBackend>(
                 // itself while the rest of the batch runs. Both shapes carry the
                 // same message, so an index-qualified read is unreachable here
                 // even when it does name the primary key. Captured eu-west-2
-                // 2026-08-15.
+                // 2026-08-15. A read of a multi-attribute index never gets here:
+                // the statement check refused it in its own words.
                 //
                 // Only for a table that resolved. A statement has no target
                 // either when its WHERE names no key or when its table could not
@@ -400,15 +418,8 @@ pub async fn execute<S: StorageBackend>(
                 };
                 let refusal = match resolved_table {
                     Some(resolved) if matches!(stmt, partiql::parser::Statement::Select { .. }) => {
-                        if let Some(index) = partiql::parser::index_name(&stmt) {
-                            // A multi-attribute index is refused in its own
-                            // words first (captured eu-west-2 and us-east-1,
-                            // 2026-10-09).
-                            Some(
-                                partiql::executor::reject_multi_attribute_index(resolved, index)
-                                    .err()
-                                    .map_or_else(unkeyed, |e| e.to_string()),
-                            )
+                        if partiql::parser::index_name(&stmt).is_some() {
+                            Some(unkeyed())
                         } else if let Err(e) =
                             partiql::executor::reject_overlapping_select(&stmt, params, resolved)
                         {
@@ -621,7 +632,7 @@ fn own_refusal(stmt_req: &BatchStatementRequest) -> Option<String> {
 async fn prepare<S: StorageBackend>(
     storage: &S,
     statements: &[BatchStatementRequest],
-) -> (Vec<Prepared>, HashMap<String, ResolvedTable>) {
+) -> Result<(Vec<Prepared>, HashMap<String, ResolvedTable>)> {
     let mut prepared = Vec::with_capacity(statements.len());
     // Keyed by table, not by statement: a batch is usually 25 statements
     // against one table, and that is one resolution rather than 25.
@@ -631,19 +642,29 @@ async fn prepare<S: StorageBackend>(
         // A statement check's refusal is the member's own error, so the member
         // takes no part in the batch's checks (captured eu-west-2,
         // 2026-11-11).
-        let parsed = partiql::executor::checked_statement(
+        let checked = partiql::executor::checked_statement(
             storage,
             &stmt_req.statement,
             stmt_req.parameters.as_deref().unwrap_or_default(),
             partiql::executor::StatementSource::BatchMember,
         )
-        .await
-        .map_err(|failure| match failure {
-            partiql::parser::ParseFailure::Statement(e) => e,
-            partiql::parser::ParseFailure::Literal(message) => {
-                partiql::parser::ParseError::Validation(message)
+        .await;
+        // A failure that isn't a refusal of the statement fails the request.
+        let parsed = match checked {
+            Ok(checked) => {
+                if let Some(table) = checked.table {
+                    tables.entry(table.table_name.clone()).or_insert(table);
+                }
+                Ok(checked.statement)
             }
-        });
+            Err(partiql::executor::CheckFailure::Refused(
+                partiql::parser::ParseFailure::Statement(e),
+            )) => Err(e),
+            Err(partiql::executor::CheckFailure::Refused(
+                partiql::parser::ParseFailure::Literal(message),
+            )) => Err(partiql::parser::ParseError::Validation(message)),
+            Err(partiql::executor::CheckFailure::Failed(error)) => return Err(error),
+        };
         let mut target = None;
         if let Ok(ref stmt) = parsed
             && let Some(name) = partiql::parser::table_name(stmt)
@@ -665,7 +686,7 @@ async fn prepare<S: StorageBackend>(
             target,
         });
     }
-    (prepared, tables)
+    Ok((prepared, tables))
 }
 
 /// The write units a failed statement is charged.

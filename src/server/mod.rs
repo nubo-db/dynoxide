@@ -416,7 +416,7 @@ fn answer(
             // An answer quoting a stand-in comes from a member that doesn't
             // read malformed tokens. It gets the answer the token got before
             // DynamoDB's reading of them was known.
-            if crate::number_tokens::quotes_stand_in(&json) {
+            if crate::number_tokens::error_quotes_stand_in(&json) {
                 return serialization_exception_bare(response_ct);
             }
             tracing::warn!(operation, status = %status, "error response");

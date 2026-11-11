@@ -177,7 +177,7 @@ pub async fn dispatch_http<S: StorageBackend>(
 /// before DynamoDB's reading of them was known.
 fn error_outcome(e: DynoxideError, operation: &str) -> HttpOutcome {
     let json = e.to_json_for(operation);
-    if crate::number_tokens::quotes_stand_in(&json) {
+    if crate::number_tokens::error_quotes_stand_in(&json) {
         return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
     }
     HttpOutcome::new(e.status_code(), json)
@@ -318,7 +318,7 @@ pub async fn dispatch<S: StorageBackend>(
         answer(backend, ctx, op, &request_json)
             .await
             .map_err(|json| {
-                if crate::number_tokens::quotes_stand_in(&json) {
+                if crate::number_tokens::error_quotes_stand_in(&json) {
                     SERIALIZATION_EXCEPTION_BARE.to_string()
                 } else {
                     json

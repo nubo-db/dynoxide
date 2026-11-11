@@ -1221,3 +1221,40 @@ async fn a_body_nested_too_deep_reads_a_malformed_token_the_same_way() {
         )
     );
 }
+
+#[tokio::test]
+async fn an_error_answer_holding_a_stored_item_is_not_mistaken_for_a_stand_in() {
+    let url = start().await;
+    let (status, _) = send(
+        &url,
+        "CreateTable",
+        r#"{"TableName":"items","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    // The stored value holds the first stand-in's digits, which the request
+    // body below doesn't, so the request's stand-in uses them.
+    let (status, _) = send(
+        &url,
+        "PutItem",
+        r#"{"TableName":"items","Item":{"pk":{"S":"a"},"v":{"S":"07310000001"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = send(
+        &url,
+        "PutItem",
+        r#"{"TableName":"items","Item":{"pk":{"S":"a"}},"ConditionExpression":"attribute_not_exists(pk)","ReturnValuesOnConditionCheckFailure":"ALL_OLD","Unread":01}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let answer: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        answer["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("#ConditionalCheckFailedException"),
+        "{body}"
+    );
+    assert_eq!(answer["Item"]["v"]["S"], "07310000001", "{body}");
+}

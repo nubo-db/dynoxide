@@ -100,11 +100,37 @@ fn token_for(text: &str) -> Option<String> {
     })
 }
 
-/// Whether `text` quotes a stand-in, so that an answer holding it would give
-/// away a number the client never sent. Always false outside a request with
+/// Whether the error answer `json` quotes a stand-in in one of its messages,
+/// so that it would give away a number the client never sent. Only the
+/// messages are read: the rest of an answer can hold stored items, whose
+/// digits a stand-in isn't chosen to avoid. Always false outside a request
+/// with stand-ins.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn error_quotes_stand_in(json: &str) -> bool {
+    if STAND_INS.with(|cell| cell.borrow().is_none()) {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(error)) = serde_json::from_str(json) else {
+        return false;
+    };
+    let message = |value: &serde_json::Value| {
+        ["message", "Message"]
+            .into_iter()
+            .filter_map(|key| value.get(key)?.as_str())
+            .any(quotes_stand_in)
+    };
+    let error = serde_json::Value::Object(error);
+    message(&error)
+        || error
+            .get("CancellationReasons")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|reasons| reasons.iter().any(message))
+}
+
+/// Whether `text` quotes a stand-in. Always false outside a request with
 /// stand-ins.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
-pub(crate) fn quotes_stand_in(text: &str) -> bool {
+fn quotes_stand_in(text: &str) -> bool {
     STAND_INS.with(|cell| {
         cell.borrow().as_ref().is_some_and(|stand_ins| {
             let mut quoted = false;
@@ -205,14 +231,19 @@ pub(crate) fn stand_in_malformed_numbers(body: &str) -> Option<(String, StandIns
         .filter(|last| *last < 10_000_000_000)?;
     let candidate = |value: i64| (FIRST_STAND_IN..=last).contains(&value);
 
-    // A stand-in's digits mustn't appear in the body, so an answer quoting
-    // them can only be quoting the stand-in.
+    // A stand-in's digits mustn't appear in the body, as written or in a
+    // string once its escapes are read, so a message quoting them can only be
+    // quoting the stand-in.
     let mut body_digits = std::collections::HashSet::new();
-    for_each_ten_digits(body, |digits| {
-        if candidate(digits) {
-            body_digits.insert(digits);
-        }
-    });
+    let mut reserve = |text: &str| {
+        for_each_ten_digits(text, |digits| {
+            if candidate(digits) {
+                body_digits.insert(digits);
+            }
+        });
+    };
+    reserve(body);
+    for_each_escaped_string(body, |decoded| reserve(decoded));
     // Nor may it equal a number the client sent, by value, so a reader that
     // meets either after a round trip through `serde_json::Value` can tell
     // them apart.
@@ -297,6 +328,38 @@ fn for_each_ten_digits(text: &str, mut each: impl FnMut(i64)) {
             run = 0;
             value = 0;
         }
+    }
+}
+
+/// Call `each` with the decoded text of every string in `body` that holds an
+/// escape.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn for_each_escaped_string(body: &str, mut each: impl FnMut(&str)) {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut escaped = false;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' {
+                escaped = true;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if escaped
+            && i < bytes.len()
+            && let Ok(decoded) = serde_json::from_str::<String>(&body[start..=i])
+        {
+            each(&decoded);
+        }
+        i += 1;
     }
 }
 
@@ -693,6 +756,113 @@ mod tests {
                 lenient: false
             })
         ));
+    }
+
+    #[test]
+    fn a_stand_in_avoids_digits_a_string_holds_once_its_escapes_are_read() {
+        // The string ends in the escape for `1`, so it reads as 7310000001
+        // although the body never writes those ten digits in a row.
+        let body = format!(r#"{{"T":"731000000{}u0031","A":01}}"#, '\\');
+        assert!(!body.contains("7310000001"));
+        let (out, _) = replaced(&body);
+        assert!(out.ends_with(r#""A":-7310000002}"#), "{out}");
+    }
+
+    #[test]
+    fn a_body_holding_many_candidates_still_gets_unique_absent_stand_ins() {
+        let taken = 3000;
+        let strings: Vec<String> = (0..taken)
+            .map(|n| format!("\"{}\"", FIRST_STAND_IN + n))
+            .collect();
+        let tokens = vec!["01"; 3000];
+        let body = format!(
+            r#"{{"S":[{}],"A":[{}]}}"#,
+            strings.join(","),
+            tokens.join(",")
+        );
+        let (out, stand_ins) = replaced(&body);
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+        assert_eq!(stand_ins.entries.len(), tokens.len());
+        assert_eq!(stand_ins.entries[0].digits, FIRST_STAND_IN + taken);
+        assert!(
+            stand_ins
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].digits < pair[1].digits)
+        );
+    }
+
+    #[test]
+    fn only_an_error_answers_messages_are_read_for_a_stand_in() {
+        let (_, stand_ins) = replaced(r#"{"A":01}"#);
+        let digits = stand_ins.entries[0].digits;
+        with_stand_ins(Some(stand_ins), || {
+            // A stored item holding the digits is the item, not a stand-in.
+            let item = format!(
+                r#"{{"__type":"x#ConditionalCheckFailedException","message":"The conditional request failed","Item":{{"v":{{"S":"0{digits}"}}}}}}"#
+            );
+            assert!(!error_quotes_stand_in(&item));
+            for quoting in [
+                format!(r#"{{"__type":"x","message":"Value '-{digits}' at 'limit'"}}"#),
+                format!(r#"{{"__type":"x","Message":"Value '-{digits}' at 'limit'"}}"#),
+                format!(
+                    r#"{{"__type":"x","Message":"Transaction cancelled","CancellationReasons":[{{"Code":"None"}},{{"Code":"ValidationError","Message":"Value '-{digits}'"}}]}}"#
+                ),
+            ] {
+                assert!(error_quotes_stand_in(&quoting), "{quoting}");
+            }
+        });
+    }
+
+    #[test]
+    fn each_request_keeps_its_own_table_across_interleaved_polls() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        /// Pending once, then ready, so the table has to survive an await.
+        struct YieldOnce(bool);
+        impl Future for YieldOnce {
+            type Output = ();
+            fn poll(mut self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                if std::mem::replace(&mut self.0, true) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let (out, stand_ins) = replaced(r#"{"A":01}"#);
+        let quoted = format!("Value '{out}'");
+        let mut with = pin!(with_stand_ins_async(Some(stand_ins), async {
+            YieldOnce(false).await;
+            quotes_stand_in(&quoted)
+        }));
+        let mut without = pin!(with_stand_ins_async(None, async {
+            YieldOnce(false).await;
+            quotes_stand_in(&quoted)
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(with.as_mut().poll(&mut cx).is_pending());
+        assert!(without.as_mut().poll(&mut cx).is_pending());
+        assert!(!quotes_stand_in(&quoted), "nothing between polls");
+        assert_eq!(without.as_mut().poll(&mut cx), Poll::Ready(false));
+        assert_eq!(with.as_mut().poll(&mut cx), Poll::Ready(true));
+        assert!(!quotes_stand_in(&quoted));
+    }
+
+    #[test]
+    fn the_table_is_cleared_when_a_request_panics() {
+        let (out, stand_ins) = replaced(r#"{"A":01}"#);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_stand_ins(Some(stand_ins), || {
+                assert!(quotes_stand_in(&out));
+                panic!("the request failed");
+            })
+        }));
+        assert!(result.is_err());
+        assert!(!quotes_stand_in(&out));
     }
 
     #[test]

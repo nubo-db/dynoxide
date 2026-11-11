@@ -1552,33 +1552,50 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("put_item") {
             return Ok(err);
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+        // The values are read first, by the tool's own decoder, which names
+        // an argument that isn't DynamoDB JSON at all. The request is then
+        // decoded as PutItem's wire request, which checks its members in
+        // PutItem's order and words, after the values, as over HTTP.
+        if let Err(err) = parse_dynamo_map(params.item.clone(), "item", resolve_single_write) {
             return Ok(err);
         }
-        let item = match parse_dynamo_map(params.item, "item", resolve_single_write) {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        let expression_attribute_values = match parse_optional_dynamo_map(
-            params.expression_attribute_values,
+        if let Err(err) = parse_optional_dynamo_map(
+            params.expression_attribute_values.clone(),
             "expression_attribute_values",
             resolve_single_write,
         ) {
-            Ok(v) => v,
+            return Ok(err);
+        }
+        let request: crate::actions::put_item::PutItemRequest = match decode_wire_request(
+            "PutItem",
+            vec![
+                ("TableName", Some(params.table_name.into())),
+                ("Item", Some(params.item)),
+                (
+                    "ConditionExpression",
+                    string_member(params.condition_expression),
+                ),
+                (
+                    "ExpressionAttributeNames",
+                    names_member(params.expression_attribute_names),
+                ),
+                (
+                    "ExpressionAttributeValues",
+                    params.expression_attribute_values,
+                ),
+                ("ReturnValues", string_member(params.return_values)),
+                (
+                    "ReturnValuesOnConditionCheckFailure",
+                    string_member(params.return_values_on_condition_check_failure),
+                ),
+                (
+                    "ReturnConsumedCapacity",
+                    string_member(params.return_consumed_capacity),
+                ),
+            ],
+        ) {
+            Ok(request) => request,
             Err(err) => return Ok(err),
-        };
-
-        let request = crate::actions::put_item::PutItemRequest {
-            table_name: params.table_name,
-            item,
-            condition_expression: params.condition_expression,
-            expression_attribute_names: params.expression_attribute_names,
-            expression_attribute_values,
-            return_values: params.return_values,
-            return_values_on_condition_check_failure: params
-                .return_values_on_condition_check_failure,
-            return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
         };
         match self.db.put_item(request) {
             Ok(resp) => json_result(&resp),
@@ -1591,32 +1608,38 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetItemParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Over HTTP a flag that doesn't read fails the request as it is
-        // decoded, before the capacity mode is checked.
-        let consistent_read = match read_flag(params.consistent_read) {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
-        let key = match parse_dynamo_map(
-            params.key,
+        // The key is read first, as on `put_item`, then the request as
+        // GetItem's wire request, which reads `consistent_read` as the HTTP
+        // API reads it and checks the members in GetItem's order.
+        if let Err(err) = parse_dynamo_map(
+            params.key.clone(),
             "key",
             crate::validation::strip_request_validation_tag,
         ) {
-            Ok(v) => v,
+            return Ok(err);
+        }
+        let request: crate::actions::get_item::GetItemRequest = match decode_wire_request(
+            "GetItem",
+            vec![
+                ("TableName", Some(params.table_name.into())),
+                ("Key", Some(params.key)),
+                (
+                    "ProjectionExpression",
+                    string_member(params.projection_expression),
+                ),
+                (
+                    "ExpressionAttributeNames",
+                    names_member(params.expression_attribute_names),
+                ),
+                ("ConsistentRead", params.consistent_read),
+                (
+                    "ReturnConsumedCapacity",
+                    string_member(params.return_consumed_capacity),
+                ),
+            ],
+        ) {
+            Ok(request) => request,
             Err(err) => return Ok(err),
-        };
-
-        let request = crate::actions::get_item::GetItemRequest {
-            table_name: params.table_name,
-            key,
-            projection_expression: params.projection_expression,
-            expression_attribute_names: params.expression_attribute_names,
-            consistent_read,
-            return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
         };
         match self.db.get_item(request) {
             Ok(resp) => json_result(&resp),
@@ -1634,31 +1657,47 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("update_item") {
             return Ok(err);
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+        // The values are read first, as on `put_item`, then the request as
+        // UpdateItem's wire request, which reports the first enum member it
+        // refuses in UpdateItem's own words.
+        if let Err(err) = parse_dynamo_map(params.key.clone(), "key", resolve_single_write) {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(params.key, "key", resolve_single_write) {
-            Ok(v) => v,
+        if let Err(err) = parse_update_expression_values(params.expression_attribute_values.clone())
+        {
+            return Ok(err);
+        }
+        let request: crate::actions::update_item::UpdateItemRequest = match decode_wire_request(
+            "UpdateItem",
+            vec![
+                ("TableName", Some(params.table_name.into())),
+                ("Key", Some(params.key)),
+                ("UpdateExpression", string_member(params.update_expression)),
+                (
+                    "ConditionExpression",
+                    string_member(params.condition_expression),
+                ),
+                (
+                    "ExpressionAttributeNames",
+                    names_member(params.expression_attribute_names),
+                ),
+                (
+                    "ExpressionAttributeValues",
+                    params.expression_attribute_values,
+                ),
+                ("ReturnValues", string_member(params.return_values)),
+                (
+                    "ReturnValuesOnConditionCheckFailure",
+                    string_member(params.return_values_on_condition_check_failure),
+                ),
+                (
+                    "ReturnConsumedCapacity",
+                    string_member(params.return_consumed_capacity),
+                ),
+            ],
+        ) {
+            Ok(request) => request,
             Err(err) => return Ok(err),
-        };
-        let expression_attribute_values =
-            match parse_update_expression_values(params.expression_attribute_values) {
-                Ok(v) => v,
-                Err(err) => return Ok(err),
-            };
-
-        let request = crate::actions::update_item::UpdateItemRequest {
-            table_name: params.table_name,
-            key,
-            update_expression: params.update_expression,
-            condition_expression: params.condition_expression,
-            expression_attribute_names: params.expression_attribute_names,
-            expression_attribute_values,
-            return_values: params.return_values,
-            return_values_on_condition_check_failure: params
-                .return_values_on_condition_check_failure,
-            return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
         };
         match self.db.update_item(request) {
             Ok(resp) => json_result(&resp),
@@ -1839,33 +1878,43 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("delete_item") {
             return Ok(err);
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+        // The key is read first, as on `put_item`, then the request as
+        // DeleteItem's wire request. DeleteItem reads its expression values
+        // after the member checks, naming a refused one by its key, so they
+        // are passed on as given.
+        if let Err(err) = parse_dynamo_map(params.key.clone(), "key", resolve_single_write) {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(params.key, "key", resolve_single_write) {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        let expression_attribute_values = match parse_optional_dynamo_map(
-            params.expression_attribute_values,
-            "expression_attribute_values",
-            resolve_single_write,
+        let request: crate::actions::delete_item::DeleteItemRequest = match decode_wire_request(
+            "DeleteItem",
+            vec![
+                ("TableName", Some(params.table_name.into())),
+                ("Key", Some(params.key)),
+                (
+                    "ConditionExpression",
+                    string_member(params.condition_expression),
+                ),
+                (
+                    "ExpressionAttributeNames",
+                    names_member(params.expression_attribute_names),
+                ),
+                (
+                    "ExpressionAttributeValues",
+                    params.expression_attribute_values,
+                ),
+                ("ReturnValues", string_member(params.return_values)),
+                (
+                    "ReturnValuesOnConditionCheckFailure",
+                    string_member(params.return_values_on_condition_check_failure),
+                ),
+                (
+                    "ReturnConsumedCapacity",
+                    string_member(params.return_consumed_capacity),
+                ),
+            ],
         ) {
-            Ok(v) => v,
+            Ok(request) => request,
             Err(err) => return Ok(err),
-        };
-
-        let request = crate::actions::delete_item::DeleteItemRequest {
-            table_name: params.table_name,
-            key,
-            condition_expression: params.condition_expression,
-            expression_attribute_names: params.expression_attribute_names,
-            expression_attribute_values,
-            return_values: params.return_values,
-            return_values_on_condition_check_failure: params
-                .return_values_on_condition_check_failure,
-            return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
         };
         match self.db.delete_item(request) {
             Ok(resp) => json_result(&resp),
@@ -1883,9 +1932,9 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("batch_write_item") {
             return Ok(err);
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
+        // A `return_consumed_capacity` outside the enum is left to the
+        // action, which checks it with BatchWriteItem's other member errors,
+        // after a refused value, as `batch_get_item` leaves it.
         // Parse the request_items Value into the typed struct.
         // We accept both PascalCase and snake_case keys for agent ergonomics.
         let request_items = match parse_batch_write_request_items(params.request_items) {
@@ -3651,7 +3700,7 @@ mod capacity_tests {
                 "ExpressionAttributeValues": {":g": {"S": "g3"}}
             }),
         }
-        .check();
+        .check_refusing(BARE_BOGUS_MODE);
     }
 
     #[test]

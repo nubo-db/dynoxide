@@ -6846,3 +6846,207 @@ fn the_other_numeric_arguments_answer_as_the_http_api_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// The item tools read their values first and then check the request's
+/// members as the HTTP operation does: a refused key, item or expression
+/// value ahead of a bad `return_consumed_capacity`, the member errors listed
+/// together where the operation lists them, UpdateItem's single enum error
+/// in its own wording, and `return_values_on_condition_check_failure`
+/// outside its enum refused. `delete_item` reads its expression values after
+/// the member checks, as DeleteItem does. Every expectation is the HTTP API's
+/// answer to the same request.
+#[test]
+fn item_tools_check_their_members_as_the_http_api_does() {
+    let table = "Members";
+    let (mut child, http) = both_with_items(table, &[json!({"pk": {"S": "a"}, "v": {"N": "1"}})]);
+    let name = ("table_name", "TableName", json!(table));
+    let key = |v: Value| ("key", "Key", json!({"pk": v}));
+    let item = |v: Value| ("item", "Item", json!({"pk": {"S": "q"}, "x": v}));
+    let values = |v: Value| {
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":x": v}),
+        )
+    };
+    let condition = (
+        "condition_expression",
+        "ConditionExpression",
+        json!("x = :x"),
+    );
+    let update = ("update_expression", "UpdateExpression", json!("SET y = :x"));
+    let mode = |m: &str| {
+        (
+            "return_consumed_capacity",
+            "ReturnConsumedCapacity",
+            json!(m),
+        )
+    };
+    let return_values = ("return_values", "ReturnValues", json!("BAD"));
+    let on_failure = (
+        "return_values_on_condition_check_failure",
+        "ReturnValuesOnConditionCheckFailure",
+        json!("X"),
+    );
+    let fine = json!({"S": "a"});
+    let mut requests: Vec<(&str, &str, Vec<(&str, &str, Value)>)> = Vec::new();
+    // Values refused beside a bad mode.
+    for bad in [
+        json!({"N": "abc"}),
+        json!({"S": "a", "N": "1"}),
+        json!({"BOOL": "no"}),
+        json!({"S": ""}),
+        json!({"NULL": "no"}),
+    ] {
+        requests.push((
+            "get_item",
+            "GetItem",
+            vec![name.clone(), key(bad.clone()), mode("BOGUS")],
+        ));
+        requests.push((
+            "put_item",
+            "PutItem",
+            vec![name.clone(), item(bad.clone()), mode("BOGUS")],
+        ));
+        requests.push((
+            "put_item",
+            "PutItem",
+            vec![
+                name.clone(),
+                item(fine.clone()),
+                condition.clone(),
+                values(bad.clone()),
+                mode("BOGUS"),
+            ],
+        ));
+        requests.push((
+            "update_item",
+            "UpdateItem",
+            vec![
+                name.clone(),
+                key(bad.clone()),
+                update.clone(),
+                values(json!({"N": "1"})),
+                mode("BOGUS"),
+            ],
+        ));
+        requests.push((
+            "update_item",
+            "UpdateItem",
+            vec![
+                name.clone(),
+                key(fine.clone()),
+                update.clone(),
+                values(bad.clone()),
+                mode("BOGUS"),
+            ],
+        ));
+        requests.push((
+            "delete_item",
+            "DeleteItem",
+            vec![name.clone(), key(bad.clone()), mode("BOGUS")],
+        ));
+        for with_mode in [false, true] {
+            let mut members = vec![
+                name.clone(),
+                key(json!({"S": "z"})),
+                condition.clone(),
+                values(bad.clone()),
+            ];
+            if with_mode {
+                members.push(mode("BOGUS"));
+            }
+            requests.push(("delete_item", "DeleteItem", members));
+        }
+        requests.push((
+            "batch_write_item",
+            "BatchWriteItem",
+            vec![
+                (
+                    "request_items",
+                    "RequestItems",
+                    json!({table: [{"PutRequest": {"Item": {"pk": {"S": "q"}, "x": bad}}}]}),
+                ),
+                mode("BOGUS"),
+            ],
+        ));
+    }
+    // The members alone and together.
+    let enums: Vec<Vec<(&str, &str, Value)>> = vec![
+        vec![mode("BOGUS")],
+        vec![return_values.clone()],
+        vec![return_values.clone(), mode("BOGUS")],
+        vec![on_failure.clone()],
+        vec![on_failure.clone(), mode("BOGUS")],
+        vec![return_values.clone(), on_failure.clone(), mode("BOGUS")],
+    ];
+    for members in enums {
+        let with = |mut base: Vec<(&'static str, &'static str, Value)>| {
+            base.extend(members.iter().cloned());
+            base
+        };
+        requests.push((
+            "put_item",
+            "PutItem",
+            with(vec![name.clone(), item(fine.clone())]),
+        ));
+        requests.push((
+            "update_item",
+            "UpdateItem",
+            with(vec![
+                name.clone(),
+                key(fine.clone()),
+                update.clone(),
+                values(json!({"N": "1"})),
+            ]),
+        ));
+        requests.push((
+            "delete_item",
+            "DeleteItem",
+            with(vec![name.clone(), key(json!({"S": "z"}))]),
+        ));
+    }
+    for tool_and_operation in [
+        ("get_item", "GetItem"),
+        ("delete_item", "DeleteItem"),
+        ("update_item", "UpdateItem"),
+    ] {
+        requests.push((
+            tool_and_operation.0,
+            tool_and_operation.1,
+            vec![
+                ("table_name", "TableName", json!("ab")),
+                key(fine.clone()),
+                mode("BOGUS"),
+            ],
+        ));
+    }
+    requests.push((
+        "put_item",
+        "PutItem",
+        vec![
+            ("table_name", "TableName", json!("ab")),
+            item(fine.clone()),
+            mode("BOGUS"),
+        ],
+    ));
+
+    let checked = requests.len();
+    let cases = requests
+        .into_iter()
+        .map(|(tool, operation, members)| {
+            let (args, body) = same_request(&members);
+            (tool, args, operation, body)
+        })
+        .collect();
+    let differ = differences(&mut child, &http, cases);
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

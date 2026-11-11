@@ -837,8 +837,9 @@ pub(crate) fn with_value_layer<T>(
 /// Run `future` with values read under `layer`, set around each of its polls
 /// and restored after, so the layer holds across the future's awaits without
 /// reaching anything polled in between. The wasm engine's single thread runs
-/// other requests between those polls.
-#[cfg(any(feature = "wasm-sqlite", test))]
+/// other requests between those polls, and the MCP server's runtime can run
+/// another tool call on the same thread.
+#[cfg(any(feature = "mcp-server", feature = "wasm-sqlite", test))]
 pub(crate) async fn with_value_layer_async<F: std::future::Future>(
     layer: crate::validation::ValueLayer,
     future: F,

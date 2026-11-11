@@ -1906,16 +1906,15 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<BatchGetItemParams>,
     ) -> Result<CallToolResult, McpError> {
-        // `request_items` is decoded first: a `ConsistentRead` inside it that
-        // doesn't read fails the request as BatchGetItem's decoder reads it,
-        // ahead of the capacity mode's member check.
+        // A `return_consumed_capacity` outside the enum is left to the
+        // action, which checks it in BatchGetItem's order: after a
+        // `ConsistentRead` that doesn't read and a refused key value, which
+        // fail as `request_items` is decoded, and beside the request's own
+        // member checks.
         let request_items = match parse_batch_get_request_items(params.request_items) {
             Ok(v) => v,
             Err(e) => return Ok(e),
         };
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
 
         let request = crate::actions::batch_get_item::BatchGetItemRequest {
             request_items,

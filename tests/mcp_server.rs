@@ -5246,6 +5246,77 @@ fn an_unreadable_flag_is_reported_ahead_of_a_bad_capacity_mode() {
     let _ = child.wait();
 }
 
+/// `batch_get_item` leaves a `return_consumed_capacity` outside the enum to
+/// BatchGetItem's own checks, so the request's member errors and a refused
+/// key value are reported in the order BatchGetItem reports them over HTTP.
+#[test]
+fn batch_get_item_reports_a_bad_capacity_mode_where_batch_get_item_does() {
+    let mut child = mcp_with_table("Flags");
+    let bogus = "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let cases: Vec<(Value, (String, String))> = vec![
+        (
+            json!({}),
+            enveloped(
+                "Value at 'RequestItems' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"Flags": {"Keys": []}}),
+            enveloped(
+                "Value at 'RequestItems.Flags.member.Keys' failed to satisfy constraint: Member \
+                 must have length greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"T": {"Keys": [{"pk": {"S": "a"}}]}}),
+            validation_error(&format!(
+                "2 validation errors detected: Value '{{\"T\":{{\"Keys\":[{{\"pk\":{{\"S\":\"a\"}}}}]}}}}' \
+                 at 'requestItems' failed to satisfy constraint: Map keys must satisfy \
+                 constraint: [Member must have length less than or equal to 255, Member must \
+                 have length greater than or equal to 3, Member must satisfy regular \
+                 expression pattern: [a-zA-Z0-9_.-]+]; {bogus}"
+            )),
+        ),
+        (json!({"Flags": {"Keys": [{"pk": {"S": "a"}}]}}), enveloped(bogus)),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"N": "abc"}}]}}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"S": "a", "N": "1"}}]}}),
+            validation_error(TWO_TYPES),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"BOOL": "no"}}]}}),
+            enveloped(bogus),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (request_items, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "batch_get_item",
+            json!({"request_items": request_items, "return_consumed_capacity": "BOGUS"}),
+        );
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{request_items}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 /// `query`'s `scan_index_forward` reads a string as Query's `ScanIndexForward`
 /// does over HTTP: one that reads as false reads the sort key descending, one
 /// that reads as true ascending, and anything else is refused as malformed.

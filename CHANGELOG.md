@@ -52,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
+  The refusals now carry DynamoDB's `SerializationException` messages
+  (`Buffer is too short for base64 encoding` for one character, `Base64
+  encoded length is expected a multiple of 4 bytes but found: 2` for `!!`,
+  `Invalid last non-pad Base64 character dectected` for `ab==`, or no
+  message at all) and come ahead of the request's validation, where before
+  they gave the base64 crate's error with a line and column. Values DynamoDB
+  accepts that Dynoxide used to refuse are now accepted as the same bytes:
+  unpadded and part-padded values such as `QQ`, `QQ=` and `QUI`, and the
+  final-group forms such as `-Q==`, which DynamoDB stores as `0xfd`. The
+  crate's own `AttributeValue` deserialiser reads them the same way
+  ([#316](https://github.com/nubo-db/dynoxide/issues/316)).
 - **Opening a database checks what it reads before it changes anything.** A
   schema version that isn't a whole number, or is too large to be one, is
   refused rather than read as no version, which ran every migration on the

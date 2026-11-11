@@ -766,6 +766,46 @@ mod tests {
     }
 
     #[test]
+    fn base64_dynamodb_refuses_is_refused_in_its_words() {
+        // The wasm surface reads values with the same decoder as the HTTP
+        // server (captured eu-west-2, 2026-11-11).
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for (value, expected) in [
+            (
+                "!!",
+                Some("Base64 encoded length is expected a multiple of 4 bytes but found: 2"),
+            ),
+            (
+                "ab==",
+                Some("Invalid last non-pad Base64 character dectected"),
+            ),
+            ("!!!!", None),
+        ] {
+            let body = format!(
+                r#"{{"TableName":"Music","Item":{{"artist":{{"S":"a"}},"song":{{"S":"a"}},"b":{{"B":"{value}"}}}}}}"#
+            );
+            let err = run(&backend, "PutItem", &body).unwrap_err();
+            let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert!(
+                v["__type"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SerializationException"),
+                "{value}: got {v}"
+            );
+            assert_eq!(
+                v.get("Message").and_then(|m| m.as_str()),
+                expected,
+                "{value}: got {v}"
+            );
+        }
+        let body =
+            r#"{"TableName":"Music","Item":{"artist":{"S":"a"},"song":{"S":"a"},"b":{"B":"QQ"}}}"#;
+        run(&backend, "PutItem", body).unwrap();
+    }
+
+    #[test]
     fn create_put_get_roundtrip() {
         let backend = Storage::memory().unwrap();
         run(&backend, "CreateTable", CREATE_MUSIC).unwrap();

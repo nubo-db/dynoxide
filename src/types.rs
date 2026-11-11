@@ -2373,29 +2373,46 @@ pub fn f32_number_string(v: f32) -> String {
 }
 
 /// Provisioned throughput settings (stored but not enforced).
+///
+/// A unit is read as DynamoDB reads a Long member: a fraction truncates and a
+/// malformed number token is read by its integer rule (see
+/// `number_tokens::deserialize_units`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvisionedThroughput {
-    #[serde(rename = "ReadCapacityUnits", alias = "read_capacity_units", default)]
+    #[serde(
+        rename = "ReadCapacityUnits",
+        alias = "read_capacity_units",
+        default,
+        deserialize_with = "crate::number_tokens::deserialize_units"
+    )]
     pub read_capacity_units: Option<i64>,
-    #[serde(rename = "WriteCapacityUnits", alias = "write_capacity_units", default)]
+    #[serde(
+        rename = "WriteCapacityUnits",
+        alias = "write_capacity_units",
+        default,
+        deserialize_with = "crate::number_tokens::deserialize_units"
+    )]
     pub write_capacity_units: Option<i64>,
 }
 
 /// On-demand (PAY_PER_REQUEST) throughput ceilings (stored but not enforced).
+/// The units are read as [`ProvisionedThroughput`]'s are.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct OnDemandThroughput {
     #[serde(
         rename = "MaxReadRequestUnits",
         alias = "max_read_request_units",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::number_tokens::deserialize_units"
     )]
     pub max_read_request_units: Option<i64>,
     #[serde(
         rename = "MaxWriteRequestUnits",
         alias = "max_write_request_units",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::number_tokens::deserialize_units"
     )]
     pub max_write_request_units: Option<i64>,
 }

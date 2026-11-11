@@ -156,6 +156,41 @@ pub async fn dispatch_http<S: StorageBackend>(
     body: &str,
     auth: crate::auth_material::AuthMaterial<'_>,
 ) -> HttpOutcome {
+    // A number token JSON doesn't allow is read as DynamoDB reads it, as on
+    // the native server (see `number_tokens`). The table is set around every
+    // poll, since this thread answers other requests between them.
+    match crate::number_tokens::stand_in_malformed_numbers(body) {
+        Some((body, stand_ins)) => {
+            crate::number_tokens::with_stand_ins_async(
+                Some(stand_ins),
+                answer_http(backend, ctx, target, &body, auth),
+            )
+            .await
+        }
+        None => answer_http(backend, ctx, target, body, auth).await,
+    }
+}
+
+/// The error outcome for `e`, or a bare `SerializationException` when the
+/// answer would quote a stand-in for a malformed number token: that comes from
+/// a member that doesn't read such tokens, and gets the answer the token got
+/// before DynamoDB's reading of them was known.
+fn error_outcome(e: DynoxideError, operation: &str) -> HttpOutcome {
+    let json = e.to_json_for(operation);
+    if crate::number_tokens::error_quotes_stand_in(&json) {
+        return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+    }
+    HttpOutcome::new(e.status_code(), json)
+}
+
+/// [`dispatch_http`] once malformed number tokens have stand-ins.
+async fn answer_http<S: StorageBackend>(
+    backend: &S,
+    ctx: &DispatchContext<'_>,
+    target: Option<&str>,
+    body: &str,
+    auth: crate::auth_material::AuthMaterial<'_>,
+) -> HttpOutcome {
     // Non-JSON body → bare SerializationException, before the target is read.
     // Valid JSON nested deeper than the parser follows is still read, as
     // DynamoDB reads it: see `deep_nesting`.
@@ -219,9 +254,7 @@ pub async fn dispatch_http<S: StorageBackend>(
             crate::deep_nesting::DeepBody::Unreadable => {
                 return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
             }
-            crate::deep_nesting::DeepBody::Refuse(e) => {
-                return HttpOutcome::new(e.status_code(), e.to_json_for(operation));
-            }
+            crate::deep_nesting::DeepBody::Refuse(e) => return error_outcome(e, operation),
             crate::deep_nesting::DeepBody::Run(body) => {
                 rewritten = body;
                 rewritten.as_str()
@@ -236,7 +269,7 @@ pub async fn dispatch_http<S: StorageBackend>(
     // serialised envelope. Same source of truth as the native server.
     match route(backend, ctx, operation, body).await {
         Ok(json) => HttpOutcome::new(200, json),
-        Err(e) => HttpOutcome::new(e.status_code(), e.to_json_for(operation)),
+        Err(e) => error_outcome(e, operation),
     }
 }
 
@@ -274,6 +307,34 @@ pub async fn dispatch<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
+    // A number token JSON doesn't allow is read as DynamoDB reads it, as on
+    // the wire (see `dispatch_http`).
+    let Some((request_json, stand_ins)) =
+        crate::number_tokens::stand_in_malformed_numbers(request_json)
+    else {
+        return answer(backend, ctx, op, request_json).await;
+    };
+    crate::number_tokens::with_stand_ins_async(Some(stand_ins), async {
+        answer(backend, ctx, op, &request_json)
+            .await
+            .map_err(|json| {
+                if crate::number_tokens::error_quotes_stand_in(&json) {
+                    SERIALIZATION_EXCEPTION_BARE.to_string()
+                } else {
+                    json
+                }
+            })
+    })
+    .await
+}
+
+/// [`dispatch`] once malformed number tokens have stand-ins.
+async fn answer<S: StorageBackend>(
+    backend: &S,
+    ctx: &DispatchContext<'_>,
+    op: &str,
+    request_json: &str,
+) -> std::result::Result<String, String> {
     // PartiQL parameters fail on whichever fault DynamoDB's walk meets first
     // (see `deep_nesting::parameter_order`).
     let in_walk_order = crate::deep_nesting::in_walk_order(op, request_json);
@@ -1378,6 +1439,41 @@ mod tests {
         format!(
             r#"{{"Statement":"SELECT * FROM \"Music\" WHERE artist = 'a' AND x = ? AND y = ?","Parameters":[{first},{second}]}}"#
         )
+    }
+
+    #[test]
+    fn malformed_number_tokens_are_read_as_dynamodb_reads_them_on_both_entry_points() {
+        // Captured eu-west-2, 9 and 10 November 2026: a malformed token is
+        // accepted where nothing reads it and read by the integer rule in
+        // `Limit`. A member outside that rule refuses it, quoting nothing.
+        const BAD_NUMBER: &str = r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Bad number format"}"#;
+        const AT_LEAST_1: &str = "1 validation error detected: Value '0' at 'limit' failed to \
+                                  satisfy constraint: Member must have value greater than or equal to 1";
+        let backend = Storage::memory().unwrap();
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        let both = |op: &str, body: &str| {
+            let out = http(&backend, Some(&format!("DynamoDB_20120810.{op}")), body);
+            let run = run(&backend, op, body);
+            (out, run)
+        };
+        for body in [r#"{"Foo":1.5.5,"Bar":[01,-,1e]}"#, r#"{"Limit":01}"#] {
+            let (out, run) = both("ListTables", body);
+            assert_eq!(out.status, 200, "{body}: {}", out.body);
+            assert_eq!(json(&out.body), json(&run.unwrap()), "{body}");
+        }
+        let (out, run) = both("ListTables", r#"{"Limit":-}"#);
+        assert_eq!(json(&out.body)["message"], AT_LEAST_1);
+        assert_eq!(json(&run.unwrap_err())["message"], AT_LEAST_1);
+        let (out, run) = both("ListTables", r#"{"Limit":1.5.5}"#);
+        assert_eq!(json(&out.body), json(BAD_NUMBER));
+        assert_eq!(json(&run.unwrap_err()), json(BAD_NUMBER));
+        let dimensions = r#"{"TableName":"vectors","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","VectorIndexes":[{"IndexName":"v","VectorAttribute":{"AttributeName":"vec"},"Dimensions":01,"DistanceFunction":"COSINE","Projection":{"ProjectionType":"ALL"}}]}"#;
+        let (out, run) = both("CreateTable", dimensions);
+        assert_eq!(
+            (out.status, out.body.as_str()),
+            (400, SERIALIZATION_EXCEPTION_BARE)
+        );
+        assert_eq!(run.unwrap_err(), SERIALIZATION_EXCEPTION_BARE);
     }
 
     #[test]

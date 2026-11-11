@@ -77,6 +77,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when an earlier parameter was refused for its value. A bare string now
   answers `Unexpected value type in payload`
   ([#308](https://github.com/nubo-db/dynoxide/issues/308)).
+- A number written in a way JSON doesn't allow, such as `1.5.5`, `1e`, `01`
+  or `-`, is read as DynamoDB reads it, rather than failing the whole request
+  with a bare `SerializationException`. Where DynamoDB doesn't read the member
+  it is accepted. Where the member holds another type it gets the answer a
+  well-formed number gets: `DECIMAL_VALUE cannot be converted to String` for
+  one with a point or an exponent and `NUMBER_VALUE` for one without, `Unexpected
+  field type` in a list or map member, `Unexpected value type in payload` as an
+  attribute value or PartiQL parameter. In `Limit`, Scan's `Segment` and
+  `TotalSegments` and the throughput units, DynamoDB's looser rule applies:
+  `-`, `00` and `-.5` read as 0, `01` as 1 and `1.e5` as 100000, while a token
+  it can't read, such as `1.5.5`, `1e` or `--1`, is refused with `Bad number
+  format`. `1e400.5` no longer leaks the parser's own message. ListTables
+  `Limit` and the throughput units also read a well-formed fraction or a number
+  past the range as Query's `Limit` does, so `0.5` gets the at-least-1 error
+  instead of serde's `floating point` text, and ListTables `Limit: 1e400` the
+  at-most-100 error. Streams `Limit`, SearchVectors `TopK` and a vector index's
+  `Dimensions` still refuse such a token with a bare `SerializationException`,
+  since DynamoDB's reading there hasn't been captured
+  ([#309](https://github.com/nubo-db/dynoxide/issues/309)).
 - An attribute value with a member of the wrong JSON type is refused with
   DynamoDB's `SerializationException` message, which names what was found and
   what was expected. A number where `S` or `N` belongs gives `NUMBER_VALUE

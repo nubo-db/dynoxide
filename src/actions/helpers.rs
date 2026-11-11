@@ -2569,8 +2569,9 @@ fn validate_filter_attribute_value(
 }
 
 /// An integer member as DynamoDB reads it: a 32-bit signed integer that
-/// saturates at either end, truncating a fraction. A value that saturated or
-/// was written with a fraction or exponent is flagged, because the member is
+/// saturates at either end, truncating a fraction. A value that saturated, was
+/// written with a fraction or exponent, or was a token JSON doesn't allow (see
+/// `number_tokens::read_integer`) is flagged, because the member is
 /// then checked by the older layer, which reports the value as read (captured
 /// eu-west-2 and eu-central-1, 20 October 2026). `0.0` is flagged though it
 /// loses nothing: Query reports it as read, as it does `0.5` (captured
@@ -2594,38 +2595,26 @@ pub(crate) fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
     else {
         return Ok(None);
     };
-    let number = match serde_json::from_str::<serde_json::Number>(raw.get()) {
-        Ok(number) => number,
-        Err(e) if crate::serde_errors::is_number_out_of_range(&e) => {
-            let value = if raw.get().starts_with('-') {
-                i32::MIN
-            } else {
-                i32::MAX
-            };
-            return Ok(Some(Int32 {
-                value: i64::from(value),
-                coerced: true,
-            }));
+    // A malformed token is read by DynamoDB's integer rule or refused as
+    // `Bad number format` (see `number_tokens::integer_text`).
+    let crate::number_tokens::Integer {
+        value: wide,
+        lenient,
+    } = match crate::number_tokens::read_integer(raw.get()) {
+        Ok(integer) => integer,
+        Err(crate::number_tokens::IntegerFault::BadNumber) => {
+            return Err(crate::number_tokens::bad_number());
         }
-        // Anything other than a number keeps serde's own wording, which the
-        // caller maps as it did when the member was read as a number.
-        Err(e) => return Err(D::Error::custom(e)),
-    };
-    let mut float = false;
-    let wide = if let Some(i) = number.as_i64() {
-        i128::from(i)
-    } else if let Some(u) = number.as_u64() {
-        i128::from(u)
-    } else {
-        // A fraction truncates toward zero; NaN and the infinities cannot
-        // appear in JSON.
-        float = true;
-        number.as_f64().unwrap_or(0.0).trunc() as i128
+        // Anything other than a number keeps serde's own wording, which
+        // the caller maps as it did when the member was read as a number.
+        Err(crate::number_tokens::IntegerFault::NotANumber(e)) => {
+            return Err(D::Error::custom(e));
+        }
     };
     let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
     Ok(Some(Int32 {
         value: clamped as i64,
-        coerced: float || clamped != wide,
+        coerced: lenient || clamped != wide,
     }))
 }
 

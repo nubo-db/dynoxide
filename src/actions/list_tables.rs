@@ -8,8 +8,15 @@ use serde::{Deserialize, Serialize};
 struct ListTablesRequestRaw {
     #[serde(rename = "ExclusiveStartTableName", default)]
     exclusive_start_table_name: Option<String>,
-    #[serde(rename = "Limit", default)]
-    limit: Option<i64>,
+    /// Read as Query's `Limit` is: a fraction truncates, a number past the
+    /// range saturates and a malformed token is read by DynamoDB's integer
+    /// rule (captured eu-west-2, 9 and 10 November 2026).
+    #[serde(
+        rename = "Limit",
+        default,
+        deserialize_with = "super::helpers::deserialize_int32"
+    )]
+    limit: Option<super::helpers::Int32>,
 }
 
 #[derive(Debug, Default)]
@@ -23,6 +30,7 @@ impl<'de> serde::Deserialize<'de> for ListTablesRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ListTablesRequestRaw::deserialize(deserializer)?;
+        let limit = raw.limit.map(|limit| limit.value);
 
         let mut errors = Vec::new();
 
@@ -56,7 +64,7 @@ impl<'de> serde::Deserialize<'de> for ListTablesRequest {
         }
 
         // Validate Limit
-        if let Some(limit) = raw.limit {
+        if let Some(limit) = limit {
             if limit < 1 {
                 errors.push(format!(
                     "Value '{}' at 'limit' failed to satisfy constraint: \
@@ -79,7 +87,7 @@ impl<'de> serde::Deserialize<'de> for ListTablesRequest {
 
         Ok(ListTablesRequest {
             exclusive_start_table_name: raw.exclusive_start_table_name,
-            limit: raw.limit,
+            limit,
         })
     }
 }

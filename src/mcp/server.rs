@@ -3338,6 +3338,11 @@ mod capacity_tests {
         'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy \
         enum value set: [INDEXES, TOTAL, NONE]";
 
+    /// The same refusal without the envelope, as SearchVectors and UpdateItem
+    /// give it over HTTP.
+    const BARE_BOGUS_MODE: &str = "Value 'BOGUS' at 'returnConsumedCapacity' failed to \
+        satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+
     fn wire<T: serde::de::DeserializeOwned>(value: Value) -> T {
         serde_json::from_value(value).expect("fixture request deserialises")
     }
@@ -3498,6 +3503,12 @@ mod capacity_tests {
 
         /// Every check the fourteen tools share.
         fn check(&self) {
+            self.check_refusing(BOGUS_MODE);
+        }
+
+        /// [`Case::check`], for a tool whose operation refuses a mode outside
+        /// the enum with `refusal` over HTTP.
+        fn check_refusing(&self, refusal: &str) {
             for mode in ["TOTAL", "INDEXES"] {
                 assert_eq!(self.reported(mode), self.expected(mode), "{mode}");
             }
@@ -3519,7 +3530,7 @@ mod capacity_tests {
             let (is_error, body) = self.call(&server(), Some("BOGUS"));
             assert!(is_error, "BOGUS was accepted: {body}");
             assert_eq!(body["error_type"], "ValidationException");
-            assert_eq!(body["message"], BOGUS_MODE);
+            assert_eq!(body["message"], refusal);
         }
     }
 
@@ -3726,7 +3737,7 @@ mod capacity_tests {
                 "SearchVector": vector, "TopK": 1
             }),
         }
-        .check();
+        .check_refusing(BARE_BOGUS_MODE);
     }
 
     #[test]

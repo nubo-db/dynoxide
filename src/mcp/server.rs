@@ -1106,32 +1106,34 @@ fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
         .map(to_tool_error)
 }
 
-/// Refuse a `segment` or `total_segments` that is negative or past what a
-/// 32-bit integer holds, as Scan's member checks refuse it over HTTP. The HTTP
-/// API reads `Segment`, `TotalSegments` and `Limit` as 32-bit integers, so a
-/// value past either end is read as that end and the request moves to the
-/// older wording, which echoes the value and lists the request's other member
-/// errors with it. This mirrors `actions::helpers::deserialize_int32` and the
-/// `ScanMembers` that `actions::scan` builds from what it reads. Anything in
-/// range is left to the action, which runs the same checks.
-fn refuse_segments_outside_int32(params: &ScanParams) -> Option<CallToolResult> {
+/// Run Scan's member checks on `segment`, `total_segments` and `limit` as the
+/// HTTP API reads them, when it reads them differently from the action: a
+/// negative segment, which the action's request can't hold, or any of the
+/// three past what a 32-bit integer holds. The HTTP API reads all three as
+/// 32-bit integers, so a value past either end is read as that end and the
+/// request moves to the older wording, which echoes the value and lists the
+/// request's other member errors with it. This mirrors
+/// `actions::helpers::deserialize_int32` and the `ScanMembers` that
+/// `actions::scan` builds from what it reads. Anything else, and a request the
+/// checks pass, is left to the action.
+fn refuse_scan_members_read_as_int32(params: &ScanParams) -> Option<CallToolResult> {
     let int32 = |value: i64| {
         let read = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
         (read, read != value)
     };
     let segment = params.segment.map(int32);
     let total_segments = params.total_segments.map(int32);
-    if ![segment, total_segments]
+    let limit = params
+        .limit
+        .map(|l| int32(i64::try_from(l).unwrap_or(i64::MAX)));
+    let read = [segment, total_segments, limit];
+    if !read
         .iter()
         .flatten()
         .any(|&(value, coerced)| coerced || value < 0)
     {
         return None;
     }
-    let limit = params
-        .limit
-        .map(|l| int32(i64::try_from(l).unwrap_or(i64::MAX)));
-    let read = [segment, total_segments, limit];
     crate::actions::scan::ScanMembers {
         table_name: Some(&params.table_name),
         select: params.select.as_deref(),
@@ -1775,7 +1777,7 @@ impl McpServer {
         description = "Scan an entire table or GSI/LSI, optionally applying a filter expression. Use query instead when you know the partition key. Use select=COUNT to get only Count and ScannedCount without items. Use Segment and TotalSegments for parallel scan; segment filtering uses FNV-1a hash at the SQLite level."
     )]
     fn scan(&self, Parameters(params): Parameters<ScanParams>) -> Result<CallToolResult, McpError> {
-        if let Some(err) = refuse_segments_outside_int32(&params) {
+        if let Some(err) = refuse_scan_members_read_as_int32(&params) {
             return Ok(err);
         }
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {

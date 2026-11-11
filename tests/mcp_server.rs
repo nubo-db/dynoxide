@@ -5883,7 +5883,15 @@ fn scan_segments_answer_as_the_http_api_does() {
             ),
         ),
         // A limit past what a 32-bit integer holds is read as the largest one,
-        // which moves a segment's refusal to the older wording too.
+        // which moves a segment's refusal to the older wording too, whether
+        // or not the segment itself is past 32 bits.
+        (
+            json!({"total_segments": 0, "limit": 3_000_000_000_u64}),
+            one(
+                "Value '0' at 'totalSegments' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 1",
+            ),
+        ),
         (
             json!({"segment": -1, "total_segments": 2, "limit": 3_000_000_000_u64}),
             one(
@@ -5908,6 +5916,15 @@ fn scan_segments_answer_as_the_http_api_does() {
         2,
         "scan",
         json!({"table_name": "Segments", "segment": 1, "total_segments": 2}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(tool_content(&resp)["Count"], json!(0));
+    // And so does a limit past 32 bits with no segments.
+    let resp = call_tool(
+        &mut child,
+        3,
+        "scan",
+        json!({"table_name": "Segments", "limit": 3_000_000_000_u64}),
     );
     assert!(!is_tool_error(&resp), "{resp}");
     assert_eq!(tool_content(&resp)["Count"], json!(0));

@@ -132,8 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   satisfy constraint: Member must have value greater than or equal to 0`. It
   used to refuse it as a malformed argument. An integer past what 32 bits
   hold reads as the nearest 32-bit integer, as it does over HTTP, and so does
-  `limit` beside a segment refused this way. A fraction, or an integer past
-  64 bits, is still refused as a malformed argument
+  `limit`; either moves a segment refusal to the older wording, which echoes
+  the value. A fraction, or an integer past 64 bits, is still refused as a
+  malformed argument
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 - The MCP `execute_partiql` tool reports a member error (`limit` 0, a bad
   `return_consumed_capacity` or `return_values_on_condition_check_failure`,

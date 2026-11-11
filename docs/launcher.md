@@ -392,6 +392,22 @@ Started without it, for a binary older than this contract:
 - On Windows: kill. There's no graceful option there. A `--db-path` file
   keeps every write that completed.
 
+A binary the user supplies may not be Dynoxide itself but a shim, such as a
+version manager's, or a script that starts the real binary as its child.
+Signals through the handle reach only the shim, so a wrapper may also,
+optionally, signal what the process started:
+
+- Read the process's descendants once it's ready, and again before closing
+  stdin. A child is re-parented once its parent dies, so after a shim exits
+  its child can only be found from what was read earlier.
+- Send each signal step to them as well, and once the process has exited,
+  stop any still running: SIGTERM, wait, kill.
+- Record each one's start time when you read it, and signal it only while
+  that still matches. That's what keeps a reused process ID safe. Count a
+  zombie as gone: in a container whose first process doesn't reap orphans, a
+  killed child stays one.
+- On Windows, `taskkill /T /F /PID <pid>` as the kill step takes the tree.
+
 ## When the test runner dies
 
 If the runner is killed outright, none of its shutdown hooks run. With
@@ -462,7 +478,8 @@ Fixed, so wrappers behave alike:
 - [ ] Exporting is a separate call, sets both region variables and
       `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=false`, and never
       `AWS_ENDPOINT_URL`.
-- [ ] Stopping closes stdin, waits, then signals through the process handle.
+- [ ] Stopping closes stdin, waits, then signals through the process handle,
+      and optionally what the process started, checked by start time.
 - [ ] No other process holds the stdin pipe, forks included.
 
 ## Changes to this contract

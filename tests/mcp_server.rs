@@ -2321,6 +2321,59 @@ fn test_transact_write_items_null_false_bare() {
     let _ = child.wait();
 }
 
+/// The transaction write tool answers its member checks as the HTTP API does:
+/// a table name left out, an empty token ahead of a number refused in an item
+/// and ahead of a bad capacity mode, and an item naming no action beside a
+/// bad capacity mode (captured eu-west-2 and us-east-1, 2026-11-11).
+#[test]
+fn the_transaction_write_tool_checks_its_members_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let cases = [
+        (
+            json!({"transact_items": [{"Put": {"Item": {"pk": {"S": "a"}}}}]}),
+            "1 validation error detected: Value null at 'transactItems.1.member.put.tableName' \
+             failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            json!({
+                "transact_items": [{"Put": {"TableName": "Parity", "Item": {"pk": {"N": "abc"}}}}],
+                "client_request_token": ""
+            }),
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1",
+        ),
+        (
+            json!({
+                "transact_items": [{"Put": {"TableName": "Parity", "Item": {"pk": {"N": "abc"}}}}],
+                "client_request_token": "",
+                "return_consumed_capacity": "BAD"
+            }),
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1",
+        ),
+        (
+            json!({
+                "transact_items": [{}, {"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}],
+                "return_consumed_capacity": "BAD"
+            }),
+            "2 validation errors detected: Value '' at 'transactItems' failed to satisfy \
+             constraint: TransactWriteRequest should contain Delete or Put or Update or \
+             ConditionCheck; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy \
+             constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+        ),
+    ];
+    for (id, (args, expected)) in (2..).zip(cases) {
+        let resp = call_tool(&mut child, id, "transact_write_items", args);
+        assert_validation_tool_error(&resp, expected);
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn test_update_item_duplicate_set_in_eav_enveloped() {
     let mut child = spawn_mcp();

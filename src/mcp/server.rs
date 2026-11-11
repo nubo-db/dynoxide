@@ -1099,7 +1099,7 @@ fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
 /// Refuse a `return_consumed_capacity` outside DynamoDB's enum with the error a
 /// wire client gets, before the tool reads or writes anything. Most tools build
 /// their action request directly, which skips the check the wire path makes
-/// while deserialising, so every capacity-bearing tool asks here instead.
+/// while deserialising, so those tools ask here instead.
 fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
     crate::validation::reject_bad_capacity_mode(mode)
         .err()
@@ -2292,19 +2292,21 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("transact_write_items") {
             return Ok(err);
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
+        // Read through the HTTP API's reader, so a member left out, the
+        // token, the capacity mode and a value refused in an item are
+        // answered in the order and wording a wire client gets.
+        let mut wire = serde_json::json!({ "TransactItems": params.transact_items });
+        if let Some(token) = params.client_request_token {
+            wire["ClientRequestToken"] = token.into();
         }
-        let transact_items = match parse_json_param(params.transact_items, "transact_items") {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        let request = crate::actions::transact_write_items::TransactWriteItemsRequest {
-            transact_items,
-            client_request_token: params.client_request_token,
-            return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
-        };
+        if let Some(mode) = params.return_consumed_capacity {
+            wire["ReturnConsumedCapacity"] = mode.into();
+        }
+        let request: crate::actions::transact_write_items::TransactWriteItemsRequest =
+            match parse_json_param(wire, "transact_items") {
+                Ok(r) => r,
+                Err(err) => return Ok(err),
+            };
         match self.db.transact_write_items(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),

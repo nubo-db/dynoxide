@@ -1069,6 +1069,39 @@ const CAPTURED: &[(&str, &str, &str)] = &[
         r##"{"TableName":"_capture_731000000\u0031","ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":1}}"##,
         r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: _capture_7310000001 not found"}"##,
     ),
+    // A member `ProvisionedThroughput` doesn't have is not read, even one
+    // named as an on-demand unit.
+    (
+        "UpdateTable",
+        r##"{"TableName":"no_such_table","ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1,"MaxReadRequestUnits":1.5.5}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: no_such_table not found"}"##,
+    ),
+    (
+        "UpdateTable",
+        r##"{"TableName":"no_such_table","ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1,"Foo":1.5.5}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: no_such_table not found"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1,"MaxWriteRequestUnits":1e}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"}"##,
+    ),
+    // A GSI's units in UpdateTable are read as the table's are.
+    (
+        "UpdateTable",
+        r##"{"TableName":"no_such_table","GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"gsi","ProvisionedThroughput":{"ReadCapacityUnits":1.5.5,"WriteCapacityUnits":1}}}]}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Bad number format"}"##,
+    ),
+    (
+        "UpdateTable",
+        r##"{"TableName":"no_such_table","GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"gsi","ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":1}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: no_such_table not found"}"##,
+    ),
+    (
+        "UpdateTable",
+        r##"{"TableName":"no_such_table","GlobalSecondaryIndexUpdates":[{"Update":{"IndexName":"gsi","ProvisionedThroughput":{"ReadCapacityUnits":-,"WriteCapacityUnits":1}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'globalSecondaryIndexUpdates.1.member.update.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+    ),
 ];
 
 /// Bodies whose answer depends on which of two faults DynamoDB meets first in
@@ -1116,7 +1149,7 @@ async fn every_captured_body_is_answered_as_dynamodb_answers_it() {
         (CAPTURED.len(), skipped),
         // The `0.5` body of the second list was captured twice.
         (
-            205,
+            211,
             WRITTEN_ORDER.len() + KEY_SCHEMA_BESIDE_THROUGHPUT.len() + 1
         ),
         "every captured row is checked or named"

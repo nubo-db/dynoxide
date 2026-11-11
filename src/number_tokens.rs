@@ -557,24 +557,19 @@ fn saturate_i64(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-/// Read the throughput units in a `ProvisionedThroughput` or
-/// `OnDemandThroughput` object held as JSON as [`deserialize_units`] does,
-/// writing each back as the whole number it reads as, so every later check
-/// sees what DynamoDB reads. A token an integer member refuses is
-/// `Bad number format`, raised as the deserialisation fault it is, before
-/// anything checks the request.
+/// Read the throughput units in a `ProvisionedThroughput` object held as JSON
+/// as [`deserialize_units`] does, writing each back as the whole number it
+/// reads as, so every later check sees what DynamoDB reads. A token an integer
+/// member refuses is `Bad number format`, raised as the deserialisation fault
+/// it is, before anything checks the request. Any other member is left alone,
+/// since DynamoDB doesn't read it (captured eu-west-2, 11 November 2026).
 pub(crate) fn read_units_in<E: serde::de::Error>(
     throughput: &mut serde_json::Value,
 ) -> Result<(), E> {
     let Some(members) = throughput.as_object_mut() else {
         return Ok(());
     };
-    for unit in [
-        "ReadCapacityUnits",
-        "WriteCapacityUnits",
-        "MaxReadRequestUnits",
-        "MaxWriteRequestUnits",
-    ] {
+    for unit in ["ReadCapacityUnits", "WriteCapacityUnits"] {
         if let Some(value) = members.get_mut(unit)
             && let serde_json::Value::Number(number) = value
         {

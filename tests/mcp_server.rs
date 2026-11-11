@@ -7215,3 +7215,583 @@ fn batch_request_items_answer_as_the_http_api_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// Run one request on both surfaces during setup, failing if either refuses.
+fn on_both(
+    child: &mut std::process::Child,
+    http: &HttpApi,
+    id: u64,
+    call: (&str, Value, &str, Value),
+) {
+    let (tool, args, operation, body) = call;
+    let resp = call_tool(child, id, tool, args);
+    assert!(!is_tool_error(&resp), "{tool}: {resp}");
+    let (status, answer) = http.call(operation, &body);
+    assert_eq!(status, 200, "{operation}: {answer}");
+}
+
+/// Two copies of the same data, one behind a `dynoxide mcp` subprocess and
+/// one behind the HTTP API: `Rich` (pk, sk) with a sparse index `byG` on
+/// (g, sk), and `Vecs` with a vector index `vix` on `emb`.
+fn both_with_rich_data() -> (std::process::Child, HttpApi) {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let http = HttpApi::start();
+    on_both(
+        &mut child,
+        &http,
+        800,
+        (
+            "create_table",
+            json!({
+                "table_name": "Rich",
+                "billing_mode": "PAY_PER_REQUEST",
+                "key_schema": [
+                    {"attribute_name": "pk", "key_type": "HASH"},
+                    {"attribute_name": "sk", "key_type": "RANGE"}
+                ],
+                "attribute_definitions": [
+                    {"attribute_name": "pk", "attribute_type": "S"},
+                    {"attribute_name": "sk", "attribute_type": "N"},
+                    {"attribute_name": "g", "attribute_type": "S"}
+                ],
+                "global_secondary_indexes": [{
+                    "index_name": "byG",
+                    "key_schema": [
+                        {"attribute_name": "g", "key_type": "HASH"},
+                        {"attribute_name": "sk", "key_type": "RANGE"}
+                    ],
+                    "projection": {"projection_type": "ALL"}
+                }]
+            }),
+            "CreateTable",
+            json!({
+                "TableName": "Rich",
+                "BillingMode": "PAY_PER_REQUEST",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "N"},
+                    {"AttributeName": "g", "AttributeType": "S"}
+                ],
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": "byG",
+                    "KeySchema": [
+                        {"AttributeName": "g", "KeyType": "HASH"},
+                        {"AttributeName": "sk", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                }]
+            }),
+        ),
+    );
+    on_both(
+        &mut child,
+        &http,
+        801,
+        (
+            "create_table",
+            json!({
+                "table_name": "Vecs",
+                "billing_mode": "PAY_PER_REQUEST",
+                "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+                "attribute_definitions": [
+                    {"attribute_name": "pk", "attribute_type": "S"},
+                    {"attribute_name": "t", "attribute_type": "S"}
+                ],
+                "vector_indexes": [{
+                    "index_name": "vix",
+                    "vector_attribute": {"attribute_name": "emb"},
+                    "search_schema": [
+                        {"attribute_name": "t", "search_schema_element_type": "INLINE_FILTER"}
+                    ],
+                    "projection": {"projection_type": "ALL"},
+                    "dimensions": 3,
+                    "distance_function": "COSINE"
+                }]
+            }),
+            "CreateTable",
+            json!({
+                "TableName": "Vecs",
+                "BillingMode": "PAY_PER_REQUEST",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "t", "AttributeType": "S"}
+                ],
+                "VectorIndexes": [{
+                    "IndexName": "vix",
+                    "VectorAttribute": {"AttributeName": "emb"},
+                    "SearchSchema": [
+                        {"AttributeName": "t", "SearchSchemaElementType": "INLINE_FILTER"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "Dimensions": 3,
+                    "DistanceFunction": "COSINE"
+                }]
+            }),
+        ),
+    );
+    let mut items = Vec::new();
+    for sk in 1..=6 {
+        let mut item = json!({
+            "pk": {"S": "a"},
+            "sk": {"N": sk.to_string()},
+            "t": {"S": if sk % 2 == 1 { "keep" } else { "drop" }},
+            "v": {"N": (sk * 10).to_string()},
+            "o": {"S": "other"}
+        });
+        if sk <= 3 {
+            item["g"] = json!({"S": "x"});
+        }
+        items.push(("Rich", item));
+    }
+    items.push((
+        "Rich",
+        json!({"pk": {"S": "b"}, "sk": {"N": "1"}, "g": {"S": "y"}, "t": {"S": "keep"}}),
+    ));
+    for (pk, emb, t) in [
+        ("v1", ["1", "0", "0"], "keep"),
+        ("v2", ["0.9", "0.1", "0"], "drop"),
+        ("v3", ["0", "1", "0"], "keep"),
+        ("v4", ["0", "0", "1"], "drop"),
+    ] {
+        let emb: Vec<Value> = emb.iter().map(|n| json!({"N": n})).collect();
+        items.push((
+            "Vecs",
+            json!({"pk": {"S": pk}, "emb": {"L": emb}, "t": {"S": t}, "o": {"S": "other"}}),
+        ));
+    }
+    for (id, (table, item)) in (810..).zip(items) {
+        on_both(
+            &mut child,
+            &http,
+            id,
+            (
+                "put_item",
+                json!({"table_name": table, "item": item}),
+                "PutItem",
+                json!({"TableName": table, "Item": item}),
+            ),
+        );
+    }
+    (child, http)
+}
+
+/// Valid calls that each use one optional argument in a way that changes the
+/// result answer as the HTTP API does, whole successful bodies included. A
+/// tool that dropped the argument on the way to the operation would answer
+/// differently.
+#[test]
+fn valid_calls_answer_as_the_http_api_does() {
+    let (mut child, http) = both_with_rich_data();
+    let rich = ("table_name", "TableName", json!("Rich"));
+    let vecs = ("table_name", "TableName", json!("Vecs"));
+    let on_a = [
+        (
+            "key_condition_expression",
+            "KeyConditionExpression",
+            json!("pk = :p"),
+        ),
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":p": {"S": "a"}}),
+        ),
+    ];
+    let query = |extra: Vec<Member<'static>>| {
+        let mut members = vec![rich.clone(), on_a[0].clone(), on_a[1].clone()];
+        for member in extra {
+            members.retain(|(arg, _, _)| *arg != member.0);
+            members.push(member);
+        }
+        ("query", "Query", members)
+    };
+    let key = json!({"pk": {"S": "a"}, "sk": {"N": "3"}});
+    let vector = json!([{"N": "1"}, {"N": "0"}, {"N": "0"}]);
+    let search = |extra: Vec<Member<'static>>| {
+        let mut members = vec![
+            vecs.clone(),
+            ("index_name", "IndexName", json!("vix")),
+            ("search_vector", "SearchVector", vector.clone()),
+            ("top_k", "TopK", json!(2)),
+        ];
+        members.extend(extra);
+        ("search_vectors", "SearchVectors", members)
+    };
+
+    // A page boundary taken from the HTTP API's own first page.
+    let (status, first_page) = http.call(
+        "Query",
+        &json!({
+            "TableName": "Rich", "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "a"}}, "Limit": 2
+        }),
+    );
+    assert_eq!(status, 200, "{first_page}");
+    let start_key = first_page["LastEvaluatedKey"].clone();
+    assert!(
+        start_key.is_object(),
+        "the first page ends early: {first_page}"
+    );
+
+    let requests: Vec<(&str, &str, Vec<Member>)> = vec![
+        query(vec![
+            ("filter_expression", "FilterExpression", json!("t = :t")),
+            (
+                "expression_attribute_values",
+                "ExpressionAttributeValues",
+                json!({":p": {"S": "a"}, ":t": {"S": "keep"}}),
+            ),
+        ]),
+        query(vec![(
+            "projection_expression",
+            "ProjectionExpression",
+            json!("sk, t"),
+        )]),
+        query(vec![
+            (
+                "projection_expression",
+                "ProjectionExpression",
+                json!("#t, sk"),
+            ),
+            (
+                "expression_attribute_names",
+                "ExpressionAttributeNames",
+                json!({"#t": "t"}),
+            ),
+        ]),
+        query(vec![
+            ("limit", "Limit", json!(2)),
+            (
+                "exclusive_start_key",
+                "ExclusiveStartKey",
+                start_key.clone(),
+            ),
+        ]),
+        query(vec![("select", "Select", json!("COUNT"))]),
+        query(vec![
+            ("select", "Select", json!("SPECIFIC_ATTRIBUTES")),
+            ("projection_expression", "ProjectionExpression", json!("v")),
+        ]),
+        query(vec![
+            ("index_name", "IndexName", json!("byG")),
+            (
+                "key_condition_expression",
+                "KeyConditionExpression",
+                json!("g = :g"),
+            ),
+            (
+                "expression_attribute_values",
+                "ExpressionAttributeValues",
+                json!({":g": {"S": "x"}}),
+            ),
+        ]),
+        (
+            "scan",
+            "Scan",
+            vec![
+                rich.clone(),
+                (
+                    "projection_expression",
+                    "ProjectionExpression",
+                    json!("pk, sk"),
+                ),
+            ],
+        ),
+        (
+            "scan",
+            "Scan",
+            vec![
+                rich.clone(),
+                (
+                    "projection_expression",
+                    "ProjectionExpression",
+                    json!("#o, sk"),
+                ),
+                (
+                    "expression_attribute_names",
+                    "ExpressionAttributeNames",
+                    json!({"#o": "o"}),
+                ),
+            ],
+        ),
+        (
+            "scan",
+            "Scan",
+            vec![rich.clone(), ("index_name", "IndexName", json!("byG"))],
+        ),
+        (
+            "get_item",
+            "GetItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", key.clone()),
+                ("projection_expression", "ProjectionExpression", json!("t")),
+            ],
+        ),
+        (
+            "get_item",
+            "GetItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", key.clone()),
+                ("projection_expression", "ProjectionExpression", json!("#v")),
+                (
+                    "expression_attribute_names",
+                    "ExpressionAttributeNames",
+                    json!({"#v": "v"}),
+                ),
+            ],
+        ),
+        search(vec![
+            (
+                "search_condition_expression",
+                "SearchConditionExpression",
+                json!("t = :t"),
+            ),
+            (
+                "expression_attribute_values",
+                "ExpressionAttributeValues",
+                json!({":t": {"S": "keep"}}),
+            ),
+        ]),
+        search(vec![(
+            "projection_expression",
+            "ProjectionExpression",
+            json!("pk"),
+        )]),
+        // BatchGetItem applies AttributesToGet, so the tool does too.
+        (
+            "batch_get_item",
+            "BatchGetItem",
+            vec![(
+                "request_items",
+                "RequestItems",
+                json!({"Rich": {"Keys": [key.clone()], "AttributesToGet": ["t", "sk"]}}),
+            )],
+        ),
+        // The writes come last, as they change the data the reads see.
+        (
+            "put_item",
+            "PutItem",
+            vec![
+                rich.clone(),
+                (
+                    "item",
+                    "Item",
+                    json!({"pk": {"S": "a"}, "sk": {"N": "1"}, "v": {"N": "11"}}),
+                ),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("v = :v"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":v": {"N": "10"}}),
+                ),
+                ("return_values", "ReturnValues", json!("ALL_OLD")),
+            ],
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", key.clone()),
+                ("update_expression", "UpdateExpression", json!("SET w = :w")),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("attribute_exists(pk)"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":w": {"S": "new"}}),
+                ),
+                ("return_values", "ReturnValues", json!("ALL_NEW")),
+            ],
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", json!({"pk": {"S": "a"}, "sk": {"N": "9"}})),
+                ("update_expression", "UpdateExpression", json!("SET w = :w")),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("attribute_exists(pk)"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":w": {"S": "new"}}),
+                ),
+            ],
+        ),
+        (
+            "put_item",
+            "PutItem",
+            vec![
+                rich.clone(),
+                ("item", "Item", json!({"pk": {"S": "a"}, "sk": {"N": "2"}})),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("v = :v"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":v": {"N": "999"}}),
+                ),
+            ],
+        ),
+    ];
+
+    let checked = requests.len();
+    let mut differ = Vec::new();
+    for (id, (tool, operation, members)) in (4000..).zip(requests) {
+        let (args, body) = same_request(&members);
+        let over_mcp = mcp_answer(&call_tool(&mut child, id, tool, args.clone()));
+        let over_http = http.answer(operation, &body);
+        // Each read and the first two writes are meant to succeed, so an
+        // argument the tool dropped can't hide behind an error both give.
+        if !matches!(over_http, Answer::Ok(_))
+            && !matches!(&over_http, Answer::Err(t, _) if t == "ConditionalCheckFailedException")
+        {
+            differ.push(format!("{tool} {args}\n  HTTP refused it: {over_http:?}"));
+        }
+        if over_mcp != over_http {
+            differ.push(format!(
+                "{tool} {args}\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+            ));
+        }
+    }
+
+    // A refusal that carries more than a message: the failed condition's item
+    // and a cancelled transaction's reasons, against the HTTP API's `Item`
+    // and `CancellationReasons`.
+    let failed_put = vec![
+        rich.clone(),
+        ("item", "Item", json!({"pk": {"S": "a"}, "sk": {"N": "4"}})),
+        (
+            "condition_expression",
+            "ConditionExpression",
+            json!("v = :v"),
+        ),
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":v": {"N": "999"}}),
+        ),
+        (
+            "return_values_on_condition_check_failure",
+            "ReturnValuesOnConditionCheckFailure",
+            json!("ALL_OLD"),
+        ),
+    ];
+    let cancelled = vec![(
+        "transact_items",
+        "TransactItems",
+        json!([
+            {"Put": {"TableName": "Rich", "Item": {"pk": {"S": "c"}, "sk": {"N": "1"}}}},
+            {"ConditionCheck": {
+                "TableName": "Rich", "Key": {"pk": {"S": "a"}, "sk": {"N": "5"}},
+                "ConditionExpression": "v = :v",
+                "ExpressionAttributeValues": {":v": {"N": "999"}},
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+            }}
+        ]),
+    )];
+    for (id, (tool, operation, members, mcp_field, http_field)) in (4200..).zip([
+        ("put_item", "PutItem", failed_put, "item", "Item"),
+        (
+            "transact_write_items",
+            "TransactWriteItems",
+            cancelled,
+            "cancellation_reasons",
+            "CancellationReasons",
+        ),
+    ]) {
+        let (args, body) = same_request(&members);
+        let resp = call_tool(&mut child, id, tool, args);
+        assert!(is_tool_error(&resp), "{tool} succeeded: {resp}");
+        let (status, over_http) = http.call(operation, &body);
+        assert_eq!(status, 400, "{over_http}");
+        assert!(
+            !over_http[http_field].is_null(),
+            "{operation} gave no {http_field}, so a match would prove nothing: {over_http}"
+        );
+        let over_mcp = tool_content(&resp);
+        // TransactWriteItems spells its message `Message`.
+        let http_message = over_http
+            .get("message")
+            .or_else(|| over_http.get("Message"));
+        if over_mcp[mcp_field] != over_http[http_field]
+            || Some(&over_mcp["message"]) != http_message
+        {
+            differ.push(format!(
+                "{tool} {mcp_field}\n  MCP:  {over_mcp}\n  HTTP: {over_http}"
+            ));
+        }
+    }
+
+    // ExecuteStatement pages with each surface's own token, so the second
+    // page is asked for separately on each and compared.
+    let statement = r#"SELECT * FROM "Rich" WHERE pk = 'a'"#;
+    let over_mcp = tool_content(&call_tool(
+        &mut child,
+        4100,
+        "execute_partiql",
+        json!({"statement": statement, "limit": 2}),
+    ));
+    let (status, over_http) = http.call(
+        "ExecuteStatement",
+        &json!({"Statement": statement, "Limit": 2}),
+    );
+    assert_eq!(status, 200, "{over_http}");
+    assert_eq!(over_mcp["Items"], over_http["Items"]);
+    let (mcp_token, http_token) = (
+        over_mcp["NextToken"].clone(),
+        over_http["NextToken"].clone(),
+    );
+    assert!(
+        http_token.is_string(),
+        "the first page ends early: {over_http}"
+    );
+    let over_mcp = mcp_answer(&call_tool(
+        &mut child,
+        4101,
+        "execute_partiql",
+        json!({"statement": statement, "limit": 2, "next_token": mcp_token}),
+    ));
+    let over_http = http.answer(
+        "ExecuteStatement",
+        &json!({"Statement": statement, "Limit": 2, "NextToken": http_token}),
+    );
+    if over_mcp != over_http {
+        differ.push(format!(
+            "execute_partiql second page\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+        ));
+    }
+
+    assert!(
+        differ.is_empty(),
+        "{} of {} answers differ:\n{}",
+        differ.len(),
+        checked + 3,
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

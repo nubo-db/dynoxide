@@ -21,7 +21,7 @@ struct ScanRequestRaw {
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<crate::types::HeldValues>,
     #[serde(
         rename = "Limit",
         default,
@@ -244,6 +244,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
+        let expression_attribute_values = helpers::read_values_after_start_key(
+            raw.expression_attribute_values,
+            crate::types::deserialize_named_nulls,
+            raw.exclusive_start_key.as_ref(),
+            |key| helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current),
+        )
+        .map_err(serde::de::Error::custom)?;
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
         // request malformed, ahead of everything else.
@@ -278,7 +285,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             filter_expression: raw.filter_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             limit: raw.limit.map(|n| n.value as usize),
             exclusive_start_key: None,
             select: raw.select,

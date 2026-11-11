@@ -52,6 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A JSON `null` where an attribute value belongs is refused in DynamoDB's
+  words, `The supplied Item contains a null AttributeValue`, where before it
+  was taken for an empty value. A null member of an item, a key or an `M` is
+  named (`: pk is null`); one in an `L`, a PartiQL parameter or an
+  `AttributeValueList` is not. `ExpressionAttributeValues` and
+  `ExclusiveStartKey` wrap it as they wrap their other faults, and a null
+  given for a whole `Expected`, `AttributeUpdates` or `KeyConditions` entry
+  gets the message DynamoDB has for each. In BatchExecuteStatement it fails
+  only its own statement. The faults in an item or key are now met in the
+  order DynamoDB walks them (its Java `HashMap` order, with a value of the
+  wrong JSON type ahead of the rest), an item or key is checked before
+  `ExpressionAttributeValues` and a starting key before Query's, and a null
+  puts the request on the older validation layer, so a bad number beside one
+  comes back without the `1 validation error detected:` envelope. An
+  `AttributeUpdates` entry with no value and an action other than `DELETE`
+  is now refused inside that envelope
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages
   (`Buffer is too short for base64 encoding` for one character, `Base64

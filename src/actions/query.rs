@@ -22,12 +22,8 @@ struct QueryRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_named_empty_and_null_refusals"
-    )]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<crate::types::HeldValues>,
     #[serde(
         rename = "ScanIndexForward",
         default,
@@ -115,6 +111,16 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = QueryRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
+        let expression_attribute_values = helpers::read_values_after_start_key(
+            raw.expression_attribute_values,
+            crate::types::deserialize_named_empty_and_null_refusals,
+            raw.exclusive_start_key.as_ref(),
+            |key| {
+                helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current)
+                    .map_err(start_key_value_error)
+            },
+        )
+        .map_err(serde::de::Error::custom)?;
 
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
@@ -222,7 +228,7 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             filter_expression: raw.filter_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             // Left out or null, a Query reads forward (captured eu-west-2 and
             // us-east-1, 2026-10-10).
             scan_index_forward: raw.scan_index_forward.unwrap_or(true),

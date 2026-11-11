@@ -16,7 +16,10 @@ pub struct BatchGetItemRequest {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct KeysAndAttributes {
-    #[serde(rename = "Keys")]
+    #[serde(
+        rename = "Keys",
+        deserialize_with = "crate::types::deserialize_attribute_maps"
+    )]
     pub keys: Vec<HashMap<String, AttributeValue>>,
     #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,

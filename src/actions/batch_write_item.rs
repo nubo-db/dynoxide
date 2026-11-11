@@ -25,13 +25,19 @@ pub struct WriteRequest {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PutRequest {
-    #[serde(rename = "Item")]
+    #[serde(
+        rename = "Item",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub item: Item,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DeleteRequest {
-    #[serde(rename = "Key")]
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub key: HashMap<String, AttributeValue>,
 }
 

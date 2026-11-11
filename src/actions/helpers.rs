@@ -1050,6 +1050,11 @@ pub fn parse_expression_attribute_values_raw(
                     return Err(error);
                 }
                 return Err(match value_refusal(&msg) {
+                    // A JSON null is named by key on every operation (captured
+                    // eu-west-2 and us-east-1, 2026-11-11).
+                    ValueRefusal::Null(inner) => {
+                        DynoxideError::ValidationException(named_value_refusal(inner, key))
+                    }
                     ValueRefusal::Empty => {
                         DynoxideError::ValidationException(named_value_refusal(EMPTY_VALUE, key))
                     }
@@ -1108,6 +1113,18 @@ pub fn parse_expression_attribute_values_raw(
 pub(crate) fn read_expected(
     expected: &serde_json::Value,
 ) -> Result<Option<HashMap<String, ExpectedCondition>>> {
+    // A null given for a whole condition is refused in words of its own
+    // (captured eu-west-2 and us-east-1, 2026-11-11).
+    if let Some(name) = expected.as_object().and_then(|conditions| {
+        conditions
+            .iter()
+            .find_map(|(name, condition)| condition.is_null().then_some(name))
+    }) {
+        return Err(DynoxideError::ValidationException(format!(
+            "One or more parameter values were invalid: \
+             ExpectedAttributeValue must not be null for Attribute: {name}"
+        )));
+    }
     match serde_json::from_value::<HashMap<String, ExpectedCondition>>(expected.clone()) {
         Ok(map) => {
             // Each value is checked as an item's would be: empty and duplicated
@@ -1959,6 +1976,35 @@ pub fn extract_key_strings(
     Ok((pk, sk))
 }
 
+/// Read a Query's or Scan's `ExpressionAttributeValues` with `read`, after
+/// its starting key. DynamoDB checks `ExclusiveStartKey` ahead of the
+/// expression values, whichever is written first (captured eu-west-2 and
+/// us-east-1, 2026-11-11, on Query; Scan is taken to read them the same way),
+/// so when a value is refused, the starting key's own fault, read as
+/// `read_start_key` reads it, is answered instead. Otherwise the starting key
+/// is read later, after the request's other checks. The error is a raw serde
+/// message, marker and all.
+pub(crate) fn read_values_after_start_key(
+    values: Option<crate::types::HeldValues>,
+    read: impl FnOnce(
+        serde_json::Value,
+    )
+        -> std::result::Result<Option<HashMap<String, AttributeValue>>, serde_json::Error>,
+    start_key: Option<&serde_json::Value>,
+    read_start_key: impl FnOnce(&serde_json::Value) -> Result<HashMap<String, AttributeValue>>,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, String> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    match values.read(read) {
+        Ok(values) => Ok(Some(values)),
+        Err(refusal) => match start_key.map(read_start_key) {
+            Some(Err(error)) => Err(crate::serde_errors::marked_message(&error).unwrap_or(refusal)),
+            _ => Err(refusal),
+        },
+    }
+}
+
 /// Parse an `ExclusiveStartKey` from a raw `serde_json::Value`.
 ///
 /// Validation errors are formatted to match DynamoDB's exact error messages:
@@ -1972,9 +2018,9 @@ pub fn parse_exclusive_start_key(
 ) -> Result<HashMap<String, AttributeValue>> {
     // First, try to deserialise: this catches multi-type and number errors
     let parsed = match crate::types::with_value_layer(layer, || {
-        serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone())
+        serde_json::from_value::<crate::types::AttributeMap>(value.clone())
     }) {
-        Ok(map) => map,
+        Ok(map) => map.0,
         Err(e) => {
             let msg = e.to_string();
             // A malformed value fails the request as it is read, as it does
@@ -1985,7 +2031,13 @@ pub fn parse_exclusive_start_key(
             // Strip the serde position suffix and any internal marker
             let inner = crate::serde_errors::clean_serde_message(&msg);
 
-            if inner.contains("empty AttributeValue")
+            if inner.starts_with(crate::serde_errors::NULL_VALUE) {
+                // A null member is named, inside the starting-key prefix
+                // (captured eu-west-2 and us-east-1, 2026-11-11).
+                return Err(DynoxideError::ValidationException(format!(
+                    "The provided starting key is invalid: {inner}"
+                )));
+            } else if inner.contains("empty AttributeValue")
                 || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
             {
                 return Err(DynoxideError::ValidationException(
@@ -2432,7 +2484,7 @@ fn validate_comparison_type_compat(comp_op: &str, type_name: &str) -> Result<()>
 /// validation order (filters are validated before ExclusiveStartKey).
 pub fn validate_filter_conditions_raw(
     value: Option<&serde_json::Value>,
-    _param_name: &str,
+    param_name: &str,
 
     layer: crate::validation::ValueLayer,
 ) -> Result<()> {
@@ -2442,6 +2494,17 @@ pub fn validate_filter_conditions_raw(
     };
 
     let obj = val.as_object().unwrap();
+    // A KeyConditions entry given as null is refused before the table is
+    // looked up (captured eu-west-2 and us-east-1, 2026-11-11).
+    if param_name == "KeyConditions"
+        && let Some(name) = obj
+            .iter()
+            .find_map(|(name, condition)| condition.is_null().then_some(name))
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "The filter condition for an attribute cannot be null: {name}"
+        )));
+    }
     for (_attr_name, cond_val) in obj {
         let cond_obj = match cond_val.as_object() {
             Some(o) => o,
@@ -2492,7 +2555,8 @@ fn legacy_value_refusal(
     match value_refusal(msg) {
         ValueRefusal::Empty => refusal(EMPTY_VALUE),
         ValueRefusal::MoreThanOneType => refusal(MORE_THAN_ONE_TYPE),
-        ValueRefusal::EmptySet(inner)
+        ValueRefusal::Null(inner)
+        | ValueRefusal::EmptySet(inner)
         | ValueRefusal::Number(inner)
         | ValueRefusal::ParsedNull(inner)
         | ValueRefusal::RequestNull(inner) => refusal(inner),

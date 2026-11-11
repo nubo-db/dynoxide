@@ -11,7 +11,7 @@ struct PutItemRequestRaw {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
     #[serde(rename = "Item", default)]
-    item: Option<HashMap<String, AttributeValue>>,
+    item: Option<types::HeldAttributeMap>,
     #[serde(rename = "ReturnValues", default)]
     return_values: Option<String>,
     #[serde(rename = "ConditionExpression", default)]
@@ -19,7 +19,7 @@ struct PutItemRequestRaw {
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<types::HeldValues>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -53,6 +53,17 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = PutItemRequestRaw::deserialize(deserializer)?;
 
+        // The item's values are checked ahead of the expression values,
+        // whichever is written first (captured eu-west-2 and us-east-1,
+        // 2026-11-11).
+        let item = raw.item.map(|item| item.0).transpose();
+        let item = item.map_err(serde::de::Error::custom)?;
+        let expression_attribute_values = raw
+            .expression_attribute_values
+            .map(|values| values.read(types::deserialize_named_nulls))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
         // request malformed, ahead of everything else.
@@ -75,7 +86,7 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
         let table_name = raw.table_name.unwrap_or_default();
 
         // Item constraint validation
-        if raw.item.is_none() {
+        if item.is_none() {
             errors.push(
                 "Value null at 'item' failed to satisfy constraint: \
                  Member must not be null"
@@ -123,11 +134,11 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
 
         Ok(PutItemRequest {
             table_name,
-            item: raw.item.unwrap_or_default(),
+            item: item.unwrap_or_default(),
             return_values: raw.return_values,
             condition_expression: raw.condition_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             return_consumed_capacity: raw.return_consumed_capacity,
             return_values_on_condition_check_failure: raw.return_values_on_condition_check_failure,
             return_item_collection_metrics: raw.return_item_collection_metrics,

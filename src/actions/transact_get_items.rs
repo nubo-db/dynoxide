@@ -84,7 +84,10 @@ pub struct TransactGetItem {
 pub struct TransactGet {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Key")]
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,

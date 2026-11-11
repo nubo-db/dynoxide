@@ -280,6 +280,30 @@ impl<'a> TrackedExpressionAttributes<'a> {
         }
     }
 
+    /// Record the value references a parsed key condition uses. Parsing has
+    /// already recorded its names; its values are only read once it is bound
+    /// to a table's key.
+    pub(crate) fn track_key_condition(&self, condition: &key_condition::KeyCondition) {
+        use key_condition::SortKeyCondition as C;
+        let mut used = self.used_values.borrow_mut();
+        for clause in &condition.clauses {
+            match clause {
+                C::Eq(_, v)
+                | C::Lt(_, v)
+                | C::Le(_, v)
+                | C::Gt(_, v)
+                | C::Ge(_, v)
+                | C::BeginsWith(_, v) => {
+                    used.insert(v.clone());
+                }
+                C::Between(_, lo, hi) => {
+                    used.insert(lo.clone());
+                    used.insert(hi.clone());
+                }
+            }
+        }
+    }
+
     /// The first value reference, in name order, that the tracked expressions
     /// use but `ExpressionAttributeValues` doesn't define.
     pub(crate) fn first_undefined_value(&self) -> Option<String> {

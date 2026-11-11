@@ -1742,6 +1742,43 @@ pub struct ConvertedCondition {
     pub attribute_names: HashMap<String, String>,
 }
 
+/// The checks a Query or Scan makes on its expression attributes before the
+/// table is looked up, in DynamoDB's order: a value the FilterExpression uses
+/// but nobody defined, a name the ProjectionExpression uses but nobody
+/// defined, then a name and then a value that no expression uses (captured
+/// eu-west-2 and us-east-1, 2026-11-11). `tracker` already holds what any
+/// other expression uses. An expression that doesn't parse is left for the
+/// checks that report it.
+pub(crate) fn check_expression_attributes(
+    tracker: &crate::expressions::TrackedExpressionAttributes,
+    filter: Option<&str>,
+    projection: Option<&str>,
+) -> Result<()> {
+    if let Some(Ok(filter)) = filter
+        .filter(|fe| !fe.is_empty())
+        .map(crate::expressions::condition::parse)
+    {
+        tracker.track_condition_expr(&filter);
+        if let Some(value) = tracker.first_undefined_value() {
+            return Err(DynoxideError::ValidationException(format!(
+                "Invalid FilterExpression: An expression attribute value used in expression \
+                 is not defined; attribute value: {value}"
+            )));
+        }
+    }
+    if let Some(Ok(projection)) = projection
+        .filter(|pe| !pe.is_empty())
+        .map(crate::expressions::projection::parse)
+    {
+        for path in &projection.paths {
+            crate::expressions::resolve_path_elements(path, tracker).map_err(|e| {
+                DynoxideError::ValidationException(format!("Invalid ProjectionExpression: {e}"))
+            })?;
+        }
+    }
+    tracker.check_unused()
+}
+
 /// The request's own `ExpressionAttributeNames` and `ExpressionAttributeValues`,
 /// which a legacy condition's generated placeholders are merged into and so
 /// must never share a key with.

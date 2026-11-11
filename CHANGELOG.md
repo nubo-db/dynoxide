@@ -67,9 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mixing message no longer names it beside a `FilterExpression`. The
   placeholders Dynoxide names the key conditions through internally never
   take the place of the caller's own, so a caller's `:kc_v0` or `#kc_0` means
-  what the caller defined. Beside `KeyConditions`, an unused name or value and
-  a value the filter uses without defining are refused before the table is
-  looked up, as on DynamoDB. `ExpressionAttributeValues` on a Query or Scan
+  what the caller defined. On every Query and Scan, an unused name or value,
+  a value the filter uses without defining it and a name the projection uses
+  without defining it are refused before the table is looked up, as on
+  DynamoDB. A filter value nobody defined used to go unnoticed when no item
+  was read. `ExpressionAttributeValues` on a Query or Scan
   with only a `ProjectionExpression` is now refused, and on Query and Scan the
   refusal no longer ends with `: FilterExpression is null`
   ([#319](https://github.com/nubo-db/dynoxide/issues/319)).

@@ -489,18 +489,27 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // Beside KeyConditions, the expressions' attributes are checked before the
-    // table is looked up: a value the FilterExpression uses but nobody
-    // defined, then a name or value no expression uses (captured eu-west-2
-    // and us-east-1, 2026-11-11). Whether a KeyConditionExpression request
-    // is checked this early too is uncaptured, so it keeps its order.
-    if request.key_condition_expression.is_none()
-        && request
-            .key_conditions
-            .as_ref()
-            .is_some_and(|v| !v.is_null())
+    // The expressions' attributes are checked before the table is looked up,
+    // as on Scan (captured eu-west-2 and us-east-1, 2026-11-11). The key
+    // condition's own references count as used.
     {
-        check_attributes_beside_key_conditions(&request)?;
+        let tracker = crate::expressions::TrackedExpressionAttributes::new(
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        );
+        // Its faults were reported above; this only records what it uses.
+        if let Some(Ok(key_condition)) = request
+            .key_condition_expression
+            .as_deref()
+            .map(|kce| expressions::key_condition::parse(kce, &tracker))
+        {
+            tracker.track_key_condition(&key_condition);
+        }
+        helpers::check_expression_attributes(
+            &tracker,
+            request.filter_expression.as_deref(),
+            request.projection_expression.as_deref(),
+        )?;
     }
 
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
@@ -1374,40 +1383,6 @@ fn sort_key_satisfies(
             _ => false,
         },
     }
-}
-
-/// The expression attributes of a Query that names its key through
-/// `KeyConditions`, checked against the FilterExpression and
-/// ProjectionExpression beside it. An expression that doesn't parse is left
-/// for the checks that already report it.
-fn check_attributes_beside_key_conditions(request: &QueryRequest) -> Result<()> {
-    let tracker = crate::expressions::TrackedExpressionAttributes::new(
-        &request.expression_attribute_names,
-        &request.expression_attribute_values,
-    );
-    if let Some(Ok(filter)) = request
-        .filter_expression
-        .as_deref()
-        .filter(|fe| !fe.is_empty())
-        .map(expressions::condition::parse)
-    {
-        tracker.track_condition_expr(&filter);
-        if let Some(value) = tracker.first_undefined_value() {
-            return Err(DynoxideError::ValidationException(format!(
-                "Invalid FilterExpression: An expression attribute value used in expression \
-                 is not defined; attribute value: {value}"
-            )));
-        }
-    }
-    if let Some(Ok(projection)) = request
-        .projection_expression
-        .as_deref()
-        .filter(|pe| !pe.is_empty())
-        .map(expressions::projection::parse)
-    {
-        tracker.track_projection_expr(&projection);
-    }
-    tracker.check_unused()
 }
 
 /// A legacy KeyConditions value must be the key's schema type. Any other type

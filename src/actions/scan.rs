@@ -559,6 +559,18 @@ pub async fn execute<S: StorageBackend>(
         _ => {}
     }
 
+    // The expressions' attributes are checked before the table is looked up
+    // (captured eu-west-2 and us-east-1, 2026-11-11). A converted ScanFilter's
+    // generated placeholders are used by the filter it became.
+    helpers::check_expression_attributes(
+        &crate::expressions::TrackedExpressionAttributes::new(
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        ),
+        request.filter_expression.as_deref(),
+        request.projection_expression.as_deref(),
+    )?;
+
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
 

@@ -5771,6 +5771,15 @@ fn scan_segments_answer_as_the_http_api_does() {
                  satisfy constraint: Member must have value greater than or equal to 1",
             ),
         ),
+        // A limit past what a 32-bit integer holds is read as the largest one,
+        // which moves a segment's refusal to the older wording too.
+        (
+            json!({"segment": -1, "total_segments": 2, "limit": 3_000_000_000_u64}),
+            one(
+                "Value '-1' at 'segment' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 0",
+            ),
+        ),
     ];
     let mut id = 10;
     for (segments, refusal) in cases {

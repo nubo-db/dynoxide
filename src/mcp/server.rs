@@ -1103,10 +1103,12 @@ fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
 
 /// Refuse a `segment` or `total_segments` that is negative or past what a
 /// 32-bit integer holds, as Scan's member checks refuse it over HTTP. The HTTP
-/// API reads both as 32-bit integers, so a value past either end is read as
-/// that end and the request moves to the older wording, which echoes the value
-/// and lists the request's other member errors with it. Anything in range is
-/// left to the action, which runs the same checks.
+/// API reads `Segment`, `TotalSegments` and `Limit` as 32-bit integers, so a
+/// value past either end is read as that end and the request moves to the
+/// older wording, which echoes the value and lists the request's other member
+/// errors with it. This mirrors `actions::helpers::deserialize_int32` and the
+/// `ScanMembers` that `actions::scan` builds from what it reads. Anything in
+/// range is left to the action, which runs the same checks.
 fn refuse_segments_outside_int32(params: &ScanParams) -> Option<CallToolResult> {
     let int32 = |value: i64| {
         let read = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
@@ -1114,21 +1116,24 @@ fn refuse_segments_outside_int32(params: &ScanParams) -> Option<CallToolResult> 
     };
     let segment = params.segment.map(int32);
     let total_segments = params.total_segments.map(int32);
-    let read = [segment, total_segments];
-    if !read
+    if ![segment, total_segments]
         .iter()
         .flatten()
         .any(|&(value, coerced)| coerced || value < 0)
     {
         return None;
     }
+    let limit = params
+        .limit
+        .map(|l| int32(i64::try_from(l).unwrap_or(i64::MAX)));
+    let read = [segment, total_segments, limit];
     crate::actions::scan::ScanMembers {
         table_name: Some(&params.table_name),
         select: params.select.as_deref(),
         return_consumed_capacity: params.return_consumed_capacity.as_deref(),
         conditional_operator: None,
         scan_filter: None,
-        limit: params.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)),
+        limit: limit.map(|(value, _)| value),
         segment: segment.map(|(value, _)| value),
         total_segments: total_segments.map(|(value, _)| value),
         coerced: read.iter().flatten().any(|&(_, coerced)| coerced),

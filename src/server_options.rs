@@ -14,11 +14,13 @@ use std::io::Write;
 /// database would never close. A line nobody can read isn't worth that.
 #[doc(hidden)]
 pub fn stderr_line(args: std::fmt::Arguments<'_>) {
-    write_line(&mut std::io::stderr(), args);
+    // One lock for the whole line, as `eprintln!` takes, so a log line on
+    // stderr can't land between the message and its newline.
+    write_line(&mut std::io::stderr().lock(), args);
 }
 
 fn write_line(out: &mut impl Write, args: std::fmt::Arguments<'_>) {
-    let _ = out.write_fmt(args).and_then(|()| out.write_all(b"\n"));
+    let _ = writeln!(out, "{args}");
 }
 
 /// Options controlling the output of the DynamoDB HTTP server

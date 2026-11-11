@@ -3,6 +3,10 @@
 //! Exposes DynamoDB operations as MCP tools, allowing coding agents to
 //! interact with the local DynamoDB emulator through structured tool calls.
 
+// A launcher may have stopped reading stderr by the time anything here
+// writes to it, and `eprintln!` panics on that write. Use `crate::stderr_line`.
+#![deny(clippy::print_stderr)]
+
 mod auth;
 mod errors;
 mod server;

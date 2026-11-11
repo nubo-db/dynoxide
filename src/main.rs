@@ -974,10 +974,10 @@ fn resolve_mcp_http_options(
 
     match &resolved.mode {
         AuthMode::Disabled => {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "WARNING: MCP auth disabled (--no-auth, loopback only). \
                  Any local process on this machine can call this server."
-            );
+            ));
         }
         AuthMode::Enabled(token) if resolved.first_run => {
             if let Some(path) = &resolved.token_path {
@@ -987,7 +987,10 @@ fn resolve_mcp_http_options(
                     format!("{host}:{port}")
                 };
                 let url = format!("http://{authority}/mcp");
-                eprintln!("{}", mcp::first_run_message(&url, token, path));
+                dynoxide::stderr_line(format_args!(
+                    "{}",
+                    mcp::first_run_message(&url, token, path)
+                ));
             }
         }
         AuthMode::Enabled(_) => {}
@@ -1213,7 +1216,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         // The import report always prints; this only separates it from the
         // server output that follows, which quiet mode suppresses.
         if !quiet {
-            eprintln!();
+            dynoxide::stderr_line(format_args!(""));
         }
 
         // Both --serve and --mcp: run HTTP + MCP concurrently
@@ -1243,10 +1246,10 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
             let mcp_shutdown_clone = mcp_shutdown.clone();
 
             if !quiet {
-                eprintln!(
+                dynoxide::stderr_line(format_args!(
                     "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
                     args.host, args.port, args.mcp_host, args.mcp_port
-                );
+                ));
             }
 
             let (http_result, mcp_result) = tokio::join!(

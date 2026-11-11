@@ -674,6 +674,12 @@ fn writes_survive_a_shutdown_through_stdin() {
 /// it's killed, so the shutdown that follows writes to a broken pipe. The
 /// write must fail quietly: a panic there aborts the release build before the
 /// database closes, leaving its write-ahead log behind.
+///
+/// Only the release build aborts on panic. In this debug build the panic is
+/// caught in the task axum runs the shutdown future in, and the server still
+/// exits cleanly, so this test passes with or without the fix. It pins the
+/// behaviour; the npm package's "a write survives the runner being killed
+/// outright" test runs a release build and is the one that fails without it.
 #[test]
 fn a_shutdown_with_no_one_reading_stderr_still_closes_the_database() {
     let dir = tempfile::tempdir().unwrap();

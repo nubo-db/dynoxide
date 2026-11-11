@@ -2,6 +2,10 @@
 //!
 //! Only compiled with the `http-server` feature flag.
 
+// A launcher may have stopped reading stderr by the time anything here
+// writes to it, and `eprintln!` panics on that write. Use `crate::stderr_line`.
+#![deny(clippy::print_stderr)]
+
 mod auth;
 
 use crate::serde_errors::{deserialize, serialize};

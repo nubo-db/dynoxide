@@ -77,6 +77,18 @@ const LIST_FOR_A_STRING: &[(&str, usize, &str)] = &[
     ),
 ];
 
+/// Rows left out until a capture settles them. DynamoDB reported the number
+/// refused in the first action's expression values bare, where Dynoxide wraps
+/// it naming its key as it does for one refused on its own. Whether a lone
+/// refused expression value is now bare as well, in both regions, has not
+/// been captured since 2026-10-09, when us-east-1 wrapped it and eu-west-2 did
+/// not. Each row is still sent and must still give the answer recorded here.
+const AWAITING_A_CAPTURE: &[(&str, usize, &str)] = &[(
+    "sixth round",
+    2,
+    r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: xyz for key :v"}"#,
+)];
+
 async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
     let puts: String = format!("[{}]", vec![PUT; 101].join(", "));
     let mut wrong = Vec::new();
@@ -89,6 +101,7 @@ async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
         compared += 1;
         if let Some(&(_, _, today)) = LIST_FOR_A_STRING
             .iter()
+            .chain(AWAITING_A_CAPTURE)
             .find(|&&(r, n, _)| r == round && n == number)
         {
             left_out += 1;
@@ -96,7 +109,7 @@ async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
             if got == expected {
                 wrong.push(format!(
                     "{round} row {number} now answers as DynamoDB did: drop it from \
-                     LIST_FOR_A_STRING"
+                     the rows left out"
                 ));
             } else if status != 400 || got != today {
                 wrong.push(format!(
@@ -121,6 +134,7 @@ async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
         left_out,
         LIST_FOR_A_STRING
             .iter()
+            .chain(AWAITING_A_CAPTURE)
             .filter(|&&(r, _, _)| r == round)
             .count(),
         "every row left out of {round} must still be sent"
@@ -161,6 +175,12 @@ async fn the_fourth_round_answers_as_dynamodb_did() {
 async fn the_fifth_round_answers_as_dynamodb_did() {
     let url = start_server().await;
     assert_rows(&url, "fifth round", FIFTH_ROUND).await;
+}
+
+#[tokio::test]
+async fn the_sixth_round_answers_as_dynamodb_did() {
+    let url = start_server().await;
+    assert_rows(&url, "sixth round", SIXTH_ROUND).await;
 }
 
 /// The token at its lengths and beside the request's other members, with the
@@ -921,5 +941,82 @@ const FIFTH_ROUND: &[Row] = &[
         "TransactWriteItems",
         r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}], "ClientRequestToken": "", "ReturnConsumedCapacity": "BAD"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'ClientRequestToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+    ),
+];
+
+/// A Delete's mode among its null members, values refused in two actions, and
+/// an item or action given as null, a list or a scalar.
+const SIXTH_ROUND: &[Row] = &[
+    (
+        1,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Delete": {"ReturnValuesOnConditionCheckFailure": "BAD"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"3 validation errors detected: Value 'BAD' at 'transactItems.1.member.delete.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.1.member.delete.key' failed to satisfy constraint: Member must not be null; Value null at 'transactItems.1.member.delete.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        2,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"#,
+    ),
+    (
+        3,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        4,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": ["x"]}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        5,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": "x"}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected field type"}"#,
+    ),
+    (
+        6,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": 5}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected field type"}"#,
+    ),
+    (
+        7,
+        "TransactWriteItems",
+        r#"{"TransactItems": [null, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": 5}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+    ),
+    (
+        8,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": 5}}}}, null]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r#"{"TransactItems": [null], "ClientRequestToken": ""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'clientRequestToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+    ),
+    (
+        10,
+        "TransactWriteItems",
+        r#"{"TransactItems": [null, {}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"TransactItems can't be null"}"#,
+    ),
+    (
+        11,
+        "TransactWriteItems",
+        r#"{"TransactItems": ["x"]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+    ),
+    (
+        12,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "a = :a AND b = :b", "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"S": 5}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
     ),
 ];

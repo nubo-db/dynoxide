@@ -2321,6 +2321,104 @@ fn test_transact_write_items_null_false_bare() {
     let _ = child.wait();
 }
 
+/// A transaction write with every kind of action, expression names and values,
+/// a token and a capacity mode goes through the tool, and a second call with
+/// the same token succeeds without writing again.
+#[test]
+fn the_transaction_write_tool_runs_every_action_and_replays_its_token() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    for (id, pk) in (2..).zip(["update", "delete", "check"]) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Parity", "item": {"pk": {"S": pk}, "n": {"N": "1"}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+
+    let args = json!({
+        "transact_items": [
+            {"Put": {
+                "TableName": "Parity",
+                "Item": {"pk": {"S": "put"}, "n": {"N": "7"}},
+                "ConditionExpression": "attribute_not_exists(#p)",
+                "ExpressionAttributeNames": {"#p": "pk"}
+            }},
+            {"Update": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "update"}},
+                "UpdateExpression": "SET #n = #n + :one",
+                "ConditionExpression": "#n = :was",
+                "ExpressionAttributeNames": {"#n": "n"},
+                "ExpressionAttributeValues": {":one": {"N": "1"}, ":was": {"N": "1"}}
+            }},
+            {"Delete": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "delete"}},
+                "ConditionExpression": "#n = :was",
+                "ExpressionAttributeNames": {"#n": "n"},
+                "ExpressionAttributeValues": {":was": {"N": "1"}}
+            }},
+            {"ConditionCheck": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "check"}},
+                "ConditionExpression": "attribute_exists(#p) AND #n = :was",
+                "ExpressionAttributeNames": {"#p": "pk", "#n": "n"},
+                "ExpressionAttributeValues": {":was": {"N": "1"}}
+            }}
+        ],
+        "client_request_token": "round-trip-token",
+        "return_consumed_capacity": "TOTAL"
+    });
+    let first = call_tool(&mut child, 10, "transact_write_items", args.clone());
+    assert!(!is_tool_error(&first), "{first}");
+    let first = tool_content(&first);
+    assert_eq!(
+        first["ConsumedCapacity"],
+        json!([{"TableName": "Parity", "CapacityUnits": 8.0, "WriteCapacityUnits": 8.0}]),
+        "{first}"
+    );
+
+    let replay = call_tool(&mut child, 11, "transact_write_items", args);
+    assert!(!is_tool_error(&replay), "{replay}");
+    // The replay is billed as a transactional read of the same items.
+    assert_eq!(
+        tool_content(&replay)["ConsumedCapacity"],
+        json!([{"TableName": "Parity", "CapacityUnits": 8.0, "ReadCapacityUnits": 8.0}])
+    );
+
+    let stored = |child: &mut std::process::Child, id: u64, pk: &str| {
+        let resp = call_tool(
+            child,
+            id,
+            "get_item",
+            json!({"table_name": "Parity", "key": {"pk": {"S": pk}}, "consistent_read": true}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+        tool_content(&resp)["Item"].clone()
+    };
+    assert_eq!(
+        stored(&mut child, 12, "put"),
+        json!({"pk": {"S": "put"}, "n": {"N": "7"}})
+    );
+    assert_eq!(
+        stored(&mut child, 13, "update"),
+        json!({"pk": {"S": "update"}, "n": {"N": "2"}})
+    );
+    assert_eq!(stored(&mut child, 14, "delete"), Value::Null);
+    assert_eq!(
+        stored(&mut child, 15, "check"),
+        json!({"pk": {"S": "check"}, "n": {"N": "1"}})
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 /// The transaction write tool answers its member checks as the HTTP API does:
 /// a table name left out, an empty token ahead of a number refused in an item
 /// and ahead of a bad capacity mode, and an item naming no action beside a

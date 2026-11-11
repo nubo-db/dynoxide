@@ -21,7 +21,7 @@ use std::marker::PhantomData;
 #[derive(Deserialize)]
 pub(super) struct Request {
     #[serde(rename = "TransactItems", default)]
-    transact_items: Option<Vec<Option<Item>>>,
+    transact_items: Option<Vec<ListedItem>>,
     #[serde(rename = "ClientRequestToken", default)]
     client_request_token: Option<String>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
@@ -205,6 +205,80 @@ where
     deserializer.deserialize_option(Reader(PhantomData))
 }
 
+/// One entry of `TransactItems`: an item, or `None` for one given as null.
+struct ListedItem(Option<Item>);
+
+impl<'de> Deserialize<'de> for ListedItem {
+    /// Read an entry: null, an object or a list as the derived reader takes
+    /// them, and a string, number or boolean refused with DynamoDB's
+    /// `SerializationException` for a value of the wrong type in the list
+    /// (captured eu-west-2 and us-east-1, 2026-11-11, for a string).
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Reader;
+
+        fn refuse<E: de::Error>() -> Result<ListedItem, E> {
+            Err(E::custom(format!(
+                "{SERIALIZATION_MARKER}Unexpected value type in payload"
+            )))
+        }
+
+        impl<'de> de::Visitor<'de> for Reader {
+            type Value = ListedItem;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("struct Item")
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<ListedItem, E> {
+                Ok(ListedItem(None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<ListedItem, E> {
+                Ok(ListedItem(None))
+            }
+
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<ListedItem, D::Error> {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<ListedItem, A::Error> {
+                Item::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(|item| ListedItem(Some(item)))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<ListedItem, A::Error> {
+                Item::deserialize(de::value::SeqAccessDeserializer::new(seq))
+                    .map(|item| ListedItem(Some(item)))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<ListedItem, E> {
+                refuse()
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<ListedItem, E> {
+                refuse()
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<ListedItem, E> {
+                refuse()
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<ListedItem, E> {
+                refuse()
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<ListedItem, E> {
+                refuse()
+            }
+        }
+
+        deserializer.deserialize_option(Reader)
+    }
+}
+
 /// A required member left null, in the newer form.
 fn null_member(path: &str) -> String {
     format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
@@ -229,36 +303,34 @@ impl Request {
     /// The request, or the message it is refused with, marked for its error
     /// class.
     ///
-    /// An item given as null fails the request as it is read. Otherwise a
-    /// required member left null is the first stage of DynamoDB's member
+    /// A required member left null is the first stage of DynamoDB's member
     /// checks. It lists each action's members in request order (see
     /// [`Item::members`]), then the token if its length is wrong, in the
-    /// newer form, then the request's enums. Then come the stages
+    /// newer form, then the request's enums. An item given as null makes the
+    /// stage fire too, though it is not listed: when nothing else is, the
+    /// request is refused with `TransactItems can't be null`. Then come the
+    /// stages
     /// [`super::stages_before_values`] runs, and only then a value refused in
     /// an item (captured eu-west-2 and us-east-1, 2026-11-11).
     pub(super) fn into_request(self) -> Result<TransactWriteItemsRequest, String> {
         let marked = |msg: String| format!("{VALIDATION_MARKER}{msg}");
 
-        let items = match self.transact_items {
-            None => None,
-            Some(items) => match items.into_iter().collect::<Option<Vec<Item>>>() {
-                Some(items) => Some(items),
-                None => return Err(marked("TransactItems can't be null".to_string())),
-            },
-        };
-
         let mut listed = Vec::new();
-        let any_null = match items {
+        let any_null = match self.transact_items {
             None => {
                 listed.push(null_member("transactItems"));
                 true
             }
-            Some(ref items) => items
-                .iter()
-                .enumerate()
-                .fold(false, |any, (position, item)| {
-                    item.first_stage(position + 1, &mut listed) || any
-                }),
+            Some(ref items) => {
+                items
+                    .iter()
+                    .enumerate()
+                    .fold(false, |any, (position, ListedItem(item))| {
+                        item.as_ref()
+                            .is_none_or(|item| item.first_stage(position + 1, &mut listed))
+                            || any
+                    })
+            }
         };
         if any_null {
             listed.extend(crate::token_constraint_error(
@@ -268,15 +340,18 @@ impl Request {
                 self.return_consumed_capacity.as_deref(),
                 self.return_item_collection_metrics.as_deref(),
             ));
-            let msg = crate::validation::format_validation_errors(&listed)
-                .expect("a null member is always listed");
-            return Err(marked(msg));
+            return Err(marked(
+                crate::validation::format_validation_errors(&listed)
+                    .unwrap_or_else(|| "TransactItems can't be null".to_string()),
+            ));
         }
 
         let mut refusal = None;
-        let transact_items: Vec<TransactWriteItem> = items
+        let transact_items: Vec<TransactWriteItem> = self
+            .transact_items
             .unwrap_or_default()
             .into_iter()
+            .flat_map(|ListedItem(item)| item)
             .map(|item| item.into_item(&mut refusal))
             .collect();
         let request = TransactWriteItemsRequest {

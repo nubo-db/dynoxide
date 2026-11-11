@@ -1365,3 +1365,44 @@ async fn get_item_target<S: StorageBackend>(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The public action types' own reader stops at the first expression value
+    /// refused for its number and names its key, as it did before the request
+    /// reader came to share its wording.
+    #[test]
+    fn the_derived_read_stops_at_the_first_refused_expression_value() {
+        let values = serde_json::json!({":a": {"N": "xyz"}, ":b": {"N": "abc"}});
+        let expected = format!(
+            "{}ExpressionAttributeValues contains invalid value: The parameter cannot be \
+             converted to a numeric value: xyz for key :a",
+            crate::serde_errors::VALIDATION_MARKER
+        );
+        let put = serde_json::json!({
+            "TableName": "t",
+            "Item": {"pk": {"S": "a"}},
+            "ConditionExpression": "a = :a AND b = :b",
+            "ExpressionAttributeValues": values
+        });
+        let check = serde_json::json!({
+            "TableName": "t",
+            "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "a = :a AND b = :b",
+            "ExpressionAttributeValues": values
+        });
+        let mut update = check.clone();
+        update["UpdateExpression"] = "SET a = :a, b = :b".into();
+        let errors = [
+            serde_json::from_value::<TransactPut>(put).err(),
+            serde_json::from_value::<TransactUpdate>(update).err(),
+            serde_json::from_value::<TransactDelete>(check.clone()).err(),
+            serde_json::from_value::<TransactConditionCheck>(check).err(),
+        ];
+        for error in errors {
+            assert_eq!(error.expect("the value is refused").to_string(), expected);
+        }
+    }
+}

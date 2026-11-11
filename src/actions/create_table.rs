@@ -80,8 +80,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
             .flatten()
             .filter_map(|gsi| gsi.get_mut("ProvisionedThroughput"));
         for throughput in raw.provisioned_throughput.iter_mut().chain(gsi_throughputs) {
-            crate::number_tokens::read_units_in(throughput)
-                .map_err(|()| crate::number_tokens::bad_number::<D::Error>())?;
+            crate::number_tokens::read_units_in(throughput)?;
         }
         match validate_raw_and_build(raw) {
             Ok(req) => Ok(req),

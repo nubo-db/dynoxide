@@ -310,7 +310,10 @@ async fn handle_request(
     // for the request's integer members (see `number_tokens`). Nothing after
     // this awaits, so the table holds for the rest of the request.
     let (body, stand_ins) = match crate::number_tokens::stand_in_malformed_numbers(&body) {
-        Some((body, stand_ins)) => (body, Some(std::rc::Rc::new(stand_ins))),
+        Some((replaced, stand_ins)) => {
+            drop(body);
+            (replaced, Some(stand_ins))
+        }
         None => (body, None),
     };
     crate::number_tokens::with_stand_ins(stand_ins, || {

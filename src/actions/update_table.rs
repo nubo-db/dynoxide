@@ -67,11 +67,8 @@ impl<'de> serde::Deserialize<'de> for UpdateTableRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let mut raw = UpdateTableRequestRaw::deserialize(deserializer)?;
-        // The units held as JSON are read before anything checks them, so a
-        // malformed one is refused as the deserialisation fault it is.
         if let Some(throughput) = raw.provisioned_throughput.as_mut() {
-            crate::number_tokens::read_units_in(throughput)
-                .map_err(|()| crate::number_tokens::bad_number::<D::Error>())?;
+            crate::number_tokens::read_units_in(throughput)?;
         }
 
         // Phase 1: Check TableName missing

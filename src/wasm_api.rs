@@ -162,7 +162,7 @@ pub async fn dispatch_http<S: StorageBackend>(
     match crate::number_tokens::stand_in_malformed_numbers(body) {
         Some((body, stand_ins)) => {
             crate::number_tokens::with_stand_ins_async(
-                Some(std::rc::Rc::new(stand_ins)),
+                Some(stand_ins),
                 answer_http(backend, ctx, target, &body, auth),
             )
             .await
@@ -314,7 +314,7 @@ pub async fn dispatch<S: StorageBackend>(
     else {
         return answer(backend, ctx, op, request_json).await;
     };
-    crate::number_tokens::with_stand_ins_async(Some(std::rc::Rc::new(stand_ins)), async {
+    crate::number_tokens::with_stand_ins_async(Some(stand_ins), async {
         answer(backend, ctx, op, &request_json)
             .await
             .map_err(|json| {

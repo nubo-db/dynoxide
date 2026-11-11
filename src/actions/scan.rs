@@ -390,7 +390,7 @@ pub async fn execute<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr,
-            all_expression_param_names: vec!["FilterExpression"],
+            value_expression_params: &["FilterExpression"],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
@@ -448,8 +448,14 @@ pub async fn execute<S: StorageBackend>(
     if let Some(sf) = scan_filter
         && !sf.is_empty()
     {
-        let converted =
-            helpers::convert_filter_conditions(&sf, request.conditional_operator.as_deref())?;
+        let converted = helpers::convert_filter_conditions(
+            &sf,
+            request.conditional_operator.as_deref(),
+            helpers::CallerPlaceholders {
+                names: request.expression_attribute_names.as_ref(),
+                values: request.expression_attribute_values.as_ref(),
+            },
+        )?;
         if !converted.expression.is_empty() {
             request.filter_expression = Some(converted.expression);
             let expr_values = request

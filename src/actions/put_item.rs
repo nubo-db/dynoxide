@@ -227,7 +227,7 @@ async fn execute_inner<S: StorageBackend>(
             // DynamoDB names no expression after its "can only be specified
             // when using expressions" message on the single-item writes
             // (eu-west-2 and us-east-1, 2026-10-09).
-            all_expression_param_names: vec![],
+            value_expression_params: &[],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &None,

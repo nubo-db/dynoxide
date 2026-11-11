@@ -64,7 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the key, as UpdateItem does. `KeyConditions` now conflicts only with
   `KeyConditionExpression`, so a Query that pairs it with a `FilterExpression`
   or a `ProjectionExpression` runs, where it used to be refused, and the
-  mixing message no longer names it beside a `FilterExpression`
+  mixing message no longer names it beside a `FilterExpression`. The
+  placeholders Dynoxide names the key conditions through internally never
+  take the place of the caller's own, so a caller's `:kc_v0` or `#kc_0` means
+  what the caller defined. Beside `KeyConditions`, an unused name or value and
+  a value the filter uses without defining are refused before the table is
+  looked up, as on DynamoDB. `ExpressionAttributeValues` on a Query or Scan
+  with only a `ProjectionExpression` is now refused, and on Query and Scan the
+  refusal no longer ends with `: FilterExpression is null`
   ([#319](https://github.com/nubo-db/dynoxide/issues/319)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages

@@ -280,6 +280,18 @@ impl<'a> TrackedExpressionAttributes<'a> {
         }
     }
 
+    /// The first value reference, in name order, that the tracked expressions
+    /// use but `ExpressionAttributeValues` doesn't define.
+    pub(crate) fn first_undefined_value(&self) -> Option<String> {
+        let used_values = self.used_values.borrow();
+        let mut undefined: Vec<&String> = used_values
+            .iter()
+            .filter(|v| !self.values.as_ref().is_some_and(|map| map.contains_key(*v)))
+            .collect();
+        undefined.sort();
+        undefined.first().map(|v| (*v).clone())
+    }
+
     /// Check for unused names/values. Returns an error listing all unused keys.
     pub fn check_unused(&self) -> Result<(), DynoxideError> {
         let used_names = self.used_names.borrow();

@@ -705,9 +705,12 @@ pub struct ExpressionParamContext<'a> {
     pub non_expression_params: Vec<&'a str>,
     /// Names of expression parameters that are present (e.g. "ConditionExpression", "UpdateExpression", "ProjectionExpression")
     pub expression_params: Vec<&'a str>,
-    /// All expression parameter names that could carry expressions
-    /// (used to build the "is null" message for ExpressionAttributeValues)
-    pub all_expression_param_names: Vec<&'a str>,
+    /// The expression parameters that can use ExpressionAttributeValues, where
+    /// only some of the operation's can: without one of them, values are
+    /// refused even beside another expression (a Query's or Scan's
+    /// ProjectionExpression, captured eu-west-2 and us-east-1, 2026-11-11).
+    /// Empty where any expression will do.
+    pub value_expression_params: &'a [&'a str],
     pub expression_attribute_names: &'a Option<HashMap<String, String>>,
     pub expression_attribute_values: &'a Option<HashMap<String, AttributeValue>>,
     /// Raw JSON for ExpressionAttributeValues: when present, used for key
@@ -779,21 +782,20 @@ pub fn validate_expression_params(
         ));
     }
 
-    // ExpressionAttributeValues without any expression
-    if has_values && !has_expressions {
-        let null_parts: Vec<String> = ctx
-            .all_expression_param_names
+    // ExpressionAttributeValues without an expression that can use them. The
+    // message is the same on every operation, with nothing after it (Query and
+    // Scan captured eu-west-2 and us-east-1, 2026-11-11).
+    let can_use_values = if ctx.value_expression_params.is_empty() {
+        has_expressions
+    } else {
+        ctx.expression_params
             .iter()
-            .map(|n| format!("{n} is null"))
-            .collect();
-        let suffix = if null_parts.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", null_parts.join(" and "))
-        };
-        return Err(ClassifiedValidationError::enveloped(format!(
-            "ExpressionAttributeValues can only be specified when using expressions{suffix}"
-        )));
+            .any(|p| ctx.value_expression_params.contains(p))
+    };
+    if has_values && !can_use_values {
+        return Err(ClassifiedValidationError::enveloped(
+            "ExpressionAttributeValues can only be specified when using expressions",
+        ));
     }
 
     // Empty ExpressionAttributeNames
@@ -1740,15 +1742,53 @@ pub struct ConvertedCondition {
     pub attribute_names: HashMap<String, String>,
 }
 
+/// The request's own `ExpressionAttributeNames` and `ExpressionAttributeValues`,
+/// which a legacy condition's generated placeholders are merged into and so
+/// must never share a key with.
+#[derive(Clone, Copy)]
+pub struct CallerPlaceholders<'a> {
+    pub names: Option<&'a HashMap<String, String>>,
+    pub values: Option<&'a HashMap<String, AttributeValue>>,
+}
+
+impl CallerPlaceholders<'_> {
+    /// A prefix for generated placeholders, `#<prefix>_<n>` and
+    /// `:<prefix>_v<n>`, that none of the caller's keys starts with, so no
+    /// generated key can be one of them: `base`, or `base` followed by the
+    /// first number that is free.
+    fn free_prefix(&self, base: &str) -> String {
+        let taken = |prefix: &str| {
+            let name_start = format!("#{prefix}_");
+            let value_start = format!(":{prefix}_");
+            self.names
+                .is_some_and(|names| names.keys().any(|k| k.starts_with(&name_start)))
+                || self
+                    .values
+                    .is_some_and(|values| values.keys().any(|k| k.starts_with(&value_start)))
+        };
+        if !taken(base) {
+            return base.to_string();
+        }
+        (1u32..)
+            .map(|n| format!("{base}{n}"))
+            .find(|prefix| !taken(prefix))
+            .expect("a finite set of keys leaves some prefix free")
+    }
+}
+
 /// Convert legacy `KeyConditions` to a KeyConditionExpression + ExpressionAttributeValues.
 ///
 /// If `partition_key_name` is provided, the partition key condition is placed
 /// first in the expression so that the key condition parser identifies it
-/// correctly (important when both hash and range use EQ).
+/// correctly (important when both hash and range use EQ). The generated
+/// placeholders never share a key with `caller`'s, which a FilterExpression or
+/// ProjectionExpression beside the conditions may use.
 pub fn convert_key_conditions(
     key_conditions: &HashMap<String, KeyCondition>,
     partition_key_name: Option<&str>,
+    caller: CallerPlaceholders<'_>,
 ) -> Result<ConvertedCondition> {
+    let prefix = caller.free_prefix("kc");
     let mut parts = Vec::new();
     let mut values = HashMap::new();
     let mut names = HashMap::new();
@@ -1769,7 +1809,7 @@ pub fn convert_key_conditions(
     // (`-`, `.`, anything outside ASCII).
     for (index, attr_name) in ordered_keys.into_iter().enumerate() {
         let cond = &key_conditions[attr_name];
-        let name_ref = format!("#kc_{index}");
+        let name_ref = format!("#{prefix}_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
         // Operators are matched as written: DynamoDB refuses `eq`.
@@ -1792,7 +1832,7 @@ pub fn convert_key_conditions(
             cond.attribute_value_list.as_deref(),
             op,
             count..=count,
-            "kc",
+            &prefix,
             &mut val_idx,
             &mut values,
         )?;
@@ -1825,10 +1865,13 @@ pub struct FilterCondition {
 }
 
 /// Convert legacy `QueryFilter` / `ScanFilter` to a FilterExpression + values + names.
+/// The generated placeholders never share a key with `caller`'s.
 pub fn convert_filter_conditions(
     conditions: &HashMap<String, FilterCondition>,
     conditional_operator: Option<&str>,
+    caller: CallerPlaceholders<'_>,
 ) -> Result<ConvertedCondition> {
+    let prefix = caller.free_prefix("qf");
     let joiner = match conditional_operator {
         Some(op) if op.eq_ignore_ascii_case("OR") => " OR ",
         _ => " AND ",
@@ -1844,7 +1887,7 @@ pub fn convert_filter_conditions(
     let mut ordered: Vec<(&String, &FilterCondition)> = conditions.iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
     for (index, (attr_name, cond)) in ordered.into_iter().enumerate() {
-        let name_ref = format!("#qf_{index}");
+        let name_ref = format!("#{prefix}_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
         // Operators are matched as written: DynamoDB refuses `eq`. An unknown
@@ -1866,7 +1909,7 @@ pub fn convert_filter_conditions(
             cond.attribute_value_list.as_deref(),
             op,
             counts,
-            "qf",
+            &prefix,
             &mut val_idx,
             &mut values,
         )?;

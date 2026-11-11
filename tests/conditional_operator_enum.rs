@@ -3,8 +3,9 @@
 //! UpdateItem and DeleteItem. Beside it, which legacy parameters the
 //! expression-mixing refusal names on Query.
 //!
-//! `FIRST` and `SECOND` hold the 67 requests sent to eu-west-2 and us-east-1
-//! on 11 November 2026, with the answers both regions gave, as the response
+//! `FIRST`, `SECOND` and `THIRD` hold the 79 requests sent to eu-west-2 and
+//! us-east-1 on 11 November 2026, with the answers both regions gave, as the
+//! response
 //! bodies DynamoDB returned. They are data captured from DynamoDB, not written
 //! by hand. Every request names a table that doesn't exist, and the server
 //! here has no tables, so a request DynamoDB accepts as far as the table
@@ -151,6 +152,107 @@ async fn key_conditions_run_beside_a_filter_or_projection_expression() {
         serde_json::json!([{"b": {"S": "one"}}, {"b": {"S": "two"}}]),
         "{body}"
     );
+}
+
+/// The third set: `ExpressionAttributeValues` without an expression that can
+/// use them, and an unused or undefined name or value beside `KeyConditions`,
+/// each refused before the table is looked up.
+#[tokio::test]
+async fn expression_attributes_beside_key_conditions_are_checked_first() {
+    assert_captured(THIRD).await;
+}
+
+/// A table keyed on `pk` and `sk` with a global index on `gk`, holding two
+/// items in partition `a` (and in index partition `g`) and one elsewhere.
+async fn populated_server() -> String {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "Tab",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gk", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{"AttributeName": "gk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let url = start_server(db).await;
+    for item in [
+        r#"{"pk":{"S":"a"},"sk":{"S":"1"},"gk":{"S":"g"},"a":{"S":"x"},"b":{"S":"one"}}"#,
+        r#"{"pk":{"S":"a"},"sk":{"S":"2"},"gk":{"S":"g"},"a":{"S":"y"},"b":{"S":"two"}}"#,
+        r#"{"pk":{"S":"z"},"sk":{"S":"1"},"gk":{"S":"h"},"a":{"S":"x"},"b":{"S":"three"}}"#,
+    ] {
+        let (status, body) = send(
+            &url,
+            "PutItem",
+            &format!(r#"{{"TableName":"Tab","Item":{item}}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    url
+}
+
+/// The placeholders Dynoxide names `KeyConditions` through internally must not
+/// take the place of the caller's own, whatever the caller calls them: a value
+/// or a name the caller defines is the one its expressions read, on the table
+/// and on an index.
+#[tokio::test]
+async fn key_conditions_leave_the_callers_placeholders_alone() {
+    let url = populated_server().await;
+    for target in [
+        r#""KeyConditions":{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}}"#,
+        r#""IndexName":"gsi","KeyConditions":{"gk":{"AttributeValueList":[{"S":"g"}],"ComparisonOperator":"EQ"}}"#,
+    ] {
+        let filters = [
+            r#""FilterExpression":"a = :kc_v0","ExpressionAttributeValues":{":kc_v0":{"S":"x"}}"#,
+            r##""FilterExpression":"#kc_0 = :v","ExpressionAttributeNames":{"#kc_0":"a"},"ExpressionAttributeValues":{":v":{"S":"x"}}"##,
+            r##""FilterExpression":"#kc1_0 = :kc_v0","ExpressionAttributeNames":{"#kc1_0":"a"},"ExpressionAttributeValues":{":kc_v0":{"S":"x"}}"##,
+        ];
+        for filter in filters {
+            let (status, body) = send(
+                &url,
+                "Query",
+                &format!(r#"{{"TableName":"Tab",{target},{filter}}}"#),
+            )
+            .await;
+            assert_eq!(status, 200, "{target} {filter}: {body}");
+            assert_eq!(body["Count"], 1, "{target} {filter}: {body}");
+            assert_eq!(
+                body["Items"][0]["b"],
+                serde_json::json!({"S": "one"}),
+                "{target} {filter}: {body}"
+            );
+        }
+        let (status, body) = send(
+            &url,
+            "Query",
+            &format!(
+                r##"{{"TableName":"Tab",{target},"ProjectionExpression":"#kc_0","ExpressionAttributeNames":{{"#kc_0":"b"}}}}"##
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{target}: {body}");
+        let mut items = body["Items"].as_array().cloned().unwrap_or_default();
+        items.sort_by_key(|item| item["b"]["S"].as_str().map(str::to_string));
+        assert_eq!(
+            serde_json::Value::Array(items),
+            serde_json::json!([{"b": {"S": "one"}}, {"b": {"S": "two"}}]),
+            "{target}: {body}"
+        );
+    }
 }
 
 /// Captured in eu-west-2 and us-east-1, 11 November 2026; both regions gave
@@ -495,5 +597,71 @@ const SECOND: &[(&str, &str, &str)] = &[
         "DeleteItem",
         r#"{"TableName": "_capture_20261111_317_none", "Expected": {"a": {"Value": {"S": "x"}}, "b": {"Value": {"S": "y"}}}, "ConditionalOperator": "XOR"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]; Value null at 'key' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+];
+
+/// Captured the same day in the same two regions, which agreed on every
+/// request: the expression attributes beside `KeyConditions`, and beside a
+/// Query or Scan with only a `ProjectionExpression` or no expression at all.
+const THIRD: &[(&str, &str, &str)] = &[
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "ProjectionExpression": "a", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "ProjectionExpression": "#a", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "ProjectionExpression": "a", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeNames unused in expressions: keys: {#a}"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "FilterExpression": "a = :v", "ExpressionAttributeValues": {":v": {"S": "x"}, ":w": {"S": "y"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeValues unused in expressions: keys: {:w}"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "FilterExpression": "a = :v"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: :v"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "FilterExpression": "#a = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute name used in the document path is not defined; attribute name: #a"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "a", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues can only be specified when using expressions"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ScanFilter": {"a": {"AttributeValueList": [{"S": "x"}], "ComparisonOperator": "EQ"}}, "ProjectionExpression": "a"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {ProjectionExpression}"}"##,
     ),
 ];

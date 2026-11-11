@@ -352,7 +352,7 @@ pub async fn execute<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr,
-            all_expression_param_names: vec!["FilterExpression", "KeyConditionExpression"],
+            value_expression_params: &["FilterExpression", "KeyConditionExpression"],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
@@ -489,6 +489,20 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Beside KeyConditions, the expressions' attributes are checked before the
+    // table is looked up: a value the FilterExpression uses but nobody
+    // defined, then a name or value no expression uses (captured eu-west-2
+    // and us-east-1, 2026-11-11). Whether a KeyConditionExpression request
+    // is checked this early too is uncaptured, so it keeps its order.
+    if request.key_condition_expression.is_none()
+        && request
+            .key_conditions
+            .as_ref()
+            .is_some_and(|v| !v.is_null())
+    {
+        check_attributes_beside_key_conditions(&request)?;
+    }
+
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
 
@@ -525,7 +539,14 @@ pub async fn execute<S: StorageBackend>(
         && !kc.is_empty()
     {
         check_legacy_key_condition_types(&kc, &meta)?;
-        let converted = helpers::convert_key_conditions(&kc, Some(&effective_pk_for_kc))?;
+        let converted = helpers::convert_key_conditions(
+            &kc,
+            Some(&effective_pk_for_kc),
+            helpers::CallerPlaceholders {
+                names: request.expression_attribute_names.as_ref(),
+                values: request.expression_attribute_values.as_ref(),
+            },
+        )?;
         request.key_condition_expression = Some(converted.expression);
         let expr_values = request
             .expression_attribute_values
@@ -548,8 +569,14 @@ pub async fn execute<S: StorageBackend>(
     if let Some(qf) = query_filter
         && !qf.is_empty()
     {
-        let converted =
-            helpers::convert_filter_conditions(&qf, request.conditional_operator.as_deref())?;
+        let converted = helpers::convert_filter_conditions(
+            &qf,
+            request.conditional_operator.as_deref(),
+            helpers::CallerPlaceholders {
+                names: request.expression_attribute_names.as_ref(),
+                values: request.expression_attribute_values.as_ref(),
+            },
+        )?;
         if !converted.expression.is_empty() {
             request.filter_expression = Some(converted.expression);
             let expr_values = request
@@ -1347,6 +1374,40 @@ fn sort_key_satisfies(
             _ => false,
         },
     }
+}
+
+/// The expression attributes of a Query that names its key through
+/// `KeyConditions`, checked against the FilterExpression and
+/// ProjectionExpression beside it. An expression that doesn't parse is left
+/// for the checks that already report it.
+fn check_attributes_beside_key_conditions(request: &QueryRequest) -> Result<()> {
+    let tracker = crate::expressions::TrackedExpressionAttributes::new(
+        &request.expression_attribute_names,
+        &request.expression_attribute_values,
+    );
+    if let Some(Ok(filter)) = request
+        .filter_expression
+        .as_deref()
+        .filter(|fe| !fe.is_empty())
+        .map(expressions::condition::parse)
+    {
+        tracker.track_condition_expr(&filter);
+        if let Some(value) = tracker.first_undefined_value() {
+            return Err(DynoxideError::ValidationException(format!(
+                "Invalid FilterExpression: An expression attribute value used in expression \
+                 is not defined; attribute value: {value}"
+            )));
+        }
+    }
+    if let Some(Ok(projection)) = request
+        .projection_expression
+        .as_deref()
+        .filter(|pe| !pe.is_empty())
+        .map(expressions::projection::parse)
+    {
+        tracker.track_projection_expr(&projection);
+    }
+    tracker.check_unused()
 }
 
 /// A legacy KeyConditions value must be the key's schema type. Any other type

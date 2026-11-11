@@ -145,7 +145,7 @@ pub async fn execute<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr_params,
-            all_expression_param_names: vec![],
+            value_expression_params: &[],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &None,
             expression_attribute_values_raw: &None,

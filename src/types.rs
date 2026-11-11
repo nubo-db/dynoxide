@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::de;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -253,8 +254,10 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // A member of the wrong JSON type is refused as the value is parsed,
         // ahead of the checks made on a parsed value: an empty set, a number
         // that doesn't read, a false NULL and a second member (captured
-        // eu-west-2 and us-east-1, 2026-11-08, for the second member).
-        if let Some(refusal) = wrong_json_type_in(obj) {
+        // eu-west-2 and us-east-1, 2026-11-08, for the second member). Base64
+        // that DynamoDB doesn't read is refused here too, in the same order
+        // (captured eu-west-2, 2026-11-11).
+        if let Some(refusal) = unreadable_member_in(obj) {
             return Err(de::Error::custom(format!(
                 "{}{refusal}",
                 crate::serde_errors::SERIALIZATION_MARKER
@@ -356,10 +359,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 let encoded = val
                     .as_str()
                     .expect("a member of the wrong JSON type is refused above");
-                let bytes = BASE64
-                    .decode(encoded)
-                    .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
-                Ok(AttributeValue::B(bytes))
+                Ok(AttributeValue::B(decode_base64(encoded)?))
             }
             // Both were read above; a NULL that reached here reads as true.
             "BOOL" => Ok(AttributeValue::BOOL(boolean.is_some_and(|b| b.value))),
@@ -401,11 +401,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     let encoded = item
                         .as_str()
                         .ok_or_else(|| de::Error::custom("expected string in BS"))?;
-                    decoded.push(
-                        BASE64
-                            .decode(encoded)
-                            .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?,
-                    );
+                    decoded.push(decode_base64(encoded)?);
                 }
                 Ok(AttributeValue::BS(decoded))
             }
@@ -436,13 +432,27 @@ impl<'de> Deserialize<'de> for AttributeValue {
     }
 }
 
+/// The bytes a `B` value or `BS` member reads as. The walk over the value
+/// refuses base64 DynamoDB doesn't read before this runs; should it not have,
+/// the refusal is the same one.
+fn decode_base64<E: de::Error>(encoded: &str) -> std::result::Result<Vec<u8>, E> {
+    crate::wire_base64::decode(encoded).map_err(|refusal| {
+        E::custom(format!(
+            "{}{}",
+            crate::serde_errors::SERIALIZATION_MARKER,
+            refusal.message()
+        ))
+    })
+}
+
 /// What an attribute value member, or a member of one of its lists or maps,
 /// holds as JSON.
 #[derive(Clone, Copy)]
 enum JsonSlot {
     /// A string: `S`, `N`, and the members of `SS` and `NS`.
     Text,
-    /// A base64 string: `B`, and the members of `BS`.
+    /// A base64 string: `B`, and the members of `BS`. The text is read as
+    /// DynamoDB reads it (`wire_base64`), and refused in its words.
     Bytes,
     /// An array: `SS`, `NS`, `BS` and `L`.
     List,
@@ -455,10 +465,24 @@ enum JsonSlot {
 
 impl JsonSlot {
     /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong
-    /// (captured eu-west-2 and us-east-1, 2026-11-08); `None` when the type is
-    /// right, or for JSON null, which the readers below deal with. An empty
-    /// refusal is a `SerializationException` with no message.
-    fn refusal(self, value: &serde_json::Value) -> Option<&'static str> {
+    /// (captured eu-west-2 and us-east-1, 2026-11-08), or when it is base64
+    /// text DynamoDB doesn't read (captured eu-west-2, 2026-11-11); `None`
+    /// when the value reads, or for JSON null, which the readers below deal
+    /// with. An empty refusal is a `SerializationException` with no message.
+    fn refusal(self, value: &serde_json::Value) -> Option<Cow<'static, str>> {
+        self.json_type_refusal(value)
+            .map(Cow::Borrowed)
+            .or_else(|| match (self, value) {
+                (Self::Bytes, serde_json::Value::String(text)) => {
+                    crate::wire_base64::check(text).err().map(|r| r.message())
+                }
+                _ => None,
+            })
+    }
+
+    /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong;
+    /// `None` when the type is right, or for JSON null.
+    fn json_type_refusal(self, value: &serde_json::Value) -> Option<&'static str> {
         use serde_json::Value;
         const MAP_HERE: &str = "Start of structure or map found where not expected";
         match (self, value) {
@@ -487,20 +511,23 @@ impl JsonSlot {
 
 /// DynamoDB's refusal of an attribute value, written as the JSON object
 /// `value`, when one of its type members, or anything nested in its `L` or
-/// `M`, has the wrong JSON type; `None` when the JSON types are right.
+/// `M`, has the wrong JSON type or is base64 DynamoDB doesn't read; `None`
+/// when every member reads.
 /// DynamoDB refuses these as it parses the whole value, so a fault nested in
 /// an `L` or `M` comes ahead of the outer value's own faults, such as a second
 /// member. Members are looked at in key order, which serde_json keeps sorted.
-fn wrong_json_type_in(value: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+fn unreadable_member_in(
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Cow<'static, str>> {
     value
         .iter()
-        .find_map(|(type_key, member)| wrong_json_type(type_key, member))
+        .find_map(|(type_key, member)| unreadable_member(type_key, member))
 }
 
 /// DynamoDB's refusal of an attribute value's `type_key` member when it, or
-/// anything in it, has the wrong JSON type; `None` when the JSON types are
-/// right, and for a member that isn't one of these types.
-fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<&'static str> {
+/// anything in it, has the wrong JSON type or is base64 DynamoDB doesn't
+/// read; `None` when it reads, and for a member that isn't one of these types.
+fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'static, str>> {
     let (slot, members) = match type_key {
         "S" | "N" => (JsonSlot::Text, None),
         "B" => (JsonSlot::Bytes, None),
@@ -516,7 +543,7 @@ fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<&'static
     let members = members?;
     let member_refusal = |item: &serde_json::Value| {
         members.refusal(item).or_else(|| match item {
-            serde_json::Value::Object(nested) => wrong_json_type_in(nested),
+            serde_json::Value::Object(nested) => unreadable_member_in(nested),
             _ => None,
         })
     };
@@ -2374,29 +2401,46 @@ pub fn f32_number_string(v: f32) -> String {
 }
 
 /// Provisioned throughput settings (stored but not enforced).
+///
+/// A unit is read as DynamoDB reads a Long member: a fraction truncates and a
+/// malformed number token is read by its integer rule (see
+/// `number_tokens::deserialize_units`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvisionedThroughput {
-    #[serde(rename = "ReadCapacityUnits", alias = "read_capacity_units", default)]
+    #[serde(
+        rename = "ReadCapacityUnits",
+        alias = "read_capacity_units",
+        default,
+        deserialize_with = "crate::number_tokens::deserialize_units"
+    )]
     pub read_capacity_units: Option<i64>,
-    #[serde(rename = "WriteCapacityUnits", alias = "write_capacity_units", default)]
+    #[serde(
+        rename = "WriteCapacityUnits",
+        alias = "write_capacity_units",
+        default,
+        deserialize_with = "crate::number_tokens::deserialize_units"
+    )]
     pub write_capacity_units: Option<i64>,
 }
 
 /// On-demand (PAY_PER_REQUEST) throughput ceilings (stored but not enforced).
+/// The units are read as [`ProvisionedThroughput`]'s are.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct OnDemandThroughput {
     #[serde(
         rename = "MaxReadRequestUnits",
         alias = "max_read_request_units",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::number_tokens::deserialize_units"
     )]
     pub max_read_request_units: Option<i64>,
     #[serde(
         rename = "MaxWriteRequestUnits",
         alias = "max_write_request_units",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::number_tokens::deserialize_units"
     )]
     pub max_write_request_units: Option<i64>,
 }
@@ -2703,6 +2747,22 @@ mod tests {
                 assert!(read.is_ok(), "{value} panicked");
             }
         }
+    }
+
+    #[test]
+    fn base64_reaching_the_decoder_unread_is_refused_not_panicked() {
+        let refused = decode_base64::<serde_json::Error>("!!").unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "{}Base64 encoded length is expected a multiple of 4 bytes but found: 2",
+                crate::serde_errors::SERIALIZATION_MARKER
+            )
+        );
+        assert_eq!(
+            decode_base64::<serde_json::Error>("QQ").unwrap(),
+            vec![0x41]
+        );
     }
 
     use super::*;

@@ -453,7 +453,7 @@ fn decimal_past_f64(token: &str) -> bool {
 /// part with no leading zero, then optionally a point with digits and an
 /// exponent with digits.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
-fn json_number(token: &str) -> bool {
+pub(crate) fn json_number(token: &str) -> bool {
     fn digits(text: &str) -> (&str, &str) {
         let end = text.bytes().take_while(u8::is_ascii_digit).count();
         text.split_at(end)

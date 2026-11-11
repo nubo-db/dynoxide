@@ -305,6 +305,30 @@ async fn handle_request(
         "application/json"
     };
 
+    // A number token JSON doesn't allow is read as DynamoDB reads it: each one
+    // stands in as a valid number for the parser, and the token's text is kept
+    // for the request's integer members (see `number_tokens`). Nothing after
+    // this awaits, so the table holds for the rest of the request.
+    let (body, stand_ins) = match crate::number_tokens::stand_in_malformed_numbers(&body) {
+        Some((replaced, stand_ins)) => {
+            drop(body);
+            (replaced, Some(stand_ins))
+        }
+        None => (body, None),
+    };
+    crate::number_tokens::with_stand_ins(stand_ins, || {
+        answer(&uri, &db, &headers, body, response_ct)
+    })
+}
+
+/// Answer a request whose content type has been accepted.
+fn answer(
+    uri: &Uri,
+    db: &Database,
+    headers: &HeaderMap,
+    body: String,
+    response_ct: &'static str,
+) -> Response {
     // Try to parse body as JSON. DynamoDB requires a valid JSON object.
     // Non-JSON → SerializationException (no message). Valid JSON nested deeper
     // than the parser follows is still read, as DynamoDB reads it: see
@@ -344,7 +368,7 @@ async fn handle_request(
     };
 
     // Validate authentication headers - DynamoDB checks auth after target resolution.
-    if let Some(auth_error) = validate_auth(&headers, &uri, response_ct) {
+    if let Some(auth_error) = validate_auth(headers, uri, response_ct) {
         return auth_error;
     }
 
@@ -374,10 +398,10 @@ async fn handle_request(
                 return serialization_exception_bare(response_ct);
             }
             crate::deep_nesting::DeepBody::Refuse(e) => Err(e),
-            crate::deep_nesting::DeepBody::Run(rewritten) => dispatch(&db, operation, &rewritten),
+            crate::deep_nesting::DeepBody::Run(rewritten) => dispatch(db, operation, &rewritten),
         }
     } else {
-        dispatch(&db, operation, &body)
+        dispatch(db, operation, &body)
     };
 
     match result {
@@ -389,6 +413,12 @@ async fn handle_request(
         Err(e) => {
             let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
             let json = e.to_json_for(operation);
+            // An answer quoting a stand-in comes from a member that doesn't
+            // read malformed tokens. It gets the answer the token got before
+            // DynamoDB's reading of them was known.
+            if crate::number_tokens::error_quotes_stand_in(&json) {
+                return serialization_exception_bare(response_ct);
+            }
             tracing::warn!(operation, status = %status, "error response");
             tracing::trace!(operation, body = %json, "error response body");
             dynamo_response(status, response_ct, json)

@@ -3317,8 +3317,9 @@ mod capacity_tests {
     use super::*;
     use serde_json::{Value, json};
 
-    /// What DynamoDB returns for a mode outside its enum, on every operation
-    /// that takes one (captured eu-west-2, 2026-10-08).
+    /// What DynamoDB returns for a mode outside its enum (captured eu-west-2,
+    /// 2026-10-08). UpdateItem and SearchVectors give it without the
+    /// envelope, as [`BARE_BOGUS_MODE`].
     const BOGUS_MODE: &str = "1 validation error detected: Value 'BOGUS' at \
         'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy \
         enum value set: [INDEXES, TOTAL, NONE]";

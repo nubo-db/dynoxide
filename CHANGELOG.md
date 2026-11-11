@@ -211,10 +211,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `consistent_read`, `put_request`, `item`, `delete_request`, `key`) are
   given their wire names; where an entry gives both spellings, the wire one
   is read. A malformed entry now gets the HTTP API's answer rather than an
-  `InvalidRequestItems` error of the tools' own. A non-string
-  `ProjectionExpression`, malformed `ExpressionAttributeNames` or a bad
-  `AttributesToGet` inside `batch_get_item`, which the tool used to ignore,
-  are now refused
+  `InvalidRequestItems` error of the tools' own. `batch_get_item` now applies
+  an entry's `AttributesToGet` and returns only those attributes, as
+  BatchGetItem does; it used to ignore it and return the whole item. A
+  non-string `ProjectionExpression`, malformed `ExpressionAttributeNames` or
+  a bad `AttributesToGet`, which the tool also ignored, are now refused
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 
 ## [1.6.0] - 2026-11-07

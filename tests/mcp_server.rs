@@ -5279,7 +5279,10 @@ fn batch_get_item_reports_a_bad_capacity_mode_where_batch_get_item_does() {
                  expression pattern: [a-zA-Z0-9_.-]+]; {bogus}"
             )),
         ),
-        (json!({"Flags": {"Keys": [{"pk": {"S": "a"}}]}}), enveloped(bogus)),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"S": "a"}}]}}),
+            enveloped(bogus),
+        ),
         (
             json!({"Flags": {"Keys": [{"pk": {"N": "abc"}}]}}),
             validation_error(ABC_NUMBER),

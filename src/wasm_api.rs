@@ -416,14 +416,7 @@ async fn route<S: StorageBackend>(
     // serialising, and give ExecuteStatement's condition failure carrying an
     // item its own shape.
     result.map_err(|e| {
-        let resolved = match layer {
-            crate::validation::ValueLayer::Older => {
-                crate::validation::strip_request_validation_tag(e)
-            }
-            crate::validation::ValueLayer::Current => {
-                crate::validation::resolve_request_validation_tag(op, e)
-            }
-        };
+        let resolved = crate::validation::resolve_request_validation_on(op, layer, e);
         crate::errors::for_operation(op, resolved)
     })
 }

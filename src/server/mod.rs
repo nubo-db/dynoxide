@@ -442,14 +442,7 @@ fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String>
     // dispatch. ExecuteStatement's condition failure carrying an item is
     // written in its own shape.
     result.map_err(|e| {
-        let resolved = match layer {
-            crate::validation::ValueLayer::Older => {
-                crate::validation::strip_request_validation_tag(e)
-            }
-            crate::validation::ValueLayer::Current => {
-                crate::validation::resolve_request_validation_tag(operation, e)
-            }
-        };
+        let resolved = crate::validation::resolve_request_validation_on(operation, layer, e);
         crate::errors::for_operation(operation, resolved)
     })
 }

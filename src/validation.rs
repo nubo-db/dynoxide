@@ -556,20 +556,46 @@ pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError 
 /// for untagged errors, so applying this to an already-enveloped action error
 /// is safe.
 ///
-/// Owner of the operation split for the HTTP and wasm dispatch seams, which
-/// both route through here. The same PutItem/UpdateItem/DeleteItem membership
-/// is encoded at the action boundaries (`put_item::execute`,
-/// `update_item::execute` and `delete_item::execute` apply the envelope for the
-/// in-process API) and in the MCP tools' choice of resolver, so a future
-/// enveloped operation must update all three places.
+/// Owner of the operation split for the HTTP and wasm dispatch seams and the
+/// MCP tools, which all route through here. The same
+/// PutItem/UpdateItem/DeleteItem membership is encoded at the action
+/// boundaries (`put_item::execute`, `update_item::execute` and
+/// `delete_item::execute` apply the envelope for the in-process API), so a
+/// future enveloped operation must update both places.
 ///
-/// Compiled only for the dispatch seams that consume it: the HTTP server, the
-/// wasm engine API, and the unit tests.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+/// Compiled only for the seams that consume it: the HTTP server, the MCP
+/// tools, the wasm engine API, and the unit tests.
+#[cfg(any(
+    feature = "http-server",
+    feature = "mcp-server",
+    feature = "wasm-sqlite",
+    test
+))]
 pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
     match operation {
         "PutItem" | "UpdateItem" | "DeleteItem" => envelope_request_validation(err),
         _ => strip_request_validation_tag(err),
+    }
+}
+
+/// Resolve the request-validation tag for `operation` read on `layer`: bare on
+/// the older layer, which never gives the envelope, and by the operation's
+/// own rule ([`resolve_request_validation_tag`]) on the current one. The one
+/// decision the HTTP and wasm dispatch seams and the MCP tools all make.
+#[cfg(any(
+    feature = "http-server",
+    feature = "mcp-server",
+    feature = "wasm-sqlite",
+    test
+))]
+pub(crate) fn resolve_request_validation_on(
+    operation: &str,
+    layer: ValueLayer,
+    err: DynoxideError,
+) -> DynoxideError {
+    match layer {
+        ValueLayer::Older => strip_request_validation_tag(err),
+        ValueLayer::Current => resolve_request_validation_tag(operation, err),
     }
 }
 
@@ -1424,9 +1450,14 @@ pub(crate) enum ValueLayer {
 }
 
 impl ValueLayer {
-    /// The layer DynamoDB runs `operation` on, for the dispatch seams that
-    /// read a request knowing only the operation's name.
-    #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+    /// The layer DynamoDB runs `operation` on, for the seams that read a
+    /// request knowing only the operation's name.
+    #[cfg(any(
+        feature = "http-server",
+        feature = "mcp-server",
+        feature = "wasm-sqlite",
+        test
+    ))]
     pub(crate) fn for_operation(operation: &str) -> Self {
         match operation {
             "BatchWriteItem"

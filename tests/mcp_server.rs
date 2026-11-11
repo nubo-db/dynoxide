@@ -5418,3 +5418,197 @@ fn the_flags_still_advertise_a_boolean() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+const ABC_NUMBER: &str = "The parameter cannot be converted to a numeric value: abc";
+const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value \
+                             types must have the value of true";
+const TWO_TYPES: &str = "Supplied AttributeValue has more than one datatypes set, must contain \
+                         exactly one of the supported datatypes";
+
+fn enveloped(message: &str) -> (String, String) {
+    validation_error(&format!("1 validation error detected: {message}"))
+}
+
+fn named(message: &str, key: &str) -> (String, String) {
+    validation_error(&format!(
+        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+    ))
+}
+
+/// A request holding a `BOOL` or `NULL` written as a string, or a value with
+/// two members, is read on the older layer, as tests/value_layers.rs pins over
+/// HTTP: its refusals are bare on `put_item`, and `update_item` names the key,
+/// where the same refusal alone is enveloped. The cases run in one process, so
+/// a current-layer call after an older-layer one shows the layer doesn't leak.
+#[test]
+fn item_tools_read_values_on_the_layer_the_http_api_uses() {
+    let mut child = mcp_with_table("Layers");
+    let bad_number = json!({"N": "abc"});
+    let string_bool = json!({"BOOL": "no"});
+    let cases = vec![
+        (
+            vec![("v", bad_number.clone())],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("v", bad_number.clone()), ("w", string_bool.clone())],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", bad_number.clone())],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("w", string_bool.clone()), ("v", bad_number.clone())],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", bad_number.clone()), ("w", json!({"BOOL": true}))],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("v", json!({"NULL": false}))],
+            enveloped(NULL_NOT_TRUE),
+            enveloped(NULL_NOT_TRUE),
+        ),
+        (
+            vec![("v", json!({"NULL": "no"}))],
+            validation_error(NULL_NOT_TRUE),
+            named(NULL_NOT_TRUE, ":v"),
+        ),
+        (
+            vec![("v", json!({"S": "x", "N": "1"}))],
+            validation_error(TWO_TYPES),
+            named(TWO_TYPES, ":v"),
+        ),
+        (
+            vec![("v", json!({"N": "abc", "S": "x"}))],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", json!({"NULL": false}))],
+            enveloped(NULL_NOT_TRUE),
+            enveloped(NULL_NOT_TRUE),
+        ),
+    ];
+    let mut id = 10;
+    for (pairs, on_put, on_update) in cases {
+        let mut item = json!({"pk": {"S": "m1"}});
+        let mut values = json!({});
+        let mut set = Vec::new();
+        for (name, value) in &pairs {
+            item[name] = value.clone();
+            values[format!(":{name}")] = value.clone();
+            set.push(format!("{name} = :{name}"));
+        }
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Layers", "item": item}),
+        );
+        assert_eq!(tool_error(&resp), on_put, "put_item {pairs:?}");
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "update_item",
+            json!({
+                "table_name": "Layers", "key": {"pk": {"S": "m1"}},
+                "update_expression": format!("SET {}", set.join(", ")),
+                "expression_attribute_values": values
+            }),
+        );
+        assert_eq!(tool_error(&resp), on_update, "update_item {pairs:?}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `delete_item` follows the layer too: a key value it refuses is enveloped
+/// on its own and bare beside a string-read `BOOL`, as DeleteItem answers over
+/// HTTP.
+#[test]
+fn delete_item_reads_its_key_on_the_layer_the_http_api_uses() {
+    let mut child = mcp_with_table("Layers");
+    let older = json!({
+        "table_name": "Layers", "key": {"pk": {"N": "abc"}},
+        "condition_expression": "w = :w",
+        "expression_attribute_values": {":w": {"BOOL": "no"}}
+    });
+    let current = json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}}});
+    for (id, args, refusal) in [
+        (2, current.clone(), enveloped(ABC_NUMBER)),
+        (3, older, validation_error(ABC_NUMBER)),
+        (4, current, enveloped(ABC_NUMBER)),
+    ] {
+        let resp = call_tool(&mut child, id, "delete_item", args.clone());
+        assert_eq!(tool_error(&resp), refusal, "{args}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The tools without the envelope keep their operation's own layer: GetItem
+/// reads values on the current layer, bare, and BatchWriteItem on the older
+/// one, which reads `1e2147483647` as Java's `BigDecimal` does and calls it an
+/// underflow (tests/value_layers.rs).
+#[test]
+fn other_tools_read_values_on_their_operations_layer() {
+    let mut child = mcp_with_table("Layers");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}}}),
+    );
+    assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}, "x": {"BOOL": "no"}}}),
+    );
+    assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let resp = call_tool(
+        &mut child,
+        4,
+        "batch_write_item",
+        json!({"request_items": {"Layers": [
+            {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}}
+        ]}}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        validation_error(
+            "Number underflow. Attempting to store a number with magnitude smaller than \
+             supported range"
+        )
+    );
+    // And put_item, straight after, is back on the current layer.
+    let resp = call_tool(
+        &mut child,
+        5,
+        "put_item",
+        json!({"table_name": "Layers", "item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        enveloped(
+            "Number overflow. Attempting to store a number with magnitude larger than \
+             supported range"
+        )
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

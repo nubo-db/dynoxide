@@ -897,16 +897,56 @@ fn decode_dynamo_map(
 }
 
 /// Parse a DynamoDB JSON map, resolving the wire-invisible request-validation
-/// tag with the given function: the put_item and update_item tools pass
-/// `envelope_request_validation`, matching their envelope on the HTTP
-/// surface; every other tool passes `strip_request_validation_tag`, reporting
-/// the family bare.
+/// tag with the given function: the put_item, update_item and delete_item
+/// tools pass [`resolve_single_write`], matching the HTTP surface on the layer
+/// the call is read on; every other tool passes `strip_request_validation_tag`,
+/// reporting the family bare.
 fn parse_dynamo_map(
     val: serde_json::Value,
     field_name: &str,
     resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
     decode_dynamo_map(val, field_name).map_err(|e| to_tool_error(resolve(e)))
+}
+
+/// Resolve the request-validation tag for PutItem, UpdateItem or DeleteItem
+/// (the three share the rule) on the layer this call's values are read on:
+/// in the envelope on the current layer and bare on the older one, as the
+/// HTTP API answers. `call_tool` sets the layer.
+fn resolve_single_write(err: crate::DynoxideError) -> crate::DynoxideError {
+    crate::validation::resolve_request_validation_on(
+        "PutItem",
+        crate::types::current_value_layer(),
+        err,
+    )
+}
+
+/// Decode update_item's `expression_attribute_values` with the reader
+/// UpdateItem's wire request uses, which names the key of a value refused on
+/// the older layer; a plain map never names it.
+fn parse_update_expression_values(
+    val: Option<serde_json::Value>,
+) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
+    #[derive(Deserialize)]
+    struct Named(
+        #[serde(deserialize_with = "crate::types::deserialize_named_null_refusals")]
+        Option<HashMap<String, AttributeValue>>,
+    );
+    let Some(val) = val else {
+        return Ok(None);
+    };
+    serde_json::from_value::<Named>(val)
+        .map(|named| named.0)
+        .map_err(|e| {
+            let msg = e.to_string();
+            crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
+                crate::errors::DynoxideError::ValidationException(format!(
+                    "Invalid DynamoDB JSON in 'expression_attribute_values': {}",
+                    crate::serde_errors::clean_serde_message(&msg)
+                ))
+            })
+        })
+        .map_err(|e| to_tool_error(resolve_single_write(e)))
 }
 
 /// Optional-map variant of [`parse_dynamo_map`].
@@ -1436,18 +1476,14 @@ impl McpServer {
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
-        let item = match parse_dynamo_map(
-            params.item,
-            "item",
-            crate::validation::envelope_request_validation,
-        ) {
+        let item = match parse_dynamo_map(params.item, "item", resolve_single_write) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
-            crate::validation::envelope_request_validation,
+            resolve_single_write,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1522,22 +1558,15 @@ impl McpServer {
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(
-            params.key,
-            "key",
-            crate::validation::envelope_request_validation,
-        ) {
+        let key = match parse_dynamo_map(params.key, "key", resolve_single_write) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let expression_attribute_values = match parse_optional_dynamo_map(
-            params.expression_attribute_values,
-            "expression_attribute_values",
-            crate::validation::envelope_request_validation,
-        ) {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
+        let expression_attribute_values =
+            match parse_update_expression_values(params.expression_attribute_values) {
+                Ok(v) => v,
+                Err(err) => return Ok(err),
+            };
 
         let request = crate::actions::update_item::UpdateItemRequest {
             table_name: params.table_name,
@@ -1755,18 +1784,14 @@ impl McpServer {
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(
-            params.key,
-            "key",
-            crate::validation::envelope_request_validation,
-        ) {
+        let key = match parse_dynamo_map(params.key, "key", resolve_single_write) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
-            crate::validation::envelope_request_validation,
+            resolve_single_write,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -2576,8 +2601,78 @@ impl McpServer {
 // ServerHandler implementation
 // ---------------------------------------------------------------------------
 
+/// The DynamoDB operation behind a tool, for the tools that have one: the
+/// operation decides the layer the tool's values are read on, as it does for
+/// a request over HTTP. A tool missing here (the snapshots, `bulk_put_items`,
+/// `sweep_ttl`, `get_database_info`) reads on the current layer.
+fn tool_operation(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "list_tables" => "ListTables",
+        "describe_table" => "DescribeTable",
+        "create_table" => "CreateTable",
+        "delete_table" => "DeleteTable",
+        "update_table" => "UpdateTable",
+        "put_item" => "PutItem",
+        "get_item" => "GetItem",
+        "update_item" => "UpdateItem",
+        "delete_item" => "DeleteItem",
+        "search_vectors" => "SearchVectors",
+        "query" => "Query",
+        "scan" => "Scan",
+        "batch_write_item" => "BatchWriteItem",
+        "batch_get_item" => "BatchGetItem",
+        "transact_write_items" => "TransactWriteItems",
+        "transact_get_items" => "TransactGetItems",
+        "execute_partiql" => "ExecuteStatement",
+        "batch_execute_partiql" => "BatchExecuteStatement",
+        "execute_transaction_partiql" => "ExecuteTransaction",
+        "update_time_to_live" => "UpdateTimeToLive",
+        "describe_time_to_live" => "DescribeTimeToLive",
+        "tag_resource" => "TagResource",
+        "untag_resource" => "UntagResource",
+        "list_tags_of_resource" => "ListTagsOfResource",
+        "list_streams" => "ListStreams",
+        "describe_stream" => "DescribeStream",
+        "get_shard_iterator" => "GetShardIterator",
+        "get_records" => "GetRecords",
+        _ => return None,
+    })
+}
+
+/// The layer a tool call's values are read on, decided as the HTTP API
+/// decides it for the same request: the older layer when the arguments hold a
+/// `BOOL` or `NULL` written as a string, or a value with more than one member,
+/// and otherwise the operation's own.
+fn tool_value_layer(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> crate::validation::ValueLayer {
+    let older = arguments.is_some_and(|args| args.values().any(crate::types::reads_on_older_layer));
+    if older {
+        crate::validation::ValueLayer::Older
+    } else {
+        tool_operation(tool).map_or(
+            crate::validation::ValueLayer::Current,
+            crate::validation::ValueLayer::for_operation,
+        )
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for McpServer {
+    /// Every tool runs under the validation layer its arguments would be read
+    /// on over HTTP, set around each poll of the call so it never reaches
+    /// another call the runtime polls on the same thread.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let layer = tool_value_layer(&request.name, request.arguments.as_ref());
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::types::with_value_layer_async(layer, Self::tool_router().call(call)).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         let base_instructions = "\
             Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. \

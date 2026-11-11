@@ -257,7 +257,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // eu-west-2 and us-east-1, 2026-11-08, for the second member). Base64
         // that DynamoDB doesn't read is refused here too, in the same order
         // (captured eu-west-2, 2026-11-11).
-        if let Some(refusal) = wrong_json_type_in(obj) {
+        if let Some(refusal) = unreadable_member_in(obj) {
             return Err(de::Error::custom(format!(
                 "{}{refusal}",
                 crate::serde_errors::SERIALIZATION_MARKER
@@ -359,9 +359,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 let encoded = val
                     .as_str()
                     .expect("a member of the wrong JSON type is refused above");
-                let bytes = crate::wire_base64::decode(encoded)
-                    .expect("base64 DynamoDB refuses is refused above");
-                Ok(AttributeValue::B(bytes))
+                Ok(AttributeValue::B(decode_base64(encoded)?))
             }
             // Both were read above; a NULL that reached here reads as true.
             "BOOL" => Ok(AttributeValue::BOOL(boolean.is_some_and(|b| b.value))),
@@ -403,10 +401,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     let encoded = item
                         .as_str()
                         .ok_or_else(|| de::Error::custom("expected string in BS"))?;
-                    decoded.push(
-                        crate::wire_base64::decode(encoded)
-                            .expect("base64 DynamoDB refuses is refused above"),
-                    );
+                    decoded.push(decode_base64(encoded)?);
                 }
                 Ok(AttributeValue::BS(decoded))
             }
@@ -435,6 +430,19 @@ impl<'de> Deserialize<'de> for AttributeValue {
             _ => unreachable!(),
         }
     }
+}
+
+/// The bytes a `B` value or `BS` member reads as. The walk over the value
+/// refuses base64 DynamoDB doesn't read before this runs; should it not have,
+/// the refusal is the same one.
+fn decode_base64<E: de::Error>(encoded: &str) -> std::result::Result<Vec<u8>, E> {
+    crate::wire_base64::decode(encoded).map_err(|refusal| {
+        E::custom(format!(
+            "{}{}",
+            crate::serde_errors::SERIALIZATION_MARKER,
+            refusal.message()
+        ))
+    })
 }
 
 /// What an attribute value member, or a member of one of its lists or maps,
@@ -508,18 +516,18 @@ impl JsonSlot {
 /// DynamoDB refuses these as it parses the whole value, so a fault nested in
 /// an `L` or `M` comes ahead of the outer value's own faults, such as a second
 /// member. Members are looked at in key order, which serde_json keeps sorted.
-fn wrong_json_type_in(
+fn unreadable_member_in(
     value: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<Cow<'static, str>> {
     value
         .iter()
-        .find_map(|(type_key, member)| wrong_json_type(type_key, member))
+        .find_map(|(type_key, member)| unreadable_member(type_key, member))
 }
 
 /// DynamoDB's refusal of an attribute value's `type_key` member when it, or
 /// anything in it, has the wrong JSON type or is base64 DynamoDB doesn't
 /// read; `None` when it reads, and for a member that isn't one of these types.
-fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<Cow<'static, str>> {
+fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'static, str>> {
     let (slot, members) = match type_key {
         "S" | "N" => (JsonSlot::Text, None),
         "B" => (JsonSlot::Bytes, None),
@@ -535,7 +543,7 @@ fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<Cow<'sta
     let members = members?;
     let member_refusal = |item: &serde_json::Value| {
         members.refusal(item).or_else(|| match item {
-            serde_json::Value::Object(nested) => wrong_json_type_in(nested),
+            serde_json::Value::Object(nested) => unreadable_member_in(nested),
             _ => None,
         })
     };
@@ -2721,6 +2729,22 @@ mod tests {
                 assert!(read.is_ok(), "{value} panicked");
             }
         }
+    }
+
+    #[test]
+    fn base64_reaching_the_decoder_unread_is_refused_not_panicked() {
+        let refused = decode_base64::<serde_json::Error>("!!").unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "{}Base64 encoded length is expected a multiple of 4 bytes but found: 2",
+                crate::serde_errors::SERIALIZATION_MARKER
+            )
+        );
+        assert_eq!(
+            decode_base64::<serde_json::Error>("QQ").unwrap(),
+            vec![0x41]
+        );
     }
 
     use super::*;

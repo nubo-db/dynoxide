@@ -5203,7 +5203,8 @@ fn get_item_reads_consistent_read_as_the_http_api_does() {
 
 /// A flag that doesn't read fails the request as it is decoded, so it is the
 /// error reported beside a `return_consumed_capacity` outside the enum, which
-/// is checked later.
+/// is checked later. That holds for `ConsistentRead` inside `batch_get_item`'s
+/// `request_items` too, as BatchGetItem answers over HTTP.
 #[test]
 fn an_unreadable_flag_is_reported_ahead_of_a_bad_capacity_mode() {
     let mut child = mcp_with_table("Flags");
@@ -5225,6 +5226,16 @@ fn an_unreadable_flag_is_reported_ahead_of_a_bad_capacity_mode() {
             "table_name": "Flags", "key_condition_expression": "pk = :p",
             "expression_attribute_values": {":p": {"S": "c"}},
             "scan_index_forward": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+    let resp = call_tool(
+        &mut child,
+        4,
+        "batch_get_item",
+        json!({
+            "request_items": {"Flags": {"Keys": [{"pk": {"S": "c"}}], "ConsistentRead": "x"}},
+            "return_consumed_capacity": "BOGUS"
         }),
     );
     assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));

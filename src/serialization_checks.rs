@@ -424,6 +424,14 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
     check_field_is_int(obj, "Segment")?;
     check_field_is_int(obj, "TotalSegments")?;
     check_field_is_bool(obj, "ScanIndexForward")?;
+    // DynamoDB refuses a list here with no message (captured eu-west-2 and
+    // us-east-1, 2026-11-11). The shared check below answers a list
+    // differently for the other operations, and that is not changed here.
+    // A BatchExecuteStatement member takes the same rule from
+    // `crate::types::deserialize_statement_flag`.
+    if operation == "ExecuteStatement" && obj.get("ConsistentRead").is_some_and(|v| v.is_array()) {
+        return Err(crate::DynoxideError::SerializationException(String::new()));
+    }
     check_field_is_bool(obj, "ConsistentRead")?;
 
     Ok(())

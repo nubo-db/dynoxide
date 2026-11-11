@@ -42,7 +42,11 @@ struct ExecuteStatementRequestRaw {
     limit: Option<super::helpers::Int32>,
     #[serde(rename = "NextToken", default)]
     next_token: Option<String>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_statement_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
@@ -73,6 +77,7 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
                 &raw.statement,
                 raw.return_consumed_capacity.as_deref(),
                 raw.parameters.values.as_deref(),
+                raw.next_token.as_deref(),
             );
             if let Some(msg) = crate::validation::format_validation_errors(&violations) {
                 return Err(serde::de::Error::custom(format!(
@@ -102,13 +107,17 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
 /// ReturnConsumedCapacity, the parameters (captured eu-west-2 and us-east-1,
 /// 2026-10-10). A Limit below 1 is worded as Scan words it (value kept,
 /// lowercase 'limit'), not as Query does, matching what ExecuteStatement
-/// itself returns (captured eu-west-2, 2026-07-29).
+/// itself returns (captured eu-west-2, 2026-07-29). An empty NextToken is
+/// refused on any statement, a write included (captured eu-west-2,
+/// 2026-11-11, alone); its place among the others isn't captured, so it is
+/// listed last.
 fn member_violations(
     return_values_on_condition_check_failure: Option<&str>,
     limit: Option<i64>,
     statement: &str,
     return_consumed_capacity: Option<&str>,
     parameters: Option<&[AttributeValue]>,
+    next_token: Option<&str>,
 ) -> Vec<String> {
     [
         crate::validation::return_values_on_condition_check_failure_rejection(
@@ -124,6 +133,11 @@ fn member_violations(
         crate::partiql::statement_length_violation(statement, "statement"),
         crate::validation::return_consumed_capacity_rejection(return_consumed_capacity),
         crate::partiql::parameters_violation(parameters, "parameters"),
+        next_token.filter(|token| token.is_empty()).map(|_| {
+            "Value '' at 'nextToken' failed to satisfy constraint: Member must have length \
+             greater than or equal to 1"
+                .to_string()
+        }),
     ]
     .into_iter()
     .flatten()
@@ -161,6 +175,7 @@ pub async fn execute<S: StorageBackend>(
         &request.statement,
         request.return_consumed_capacity.as_deref(),
         request.parameters.as_deref(),
+        request.next_token.as_deref(),
     );
     if let Some(e) = crate::partiql::member_rejection(&violations) {
         return Err(e);
@@ -203,18 +218,27 @@ pub async fn execute<S: StorageBackend>(
 
     // The parser says which envelope its rejection takes: a malformed statement
     // gets DynamoDB's "wasn't well formed" wrapper, while a rejection DynamoDB
-    // reports on its own terms is passed through bare.
-    let supplied = request.parameters.as_ref().map_or(0, Vec::len);
-    let stmt = partiql::parser::parse_with_parameters(&request.statement, supplied).map_err(
-        |failure| {
-            DynoxideError::ValidationException(match failure {
+    // reports on its own terms, the statement checks' among them, is passed
+    // through bare.
+    let params = request.parameters.unwrap_or_default();
+    let checked = partiql::executor::checked_statement(
+        storage,
+        &request.statement,
+        &params,
+        partiql::executor::StatementSource::ExecuteStatement,
+    )
+    .await
+    .map_err(|failure| match failure {
+        partiql::executor::CheckFailure::Refused(refusal) => {
+            DynoxideError::ValidationException(match refusal {
                 partiql::parser::ParseFailure::Statement(e) => e.into_message(),
                 partiql::parser::ParseFailure::Literal(message) => message,
             })
-        },
-    )?;
+        }
+        partiql::executor::CheckFailure::Failed(error) => error,
+    })?;
+    let stmt = checked.statement;
 
-    let params = request.parameters.unwrap_or_default();
     // The statement's text goes with it, so a continuation token is bound to
     // the statement as written, as DynamoDB binds it.
     let run = partiql::executor::execute_written_page(
@@ -230,9 +254,9 @@ pub async fn execute<S: StorageBackend>(
         request.next_token.as_deref(),
         request.consistent_read.unwrap_or(false),
         request.return_consumed_capacity.as_deref(),
-        // A single statement has no preparation pass to share a resolution
-        // with, so the executor resolves the table itself, once.
-        None,
+        // The table the statement check loaded for an index read, if it
+        // loaded one; otherwise the executor resolves the table itself, once.
+        checked.table.as_ref(),
         request.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"),
     );
     // Base write, index fan-out and stream record are one atomic unit, as they

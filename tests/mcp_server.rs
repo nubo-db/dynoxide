@@ -6172,7 +6172,15 @@ fn execute_partiql_orders_member_and_parameter_errors_as_the_http_api_does() {
 
 /// `execute_partiql`'s `consistent_read` is ExecuteStatement's
 /// `ConsistentRead` as given, so it answers whatever ExecuteStatement answers
-/// over HTTP, which today refuses a string as malformed.
+/// over HTTP. A string DynamoDB reads as a boolean, in any case, reads as
+/// GetItem reads it, and the read is charged by the consistency it names
+/// (captured eu-west-2 and us-east-1, 2026-11-11: `"true"`, `"t"`, `"yes"`,
+/// `"y"`, `"1"`, `"TRUE"`, `"Yes"`, `"false"`, `"f"`, `"no"`, `"n"` and `"0"`
+/// run). Any other string, `"on"` and `" true"` among them, is refused as a
+/// token the parser didn't expect (captured eu-west-2 and us-east-1,
+/// 2026-11-11). A number is refused as GetItem refuses it (captured eu-west-2,
+/// 2026-11-10), and a list with no message (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
 #[test]
 fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
     let mut child = mcp_with_table("Pql");
@@ -6185,7 +6193,13 @@ fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
     assert!(!is_tool_error(&resp), "{resp}");
     let select = "SELECT * FROM \"Pql\" WHERE pk = 'a'";
     let mut id = 10;
-    for (flag, units) in [(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)] {
+    let consistent = ["true", "t", "yes", "y", "1", "TRUE", "Yes"].map(|s| (json!(s), 1.0));
+    let eventual = ["false", "f", "no", "n", "0"].map(|s| (json!(s), 0.5));
+    let read = [(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)]
+        .into_iter()
+        .chain(consistent)
+        .chain(eventual);
+    for (flag, units) in read {
         id += 1;
         let resp = call_tool(
             &mut child,
@@ -6206,8 +6220,10 @@ fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
         );
     }
     for (flag, refusal) in [
-        (json!("true"), serialization_error(UNEXPECTED_TOKEN)),
         (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("on"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(" true"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(""), serialization_error(UNEXPECTED_TOKEN)),
         (
             json!(1),
             serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
@@ -6221,6 +6237,22 @@ fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
             json!({"statement": select, "consistent_read": flag}),
         );
         assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+    for flag in [json!([]), json!([true])] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({"statement": select, "consistent_read": flag}),
+        );
+        assert!(is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["error_type"], "SerializationException", "{flag}");
+        assert!(
+            content["message"].as_str().is_none_or(str::is_empty),
+            "{flag}: {content}"
+        );
     }
 
     drop(child.stdin.take());

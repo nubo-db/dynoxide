@@ -153,13 +153,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Validation failed in TransactStatements[i]`, ahead of the same-item check
   and never a cancellation reason. A `COUNT(*)` read of a multi-attribute
   index in a batch is refused for the index, as ExecuteStatement refuses it.
-- Arithmetic on a `size` is refused for the `+` or `-` ahead of anything
-  wrong with its operands, so `size(true) + 1 > size(s)` names the `+`.
+- Arithmetic in a condition is refused for its first `+` or `-` ahead of
+  anything wrong with its operands, wherever it is written: `size(true) + 1 >
+  size(s)`, `1 + size(s) > 0`, `(size(s) + 1) > 0` and `n + 1 > 0` all name
+  the `+`. All but the first used to be called malformed statements. IS on
+  any `size` is refused for the IS, even one given two operands.
 - A PartiQL UPDATE, DELETE or INSERT sent with a `NextToken` runs as it
-  would without one, where it used to be refused. This and the three entries
+  would without one, where it used to be refused. An empty `NextToken` is
+  refused as a member error on any statement. This and the three entries
   above were captured against eu-west-2 on 11 November 2026, in rounds five
-  to eleven of the capture; rounds one to four went to us-east-1 as well, and
-  the regions agreed ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+  to thirteen of the capture; rounds one to four went to us-east-1 as well,
+  and the regions agreed ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 
 ## [1.6.0] - 2026-11-07
 

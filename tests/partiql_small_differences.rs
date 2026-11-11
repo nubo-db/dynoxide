@@ -5,11 +5,12 @@
 //!
 //! Each `const` holds requests sent to DynamoDB on 11 November 2026, in the
 //! order they were sent, with the answer DynamoDB gave each one, against an
-//! on-demand table keyed `pk` (S) and `sk` (S), or the indexed table round
-//! nine and later rounds name. They are data captured from DynamoDB, not written by hand.
+//! on-demand table keyed `pk` (S) and `sk` (S), the indexed table rounds
+//! nine to eleven name, or a table that doesn't exist. They are data captured
+//! from DynamoDB, not written by hand.
 //! Rounds one to four were captured in eu-west-2 and us-east-1, which gave
-//! the same answers; rounds five to eleven in eu-west-2. A test replays its
-//! rows in order against a new server and compares each answer with
+//! the same answers; rounds five to thirteen in eu-west-2. A test replays
+//! its rows in order against a new server and compares each answer with
 //! DynamoDB's as JSON, so key order makes no difference, along with the HTTP
 //! status: 400 for an error and 200 otherwise.
 
@@ -1035,64 +1036,8 @@ async fn index_refusals_rank_against_the_statement_checks() {
     replay_on(INDEXED_TABLE, ROUND_ELEVEN).await;
 }
 
-/// A size given two operands and standing as a condition by itself, beside
-/// another, or under IS, is refused for its operand count on every surface,
-/// as the count is reported ahead of the operator a size stands under. The
-/// count is captured under an operator; standing bare it is inferred.
-#[tokio::test]
-async fn a_bare_size_with_two_operands_is_refused_for_its_count() {
-    let url = start_server().await;
-    let count = "Incorrect number of operands for operator or function; operator or function: \
-                 size, number of operands: 2";
-    for clause in ["size(s, s)", "size(s, s) AND n = 1", "size(s, s) IS NULL"] {
-        let select =
-            format!(r#"SELECT pk FROM "{TABLE_NAME}" WHERE pk='a' AND sk='b' AND {clause}"#);
-        let update =
-            format!(r#"UPDATE "{TABLE_NAME}" SET z = 1 WHERE pk='a' AND sk='b' AND {clause}"#);
-        let (status, got) = answer(
-            &url,
-            "ExecuteStatement",
-            &serde_json::json!({ "Statement": select }).to_string(),
-        )
-        .await;
-        assert_eq!(
-            (status, &got["message"]),
-            (400, &serde_json::json!(count)),
-            "{clause}"
-        );
-        let (status, got) = answer(
-            &url,
-            "BatchExecuteStatement",
-            &serde_json::json!({ "Statements": [{ "Statement": select }] }).to_string(),
-        )
-        .await;
-        assert_eq!(status, 200, "{clause}");
-        assert_eq!(
-            got["Responses"][0]["Error"],
-            serde_json::json!({ "Code": "ValidationError", "Message": count }),
-            "{clause}"
-        );
-        let (status, got) = answer(
-            &url,
-            "ExecuteTransaction",
-            &serde_json::json!({ "TransactStatements": [{ "Statement": update }] }).to_string(),
-        )
-        .await;
-        assert_eq!(
-            (status, &got["message"]),
-            (
-                400,
-                &serde_json::json!(format!(
-                    "Validation failed in TransactStatements[0]: {count}"
-                ))
-            ),
-            "{clause}"
-        );
-    }
-}
-
 /// A SELECT on an index keyed on two attributes a side is refused, on
-/// ExecuteStatement and as a batch member, with the table loaded once for it.
+/// ExecuteStatement and as a batch member.
 #[tokio::test]
 async fn a_read_of_a_multi_attribute_index_is_refused() {
     let url = start_server_with(INDEXED_TABLE).await;
@@ -1120,6 +1065,95 @@ async fn a_read_of_a_multi_attribute_index_is_refused() {
         got["Responses"][0]["Error"],
         serde_json::json!({ "Code": "ValidationError", "Message": refusal })
     );
+}
+
+/// A size given two operands is refused for its count standing bare, beside
+/// another condition and under NOT, and for the `+` in arithmetic; under IS
+/// it is refused for the IS, on every surface. These checks come before the
+/// table is looked for.
+#[tokio::test]
+async fn a_size_with_two_operands_is_refused_where_it_stands() {
+    replay(ROUND_TWELVE).await;
+}
+
+/// An empty NextToken is refused as a member on any statement, and a
+/// non-empty one on a write is ignored. IS on any size is refused for the IS,
+/// and arithmetic is refused for its operator wherever it is written,
+/// bracketed or not and on a path or a value.
+#[tokio::test]
+async fn empty_next_tokens_is_on_a_size_and_arithmetic_answer_as_dynamodb_does() {
+    replay(ROUND_THIRTEEN).await;
+}
+
+/// A batch member refused for its WHERE clause writes nothing, and the
+/// member beside it writes as it would alone.
+#[tokio::test]
+async fn a_refused_batch_member_writes_nothing() {
+    let url = start_server().await;
+    for sk in ["b", "c"] {
+        let item = serde_json::json!({
+            "TableName": TABLE_NAME,
+            "Item": {"pk": {"S": "a"}, "sk": {"S": sk}, "n": {"N": "1"}, "s": {"S": "x"}}
+        });
+        assert_eq!(answer(&url, "PutItem", &item.to_string()).await.0, 200);
+    }
+    let batch = serde_json::json!({ "Statements": [
+        {"Statement": format!(
+            r#"UPDATE "{TABLE_NAME}" SET z = 1 WHERE pk='a' AND sk='b' AND size(s, s) AND n = 1"#
+        )},
+        {"Statement": format!(r#"UPDATE "{TABLE_NAME}" SET z = 2 WHERE pk='a' AND sk='c'"#)},
+    ]});
+    let (status, got) = answer(&url, "BatchExecuteStatement", &batch.to_string()).await;
+    assert_eq!(status, 200);
+    assert_eq!(got["Responses"][0]["Error"]["Code"], "ValidationError");
+    assert!(got["Responses"][1].get("Error").is_none(), "{got}");
+    let z = |sk: &str| {
+        let url = url.clone();
+        let key = serde_json::json!({
+            "TableName": TABLE_NAME,
+            "Key": {"pk": {"S": "a"}, "sk": {"S": sk}},
+            "ConsistentRead": true
+        });
+        async move { answer(&url, "GetItem", &key.to_string()).await.1["Item"]["z"].clone() }
+    };
+    assert_eq!(z("b").await, serde_json::Value::Null);
+    assert_eq!(z("c").await, serde_json::json!({"N": "2"}));
+}
+
+/// A write sent with a NextToken taken from a real page of a SELECT runs once,
+/// as it would without the token.
+#[tokio::test]
+async fn a_write_with_a_next_token_runs_once() {
+    let url = start_server().await;
+    for sk in ["b", "c", "d"] {
+        let item = serde_json::json!({
+            "TableName": TABLE_NAME,
+            "Item": {"pk": {"S": "a"}, "sk": {"S": sk}, "c": {"N": "0"}}
+        });
+        assert_eq!(answer(&url, "PutItem", &item.to_string()).await.0, 200);
+    }
+    let page = serde_json::json!({
+        "Statement": format!(r#"SELECT * FROM "{TABLE_NAME}" WHERE pk='a'"#),
+        "Limit": 1
+    });
+    let (status, got) = answer(&url, "ExecuteStatement", &page.to_string()).await;
+    assert_eq!(status, 200);
+    let token = got["NextToken"]
+        .as_str()
+        .expect("a first page carries a token");
+    let write = serde_json::json!({
+        "Statement": format!(r#"UPDATE "{TABLE_NAME}" SET c = c + 1 WHERE pk='a' AND sk='c'"#),
+        "NextToken": token
+    });
+    let (status, got) = answer(&url, "ExecuteStatement", &write.to_string()).await;
+    assert_eq!((status, got.get("NextToken")), (200, None), "{got}");
+    let key = serde_json::json!({
+        "TableName": TABLE_NAME,
+        "Key": {"pk": {"S": "a"}, "sk": {"S": "c"}},
+        "ConsistentRead": true
+    });
+    let (_, got) = answer(&url, "GetItem", &key.to_string()).await;
+    assert_eq!(got["Item"]["c"], serde_json::json!({"N": "1"}));
 }
 
 /// Two more rows are left out, for causes of their own. `SET z = size(true)`
@@ -3175,5 +3209,198 @@ const ROUND_ELEVEN: &[Row] = &[
         "ExecuteTransaction",
         r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND size(true) > 1"}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+];
+
+/// Round twelve, captured in eu-west-2 against a table that doesn't exist.
+const ROUND_TWELVE: &[Row] = &[
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s)"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s)"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) AND n = 1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) AND n = 1"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) AND n = 1"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) IS NULL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The left hand side argument to IS must be a Variable Reference, Literal, or Path"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) IS NULL"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"The left hand side argument to IS must be a Variable Reference, Literal, or Path"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) IS NULL"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: The left hand side argument to IS must be a Variable Reference, Literal, or Path"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND NOT size(s, s)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND NOT size(s, s)"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND NOT size(s, s)"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect number of operands for operator or function; operator or function: size, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) + size(s, s) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) + size(s, s) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Unsupported operator in Condition Expression. Operator: +"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) + size(s, s) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) + 1 > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) + 1 > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Unsupported operator in Condition Expression. Operator: +"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) + 1 > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: AND, operand type: N"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s)"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: AND, operand type: N"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s)"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: AND, operand type: N"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) AND n = 1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: AND, operand type: N"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) AND n = 1"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: AND, operand type: N"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) AND n = 1"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: AND, operand type: N"}"#,
+    ),
+];
+
+/// Round thirteen, captured in eu-west-2 against a table that doesn't exist.
+const ROUND_THIRTEEN: &[Row] = &[
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_none\" WHERE id = 'zz' AND sk = 'zz'", "NextToken": ""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'nextToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'zz'", "NextToken": ""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'nextToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_none\" SET a = 1 WHERE id = 'zz' AND sk = 'zz'", "NextToken": ""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'nextToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_none\" WHERE id = 'zz' AND sk = 'zz'", "NextToken": "abc"}"#,
+        r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'zz'", "NextToken": "abc"}"#,
+        r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND 1 + size(s, s) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND (size(s, s) + 1) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND 1 + size(s) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND (size(s) + 1) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND n + 1 > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s, s) IS MISSING"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The left hand side argument to IS must be a Variable Reference, Literal, or Path"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(s) IS NULL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The left hand side argument to IS must be a Variable Reference, Literal, or Path"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_none\" WHERE id = 'i1' AND size(true) IS NULL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The left hand side argument to IS must be a Variable Reference, Literal, or Path"}"#,
     ),
 ];

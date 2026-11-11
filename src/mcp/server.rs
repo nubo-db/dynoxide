@@ -508,13 +508,18 @@ pub struct ScanParams {
     )]
     pub select: Option<String>,
 
+    /// Decoded as `i64` so a negative value, or one past 32 bits, reaches
+    /// Scan's member checks as it does over HTTP; the schema still advertises
+    /// the unsigned integer it always has.
     #[schemars(
-        description = "Segment number for parallel scan (0-based). Must be used with total_segments."
+        description = "Segment number for parallel scan (0-based). Must be used with total_segments.",
+        with = "Option<u32>"
     )]
     pub segment: Option<i64>,
 
     #[schemars(
-        description = "Total number of parallel scan segments (1 to 1000000). Must be used with segment."
+        description = "Total number of parallel scan segments (1 to 1000000). Must be used with segment.",
+        with = "Option<u32>"
     )]
     pub total_segments: Option<i64>,
 

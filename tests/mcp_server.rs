@@ -5430,6 +5430,44 @@ fn the_flags_still_advertise_a_boolean() {
     let _ = child.wait();
 }
 
+/// `scan`'s `segment` and `total_segments` take a negative value now, but the
+/// listed schema is the unsigned integer it has always been.
+#[test]
+fn the_segments_still_advertise_an_unsigned_integer() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let scan = tools.iter().find(|t| t["name"] == "scan").unwrap();
+    let properties = &scan["inputSchema"]["properties"];
+    assert_eq!(
+        properties["segment"],
+        json!({
+            "description": "Segment number for parallel scan (0-based). Must be used with \
+                            total_segments.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+        })
+    );
+    assert_eq!(
+        properties["total_segments"],
+        json!({
+            "description": "Total number of parallel scan segments (1 to 1000000). Must be used \
+                            with segment.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+        })
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 const ABC_NUMBER: &str = "The parameter cannot be converted to a numeric value: abc";
 const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value \
                              types must have the value of true";

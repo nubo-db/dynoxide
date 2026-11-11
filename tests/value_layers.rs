@@ -12,7 +12,11 @@
 //! us-east-1, eu-west-1 and us-west-2, 2026-10-09; where the regions split
 //! (eu-west-2 runs the current layer on the transactions), Dynoxide follows
 //! the majority. Scan was one of those until 20 October 2026, when 19 of 33
-//! regions read its values on the current layer.
+//! regions read its values on the current layer. By 11 November 2026 a bad
+//! number in a TransactWriteItems action's expression values came back bare
+//! in eu-west-2 and us-east-1 alike, unless the request held a null (see
+//! tests/null_attribute_values.rs), so a transaction's number is no longer
+//! wrapped here; the older layer's number rule is still followed for it.
 
 #![cfg(feature = "http-server")]
 
@@ -162,7 +166,7 @@ async fn reads_on_the_current_layer_refuse_numbers_bare() {
 }
 
 #[tokio::test]
-async fn the_older_layer_reads_numbers_as_big_decimal_and_names_expression_values() {
+async fn the_older_layer_reads_numbers_as_big_decimal() {
     let url = start().await;
     let batch = refusal(
         &url,
@@ -178,7 +182,7 @@ async fn the_older_layer_reads_numbers_as_big_decimal_and_names_expression_value
             "UpdateExpression": "SET n = :v", "ExpressionAttributeValues": {":v": n("1e2147483647")}}}]}),
     )
     .await;
-    assert_eq!(transaction, for_key(UNDERFLOW, ":v"));
+    assert_eq!(transaction, UNDERFLOW);
 }
 
 #[tokio::test]

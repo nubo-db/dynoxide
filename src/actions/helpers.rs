@@ -2026,6 +2026,14 @@ pub fn parse_exclusive_start_key(
     value: &serde_json::Value,
     layer: crate::validation::ValueLayer,
 ) -> Result<HashMap<String, AttributeValue>> {
+    // A null among the key's values puts the request on the older layer, so
+    // the key's other values are read by that layer's rules, as an item's
+    // are beside a null.
+    let layer = if start_key_holds_null(Some(value)) {
+        crate::validation::ValueLayer::Older
+    } else {
+        layer
+    };
     // First, try to deserialise: this catches multi-type and number errors
     let parsed = match crate::types::with_value_layer(layer, || {
         serde_json::from_value::<crate::types::AttributeMap>(value.clone())

@@ -45,7 +45,7 @@ struct UpdateItemRequestRaw {
         default,
         deserialize_with = "deserialize_attribute_updates"
     )]
-    attribute_updates: Option<HashMap<String, AttributeValueUpdate>>,
+    attribute_updates: Option<HeldUpdates>,
     #[serde(rename = "Expected", default)]
     expected: Option<serde_json::Value>,
     #[serde(rename = "ConditionalOperator", default)]
@@ -119,6 +119,12 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         let key = raw
             .key
             .map(|key| key.0)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        // So are they ahead of the values in AttributeUpdates, whichever is
+        // written first (captured eu-west-2 and us-east-1, 2026-11-11).
+        let attribute_updates = raw
+            .attribute_updates
             .transpose()
             .map_err(serde::de::Error::custom)?;
         let expression_attribute_values = raw
@@ -243,7 +249,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             return_consumed_capacity: raw.return_consumed_capacity,
             return_values_on_condition_check_failure: raw.return_values_on_condition_check_failure,
             return_item_collection_metrics: raw.return_item_collection_metrics,
-            attribute_updates: raw.attribute_updates,
+            attribute_updates,
             expected: raw.expected,
             conditional_operator: raw.conditional_operator,
         })
@@ -259,31 +265,48 @@ pub struct AttributeValueUpdate {
     pub value: Option<AttributeValue>,
 }
 
+/// `AttributeUpdates` as read, or the refusal held for it as the raw serde
+/// message.
+type HeldUpdates = std::result::Result<HashMap<String, AttributeValueUpdate>, String>;
+
 /// Deserialise `AttributeUpdates`, refusing an entry given as null in
 /// DynamoDB's words for it, which name the attribute (captured eu-west-2 and
-/// us-east-1, 2026-11-11). Entries are read in written order.
+/// us-east-1, 2026-11-11). Entries are read in written order. A value of the
+/// wrong JSON type fails the request as it is parsed; any other refusal is
+/// held, so the key's can be reported first.
 fn deserialize_attribute_updates<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValueUpdate>>, D::Error> {
+) -> std::result::Result<Option<HeldUpdates>, D::Error> {
     let Some(types::WrittenMembers(members)) =
         Option::<types::WrittenMembers>::deserialize(deserializer)?
     else {
         return Ok(None);
     };
     let mut updates = HashMap::with_capacity(members.len());
+    let mut held = None;
     for (name, update) in members {
         if update.is_null() {
-            return Err(serde::de::Error::custom(format!(
+            held = held.or(Some(format!(
                 "{}Supplied AttributeValueUpdate is empty, must contain one of the \
                  supported actions: {name} is null",
                 crate::serde_errors::VALIDATION_MARKER
             )));
+            continue;
         }
-        let update = serde_json::from_value::<AttributeValueUpdate>(update)
-            .map_err(serde::de::Error::custom)?;
-        updates.insert(name, update);
+        match serde_json::from_value::<AttributeValueUpdate>(update) {
+            Ok(update) => {
+                updates.insert(name, update);
+            }
+            Err(e) => {
+                let refusal = e.to_string();
+                if !crate::serde_errors::is_validation_refusal(&refusal) {
+                    return Err(serde::de::Error::custom(refusal));
+                }
+                held = held.or(Some(refusal));
+            }
+        }
     }
-    Ok(Some(updates))
+    Ok(Some(held.map_or(Ok(updates), Err)))
 }
 
 /// DynamoDB's refusal of an `AttributeUpdates` action other than `ADD`,

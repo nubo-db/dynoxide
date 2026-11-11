@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TransactWriteItemsRequest {
-    #[serde(rename = "TransactItems")]
+    #[serde(rename = "TransactItems", deserialize_with = "read_actions")]
     pub transact_items: Vec<TransactWriteItem>,
     #[serde(rename = "ClientRequestToken", default)]
     pub client_request_token: Option<String>,
@@ -30,6 +30,32 @@ pub struct TransactWriteItem {
     pub condition_check: Option<TransactConditionCheck>,
 }
 
+thread_local! {
+    /// Whether the request being read holds a JSON null where an attribute
+    /// value belongs, which changes how its actions are read (see
+    /// [`refusal_ahead_of_action`]). Set around the read of `TransactItems`.
+    static NULL_IN_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read `TransactItems`, noting for each action's read whether any of them
+/// holds a null where an attribute value belongs.
+fn read_actions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<TransactWriteItem>, D::Error> {
+    use serde::de::Error;
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NULL_IN_REQUEST.with(|cell| cell.set(self.0));
+        }
+    }
+    let actions = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    let holds_null = serde_json::from_str::<serde_json::Value>(actions.get())
+        .is_ok_and(|actions| types::holds_null(&actions));
+    let _restore = Restore(NULL_IN_REQUEST.with(|cell| cell.replace(holds_null)));
+    serde_json::from_str(actions.get()).map_err(D::Error::custom)
+}
+
 /// Read one action, first refusing it for [`refusal_ahead_of_action`].
 fn read_action<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
@@ -41,22 +67,34 @@ where
     else {
         return Ok(None);
     };
-    if let Some(refusal) = refusal_ahead_of_action(action.get()) {
+    let null_in_request = NULL_IN_REQUEST.with(std::cell::Cell::get);
+    if let Some(refusal) = refusal_ahead_of_action::<T>(action.get(), null_in_request) {
         return Err(D::Error::custom(refusal));
     }
     serde_json::from_str(action.get()).map_err(D::Error::custom)
 }
 
 /// The refusal an action (a `Put`, `Update`, `Delete` or `ConditionCheck`,
-/// given as its JSON text) gets ahead of the rest of it, if any, as the raw
-/// serde message.
+/// given as its JSON text and read as `T`) gets ahead of the rest of it, if
+/// any, as the raw serde message. `null_in_request` says whether the request
+/// holds a JSON null where an attribute value belongs, in this action or
+/// another.
 ///
-/// DynamoDB reads an action's `ExpressionAttributeValues` ahead of its `Item`
-/// or `Key`, whichever is written first: with a null in each, the value is
-/// the one named (captured eu-west-2 and us-east-1, 2026-11-11). PutItem and
-/// UpdateItem read them the other way round. A value of the wrong JSON type
-/// still fails the request where it is written, ahead of both.
-pub(crate) fn refusal_ahead_of_action(action: &str) -> Option<String> {
+/// A member of the wrong JSON type fails the action first, in written order,
+/// whether it is a value or `TableName: 5`. After that, the action's `Item` or
+/// `Key` and its `ExpressionAttributeValues` are reported in an order that
+/// turns on the null, whichever is written first (captured eu-west-2 and
+/// us-east-1, 2026-11-11):
+///
+/// - Without a null, the `Item` or `Key` comes first, and a bad number in the
+///   values is reported bare.
+/// - With one, the values come first, and a bad number in them is named by
+///   key, as a null is.
+pub(crate) fn refusal_ahead_of_action<T: serde::de::DeserializeOwned>(
+    action: &str,
+    null_in_request: bool,
+) -> Option<String> {
+    use crate::serde_errors::is_validation_refusal;
     fn written_members<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Vec<(String, Box<serde_json::value::RawValue>)>, D::Error> {
@@ -81,27 +119,52 @@ pub(crate) fn refusal_ahead_of_action(action: &str) -> Option<String> {
     }
     // An action that isn't a map is refused as the action is read.
     let members = written_members(&mut serde_json::Deserializer::from_str(action)).ok()?;
-    let mut held = None;
+    let mut attributes = None;
+    let mut values = None;
+    let mut stand_ins = Vec::with_capacity(members.len());
     for (name, value) in &members {
         let refusal = match name.as_str() {
-            "Item" | "Key" => serde_json::from_str::<types::AttributeMap>(value.get()).err(),
-            "ExpressionAttributeValues" => types::deserialize_older_expression_values(
-                &mut serde_json::Deserializer::from_str(value.get()),
-            )
-            .err(),
+            "Item" | "Key" => serde_json::from_str::<types::AttributeMap>(value.get())
+                .err()
+                .map(|e| e.to_string()),
+            "ExpressionAttributeValues" => {
+                match serde_json::from_str::<types::WrittenMembers>(value.get()) {
+                    Ok(types::WrittenMembers(read)) => {
+                        types::with_value_layer(crate::validation::ValueLayer::Older, || {
+                            types::read_transaction_values(read, null_in_request)
+                        })
+                        .err()
+                    }
+                    Err(e) => Some(e.to_string()),
+                }
+            }
             _ => None,
         };
-        let Some(refusal) = refusal.map(|e| e.to_string()) else {
-            continue;
-        };
-        if !crate::serde_errors::is_validation_refusal(&refusal) {
-            return Some(refusal);
-        }
-        if name == "ExpressionAttributeValues" {
-            held = Some(refusal);
+        let held = refusal.filter(|refusal| is_validation_refusal(refusal));
+        // A value map whose only faults are held stands in as empty, so the
+        // read below finds the action's members of the wrong JSON type.
+        let stand_in = if held.is_some() { "{}" } else { value.get() };
+        stand_ins.push(format!(
+            "{}:{stand_in}",
+            serde_json::Value::String(name.clone())
+        ));
+        match name.as_str() {
+            "Item" | "Key" => attributes = attributes.or(held),
+            "ExpressionAttributeValues" => values = values.or(held),
+            _ => {}
         }
     }
-    held
+    if let Err(e) = serde_json::from_str::<T>(&format!("{{{}}}", stand_ins.join(","))) {
+        let refusal = e.to_string();
+        if !is_validation_refusal(&refusal) {
+            return Some(refusal);
+        }
+    }
+    if null_in_request {
+        values.or(attributes)
+    } else {
+        attributes.or(values)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -120,7 +183,7 @@ pub struct TransactPut {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
+        deserialize_with = "crate::types::deserialize_transaction_values"
     )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -145,7 +208,7 @@ pub struct TransactUpdate {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
+        deserialize_with = "crate::types::deserialize_transaction_values"
     )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -168,7 +231,7 @@ pub struct TransactDelete {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
+        deserialize_with = "crate::types::deserialize_transaction_values"
     )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -191,7 +254,7 @@ pub struct TransactConditionCheck {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
+        deserialize_with = "crate::types::deserialize_transaction_values"
     )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]

@@ -948,6 +948,9 @@ fn parse_expression_values(
     resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
     const FIELD: &str = "expression_attribute_values";
+    if let Some(refusal) = values_shape_refusal(val.as_ref()) {
+        return Err(refusal);
+    }
     match val {
         None => Ok(None),
         Some(serde_json::Value::Object(values)) => read(values.into_iter().collect())
@@ -955,6 +958,30 @@ fn parse_expression_values(
             .map_err(|msg| to_tool_error(resolve(classify_decode_error(&msg, FIELD)))),
         Some(other) => parse_optional_dynamo_map(Some(other), FIELD, resolve),
     }
+}
+
+/// The refusal for `expression_attribute_values` that isn't a map of
+/// attribute value structs, in the HTTP API's words for the same body: a
+/// SerializationException such as `Unexpected field type`.
+fn values_shape_refusal(val: Option<&serde_json::Value>) -> Option<CallToolResult> {
+    const CLASS: &str = "com.amazonaws.dynamodb.v20120810.AttributeValue";
+    let message = match val? {
+        serde_json::Value::Null => return None,
+        serde_json::Value::Object(values) => match values
+            .values()
+            .find(|value| !value.is_object() && !value.is_null())?
+        {
+            serde_json::Value::Array(_) => format!("Unrecognized collection type class {CLASS}"),
+            _ => "Unexpected value type in payload".to_string(),
+        },
+        serde_json::Value::Array(_) => {
+            format!("Unrecognized collection type java.util.Map<java.lang.String, {CLASS}>")
+        }
+        _ => "Unexpected field type".to_string(),
+    };
+    Some(to_tool_error(
+        crate::errors::DynoxideError::SerializationException(message),
+    ))
 }
 
 /// Optional-map variant of [`parse_dynamo_map`].
@@ -1839,6 +1866,9 @@ impl McpServer {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
+        if let Some(refusal) = values_shape_refusal(params.expression_attribute_values.as_ref()) {
+            return Ok(refusal);
+        }
 
         let request = crate::actions::delete_item::DeleteItemRequest {
             table_name: params.table_name,

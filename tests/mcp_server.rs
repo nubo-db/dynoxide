@@ -5757,7 +5757,9 @@ fn other_tools_read_values_on_their_operations_layer() {
                 "UpdateExpression": "SET v = :v",
                 "ExpressionAttributeValues": {":v": tiny}
             }}]}),
-            named(underflow, ":v"),
+            // Bare, as a transaction's expression values refuse a number when
+            // the request holds no null (tests/null_attribute_values.rs).
+            validation_error(underflow),
         ),
         (
             "transact_write_items",
@@ -6303,6 +6305,20 @@ fn a_null_value_is_refused_through_the_tools_as_over_http() {
                 "expression_attribute_values": {":b": null, ":a": {"N": "abc"}}}),
             named(NULL_VALUE, ":b"),
         ),
+        // A null puts the call on the older layer: a bad number beside one in
+        // the item is bare, and one in the expression values is named.
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": null, "x": {"N": "abc"}}}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": {"S": "a"}},
+                "condition_expression": "x = :a AND y = :b",
+                "expression_attribute_values": {":a": null, ":b": {"N": "abc"}}}),
+            named(ABC_NUMBER, ":b"),
+        ),
     ];
     let checked = cases.len();
     let mut mismatches = Vec::new();
@@ -6318,6 +6334,187 @@ fn a_null_value_is_refused_through_the_tools_as_over_http() {
         "{} of {checked} answers differ: {mismatches:#?}",
         mismatches.len()
     );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Expression values that aren't a map of values are refused as the HTTP API
+/// refuses the same body, and `delete_item` deletes nothing.
+#[test]
+fn malformed_expression_values_are_refused_and_delete_nothing() {
+    let mut child = mcp_with_table("Shapes");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Shapes", "item": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let cases = [
+        (json!("x"), "Unexpected field type"),
+        (json!(5), "Unexpected field type"),
+        (
+            json!([]),
+            "Unrecognized collection type java.util.Map<java.lang.String, \
+             com.amazonaws.dynamodb.v20120810.AttributeValue>",
+        ),
+        (json!({":v": "x"}), "Unexpected value type in payload"),
+    ];
+    let mut id = 10;
+    for (values, message) in cases {
+        for tool in ["delete_item", "put_item"] {
+            id += 1;
+            let mut args = json!({
+                "table_name": "Shapes", "condition_expression": "attribute_exists(pk)",
+                "expression_attribute_values": values
+            });
+            let target = if tool == "delete_item" { "key" } else { "item" };
+            args[target] = json!({"pk": {"S": "a"}});
+            let resp = call_tool(&mut child, id, tool, args);
+            assert_eq!(
+                tool_error(&resp),
+                serialization_error(message),
+                "{tool} {values}"
+            );
+        }
+    }
+    let resp = call_tool(
+        &mut child,
+        50,
+        "get_item",
+        json!({"table_name": "Shapes", "key": {"pk": {"S": "a"}}}),
+    );
+    assert_eq!(tool_content(&resp)["Item"], json!({"pk": {"S": "a"}}));
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A valid expression value reaches the condition or filter it is used in:
+/// a condition on it decides whether `put_item` and `delete_item` write, and
+/// a filter on it decides what `scan` returns.
+#[test]
+fn expression_values_decide_conditions_and_filters() {
+    let mut child = mcp_with_table("Decided");
+    let mut id = 1;
+    let mut call = |child: &mut std::process::Child, tool: &str, args: Value| {
+        id += 1;
+        call_tool(child, id, tool, args)
+    };
+    for (pk, v) in [("a", "1"), ("b", "2")] {
+        let resp = call(
+            &mut child,
+            "put_item",
+            json!({"table_name": "Decided", "item": {"pk": {"S": pk}, "v": {"N": v}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+    let conditional = |tool: &str, v: &str| {
+        let mut args = json!({
+            "table_name": "Decided", "condition_expression": "v = :v",
+            "expression_attribute_values": {":v": {"N": v}}
+        });
+        if tool == "put_item" {
+            args["item"] = json!({"pk": {"S": "a"}, "v": {"N": "1"}, "w": {"S": "put"}});
+        } else {
+            args["key"] = json!({"pk": {"S": "a"}});
+        }
+        args
+    };
+    for tool in ["put_item", "delete_item"] {
+        let resp = call(&mut child, tool, conditional(tool, "9"));
+        assert_eq!(
+            tool_content(&resp)["error_type"],
+            "ConditionalCheckFailedException",
+            "{tool}: {resp}"
+        );
+        let resp = call(&mut child, tool, conditional(tool, "1"));
+        assert!(!is_tool_error(&resp), "{tool}: {resp}");
+    }
+    let resp = call(
+        &mut child,
+        "get_item",
+        json!({"table_name": "Decided", "key": {"pk": {"S": "a"}}}),
+    );
+    assert!(tool_content(&resp).get("Item").is_none(), "{resp}");
+    let resp = call(
+        &mut child,
+        "scan",
+        json!({"table_name": "Decided", "filter_expression": "v = :v",
+            "expression_attribute_values": {":v": {"N": "2"}}}),
+    );
+    assert_eq!(
+        tool_content(&resp)["Items"],
+        json!([{"pk": {"S": "b"}, "v": {"N": "2"}}])
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `query` and `scan` page with an `exclusive_start_key` taken from the last
+/// page's `LastEvaluatedKey`, and every item comes back once.
+#[test]
+fn query_and_scan_page_from_the_last_evaluated_key() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Pages",
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [
+                {"attribute_name": "pk", "key_type": "HASH"},
+                {"attribute_name": "sk", "key_type": "RANGE"}
+            ],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "sk", "attribute_type": "N"}
+            ]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let mut id = 1;
+    for sk in 1..=5 {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Pages", "item": {"pk": {"S": "p"}, "sk": {"N": sk.to_string()}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+    for tool in ["query", "scan"] {
+        let mut seen = Vec::new();
+        let mut start = Value::Null;
+        loop {
+            let mut args = json!({"table_name": "Pages", "limit": 2});
+            if tool == "query" {
+                args["key_condition_expression"] = json!("pk = :p");
+                args["expression_attribute_values"] = json!({":p": {"S": "p"}});
+            }
+            if !start.is_null() {
+                args["exclusive_start_key"] = start.clone();
+            }
+            id += 1;
+            let resp = call_tool(&mut child, id, tool, args);
+            assert!(!is_tool_error(&resp), "{tool}: {resp}");
+            let page = tool_content(&resp);
+            for item in page["Items"].as_array().unwrap() {
+                seen.push(item["sk"]["N"].as_str().unwrap().to_string());
+            }
+            start = page["LastEvaluatedKey"].clone();
+            if start.is_null() {
+                break;
+            }
+            assert!(seen.len() <= 5, "{tool} pages past the end: {seen:?}");
+        }
+        assert_eq!(seen, ["1", "2", "3", "4", "5"], "{tool}");
+    }
 
     drop(child.stdin.take());
     let _ = child.wait();

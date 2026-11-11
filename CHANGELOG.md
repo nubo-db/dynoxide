@@ -65,14 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HashMap` order, with a value of the wrong JSON type ahead of the rest), as
   are those in PutItem's expression values and in any request's expression
   values once a null is present. An item or key is checked before
-  `ExpressionAttributeValues`, except in a TransactWriteItems action, where
-  the values come first, and a starting key before Query's. A null puts the
+  `ExpressionAttributeValues` and `AttributeUpdates`, and a starting key
+  before Query's. In a TransactWriteItems action the item or key comes first
+  too, unless the request holds a null, when the values do; a member of the
+  wrong JSON type anywhere in the action comes ahead of both. A null,
+  including one given as a type member such as `{"S": null}`, puts the
   request on the older validation layer, so a bad number beside one in an
   item comes back without the `1 validation error detected:` envelope, and
   one in the expression values is named by its key; a null in a starting key
-  puts a Query's or Scan's `Limit` error in that layer's words. The MCP
-  tools give the same answers. An `AttributeUpdates` entry with no value and
-  an action other than `DELETE` is now refused inside that envelope
+  puts a Query's or Scan's `Limit` error, and its other numbers, in that
+  layer's words. Without a null, a bad number in a transaction's expression
+  values is no longer named by key, as DynamoDB now answers. A name written
+  twice in an item, a key, `ExpressionAttributeValues` or `AttributeUpdates`
+  is refused with `Duplicate key found in payload`. The MCP tools give the
+  same answers, and refuse expression values that aren't a map as the HTTP
+  API does, where `delete_item` used to ignore them. An `AttributeUpdates`
+  entry with no value and an action other than `DELETE` is now refused
+  inside that envelope
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages

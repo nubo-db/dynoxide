@@ -20,7 +20,7 @@ function fake(mode, extra = {}) {
   const { env, options, ...seam } = extra;
   return launch(
     { binary: FAKE, ...options },
-    { command: [process.execPath], env: { FAKE_MODE: mode, ...env }, graceMs: 500, ...seam }
+    { command: [process.execPath], env: { FAKE_MODE: mode, ...env }, graceMs: 3000, ...seam }
   );
 }
 
@@ -104,6 +104,35 @@ test("a JSON line whose event isn't ready is an invalid ready line", async () =>
   await assert.rejects(fake("not-ready"), { code: "DYNOXIDE_BAD_READY_LINE" });
 });
 
+test("a ready line without a numeric port is an invalid ready line", async () => {
+  await assert.rejects(fake("no-port"), { code: "DYNOXIDE_BAD_READY_LINE" });
+});
+
+test("a supplied binary that's too old is refused before it's started as a server", async () => {
+  const record = path.join(tmp(), "record");
+  await assert.rejects(fake("ready", { env: { FAKE_VERSION: "1.6.0", FAKE_RECORD: record } }), {
+    code: "DYNOXIDE_TOO_OLD",
+  });
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, "utf8")).args, ["--version"]);
+});
+
+test("the platform package's binary isn't version-checked", async () => {
+  const server = await fake("ready", {
+    env: { FAKE_VERSION: "1.6.0" },
+    resolve: () => ({ path: FAKE, source: "package" }),
+  });
+  assert.strictEqual(server.binarySource, "package");
+  await server.stop();
+});
+
+test("a binary that can't be spawned is its own error", async () => {
+  const missing = path.join(tmp(), "no-such-dynoxide");
+  await assert.rejects(
+    launch({}, { resolve: () => ({ path: missing, source: "package" }) }),
+    { code: "DYNOXIDE_SPAWN_FAILED" }
+  );
+});
+
 test("port 0 in the ready line is its own error", async () => {
   await assert.rejects(fake("port-zero"), { code: "DYNOXIDE_PORT_ZERO" });
 });
@@ -127,13 +156,13 @@ test("no ready line within the timeout fails, with stderr, and the child is stop
 
 test("a server that ignores stdin is stopped with SIGTERM", { skip: !unix && "SIGTERM is a kill on Windows" }, async () => {
   const marker = path.join(tmp(), "marker");
-  const server = await fake("ignore-stdin", { env: { FAKE_MARKER: marker } });
+  const server = await fake("ignore-stdin", { env: { FAKE_MARKER: marker }, graceMs: 500 });
   await server.stop();
   assert.strictEqual(fs.readFileSync(marker, "utf8"), "sigterm");
 });
 
 test("a server that ignores stdin and SIGTERM is killed within the grace periods", { timeout: 10000 }, async () => {
-  const server = await fake("ignore-term");
+  const server = await fake("ignore-term", { graceMs: 500 });
   const started = Date.now();
   const status = await server.stop();
   const took = Date.now() - started;
@@ -167,16 +196,18 @@ test("a server that floods stdout and stderr keeps being read, and stops", async
   assert.strictEqual((await server.stop()).code, 0);
 });
 
-test("DYNOXIDE_ENCRYPTION_KEY doesn't reach the server", async () => {
+test("DYNOXIDE_ENCRYPTION_KEY reaches neither the version check nor the server", async () => {
   const record = path.join(tmp(), "record");
+  const versionRecord = path.join(tmp(), "version-record");
   process.env.DYNOXIDE_ENCRYPTION_KEY = "secret";
   try {
-    const server = await fake("ready", { env: { FAKE_RECORD: record } });
+    const server = await fake("ready", { env: { FAKE_RECORD: record, FAKE_VERSION_RECORD: versionRecord } });
     await server.stop();
   } finally {
     delete process.env.DYNOXIDE_ENCRYPTION_KEY;
   }
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, "utf8")).keyed, []);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(versionRecord, "utf8")).keyed, []);
 });
 
 test("the arguments are the contract's, with --db-path and --schema as single arguments", async () => {
@@ -215,18 +246,34 @@ test("stop after the server died by itself resolves with that status", async () 
   else assert.notStrictEqual(status.code, 0);
 });
 
-test("stop works through await using's dispose method", async () => {
+test(
+  "stop works through await using's dispose method",
+  { skip: typeof Symbol.asyncDispose !== "symbol" && "this Node has no Symbol.asyncDispose" },
+  async () => {
   const server = await fake("ready");
-  if (typeof Symbol.asyncDispose !== "symbol") return;
   await server[Symbol.asyncDispose]();
   assert.strictEqual(await answers(server.port), false);
-});
+  }
+);
 
 test("twelve servers share one exit listener", async () => {
   const before = process.listenerCount("exit");
   const servers = await Promise.all(Array.from({ length: 12 }, () => fake("ready")));
   assert.ok(process.listenerCount("exit") - before <= 1);
   await Promise.all(servers.map((s) => s.stop()));
+});
+
+test("a script that awaits stop exits as soon as the server has stopped", () => {
+  const started = Date.now();
+  const run = spawnSync(process.execPath, [path.join(FIXTURES, "stop-then-exit.js"), FAKE], {
+    encoding: "utf8",
+    timeout: 15000,
+  });
+  const took = Date.now() - started;
+  assert.strictEqual(run.status, 0, run.stderr);
+  assert.deepStrictEqual(JSON.parse(run.stdout), { code: 0, signal: null });
+  // The default grace period is 5 seconds; a leftover timer would hold Node that long.
+  assert.ok(took < 4000, `the script took ${took} ms to exit`);
 });
 
 test("a script that never calls stop exits on its own, and the server stops", async () => {
@@ -325,28 +372,34 @@ test("the README example runs as written", { skip: readmeSkip }, () => {
     timeout: 20000,
   });
   assert.strictEqual(run.status, 0, run.stderr);
-  assert.match(run.stdout, /\[\]/);
+  assert.strictEqual(run.stdout.trim(), "[]");
 });
 
 // Starts a fixture that starts a server, then kills the fixture outright.
-async function hardKill(fixture) {
-  const child = spawn(process.execPath, [path.join(FIXTURES, fixture)], {
+async function hardKill(fixture, args = []) {
+  const child = spawn(process.execPath, [path.join(FIXTURES, fixture), ...args], {
     stdio: ["ignore", "pipe", "inherit"],
     env: process.env,
   });
-  const line = await new Promise((resolve, reject) => {
-    let out = "";
-    child.stdout.on("data", (c) => {
-      out += c;
-      if (out.includes("\n")) resolve(out.split("\n")[0]);
+  const kill = () => {
+    if (unix) child.kill("SIGKILL");
+    else spawnSync("taskkill", ["/F", "/PID", String(child.pid)]);
+  };
+  try {
+    const line = await new Promise((resolve, reject) => {
+      let out = "";
+      child.stdout.on("data", (c) => {
+        out += c;
+        if (out.includes("\n")) resolve(out.split("\n")[0]);
+      });
+      child.on("exit", (code) => reject(new Error(`the fixture exited ${code} before starting a server`)));
     });
-    child.on("exit", (code) => reject(new Error(`the fixture exited ${code} before starting a server`)));
-  });
-  const { port, pid } = JSON.parse(line);
-  assert.ok(await answers(port));
-  if (unix) child.kill("SIGKILL");
-  else spawnSync("taskkill", ["/F", "/PID", String(child.pid)]);
-  return { port, pid };
+    const { port, pid } = JSON.parse(line);
+    assert.ok(await answers(port));
+    return { port, pid };
+  } finally {
+    kill();
+  }
 }
 
 realTest("the server stops when its runner is killed outright", async () => {
@@ -365,3 +418,20 @@ realTest("the hard-kill check sees a server that does outlive its runner", async
     } catch {}
   }
 });
+
+// On Windows the job object ends the server abruptly rather than through
+// stdin, so only Linux and macOS promise a clean shutdown after a hard kill.
+test(
+  "a write survives the runner being killed outright",
+  { skip: (!real && "DYNOXIDE_BINARY isn't set") || (!unix && "Windows ends the server without a clean shutdown") },
+  async () => {
+  const { start } = require("..");
+  const dbPath = path.join(tmp(), "data.db");
+  const { port } = await hardKill("hard-kill-child.js", [dbPath]);
+  assert.ok(await waitUntil(async () => !(await answers(port)), 3000), "the server outlived its runner");
+  const server = await start({ dbPath });
+  const got = await dynamo(server.endpoint, "GetItem", { TableName: "kept", Key: { pk: { S: "after-kill" } } });
+  await server.stop();
+  assert.deepStrictEqual(got.Item, { pk: { S: "after-kill" } });
+  }
+);

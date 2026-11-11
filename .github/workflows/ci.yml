@@ -573,12 +573,6 @@ jobs:
       - name: Run the browser engine tests
         run: npm run test:browser
 
-  # Decides which jobs this PR needs, from its changed files. `docker` gates the
-  # Docker smoke test on the paths that can break the documented MCP-in-Docker
-  # recipe. `code` gates the build and test jobs, and is false only when every
-  # changed file is documentation, so a docs-only PR runs lint and little else.
-  # The rules live in scripts/ci-changed-paths.sh, which lint tests. Implemented
-  # with git diff (no third-party action).
   # The npm package's start(), against a binary built here. Node 18 is the
   # oldest the tests run on (node:test); Node 24 also runs the README's AWS SDK
   # example and the type checks, which need Node 20 or later and network
@@ -594,8 +588,9 @@ jobs:
         include:
           - { os: ubuntu-latest, node: "18.x", skips: 3 }
           - { os: macos-latest, node: "18.x", skips: 3 }
-          # SIGTERM is a kill on Windows, so that test is skipped there too.
-          - { os: windows-latest, node: "18.x", skips: 4 }
+          # Windows also skips the SIGTERM test (SIGTERM is a kill there) and
+          # the clean-shutdown-after-a-hard-kill test.
+          - { os: windows-latest, node: "18.x", skips: 5 }
           - { os: ubuntu-latest, node: "24", skips: 0, extra: true }
     defaults:
       run:
@@ -651,6 +646,12 @@ jobs:
       - name: Check each leg
         run: scripts/check-npm-legs.sh legs Linux-node18.x macOS-node18.x Windows-node18.x Linux-node24
 
+  # Decides which jobs this PR needs, from its changed files. `docker` gates the
+  # Docker smoke test on the paths that can break the documented MCP-in-Docker
+  # recipe. `code` gates the build and test jobs, and is false only when every
+  # changed file is documentation, so a docs-only PR runs lint and little else.
+  # The rules live in scripts/ci-changed-paths.sh, which lint tests. Implemented
+  # with git diff (no third-party action).
   changes:
     name: Detect what changed
     runs-on: ubuntu-latest

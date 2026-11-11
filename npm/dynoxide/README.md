@@ -66,7 +66,22 @@ The options are all optional:
 
 `stop()` closes the server's stdin, which shuts it down cleanly, and kills it if it's still running after 5 seconds (on Linux and macOS it gets a SIGTERM and another 5 seconds first). Calling it again returns the same promise. Where the runtime has `Symbol.asyncDispose`, `await using server = await start()` stops the server at the end of the block.
 
-If the server can't start, `start()` rejects with an error that includes the last lines of the server's stderr. `start()` is tested on Node 18 and later.
+If the server can't start, `start()` rejects with an error whose `code` says why. Errors from after the server was spawned also carry the last lines of its stderr, in the message and as `err.stderr`.
+
+| `code` | |
+|---|---|
+| `DYNOXIDE_BINARY_MISSING` | The `binary` option or `DYNOXIDE_BINARY` names a file that doesn't exist. |
+| `DYNOXIDE_UNSUPPORTED_PLATFORM` | There's no prebuilt binary for this platform. |
+| `DYNOXIDE_PACKAGE_MISSING` | The platform package wasn't installed, usually because optional dependencies were skipped. |
+| `DYNOXIDE_TOO_OLD` | The supplied binary is older than 1.7.0. |
+| `DYNOXIDE_VERSION_CHECK_FAILED` | The supplied binary couldn't be run with `--version`, or didn't report a version. |
+| `DYNOXIDE_SPAWN_FAILED` | The binary couldn't be started. |
+| `DYNOXIDE_EXITED` | The server exited before it was ready. |
+| `DYNOXIDE_BAD_READY_LINE` | The server's first line of output wasn't a ready line. |
+| `DYNOXIDE_PORT_ZERO` | The ready line reported port 0. |
+| `DYNOXIDE_TIMEOUT` | The server wasn't ready within `readyTimeoutMs`. |
+
+`start()` is tested on Node 18 and later.
 
 ### With Vitest
 

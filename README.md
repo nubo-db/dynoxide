@@ -80,6 +80,8 @@ Or install it into a project to pin the version, after which `npx dynoxide` uses
 npm install --save-dev dynoxide
 ```
 
+In a Node test suite, the package's `start()` runs a server on a free port and stops it when the tests finish. See [starting a server from your tests](https://github.com/nubo-db/dynoxide/blob/main/npm/dynoxide/README.md#starting-a-server-from-your-tests).
+
 Or run it in Docker, a drop-in for `amazon/dynamodb-local`:
 
 ```sh

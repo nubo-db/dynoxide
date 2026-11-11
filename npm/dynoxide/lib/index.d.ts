@@ -39,5 +39,24 @@ export interface DynoxideServer {
   [Symbol.asyncDispose](): Promise<void>;
 }
 
-/** Starts a Dynoxide server on a free port. */
+/** The `code` on an error from start(). */
+export type DynoxideErrorCode =
+  | "DYNOXIDE_BINARY_MISSING"
+  | "DYNOXIDE_UNSUPPORTED_PLATFORM"
+  | "DYNOXIDE_PACKAGE_MISSING"
+  | "DYNOXIDE_TOO_OLD"
+  | "DYNOXIDE_VERSION_CHECK_FAILED"
+  | "DYNOXIDE_SPAWN_FAILED"
+  | "DYNOXIDE_EXITED"
+  | "DYNOXIDE_BAD_READY_LINE"
+  | "DYNOXIDE_PORT_ZERO"
+  | "DYNOXIDE_TIMEOUT";
+
+export interface DynoxideError extends Error {
+  code: DynoxideErrorCode;
+  /** The last lines of the server's stderr, for errors after it was spawned. */
+  stderr?: string[];
+}
+
+/** Starts a Dynoxide server on a free port. Rejects with a DynoxideError. */
 export function start(options?: StartOptions): Promise<DynoxideServer>;

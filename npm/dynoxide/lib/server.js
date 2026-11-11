@@ -1,7 +1,8 @@
 "use strict";
 
 const { spawn } = require("child_process");
-const { resolveBinary, checkVersion } = require("./binary");
+const { resolveBinary, checkVersion, withoutKey } = require("./binary");
+const { coded } = require("./platform");
 
 const READY_TIMEOUT_MS = 10000;
 const GRACE_MS = 5000;
@@ -22,9 +23,10 @@ function watchExit() {
 }
 
 // Starts a server. `seam` is for the tests: a command prefix to run a fake
-// binary through Node, extra environment for it, and shorter grace periods.
+// binary through Node, extra environment for it, shorter grace periods, and a
+// stand-in for the binary lookup.
 async function launch(options = {}, seam = {}) {
-  const found = resolveBinary(options);
+  const found = seam.resolve ? seam.resolve() : resolveBinary(options);
   const command = seam.command || [];
   if (found.source !== "package") {
     await checkVersion(found.path, { command, env: seam.env });
@@ -41,20 +43,23 @@ async function launch(options = {}, seam = {}) {
     windowsHide: true,
   });
 
-  const process_ = watch(child, seam.graceMs || GRACE_MS);
+  const watcher = watch(child, seam.graceMs || GRACE_MS);
   let ready;
   try {
-    ready = await readyLine(child, process_, options.readyTimeoutMs || READY_TIMEOUT_MS);
+    ready = await readyLine(child, watcher, options.readyTimeoutMs || READY_TIMEOUT_MS);
   } catch (err) {
-    await process_.stop();
-    err.stderr = process_.stderrTail();
+    await watcher.stop();
+    err.stderr = watcher.stderrTail();
     err.message += tailText(err.stderr);
     throw err;
   }
 
-  live.add(child);
-  watchExit();
-  child.once("exit", () => live.delete(child));
+  // A server that already died after its ready line has nothing to close.
+  if (!watcher.status()) {
+    live.add(child);
+    watchExit();
+    child.once("exit", () => live.delete(child));
+  }
 
   // A forgotten stop() mustn't keep Node running. If Node exits, its end of
   // the stdin pipe closes and the server stops itself.
@@ -63,7 +68,7 @@ async function launch(options = {}, seam = {}) {
 
   const stop = () => {
     live.delete(child);
-    return process_.stop();
+    return watcher.stop();
   };
   const server = {
     endpoint: ready.endpoint,
@@ -81,18 +86,6 @@ async function launch(options = {}, seam = {}) {
   return server;
 }
 
-function withoutKey(env) {
-  const copy = {};
-  for (const [name, value] of Object.entries(env)) {
-    const match =
-      process.platform === "win32"
-        ? name.toUpperCase() === "DYNOXIDE_ENCRYPTION_KEY"
-        : name === "DYNOXIDE_ENCRYPTION_KEY";
-    if (!match) copy[name] = value;
-  }
-  return copy;
-}
-
 // Tracks one child: its first exit status, a bounded stderr tail, and the
 // contract's stop procedure (close stdin, SIGTERM, kill), run once.
 function watch(child, graceMs) {
@@ -103,8 +96,10 @@ function watch(child, graceMs) {
       status = status || { code, signal };
       resolve(status);
     });
-    child.once("error", (err) => {
-      spawnError = err;
+    // 'on', not 'once': a failed kill() also reports here, and an 'error' with
+    // no listener would throw.
+    child.on("error", (err) => {
+      spawnError = spawnError || err;
       // A child that never started has no exit event to wait for.
       if (child.pid === undefined) {
         status = { code: null, signal: null };
@@ -120,8 +115,18 @@ function watch(child, graceMs) {
   });
   child.stdin.on("error", () => {});
 
-  const within = (ms) =>
-    Promise.race([exited, new Promise((resolve) => setTimeout(resolve, ms))]).then(() => status !== null);
+  // Waits up to `ms` for the exit, then clears its timer so a stopped server
+  // doesn't keep Node running for the rest of the grace period.
+  const within = (ms) => {
+    let timer;
+    const elapsed = new Promise((resolve) => {
+      timer = setTimeout(resolve, ms);
+    });
+    return Promise.race([exited, elapsed]).then(() => {
+      clearTimeout(timer);
+      return status !== null;
+    });
+  };
 
   let stopping = null;
   const stop = () => {
@@ -144,6 +149,7 @@ function watch(child, graceMs) {
   return {
     exited,
     stop,
+    status: () => status,
     spawnError: () => spawnError,
     stderrTail: () => stderr.split(/\r?\n/).filter(Boolean).slice(-STDERR_LINES),
   };
@@ -152,7 +158,7 @@ function watch(child, graceMs) {
 // Resolves with the parsed ready line, or rejects with one of the contract's
 // startup errors. Output after the first line keeps being read and dropped,
 // so a chatty server can't fill the pipe.
-function readyLine(child, process_, timeoutMs) {
+function readyLine(child, watcher, timeoutMs) {
   return new Promise((resolve, reject) => {
     let buffer = "";
     let done = false;
@@ -164,7 +170,7 @@ function readyLine(child, process_, timeoutMs) {
     };
 
     const timer = setTimeout(
-      () => finish(reject, failure("DYNOXIDE_TIMEOUT", `Dynoxide wasn't ready within ${timeoutMs / 1000} seconds.`)),
+      () => finish(reject, coded("DYNOXIDE_TIMEOUT", `Dynoxide wasn't ready within ${timeoutMs / 1000} seconds.`)),
       timeoutMs
     );
 
@@ -181,10 +187,16 @@ function readyLine(child, process_, timeoutMs) {
       } catch {
         ready = null;
       }
-      if (!ready || typeof ready !== "object" || ready.event !== "ready" || typeof ready.endpoint !== "string") {
-        finish(reject, failure("DYNOXIDE_BAD_READY_LINE", `Dynoxide's first line of output wasn't a ready line: ${line.slice(0, 200)}`));
-      } else if (!ready.port) {
-        finish(reject, failure("DYNOXIDE_PORT_ZERO", "Dynoxide's ready line reported port 0, which isn't a port it can be reached on."));
+      if (
+        !ready ||
+        typeof ready !== "object" ||
+        ready.event !== "ready" ||
+        typeof ready.endpoint !== "string" ||
+        typeof ready.port !== "number"
+      ) {
+        finish(reject, coded("DYNOXIDE_BAD_READY_LINE", `Dynoxide's first line of output wasn't a ready line: ${line.slice(0, 200)}`));
+      } else if (ready.port === 0) {
+        finish(reject, coded("DYNOXIDE_PORT_ZERO", "Dynoxide's ready line reported port 0, which isn't a port it can be reached on."));
       } else {
         finish(resolve, ready);
       }
@@ -193,9 +205,9 @@ function readyLine(child, process_, timeoutMs) {
     // 'close' rather than 'exit': it comes after the last of stdout, so a
     // ready line written just before exiting is still seen.
     child.once("close", (code, signal) => {
-      const err = process_.spawnError();
+      const err = watcher.spawnError();
       if (err) {
-        finish(reject, failure("DYNOXIDE_SPAWN_FAILED", `Couldn't run Dynoxide: ${err.message}`));
+        finish(reject, coded("DYNOXIDE_SPAWN_FAILED", `Couldn't run Dynoxide: ${err.message}`));
         return;
       }
       const how = signal ? `was killed by ${signal}` : `exited with status ${code}`;
@@ -203,15 +215,9 @@ function readyLine(child, process_, timeoutMs) {
         code === 126 || code === 127
           ? " That status means the system couldn't run it: check it's a Dynoxide executable for this platform."
           : "";
-      finish(reject, failure("DYNOXIDE_EXITED", `Dynoxide ${how} before it was ready.${hint}`));
+      finish(reject, coded("DYNOXIDE_EXITED", `Dynoxide ${how} before it was ready.${hint}`));
     });
   });
-}
-
-function failure(code, message) {
-  const err = new Error(message);
-  err.code = code;
-  return err;
 }
 
 function tailText(lines) {

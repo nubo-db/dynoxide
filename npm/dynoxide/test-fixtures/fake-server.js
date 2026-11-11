@@ -20,6 +20,11 @@ if (process.env.FAKE_RECORD) {
   fs.writeFileSync(process.env.FAKE_RECORD, JSON.stringify({ args, keyed }));
 }
 
+if (args[0] === "--version" && process.env.FAKE_VERSION_RECORD) {
+  const keyed = Object.keys(process.env).filter((k) => k.toUpperCase() === "DYNOXIDE_ENCRYPTION_KEY");
+  fs.writeFileSync(process.env.FAKE_VERSION_RECORD, JSON.stringify({ keyed }));
+}
+
 if (args[0] === "--version") {
   switch (mode) {
     case "version-hang":
@@ -68,6 +73,10 @@ switch (mode) {
     break;
   case "not-ready":
     process.stdout.write(JSON.stringify({ event: "starting" }) + "\n");
+    setInterval(() => {}, 1000);
+    break;
+  case "no-port":
+    process.stdout.write(JSON.stringify({ event: "ready", endpoint: "http://127.0.0.1:1" }) + "\n");
     setInterval(() => {}, 1000);
     break;
   case "port-zero":

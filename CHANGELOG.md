@@ -191,12 +191,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then the first number refused in an item, key or expression value, then
   the first action's bad `ReturnValuesOnConditionCheckFailure` rather than
   every one. An item given as null is refused with `TransactItems can't be
-  null` unless a member left out, the token or an enum is reported first, and
-  an item given as a string or number, or an action given as a list, with a
-  `SerializationException`. TransactWriteItems reads its numbers as DynamoDB
-  now does in every region: a refused expression value is no longer wrapped
-  in `ExpressionAttributeValues contains invalid value: ... for key`, and
-  `1e2147483647` is an overflow, as on PutItem. The MCP `transact_write_items`
+  null` unless a member left out, the token, an enum or another item's bad
+  `ReturnValuesOnConditionCheckFailure` is reported first. An item given as a
+  string, a number or a list with anything in it, or an action given as a
+  list, gets a `SerializationException`; before, an item given as a list was
+  read by position and could run as a Put. TransactWriteItems reads its
+  numbers and sets as DynamoDB now does in every region: a refused expression
+  value is no longer wrapped in `ExpressionAttributeValues contains invalid
+  value: ... for key`, `1e2147483647` is an overflow, as on PutItem, and a
+  repeated string set member is listed quoted and sorted. The MCP `transact_write_items`
   tool reads its arguments the same way. ExecuteTransaction lists the empty
   token first, and a missing `TransactStatements` is
   `Value null at 'transactStatements'`

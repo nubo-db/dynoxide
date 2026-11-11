@@ -655,8 +655,9 @@ fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
     // Every action's sets are checked first, empty or with a repeated member,
     // in its item or key and its expression values: ahead of a missing table
     // and a condition's syntax error, as a top-level refusal (us-east-1,
-    // eu-west-1 and us-west-2, 2026-10-09, in the older layer's words;
-    // eu-west-2 uses the current layer's).
+    // eu-west-1 and us-west-2, 2026-10-09), worded on the current layer in
+    // every region (captured eu-west-2, us-east-1, eu-west-1 and us-west-2,
+    // 2026-11-11).
     validate_action_sets(item)?;
     if let Some(ref put) = item.put {
         validate_expression_value_depth(&put.expression_attribute_values)?;
@@ -731,9 +732,11 @@ fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
 }
 
 /// The empty or duplicated sets in one action, item or key first and then its
-/// expression values (named by key, in key order), in the older layer's words.
+/// expression values, each in key order, worded by the layer the request's
+/// values were read on. A refused expression value is reported bare, as
+/// DynamoDB reports it in every region (captured eu-west-2, us-east-1,
+/// eu-west-1 and us-west-2, 2026-11-11).
 fn validate_action_sets(item: &TransactWriteItem) -> Result<()> {
-    use crate::validation::{ValueLayer, find_set_error};
     let (values, values_map) = if let Some(ref put) = item.put {
         (&put.item, &put.expression_attribute_values)
     } else if let Some(ref update) = item.update {
@@ -745,25 +748,18 @@ fn validate_action_sets(item: &TransactWriteItem) -> Result<()> {
     } else {
         return Ok(());
     };
-    let mut names: Vec<&String> = values.keys().collect();
-    names.sort();
-    for name in names {
-        if let Some(message) = find_set_error(&values[name], ValueLayer::Older) {
-            return Err(DynoxideError::ValidationException(message));
-        }
+    let layer = crate::types::current_value_layer();
+    let in_key_order = |map: &HashMap<String, AttributeValue>| {
+        let mut names: Vec<&String> = map.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .find_map(|name| crate::validation::find_set_error(&map[name], layer))
+    };
+    match in_key_order(values).or_else(|| values_map.as_ref().and_then(in_key_order)) {
+        Some(message) => Err(DynoxideError::ValidationException(message)),
+        None => Ok(()),
     }
-    if let Some(eav) = values_map {
-        let mut keys: Vec<&String> = eav.keys().collect();
-        keys.sort();
-        for key in keys {
-            if let Some(message) = find_set_error(&eav[key], ValueLayer::Older) {
-                return Err(DynoxideError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {message} for key {key}"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The names and values an action's expressions refer to, checked from the

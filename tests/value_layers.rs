@@ -13,9 +13,7 @@
 //! layer on the transactions), Dynoxide follows the majority. Scan was one of
 //! those until 20 October 2026, when 19 of 33 regions read its values on the
 //! current layer, and TransactWriteItems' numbers until 11 November 2026, when
-//! all four regions read them on the current layer. A set repeated in a
-//! TransactWriteItems action is still worded as on the older layer, as no
-//! capture since 2026-10-09 has shown it.
+//! all four regions read them, and its sets, on the current layer.
 
 #![cfg(feature = "http-server")]
 
@@ -308,10 +306,14 @@ async fn scan_values_use_the_current_words_with_no_wrapper() {
     );
 }
 
+/// TransactWriteItems refuses a repeated set member in any action before it
+/// runs one, in the current layer's words with no wrapper on an expression
+/// value (captured eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-11-11,
+/// eighth round rows 3 to 6). TransactGetItems is still on the older layer.
 #[tokio::test]
 async fn transactions_check_every_actions_sets_up_front() {
     let url = start().await;
-    let older = format!("{INVALID}Input collection [b, a, b] contains duplicates.");
+    let current = format!(r#"{INVALID}Input collection ["a", "b", "b"] contains duplicates."#);
     // Ahead of a missing table.
     let missing_table = refusal(
         &url,
@@ -320,7 +322,7 @@ async fn transactions_check_every_actions_sets_up_front() {
             "Key": {"pk": {"SS": ["b", "a", "b"]}}}}]}),
     )
     .await;
-    assert_eq!(missing_table, older);
+    assert_eq!(missing_table, current);
     // Ahead of a condition's syntax error, and in a later action.
     let after_a_good_action = refusal(
         &url,
@@ -333,7 +335,7 @@ async fn transactions_check_every_actions_sets_up_front() {
         ]}),
     )
     .await;
-    assert_eq!(after_a_good_action, for_key(&older, ":t"));
+    assert_eq!(after_a_good_action, current);
     let get = refusal(
         &url,
         "TransactGetItems",

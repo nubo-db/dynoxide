@@ -207,10 +207,12 @@ where
 struct ListedItem(Option<Item>);
 
 impl<'de> Deserialize<'de> for ListedItem {
-    /// Read an entry: null, an object or a list as the derived reader takes
-    /// them, and a string, number or boolean refused with DynamoDB's
-    /// `SerializationException` for a value of the wrong type in the list
-    /// (captured eu-west-2 and us-east-1, 2026-11-11, for a string).
+    /// Read an entry: null as an item left null, an object as an item, and an
+    /// empty list as an item naming no action. A list with anything in it is
+    /// refused with a `SerializationException` that has no message, and a
+    /// string, number or boolean with DynamoDB's message for a value of the
+    /// wrong type in the list (captured eu-west-2, us-east-1, eu-west-1 and
+    /// us-west-2, 2026-11-11).
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Reader;
 
@@ -247,9 +249,16 @@ impl<'de> Deserialize<'de> for ListedItem {
                     .map(|item| ListedItem(Some(item)))
             }
 
-            fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<ListedItem, A::Error> {
-                Item::deserialize(de::value::SeqAccessDeserializer::new(seq))
-                    .map(|item| ListedItem(Some(item)))
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<ListedItem, A::Error> {
+                if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(SERIALIZATION_MARKER));
+                }
+                Ok(ListedItem(Some(Item {
+                    put: None,
+                    update: None,
+                    delete: None,
+                    condition_check: None,
+                })))
             }
 
             fn visit_bool<E: de::Error>(self, _: bool) -> Result<ListedItem, E> {

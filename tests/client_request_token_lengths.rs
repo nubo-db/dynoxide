@@ -14,7 +14,8 @@
 //! single space or 36 characters is accepted.
 //!
 //! The rows below are the requests sent to eu-west-2 and us-east-1 on
-//! 11 November 2026 (the seventh round to eu-west-1 and us-west-2 as well) and
+//! 11 November 2026 (the seventh and eighth rounds to eu-west-1 and us-west-2
+//! as well) and
 //! the answers DynamoDB gave, which the regions agreed on row for row. They are data captured from DynamoDB, not written by hand.
 //! Every request names a table that doesn't exist. `PUTS_101` stands for a
 //! list of 101 copies of the Put in row 1, which is what those rows sent.
@@ -176,6 +177,12 @@ async fn the_seventh_round_answers_as_dynamodb_did() {
     assert_rows(&url, "seventh round", SEVENTH_ROUND).await;
 }
 
+#[tokio::test]
+async fn the_eighth_round_answers_as_dynamodb_did() {
+    let url = start_server().await;
+    assert_rows(&url, "eighth round", EIGHTH_ROUND).await;
+}
+
 /// A number refused in an item waits for the stages checked as the request is
 /// read: an empty token beside it and a bad `ReturnConsumedCapacity` is
 /// reported alone, in the older form (fifth round row 14).
@@ -197,6 +204,40 @@ async fn a_refused_number_waits_for_the_token_and_the_enums() {
                         satisfy constraint: Member must have length greater than or equal to 1"
         })
     );
+}
+
+/// An item given as a list holding what a Put would hold is refused as it is
+/// read, with a `SerializationException` that has no message (eighth round
+/// row 9), and the table it names is left as it was.
+#[tokio::test]
+async fn an_item_given_as_a_list_writes_nothing() {
+    let url = start_server().await;
+    let (status, _) = send(
+        &url,
+        "CreateTable",
+        r#"{"TableName": "Listed", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}], "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}], "BillingMode": "PAY_PER_REQUEST"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, got) = send(
+        &url,
+        "TransactWriteItems",
+        r#"{"TransactItems": [[{"TableName": "Listed", "Item": {"pk": {"S": "a"}}}]]}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        got,
+        serde_json::json!({"__type": "com.amazon.coral.service#SerializationException"})
+    );
+    let (status, got) = send(
+        &url,
+        "Scan",
+        r#"{"TableName": "Listed", "ConsistentRead": true}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(got["Count"], 0, "{got}");
 }
 
 /// The token at its lengths and beside the request's other members, with the
@@ -1131,5 +1172,101 @@ const SEVENTH_ROUND: &[Row] = &[
         "TransactWriteItems",
         r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}, "Delete": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}}}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"TransactItems can only contain one of Check, Put, Update or Delete"}"#,
+    ),
+];
+
+/// Repeated set members on the current layer, an item given as a list, and
+/// cases the earlier rounds left to inference. Captured in eu-west-2,
+/// us-east-1, eu-west-1 and us-west-2, which agreed on every row.
+const EIGHTH_ROUND: &[Row] = &[
+    (
+        1,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}}, "Delete": {"TableName": "x", "Key": {"pk": {"S": "a"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"TransactItems can only contain one of Check, Put, Update or Delete"}"#,
+    ),
+    (
+        2,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}, "Delete": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'x' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+    ),
+    (
+        3,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}, "v": {"SS": ["b", "a", "b", "C"]}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Input collection [\"a\", \"b\", \"b\", \"C\"] contains duplicates."}"#,
+    ),
+    (
+        4,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Update": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET a = :v", "ExpressionAttributeValues": {":v": {"NS": ["1", "1.0"]}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Input collection contains duplicates."}"#,
+    ),
+    (
+        5,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"ConditionCheck": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "ConditionExpression": "a = :t", "ExpressionAttributeValues": {":t": {"SS": ["b", "a", "b"]}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Input collection [\"a\", \"b\", \"b\"] contains duplicates."}"#,
+    ),
+    (
+        6,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Delete": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"SS": ["b", "a", "b"]}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Input collection [\"a\", \"b\", \"b\"] contains duplicates."}"#,
+    ),
+    (
+        7,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}, "v": {"SS": []}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set  may not be empty"}"#,
+    ),
+    (
+        8,
+        "TransactWriteItems",
+        r#"{"TransactItems": [null, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ReturnValuesOnConditionCheckFailure": "BAD"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BAD' at 'transactItems.2.member.put.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]"}"#,
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r#"{"TransactItems": [[{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}}]]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        10,
+        "TransactWriteItems",
+        r#"{"TransactItems": [["x"]]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        11,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}, "v": {"N": "1e2147483648"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number overflow. Attempting to store a number with magnitude larger than supported range"}"#,
+    ),
+    (
+        12,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}, "v": {"N": "1e-2147483649"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number underflow. Attempting to store a number with magnitude smaller than supported range"}"#,
+    ),
+    (
+        13,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": ""}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: "}"#,
+    ),
+    (
+        14,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Update": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET a = :v", "ExpressionAttributeValues": {":v": {"NULL": false}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Null attribute value types must have the value of true"}"#,
+    ),
+    (
+        15,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{}, {"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"}"#,
     ),
 ];

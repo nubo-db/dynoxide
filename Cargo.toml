@@ -58,7 +58,7 @@ wasm-harness = ["wasm-sqlite"]
 full = ["native-sqlite", "http-server", "mcp-server", "import", "cli"]
 
 [dependencies]
-rusqlite = { version = "0.41", features = ["backup", "functions"], optional = true }
+rusqlite = { version = "0.42", features = ["backup", "functions"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"

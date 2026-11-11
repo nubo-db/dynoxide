@@ -83,6 +83,9 @@ pub(crate) mod set_order;
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.
 pub(crate) mod serde_errors;
+// Number tokens DynamoDB reads that JSON doesn't: the stand-ins the wire
+// seams put in their place and the integer members' reading of them.
+pub(crate) mod number_tokens;
 // Shared by the HTTP server and the wasm dispatch: both must reject a
 // mistyped field with the same SerializationException, or the two surfaces
 // disagree on requests neither has deserialised yet.

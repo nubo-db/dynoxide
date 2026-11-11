@@ -106,6 +106,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It holds over HTTP and in the wasm engine. Captured against eu-west-2 and
   us-east-1 on 9 October 2026, and the map order against eu-west-2 on
   9 November 2026 ([#261](https://github.com/nubo-db/dynoxide/issues/261)).
+- A PartiQL UPDATE that sets or removes a path into a key attribute, such as
+  `SET pk.x = 1` or `REMOVE sk[0]`, is refused as an update of that key:
+  `Cannot update attribute pk. This attribute is part of the key`. It used to
+  say the document path was invalid, or fail its condition when the item was
+  missing. With both keys named, the sort key is the one reported, whichever
+  comes first. `SET m.pk = 2` still runs. Captured against eu-west-2 on
+  11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- ExecuteStatement and a BatchExecuteStatement member read a `ConsistentRead`
+  written as a string, such as `"true"` or `"no"`, as GetItem does, where they
+  used to refuse it with a `SerializationException`. A list there is refused
+  with no message, as DynamoDB refuses it on these two operations. Captured
+  against eu-west-2 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- The refusal of an ORDER BY term that isn't a key prints a quoted name
+  without its quotes, so `ORDER BY "a.b"` names `a.b`. Captured against
+  eu-west-2 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- In a PartiQL WHERE clause, a call to `attribute_exists`,
+  `attribute_not_exists` or `attribute_type` can be a BETWEEN bound or
+  subject, the operand of `size` or `attribute_type`, or the argument of
+  `attribute_exists`, and it answers as a boolean written there would.
+  `attribute_type(attribute_exists(n), 'BOOL')` is true, and `n BETWEEN
+  attribute_exists(n) AND 5` is refused for its boolean bound. These used to
+  fail to parse. `size` now refuses a number, a boolean or a null operand, as
+  a literal, a parameter, a call or another `size`, where it used to match
+  nothing. A refusal from inside a call is reported ahead of the operator it
+  stands under. Captured against eu-west-2 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 
 ## [1.6.0] - 2026-11-07
 

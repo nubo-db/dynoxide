@@ -885,20 +885,22 @@ pub struct BulkPutItemsParams {
 // Helper: convert serde_json::Value → HashMap<String, AttributeValue>
 // ---------------------------------------------------------------------------
 
-/// Decode a DynamoDB JSON map, classifying failures as `DynoxideError`s.
+/// Decode DynamoDB JSON, classifying failures as `DynoxideError`s.
 ///
 /// Marker-tagged serde failures classify through the shared decoder in
 /// `serde_errors`, so the internal markers never reach a tool error; any
-/// other failure keeps the field-specific message.
-fn decode_dynamo_map(
+/// other failure keeps the field-specific message, with the echoed serde text
+/// cleaned so neither marker nor position suffix can leak.
+fn decode_dynamo_json<T: serde::de::DeserializeOwned>(
     val: serde_json::Value,
     field_name: &str,
-) -> Result<HashMap<String, AttributeValue>, crate::errors::DynoxideError> {
+) -> Result<T, crate::errors::DynoxideError> {
     serde_json::from_value(val).map_err(|e| {
         let msg = e.to_string();
         crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
             crate::errors::DynoxideError::ValidationException(format!(
-                "Invalid DynamoDB JSON in '{field_name}': {msg}"
+                "Invalid DynamoDB JSON in '{field_name}': {}",
+                crate::serde_errors::clean_serde_message(&msg)
             ))
         })
     })
@@ -914,7 +916,7 @@ fn parse_dynamo_map(
     field_name: &str,
     resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
-    decode_dynamo_map(val, field_name).map_err(|e| to_tool_error(resolve(e)))
+    decode_dynamo_json(val, field_name).map_err(|e| to_tool_error(resolve(e)))
 }
 
 /// Resolve the request-validation tag for PutItem, UpdateItem or DeleteItem
@@ -943,17 +945,8 @@ fn parse_update_expression_values(
     let Some(val) = val else {
         return Ok(None);
     };
-    serde_json::from_value::<Named>(val)
+    decode_dynamo_json::<Named>(val, "expression_attribute_values")
         .map(|named| named.0)
-        .map_err(|e| {
-            let msg = e.to_string();
-            crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
-                crate::errors::DynoxideError::ValidationException(format!(
-                    "Invalid DynamoDB JSON in 'expression_attribute_values': {}",
-                    crate::serde_errors::clean_serde_message(&msg)
-                ))
-            })
-        })
         .map_err(|e| to_tool_error(resolve_single_write(e)))
 }
 
@@ -1152,7 +1145,7 @@ fn refuse_segments_outside_int32(params: &ScanParams) -> Option<CallToolResult> 
 ///
 /// Marker-tagged serde failures classify through the shared decoder in
 /// `serde_errors` and report the request-validation family bare, exactly as
-/// [`decode_dynamo_map`] does; genuinely malformed input keeps the
+/// [`decode_dynamo_json`] does; genuinely malformed input keeps the
 /// field-specific message, with the echoed serde text cleaned so neither
 /// marker nor position suffix can leak.
 fn parse_json_param<T: serde::de::DeserializeOwned>(

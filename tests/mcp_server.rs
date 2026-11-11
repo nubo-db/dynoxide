@@ -7050,3 +7050,165 @@ fn item_tools_check_their_members_as_the_http_api_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// A tool error's type and message as given, serde's position included, for
+/// the answers the HTTP API gives with one.
+fn mcp_answer_as_given(resp: &Value) -> Answer {
+    if !is_tool_error(resp) {
+        return mcp_answer(resp);
+    }
+    let content = tool_content(resp);
+    Answer::Err(
+        content["error_type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        content["message"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// `batch_get_item` and `batch_write_item` decode `request_items` as their
+/// operations' requests do, after the snake_case spellings the tools accept
+/// are given their wire names, so a malformed entry gets the HTTP API's
+/// answer for the same request items. The HTTP API's answers for several of
+/// these differ from DynamoDB's and will change; the tools follow them, so
+/// each is compared with the HTTP API's answer here rather than pinned.
+#[test]
+fn batch_request_items_answer_as_the_http_api_does() {
+    let table = "Batch";
+    let (mut child, http) = both_with_items(table, &[json!({"pk": {"S": "a"}})]);
+    let keys = json!([{"pk": {"S": "a"}}]);
+    let item = |pk: &str| json!({"pk": {"S": pk}});
+    // (tool, the tool's request_items, operation, the wire's RequestItems)
+    let mut cases: Vec<(&str, Value, &str, Value)> = Vec::new();
+    let mut same = |tool: &'static str, operation: &'static str, items: Value| {
+        cases.push((tool, items.clone(), operation, items));
+    };
+    for items in [
+        json!("x"),
+        json!([]),
+        json!({}),
+        json!({table: {}}),
+        json!({table: "x"}),
+        json!({table: []}),
+        json!({table: {"Keys": "x"}}),
+        json!({table: {"Keys": [1]}}),
+        json!({table: {"Keys": ["x"]}}),
+        json!({table: {"Keys": [{"pk": "x"}]}}),
+        json!({table: {"Keys": null}}),
+        json!({table: {"Keys": keys, "ProjectionExpression": 5}}),
+        json!({table: {"Keys": keys, "ExpressionAttributeNames": "x"}}),
+        json!({table: {"Keys": keys, "ExpressionAttributeNames": {"#a": 5}}}),
+        json!({table: {"Keys": keys, "ConsistentRead": "x"}}),
+        json!({table: {"Keys": keys, "AttributesToGet": "pk"}}),
+        json!({table: {"Keys": keys, "AttributesToGet": ["pk"]}}),
+        json!({table: {"Keys": keys}}),
+    ] {
+        same("batch_get_item", "BatchGetItem", items);
+    }
+    for items in [
+        json!("x"),
+        json!([]),
+        json!({}),
+        json!({table: "x"}),
+        json!({table: {}}),
+        json!({table: []}),
+        json!({table: [1]}),
+        json!({table: ["x"]}),
+        json!({table: [[]]}),
+        json!({table: [{}]}),
+        json!({table: [null]}),
+        json!({table: [{"PutRequest": "x"}]}),
+        json!({table: [{"PutRequest": {}}]}),
+        json!({table: [{"DeleteRequest": {}}]}),
+        json!({table: [{"PutRequest": {"Item": "x"}}]}),
+        json!({table: [{"PutRequest": {"Item": {"pk": "x"}}}]}),
+        json!({table: [{"DeleteRequest": {"Key": "x"}}]}),
+        json!({table: [{"PutRequest": {"Item": item("b")}, "DeleteRequest": {"Key": item("a")}}]}),
+        json!({table: [{"PutRequest": {"Item": item("b")}}]}),
+    ] {
+        same("batch_write_item", "BatchWriteItem", items);
+    }
+    // The snake_case spellings, given their wire names; where an entry gives
+    // both, the wire spelling is the one read.
+    cases.push((
+        "batch_get_item",
+        json!({table: {"keys": keys, "projection_expression": "pk", "consistent_read": "yes"}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys, "ProjectionExpression": "pk", "ConsistentRead": "yes"}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"keys": keys, "projection_expression": 5}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys, "ProjectionExpression": 5}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"keys": keys, "expression_attribute_names": "x"}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys, "ExpressionAttributeNames": "x"}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"projection_expression": "pk"}}),
+        "BatchGetItem",
+        json!({table: {"ProjectionExpression": "pk"}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"Keys": keys, "keys": "x"}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys}}),
+    ));
+    cases.push((
+        "batch_write_item",
+        json!({table: [
+            {"put_request": {"item": item("c")}},
+            {"delete_request": {"key": item("b")}}
+        ]}),
+        "BatchWriteItem",
+        json!({table: [
+            {"PutRequest": {"Item": item("c")}},
+            {"DeleteRequest": {"Key": item("b")}}
+        ]}),
+    ));
+    cases.push((
+        "batch_write_item",
+        json!({table: [{"put_request": {}}]}),
+        "BatchWriteItem",
+        json!({table: [{"PutRequest": {}}]}),
+    ));
+    cases.push((
+        "batch_write_item",
+        json!({table: [{"PutRequest": {"Item": item("d"), "item": "x"}, "put_request": "x"}]}),
+        "BatchWriteItem",
+        json!({table: [{"PutRequest": {"Item": item("d")}}]}),
+    ));
+
+    let checked = cases.len();
+    let mut differ = Vec::new();
+    for (id, (tool, items, operation, wire)) in (3000..).zip(cases) {
+        let over_mcp = mcp_answer_as_given(&call_tool(
+            &mut child,
+            id,
+            tool,
+            json!({"request_items": items}),
+        ));
+        let over_http = http.answer(operation, &json!({"RequestItems": wire}));
+        if over_mcp != over_http {
+            differ.push(format!(
+                "{tool} {items}\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+            ));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

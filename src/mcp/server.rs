@@ -321,8 +321,8 @@ pub struct GetItemParams {
     #[schemars(description = "Substitution tokens for expression attribute names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
-    /// Read by [`read_flag`], so a string reads as the HTTP API reads it; the
-    /// schema still advertises a boolean.
+    /// Passed to GetItem's own decoder as given, so a string reads as the
+    /// HTTP API reads it; the schema still advertises a boolean.
     #[schemars(
         description = "Whether to use strongly consistent reads",
         with = "Option<bool>"
@@ -449,7 +449,8 @@ pub struct QueryParams {
     )]
     pub expression_attribute_values: Option<serde_json::Value>,
 
-    /// Read by [`read_flag`], as `consistent_read` is on `get_item`.
+    /// Passed to Query's own decoder as given, as `consistent_read` is on
+    /// `get_item`.
     #[schemars(
         description = "Whether to scan forward (true, default) or backward (false) by sort key",
         with = "Option<bool>"
@@ -1087,33 +1088,6 @@ fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Read a request's own boolean member (`ConsistentRead`, `ScanIndexForward`)
-/// as the HTTP API reads it: JSON `true` or `false`, or a string DynamoDB reads
-/// as one, with JSON `null` leaving it unset. Anything else is refused with the
-/// `SerializationException` the HTTP API gives. The tools take these as JSON
-/// rather than as `bool` so that refusal is a tool error in DynamoDB's words,
-/// not the argument decoder's own.
-///
-/// One known difference remains: a flag given as `-0`, or as an integer past
-/// 64 bits, is refused as a `DECIMAL_VALUE` where the HTTP API says
-/// `NUMBER_VALUE`, because the arguments arrive already parsed and the number
-/// as written is gone.
-fn read_flag(value: Option<serde_json::Value>) -> Result<Option<bool>, CallToolResult> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    crate::types::deserialize_lenient_flag(value).map_err(|e| {
-        let msg = e.to_string();
-        to_tool_error(
-            crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
-                crate::errors::DynoxideError::SerializationException(
-                    crate::serde_errors::clean_serde_message(&msg).to_string(),
-                )
-            }),
-        )
-    })
-}
-
 /// Return a tool-level validation error (keeps the agent conversation flowing,
 /// unlike McpError which may abort it).
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
@@ -1145,6 +1119,11 @@ fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
 /// request uses and the member checks in the operation's own order, with the
 /// request-validation tag resolved for the operation and the layer the call
 /// is read on.
+///
+/// One known difference remains: the arguments arrive already parsed, so a
+/// number written as `-0`, or as an integer past 64 bits, is read as the
+/// value it parsed to rather than as written. For a boolean member that is a
+/// `DECIMAL_VALUE` refusal where the HTTP API says `NUMBER_VALUE`.
 fn decode_wire_request<T: serde::de::DeserializeOwned>(
     operation: &str,
     members: Vec<(&str, Option<serde_json::Value>)>,
@@ -1935,18 +1914,26 @@ impl McpServer {
         // A `return_consumed_capacity` outside the enum is left to the
         // action, which checks it with BatchWriteItem's other member errors,
         // after a refused value, as `batch_get_item` leaves it.
-        // Parse the request_items Value into the typed struct.
-        // We accept both PascalCase and snake_case keys for agent ergonomics.
-        let request_items = match parse_batch_write_request_items(params.request_items) {
-            Ok(v) => v,
-            Err(e) => return Ok(e),
-        };
-
-        let request = crate::actions::batch_write_item::BatchWriteItemRequest {
-            request_items,
-            return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
-        };
+        // Decoded as BatchWriteItem's wire request, after the snake_case
+        // spellings the tool accepts are given their wire names, so a
+        // malformed entry gets the HTTP API's answer.
+        let request: crate::actions::batch_write_item::BatchWriteItemRequest =
+            match decode_wire_request(
+                "BatchWriteItem",
+                vec![
+                    (
+                        "RequestItems",
+                        Some(batch_write_wire_spellings(params.request_items)),
+                    ),
+                    (
+                        "ReturnConsumedCapacity",
+                        string_member(params.return_consumed_capacity),
+                    ),
+                ],
+            ) {
+                Ok(request) => request,
+                Err(err) => return Ok(err),
+            };
         match self.db.batch_write_item(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),
@@ -1960,19 +1947,27 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<BatchGetItemParams>,
     ) -> Result<CallToolResult, McpError> {
-        // A `return_consumed_capacity` outside the enum is left to the
-        // action, which checks it in BatchGetItem's order: after a
-        // `ConsistentRead` that doesn't read and a refused key value, which
-        // fail as `request_items` is decoded, and beside the request's own
-        // member checks.
-        let request_items = match parse_batch_get_request_items(params.request_items) {
-            Ok(v) => v,
-            Err(e) => return Ok(e),
-        };
-
-        let request = crate::actions::batch_get_item::BatchGetItemRequest {
-            request_items,
-            return_consumed_capacity: params.return_consumed_capacity,
+        // Decoded as BatchGetItem's wire request, after the snake_case
+        // spellings the tool accepts are given their wire names, so a
+        // malformed entry, a `ConsistentRead` that doesn't read and a refused
+        // key value get the HTTP API's answers. A `return_consumed_capacity`
+        // outside the enum is left to the action, which checks it beside the
+        // request's own member checks, as over HTTP.
+        let request: crate::actions::batch_get_item::BatchGetItemRequest = match decode_wire_request(
+            "BatchGetItem",
+            vec![
+                (
+                    "RequestItems",
+                    Some(batch_get_wire_spellings(params.request_items)),
+                ),
+                (
+                    "ReturnConsumedCapacity",
+                    string_member(params.return_consumed_capacity),
+                ),
+            ],
+        ) {
+            Ok(request) => request,
+            Err(err) => return Ok(err),
         };
         match self.db.batch_get_item(request) {
             Ok(resp) => json_result(&resp),
@@ -2852,142 +2847,83 @@ impl ServerHandler for McpServer {
 // Batch operation parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Tool error for malformed batch request_items, mirroring the wording the
-/// batch decoders below have always produced.
-fn invalid_request_items_error(message: &str) -> CallToolResult {
-    tool_validation_error("InvalidRequestItems", message)
+/// `object` with each snake_case member in `names` given its wire name. A
+/// member the entry also gives in the wire spelling is dropped, so the wire
+/// spelling is the one read. Anything that isn't an object, and any member
+/// not named, is left as given for the operation's decoder to answer.
+fn with_wire_names(
+    object: serde_json::Value,
+    names: &[(&str, &str)],
+    nested: impl Fn(&str, serde_json::Value) -> serde_json::Value,
+) -> serde_json::Value {
+    let serde_json::Value::Object(members) = object else {
+        return object;
+    };
+    let wire_name = |name: &str| {
+        names
+            .iter()
+            .find(|(snake, _)| *snake == name)
+            .map(|(_, wire)| *wire)
+    };
+    let given_in_wire_spelling: Vec<String> = members
+        .keys()
+        .filter(|name| wire_name(name).is_none())
+        .cloned()
+        .collect();
+    serde_json::Value::Object(
+        members
+            .into_iter()
+            .filter_map(|(name, value)| match wire_name(&name) {
+                Some(wire) if given_in_wire_spelling.iter().any(|n| n == wire) => None,
+                Some(wire) => Some((wire.to_string(), value)),
+                None => Some((name, value)),
+            })
+            .map(|(name, value)| {
+                let value = nested(&name, value);
+                (name, value)
+            })
+            .collect(),
+    )
 }
 
-/// Classify a serde failure inside the hand-rolled batch decoders: a
-/// marker-tagged failure classifies through the shared decoder in
-/// `serde_errors`, reporting the request-validation family bare; anything else
-/// keeps the site's message, with the echoed serde text cleaned so neither
-/// marker nor position suffix can leak.
-fn batch_decode_error(context: &str, msg: &str) -> CallToolResult {
-    match crate::serde_errors::classify_marked_serde_error(msg) {
-        Some(err) => to_tool_error(crate::validation::strip_request_validation_tag(err)),
-        None => invalid_request_items_error(&format!(
-            "{context}: {}",
-            crate::serde_errors::clean_serde_message(msg)
-        )),
-    }
+/// batch_get_item's `request_items` with the snake_case members of each
+/// table's entry given their wire names.
+fn batch_get_wire_spellings(request_items: serde_json::Value) -> serde_json::Value {
+    const NAMES: [(&str, &str); 4] = [
+        ("keys", "Keys"),
+        ("projection_expression", "ProjectionExpression"),
+        ("expression_attribute_names", "ExpressionAttributeNames"),
+        ("consistent_read", "ConsistentRead"),
+    ];
+    with_wire_names(request_items, &[], |_, entry| {
+        with_wire_names(entry, &NAMES, |_, value| value)
+    })
 }
 
-/// Parse batch_write_item request_items from JSON Value.
-/// Accepts both PascalCase and snake_case keys.
-fn parse_batch_write_request_items(
-    val: serde_json::Value,
-) -> Result<HashMap<String, Vec<crate::actions::batch_write_item::WriteRequest>>, CallToolResult> {
-    let map = val
-        .as_object()
-        .ok_or_else(|| invalid_request_items_error("request_items must be an object"))?;
-
-    let mut result = HashMap::new();
-    for (table_name, requests) in map {
-        let arr = requests.as_array().ok_or_else(|| {
-            invalid_request_items_error(&format!("request_items['{table_name}'] must be an array"))
-        })?;
-
-        let mut write_requests = Vec::new();
-        for req in arr {
-            let put = req.get("PutRequest").or_else(|| req.get("put_request"));
-            let del = req
-                .get("DeleteRequest")
-                .or_else(|| req.get("delete_request"));
-
-            let put_request = match put {
-                Some(p) => {
-                    let item_val = p
-                        .get("Item")
-                        .or_else(|| p.get("item"))
-                        .ok_or_else(|| invalid_request_items_error("PutRequest missing Item"))?;
-                    let item: HashMap<String, AttributeValue> =
-                        serde_json::from_value(item_val.clone()).map_err(|e| {
-                            batch_decode_error("Invalid item in PutRequest", &e.to_string())
-                        })?;
-                    Some(crate::actions::batch_write_item::PutRequest { item })
-                }
-                None => None,
-            };
-
-            let delete_request = match del {
-                Some(d) => {
-                    let key_val = d
-                        .get("Key")
-                        .or_else(|| d.get("key"))
-                        .ok_or_else(|| invalid_request_items_error("DeleteRequest missing Key"))?;
-                    let key: HashMap<String, AttributeValue> =
-                        serde_json::from_value(key_val.clone()).map_err(|e| {
-                            batch_decode_error("Invalid key in DeleteRequest", &e.to_string())
-                        })?;
-                    Some(crate::actions::batch_write_item::DeleteRequest { key })
-                }
-                None => None,
-            };
-
-            write_requests.push(crate::actions::batch_write_item::WriteRequest {
-                put_request,
-                delete_request,
-            });
-        }
-        result.insert(table_name.clone(), write_requests);
-    }
-    Ok(result)
-}
-
-/// Parse batch_get_item request_items from JSON Value.
-/// Accepts both PascalCase and snake_case keys.
-fn parse_batch_get_request_items(
-    val: serde_json::Value,
-) -> Result<HashMap<String, crate::actions::batch_get_item::KeysAndAttributes>, CallToolResult> {
-    let map = val
-        .as_object()
-        .ok_or_else(|| invalid_request_items_error("request_items must be an object"))?;
-
-    let mut result = HashMap::new();
-    for (table_name, attrs) in map {
-        let keys_val = attrs
-            .get("Keys")
-            .or_else(|| attrs.get("keys"))
-            .ok_or_else(|| {
-                invalid_request_items_error(&format!("request_items['{table_name}'] missing Keys"))
-            })?;
-
-        let keys: Vec<HashMap<String, AttributeValue>> = serde_json::from_value(keys_val.clone())
-            .map_err(|e| {
-            batch_decode_error(&format!("Invalid keys for '{table_name}'"), &e.to_string())
-        })?;
-
-        let projection_expression = attrs
-            .get("ProjectionExpression")
-            .or_else(|| attrs.get("projection_expression"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        let expression_attribute_names = attrs
-            .get("ExpressionAttributeNames")
-            .or_else(|| attrs.get("expression_attribute_names"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-        let consistent_read = read_flag(
-            attrs
-                .get("ConsistentRead")
-                .or_else(|| attrs.get("consistent_read"))
-                .cloned(),
-        )?;
-
-        result.insert(
-            table_name.clone(),
-            crate::actions::batch_get_item::KeysAndAttributes {
-                keys,
-                projection_expression,
-                expression_attribute_names,
-                consistent_read,
-                attributes_to_get: None,
-            },
-        );
-    }
-    Ok(result)
+/// batch_write_item's `request_items` with each write request's snake_case
+/// members, and those of the put or delete it holds, given their wire names.
+fn batch_write_wire_spellings(request_items: serde_json::Value) -> serde_json::Value {
+    const REQUESTS: [(&str, &str); 2] = [
+        ("put_request", "PutRequest"),
+        ("delete_request", "DeleteRequest"),
+    ];
+    with_wire_names(request_items, &[], |_, requests| {
+        let serde_json::Value::Array(requests) = requests else {
+            return requests;
+        };
+        serde_json::Value::Array(
+            requests
+                .into_iter()
+                .map(|request| {
+                    with_wire_names(request, &REQUESTS, |name, action| match name {
+                        "PutRequest" => with_wire_names(action, &[("item", "Item")], |_, v| v),
+                        "DeleteRequest" => with_wire_names(action, &[("key", "Key")], |_, v| v),
+                        _ => action,
+                    })
+                })
+                .collect(),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

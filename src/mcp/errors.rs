@@ -61,15 +61,19 @@ pub fn to_tool_error(err: DynoxideError) -> CallToolResult {
         "retryable": is_retryable(&err),
     });
     // A failed condition asked for ALL_OLD carries the item it was evaluated
-    // against, as DynamoDB's ConditionalCheckFailedException does.
+    // against, as DynamoDB's ConditionalCheckFailedException does, with its
+    // number sets in the order the HTTP API writes them for the operation:
+    // numeric for the item operations, hash order for ExecuteStatement.
     let item = match &err {
-        DynoxideError::ConditionalCheckFailedException(_, item) => item.as_ref(),
-        DynoxideError::StatementConditionalCheckFailed(_, item) => Some(item),
+        DynoxideError::ConditionalCheckFailedException(_, Some(item)) => {
+            serde_json::to_value(item).ok()
+        }
+        DynoxideError::StatementConditionalCheckFailed(_, item) => {
+            serde_json::to_value(crate::set_order::HashOrderedItem(item)).ok()
+        }
         _ => None,
     };
-    if let Some(item) = item
-        && let Ok(item) = serde_json::to_value(item)
-    {
+    if let Some(item) = item {
         error_json["item"] = item;
     }
 

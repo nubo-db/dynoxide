@@ -506,6 +506,58 @@ fn a_failed_condition_hands_back_the_item_when_asked() {
     let _ = child.wait();
 }
 
+/// The item a failed condition hands back writes a number set in the order
+/// the HTTP API writes it for the same operation: ExecuteStatement in hash
+/// order, PutItem in numeric order (both as the HTTP API answers on this
+/// build, which follows DynamoDB's captures).
+#[test]
+fn a_failed_condition_writes_number_sets_in_the_operations_order() {
+    let mut child = mcp_with_table("Ordered");
+    let stored = json!({"pk": {"S": "a"}, "ns": {"NS": ["3", "1", "2"]}, "v": {"N": "1"}});
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Ordered", "item": stored}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "execute_partiql",
+        json!({
+            "statement": r#"UPDATE "Ordered" SET v = 2 WHERE pk = 'a' AND v = 9"#,
+            "return_values_on_condition_check_failure": "ALL_OLD"
+        }),
+    );
+    assert_eq!(tool_error(&resp).0, "ConditionalCheckFailedException");
+    assert_eq!(
+        tool_content(&resp)["item"]["ns"],
+        json!({"NS": ["3", "2", "1"]})
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "put_item",
+        json!({
+            "table_name": "Ordered",
+            "item": {"pk": {"S": "a"}},
+            "condition_expression": "attribute_not_exists(pk)",
+            "return_values_on_condition_check_failure": "ALL_OLD"
+        }),
+    );
+    assert_eq!(tool_error(&resp).0, "ConditionalCheckFailedException");
+    assert_eq!(
+        tool_content(&resp)["item"]["ns"],
+        json!({"NS": ["1", "2", "3"]})
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn the_instructions_say_capacity_can_be_requested() {
     let mut child = spawn_mcp();

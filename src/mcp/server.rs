@@ -1994,7 +1994,12 @@ impl McpServer {
             };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),
-            Err(err) => Ok(to_tool_error(err)),
+            // A failed condition's item takes ExecuteStatement's own shape,
+            // as the HTTP API writes it.
+            Err(err) => Ok(to_tool_error(crate::errors::for_operation(
+                "ExecuteStatement",
+                err,
+            ))),
         }
     }
 

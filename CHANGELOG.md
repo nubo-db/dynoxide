@@ -52,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
+  The refusals now carry DynamoDB's `SerializationException` messages
+  (`Buffer is too short for base64 encoding` for one character, `Base64
+  encoded length is expected a multiple of 4 bytes but found: 2` for `!!`,
+  `Invalid last non-pad Base64 character dectected` for `ab==`, or no
+  message at all) and come ahead of the request's validation, where before
+  they gave the base64 crate's error with a line and column. Values DynamoDB
+  accepts that Dynoxide used to refuse are now accepted as the same bytes:
+  unpadded and part-padded values such as `QQ`, `QQ=` and `QUI`, and the
+  final-group forms such as `-Q==`, which DynamoDB stores as `0xfd`. The
+  crate's own `AttributeValue` deserialiser reads them the same way
+  ([#316](https://github.com/nubo-db/dynoxide/issues/316)).
 - **Opening a database checks what it reads before it changes anything.** A
   schema version that isn't a whole number, or is too large to be one, is
   refused rather than read as no version, which ran every migration on the
@@ -77,6 +89,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when an earlier parameter was refused for its value. A bare string now
   answers `Unexpected value type in payload`
   ([#308](https://github.com/nubo-db/dynoxide/issues/308)).
+- A number written in a way JSON doesn't allow, such as `1.5.5`, `1e`, `01`
+  or `-`, is read as DynamoDB reads it, rather than failing the whole request
+  with a bare `SerializationException`. Where DynamoDB doesn't read the member
+  it is accepted. Where the member holds another type it gets the answer a
+  well-formed number gets: `DECIMAL_VALUE cannot be converted to String` for
+  one with a point or an exponent and `NUMBER_VALUE` for one without, `Unexpected
+  field type` in a list or map member, `Unexpected value type in payload` as an
+  attribute value or PartiQL parameter. In `Limit`, Scan's `Segment` and
+  `TotalSegments` and the throughput units, DynamoDB's looser rule applies:
+  `-`, `00` and `-.5` read as 0, `01` as 1 and `1.e5` as 100000, while a token
+  it can't read, such as `1.5.5`, `1e` or `--1`, is refused with `Bad number
+  format`. `1e400.5` no longer leaks the parser's own message. ListTables
+  `Limit` and the throughput units also read a well-formed fraction or a number
+  past the range as Query's `Limit` does, so `0.5` gets the at-least-1 error
+  instead of serde's `floating point` text, and ListTables `Limit: 1e400` the
+  at-most-100 error. Streams `Limit`, SearchVectors `TopK` and a vector index's
+  `Dimensions` still refuse such a token with a bare `SerializationException`,
+  since DynamoDB's reading there hasn't been captured
+  ([#309](https://github.com/nubo-db/dynoxide/issues/309)).
 - An attribute value with a member of the wrong JSON type is refused with
   DynamoDB's `SerializationException` message, which names what was found and
   what was expected. A number where `S` or `N` belongs gives `NUMBER_VALUE
@@ -164,6 +195,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above were captured against eu-west-2 on 11 November 2026, in rounds five
   to thirteen of the capture; rounds one to four went to us-east-1 as well,
   and the regions agreed ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- The MCP tools read `consistent_read` (`get_item`, and `ConsistentRead`
+  inside `batch_get_item`'s `request_items`) and `scan_index_forward`
+  (`query`) as the HTTP API does: the strings DynamoDB reads as booleans,
+  such as `"true"`, `"yes"`, `"0"` and `"N"`, work, and anything else is
+  refused with the HTTP API's `SerializationException`. A string used to be
+  refused as a malformed argument on `get_item` and `query`, and inside
+  `batch_get_item` it was dropped without a word, so `"true"` read eventually
+  consistent. The listed schema still says boolean. One difference remains:
+  a flag given as `-0`, or as an integer past 64 bits, is refused as a
+  `DECIMAL_VALUE` where the HTTP API says `NUMBER_VALUE`, because MCP
+  arguments arrive already parsed
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP tools read values on the validation layer the HTTP API would use
+  for the same request. Arguments holding a `BOOL` or `NULL` written as a
+  string, or a value with two members, move the call to the older layer,
+  where `put_item`, `update_item` and `delete_item` report a refused value
+  bare rather than inside `1 validation error detected: `, and `update_item`
+  names the key in `expression_attribute_values`. The batch, transaction and
+  PartiQL tools now read on their operation's older layer too, so
+  `batch_write_item` calls `1e2147483647` an underflow, as BatchWriteItem
+  does ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP `scan` tool takes a negative `segment` or `total_segments` and
+  answers with Scan's member check, such as `Value at 'Segment' failed to
+  satisfy constraint: Member must have value greater than or equal to 0`. It
+  used to refuse it as a malformed argument. An integer past what 32 bits
+  hold reads as the nearest 32-bit integer, as it does over HTTP, and so does
+  `limit`; either moves a segment refusal to the older wording, which echoes
+  the value. A fraction, or an integer past 64 bits, is still refused as a
+  malformed argument
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP `execute_partiql` tool reports a member error (`limit` 0, a bad
+  `return_consumed_capacity` or `return_values_on_condition_check_failure`,
+  an empty statement) ahead of a parameter refused for its value, and
+  `parameters` that isn't a list as a `SerializationException` rather than a
+  protocol error, as ExecuteStatement does over HTTP. `consistent_read` goes
+  to ExecuteStatement as given, so a string gets ExecuteStatement's answer
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 
 ## [1.6.0] - 2026-11-07
 

@@ -83,6 +83,9 @@ pub(crate) mod set_order;
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.
 pub(crate) mod serde_errors;
+// Number tokens DynamoDB reads that JSON doesn't: the stand-ins the wire
+// seams put in their place and the integer members' reading of them.
+pub(crate) mod number_tokens;
 // Shared by the HTTP server and the wasm dispatch: both must reject a
 // mistyped field with the same SerializationException, or the two surfaces
 // disagree on requests neither has deserialised yet.
@@ -114,6 +117,8 @@ pub mod streams;
 pub mod ttl;
 pub mod types;
 pub mod validation;
+// How DynamoDB reads the base64 text of a binary value in a request.
+pub(crate) mod wire_base64;
 // The single source of truth for DynamoDB operation names, shared by the HTTP
 // server and the wasm engine API so the two lists cannot drift. Compiled only
 // for the builds that consume it.

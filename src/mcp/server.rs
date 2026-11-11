@@ -321,9 +321,14 @@ pub struct GetItemParams {
     #[schemars(description = "Substitution tokens for expression attribute names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
-    #[schemars(description = "Whether to use strongly consistent reads")]
+    /// Read by [`read_flag`], so a string reads as the HTTP API reads it; the
+    /// schema still advertises a boolean.
+    #[schemars(
+        description = "Whether to use strongly consistent reads",
+        with = "Option<bool>"
+    )]
     #[serde(default)]
-    pub consistent_read: Option<bool>,
+    pub consistent_read: Option<serde_json::Value>,
 
     #[schemars(
         description = RETURN_CONSUMED_CAPACITY,
@@ -441,10 +446,12 @@ pub struct QueryParams {
     )]
     pub expression_attribute_values: Option<serde_json::Value>,
 
+    /// Read by [`read_flag`], as `consistent_read` is on `get_item`.
     #[schemars(
-        description = "Whether to scan forward (true, default) or backward (false) by sort key"
+        description = "Whether to scan forward (true, default) or backward (false) by sort key",
+        with = "Option<bool>"
     )]
-    pub scan_index_forward: Option<bool>,
+    pub scan_index_forward: Option<serde_json::Value>,
 
     #[schemars(description = "Maximum number of items to evaluate")]
     pub limit: Option<usize>,
@@ -501,15 +508,20 @@ pub struct ScanParams {
     )]
     pub select: Option<String>,
 
+    /// Decoded as `i64` so a negative value, or one past 32 bits, reaches
+    /// Scan's member checks as it does over HTTP; the schema still advertises
+    /// the unsigned integer it always has.
     #[schemars(
-        description = "Segment number for parallel scan (0-based). Must be used with total_segments."
+        description = "Segment number for parallel scan (0-based). Must be used with total_segments.",
+        with = "Option<u32>"
     )]
-    pub segment: Option<u32>,
+    pub segment: Option<i64>,
 
     #[schemars(
-        description = "Total number of parallel scan segments (1 to 1000000). Must be used with segment."
+        description = "Total number of parallel scan segments (1 to 1000000). Must be used with segment.",
+        with = "Option<u32>"
     )]
-    pub total_segments: Option<u32>,
+    pub total_segments: Option<i64>,
 
     #[schemars(
         description = RETURN_CONSUMED_CAPACITY,
@@ -593,14 +605,19 @@ pub struct ExecutePartiqlParams {
     )]
     pub statement: String,
 
-    #[schemars(description = "Positional parameters for the statement, in DynamoDB JSON format")]
+    #[schemars(
+        description = "A JSON array of positional parameters in DynamoDB JSON, one for each ? in the statement, in order. For example, [{\"S\": \"user#1\"}, {\"N\": \"42\"}] for WHERE pk = ? AND n = ?."
+    )]
     pub parameters: Option<serde_json::Value>,
 
+    /// Passed to ExecuteStatement's own decoder as given, so it answers as
+    /// ExecuteStatement does over HTTP; the schema still advertises a boolean.
     #[schemars(
-        description = "Whether to use strongly consistent reads. Does not change which rows come back, but it doubles the rate a SELECT is charged at and it makes a SELECT qualified by a GSI a rejection, because a GSI cannot serve one."
+        description = "Whether to use strongly consistent reads. Does not change which rows come back, but it doubles the rate a SELECT is charged at and it makes a SELECT qualified by a GSI a rejection, because a GSI cannot serve one.",
+        with = "Option<bool>"
     )]
     #[serde(default)]
-    pub consistent_read: Option<bool>,
+    pub consistent_read: Option<serde_json::Value>,
 
     #[schemars(
         description = "Maximum number of items to evaluate for SELECT statements (not necessarily the number returned); a filtered page can come back short or empty and still carry a NextToken"
@@ -870,36 +887,69 @@ pub struct BulkPutItemsParams {
 // Helper: convert serde_json::Value → HashMap<String, AttributeValue>
 // ---------------------------------------------------------------------------
 
-/// Decode a DynamoDB JSON map, classifying failures as `DynoxideError`s.
+/// Decode DynamoDB JSON, classifying failures as `DynoxideError`s.
 ///
 /// Marker-tagged serde failures classify through the shared decoder in
 /// `serde_errors`, so the internal markers never reach a tool error; any
-/// other failure keeps the field-specific message.
-fn decode_dynamo_map(
+/// other failure keeps the field-specific message, with the echoed serde text
+/// cleaned so neither marker nor position suffix can leak.
+fn decode_dynamo_json<T: serde::de::DeserializeOwned>(
     val: serde_json::Value,
     field_name: &str,
-) -> Result<HashMap<String, AttributeValue>, crate::errors::DynoxideError> {
+) -> Result<T, crate::errors::DynoxideError> {
     serde_json::from_value(val).map_err(|e| {
         let msg = e.to_string();
         crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
             crate::errors::DynoxideError::ValidationException(format!(
-                "Invalid DynamoDB JSON in '{field_name}': {msg}"
+                "Invalid DynamoDB JSON in '{field_name}': {}",
+                crate::serde_errors::clean_serde_message(&msg)
             ))
         })
     })
 }
 
 /// Parse a DynamoDB JSON map, resolving the wire-invisible request-validation
-/// tag with the given function: the put_item and update_item tools pass
-/// `envelope_request_validation`, matching their envelope on the HTTP
-/// surface; every other tool passes `strip_request_validation_tag`, reporting
-/// the family bare.
+/// tag with the given function: the put_item, update_item and delete_item
+/// tools pass [`resolve_single_write`], matching the HTTP surface on the layer
+/// the call is read on; every other tool passes `strip_request_validation_tag`,
+/// reporting the family bare.
 fn parse_dynamo_map(
     val: serde_json::Value,
     field_name: &str,
     resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
-    decode_dynamo_map(val, field_name).map_err(|e| to_tool_error(resolve(e)))
+    decode_dynamo_json(val, field_name).map_err(|e| to_tool_error(resolve(e)))
+}
+
+/// Resolve the request-validation tag for PutItem, UpdateItem or DeleteItem
+/// (the three share the rule) on the layer this call's values are read on:
+/// in the envelope on the current layer and bare on the older one, as the
+/// HTTP API answers. `call_tool` sets the layer.
+fn resolve_single_write(err: crate::DynoxideError) -> crate::DynoxideError {
+    crate::validation::resolve_request_validation_on(
+        "PutItem",
+        crate::types::current_value_layer(),
+        err,
+    )
+}
+
+/// Decode update_item's `expression_attribute_values` with the reader
+/// UpdateItem's wire request uses, which names the key of a value refused on
+/// the older layer; a plain map never names it.
+fn parse_update_expression_values(
+    val: Option<serde_json::Value>,
+) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
+    #[derive(Deserialize)]
+    struct Named(
+        #[serde(deserialize_with = "crate::types::deserialize_named_null_refusals")]
+        Option<HashMap<String, AttributeValue>>,
+    );
+    let Some(val) = val else {
+        return Ok(None);
+    };
+    decode_dynamo_json::<Named>(val, "expression_attribute_values")
+        .map(|named| named.0)
+        .map_err(|e| to_tool_error(resolve_single_write(e)))
 }
 
 /// Optional-map variant of [`parse_dynamo_map`].
@@ -1006,6 +1056,33 @@ fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Read a request's own boolean member (`ConsistentRead`, `ScanIndexForward`)
+/// as the HTTP API reads it: JSON `true` or `false`, or a string DynamoDB reads
+/// as one, with JSON `null` leaving it unset. Anything else is refused with the
+/// `SerializationException` the HTTP API gives. The tools take these as JSON
+/// rather than as `bool` so that refusal is a tool error in DynamoDB's words,
+/// not the argument decoder's own.
+///
+/// One known difference remains: a flag given as `-0`, or as an integer past
+/// 64 bits, is refused as a `DECIMAL_VALUE` where the HTTP API says
+/// `NUMBER_VALUE`, because the arguments arrive already parsed and the number
+/// as written is gone.
+fn read_flag(value: Option<serde_json::Value>) -> Result<Option<bool>, CallToolResult> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    crate::types::deserialize_lenient_flag(value).map_err(|e| {
+        let msg = e.to_string();
+        to_tool_error(
+            crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
+                crate::errors::DynoxideError::SerializationException(
+                    crate::serde_errors::clean_serde_message(&msg).to_string(),
+                )
+            }),
+        )
+    })
+}
+
 /// Return a tool-level validation error (keeps the agent conversation flowing,
 /// unlike McpError which may abort it).
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
@@ -1029,12 +1106,55 @@ fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
         .map(to_tool_error)
 }
 
+/// Run Scan's member checks on `segment`, `total_segments` and `limit` as the
+/// HTTP API reads them, when it reads them differently from the action: a
+/// negative segment, which the action's request can't hold, or any of the
+/// three past what a 32-bit integer holds. The HTTP API reads all three as
+/// 32-bit integers, so a value past either end is read as that end and the
+/// request moves to the older wording, which echoes the value and lists the
+/// request's other member errors with it. This mirrors
+/// `actions::helpers::deserialize_int32` and the `ScanMembers` that
+/// `actions::scan` builds from what it reads. Anything else, and a request the
+/// checks pass, is left to the action.
+fn refuse_scan_members_read_as_int32(params: &ScanParams) -> Option<CallToolResult> {
+    let int32 = |value: i64| {
+        let read = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        (read, read != value)
+    };
+    let segment = params.segment.map(int32);
+    let total_segments = params.total_segments.map(int32);
+    let limit = params
+        .limit
+        .map(|l| int32(i64::try_from(l).unwrap_or(i64::MAX)));
+    let read = [segment, total_segments, limit];
+    if !read
+        .iter()
+        .flatten()
+        .any(|&(value, coerced)| coerced || value < 0)
+    {
+        return None;
+    }
+    crate::actions::scan::ScanMembers {
+        table_name: Some(&params.table_name),
+        select: params.select.as_deref(),
+        return_consumed_capacity: params.return_consumed_capacity.as_deref(),
+        conditional_operator: None,
+        scan_filter: None,
+        limit: limit.map(|(value, _)| value),
+        segment: segment.map(|(value, _)| value),
+        total_segments: total_segments.map(|(value, _)| value),
+        coerced: read.iter().flatten().any(|&(_, coerced)| coerced),
+    }
+    .rejection()
+    .map(|msg| to_tool_error(crate::errors::DynoxideError::ValidationException(msg)))
+}
+
 /// Parse a required JSON value into a typed result, returning a tool validation
 /// error (not an McpError) on failure so the agent conversation continues.
 ///
 /// Marker-tagged serde failures classify through the shared decoder in
 /// `serde_errors` and report the request-validation family bare, exactly as
-/// [`decode_dynamo_map`] does; genuinely malformed input keeps the
+/// [`decode_dynamo_json`] does; genuinely malformed input keeps the
 /// field-specific message, with the echoed serde text cleaned so neither
 /// marker nor position suffix can leak.
 fn parse_json_param<T: serde::de::DeserializeOwned>(
@@ -1407,18 +1527,14 @@ impl McpServer {
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
-        let item = match parse_dynamo_map(
-            params.item,
-            "item",
-            crate::validation::envelope_request_validation,
-        ) {
+        let item = match parse_dynamo_map(params.item, "item", resolve_single_write) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
-            crate::validation::envelope_request_validation,
+            resolve_single_write,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1447,6 +1563,12 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetItemParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Over HTTP a flag that doesn't read fails the request as it is
+        // decoded, before the capacity mode is checked.
+        let consistent_read = match read_flag(params.consistent_read) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
@@ -1464,7 +1586,7 @@ impl McpServer {
             key,
             projection_expression: params.projection_expression,
             expression_attribute_names: params.expression_attribute_names,
-            consistent_read: params.consistent_read,
+            consistent_read,
             return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
@@ -1487,22 +1609,15 @@ impl McpServer {
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(
-            params.key,
-            "key",
-            crate::validation::envelope_request_validation,
-        ) {
+        let key = match parse_dynamo_map(params.key, "key", resolve_single_write) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
-        let expression_attribute_values = match parse_optional_dynamo_map(
-            params.expression_attribute_values,
-            "expression_attribute_values",
-            crate::validation::envelope_request_validation,
-        ) {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
+        let expression_attribute_values =
+            match parse_update_expression_values(params.expression_attribute_values) {
+                Ok(v) => v,
+                Err(err) => return Ok(err),
+            };
 
         let request = crate::actions::update_item::UpdateItemRequest {
             table_name: params.table_name,
@@ -1608,6 +1723,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Read ahead of the capacity mode, as on `get_item`.
+        let scan_index_forward = match read_flag(params.scan_index_forward) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
@@ -1635,7 +1755,7 @@ impl McpServer {
             projection_expression: params.projection_expression,
             expression_attribute_names: params.expression_attribute_names,
             expression_attribute_values,
-            scan_index_forward: params.scan_index_forward.unwrap_or(true),
+            scan_index_forward: scan_index_forward.unwrap_or(true),
             limit: self.apply_item_limit(params.limit),
             exclusive_start_key,
             index_name: params.index_name,
@@ -1657,6 +1777,9 @@ impl McpServer {
         description = "Scan an entire table or GSI/LSI, optionally applying a filter expression. Use query instead when you know the partition key. Use select=COUNT to get only Count and ScannedCount without items. Use Segment and TotalSegments for parallel scan; segment filtering uses FNV-1a hash at the SQLite level."
     )]
     fn scan(&self, Parameters(params): Parameters<ScanParams>) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_scan_members_read_as_int32(&params) {
+            return Ok(err);
+        }
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
@@ -1687,8 +1810,9 @@ impl McpServer {
             exclusive_start_key,
             index_name: params.index_name,
             select: params.select,
-            segment: params.segment,
-            total_segments: params.total_segments,
+            // In range here: anything negative or past 32 bits was refused above.
+            segment: params.segment.and_then(|s| u32::try_from(s).ok()),
+            total_segments: params.total_segments.and_then(|t| u32::try_from(t).ok()),
             return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
@@ -1715,18 +1839,14 @@ impl McpServer {
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
-        let key = match parse_dynamo_map(
-            params.key,
-            "key",
-            crate::validation::envelope_request_validation,
-        ) {
+        let key = match parse_dynamo_map(params.key, "key", resolve_single_write) {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
-            crate::validation::envelope_request_validation,
+            resolve_single_write,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1788,9 +1908,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<BatchGetItemParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
+        // A `return_consumed_capacity` outside the enum is left to the
+        // action, which checks it in BatchGetItem's order: after a
+        // `ConsistentRead` that doesn't read and a refused key value, which
+        // fail as `request_items` is decoded, and beside the request's own
+        // member checks.
         let request_items = match parse_batch_get_request_items(params.request_items) {
             Ok(v) => v,
             Err(e) => return Ok(e),
@@ -1829,45 +1951,47 @@ impl McpServer {
                 ));
             }
         }
-        // The action lists a bad ReturnConsumedCapacity with the statement's
-        // other member errors, so it isn't refused on its own here.
-        let parameters: Option<Vec<AttributeValue>> = match params.parameters {
-            Some(val) => match serde_json::from_value(val) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    // Marker-tagged serde failures classify through the shared
-                    // decoder, reporting the request-validation family bare;
-                    // malformed input keeps the field-specific message, with
-                    // the echoed serde text cleaned so neither marker nor
-                    // position suffix can leak.
-                    let msg = e.to_string();
-                    if let Some(err) = crate::serde_errors::classify_marked_serde_error(&msg) {
-                        return Ok(to_tool_error(
-                            crate::validation::strip_request_validation_tag(err),
-                        ));
-                    }
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "Invalid parameters: {}",
-                            crate::serde_errors::clean_serde_message(&msg)
-                        ),
-                        None,
+        // Decoded as ExecuteStatement's wire request, by the HTTP seam's own
+        // decoder, so the tool answers as the HTTP API does: a parameter of
+        // the wrong JSON type, or parameters that aren't a list, first, then
+        // the member errors (a bad ReturnConsumedCapacity among them), then a
+        // parameter refused for its value. Only the member names change,
+        // because these params are snake_case.
+        let mut wire = serde_json::Map::new();
+        wire.insert(
+            "Statement".to_string(),
+            serde_json::Value::from(params.statement),
+        );
+        let optional: [(&str, Option<serde_json::Value>); 6] = [
+            ("Parameters", params.parameters),
+            ("Limit", params.limit.map(serde_json::Value::from)),
+            ("NextToken", params.next_token.map(serde_json::Value::from)),
+            ("ConsistentRead", params.consistent_read),
+            (
+                "ReturnConsumedCapacity",
+                params.return_consumed_capacity.map(serde_json::Value::from),
+            ),
+            (
+                "ReturnValuesOnConditionCheckFailure",
+                params
+                    .return_values_on_condition_check_failure
+                    .map(serde_json::Value::from),
+            ),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                wire.insert(name.to_string(), value);
+            }
+        }
+        let request: crate::actions::execute_statement::ExecuteStatementRequest =
+            match crate::serde_errors::deserialize(&serde_json::Value::Object(wire).to_string()) {
+                Ok(request) => request,
+                Err(err) => {
+                    return Ok(to_tool_error(
+                        crate::validation::strip_request_validation_tag(err),
                     ));
                 }
-            },
-            None => None,
-        };
-
-        let request = crate::actions::execute_statement::ExecuteStatementRequest {
-            statement: params.statement,
-            parameters,
-            limit: params.limit,
-            next_token: params.next_token,
-            consistent_read: params.consistent_read,
-            return_consumed_capacity: params.return_consumed_capacity,
-            return_values_on_condition_check_failure: params
-                .return_values_on_condition_check_failure,
-        };
+            };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),
@@ -2536,8 +2660,78 @@ impl McpServer {
 // ServerHandler implementation
 // ---------------------------------------------------------------------------
 
+/// The DynamoDB operation behind a tool, for the tools that have one: the
+/// operation decides the layer the tool's values are read on, as it does for
+/// a request over HTTP. A tool missing here (the snapshots, `bulk_put_items`,
+/// `sweep_ttl`, `get_database_info`) reads on the current layer.
+fn tool_operation(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "list_tables" => "ListTables",
+        "describe_table" => "DescribeTable",
+        "create_table" => "CreateTable",
+        "delete_table" => "DeleteTable",
+        "update_table" => "UpdateTable",
+        "put_item" => "PutItem",
+        "get_item" => "GetItem",
+        "update_item" => "UpdateItem",
+        "delete_item" => "DeleteItem",
+        "search_vectors" => "SearchVectors",
+        "query" => "Query",
+        "scan" => "Scan",
+        "batch_write_item" => "BatchWriteItem",
+        "batch_get_item" => "BatchGetItem",
+        "transact_write_items" => "TransactWriteItems",
+        "transact_get_items" => "TransactGetItems",
+        "execute_partiql" => "ExecuteStatement",
+        "batch_execute_partiql" => "BatchExecuteStatement",
+        "execute_transaction_partiql" => "ExecuteTransaction",
+        "update_time_to_live" => "UpdateTimeToLive",
+        "describe_time_to_live" => "DescribeTimeToLive",
+        "tag_resource" => "TagResource",
+        "untag_resource" => "UntagResource",
+        "list_tags_of_resource" => "ListTagsOfResource",
+        "list_streams" => "ListStreams",
+        "describe_stream" => "DescribeStream",
+        "get_shard_iterator" => "GetShardIterator",
+        "get_records" => "GetRecords",
+        _ => return None,
+    })
+}
+
+/// The layer a tool call's values are read on, decided as the HTTP API
+/// decides it for the same request: the older layer when the arguments hold a
+/// `BOOL` or `NULL` written as a string, or a value with more than one member,
+/// and otherwise the operation's own.
+fn tool_value_layer(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> crate::validation::ValueLayer {
+    let older = arguments.is_some_and(|args| args.values().any(crate::types::reads_on_older_layer));
+    if older {
+        crate::validation::ValueLayer::Older
+    } else {
+        tool_operation(tool).map_or(
+            crate::validation::ValueLayer::Current,
+            crate::validation::ValueLayer::for_operation,
+        )
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for McpServer {
+    /// Every tool runs under the validation layer its arguments would be read
+    /// on over HTTP, set around each poll of the call so it never reaches
+    /// another call the runtime polls on the same thread.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let layer = tool_value_layer(&request.name, request.arguments.as_ref());
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::types::with_value_layer_async(layer, Self::tool_router().call(call)).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         let base_instructions = "\
             Dynoxide is a lightweight, embeddable DynamoDB emulator backed by SQLite. \
@@ -2710,10 +2904,12 @@ fn parse_batch_get_request_items(
             .or_else(|| attrs.get("expression_attribute_names"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        let consistent_read = attrs
-            .get("ConsistentRead")
-            .or_else(|| attrs.get("consistent_read"))
-            .and_then(|v| v.as_bool());
+        let consistent_read = read_flag(
+            attrs
+                .get("ConsistentRead")
+                .or_else(|| attrs.get("consistent_read"))
+                .cloned(),
+        )?;
 
         result.insert(
             table_name.clone(),
@@ -2973,6 +3169,141 @@ mod tests {
         assert_eq!(json["notices"][0]["concern"], "exposure");
         assert_eq!(json["notices"][1]["concern"], "caution");
         assert_eq!(json["notices"].as_array().unwrap().len(), 3);
+    }
+}
+
+/// Every tool the server lists reads its values on its DynamoDB operation's
+/// layer, or is named here as having no operation, so a tool added without an
+/// entry in `tool_operation` can't fall back to the current layer unnoticed.
+#[cfg(test)]
+mod tool_operation_tests {
+    use super::*;
+
+    const WITHOUT_AN_OPERATION: [&str; 7] = [
+        "get_database_info",
+        "create_snapshot",
+        "restore_snapshot",
+        "list_snapshots",
+        "delete_snapshot",
+        "sweep_ttl",
+        "bulk_put_items",
+    ];
+
+    #[test]
+    fn every_listed_tool_has_an_operation_or_is_named_as_having_none() {
+        let tools: Vec<String> = McpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            tools.len() > WITHOUT_AN_OPERATION.len(),
+            "only {} tools listed",
+            tools.len()
+        );
+        let unaccounted: Vec<&String> = tools
+            .iter()
+            .filter(|name| {
+                tool_operation(name).is_none() && !WITHOUT_AN_OPERATION.contains(&name.as_str())
+            })
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "{} of {} listed tools have no operation and aren't named as having none: \
+             {unaccounted:?}",
+            unaccounted.len(),
+            tools.len()
+        );
+        for name in WITHOUT_AN_OPERATION {
+            assert!(tools.iter().any(|t| t == name), "{name} isn't listed");
+            assert_eq!(tool_operation(name), None, "{name} has an operation");
+        }
+        for (tool, _) in OPERATIONS {
+            assert!(tools.iter().any(|t| t == tool), "{tool} isn't listed");
+        }
+        assert_eq!(
+            tools.len(),
+            OPERATIONS.len() + WITHOUT_AN_OPERATION.len(),
+            "a listed tool is in neither table"
+        );
+    }
+
+    /// Each tool's operation, spelt as `ValueLayer::for_operation` and the
+    /// HTTP dispatch spell it. A misspelt name would read on the current layer
+    /// without a word, so the whole map is pinned.
+    const OPERATIONS: [(&str, &str); 28] = [
+        ("list_tables", "ListTables"),
+        ("describe_table", "DescribeTable"),
+        ("create_table", "CreateTable"),
+        ("delete_table", "DeleteTable"),
+        ("update_table", "UpdateTable"),
+        ("put_item", "PutItem"),
+        ("get_item", "GetItem"),
+        ("update_item", "UpdateItem"),
+        ("delete_item", "DeleteItem"),
+        ("search_vectors", "SearchVectors"),
+        ("query", "Query"),
+        ("scan", "Scan"),
+        ("batch_write_item", "BatchWriteItem"),
+        ("batch_get_item", "BatchGetItem"),
+        ("transact_write_items", "TransactWriteItems"),
+        ("transact_get_items", "TransactGetItems"),
+        ("execute_partiql", "ExecuteStatement"),
+        ("batch_execute_partiql", "BatchExecuteStatement"),
+        ("execute_transaction_partiql", "ExecuteTransaction"),
+        ("update_time_to_live", "UpdateTimeToLive"),
+        ("describe_time_to_live", "DescribeTimeToLive"),
+        ("tag_resource", "TagResource"),
+        ("untag_resource", "UntagResource"),
+        ("list_tags_of_resource", "ListTagsOfResource"),
+        ("list_streams", "ListStreams"),
+        ("describe_stream", "DescribeStream"),
+        ("get_shard_iterator", "GetShardIterator"),
+        ("get_records", "GetRecords"),
+    ];
+
+    /// The tools whose operation reads values on the older layer.
+    const ON_THE_OLDER_LAYER: [&str; 6] = [
+        "batch_write_item",
+        "transact_write_items",
+        "transact_get_items",
+        "execute_partiql",
+        "batch_execute_partiql",
+        "execute_transaction_partiql",
+    ];
+
+    #[test]
+    fn each_tool_maps_to_its_operation() {
+        let wrong: Vec<String> = OPERATIONS
+            .iter()
+            .filter(|(tool, operation)| tool_operation(tool) != Some(*operation))
+            .map(|(tool, operation)| {
+                format!("{tool}: {:?}, expected {operation}", tool_operation(tool))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{} of {} tools map wrongly: {wrong:?}",
+            wrong.len(),
+            OPERATIONS.len()
+        );
+    }
+
+    #[test]
+    fn the_batch_transaction_and_partiql_tools_read_on_the_older_layer() {
+        use crate::validation::ValueLayer;
+        for (tool, _) in OPERATIONS {
+            let layer = tool_operation(tool).map(ValueLayer::for_operation);
+            let expected = if ON_THE_OLDER_LAYER.contains(&tool) {
+                ValueLayer::Older
+            } else {
+                ValueLayer::Current
+            };
+            assert_eq!(layer, Some(expected), "{tool}");
+            // And the layer a call to the tool is dispatched on, given
+            // arguments that don't move it to the older layer.
+            assert_eq!(tool_value_layer(tool, None), expected, "{tool} dispatch");
+        }
     }
 }
 

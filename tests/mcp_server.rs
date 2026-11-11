@@ -5063,3 +5063,1166 @@ fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
         "the dropped line should be logged on stderr, got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Arguments read as the HTTP API reads them
+// ---------------------------------------------------------------------------
+//
+// Every expectation below is the HTTP API's answer to the same request, as
+// pinned in tests/bool_and_null_values_http.rs, tests/value_layers.rs,
+// tests/partiql_member_errors_before_parameters.rs and the scan member checks.
+
+const UNEXPECTED_TOKEN: &str = "Unexpected token received from parser";
+
+/// Spawn a server holding a hash-only table called `table`.
+fn mcp_with_table(table: &str) -> std::process::Child {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": table,
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    child
+}
+
+/// The error type and message of a tool error, failing if the call succeeded.
+fn tool_error(resp: &Value) -> (String, String) {
+    assert!(is_tool_error(resp), "expected a tool error: {resp}");
+    let raw = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !raw.contains("VALIDATION") && !raw.contains("SERIALIZATION") && !raw.contains(" at line "),
+        "internal marker or serde position leaked: {raw}"
+    );
+    let content = tool_content(resp);
+    (
+        content["error_type"].as_str().unwrap().to_string(),
+        content["message"].as_str().unwrap().to_string(),
+    )
+}
+
+fn serialization_error(message: &str) -> (String, String) {
+    ("SerializationException".to_string(), message.to_string())
+}
+
+fn validation_error(message: &str) -> (String, String) {
+    ("ValidationException".to_string(), message.to_string())
+}
+
+/// What the HTTP API answers for a flag it can't read as a boolean.
+fn refused_flags() -> Vec<(Value, (String, String))> {
+    vec![
+        (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("off"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(""), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(" true"), serialization_error(UNEXPECTED_TOKEN)),
+        (
+            json!(1),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!(0),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!(1.5),
+            serialization_error("DECIMAL_VALUE cannot be converted to Boolean"),
+        ),
+        // Pinned to the HTTP API's present answer for a list, which the tool
+        // follows if that answer changes.
+        (
+            json!([true]),
+            serialization_error("Unrecognized collection type class java.lang.Boolean"),
+        ),
+        (
+            json!({"a": true}),
+            serialization_error("Start of structure or map found where not expected"),
+        ),
+    ]
+}
+
+const TRUTHY: [&str; 9] = ["true", "TRUE", "True", "t", "T", "yes", "y", "Y", "1"];
+const FALSY: [&str; 10] = ["false", "FALSE", "f", "F", "no", "No", "n", "N", "0", "nO"];
+
+/// `get_item`'s `consistent_read` reads a string as GetItem's `ConsistentRead`
+/// does over HTTP: one that reads as true is a strongly consistent read,
+/// charged 1.0 for a small item, one that reads as false an eventually
+/// consistent one, charged 0.5, and anything else is refused as malformed.
+#[test]
+fn get_item_reads_consistent_read_as_the_http_api_does() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Flags", "item": {"pk": {"S": "c"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let mut id = 10;
+    let mut get = |child: &mut std::process::Child, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "get_item",
+            json!({
+                "table_name": "Flags", "key": {"pk": {"S": "c"}},
+                "consistent_read": flag, "return_consumed_capacity": "TOTAL"
+            }),
+        )
+    };
+    let mut flags: Vec<(Value, f64)> = Vec::new();
+    flags.extend(TRUTHY.iter().map(|t| (json!(t), 1.0)));
+    flags.extend(FALSY.iter().map(|t| (json!(t), 0.5)));
+    flags.extend([(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)]);
+    for (flag, units) in flags {
+        let resp = get(&mut child, flag.clone());
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["Item"]["pk"], json!({"S": "c"}), "{flag}");
+        assert_eq!(
+            content["ConsumedCapacity"]["CapacityUnits"],
+            json!(units),
+            "{flag}"
+        );
+    }
+    for (flag, refusal) in refused_flags() {
+        let resp = get(&mut child, flag.clone());
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A flag that doesn't read fails the request as it is decoded, so it is the
+/// error reported beside a `return_consumed_capacity` outside the enum, which
+/// is checked later. That holds for `ConsistentRead` inside `batch_get_item`'s
+/// `request_items` too, as BatchGetItem answers over HTTP.
+#[test]
+fn an_unreadable_flag_is_reported_ahead_of_a_bad_capacity_mode() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({
+            "table_name": "Flags", "key": {"pk": {"S": "c"}},
+            "consistent_read": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+    let resp = call_tool(
+        &mut child,
+        3,
+        "query",
+        json!({
+            "table_name": "Flags", "key_condition_expression": "pk = :p",
+            "expression_attribute_values": {":p": {"S": "c"}},
+            "scan_index_forward": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+    let resp = call_tool(
+        &mut child,
+        4,
+        "batch_get_item",
+        json!({
+            "request_items": {"Flags": {"Keys": [{"pk": {"S": "c"}}], "ConsistentRead": "x"}},
+            "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `batch_get_item` leaves a `return_consumed_capacity` outside the enum to
+/// BatchGetItem's own checks, so the request's member errors and a refused
+/// key value are reported in the order BatchGetItem reports them over HTTP.
+#[test]
+fn batch_get_item_reports_a_bad_capacity_mode_where_batch_get_item_does() {
+    let mut child = mcp_with_table("Flags");
+    let bogus = "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let cases: Vec<(Value, (String, String))> = vec![
+        (
+            json!({}),
+            enveloped(
+                "Value at 'RequestItems' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"Flags": {"Keys": []}}),
+            enveloped(
+                "Value at 'RequestItems.Flags.member.Keys' failed to satisfy constraint: Member \
+                 must have length greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"T": {"Keys": [{"pk": {"S": "a"}}]}}),
+            validation_error(&format!(
+                "2 validation errors detected: Value '{{\"T\":{{\"Keys\":[{{\"pk\":{{\"S\":\"a\"}}}}]}}}}' \
+                 at 'requestItems' failed to satisfy constraint: Map keys must satisfy \
+                 constraint: [Member must have length less than or equal to 255, Member must \
+                 have length greater than or equal to 3, Member must satisfy regular \
+                 expression pattern: [a-zA-Z0-9_.-]+]; {bogus}"
+            )),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"S": "a"}}]}}),
+            enveloped(bogus),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"N": "abc"}}]}}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"S": "a", "N": "1"}}]}}),
+            validation_error(TWO_TYPES),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"BOOL": "no"}}]}}),
+            enveloped(bogus),
+        ),
+        (
+            json!({"Flags": {"Keys": (0..101)
+                .map(|i| json!({"pk": {"S": i.to_string()}}))
+                .collect::<Vec<_>>()}}),
+            enveloped(
+                "Value at 'RequestItems.Flags.member.Keys' failed to satisfy constraint: Member \
+                 must have length less than or equal to 100",
+            ),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (request_items, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "batch_get_item",
+            json!({"request_items": request_items, "return_consumed_capacity": "BOGUS"}),
+        );
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{request_items}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `query`'s `scan_index_forward` reads a string as Query's `ScanIndexForward`
+/// does over HTTP: one that reads as false reads the sort key descending, one
+/// that reads as true ascending, and anything else is refused as malformed.
+#[test]
+fn query_reads_scan_index_forward_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Sorted",
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [
+                {"attribute_name": "pk", "key_type": "HASH"},
+                {"attribute_name": "sk", "key_type": "RANGE"}
+            ],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "sk", "attribute_type": "N"}
+            ]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    for (id, sk) in [(2, "1"), (3, "2"), (4, "3")] {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Sorted", "item": {"pk": {"S": "p"}, "sk": {"N": sk}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+
+    let mut id = 10;
+    let mut query = |child: &mut std::process::Child, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "query",
+            json!({
+                "table_name": "Sorted", "key_condition_expression": "pk = :p",
+                "expression_attribute_values": {":p": {"S": "p"}},
+                "scan_index_forward": flag
+            }),
+        )
+    };
+    let order = |resp: &Value| -> Vec<String> {
+        tool_content(resp)["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["sk"]["N"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let mut flags: Vec<(Value, [&str; 3])> = Vec::new();
+    flags.extend(TRUTHY.iter().map(|t| (json!(t), ["1", "2", "3"])));
+    flags.extend(FALSY.iter().map(|t| (json!(t), ["3", "2", "1"])));
+    flags.extend([
+        (json!(true), ["1", "2", "3"]),
+        (json!(false), ["3", "2", "1"]),
+        (Value::Null, ["1", "2", "3"]),
+    ]);
+    for (flag, expected) in flags {
+        let resp = query(&mut child, flag.clone());
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        assert_eq!(order(&resp), expected, "{flag}");
+    }
+    for (flag, refusal) in refused_flags() {
+        let resp = query(&mut child, flag.clone());
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `ConsistentRead` inside `batch_get_item`'s `request_items` reads as
+/// BatchGetItem's does over HTTP, under either spelling. A string used to be
+/// dropped without a word, so `"true"` read eventually consistent.
+#[test]
+fn batch_get_item_reads_consistent_read_as_the_http_api_does() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Flags", "item": {"pk": {"S": "c"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let mut id = 10;
+    let mut batch = |child: &mut std::process::Child, member: &str, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "batch_get_item",
+            json!({
+                "request_items": {"Flags": {"keys": [{"pk": {"S": "c"}}], member: flag}},
+                "return_consumed_capacity": "TOTAL"
+            }),
+        )
+    };
+    for member in ["ConsistentRead", "consistent_read"] {
+        for (flag, units) in [
+            (json!("true"), 1.0),
+            (json!("Yes"), 1.0),
+            (json!("1"), 1.0),
+            (json!(true), 1.0),
+            (json!("false"), 0.5),
+            (json!("n"), 0.5),
+            (json!(false), 0.5),
+            (Value::Null, 0.5),
+        ] {
+            let resp = batch(&mut child, member, flag.clone());
+            assert!(!is_tool_error(&resp), "{member} {flag}: {resp}");
+            assert_eq!(
+                tool_content(&resp)["ConsumedCapacity"][0]["CapacityUnits"],
+                json!(units),
+                "{member} {flag}"
+            );
+        }
+        for (flag, refusal) in refused_flags() {
+            let resp = batch(&mut child, member, flag.clone());
+            assert_eq!(tool_error(&resp), refusal, "{member} {flag}");
+        }
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Strings are read but not advertised: each flag's listed schema is the
+/// boolean it has always been.
+#[test]
+fn the_flags_still_advertise_a_boolean() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let property = |tool: &str, name: &str| {
+        let tool = tools.iter().find(|t| t["name"] == tool).unwrap();
+        assert!(
+            !tool["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&json!(name))),
+            "{name} is optional"
+        );
+        tool["inputSchema"]["properties"][name].clone()
+    };
+    assert_eq!(
+        property("get_item", "consistent_read"),
+        json!({
+            "default": null,
+            "description": "Whether to use strongly consistent reads",
+            "type": ["boolean", "null"]
+        })
+    );
+    assert_eq!(
+        property("query", "scan_index_forward"),
+        json!({
+            "description": "Whether to scan forward (true, default) or backward (false) by sort key",
+            "type": ["boolean", "null"]
+        })
+    );
+    assert_eq!(
+        property("execute_partiql", "consistent_read"),
+        json!({
+            "default": null,
+            "description": "Whether to use strongly consistent reads. Does not change which rows \
+                            come back, but it doubles the rate a SELECT is charged at and it makes \
+                            a SELECT qualified by a GSI a rejection, because a GSI cannot serve one.",
+            "type": ["boolean", "null"]
+        })
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `scan`'s `segment` and `total_segments` take a negative value now, but the
+/// listed schema is the unsigned integer it has always been.
+#[test]
+fn the_segments_still_advertise_an_unsigned_integer() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let scan = tools.iter().find(|t| t["name"] == "scan").unwrap();
+    let properties = &scan["inputSchema"]["properties"];
+    assert_eq!(
+        properties["segment"],
+        json!({
+            "description": "Segment number for parallel scan (0-based). Must be used with \
+                            total_segments.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+        })
+    );
+    assert_eq!(
+        properties["total_segments"],
+        json!({
+            "description": "Total number of parallel scan segments (1 to 1000000). Must be used \
+                            with segment.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+        })
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+const ABC_NUMBER: &str = "The parameter cannot be converted to a numeric value: abc";
+const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value \
+                             types must have the value of true";
+const TWO_TYPES: &str = "Supplied AttributeValue has more than one datatypes set, must contain \
+                         exactly one of the supported datatypes";
+
+fn enveloped(message: &str) -> (String, String) {
+    validation_error(&format!("1 validation error detected: {message}"))
+}
+
+fn named(message: &str, key: &str) -> (String, String) {
+    validation_error(&format!(
+        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+    ))
+}
+
+/// A request holding a `BOOL` or `NULL` written as a string, or a value with
+/// two members, is read on the older layer, as tests/value_layers.rs pins over
+/// HTTP: its refusals are bare on `put_item`, and `update_item` names the key,
+/// where the same refusal alone is enveloped. The cases run in one process, so
+/// a current-layer call after an older-layer one shows the layer doesn't leak.
+#[test]
+fn item_tools_read_values_on_the_layer_the_http_api_uses() {
+    let mut child = mcp_with_table("Layers");
+    let bad_number = json!({"N": "abc"});
+    let string_bool = json!({"BOOL": "no"});
+    let cases = vec![
+        (
+            vec![("v", bad_number.clone())],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("v", bad_number.clone()), ("w", string_bool.clone())],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", bad_number.clone())],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("w", string_bool.clone()), ("v", bad_number.clone())],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", bad_number.clone()), ("w", json!({"BOOL": true}))],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("v", json!({"NULL": false}))],
+            enveloped(NULL_NOT_TRUE),
+            enveloped(NULL_NOT_TRUE),
+        ),
+        (
+            vec![("v", json!({"NULL": "no"}))],
+            validation_error(NULL_NOT_TRUE),
+            named(NULL_NOT_TRUE, ":v"),
+        ),
+        (
+            vec![("v", json!({"S": "x", "N": "1"}))],
+            validation_error(TWO_TYPES),
+            named(TWO_TYPES, ":v"),
+        ),
+        (
+            vec![("v", json!({"N": "abc", "S": "x"}))],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", json!({"NULL": false}))],
+            enveloped(NULL_NOT_TRUE),
+            enveloped(NULL_NOT_TRUE),
+        ),
+    ];
+    let mut id = 10;
+    for (pairs, on_put, on_update) in cases {
+        let mut item = json!({"pk": {"S": "m1"}});
+        let mut values = json!({});
+        let mut set = Vec::new();
+        for (name, value) in &pairs {
+            item[name] = value.clone();
+            values[format!(":{name}")] = value.clone();
+            set.push(format!("{name} = :{name}"));
+        }
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Layers", "item": item}),
+        );
+        assert_eq!(tool_error(&resp), on_put, "put_item {pairs:?}");
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "update_item",
+            json!({
+                "table_name": "Layers", "key": {"pk": {"S": "m1"}},
+                "update_expression": format!("SET {}", set.join(", ")),
+                "expression_attribute_values": values
+            }),
+        );
+        assert_eq!(tool_error(&resp), on_update, "update_item {pairs:?}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `delete_item` follows the layer too: a key value it refuses is enveloped
+/// on its own and bare beside a string-read `BOOL`, as DeleteItem answers over
+/// HTTP.
+#[test]
+fn delete_item_reads_its_key_on_the_layer_the_http_api_uses() {
+    let mut child = mcp_with_table("Layers");
+    let older = json!({
+        "table_name": "Layers", "key": {"pk": {"N": "abc"}},
+        "condition_expression": "w = :w",
+        "expression_attribute_values": {":w": {"BOOL": "no"}}
+    });
+    let current = json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}}});
+    for (id, args, refusal) in [
+        (2, current.clone(), enveloped(ABC_NUMBER)),
+        (3, older, validation_error(ABC_NUMBER)),
+        (4, current, enveloped(ABC_NUMBER)),
+    ] {
+        let resp = call_tool(&mut child, id, "delete_item", args.clone());
+        assert_eq!(tool_error(&resp), refusal, "{args}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// An argument that isn't DynamoDB JSON at all is refused with the tool's own
+/// message naming the argument, with no serde marker or position in it.
+#[test]
+fn a_map_argument_that_is_not_dynamodb_json_names_the_argument() {
+    let mut child = mcp_with_table("Layers");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Layers", "item": [1]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        validation_error("Invalid DynamoDB JSON in 'item': invalid type: sequence, expected a map")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The tools without the envelope keep their operation's own layer: GetItem
+/// reads values on the current layer, bare, and the batch, transaction and
+/// PartiQL operations on the older one, which reads `1e2147483647` as Java's
+/// `BigDecimal` does and calls it an underflow (tests/value_layers.rs).
+#[test]
+fn other_tools_read_values_on_their_operations_layer() {
+    let mut child = mcp_with_table("Layers");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}}}),
+    );
+    assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}, "x": {"BOOL": "no"}}}),
+    );
+    assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let underflow = "Number underflow. Attempting to store a number with magnitude smaller than \
+                     supported range";
+    let tiny = json!({"N": "1e2147483647"});
+    let select = "SELECT * FROM \"Layers\" WHERE pk = ?";
+    // The batch_write_item, transact_write_items Put and transact_get_items
+    // cases read on the older layer only through the tool's entry in the
+    // operation map. The transact_write_items Update case and the three
+    // PartiQL cases get the same answer without it, from the actions
+    // themselves, so they pin the tool's answer whatever the map says.
+    let older: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "batch_write_item",
+            json!({"request_items": {"Layers": [
+                {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": tiny}}}
+            ]}}),
+            validation_error(underflow),
+        ),
+        (
+            "transact_write_items",
+            json!({"transact_items": [{"Update": {
+                "TableName": "Layers", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET v = :v",
+                "ExpressionAttributeValues": {":v": tiny}
+            }}]}),
+            named(underflow, ":v"),
+        ),
+        (
+            "transact_write_items",
+            json!({"transact_items": [{"Put": {
+                "TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}
+            }}]}),
+            validation_error(underflow),
+        ),
+        (
+            "transact_get_items",
+            json!({"transact_items": [{"Get": {"TableName": "Layers", "Key": {"pk": tiny}}}]}),
+            validation_error(underflow),
+        ),
+        (
+            "execute_partiql",
+            json!({"statement": select, "parameters": [tiny]}),
+            validation_error(underflow),
+        ),
+        (
+            "execute_transaction_partiql",
+            json!({"transact_statements": [{"Statement": select, "Parameters": [tiny]}]}),
+            validation_error(underflow),
+        ),
+    ];
+    let checked = older.len() + 1;
+    let mut mismatches = Vec::new();
+    let mut id = 10;
+    for (tool, args, refusal) in older {
+        id += 1;
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    // BatchExecuteStatement answers each statement in its own response.
+    let resp = call_tool(
+        &mut child,
+        30,
+        "batch_execute_partiql",
+        json!({"statements": [{"Statement": select, "Parameters": [tiny]}]}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let responses = &tool_content(&resp)["Responses"];
+    if *responses != json!([{"Error": {"Code": "ValidationError", "Message": underflow}}]) {
+        mismatches.push(format!("batch_execute_partiql: {responses}"));
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} older-layer answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+    // And put_item, straight after, is back on the current layer.
+    let resp = call_tool(
+        &mut child,
+        31,
+        "put_item",
+        json!({"table_name": "Layers", "item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        enveloped(
+            "Number overflow. Attempting to store a number with magnitude larger than \
+             supported range"
+        )
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `scan`'s `segment` and `total_segments` answer as Scan's member checks do
+/// over HTTP (tests/scan_member_stages.rs): a negative one gets the member
+/// check's message rather than failing argument decoding, and one past what
+/// a 32-bit integer holds is read as the largest one, which moves the request
+/// to the older wording with the value echoed.
+#[test]
+fn scan_segments_answer_as_the_http_api_does() {
+    let mut child = mcp_with_table("Segments");
+    let one = |m: &str| validation_error(&format!("1 validation error detected: {m}"));
+    let segment_min = "Value at 'Segment' failed to satisfy constraint: Member must have value \
+                       greater than or equal to 0";
+    let total_min = "Value at 'TotalSegments' failed to satisfy constraint: Member must have \
+                     value greater than or equal to 1";
+    let zero_based = validation_error(
+        "The Segment parameter is zero-based and must be less than parameter TotalSegments",
+    );
+    let cases: Vec<(Value, (String, String))> = vec![
+        (
+            json!({"segment": -1, "total_segments": 2}),
+            one(segment_min),
+        ),
+        (json!({"segment": -1}), one(segment_min)),
+        (json!({"segment": 0, "total_segments": -1}), one(total_min)),
+        (json!({"total_segments": -1}), one(total_min)),
+        (json!({"segment": 0, "total_segments": 0}), one(total_min)),
+        (
+            json!({"segment": -1, "total_segments": -1}),
+            validation_error(&format!(
+                "2 validation errors detected: {segment_min}; {total_min}"
+            )),
+        ),
+        (
+            json!({"segment": 2, "total_segments": 2}),
+            zero_based.clone(),
+        ),
+        (json!({"segment": 3, "total_segments": 2}), zero_based),
+        (
+            json!({"segment": 0, "total_segments": 1_000_001}),
+            one(
+                "Value at 'TotalSegments' failed to satisfy constraint: Member must have value \
+                 less than or equal to 1000000",
+            ),
+        ),
+        (
+            json!({"segment": 3_000_000_000_u64, "total_segments": 2}),
+            one(
+                "Value '2147483647' at 'segment' failed to satisfy constraint: Member must have \
+                 value less than or equal to 999999",
+            ),
+        ),
+        (
+            json!({"segment": 4_294_967_296_u64, "total_segments": 2}),
+            one(
+                "Value '2147483647' at 'segment' failed to satisfy constraint: Member must have \
+                 value less than or equal to 999999",
+            ),
+        ),
+        (
+            json!({"segment": -3_000_000_000_i64, "total_segments": 2}),
+            one(
+                "Value '-2147483648' at 'segment' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 0",
+            ),
+        ),
+        (
+            json!({"segment": 0, "total_segments": 4_294_967_296_u64}),
+            one(
+                "Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must \
+                 have value less than or equal to 1000000",
+            ),
+        ),
+        // The member checks come ahead of the capacity mode, and the older
+        // wording lists the mode and the limit with the segment.
+        (
+            json!({"segment": -1, "total_segments": 2, "return_consumed_capacity": "BOGUS"}),
+            one(segment_min),
+        ),
+        (
+            json!({
+                "segment": 3_000_000_000_u64, "total_segments": 2,
+                "limit": 0, "return_consumed_capacity": "BOGUS"
+            }),
+            validation_error(
+                "3 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed \
+                 to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, \
+                 NONE]; Value '2147483647' at 'segment' failed to satisfy constraint: Member \
+                 must have value less than or equal to 999999; Value '0' at 'limit' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1",
+            ),
+        ),
+        // A limit past what a 32-bit integer holds is read as the largest one,
+        // which moves a segment's refusal to the older wording too, whether
+        // or not the segment itself is past 32 bits.
+        // With no segment, the limit's own read leaves an enum refusal as it
+        // is worded on either layer.
+        (
+            json!({"limit": 3_000_000_000_u64, "return_consumed_capacity": "BOGUS"}),
+            one(
+                "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+            ),
+        ),
+        (
+            json!({"limit": 3_000_000_000_u64, "select": "BOGUS"}),
+            one(
+                "Value 'BOGUS' at 'select' failed to satisfy constraint: Member must satisfy enum \
+                 value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
+            ),
+        ),
+        (
+            json!({"total_segments": 0, "limit": 3_000_000_000_u64}),
+            one(
+                "Value '0' at 'totalSegments' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"segment": -1, "total_segments": 2, "limit": 3_000_000_000_u64}),
+            one(
+                "Value '-1' at 'segment' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 0",
+            ),
+        ),
+    ];
+    let mut id = 10;
+    for (segments, refusal) in cases {
+        let mut args = json!({"table_name": "Segments"});
+        for (k, v) in segments.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        id += 1;
+        let resp = call_tool(&mut child, id, "scan", args);
+        assert_eq!(tool_error(&resp), refusal, "{segments}");
+    }
+    // A segment in range still scans.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "scan",
+        json!({"table_name": "Segments", "segment": 1, "total_segments": 2}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(tool_content(&resp)["Count"], json!(0));
+    // And so does a limit past 32 bits with no segments, which reads every
+    // item rather than stopping short.
+    for (id, pk) in (3..).zip(["a", "b", "c"]) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Segments", "item": {"pk": {"S": pk}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+    let resp = call_tool(
+        &mut child,
+        6,
+        "scan",
+        json!({"table_name": "Segments", "limit": 3_000_000_000_u64}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["Count"], json!(3), "{content}");
+    let mut keys: Vec<&str> = content["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["pk"]["S"].as_str().unwrap())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["a", "b", "c"]);
+    assert!(content.get("LastEvaluatedKey").is_none(), "{content}");
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `execute_partiql` reports a member error ahead of a parameter it refuses
+/// for its value, and a parameter of the wrong JSON type, or `parameters`
+/// that isn't a list, ahead of both, as ExecuteStatement answers over HTTP
+/// (tests/partiql_member_errors_before_parameters.rs). No table is needed:
+/// each statement is refused before its table is looked up.
+#[test]
+fn execute_partiql_orders_member_and_parameter_errors_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let select = "SELECT * FROM \"Missing\" WHERE pk = ?";
+    let limit_0 = enveloped(
+        "Value '0' at 'limit' failed to satisfy constraint: Member must have value greater \
+         than or equal to 1",
+    );
+    let bad_capacity = "Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: \
+                        Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let empty = "Supplied AttributeValue is empty, must contain exactly one of the supported \
+                 datatypes";
+    let number_to_string = serialization_error("NUMBER_VALUE cannot be converted to String");
+    let bad = json!({"N": "abc"});
+
+    let mut cases: Vec<(Value, (String, String))> = vec![
+        // Member errors beat a number the parameter walk refuses.
+        (
+            json!({"statement": select, "parameters": [bad], "limit": 0}),
+            limit_0.clone(),
+        ),
+        (
+            json!({
+                "statement": select, "parameters": [bad],
+                "return_values_on_condition_check_failure": "BAD"
+            }),
+            enveloped(
+                "Value 'BAD' at 'returnValuesOnConditionCheckFailure' failed to satisfy \
+                 constraint: Member must satisfy enum value set: [ALL_OLD, NONE]",
+            ),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad], "return_consumed_capacity": "BAD"}),
+            enveloped(bad_capacity),
+        ),
+        (
+            json!({"statement": "", "parameters": [bad]}),
+            enveloped(
+                "Value '' at 'statement' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({
+                "statement": select, "parameters": [bad], "limit": 0,
+                "return_consumed_capacity": "BAD"
+            }),
+            validation_error(&format!(
+                "2 validation errors detected: Value '0' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1; {bad_capacity}"
+            )),
+        ),
+        // A parameter of the wrong JSON type fails first.
+        (
+            json!({"statement": select, "parameters": [bad, {"N": 1}]}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {"N": 1}], "limit": 0}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {"S": 1}], "limit": 0}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [{"N": 1}], "limit": 0}),
+            number_to_string,
+        ),
+        (
+            json!({"statement": select, "parameters": ["str"]}),
+            serialization_error("Unexpected value type in payload"),
+        ),
+        (
+            json!({"statement": select, "parameters": ["str"], "limit": 0}),
+            serialization_error("Unexpected value type in payload"),
+        ),
+        // With no member error, the first refused parameter is reported.
+        (
+            json!({"statement": select, "parameters": [bad]}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": [{}, bad]}),
+            validation_error(empty),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {}]}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad], "next_token": "garbage"}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": []}),
+            enveloped(
+                "Value '[]' at 'parameters' failed to satisfy constraint: Member must have \
+                 length greater than or equal to 1",
+            ),
+        ),
+    ];
+    // A limit of 0 beats every kind of parameter refused for its value.
+    for refused in [
+        json!([{}]),
+        json!([{"S": "a", "N": "1"}]),
+        json!([{"NULL": false}]),
+        json!([{"NULL": "false"}]),
+        json!([{"NULL": false, "S": "a"}]),
+        json!([{"X": "a"}]),
+        json!([{"S": null}]),
+        json!([null]),
+        json!([{"NS": ["abc"]}]),
+        json!([{"M": {"a": {"N": "abc"}}}]),
+        json!([{"L": [{"N": "abc"}]}]),
+        json!([{"N": ""}]),
+        json!([{}, {"N": "abc"}]),
+        json!([{"N": "1"}, {"N": "abc"}, {"SS": ["a", "a"]}]),
+    ] {
+        cases.push((
+            json!({"statement": select, "parameters": refused, "limit": 0}),
+            limit_0.clone(),
+        ));
+    }
+    // Parameters that aren't a list fail the request first.
+    for (parameters, message) in [
+        (json!("x"), "Unexpected field type"),
+        (json!(5), "Unexpected field type"),
+        (json!(true), "Unexpected field type"),
+        (
+            json!({}),
+            "Start of structure or map found where not expected",
+        ),
+        (
+            json!({"N": "1"}),
+            "Start of structure or map found where not expected",
+        ),
+    ] {
+        cases.push((
+            json!({"statement": select, "parameters": parameters}),
+            serialization_error(message),
+        ));
+        cases.push((
+            json!({"statement": select, "parameters": parameters, "limit": 0}),
+            serialization_error(message),
+        ));
+    }
+    let mut id = 10;
+    for (args, refusal) in cases {
+        id += 1;
+        let resp = call_tool(&mut child, id, "execute_partiql", args.clone());
+        assert_eq!(tool_error(&resp), refusal, "{args}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `execute_partiql`'s `consistent_read` is ExecuteStatement's
+/// `ConsistentRead` as given, so it answers whatever ExecuteStatement answers
+/// over HTTP, which today refuses a string as malformed.
+#[test]
+fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
+    let mut child = mcp_with_table("Pql");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Pql", "item": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let select = "SELECT * FROM \"Pql\" WHERE pk = 'a'";
+    let mut id = 10;
+    for (flag, units) in [(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({
+                "statement": select, "consistent_read": flag,
+                "return_consumed_capacity": "TOTAL"
+            }),
+        );
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["Items"].as_array().unwrap().len(), 1, "{flag}");
+        assert_eq!(
+            content["ConsumedCapacity"]["CapacityUnits"],
+            json!(units),
+            "{flag}"
+        );
+    }
+    for (flag, refusal) in [
+        (json!("true"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (
+            json!(1),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+    ] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({"statement": select, "consistent_read": flag}),
+        );
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

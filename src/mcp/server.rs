@@ -3265,9 +3265,8 @@ mod tool_operation_tests {
     ];
 
     /// The tools whose operation reads values on the older layer.
-    const ON_THE_OLDER_LAYER: [&str; 6] = [
+    const ON_THE_OLDER_LAYER: [&str; 5] = [
         "batch_write_item",
-        "transact_write_items",
         "transact_get_items",
         "execute_partiql",
         "batch_execute_partiql",

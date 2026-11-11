@@ -3,16 +3,19 @@
 //! repeated member, is worded.
 //!
 //! The current layer (PutItem, UpdateItem and DeleteItem inside the
-//! `1 validation error detected: ` envelope; GetItem, BatchGetItem, Query and
-//! Scan bare) reads numbers by the stored-number rule, ends an empty one with
-//! `: `, quotes duplicated members in a particular order and never wraps an
-//! expression value. The older layer (BatchWriteItem, the transactions and
-//! PartiQL) reads numbers as Java's `BigDecimal` does, prints members as sent
-//! and wraps expression values naming the key. Captured in eu-west-2,
-//! us-east-1, eu-west-1 and us-west-2, 2026-10-09; where the regions split
-//! (eu-west-2 runs the current layer on the transactions), Dynoxide follows
-//! the majority. Scan was one of those until 20 October 2026, when 19 of 33
-//! regions read its values on the current layer.
+//! `1 validation error detected: ` envelope; GetItem, BatchGetItem, Query,
+//! Scan and TransactWriteItems bare) reads numbers by the stored-number rule,
+//! ends an empty one with `: `, quotes duplicated members in a particular
+//! order and never wraps an expression value. The older layer (BatchWriteItem,
+//! TransactGetItems and PartiQL) reads numbers as Java's `BigDecimal` does and
+//! prints members as sent. Captured in eu-west-2, us-east-1, eu-west-1 and
+//! us-west-2, 2026-10-09; where the regions split (eu-west-2 ran the current
+//! layer on the transactions), Dynoxide follows the majority. Scan was one of
+//! those until 20 October 2026, when 19 of 33 regions read its values on the
+//! current layer, and TransactWriteItems' numbers until 11 November 2026, when
+//! all four regions read them on the current layer. A set repeated in a
+//! TransactWriteItems action is still worded as on the older layer, as no
+//! capture since 2026-10-09 has shown it.
 
 #![cfg(feature = "http-server")]
 
@@ -161,8 +164,12 @@ async fn reads_on_the_current_layer_refuse_numbers_bare() {
     assert_eq!(scan, message);
 }
 
+/// BatchWriteItem reads a number as Java's `BigDecimal` does. TransactWriteItems
+/// used to as well, naming a refused expression value's key, in three of four
+/// regions on 2026-10-09; on 11 November 2026 eu-west-2, us-east-1, eu-west-1
+/// and us-west-2 all read its values on the current layer, bare.
 #[tokio::test]
-async fn the_older_layer_reads_numbers_as_big_decimal_and_names_expression_values() {
+async fn the_older_layer_reads_numbers_as_big_decimal_and_transactions_no_longer_do() {
     let url = start().await;
     let batch = refusal(
         &url,
@@ -178,7 +185,7 @@ async fn the_older_layer_reads_numbers_as_big_decimal_and_names_expression_value
             "UpdateExpression": "SET n = :v", "ExpressionAttributeValues": {":v": n("1e2147483647")}}}]}),
     )
     .await;
-    assert_eq!(transaction, for_key(UNDERFLOW, ":v"));
+    assert_eq!(transaction, OVERFLOW);
 }
 
 /// A transaction's expression values are read to the end even after one is

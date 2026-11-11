@@ -9,9 +9,7 @@ use super::{
     TransactWriteItemsRequest,
 };
 use crate::serde_errors::{SERIALIZATION_MARKER, VALIDATION_MARKER};
-use crate::types::{
-    HeldValues, deserialize_held_attributes, deserialize_held_older_expression_values,
-};
+use crate::types::{HeldValues, deserialize_held_attributes};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use std::collections::HashMap;
@@ -59,7 +57,7 @@ struct Put {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "deserialize_held_older_expression_values"
+        deserialize_with = "deserialize_held_attributes"
     )]
     expression_attribute_values: HeldValues,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -85,7 +83,7 @@ struct Update {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "deserialize_held_older_expression_values"
+        deserialize_with = "deserialize_held_attributes"
     )]
     expression_attribute_values: HeldValues,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -109,7 +107,7 @@ struct Delete {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "deserialize_held_older_expression_values"
+        deserialize_with = "deserialize_held_attributes"
     )]
     expression_attribute_values: HeldValues,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -133,7 +131,7 @@ struct ConditionCheck {
     #[serde(
         rename = "ExpressionAttributeValues",
         default,
-        deserialize_with = "deserialize_held_older_expression_values"
+        deserialize_with = "deserialize_held_attributes"
     )]
     expression_attribute_values: HeldValues,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]

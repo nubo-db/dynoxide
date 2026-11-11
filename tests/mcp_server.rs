@@ -5864,9 +5864,10 @@ fn a_map_argument_that_is_not_dynamodb_json_names_the_argument() {
 }
 
 /// The tools without the envelope keep their operation's own layer: GetItem
-/// reads values on the current layer, bare, and the batch, transaction and
-/// PartiQL operations on the older one, which reads `1e2147483647` as Java's
-/// `BigDecimal` does and calls it an underflow (tests/value_layers.rs).
+/// and TransactWriteItems read values on the current layer, bare, and the
+/// batch, TransactGetItems and PartiQL operations on the older one, which
+/// reads `1e2147483647` as Java's `BigDecimal` does and calls it an underflow
+/// (tests/value_layers.rs).
 #[test]
 fn other_tools_read_values_on_their_operations_layer() {
     let mut child = mcp_with_table("Layers");
@@ -5888,9 +5889,8 @@ fn other_tools_read_values_on_their_operations_layer() {
                      supported range";
     let tiny = json!({"N": "1e2147483647"});
     let select = "SELECT * FROM \"Layers\" WHERE pk = ?";
-    // The batch_write_item, transact_write_items Put and transact_get_items
-    // cases read on the older layer only through the tool's entry in the
-    // operation map. The transact_write_items Update case and the three
+    // The batch_write_item and transact_get_items cases read on the older
+    // layer only through the tool's entry in the operation map. The three
     // PartiQL cases get the same answer without it, from the actions
     // themselves, so they pin the tool's answer whatever the map says.
     let older: Vec<(&str, Value, (String, String))> = vec![
@@ -5899,22 +5899,6 @@ fn other_tools_read_values_on_their_operations_layer() {
             json!({"request_items": {"Layers": [
                 {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": tiny}}}
             ]}}),
-            validation_error(underflow),
-        ),
-        (
-            "transact_write_items",
-            json!({"transact_items": [{"Update": {
-                "TableName": "Layers", "Key": {"pk": {"S": "a"}},
-                "UpdateExpression": "SET v = :v",
-                "ExpressionAttributeValues": {":v": tiny}
-            }}]}),
-            named(underflow, ":v"),
-        ),
-        (
-            "transact_write_items",
-            json!({"transact_items": [{"Put": {
-                "TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}
-            }}]}),
             validation_error(underflow),
         ),
         (
@@ -5961,6 +5945,30 @@ fn other_tools_read_values_on_their_operations_layer() {
         "{} of {checked} older-layer answers differ: {mismatches:#?}",
         mismatches.len()
     );
+    // transact_write_items reads its values and its items on the current
+    // layer, bare (captured eu-west-2, us-east-1, eu-west-1 and us-west-2,
+    // 2026-11-11).
+    let overflow = "Number overflow. Attempting to store a number with magnitude larger than \
+                    supported range";
+    for (id, action) in [
+        json!({"Update": {
+            "TableName": "Layers", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET v = :v",
+            "ExpressionAttributeValues": {":v": tiny}
+        }}),
+        json!({"Put": {"TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = call_tool(
+            &mut child,
+            40 + id as u64,
+            "transact_write_items",
+            json!({"transact_items": [action]}),
+        );
+        assert_eq!(tool_error(&resp), validation_error(overflow), "{action}");
+    }
     // And put_item, straight after, is back on the current layer.
     let resp = call_tool(
         &mut child,

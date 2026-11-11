@@ -1440,21 +1440,27 @@ fn validate_key_attr_value(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueLayer {
     /// PutItem, UpdateItem and DeleteItem (inside the envelope), and GetItem,
-    /// BatchGetItem, Query and Scan (bare). Numbers by the stored-number rule, an
-    /// empty one ending `: `; duplicates quoted, in the order described at
-    /// [`duplicate_set_message`]; expression values with no
+    /// BatchGetItem, Query, Scan and TransactWriteItems (bare). Numbers by the
+    /// stored-number rule, an empty one ending `: `; duplicates quoted, in the
+    /// order described at [`duplicate_set_message`]; expression values with no
     /// `ExpressionAttributeValues contains invalid value` wrapper.
     Current,
-    /// BatchWriteItem, TransactWriteItems, TransactGetItems and the PartiQL
-    /// operations. Numbers as Java's `BigDecimal` reads them, an empty
-    /// one with no colon; duplicates unquoted, as sent; expression values
-    /// inside the wrapper.
+    /// BatchWriteItem, TransactGetItems and the PartiQL operations. Numbers as
+    /// Java's `BigDecimal` reads them, an empty one with no colon; duplicates
+    /// unquoted, as sent.
     Older,
 }
 
 impl ValueLayer {
     /// The layer DynamoDB runs `operation` on, for the seams that read a
     /// request knowing only the operation's name.
+    ///
+    /// TransactWriteItems reads its items, keys and expression values on the
+    /// current layer. On 2026-10-09 three of four regions (us-east-1,
+    /// eu-west-1 and us-west-2) still read them on the older one and named a
+    /// refused expression value's key; on 11 November 2026 eu-west-2,
+    /// us-east-1, eu-west-1 and us-west-2 all answered bare, by the
+    /// stored-number rule.
     #[cfg(any(
         feature = "http-server",
         feature = "mcp-server",
@@ -1464,7 +1470,6 @@ impl ValueLayer {
     pub(crate) fn for_operation(operation: &str) -> Self {
         match operation {
             "BatchWriteItem"
-            | "TransactWriteItems"
             | "TransactGetItems"
             | "ExecuteStatement"
             | "BatchExecuteStatement"

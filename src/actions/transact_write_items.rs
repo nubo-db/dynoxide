@@ -60,11 +60,7 @@ pub struct TransactPut {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -82,11 +78,7 @@ pub struct TransactUpdate {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -102,11 +94,7 @@ pub struct TransactDelete {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -122,11 +110,7 @@ pub struct TransactConditionCheck {
     pub condition_expression: String,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -291,22 +275,18 @@ fn table_name_errors(items: &[TransactWriteItem]) -> Vec<String> {
     errors
 }
 
-/// The third stage of the member checks. A bad `ReturnConsumedCapacity` or
-/// `ReturnItemCollectionMetrics` is listed with an item naming no action ahead
-/// of it, or, when every item names one, with every table name refused ahead
-/// of it. With both enums right, an item naming no action is reported on its
-/// own (captured eu-west-2 and us-east-1, 2026-11-11).
+/// The third stage of the member checks. An item naming no action is
+/// reported ahead of a bad `ReturnConsumedCapacity` or
+/// `ReturnItemCollectionMetrics`, and every refused table name is left out
+/// beside it. Otherwise every refused table name is listed, ahead of either
+/// enum (captured eu-west-2 and us-east-1, 2026-11-11).
 fn enum_stage_errors(
     items: &[TransactWriteItem],
     return_consumed_capacity: Option<&str>,
     return_item_collection_metrics: Option<&str>,
 ) -> Option<String> {
-    let empty_action = items.iter().any(|item| action_count(item) == 0);
     let enums = enum_errors(return_consumed_capacity, return_item_collection_metrics);
-    if enums.is_empty() {
-        return empty_action.then(|| crate::validation::envelope_message(EMPTY_ACTION));
-    }
-    let ahead = if empty_action {
+    let ahead = if items.iter().any(|item| action_count(item) == 0) {
         vec![EMPTY_ACTION.to_string()]
     } else {
         table_name_errors(items)
@@ -314,22 +294,28 @@ fn enum_stage_errors(
     crate::validation::format_validation_errors(&[ahead, enums].concat())
 }
 
-/// The second and third stages of the member checks (see [`length_errors`]
-/// and [`enum_stage_errors`]), the ones a value refused in an item comes
-/// after. The request decoder runs them when it holds such a value, and
-/// [`check_request`] runs them first.
+/// The stages of the member checks a value refused in an item comes after:
+/// the token's length and the length of `TransactItems` (see
+/// [`length_errors`]), then the request's enums with an item naming no action
+/// or the table names (see [`enum_stage_errors`]), then whether any item names
+/// more than one action (captured eu-west-2, us-east-1, eu-west-1 and
+/// us-west-2, 2026-11-11). The request decoder runs them when it holds such a
+/// value, and [`check_request`] runs them first.
 fn stages_before_values(request: &TransactWriteItemsRequest) -> Option<String> {
-    length_errors(
-        request.client_request_token.as_deref(),
-        request.transact_items.len(),
-    )
-    .or_else(|| {
-        enum_stage_errors(
-            &request.transact_items,
-            request.return_consumed_capacity.as_deref(),
-            request.return_item_collection_metrics.as_deref(),
-        )
-    })
+    let items = &request.transact_items;
+    length_errors(request.client_request_token.as_deref(), items.len())
+        .or_else(|| {
+            enum_stage_errors(
+                items,
+                request.return_consumed_capacity.as_deref(),
+                request.return_item_collection_metrics.as_deref(),
+            )
+        })
+        .or_else(|| {
+            items.iter().any(|item| action_count(item) > 1).then(|| {
+                "TransactItems can only contain one of Check, Put, Update or Delete".to_string()
+            })
+        })
 }
 
 /// The first action, in request order, whose
@@ -382,12 +368,8 @@ fn first_mode_error(items: &[TransactWriteItem]) -> Option<String> {
 ///
 /// A required member left null comes first, but a request with one never
 /// gets here: it is refused as it is read. So is a value refused in an item,
-/// once the stages [`stages_before_values`] runs have passed: the token's
-/// length and the length of `TransactItems`, then the request's enums and an
-/// item naming no action. Then the first action's
-/// `ReturnValuesOnConditionCheckFailure` that is wrong; then whether any item
-/// names more than one action; then every action's table name, in one
-/// message.
+/// once the stages [`stages_before_values`] runs have passed. Last comes the
+/// first action's `ReturnValuesOnConditionCheckFailure` that is wrong.
 ///
 /// Called at the entry point ahead of the idempotency cache as well as at the
 /// start of `execute_cached`. A same-token replay never reaches
@@ -404,19 +386,6 @@ pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
     if let Some(msg) = first_mode_error(items) {
         return refuse(crate::validation::envelope_message(&msg));
     }
-
-    // No item may name more than one action, checked for every item before
-    // any table name is.
-    if items.iter().any(|item| action_count(item) > 1) {
-        return refuse(
-            "TransactItems can only contain one of Check, Put, Update or Delete".to_string(),
-        );
-    }
-
-    if let Some(msg) = crate::validation::format_validation_errors(&table_name_errors(items)) {
-        return refuse(msg);
-    }
-
     Ok(())
 }
 
@@ -1371,15 +1340,15 @@ mod tests {
     use super::*;
 
     /// The public action types' own reader stops at the first expression value
-    /// refused for its number and names its key, as it did before the request
-    /// reader came to share its wording.
+    /// refused for its number and refuses it bare, as the request reader does
+    /// on the current layer (captured eu-west-2, us-east-1, eu-west-1 and
+    /// us-west-2, 2026-11-11).
     #[test]
     fn the_derived_read_stops_at_the_first_refused_expression_value() {
         let values = serde_json::json!({":a": {"N": "xyz"}, ":b": {"N": "abc"}});
         let expected = format!(
-            "{}ExpressionAttributeValues contains invalid value: The parameter cannot be \
-             converted to a numeric value: xyz for key :a",
-            crate::serde_errors::VALIDATION_MARKER
+            "{}The parameter cannot be converted to a numeric value: xyz",
+            crate::serde_errors::REQUEST_VALIDATION_MARKER
         );
         let put = serde_json::json!({
             "TableName": "t",

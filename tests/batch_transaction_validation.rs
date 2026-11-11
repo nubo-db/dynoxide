@@ -217,8 +217,11 @@ fn request_member_errors_are_reported_together() {
     assert!(!stored(&db, "t"));
 }
 
+/// BatchWriteItem and TransactGetItems check a table name after the request's
+/// enums. TransactWriteItems checks it after the token and lists it with a bad
+/// enum.
 #[test]
-fn a_table_name_is_checked_after_the_request_enums_and_the_token() {
+fn a_table_name_follows_the_enums_except_in_a_transaction_write_which_lists_them_together() {
     let db = setup();
     let token = "x".repeat(37);
 
@@ -230,9 +233,11 @@ fn a_table_name_is_checked_after_the_request_enums_and_the_token() {
         .unwrap_err();
     assert_eq!(validation_message(err), one(RICM), "BatchWriteItem");
 
-    // A refused table name is listed with a bad enum, the name first
-    // (captured eu-west-2 and us-east-1, 2026-11-11, where the name was too
-    // short).
+    // A refused table name is listed with a bad enum, the name first: "TW bad
+    // name put + RCC" and "TW bad name + RICM" in the 2026-10-09
+    // valid-txbatch capture, where eu-west-2 and eu-north-1 listed both and
+    // the ten other regions the enum alone, and the same requests in
+    // eu-west-2 and us-east-1 on 2026-11-11, which both listed both.
     let bad_put =
         serde_json::json!([{"Put": {"TableName": "bad!name", "Item": {"pk": {"S": "a"}}}}]);
     let bad_name = bad_name_message("bad!name", "transactItems.1.member.put.tableName");
@@ -739,13 +744,20 @@ fn a_transaction_actions_return_values_on_condition_check_failure_is_a_member_er
         one(TOKEN_TOO_LONG),
         "behind the token, which is reported alone"
     );
+    // Behind a malformed table name: "TW Put RVOCCF + bad name" in eu-west-2
+    // in the 2026-10-09 valid-order capture (the other regions then gave the
+    // mode), and a table name ahead of an item naming two actions ahead of a
+    // mode in all four regions on 2026-11-11 (seventh round rows 11 and 12).
     assert_eq!(
         write(serde_json::json!({"TransactItems": [
             {"Put": {"TableName": "bad!name", "Item": {"pk": {"S": "a"}},
                 "ReturnValuesOnConditionCheckFailure": "BOGUS"}}
         ]})),
-        one(&rvoccf("1.member.put", "BOGUS")),
-        "ahead of a malformed table name"
+        one(&bad_name_message(
+            "bad!name",
+            "transactItems.1.member.put.tableName"
+        )),
+        "behind a malformed table name"
     );
     // An empty action wins whichever item comes first (third round rows 1
     // and 2).

@@ -871,51 +871,6 @@ pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
     with_value_layer(crate::validation::ValueLayer::Older, read)
 }
 
-/// Deserialise an operation's `ExpressionAttributeValues` on the older
-/// validation layer, which refuses a number it can't store inside the
-/// `ExpressionAttributeValues contains invalid value: ... for key :k` wrapper
-/// (TransactWriteItems in three of four regions, Scan in seven of ten;
-/// 2026-10-09). Every other value error passes through as it is.
-pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    let Some(raw) =
-        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
-    else {
-        return Ok(None);
-    };
-    let mut values = HashMap::with_capacity(raw.len());
-    for (key, value) in raw {
-        let value = read_older_expression_value(&key, value).map_err(de::Error::custom)?;
-        values.insert(key, value);
-    }
-    Ok(Some(values))
-}
-
-/// One `ExpressionAttributeValues` entry read on the older layer, or the
-/// message its read fails with: a number refused inside the wrapper naming
-/// `key`, any other refusal as it was raised.
-fn read_older_expression_value(
-    key: &str,
-    value: serde_json::Value,
-) -> std::result::Result<AttributeValue, String> {
-    with_value_layer(crate::validation::ValueLayer::Older, || {
-        serde_json::from_value::<AttributeValue>(value)
-    })
-    .map_err(|e| {
-        use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
-        let msg = e.to_string();
-        match value_refusal(&msg) {
-            ValueRefusal::Number(inner) => format!(
-                "{}{}",
-                crate::serde_errors::VALIDATION_MARKER,
-                named_value_refusal(inner, key)
-            ),
-            _ => msg,
-        }
-    })
-}
-
 /// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
 /// NULL refused as it was parsed (a string that reads as false, or false
 /// beside another member) the way DynamoDB does: `ExpressionAttributeValues
@@ -1139,10 +1094,10 @@ fn hold<E: de::Error>(message: String) -> std::result::Result<String, E> {
     }
 }
 
-/// Deserialise an `Item` or a `Key` into [`HeldValues`], one value at a time
-/// in the order written. Every value is read through the one `from_value`
-/// call below, with its attribute's name in hand, so that is where a refusal
-/// that names the attribute belongs.
+/// Deserialise an `Item`, a `Key` or `ExpressionAttributeValues` into
+/// [`HeldValues`], one value at a time in the order written. Every value is
+/// read through the one `from_value` call below, with its attribute's name or
+/// placeholder in hand, so that is where a refusal that names it belongs.
 pub(crate) fn deserialize_held_attributes<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<HeldValues, D::Error> {
@@ -1195,37 +1150,6 @@ pub(crate) fn deserialize_held_attributes<'de, D: Deserializer<'de>>(
     }
 
     deserializer.deserialize_option(Attributes)
-}
-
-/// Deserialise `ExpressionAttributeValues` as
-/// [`deserialize_older_expression_values`] does, into [`HeldValues`]: every
-/// entry is read, so one of the wrong JSON type fails the read even after an
-/// earlier one was refused for its value.
-pub(crate) fn deserialize_held_older_expression_values<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<HeldValues, D::Error> {
-    let Some(raw) =
-        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
-    else {
-        return Ok(HeldValues::default());
-    };
-    let mut values = HashMap::with_capacity(raw.len());
-    let mut refusal = None;
-    for (key, value) in raw {
-        match read_older_expression_value(&key, value) {
-            Ok(value) => {
-                values.insert(key, value);
-            }
-            Err(message) => {
-                let held = hold::<D::Error>(message)?;
-                refusal.get_or_insert(held);
-            }
-        }
-    }
-    Ok(HeldValues {
-        values: Some(values),
-        refusal,
-    })
 }
 
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's

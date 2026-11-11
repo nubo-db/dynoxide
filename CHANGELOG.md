@@ -186,12 +186,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TransactItems` are reported on their own, in DynamoDB's older wording with
   no value or list echoed (`Value at 'ClientRequestToken' ...`). A bad
   `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics` comes next,
-  listed with an item that has no action and any table name refused. An item
-  with no action now gets DynamoDB's `Value '' at 'transactItems'` message.
-  Only after those is a number refused in an item reported, and then the
-  first action's bad `ReturnValuesOnConditionCheckFailure` rather than every
-  one. ExecuteTransaction lists the empty token first, and a missing
-  `TransactStatements` is `Value null at 'transactStatements'`
+  listed with an item that has no action, or with any table name refused when
+  every item has one. An item with no action now gets DynamoDB's
+  `Value '' at 'transactItems'` message. Only after those is a number refused
+  in an item reported, one in an item or key ahead of one in the expression
+  values, and then the first action's bad
+  `ReturnValuesOnConditionCheckFailure` rather than every one. An item given
+  as null is refused with `TransactItems can't be null`, and an action given
+  as a list with a `SerializationException`. The MCP `transact_write_items`
+  tool reads its arguments the same way. ExecuteTransaction lists the empty
+  token first, and a missing `TransactStatements` is
+  `Value null at 'transactStatements'`
   ([#318](https://github.com/nubo-db/dynoxide/issues/318)).
 
 ## [1.6.0] - 2026-11-07

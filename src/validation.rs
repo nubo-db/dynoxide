@@ -339,8 +339,9 @@ pub(crate) fn envelope_message(msg: &str) -> String {
 /// skipped sizing its indexes. Every operation that takes the parameter now
 /// asks here: those six, `SearchVectors`, the three PartiQL operations, and
 /// `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
-/// `TransactWriteItems`, which check it in their `execute` once their own
-/// request-level constraints have passed.
+/// `TransactWriteItems`. The batch operations and TransactGetItems check it in
+/// their `execute` once their own request-level constraints have passed;
+/// TransactWriteItems lists it in the stages of its request check.
 ///
 /// Callers that collect several failures push the message onto their own errors
 /// vec, so the multi-error envelope they report is unchanged.

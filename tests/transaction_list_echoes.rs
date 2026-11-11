@@ -359,4 +359,37 @@ fn an_echoed_map_is_sized_to_its_entries() {
         echoed_names(&message, start),
         ["bsol", "pk", "btgp", "byko", "bvrn"]
     );
+
+    // So is ExpressionAttributeNames, echoed here in a get list.
+    let names: serde_json::Map<String, Value> = sent
+        .iter()
+        .map(|name| (format!("#{name}"), json!(name)))
+        .collect();
+    let projection = sent
+        .iter()
+        .map(|name| format!("#{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut gets = vec![json!({"Get": {
+        "TableName": "t",
+        "Key": {"pk": {"S": "n"}},
+        "ProjectionExpression": projection,
+        "ExpressionAttributeNames": names
+    }})];
+    gets.extend(
+        (0..100).map(|i| json!({"Get": {"TableName": "t", "Key": {"pk": {"S": format!("g{i}")}}}})),
+    );
+    let message = db
+        .transact_get_items(
+            serde_json::from_value::<TransactGetItemsRequest>(json!({"TransactItems": gets}))
+                .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    let start =
+        message.find("expressionAttributeNames={").unwrap() + "expressionAttributeNames={".len();
+    assert_eq!(
+        echoed_names(&message, start),
+        ["#bvrn", "#bsol", "#btgp", "#byko", "#pk"]
+    );
 }

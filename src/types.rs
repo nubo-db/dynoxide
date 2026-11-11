@@ -886,28 +886,34 @@ pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'d
     };
     let mut values = HashMap::with_capacity(raw.len());
     for (key, value) in raw {
-        let read = with_value_layer(crate::validation::ValueLayer::Older, || {
-            serde_json::from_value::<AttributeValue>(value)
-        });
-        match read {
-            Ok(av) => {
-                values.insert(key, av);
-            }
-            Err(e) => {
-                use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
-                let msg = e.to_string();
-                return Err(de::Error::custom(match value_refusal(&msg) {
-                    ValueRefusal::Number(inner) => format!(
-                        "{}{}",
-                        crate::serde_errors::VALIDATION_MARKER,
-                        named_value_refusal(inner, &key)
-                    ),
-                    _ => msg,
-                }));
-            }
-        }
+        let value = read_older_expression_value(&key, value).map_err(de::Error::custom)?;
+        values.insert(key, value);
     }
     Ok(Some(values))
+}
+
+/// One `ExpressionAttributeValues` entry read on the older layer, or the
+/// message its read fails with: a number refused inside the wrapper naming
+/// `key`, any other refusal as it was raised.
+fn read_older_expression_value(
+    key: &str,
+    value: serde_json::Value,
+) -> std::result::Result<AttributeValue, String> {
+    with_value_layer(crate::validation::ValueLayer::Older, || {
+        serde_json::from_value::<AttributeValue>(value)
+    })
+    .map_err(|e| {
+        use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
+        let msg = e.to_string();
+        match value_refusal(&msg) {
+            ValueRefusal::Number(inner) => format!(
+                "{}{}",
+                crate::serde_errors::VALIDATION_MARKER,
+                named_value_refusal(inner, key)
+            ),
+            _ => msg,
+        }
+    })
 }
 
 /// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
@@ -1087,6 +1093,139 @@ pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
     }
 
     deserializer.deserialize_option(List)
+}
+
+/// A map of attribute values read off the wire, such as a transaction
+/// action's `Item`, `Key` or `ExpressionAttributeValues`, with the first value
+/// DynamoDB refuses held back, as [`HeldParameters`] holds a parameter. A
+/// value of the wrong JSON type still fails the read there and then, wherever
+/// it sits in the map, as DynamoDB fails the request ahead of its member
+/// checks. The request decoder raises the refusal once those checks pass.
+#[derive(Debug, Default)]
+pub(crate) struct HeldValues {
+    /// The values read, each refused one left out. `None` when the map was
+    /// left out or given as null.
+    pub(crate) values: Option<HashMap<String, AttributeValue>>,
+    /// The first refusal, as the reader raised it, marker and all.
+    pub(crate) refusal: Option<String>,
+}
+
+impl HeldValues {
+    /// Whether the map was left out or given as null.
+    pub(crate) fn is_null(&self) -> bool {
+        self.values.is_none() && self.refusal.is_none()
+    }
+
+    /// The values, this map's refusal kept in `refusal` if none is yet.
+    pub(crate) fn take(
+        self,
+        refusal: &mut Option<String>,
+    ) -> Option<HashMap<String, AttributeValue>> {
+        if let Some(held) = self.refusal {
+            refusal.get_or_insert(held);
+        }
+        self.values
+    }
+}
+
+/// Sort the message one value's read failed with: a refusal DynamoDB raises
+/// once the request's members pass is returned to be held, and anything else,
+/// a value of the wrong JSON type, fails the read.
+fn hold<E: de::Error>(message: String) -> std::result::Result<String, E> {
+    if crate::serde_errors::is_validation_refusal(&message) {
+        Ok(message)
+    } else {
+        Err(E::custom(message))
+    }
+}
+
+/// Deserialise an `Item` or a `Key` into [`HeldValues`], one value at a time
+/// in the order written. Every value is read through the one `from_value`
+/// call below, with its attribute's name in hand, so that is where a refusal
+/// that names the attribute belongs.
+pub(crate) fn deserialize_held_attributes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HeldValues, D::Error> {
+    struct Attributes;
+
+    impl<'de> de::Visitor<'de> for Attributes {
+        type Value = HeldValues;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a map")
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
+            Ok(HeldValues::default())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
+            Ok(HeldValues::default())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<HeldValues, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<HeldValues, A::Error> {
+            let mut values = HashMap::with_capacity(map.size_hint().unwrap_or(0).min(256));
+            let mut refusal = None;
+            while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
+                match serde_json::from_value::<AttributeValue>(value) {
+                    Ok(value) => {
+                        values.insert(name, value);
+                    }
+                    Err(e) => {
+                        let held = hold::<A::Error>(e.to_string())?;
+                        refusal.get_or_insert(held);
+                    }
+                }
+            }
+            Ok(HeldValues {
+                values: Some(values),
+                refusal,
+            })
+        }
+    }
+
+    deserializer.deserialize_option(Attributes)
+}
+
+/// Deserialise `ExpressionAttributeValues` as
+/// [`deserialize_older_expression_values`] does, into [`HeldValues`]: every
+/// entry is read, so one of the wrong JSON type fails the read even after an
+/// earlier one was refused for its value.
+pub(crate) fn deserialize_held_older_expression_values<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HeldValues, D::Error> {
+    let Some(raw) =
+        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
+    else {
+        return Ok(HeldValues::default());
+    };
+    let mut values = HashMap::with_capacity(raw.len());
+    let mut refusal = None;
+    for (key, value) in raw {
+        match read_older_expression_value(&key, value) {
+            Ok(value) => {
+                values.insert(key, value);
+            }
+            Err(message) => {
+                let held = hold::<D::Error>(message)?;
+                refusal.get_or_insert(held);
+            }
+        }
+    }
+    Ok(HeldValues {
+        values: Some(values),
+        refusal,
+    })
 }
 
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's

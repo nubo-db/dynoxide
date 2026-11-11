@@ -2,12 +2,13 @@
 //! length at both ends, and where its refusal stands among the request's other
 //! member errors.
 //!
-//! TransactWriteItems checks its members in three stages and answers with the
-//! first that finds anything. A required member left null comes first, listed
-//! in the newer form with the token after it (`Value '' at
-//! 'clientRequestToken'`). Then the token's length and `TransactItems`' length,
-//! in the older form with no value echoed (`Value at 'ClientRequestToken'`),
-//! reported alone. Then everything else. ExecuteTransaction lists the token
+//! TransactWriteItems checks its members in stages and answers with the first
+//! that finds anything. A required member left null comes first, listed in the
+//! newer form with the token after it (`Value '' at 'clientRequestToken'`).
+//! Then the token's length and `TransactItems`' length, in the older form with
+//! no value echoed (`Value at 'ClientRequestToken'`), reported alone. Then the
+//! request's enums with an item naming no action, then a value refused in an
+//! item, then the rest. ExecuteTransaction lists the token
 //! first among its member errors, always in the newer form. A token of a
 //! single space or 36 characters is accepted.
 //!
@@ -148,6 +149,18 @@ async fn the_second_round_answers_as_dynamodb_did() {
 async fn the_third_round_answers_as_dynamodb_did() {
     let url = start_server().await;
     assert_rows(&url, "third round", THIRD_ROUND).await;
+}
+
+#[tokio::test]
+async fn the_fourth_round_answers_as_dynamodb_did() {
+    let url = start_server().await;
+    assert_rows(&url, "fourth round", FOURTH_ROUND).await;
+}
+
+#[tokio::test]
+async fn the_fifth_round_answers_as_dynamodb_did() {
+    let url = start_server().await;
+    assert_rows(&url, "fifth round", FIFTH_ROUND).await;
 }
 
 /// The token at its lengths and beside the request's other members, with the
@@ -754,5 +767,159 @@ const THIRD_ROUND: &[Row] = &[
         "TransactWriteItems",
         r#"{"TransactItems": [{"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}], "ReturnConsumedCapacity": "BAD"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'x' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+    ),
+];
+
+/// Where a refused `ReturnValuesOnConditionCheckFailure` stands among an
+/// action's null members, and what an item naming no action leaves out.
+const FOURTH_ROUND: &[Row] = &[
+    (
+        1,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"Item": {"pk": {"S": "a"}}, "ReturnValuesOnConditionCheckFailure": "BAD"}}, {"Put": {"Item": {"pk": {"S": "a"}}, "ReturnValuesOnConditionCheckFailure": "BAD"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"4 validation errors detected: Value 'BAD' at 'transactItems.1.member.put.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must not be null; Value 'BAD' at 'transactItems.2.member.put.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.2.member.put.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        2,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ReturnValuesOnConditionCheckFailure": "BAD"}}, {"Put": {"Item": {"pk": {"S": "a"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'BAD' at 'transactItems.1.member.put.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.2.member.put.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        3,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"ReturnValuesOnConditionCheckFailure": "BAD"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"3 validation errors detected: Value null at 'transactItems.1.member.put.item' failed to satisfy constraint: Member must not be null; Value 'BAD' at 'transactItems.1.member.put.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        4,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Update": {"ReturnValuesOnConditionCheckFailure": "BAD"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"4 validation errors detected: Value 'BAD' at 'transactItems.1.member.update.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.1.member.update.updateExpression' failed to satisfy constraint: Member must not be null; Value null at 'transactItems.1.member.update.key' failed to satisfy constraint: Member must not be null; Value null at 'transactItems.1.member.update.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        5,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"ConditionCheck": {"ReturnValuesOnConditionCheckFailure": "BAD"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"4 validation errors detected: Value null at 'transactItems.1.member.conditionCheck.conditionExpression' failed to satisfy constraint: Member must not be null; Value 'BAD' at 'transactItems.1.member.conditionCheck.returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]; Value null at 'transactItems.1.member.conditionCheck.key' failed to satisfy constraint: Member must not be null; Value null at 'transactItems.1.member.conditionCheck.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        6,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{}, {"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}], "ReturnConsumedCapacity": "BAD"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+    ),
+    (
+        7,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}, {}], "ReturnConsumedCapacity": "BAD"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+    ),
+    (
+        8,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "bad!name", "Item": {"pk": {"S": "a"}}}}], "ReturnConsumedCapacity": "BAD"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'bad!name' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "bad!name", "Item": {"pk": {"S": "a"}}}}], "ReturnItemCollectionMetrics": "BAD"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'bad!name' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+; Value 'BAD' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"}"#,
+    ),
+    (
+        10,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'x' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"#,
+    ),
+];
+
+/// A value refused in an item or key beside one refused in the expression
+/// values, and an action or item given as a list or null.
+const FIFTH_ROUND: &[Row] = &[
+    (
+        1,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        2,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}, "Item": {"pk": {"N": "abc"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        3,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Update": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"N": "abc"}}, "UpdateExpression": "SET a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        4,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Delete": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"N": "abc"}}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        5,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"ConditionCheck": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"N": "abc"}}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        6,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}}}, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "xyz"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        7,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": []}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        8,
+        "TransactWriteItems",
+        r#"{"TransactItems": [[]]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"}"#,
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r#"{"TransactItems": [null]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"TransactItems can't be null"}"#,
+    ),
+    (
+        10,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": null}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"}"#,
+    ),
+    (
+        11,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{}, {"Put": {"Item": {"pk": {"S": "a"}}}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'transactItems.2.member.put.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        12,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"Item": {"pk": {"S": "a"}}}}, {}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must not be null"}"#,
+    ),
+    (
+        13,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}], "ClientRequestToken": ""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'ClientRequestToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+    ),
+    (
+        14,
+        "TransactWriteItems",
+        r#"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}], "ClientRequestToken": "", "ReturnConsumedCapacity": "BAD"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'ClientRequestToken' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
     ),
 ];

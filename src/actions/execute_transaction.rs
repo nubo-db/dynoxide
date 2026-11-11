@@ -275,17 +275,24 @@ fn violations_of(
 ) -> Vec<String> {
     let mut violations = Vec::new();
     violations.extend(crate::token_constraint_error(token));
-    let Some(statements) = statements else {
-        violations.push(
+    match statements {
+        None => violations.push(
             "Value null at 'transactStatements' failed to satisfy constraint: Member must not \
              be null"
                 .to_string(),
-        );
-        violations.extend(crate::validation::return_consumed_capacity_rejection(
-            return_consumed_capacity,
-        ));
-        return violations;
-    };
+        ),
+        Some(statements) => violations.extend(statement_violations(statements)),
+    }
+    violations.extend(crate::validation::return_consumed_capacity_rejection(
+        return_consumed_capacity,
+    ));
+    violations
+}
+
+/// The statement list's own violations: its length, then each statement's
+/// mode, text and parameters by index.
+fn statement_violations(statements: &[ParameterizedStatement]) -> Vec<String> {
+    let mut violations = Vec::new();
     if statements.is_empty() {
         violations.push(
             "Value '[]' at 'transactStatements' failed to satisfy constraint: Member must \
@@ -319,9 +326,6 @@ fn violations_of(
             &format!("{member}.parameters"),
         ));
     }
-    violations.extend(crate::validation::return_consumed_capacity_rejection(
-        return_consumed_capacity,
-    ));
     violations
 }
 

@@ -181,6 +181,35 @@ async fn the_older_layer_reads_numbers_as_big_decimal_and_names_expression_value
     assert_eq!(transaction, for_key(UNDERFLOW, ":v"));
 }
 
+/// A transaction's expression values are read to the end even after one is
+/// refused for its number, so a later value of the wrong JSON type still fails
+/// the request as it is read, as it does on its own.
+#[tokio::test]
+async fn a_refused_expression_value_does_not_hide_a_later_one_of_the_wrong_type() {
+    let url = start().await;
+    let alone = send(
+        &url,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {"TableName": "Vlt", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :b", "ExpressionAttributeValues": {":b": {"S": 5}}}}]}),
+    )
+    .await;
+    let after_a_refusal = send(
+        &url,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {"TableName": "Vlt", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :a, m = :b",
+            "ExpressionAttributeValues": {":a": n("1e2147483647"), ":b": {"S": 5}}}}]}),
+    )
+    .await;
+    assert_eq!(alone.0, 400);
+    assert_eq!(
+        alone.1["__type"],
+        "com.amazon.coral.service#SerializationException"
+    );
+    assert_eq!(after_a_refusal, alone);
+}
+
 #[tokio::test]
 async fn the_current_layer_quotes_duplicates_in_its_own_order() {
     let url = start().await;

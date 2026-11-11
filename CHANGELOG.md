@@ -129,11 +129,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute_exists(n) AND 5` is refused for its boolean bound. These used to
   fail to parse. `size` now refuses a number, a boolean or a null operand, as
   a literal, a parameter, a call or another `size`, where it used to match
-  nothing. A refusal from inside a call or a `size` is reported ahead of the
-  operator it stands under, and the first condition written that is refused
-  is the one reported, so `size(true) < attribute_exists(n)` is refused for
-  size's boolean. Captured against eu-west-2 on 11 November 2026, and against
-  us-east-1 for all but the order of refusals ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+  nothing. Captured against eu-west-2 and us-east-1 on 11 November 2026
+  ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- A PartiQL WHERE clause is checked in one pass, in the order it's written,
+  and the first fault met is the one reported. Inside a condition each
+  operand comes before its operator, and an operand's own operands before it,
+  so `size(true) < attribute_exists(n)` is refused for size's boolean and
+  `attribute_exists(size(s, s))` for size's operand count. A wrong operand
+  count, a type a call or operator can't take, an operand that isn't
+  distinct, an IN with more than 100 operands and a parameter of the wrong
+  type all count as faults in the same pass. Before, some of these were
+  reported ahead of others wherever they were written.
+- That pass is the statement's own validation. It comes after the parameter
+  count and a write naming an index, and after a read of an index keyed on
+  more than one attribute outside a transaction, and before the table, the
+  key, ORDER BY and RETURNING are looked at. A refused `set_add` or
+  `set_delete` comes after it. In BatchExecuteStatement a fault is that
+  member's own error, and the other members run; the member is no longer
+  counted for the duplicate, mixed read and write, or missing key checks. In
+  ExecuteTransaction it is `Validation failed in TransactStatements[i]`,
+  ahead of the same-item check and never a cancellation reason.
+- A PartiQL UPDATE sent with a `NextToken` runs as it would without one,
+  where it used to be refused. This and the two entries above were captured
+  against eu-west-2 on 11 November 2026, in rounds five to nine of the
+  capture; rounds one to four went to us-east-1 as well, and the regions
+  agreed ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 
 ## [1.6.0] - 2026-11-07
 

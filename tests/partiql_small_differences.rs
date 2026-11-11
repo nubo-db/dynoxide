@@ -1,17 +1,17 @@
-//! Four small differences between a PartiQL statement here and on DynamoDB:
-//! an UPDATE of a key attribute through a path, `ConsistentRead` written as a
-//! string, the ORDER BY refusal for a quoted name, and a condition function
-//! used as an operand.
+//! Small differences between a PartiQL statement here and on DynamoDB: an
+//! UPDATE of a key attribute through a path, `ConsistentRead` written as a
+//! string, the ORDER BY refusal for a quoted name, a condition function used
+//! as an operand, and the order of the statement's own checks.
 //!
 //! Each `const` holds requests sent to DynamoDB on 11 November 2026, in the
 //! order they were sent, with the answer DynamoDB gave each one, against an
-//! on-demand table keyed `pk` (S) and `sk` (S). They are data captured from
-//! DynamoDB, not written by hand. The rounds of requests sent before round
-//! six were captured in eu-west-2 and us-east-1, which gave the same answers;
-//! round six was captured in eu-west-2. A test replays its rows in order
-//! against a new server and compares each answer with DynamoDB's as JSON, so
-//! key order makes no difference, along with the HTTP status: 400 for an
-//! error and 200 otherwise.
+//! on-demand table keyed `pk` (S) and `sk` (S), or the indexed table round
+//! nine names. They are data captured from DynamoDB, not written by hand.
+//! Rounds one to four were captured in eu-west-2 and us-east-1, which gave
+//! the same answers; rounds five to nine in eu-west-2. A test replays its
+//! rows in order against a new server and compares each answer with
+//! DynamoDB's as JSON, so key order makes no difference, along with the HTTP
+//! status: 400 for an error and 200 otherwise.
 
 #![cfg(feature = "http-server")]
 
@@ -21,28 +21,28 @@ use dynoxide::actions::create_table::CreateTableRequest;
 /// An operation, its request body and DynamoDB's answer.
 type Row = (&'static str, &'static str, &'static str);
 
-const TABLE: &str = "_capture_20261111_230_t";
+/// A row left out of the replays: an operation, its request body, DynamoDB's
+/// answer and the answer it gets here today.
+type LeftOut = (&'static str, &'static str, &'static str, &'static str);
+
+/// The table rounds one to eight run against.
+const TABLE: &str = r#"{"TableName": "_capture_20261111_230_t", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}], "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}], "BillingMode": "PAY_PER_REQUEST"}"#;
+
+/// The table round nine runs against, as it was created on DynamoDB: a key of
+/// `id` and `sk`, an index `single` and an index `hh_rr` keyed on two
+/// attributes each side.
+const INDEXED_TABLE: &str = r#"{"TableName": "_capture_20261111_230_m", "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}, {"AttributeName": "g", "AttributeType": "S"}, {"AttributeName": "h1", "AttributeType": "S"}, {"AttributeName": "h2", "AttributeType": "S"}, {"AttributeName": "r1", "AttributeType": "S"}, {"AttributeName": "r2", "AttributeType": "S"}], "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}], "BillingMode": "PAY_PER_REQUEST", "GlobalSecondaryIndexes": [{"IndexName": "single", "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}, {"AttributeName": "r1", "KeyType": "RANGE"}], "Projection": {"ProjectionType": "ALL"}}, {"IndexName": "hh_rr", "KeySchema": [{"AttributeName": "h1", "KeyType": "HASH"}, {"AttributeName": "h2", "KeyType": "HASH"}, {"AttributeName": "r1", "KeyType": "RANGE"}, {"AttributeName": "r2", "KeyType": "RANGE"}], "Projection": {"ProjectionType": "ALL"}}]}"#;
 
 async fn start_server() -> String {
+    start_server_with(TABLE).await
+}
+
+async fn start_server_with(table: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let db = Database::memory().unwrap();
-    db.create_table(
-        serde_json::from_value::<CreateTableRequest>(serde_json::json!({
-            "TableName": TABLE,
-            "KeySchema": [
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "sk", "KeyType": "RANGE"}
-            ],
-            "AttributeDefinitions": [
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"}
-            ],
-            "BillingMode": "PAY_PER_REQUEST"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    db.create_table(serde_json::from_str::<CreateTableRequest>(table).unwrap())
+        .unwrap();
     tokio::spawn(async move {
         dynoxide::server::serve_on(listener, db).await;
     });
@@ -82,7 +82,12 @@ fn status_of(expected: &serde_json::Value) -> u16 {
 /// Send every row in order to a new server, and fail listing each answer that
 /// differs from DynamoDB's.
 async fn replay(rows: &[Row]) {
-    let url = start_server().await;
+    replay_on(TABLE, rows).await;
+}
+
+/// [`replay`] against a server holding `table`.
+async fn replay_on(table: &str, rows: &[Row]) {
+    let url = start_server_with(table).await;
     let mut wrong = Vec::new();
     for &(operation, body, expected) in rows {
         let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
@@ -975,13 +980,80 @@ async fn a_refusal_inside_an_operand_comes_before_its_operator() {
     replay(ROUND_SIX).await;
 }
 
+/// The statement checks are one pass over the WHERE clause, and they are the
+/// statement's own validation. In BatchExecuteStatement a refusal is that
+/// member's error: the other members run, and the member takes no part in
+/// the duplicate, the mixed read and write, or the whole-key checks. In
+/// ExecuteTransaction it is `Validation failed in TransactStatements[i]`,
+/// ahead of the same-item check, never a cancellation reason. On one
+/// statement the first fault written is reported, an operand's ahead of the
+/// operator it stands under, whether it is a type, a count, an operand that
+/// isn't distinct or an IN with too many.
+#[tokio::test]
+async fn the_operand_checks_are_the_statement_s_own_validation() {
+    replay(ROUND_SEVEN).await;
+}
+
+/// Inside one condition the operands are checked in the order written, each
+/// operand's own operands first, and then the operator, through NOT, OR and
+/// brackets. The parameter count comes first; the table, the key, ORDER BY,
+/// a key update and RETURNING all come after.
+#[tokio::test]
+async fn operand_faults_are_reported_in_the_order_written() {
+    replay(ROUND_EIGHT).await;
+}
+
+/// A write naming an index is refused first, and a read of an index keyed on
+/// more than one attribute a side, outside a transaction, before the
+/// operands are checked; a read of another index, or one that doesn't exist,
+/// after. A refused `set_add` comes after the operands and the parameter
+/// count. An UPDATE sent with a NextToken runs.
+#[tokio::test]
+async fn the_index_and_set_clause_checks_sit_around_the_operand_checks() {
+    replay_on(INDEXED_TABLE, ROUND_NINE).await;
+}
+
+/// Two more rows are left out, for causes of their own. `SET z = size(true)`
+/// doesn't parse here and does on DynamoDB. `attribute_type(n, s)` names the
+/// types it would take in the order of a Java hash set, which differs from
+/// host to host: the one held here was eu-west-2's on 9 October 2026, and
+/// eu-west-2 gave another on 11 November, so the types must be the same ones
+/// in any order. Each still gives the answer it gives today.
+#[tokio::test]
+async fn two_rows_with_causes_of_their_own_are_left_out() {
+    let url = start_server().await;
+    let (status, _) = answer(&url, ROUND_EIGHT[0].0, ROUND_EIGHT[0].1).await;
+    assert_eq!(status, 200);
+    let mut wrong = Vec::new();
+    for row in LEFT_OUT_OTHER {
+        wrong.extend(left_out_answer(&url, row).await);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let types = |answer: &str| {
+        let message = serde_json::from_str::<serde_json::Value>(answer).unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (head, set) = message.split_once('{').unwrap();
+        let mut set: Vec<String> = set
+            .trim_end_matches('}')
+            .split(',')
+            .map(String::from)
+            .collect();
+        set.sort();
+        (head.to_string(), set)
+    };
+    let (_, _, dynamodb, today) = LEFT_OUT_OTHER[1];
+    assert_eq!(types(today), types(dynamodb));
+}
+
 /// The captured rows left out of the replays above. `begins_with` and
 /// `contains` take only a path and a plain value here, so these answer
 /// differently: on DynamoDB either can stand as an operand, take a call as an
 /// argument or a first operand that isn't a path, and `begins_with` refuses a
 /// first operand by its type. That is one difference with one cause, larger
 /// than these, and is left for its own fix. Each is still sent, after the item
-/// its round put, and must answer with a 200 or a 400 that differs from
+/// its round put, and must give the answer it gives today, which differs from
 /// DynamoDB's.
 #[tokio::test]
 async fn only_begins_with_and_contains_rows_are_left_out() {
@@ -996,25 +1068,41 @@ async fn only_begins_with_and_contains_rows_are_left_out() {
         let url = start_server().await;
         let (status, _) = answer(&url, put.0, put.1).await;
         assert_eq!(status, 200, "{}", put.1);
-        for &(operation, body, expected) in rows {
+        for row in rows {
             count += 1;
             assert!(
-                body.contains("begins_with(") || body.contains("contains("),
-                "{body}"
+                row.1.contains("begins_with(") || row.1.contains("contains("),
+                "{}",
+                row.1
             );
-            let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
-            let (status, got) = answer(&url, operation, body).await;
-            if status != 200 && status != 400 {
-                wrong.push(format!("{body}\n  answered {status} {got}"));
-            } else if got == expected && status == status_of(&expected) {
-                wrong.push(format!(
-                    "{body}\n  now matches DynamoDB: move it into the replays above"
-                ));
-            }
+            wrong.extend(left_out_answer(&url, row).await);
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert_eq!(count, 35);
+}
+
+/// Why a left-out row's answer is wrong, if it is: it now matches DynamoDB's,
+/// and belongs in the replays, or it has changed from the answer it gave.
+async fn left_out_answer(
+    url: &str,
+    &(operation, body, dynamodb, today): &LeftOut,
+) -> Option<String> {
+    let dynamodb: serde_json::Value = serde_json::from_str(dynamodb).unwrap();
+    let today: serde_json::Value = serde_json::from_str(today).unwrap();
+    let (status, got) = answer(url, operation, body).await;
+    if got == dynamodb && status == status_of(&dynamodb) {
+        Some(format!(
+            "{body}\n  now matches DynamoDB: move it into the replays"
+        ))
+    } else if got != today || status != status_of(&today) {
+        Some(format!(
+            "{body}\n  answered {status} {got}\n  where it answered {} {today}",
+            status_of(&today)
+        ))
+    } else {
+        None
+    }
 }
 
 /// Round one, the condition rows, after the item they read is put.
@@ -1546,189 +1634,224 @@ const CALLS_TYPES: &[Row] = &[
 ];
 
 /// Round one, the rows left out of `CALLS`.
-const LEFT_OUT_ROUND_ONE: &[Row] = &[
+const LEFT_OUT_ROUND_ONE: &[LeftOut] = &[
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN begins_with(s,'h') AND 9"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected AND keyword"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN contains(s,'h') AND 9"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected AND keyword"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(begins_with(s,'h')) > 0"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains(s, attribute_exists(n))"}"#,
         r#"{"Items":[]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains(attribute_exists(n), 'x')"}"#,
         r#"{"Items":[]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ',' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(attribute_exists(n), 'x')"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ',' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(s, attribute_exists(n))"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
 ];
 
 /// Round two, the rows left out of `CALLS_MORE`.
-const LEFT_OUT_ROUND_TWO: &[Row] = &[
+const LEFT_OUT_ROUND_TWO: &[LeftOut] = &[
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(true, 'x')"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(contains(s,'h')) > 0"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(begins_with(s,'h'),'BOOL')"}"#,
         r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains(attribute_exists(n), true)"}"#,
         r#"{"Items":[]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ',' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains(l, attribute_exists(n))"}"#,
         r#"{"Items":[]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains(s, size(s))"}"#,
         r#"{"Items":[]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN attribute_exists(n) AND begins_with(s,1)"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Unexpected token after expression"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN begins_with(s,1) AND 5"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected AND keyword"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(begins_with(s,1)) > 0"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='zz' AND sk='zz' AND begins_with(s, attribute_exists(n))"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
 ];
 
 /// Round three, the rows left out of `CALLS_TYPES`.
-const LEFT_OUT_ROUND_THREE: &[Row] = &[
+const LEFT_OUT_ROUND_THREE: &[LeftOut] = &[
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with('abc','a')"}"#,
         r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(5,'a')"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(null,'a')"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: NULL"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with([1],'a')"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: L"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ',' but got '1'"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains('abc','a')"}"#,
         r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains([1,true], attribute_exists(n))"}"#,
         r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ',' but got '1'"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND contains(l, attribute_exists(n))"}"#,
         r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected ')' but got '('"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(true,'x') AND size(true) > 0"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN true AND begins_with(s,1)"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Unexpected token after expression"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN begins_with(s,1) AND size(true)"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Expected AND keyword"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN size(true) AND begins_with(s,1)"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Unexpected token after expression"}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"S": "abc"}]}"#,
         r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"N": "5"}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: N"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"L": [{"N": "1"}]}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: L"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"M": {"a": {"N": "1"}}}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: M"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"SS": ["a"]}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: SS"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"NULL": true}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: NULL"}"#,
+        r#"{"Items":[]}"#,
     ),
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"BOOL": false}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+        r#"{"Items":[]}"#,
     ),
 ];
 
@@ -1864,5 +1987,865 @@ const ROUND_SIX: &[Row] = &[
         "BatchExecuteStatement",
         r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"yes"},{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"yes"}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Provided list of item keys contains duplicates"}"#,
+    ),
+];
+
+/// Round seven, captured in eu-west-2: batches, transactions, and the order
+/// against an operand that isn't distinct, the IN limit and operand counts.
+/// Row 52 is in `LEFT_OUT_OTHER`.
+const ROUND_SEVEN: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"n":{"N":"5"},"s":{"S":"hello"},"bt":{"BOOL":true}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"c"},"n":{"N":"5"},"s":{"S":"hello"},"bt":{"BOOL":true}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='c'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='c'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}},{"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN 1 AND 5"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, 5)"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n < true"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n, n)"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) < 1"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(?) > 0", "Parameters": [{"BOOL": true}]}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(?) > 0", "Parameters": [{"BOOL": true}]}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n < ?", "Parameters": [{"BOOL": true}]}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND size(true) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='c' AND size(true) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[1]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND size(true) > 0"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN 1 AND 5"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN 1 AND 5"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_type(n, 5)"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_type(n, 5)"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND n < true"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND n < true"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_exists(n, n)"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_exists(n, n)"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND n = n"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND n = n"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_exists(n) < 1"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND attribute_exists(n) < 1"}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND size(?) > 0", "Parameters": [{"BOOL": true}]}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND size(?) > 0", "Parameters": [{"BOOL": true}]}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND n < ?", "Parameters": [{"BOOL": true}]}, {"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) < 1 AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND attribute_exists(n) < 1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, 5) AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND attribute_type(n, 5)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(?) > 0 AND n = n", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND size(?) > 0", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN 1 AND 5 AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND attribute_exists(n) BETWEEN 1 AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND n IN [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n IN [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100] AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The IN operator is provided with too many operands; number of operands: 101"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n < ? AND n = n", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND n < ?", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, ?) AND n = n", "Parameters": [{"N": "5"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND attribute_type(n, ?)", "Parameters": [{"N": "5"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, 'ZZ') AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid attribute type name found; type: ZZ, valid types: {N,BS,L,B,NULL,M,S,SS,NS,BOOL}"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND attribute_type(n, 'ZZ')"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND attribute_type(n, s)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n < true AND attribute_type(n, 5)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, 5) AND n < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(?) > 0 AND attribute_exists(n, n)", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n, n) AND size(?) > 0", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND attribute_exists(n, n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n, n) AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND ? < attribute_exists(n)", "Parameters": [{"NULL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: NULL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, 5) BETWEEN 1 AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, 'ZZ')"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid attribute type name found; type: ZZ, valid types: {N,BS,L,B,NULL,M,S,SS,NS,BOOL}"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, ?) BETWEEN 1 AND 5", "Parameters": [{"S": "Q"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid attribute type name found; type: Q, valid types: {N,BS,L,B,NULL,M,S,SS,NS,BOOL}"}"#,
+    ),
+];
+
+/// Round eight, captured in eu-west-2: the order inside one condition, NOT,
+/// OR and brackets, the parameter count, a missing table or key, and
+/// RETURNING. Row 41 is in `LEFT_OUT_OTHER`.
+const ROUND_EIGHT: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"n":{"N":"5"},"s":{"S":"hello"},"bt":{"BOOL":true}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN size(true) AND attribute_exists(n, n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN attribute_exists(n, n) AND size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) = attribute_exists(n, n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n, n) = size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n IN [size(true), attribute_exists(n, n)]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n IN [attribute_exists(n, n), size(true)]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) BETWEEN n AND n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN n AND size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN size(true) AND n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) < size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n < n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: <, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND true < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) < attribute_exists(n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: attribute_type, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(size(true), size(true))"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) NOT BETWEEN 1 AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND NOT attribute_exists(n) BETWEEN 1 AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND NOT (size(true) > 0)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND NOT n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND (size(true) > 0 OR n = n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND (n = n OR size(true) > 0)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND (n = n OR n < true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND NULL < attribute_exists(n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: NULL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) < NULL"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(s) < true AND s IN [s]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND s IN [s] AND size(s) < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: IN, first operand: [s]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND n = ?"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = ? AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = n AND s = ?"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND s = ? AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(?) > 0 AND s = ?", "Parameters": [{"BOOL": true}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n < true AND s = ?"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND s = ?", "Parameters": [{"S": "a"}, {"S": "b"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk = 'a' AND size(true) > 0 ORDER BY n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_missing\" WHERE pk='a' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_missing\" WHERE pk='a' AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET pk = 'z' WHERE pk='a' AND sk='b' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_t\" WHERE pk='a' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND s = ?"}, {"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Number of parameters in request and statement don't match."}},{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE size(true) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND size(true) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT pk FROM \"_capture_20261111_230_missing\" WHERE pk='a' AND sk='b' AND size(true) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND size(true) > 0 AND s = ?"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_missing\" SET z = 1 WHERE pk='a' AND sk='b' AND size(true) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = 1 WHERE pk='a' AND sk='b' AND size(true) > 0 RETURNING ALL OLD *"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+];
+
+/// Round nine, captured in eu-west-2 against `INDEXED_TABLE`: index reads and
+/// writes, index reads in a transaction, `set_add` refusals and a NextToken
+/// on an UPDATE.
+const ROUND_NINE: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName": "_capture_20261111_230_m", "Item": {"id": {"S": "i1"}, "sk": {"S": "s"}, "g": {"S": "g1"}, "h1": {"S": "a"}, "h2": {"S": "x"}, "r1": {"S": "m"}, "r2": {"S": "n"}, "n": {"N": "5"}, "ss": {"SS": ["a"]}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = h1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE attribute_exists(h1, h1)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE begins_with(h1, 5)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND h1 = h1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [h1]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND h1 < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND attribute_exists(h1, h1)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"nosuch\" WHERE h1 = h1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [h1]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"nosuch\" WHERE h1 < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"nosuch\" WHERE size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\".\"hh_rr\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND h1 = h1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE id = 'i1' AND sk = 's' AND h1 = h1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\".\"hh_rr\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND h1 < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE id = 'i1' AND sk = 's' AND h1 < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\".\"hh_rr\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND size(true) > 0", "NextToken": "abc"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND n = n", "NextToken": "abc"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i1' AND sk = 's'", "NextToken": "abc"}"#,
+        r#"{"Items":[]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's' AND size(true) > 0", "NextToken": "abc"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's' AND n = n", "NextToken": "abc"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = h1"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND h1 = h1"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [h1]"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 < true"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND h1 < true"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE size(true) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND size(true) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE attribute_exists(h1, h1)"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1' AND attribute_exists(h1, h1)"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Reads on indices are not supported within transactions."}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Reads on indices are not supported within transactions."}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE size(true) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first argument to SET_ADD must equal the assignment value at 1:42:7"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's' AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's' AND n < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's' AND g = ?"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss, 5) WHERE id = 'i1' AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The second argument to SET_ADD must be a value with type SET at 1:51:2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss, 5) WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss, 5) WHERE id = 'i1' AND sk = 's' AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss, 5) WHERE id = 'i1' AND sk = 's' AND n < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss, 5) WHERE id = 'i1' AND sk = 's' AND g = ?"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss) WHERE id = 'i1' AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"SET_ADD must have exactly two arguments at 1:43:7"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss) WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss) WHERE id = 'i1' AND sk = 's' AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss) WHERE id = 'i1' AND sk = 's' AND n < true"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\" SET ss = set_add(ss) WHERE id = 'i1' AND sk = 's' AND g = ?"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_absent\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first argument to SET_ADD must equal the assignment value at 1:47:7"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\" SET t = set_add(ss, <<'x'>>) WHERE id = 'i1' AND sk = 's' AND size(true) > 0"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}}]}"#,
+    ),
+];
+
+/// Round eight's row 41 and round seven's row 52, left out for causes of
+/// their own.
+const LEFT_OUT_OTHER: &[LeftOut] = &[
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET z = size(true) WHERE pk='a' AND sk='b' AND n = n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The first operand must be distinct from the remaining operands for this operator or function; operator: =, first operand: [n]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Statement wasn't well formed, can't be processed: Unexpected token after expression"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, s) AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: {B,FS,DOUBLESET,NULL,BOOL,DECIMAL,S,NS,INTSET,SS,HDS,N,DECIMALSET,M,L,HD,FLOAT,DOUBLE,BS,DICT,INT}"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: {S,HDS,N,FS,BS,NULL,DOUBLE,NS,DECIMAL,SS,DECIMALSET,BOOL,HD,DICT,INTSET,M,L,B,FLOAT,INT,DOUBLESET}"}"#,
     ),
 ];

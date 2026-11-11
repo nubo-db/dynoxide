@@ -1056,9 +1056,11 @@ fn check_order_terms(
         if !names_attribute(&term.path, read_pk)
             && !read_sk.is_some_and(|sk| names_attribute(&term.path, sk))
         {
+            // Named as the attribute, so `"a.b"` is printed `a.b` (captured
+            // eu-west-2, 2026-11-11).
             return Err(reject(format!(
                 "Attribute {} in ORDER BY clause must be part of the primary key",
-                term.path
+                root_attribute(&term.path)
             )));
         }
     }

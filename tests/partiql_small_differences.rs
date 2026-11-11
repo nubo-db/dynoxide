@@ -781,3 +781,139 @@ const CONSISTENT_READ_MORE: &[Row] = &[
         r#"{"Items":[]}"#,
     ),
 ];
+
+/// An ORDER BY term that isn't a key is refused naming the attribute, so a
+/// quoted name is printed without its quotes.
+#[tokio::test]
+async fn the_order_by_refusal_names_a_quoted_attribute_without_its_quotes() {
+    replay(ORDER_BY).await;
+    replay(ORDER_BY_MORE).await;
+}
+
+/// Round one, the ORDER BY rows, after the item they read is put.
+const ORDER_BY: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"m":{"M":{"x":{"N":"1"},"pk":{"N":"1"}}},"l":{"L":[{"N":"1"},{"N":"2"}]},"n":{"N":"5"},"a.b":{"N":"1"},"a b":{"N":"1"},"s":{"S":"hello"},"bt":{"BOOL":true},"bf":{"BOOL":false}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"a.b\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute a.b in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY a.b"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"n\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute n in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY n"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute n in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY m.x"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"m\".\"x\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:3"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY l[0]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"a b\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute a b in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"pk\""}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"sk\" DESC"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY sk"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"m\".x"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:3"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY m.\"x\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:1"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"a.b\".c"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:5"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY nope"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute nope in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"no pe\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute no pe in ORDER BY clause must be part of the primary key"}"#,
+    ),
+];
+
+/// Round two, the ORDER BY rows.
+const ORDER_BY_MORE: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"m":{"M":{"x":{"N":"1"},"pk":{"N":"1"}}},"l":{"L":[{"N":"1"},{"N":"2"}]},"n":{"N":"5"},"a.b":{"N":"1"},"a b":{"N":"1"},"s":{"S":"hello"},"bt":{"BOOL":true},"bf":{"BOOL":false}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"a.b\", sk"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute a.b in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY sk, \"a.b\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute a.b in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"a.b\" DESC"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute a.b in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"PK\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute PK in ORDER BY clause must be part of the primary key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY pk.x"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Argument to ORDER BY must be of type VariableReference. Type: PATH at 1:64:2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' ORDER BY \"n\" ASC, \"s\""}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Attribute n in ORDER BY clause must be part of the primary key"}"#,
+    ),
+];

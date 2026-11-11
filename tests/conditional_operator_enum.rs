@@ -3,9 +3,8 @@
 //! UpdateItem and DeleteItem. Beside it, which legacy parameters the
 //! expression-mixing refusal names on Query.
 //!
-//! `FIRST`, `SECOND`, `THIRD` and `FOURTH` hold the 90 requests sent to
-//! eu-west-2 and us-east-1 on 11 November 2026, with the answers both regions
-//! gave, as the response
+//! `FIRST` to `FIFTH` hold the 114 requests sent to eu-west-2 and us-east-1
+//! on 11 November 2026, with the answers both regions gave, as the response
 //! bodies DynamoDB returned. They are data captured from DynamoDB, not written
 //! by hand. Every request names a table that doesn't exist, and the server
 //! here has no tables, so a request DynamoDB accepts as far as the table
@@ -167,6 +166,62 @@ async fn expression_attributes_beside_key_conditions_are_checked_first() {
 #[tokio::test]
 async fn expression_attributes_are_checked_before_the_table_on_every_query_and_scan() {
     assert_captured(FOURTH).await;
+}
+
+/// The fifth set: a read's expressions are checked through, syntax, undefined
+/// names and values and overlapping paths, before its unused attributes and
+/// before the table is looked up, on Query, Scan, GetItem and BatchGetItem.
+#[tokio::test]
+async fn a_reads_expressions_are_checked_in_dynamodbs_order() {
+    assert_captured(FIFTH).await;
+}
+
+/// The same faults against a table that exists: a KeyConditionExpression
+/// value nobody defined is named as the key condition's, and a projection
+/// that doesn't parse is a syntax error ahead of an unused name.
+#[tokio::test]
+async fn expression_faults_are_worded_the_same_on_a_table_that_exists() {
+    let url = populated_server().await;
+    let invalid = |message: &str| {
+        serde_json::json!({
+            "__type": "com.amazon.coral.validate#ValidationException",
+            "message": message
+        })
+    };
+    for (operation, body, expected) in [
+        (
+            "Query",
+            r#"{"TableName":"Tab","KeyConditionExpression":"pk = :missing","FilterExpression":"a = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"#,
+            invalid(
+                "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :missing",
+            ),
+        ),
+        (
+            "Query",
+            r#"{"TableName":"Tab","KeyConditionExpression":"pk = :missing","ExpressionAttributeValues":{":v":{"S":"x"}}}"#,
+            invalid(
+                "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :missing",
+            ),
+        ),
+        (
+            "Scan",
+            r##"{"TableName":"Tab","ProjectionExpression":"#a,,","ExpressionAttributeNames":{"#a":"a"}}"##,
+            invalid(r#"Invalid ProjectionExpression: Syntax error; token: ",", near: ",,""#),
+        ),
+        (
+            "Query",
+            r##"{"TableName":"Tab","KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"ProjectionExpression":"#a[","ExpressionAttributeNames":{"#a":"a"}}"##,
+            invalid(r#"Invalid ProjectionExpression: Syntax error; token: "<EOF>", near: "[""#),
+        ),
+        (
+            "GetItem",
+            r##"{"TableName":"Tab","Key":{"pk":{"S":"a"},"sk":{"S":"1"}},"ProjectionExpression":"#a,,","ExpressionAttributeNames":{"#a":"a"}}"##,
+            invalid(r#"Invalid ProjectionExpression: Syntax error; token: ",", near: ",,""#),
+        ),
+    ] {
+        let (status, got) = send(&url, operation, body).await;
+        assert_eq!((status, &got), (400, &expected), "{operation} {body}");
+    }
 }
 
 /// A FilterExpression value nobody defined is refused whether or not there is
@@ -766,5 +821,131 @@ const FOURTH: &[(&str, &str, &str)] = &[
         "Scan",
         r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "#a = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute name used in the document path is not defined; attribute name: #a"}"##,
+    ),
+];
+
+/// Captured the same day in the same two regions, which agreed on every
+/// request: which of two faults in a read's expressions is reported first, on
+/// Query, Scan, GetItem and BatchGetItem.
+const FIFTH: &[(&str, &str, &str)] = &[
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :missing", "FilterExpression": "a = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :missing"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :missing", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :missing"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :missing"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :missing"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :m1", "FilterExpression": "a = :m2", "ExpressionAttributeValues": {":z": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: :m2"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "#p = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #p"}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "#p = :v", "ExpressionAttributeValues": {":v": {"S": "x"}}, "ExpressionAttributeNames": {"#q": "pk"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #p"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "#a,,", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: Syntax error; token: \",\", near: \",,\""}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "#a[", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: Syntax error; token: \"<EOF>\", near: \"[\""}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "a,,", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: Syntax error; token: \",\", near: \",,\""}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "a = = :v", "ExpressionAttributeValues": {":v": {"S": "x"}, ":w": {"S": "y"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: Syntax error; token: \"=\", near: \"= = :v\""}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = = :v", "ExpressionAttributeValues": {":v": {"S": "x"}, ":w": {"S": "y"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid KeyConditionExpression: Syntax error; token: \"=\", near: \"= = :v\""}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "a = :v OR b = :a"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: :v"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "b = :a OR a = :v"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: :a"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "#a, #a", "ExpressionAttributeNames": {"#a": "a", "#b": "b"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a]"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "#a, #a", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a]"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "a = :m", "ProjectionExpression": "#b"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: :m"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "#b, #c"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: An expression attribute name used in the document path is not defined; attribute name: #b"}"##,
+    ),
+    (
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ProjectionExpression": "#c, #b"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: An expression attribute name used in the document path is not defined; attribute name: #c"}"##,
+    ),
+    (
+        "GetItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "ProjectionExpression": "a", "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeNames unused in expressions: keys: {#a}"}"##,
+    ),
+    (
+        "GetItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "ProjectionExpression": "#b"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: An expression attribute name used in the document path is not defined; attribute name: #b"}"##,
+    ),
+    (
+        "GetItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "ExpressionAttributeNames": {"#a": "a"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
+    ),
+    (
+        "BatchGetItem",
+        r##"{"RequestItems": {"_capture_20261111_317_none": {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "a", "ExpressionAttributeNames": {"#a": "a"}}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Value provided in ExpressionAttributeNames unused in expressions: keys: {#a}"}"##,
+    ),
+    (
+        "BatchGetItem",
+        r##"{"RequestItems": {"_capture_20261111_317_none": {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "#b"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Invalid ProjectionExpression: An expression attribute name used in the document path is not defined; attribute name: #b"}"##,
+    ),
+    (
+        "BatchGetItem",
+        r##"{"RequestItems": {"_capture_20261111_317_none": {"Keys": [{"pk": {"S": "a"}}], "ExpressionAttributeNames": {"#a": "a"}}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
     ),
 ];

@@ -174,6 +174,17 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // The ProjectionExpression is checked through, its names with it, before
+    // the table is looked up (captured eu-west-2 and us-east-1, 2026-11-11).
+    let projection_expr = helpers::validate_read_expressions(
+        &request.expression_attribute_names,
+        &None, // GetItem has no ExpressionAttributeValues
+        helpers::ReadExpressions {
+            projection: request.projection_expression.as_deref(),
+            ..Default::default()
+        },
+    )?;
+
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 
@@ -199,8 +210,8 @@ pub async fn execute<S: StorageBackend>(
         None => 0,
     };
 
-    // Check for unused expression attribute names/values
-    let tracker = crate::expressions::TrackedExpressionAttributes::new(
+    // Resolves the projection's names; they were checked before the lookup.
+    let tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
         &request.expression_attribute_names,
         &None, // GetItem has no ExpressionAttributeValues
     );
@@ -215,14 +226,7 @@ pub async fn execute<S: StorageBackend>(
         None
     };
 
-    let item = if let Some(proj_expr) = &request.projection_expression {
-        let parsed = crate::expressions::projection::parse(proj_expr)
-            .map_err(DynoxideError::ValidationException)?;
-        tracker.track_projection_expr(&parsed);
-        // Reject undefined names and overlapping paths before the read, so a miss still rejects.
-        crate::expressions::projection::validate(&parsed, &tracker)
-            .map_err(DynoxideError::ValidationException)?;
-
+    let item = if let Some(parsed) = projection_expr {
         if let Some(full_item) = item {
             // GetItem does NOT automatically include key attributes in projection.
             // Only Query/Scan do that.
@@ -247,9 +251,6 @@ pub async fn execute<S: StorageBackend>(
     } else {
         item
     };
-
-    // Check for unused expression attribute names/values
-    tracker.check_unused()?;
 
     let consumed_capacity = {
         let consistent = request.consistent_read.unwrap_or(false);

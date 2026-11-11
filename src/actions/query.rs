@@ -489,28 +489,18 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // The expressions' attributes are checked before the table is looked up,
-    // as on Scan (captured eu-west-2 and us-east-1, 2026-11-11). The key
-    // condition's own references count as used.
-    {
-        let tracker = crate::expressions::TrackedExpressionAttributes::new(
-            &request.expression_attribute_names,
-            &request.expression_attribute_values,
-        );
-        // Its faults were reported above; this only records what it uses.
-        if let Some(Ok(key_condition)) = request
-            .key_condition_expression
-            .as_deref()
-            .map(|kce| expressions::key_condition::parse(kce, &tracker))
-        {
-            tracker.track_key_condition(&key_condition);
-        }
-        helpers::check_expression_attributes(
-            &tracker,
-            request.filter_expression.as_deref(),
-            request.projection_expression.as_deref(),
-        )?;
-    }
+    // Every expression is checked through, its attributes with it, before the
+    // table is looked up (captured eu-west-2 and us-east-1, 2026-11-11). Only
+    // what needs the table's key schema waits for it.
+    let projection_expr = helpers::validate_read_expressions(
+        &request.expression_attribute_names,
+        &request.expression_attribute_values,
+        helpers::ReadExpressions {
+            filter: request.filter_expression.as_deref(),
+            key_condition: request.key_condition_expression.as_deref(),
+            projection: request.projection_expression.as_deref(),
+        },
+    )?;
 
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
@@ -924,29 +914,11 @@ pub async fn execute<S: StorageBackend>(
         .transpose()
         .map_err(DynoxideError::ValidationException)?;
 
-    // Parse projection expression if present; fall back to legacy AttributesToGet
-    let projection = if let Some(ref proj_expr) = request.projection_expression {
-        Some(
-            expressions::projection::parse(proj_expr)
-                .map_err(DynoxideError::ValidationException)?,
-        )
-    } else {
-        legacy_projection.clone()
-    };
+    // The ProjectionExpression checked before the lookup, or the legacy
+    // AttributesToGet.
+    let projection = projection_expr.or_else(|| legacy_projection.clone());
 
-    // Pre-register expression references so unused check works even with zero items
-    if let Some(ref filter) = filter_expr {
-        tracker.track_condition_expr(filter);
-    }
-    if let Some(ref proj) = projection {
-        tracker.track_projection_expr(proj);
-        // Reject undefined names and overlapping paths before the row loop, so a
-        // zero-match query still rejects.
-        expressions::projection::validate(proj, &tracker)
-            .map_err(DynoxideError::ValidationException)?;
-    }
-
-    // Untracked variant for the per-item hot loop: tracking already done above
+    // Untracked: the expressions' attributes were checked before the lookup
     let loop_tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
         &request.expression_attribute_names,
         &request.expression_attribute_values,
@@ -1073,9 +1045,6 @@ pub async fn execute<S: StorageBackend>(
             items.push(result_item);
         }
     }
-
-    // Check for unused expression attribute names/values
-    tracker.check_unused()?;
 
     let count = if is_count {
         filtered_count

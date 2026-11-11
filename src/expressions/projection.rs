@@ -45,12 +45,15 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
 
     let mut paths = Vec::new();
 
-    paths.push(parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?);
+    paths.push(
+        parse_path(&mut stream, expr).map_err(|e| projection_parser_error(expr, &mut stream, e))?,
+    );
 
     while matches!(stream.peek(), Some(Token::Comma)) {
         stream.next();
         paths.push(
-            parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?,
+            parse_path(&mut stream, expr)
+                .map_err(|e| projection_parser_error(expr, &mut stream, e))?,
         );
     }
 
@@ -182,7 +185,19 @@ fn common_prefix_len(a: &[PathElement], b: &[PathElement]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
+/// DynamoDB's syntax error for the token `stream` has just read, or for the
+/// end of the expression when there was none to read.
+fn syntax_error_at_last_read(stream: &mut TokenStream, source: &str, read: bool) -> String {
+    if read {
+        stream.set_pos(stream.pos() - 1);
+    }
+    stream.syntax_error(source)
+}
+
+fn parse_path(stream: &mut TokenStream, source: &str) -> Result<Vec<PathElement>, String> {
+    // A path that doesn't start with a name, and a bracket with nothing after
+    // it, are syntax errors at that token in DynamoDB's usual form (captured
+    // eu-west-2 and us-east-1, 2026-11-11: `#a,,` and `#a[`).
     let first = match stream.next() {
         Some(Token::Identifier(name)) => {
             if super::reserved::is_reserved_keyword(name) {
@@ -193,8 +208,8 @@ fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
             PathElement::Attribute(name.clone())
         }
         Some(Token::NameRef(name)) => PathElement::Attribute(name.clone()),
-        Some(t) => return Err(format!("Expected attribute name, got {t}")),
-        None => return Err("Expected attribute name, got end of expression".to_string()),
+        Some(_) => return Err(syntax_error_at_last_read(stream, source, true)),
+        None => return Err(syntax_error_at_last_read(stream, source, false)),
     };
 
     let mut path = vec![first];
@@ -226,8 +241,8 @@ fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
                         let idx: usize = n.parse().map_err(|_| format!("Invalid index: {n}"))?;
                         path.push(PathElement::Index(idx));
                     }
-                    Some(t) => return Err(format!("Expected number in brackets, got {t}")),
-                    None => return Err("Expected number in brackets".to_string()),
+                    Some(_) => return Err(syntax_error_at_last_read(stream, source, true)),
+                    None => return Err(syntax_error_at_last_read(stream, source, false)),
                 }
                 stream.expect(&Token::RBracket)?;
             }

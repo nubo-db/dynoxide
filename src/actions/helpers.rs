@@ -1742,41 +1742,69 @@ pub struct ConvertedCondition {
     pub attribute_names: HashMap<String, String>,
 }
 
-/// The checks a Query or Scan makes on its expression attributes before the
+/// The expressions a read carries: Query, Scan, GetItem and BatchGetItem.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ReadExpressions<'a> {
+    pub filter: Option<&'a str>,
+    pub key_condition: Option<&'a str>,
+    pub projection: Option<&'a str>,
+}
+
+/// The checks a read makes on its expressions and their attributes before the
 /// table is looked up, in DynamoDB's order: a value the FilterExpression uses
-/// but nobody defined, a name the ProjectionExpression uses but nobody
-/// defined, then a name and then a value that no expression uses (captured
-/// eu-west-2 and us-east-1, 2026-11-11). `tracker` already holds what any
-/// other expression uses. An expression that doesn't parse is left for the
-/// checks that report it.
-pub(crate) fn check_expression_attributes(
-    tracker: &crate::expressions::TrackedExpressionAttributes,
-    filter: Option<&str>,
-    projection: Option<&str>,
-) -> Result<()> {
-    if let Some(Ok(filter)) = filter
+/// but nobody defined, then one the KeyConditionExpression uses, then the
+/// ProjectionExpression (its syntax, a name nobody defined in written order,
+/// overlapping paths), and only then a name and then a value no expression
+/// uses (captured eu-west-2 and us-east-1, 2026-11-11). The FilterExpression's
+/// and KeyConditionExpression's syntax and names are checked by the caller
+/// before this, so a fault there is not reported again. Returns the parsed
+/// ProjectionExpression for the read to apply.
+pub(crate) fn validate_read_expressions(
+    names: &Option<HashMap<String, String>>,
+    values: &Option<HashMap<String, AttributeValue>>,
+    expressions: ReadExpressions<'_>,
+) -> Result<Option<crate::expressions::projection::ProjectionExpr>> {
+    use crate::expressions::{condition, key_condition, projection};
+    let tracker = crate::expressions::TrackedExpressionAttributes::new(names, values);
+    let undefined_value = |expression: &str| {
+        tracker.first_undefined_value().map(|value| {
+            DynoxideError::ValidationException(format!(
+                "Invalid {expression}: An expression attribute value used in expression \
+                 is not defined; attribute value: {value}"
+            ))
+        })
+    };
+    if let Some(Ok(filter)) = expressions
+        .filter
         .filter(|fe| !fe.is_empty())
-        .map(crate::expressions::condition::parse)
+        .map(condition::parse)
     {
         tracker.track_condition_expr(&filter);
-        if let Some(value) = tracker.first_undefined_value() {
-            return Err(DynoxideError::ValidationException(format!(
-                "Invalid FilterExpression: An expression attribute value used in expression \
-                 is not defined; attribute value: {value}"
-            )));
+        if let Some(err) = undefined_value("FilterExpression") {
+            return Err(err);
         }
     }
-    if let Some(Ok(projection)) = projection
-        .filter(|pe| !pe.is_empty())
-        .map(crate::expressions::projection::parse)
+    if let Some(Ok(key_condition)) = expressions
+        .key_condition
+        .filter(|kce| !kce.is_empty())
+        .map(|kce| key_condition::parse(kce, &tracker))
     {
-        for path in &projection.paths {
-            crate::expressions::resolve_path_elements(path, tracker).map_err(|e| {
-                DynoxideError::ValidationException(format!("Invalid ProjectionExpression: {e}"))
-            })?;
+        tracker.track_key_condition(&key_condition);
+        if let Some(err) = undefined_value("KeyConditionExpression") {
+            return Err(err);
         }
     }
-    tracker.check_unused()
+    let projection = match expressions.projection.filter(|pe| !pe.is_empty()) {
+        Some(expr) => {
+            let parsed = projection::parse(expr).map_err(DynoxideError::ValidationException)?;
+            tracker.track_projection_expr(&parsed);
+            projection::validate(&parsed, &tracker).map_err(DynoxideError::ValidationException)?;
+            Some(parsed)
+        }
+        None => None,
+    };
+    tracker.check_unused()?;
+    Ok(projection)
 }
 
 /// The request's own `ExpressionAttributeNames` and `ExpressionAttributeValues`,

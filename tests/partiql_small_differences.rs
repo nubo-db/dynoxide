@@ -521,3 +521,263 @@ const KEY_PATHS_BOTH_KEYS: &[Row] = &[
         r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","CancellationReasons":[{"Code":"ValidationError","Message":"One or more parameter values were invalid: Cannot update attribute pk. This attribute is part of the key"}],"Message":"Transaction cancelled, please refer cancellation reasons for specific reasons [ValidationError]"}"#,
     ),
 ];
+
+/// `ConsistentRead` on ExecuteStatement and on a BatchExecuteStatement member
+/// is read as GetItem reads it: the strings DynamoDB takes for true and false
+/// read, `null` is absent, and anything else is refused in DynamoDB's words
+/// for what was found. A list is refused with no message, where GetItem names
+/// the type. A string that reads is no fault, so a `Limit` of 0 beside it is
+/// what's reported, and a write statement takes it too.
+#[tokio::test]
+async fn consistent_read_given_as_a_string_is_read_as_get_item_reads_it() {
+    replay(CONSISTENT_READ).await;
+    replay(CONSISTENT_READ_MORE).await;
+}
+
+/// Round one, the `ConsistentRead` rows, after the item they read is put.
+const CONSISTENT_READ: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"m":{"M":{"x":{"N":"1"},"pk":{"N":"1"}}},"l":{"L":[{"N":"1"},{"N":"2"}]},"n":{"N":"5"},"a.b":{"N":"1"},"a b":{"N":"1"},"s":{"S":"hello"},"bt":{"BOOL":true},"bf":{"BOOL":false}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"true"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"true"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"yes"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"yes"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"false"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"false"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"no"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"no"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"1"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"1"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"0"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"0"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"t"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"t"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"TRUE"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"TRUE"}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"x"}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"x"}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":""}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":""}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":1}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to Boolean"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":1}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to Boolean"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":0}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to Boolean"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":0}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to Boolean"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":1.5}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"DECIMAL_VALUE cannot be converted to Boolean"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":1.5}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"DECIMAL_VALUE cannot be converted to Boolean"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":null}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":null}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":[]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":[]}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":{}}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Start of structure or map found where not expected"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":{}}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Start of structure or map found where not expected"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":true}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":true}]}"#,
+        r#"{"Responses":[{"Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_230_t"}]}"#,
+    ),
+];
+
+/// Round two, the `ConsistentRead` rows, after the item they read is put.
+const CONSISTENT_READ_MORE: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"m":{"M":{"x":{"N":"1"},"pk":{"N":"1"}}},"l":{"L":[{"N":"1"},{"N":"2"}]},"n":{"N":"5"},"a.b":{"N":"1"},"a b":{"N":"1"},"s":{"S":"hello"},"bt":{"BOOL":true},"bf":{"BOOL":false}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"y"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"n"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"f"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"Yes"}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"on"}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":" true"}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":true}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":false}"#,
+        r#"{"Items":[{"pk":{"S":"a"}}]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"x","Limit":0}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"true","Limit":0}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"true"},{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"x"}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"UPDATE \"_capture_20261111_230_t\" SET z = 2 WHERE pk='a' AND sk='b'","ConsistentRead":"true"}"#,
+        r#"{"Items":[]}"#,
+    ),
+];

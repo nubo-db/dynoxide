@@ -595,6 +595,21 @@ pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+/// Deserialise `ConsistentRead` on ExecuteStatement or a BatchExecuteStatement
+/// member: by [`deserialize_lenient_flag`]'s rule, except that a list is
+/// refused with no message, where GetItem names the type (captured eu-west-2,
+/// 2026-11-11).
+pub(crate) fn deserialize_statement_flag<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        value => read_lenient_bool(&value)
+            .map(|flag| Some(flag.value))
+            .map_err(de::Error::custom),
+    }
+}
+
 /// The malformed-request error, marked for a `SerializationException`, for the
 /// first `Exists` or value in a legacy condition map (`QueryFilter`,
 /// `ScanFilter`, `KeyConditions`, `Expected`) that can't be read: a `BOOL`,

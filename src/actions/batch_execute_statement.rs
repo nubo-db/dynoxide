@@ -57,7 +57,11 @@ impl<'de> Deserialize<'de> for BatchStatementRequest {
             statement: String,
             #[serde(rename = "Parameters", default)]
             parameters: Option<Vec<serde_json::Value>>,
-            #[serde(rename = "ConsistentRead", default)]
+            #[serde(
+                rename = "ConsistentRead",
+                default,
+                deserialize_with = "crate::types::deserialize_statement_flag"
+            )]
             consistent_read: Option<bool>,
             #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
             return_values_on_condition_check_failure: Option<String>,

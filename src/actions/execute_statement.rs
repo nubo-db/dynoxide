@@ -42,7 +42,11 @@ struct ExecuteStatementRequestRaw {
     limit: Option<super::helpers::Int32>,
     #[serde(rename = "NextToken", default)]
     next_token: Option<String>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_statement_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,

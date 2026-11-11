@@ -424,6 +424,11 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
     check_field_is_int(obj, "Segment")?;
     check_field_is_int(obj, "TotalSegments")?;
     check_field_is_bool(obj, "ScanIndexForward")?;
+    // ExecuteStatement refuses a list here with no message, where GetItem and
+    // the other reads name the type (captured eu-west-2, 2026-11-11).
+    if operation == "ExecuteStatement" && obj.get("ConsistentRead").is_some_and(|v| v.is_array()) {
+        return Err(crate::DynoxideError::SerializationException(String::new()));
+    }
     check_field_is_bool(obj, "ConsistentRead")?;
 
     Ok(())

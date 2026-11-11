@@ -247,60 +247,75 @@ fn action_count(item: &TransactWriteItem) -> usize {
     .count()
 }
 
-/// The request-level checks, in the order DynamoDB reports them, as
-/// eu-west-2 and us-east-1 answered on 2026-11-11.
-///
-/// A required member left null comes first, but a request with one never
-/// gets here: it is refused as it is read, and so is a value refused in an
-/// item, once this function's first stage has passed. That first stage is
-/// the token's length and the length of `TransactItems` (see
-/// [`length_errors`]). Then `ReturnConsumedCapacity` and
-/// `ReturnItemCollectionMetrics`, listed together with an item naming no
-/// action; then every action's `ReturnValuesOnConditionCheckFailure`, reported
-/// only when the two enums are right; then an item naming no action on its
-/// own; then whether any item names more than one action; then every action's
-/// table name, in one message.
-///
-/// Called at the entry point ahead of the idempotency cache as well as at the
-/// start of `execute_cached`. A same-token replay never reaches
-/// `execute_cached`, and the token is keyed on the items alone, so a second
-/// call may carry a capacity mode the first one never did. Running the same
-/// checks in both places keeps their order the same whichever path answers.
-pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
-    let items = &request.transact_items;
-
-    if let Some(msg) = length_errors(request.client_request_token.as_deref(), items.len()) {
-        return Err(DynoxideError::ValidationException(msg));
-    }
-
-    // The request's two enums, with an empty action listed ahead of them.
-    let empty_action = items.iter().any(|item| action_count(item) == 0);
-    let enum_errors: Vec<String> = [
-        crate::validation::return_consumed_capacity_rejection(
-            request.return_consumed_capacity.as_deref(),
-        ),
-        crate::validation::return_item_collection_metrics_rejection(
-            request.return_item_collection_metrics.as_deref(),
-        ),
+/// The request's two enums refused, if either is.
+fn enum_errors(
+    return_consumed_capacity: Option<&str>,
+    return_item_collection_metrics: Option<&str>,
+) -> Vec<String> {
+    [
+        crate::validation::return_consumed_capacity_rejection(return_consumed_capacity),
+        crate::validation::return_item_collection_metrics_rejection(return_item_collection_metrics),
     ]
     .into_iter()
     .flatten()
-    .collect();
-    if !enum_errors.is_empty() {
-        let listed: Vec<String> = empty_action
-            .then(|| EMPTY_ACTION.to_string())
-            .into_iter()
-            .chain(enum_errors)
-            .collect();
-        if let Some(msg) = crate::validation::format_validation_errors(&listed) {
-            return Err(DynoxideError::ValidationException(msg));
-        }
-    }
+    .collect()
+}
 
-    // Every action's ReturnValuesOnConditionCheckFailure, in request order.
-    let mut mode_errors: Vec<String> = Vec::new();
+/// Every action's table name errors, under its position and action type, such
+/// as `transactItems.2.member.update.tableName`.
+fn table_name_errors(items: &[TransactWriteItem]) -> Vec<String> {
+    let mut errors = Vec::new();
     for (position, item) in items.iter().enumerate() {
-        let actions = [
+        let (action, table_name) = if let Some(ref put) = item.put {
+            ("put", &put.table_name)
+        } else if let Some(ref update) = item.update {
+            ("update", &update.table_name)
+        } else if let Some(ref delete) = item.delete {
+            ("delete", &delete.table_name)
+        } else if let Some(ref check) = item.condition_check {
+            ("conditionCheck", &check.table_name)
+        } else {
+            continue;
+        };
+        errors.extend(crate::validation::member_table_name_errors(
+            table_name,
+            &format!("transactItems.{}.member.{action}.tableName", position + 1),
+        ));
+    }
+    errors
+}
+
+/// The third stage of the member checks, which a value refused in an item
+/// comes after. A bad `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics`
+/// is listed with an item naming no action ahead of it and every table name
+/// refused between the two. With both enums right, an item naming no action
+/// is reported on its own (captured eu-west-2 and us-east-1, 2026-11-11).
+fn enum_stage_errors(
+    items: &[TransactWriteItem],
+    return_consumed_capacity: Option<&str>,
+    return_item_collection_metrics: Option<&str>,
+) -> Option<String> {
+    let empty_action = items.iter().any(|item| action_count(item) == 0);
+    let enums = enum_errors(return_consumed_capacity, return_item_collection_metrics);
+    if enums.is_empty() {
+        return empty_action.then(|| crate::validation::envelope_message(EMPTY_ACTION));
+    }
+    let listed: Vec<String> = empty_action
+        .then(|| EMPTY_ACTION.to_string())
+        .into_iter()
+        .chain(table_name_errors(items))
+        .chain(enums)
+        .collect();
+    crate::validation::format_validation_errors(&listed)
+}
+
+/// The first action, in request order, whose
+/// `ReturnValuesOnConditionCheckFailure` DynamoDB refuses. Only that one is
+/// reported, however many are wrong (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
+fn first_mode_error(items: &[TransactWriteItem]) -> Option<String> {
+    items.iter().enumerate().find_map(|(position, item)| {
+        [
             (
                 "put",
                 item.put
@@ -325,61 +340,66 @@ pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
                     .as_ref()
                     .map(|a| &a.return_values_on_condition_check_failure),
             ),
-        ];
-        for (action, value) in actions {
-            if let Some(msg) = value.and_then(|value| {
-                crate::validation::return_values_on_condition_check_failure_rejection(
-                    value.as_deref(),
-                    &format!(
-                        "transactItems.{}.member.{action}.returnValuesOnConditionCheckFailure",
-                        position + 1
-                    ),
-                )
-            }) {
-                mode_errors.push(msg);
-            }
-        }
-    }
-    if let Some(msg) = crate::validation::format_validation_errors(&mode_errors) {
-        return Err(DynoxideError::ValidationException(msg));
-    }
+        ]
+        .into_iter()
+        .find_map(|(action, value)| {
+            crate::validation::return_values_on_condition_check_failure_rejection(
+                value?.as_deref(),
+                &format!(
+                    "transactItems.{}.member.{action}.returnValuesOnConditionCheckFailure",
+                    position + 1
+                ),
+            )
+        })
+    })
+}
 
-    if empty_action {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(EMPTY_ACTION),
-        ));
+/// The request-level checks, in the order DynamoDB reports them, as
+/// eu-west-2 and us-east-1 answered on 2026-11-11.
+///
+/// A required member left null comes first, but a request with one never
+/// gets here: it is refused as it is read. So is a value refused in an item,
+/// once this function's first two stages have passed. The first is the
+/// token's length and the length of `TransactItems` (see [`length_errors`]),
+/// the second the request's enums and an item naming no action (see
+/// [`enum_stage_errors`]). Then the first action's
+/// `ReturnValuesOnConditionCheckFailure` that is wrong; then whether any item
+/// names more than one action; then every action's table name, in one
+/// message.
+///
+/// Called at the entry point ahead of the idempotency cache as well as at the
+/// start of `execute_cached`. A same-token replay never reaches
+/// `execute_cached`, and the token is keyed on the items alone, so a second
+/// call may carry a capacity mode the first one never did. Running the same
+/// checks in both places keeps their order the same whichever path answers.
+pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
+    let items = &request.transact_items;
+    let refuse = |msg: String| Err(DynoxideError::ValidationException(msg));
+
+    if let Some(msg) = length_errors(request.client_request_token.as_deref(), items.len()) {
+        return refuse(msg);
+    }
+    if let Some(msg) = enum_stage_errors(
+        items,
+        request.return_consumed_capacity.as_deref(),
+        request.return_item_collection_metrics.as_deref(),
+    ) {
+        return refuse(msg);
+    }
+    if let Some(msg) = first_mode_error(items) {
+        return refuse(crate::validation::envelope_message(&msg));
     }
 
     // No item may name more than one action, checked for every item before
     // any table name is.
     if items.iter().any(|item| action_count(item) > 1) {
-        return Err(DynoxideError::ValidationException(
+        return refuse(
             "TransactItems can only contain one of Check, Put, Update or Delete".to_string(),
-        ));
+        );
     }
 
-    // Every action's table name, reported together under its position and
-    // action type, such as `transactItems.2.member.update.tableName`.
-    let mut name_errors = Vec::new();
-    for (position, item) in items.iter().enumerate() {
-        let (action, table_name) = if let Some(ref put) = item.put {
-            ("put", &put.table_name)
-        } else if let Some(ref update) = item.update {
-            ("update", &update.table_name)
-        } else if let Some(ref delete) = item.delete {
-            ("delete", &delete.table_name)
-        } else if let Some(ref check) = item.condition_check {
-            ("conditionCheck", &check.table_name)
-        } else {
-            continue;
-        };
-        name_errors.extend(crate::validation::member_table_name_errors(
-            table_name,
-            &format!("transactItems.{}.member.{action}.tableName", position + 1),
-        ));
-    }
-    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
-        return Err(DynoxideError::ValidationException(msg));
+    if let Some(msg) = crate::validation::format_validation_errors(&table_name_errors(items)) {
+        return refuse(msg);
     }
 
     Ok(())
@@ -451,8 +471,8 @@ mod wire {
         table_name: Option<String>,
         #[serde(rename = "Key", default, deserialize_with = "held_attributes")]
         key: Held,
-        #[serde(rename = "UpdateExpression")]
-        update_expression: String,
+        #[serde(rename = "UpdateExpression", default)]
+        update_expression: Option<String>,
         #[serde(rename = "ConditionExpression", default)]
         condition_expression: Option<String>,
         #[serde(rename = "ExpressionAttributeNames", default)]
@@ -529,7 +549,10 @@ mod wire {
     }
 
     /// Read an `Item` or a `Key`, one value at a time in the order written,
-    /// as the map would otherwise be read.
+    /// as the map would otherwise be read. Every item and key a request
+    /// carries over the wire is read here, and each value's refusal is
+    /// decided in the one `from_value` call below, with the attribute's name
+    /// in hand.
     fn held_attributes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Held, D::Error> {
         struct Attributes;
 
@@ -607,25 +630,30 @@ mod wire {
         /// error class.
         ///
         /// A required member left null is the first stage of DynamoDB's
-        /// member checks: every such member in request order, then the
-        /// token if its length is wrong, in the newer form, then the
-        /// request's enums. Then the second stage (see
-        /// [`super::length_errors`]), and only then a value refused in an
-        /// item (captured eu-west-2 and us-east-1, 2026-11-11).
+        /// member checks. It lists each action's members in request order
+        /// (see [`Item::first_stage`]), then the token if its length is
+        /// wrong, in the newer form, then the request's enums. Then the
+        /// second and third stages (see [`super::length_errors`] and
+        /// [`super::enum_stage_errors`]), and only then a value refused in
+        /// an item (captured eu-west-2 and us-east-1, 2026-11-11).
         pub(super) fn into_request(self) -> Result<TransactWriteItemsRequest, String> {
             let marked = |msg: String| format!("{}{msg}", crate::serde_errors::VALIDATION_MARKER);
 
-            let mut nulls = Vec::new();
-            match self.transact_items {
-                None => nulls.push(null_member("transactItems")),
-                Some(ref items) => {
-                    for (position, item) in items.iter().enumerate() {
-                        item.null_members(position + 1, &mut nulls);
-                    }
+            let mut listed = Vec::new();
+            let any_null = match self.transact_items {
+                None => {
+                    listed.push(null_member("transactItems"));
+                    true
                 }
-            }
-            if !nulls.is_empty() {
-                nulls.extend(
+                Some(ref items) => items
+                    .iter()
+                    .enumerate()
+                    .fold(false, |any, (position, item)| {
+                        item.first_stage(position + 1, &mut listed) || any
+                    }),
+            };
+            if any_null {
+                listed.extend(
                     [
                         crate::token_constraint_error(self.client_request_token.as_deref()),
                         crate::validation::return_consumed_capacity_rejection(
@@ -638,7 +666,7 @@ mod wire {
                     .into_iter()
                     .flatten(),
                 );
-                let msg = crate::validation::format_validation_errors(&nulls)
+                let msg = crate::validation::format_validation_errors(&listed)
                     .expect("a null member is always listed");
                 return Err(marked(msg));
             }
@@ -656,6 +684,13 @@ mod wire {
                 {
                     return Err(marked(msg));
                 }
+                if let Some(msg) = super::enum_stage_errors(
+                    &transact_items,
+                    self.return_consumed_capacity.as_deref(),
+                    self.return_item_collection_metrics.as_deref(),
+                ) {
+                    return Err(marked(msg));
+                }
                 return Err(refusal);
             }
             Ok(TransactWriteItemsRequest {
@@ -668,49 +703,80 @@ mod wire {
     }
 
     impl Item {
-        /// Each required member this item's actions leave null, under the
-        /// item's position, in the order of the action's members.
-        fn null_members(&self, position: usize, out: &mut Vec<String>) {
-            let at = |action: &str, member: &str| {
-                null_member(&format!(
-                    "transactItems.{position}.member.{action}.{member}"
-                ))
-            };
-            if let Some(ref put) = self.put {
-                if put.item.is_null() {
-                    out.push(at("put", "item"));
+        /// This item's part of the first stage's list, pushed onto `out`:
+        /// each action's required members left null, with a refused
+        /// `ReturnValuesOnConditionCheckFailure` ahead of the table name.
+        /// Within an action the expression comes first, then the item or key,
+        /// then the table name (captured eu-west-2 and us-east-1, 2026-11-11).
+        /// Returns whether any member was null, since the mode alone does not
+        /// make the stage fire.
+        fn first_stage(&self, position: usize, out: &mut Vec<String>) -> bool {
+            // Per action: its name, its expression if required, its item or
+            // key, its mode and whether its table name is null.
+            let actions = [
+                self.put.as_ref().map(|a| {
+                    (
+                        "put",
+                        None,
+                        ("item", a.item.is_null()),
+                        a.return_values_on_condition_check_failure.as_deref(),
+                        a.table_name.is_none(),
+                    )
+                }),
+                self.update.as_ref().map(|a| {
+                    (
+                        "update",
+                        Some(("updateExpression", a.update_expression.is_none())),
+                        ("key", a.key.is_null()),
+                        a.return_values_on_condition_check_failure.as_deref(),
+                        a.table_name.is_none(),
+                    )
+                }),
+                self.delete.as_ref().map(|a| {
+                    (
+                        "delete",
+                        None,
+                        ("key", a.key.is_null()),
+                        a.return_values_on_condition_check_failure.as_deref(),
+                        a.table_name.is_none(),
+                    )
+                }),
+                self.condition_check.as_ref().map(|a| {
+                    (
+                        "conditionCheck",
+                        Some(("conditionExpression", a.condition_expression.is_none())),
+                        ("key", a.key.is_null()),
+                        a.return_values_on_condition_check_failure.as_deref(),
+                        a.table_name.is_none(),
+                    )
+                }),
+            ];
+            let mut any_null = false;
+            for (action, expression, (attributes, attributes_null), mode, table_name_null) in
+                actions.into_iter().flatten()
+            {
+                let at =
+                    |member: &str| format!("transactItems.{position}.member.{action}.{member}");
+                if let Some((member, true)) = expression {
+                    out.push(null_member(&at(member)));
+                    any_null = true;
                 }
-                if put.table_name.is_none() {
-                    out.push(at("put", "tableName"));
+                if attributes_null {
+                    out.push(null_member(&at(attributes)));
+                    any_null = true;
+                }
+                out.extend(
+                    crate::validation::return_values_on_condition_check_failure_rejection(
+                        mode,
+                        &at("returnValuesOnConditionCheckFailure"),
+                    ),
+                );
+                if table_name_null {
+                    out.push(null_member(&at("tableName")));
+                    any_null = true;
                 }
             }
-            if let Some(ref update) = self.update {
-                if update.key.is_null() {
-                    out.push(at("update", "key"));
-                }
-                if update.table_name.is_none() {
-                    out.push(at("update", "tableName"));
-                }
-            }
-            if let Some(ref delete) = self.delete {
-                if delete.key.is_null() {
-                    out.push(at("delete", "key"));
-                }
-                if delete.table_name.is_none() {
-                    out.push(at("delete", "tableName"));
-                }
-            }
-            if let Some(ref check) = self.condition_check {
-                if check.key.is_null() {
-                    out.push(at("conditionCheck", "key"));
-                }
-                if check.table_name.is_none() {
-                    out.push(at("conditionCheck", "tableName"));
-                }
-                if check.condition_expression.is_none() {
-                    out.push(at("conditionCheck", "conditionExpression"));
-                }
-            }
+            any_null
         }
 
         /// The public item, once no required member is null, with the first
@@ -731,7 +797,7 @@ mod wire {
                 update: self.update.map(|update| TransactUpdate {
                     table_name: update.table_name.unwrap_or_default(),
                     key: update.key.take(refusal),
-                    update_expression: update.update_expression,
+                    update_expression: update.update_expression.unwrap_or_default(),
                     condition_expression: update.condition_expression,
                     expression_attribute_names: update.expression_attribute_names,
                     expression_attribute_values: update

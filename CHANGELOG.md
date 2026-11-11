@@ -178,17 +178,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ExecuteTransaction. Before, it was accepted and the request went on to look
   up its tables. TransactWriteItems now checks its members in the order
   DynamoDB does. A required member left out (`TransactItems`, or an action's
-  `TableName`, `Item`, `Key` or a ConditionCheck's `ConditionExpression`) is
-  reported first as `Value null at '...'`, with a bad token and
-  `ReturnConsumedCapacity` listed after it, where it used to be a serde
+  `TableName`, `Item`, `Key`, `UpdateExpression` or a ConditionCheck's
+  `ConditionExpression`) is reported first as `Value null at '...'`, with a
+  bad `ReturnValuesOnConditionCheckFailure` on the same action, a bad token
+  and the request's enums listed beside it, where it used to be a serde
   `missing field` error. Then the token's length and the length of
   `TransactItems` are reported on their own, in DynamoDB's older wording with
-  no value or list echoed (`Value at 'ClientRequestToken' ...`), ahead of a bad
-  enum, an empty action or a number refused in an item. An item with no action
-  now gets DynamoDB's `Value '' at 'transactItems'` message, listed with a bad
-  `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics`, and a bad
-  `ReturnValuesOnConditionCheckFailure` is reported only when those two are
-  right. ExecuteTransaction lists the empty token first, and a missing
+  no value or list echoed (`Value at 'ClientRequestToken' ...`). A bad
+  `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics` comes next,
+  listed with an item that has no action and any table name refused. An item
+  with no action now gets DynamoDB's `Value '' at 'transactItems'` message.
+  Only after those is a number refused in an item reported, and then the
+  first action's bad `ReturnValuesOnConditionCheckFailure` rather than every
+  one. ExecuteTransaction lists the empty token first, and a missing
   `TransactStatements` is `Value null at 'transactStatements'`
   ([#318](https://github.com/nubo-db/dynoxide/issues/318)).
 

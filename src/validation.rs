@@ -556,12 +556,14 @@ pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError 
 /// for untagged errors, so applying this to an already-enveloped action error
 /// is safe.
 ///
-/// Owner of the operation split for the HTTP and wasm dispatch seams and the
-/// MCP tools, which all route through here. The same
-/// PutItem/UpdateItem/DeleteItem membership is encoded at the action
-/// boundaries (`put_item::execute`, `update_item::execute` and
-/// `delete_item::execute` apply the envelope for the in-process API), so a
-/// future enveloped operation must update both places.
+/// Owner of the operation split for the HTTP and wasm dispatch seams, which
+/// route through here. The same PutItem/UpdateItem/DeleteItem membership is
+/// encoded in two more places: at the action boundaries (`put_item::execute`,
+/// `update_item::execute` and `delete_item::execute` apply the envelope for
+/// the in-process API), and in the MCP tools' choice of resolver
+/// (`resolve_single_write` for the put_item, update_item and delete_item
+/// tools, `strip_request_validation_tag` for the rest). A future enveloped
+/// operation must update all three.
 ///
 /// Compiled only for the seams that consume it: the HTTP server, the MCP
 /// tools, the wasm engine API, and the unit tests.

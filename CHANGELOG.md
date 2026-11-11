@@ -113,7 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused with the HTTP API's `SerializationException`. A string used to be
   refused as a malformed argument on `get_item` and `query`, and inside
   `batch_get_item` it was dropped without a word, so `"true"` read eventually
-  consistent. The listed schema still says boolean
+  consistent. The listed schema still says boolean. One difference remains:
+  a flag given as `-0`, or as an integer past 64 bits, is refused as a
+  `DECIMAL_VALUE` where the HTTP API says `NUMBER_VALUE`, because MCP
+  arguments arrive already parsed
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 - The MCP tools read values on the validation layer the HTTP API would use
   for the same request. Arguments holding a `BOOL` or `NULL` written as a

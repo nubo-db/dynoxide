@@ -1062,6 +1062,11 @@ fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
 /// `SerializationException` the HTTP API gives. The tools take these as JSON
 /// rather than as `bool` so that refusal is a tool error in DynamoDB's words,
 /// not the argument decoder's own.
+///
+/// One known difference remains: a flag given as `-0`, or as an integer past
+/// 64 bits, is refused as a `DECIMAL_VALUE` where the HTTP API says
+/// `NUMBER_VALUE`, because the arguments arrive already parsed and the number
+/// as written is gone.
 fn read_flag(value: Option<serde_json::Value>) -> Result<Option<bool>, CallToolResult> {
     let Some(value) = value else {
         return Ok(None);

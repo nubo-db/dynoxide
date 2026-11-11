@@ -77,6 +77,7 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
                 &raw.statement,
                 raw.return_consumed_capacity.as_deref(),
                 raw.parameters.values.as_deref(),
+                raw.next_token.as_deref(),
             );
             if let Some(msg) = crate::validation::format_validation_errors(&violations) {
                 return Err(serde::de::Error::custom(format!(
@@ -106,13 +107,17 @@ impl<'de> Deserialize<'de> for ExecuteStatementRequest {
 /// ReturnConsumedCapacity, the parameters (captured eu-west-2 and us-east-1,
 /// 2026-10-10). A Limit below 1 is worded as Scan words it (value kept,
 /// lowercase 'limit'), not as Query does, matching what ExecuteStatement
-/// itself returns (captured eu-west-2, 2026-07-29).
+/// itself returns (captured eu-west-2, 2026-07-29). An empty NextToken is
+/// refused on any statement, a write included (captured eu-west-2,
+/// 2026-11-11, alone); its place among the others isn't captured, so it is
+/// listed last.
 fn member_violations(
     return_values_on_condition_check_failure: Option<&str>,
     limit: Option<i64>,
     statement: &str,
     return_consumed_capacity: Option<&str>,
     parameters: Option<&[AttributeValue]>,
+    next_token: Option<&str>,
 ) -> Vec<String> {
     [
         crate::validation::return_values_on_condition_check_failure_rejection(
@@ -128,6 +133,11 @@ fn member_violations(
         crate::partiql::statement_length_violation(statement, "statement"),
         crate::validation::return_consumed_capacity_rejection(return_consumed_capacity),
         crate::partiql::parameters_violation(parameters, "parameters"),
+        next_token.filter(|token| token.is_empty()).map(|_| {
+            "Value '' at 'nextToken' failed to satisfy constraint: Member must have length \
+             greater than or equal to 1"
+                .to_string()
+        }),
     ]
     .into_iter()
     .flatten()
@@ -165,6 +175,7 @@ pub async fn execute<S: StorageBackend>(
         &request.statement,
         request.return_consumed_capacity.as_deref(),
         request.parameters.as_deref(),
+        request.next_token.as_deref(),
     );
     if let Some(e) = crate::partiql::member_rejection(&violations) {
         return Err(e);

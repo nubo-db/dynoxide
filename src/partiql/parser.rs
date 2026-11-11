@@ -2654,6 +2654,16 @@ fn parse_primary(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
         t.next_token()?;
         let inner = parse_or_expr(t, depth + 1)?;
         match t.next_token()? {
+            // Bracketed arithmetic is an operand, and is refused as it is
+            // without the bracket (captured eu-west-2, 2026-11-11).
+            Some(ref s) if s == ")" && is_arithmetic(&inner) => {
+                if starts_operator_tail(t)? {
+                    let number =
+                        Operand::Value(PartiqlValue::Literal(AttributeValue::N("0".to_string())));
+                    finish_operator(t, depth, number)?;
+                }
+                Ok(inner)
+            }
             Some(ref s) if s == ")" => Ok(inner),
             other => Err(format!(
                 "Expected ')' but got '{}'",
@@ -3228,24 +3238,64 @@ fn all_values(operands: &[Operand]) -> Option<Vec<PartiqlValue>> {
 /// DynamoDB says so by naming the operator it stands under once the clause is
 /// read (captured eu-west-2 and us-east-1, 2026-10-09).
 fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<BoolExpr, String> {
-    // Arithmetic on a size is refused ahead of its own operands, so
-    // `size(true) + 1 > size(s)` is refused for the `+` and not for the
-    // boolean (captured eu-west-2, 2026-11-11). The terms are read in a loop,
-    // so a long run of `+ 1` reads in constant stack, and what follows is read
-    // and has no say.
-    if matches!(left, Operand::Size(_) | Operand::Refused(_))
-        && let Some(op) = t.peek_token()?.filter(|op| op == "+" || op == "-")
+    if t.peek_token()?
+        .is_some_and(|op| is_arithmetic_operator(&op))
     {
-        let message = format!("Unsupported operator in Condition Expression. Operator: {op}");
-        while t.peek_token()?.is_some_and(|op| op == "+" || op == "-") {
-            t.next_token()?;
-            parse_operand(t, depth)?;
-        }
-        let refused = t.refused(Vec::new(), message);
-        finish_operator(t, depth, left)?;
-        return Ok(BoolExpr::Leaf(WhereCondition::Refused(refused)));
+        return Ok(BoolExpr::Leaf(arithmetic(t, depth, left)?));
     }
     finish_operator(t, depth, left)
+}
+
+/// `+` or `-` between two operands.
+fn is_arithmetic_operator(tok: &str) -> bool {
+    tok == "+" || tok == "-"
+}
+
+/// How DynamoDB refuses arithmetic in a condition.
+const ARITHMETIC_REFUSAL: &str = "Unsupported operator in Condition Expression. Operator: ";
+
+/// Arithmetic after `left`, the operator not yet read. DynamoDB takes none in
+/// a condition and refuses the first operator ahead of anything wrong with
+/// its operands, whatever they are and wherever the arithmetic stands, so
+/// `size(true) + 1 > size(s)`, `1 + size(s, s) > 0` and `n + 1 > 0` are each
+/// refused for the `+` (captured eu-west-2, 2026-11-11). The terms are read in
+/// a loop, so a long run of `+ 1` reads in constant stack, and the comparison
+/// that follows, if one does, is read and has no say.
+fn arithmetic(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<WhereCondition, String> {
+    let op = t.peek_token()?.unwrap_or_default();
+    let refused = t.refused(Vec::new(), format!("{ARITHMETIC_REFUSAL}{op}"));
+    while t
+        .peek_token()?
+        .is_some_and(|op| is_arithmetic_operator(&op))
+    {
+        t.next_token()?;
+        parse_operand(t, depth)?;
+    }
+    if starts_operator_tail(t)? {
+        finish_operator(t, depth, left)?;
+    }
+    Ok(WhereCondition::Refused(refused))
+}
+
+/// Whether what comes next compares the operand before it: a comparison
+/// operator, BETWEEN, IN, or NOT BETWEEN or NOT IN.
+fn starts_operator_tail(t: &mut Tokenizer) -> Result<bool, String> {
+    Ok(match t.peek_token()? {
+        Some(tok) if is_comparison_operator(&tok) => true,
+        Some(tok) if is_any(&tok, &["BETWEEN", "IN"]) => true,
+        Some(tok) if is_keyword(&tok, "NOT") => t
+            .peek_token_at(1)?
+            .is_some_and(|op| is_any(&op, &["BETWEEN", "IN"])),
+        _ => false,
+    })
+}
+
+/// Whether a condition is arithmetic refused where it was read, which a
+/// bracket around it doesn't end: `(size(s) + 1) > 0` reads on past the
+/// bracket.
+fn is_arithmetic(condition: &BoolExpr) -> bool {
+    matches!(condition, BoolExpr::Leaf(WhereCondition::Refused(refused))
+        if refused.operands.is_empty() && refused.message.starts_with(ARITHMETIC_REFUSAL))
 }
 
 /// The operator after a comparison's left operand and what follows it.
@@ -3294,11 +3344,13 @@ fn finish_operator(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<Boo
                 None => WhereCondition::CompareIn(left, members),
             }))
         }
+        // IS on a size is refused ahead of anything wrong with the size, its
+        // operand count included (captured eu-west-2, 2026-11-11).
         Some(tok)
             if is_keyword(tok, "IS") && matches!(left, Operand::Size(_) | Operand::Refused(_)) =>
         {
             let refused = t.refused(
-                vec![left],
+                Vec::new(),
                 "The left hand side argument to IS must be a Variable Reference, Literal, or \
                  Path"
                     .to_string(),
@@ -3844,6 +3896,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                         }
                     }
                 }
+                op if is_arithmetic_operator(op) => arithmetic(t, depth, Operand::Path(path)),
                 _ => {
                     // Standard comparison: path op operand
                     let op_tok = t.next_token()?.ok_or("Expected comparison operator")?;

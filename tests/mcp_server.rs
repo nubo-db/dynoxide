@@ -5559,9 +5559,9 @@ fn delete_item_reads_its_key_on_the_layer_the_http_api_uses() {
 }
 
 /// The tools without the envelope keep their operation's own layer: GetItem
-/// reads values on the current layer, bare, and BatchWriteItem on the older
-/// one, which reads `1e2147483647` as Java's `BigDecimal` does and calls it an
-/// underflow (tests/value_layers.rs).
+/// reads values on the current layer, bare, and the batch, transaction and
+/// PartiQL operations on the older one, which reads `1e2147483647` as Java's
+/// `BigDecimal` does and calls it an underflow (tests/value_layers.rs).
 #[test]
 fn other_tools_read_values_on_their_operations_layer() {
     let mut child = mcp_with_table("Layers");
@@ -5579,25 +5579,82 @@ fn other_tools_read_values_on_their_operations_layer() {
         json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}, "x": {"BOOL": "no"}}}),
     );
     assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let underflow = "Number underflow. Attempting to store a number with magnitude smaller than \
+                     supported range";
+    let tiny = json!({"N": "1e2147483647"});
+    let select = "SELECT * FROM \"Layers\" WHERE pk = ?";
+    let older: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "batch_write_item",
+            json!({"request_items": {"Layers": [
+                {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": tiny}}}
+            ]}}),
+            validation_error(underflow),
+        ),
+        (
+            "transact_write_items",
+            json!({"transact_items": [{"Update": {
+                "TableName": "Layers", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET v = :v",
+                "ExpressionAttributeValues": {":v": tiny}
+            }}]}),
+            named(underflow, ":v"),
+        ),
+        (
+            "transact_write_items",
+            json!({"transact_items": [{"Put": {
+                "TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}
+            }}]}),
+            validation_error(underflow),
+        ),
+        (
+            "transact_get_items",
+            json!({"transact_items": [{"Get": {"TableName": "Layers", "Key": {"pk": tiny}}}]}),
+            validation_error(underflow),
+        ),
+        (
+            "execute_partiql",
+            json!({"statement": select, "parameters": [tiny]}),
+            validation_error(underflow),
+        ),
+        (
+            "execute_transaction_partiql",
+            json!({"transact_statements": [{"Statement": select, "Parameters": [tiny]}]}),
+            validation_error(underflow),
+        ),
+    ];
+    let checked = older.len() + 1;
+    let mut mismatches = Vec::new();
+    let mut id = 10;
+    for (tool, args, refusal) in older {
+        id += 1;
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    // BatchExecuteStatement answers each statement in its own response.
     let resp = call_tool(
         &mut child,
-        4,
-        "batch_write_item",
-        json!({"request_items": {"Layers": [
-            {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}}
-        ]}}),
+        30,
+        "batch_execute_partiql",
+        json!({"statements": [{"Statement": select, "Parameters": [tiny]}]}),
     );
-    assert_eq!(
-        tool_error(&resp),
-        validation_error(
-            "Number underflow. Attempting to store a number with magnitude smaller than \
-             supported range"
-        )
+    assert!(!is_tool_error(&resp), "{resp}");
+    let responses = &tool_content(&resp)["Responses"];
+    if *responses != json!([{"Error": {"Code": "ValidationError", "Message": underflow}}]) {
+        mismatches.push(format!("batch_execute_partiql: {responses}"));
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} older-layer answers differ: {mismatches:#?}",
+        mismatches.len()
     );
     // And put_item, straight after, is back on the current layer.
     let resp = call_tool(
         &mut child,
-        5,
+       31,
         "put_item",
         json!({"table_name": "Layers", "item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}),
     );

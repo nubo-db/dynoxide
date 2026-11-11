@@ -3158,6 +3158,55 @@ mod tests {
     }
 }
 
+/// Every tool the server lists reads its values on its DynamoDB operation's
+/// layer, or is named here as having no operation, so a tool added without an
+/// entry in `tool_operation` can't fall back to the current layer unnoticed.
+#[cfg(test)]
+mod tool_operation_tests {
+    use super::*;
+
+    const WITHOUT_AN_OPERATION: [&str; 7] = [
+        "get_database_info",
+        "create_snapshot",
+        "restore_snapshot",
+        "list_snapshots",
+        "delete_snapshot",
+        "sweep_ttl",
+        "bulk_put_items",
+    ];
+
+    #[test]
+    fn every_listed_tool_has_an_operation_or_is_named_as_having_none() {
+        let tools: Vec<String> = McpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            tools.len() > WITHOUT_AN_OPERATION.len(),
+            "only {} tools listed",
+            tools.len()
+        );
+        let unaccounted: Vec<&String> = tools
+            .iter()
+            .filter(|name| {
+                tool_operation(name).is_none() && !WITHOUT_AN_OPERATION.contains(&name.as_str())
+            })
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "{} of {} listed tools have no operation and aren't named as having none: \
+             {unaccounted:?}",
+            unaccounted.len(),
+            tools.len()
+        );
+        for name in WITHOUT_AN_OPERATION {
+            assert!(tools.iter().any(|t| t == name), "{name} isn't listed");
+            assert_eq!(tool_operation(name), None, "{name} has an operation");
+        }
+    }
+}
+
 /// `return_consumed_capacity` on the tools. Each tool has to hand back the
 /// block its action returns for the same request against the same data,
 /// refuse a value outside DynamoDB's enum with the error a wire client gets,

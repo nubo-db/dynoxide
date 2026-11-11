@@ -6,9 +6,9 @@
 //! Each `const` holds requests sent to DynamoDB on 11 November 2026, in the
 //! order they were sent, with the answer DynamoDB gave each one, against an
 //! on-demand table keyed `pk` (S) and `sk` (S), or the indexed table round
-//! nine names. They are data captured from DynamoDB, not written by hand.
+//! nine and later rounds name. They are data captured from DynamoDB, not written by hand.
 //! Rounds one to four were captured in eu-west-2 and us-east-1, which gave
-//! the same answers; rounds five to nine in eu-west-2. A test replays its
+//! the same answers; rounds five to eleven in eu-west-2. A test replays its
 //! rows in order against a new server and compares each answer with
 //! DynamoDB's as JSON, so key order makes no difference, along with the HTTP
 //! status: 400 for an error and 200 otherwise.
@@ -24,6 +24,9 @@ type Row = (&'static str, &'static str, &'static str);
 /// A row left out of the replays: an operation, its request body, DynamoDB's
 /// answer and the answer it gets here today.
 type LeftOut = (&'static str, &'static str, &'static str, &'static str);
+
+/// The name of the table rounds one to eight run against.
+const TABLE_NAME: &str = "_capture_20261111_230_t";
 
 /// The table rounds one to eight run against.
 const TABLE: &str = r#"{"TableName": "_capture_20261111_230_t", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}], "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}], "BillingMode": "PAY_PER_REQUEST"}"#;
@@ -1011,6 +1014,112 @@ async fn operand_faults_are_reported_in_the_order_written() {
 #[tokio::test]
 async fn the_index_and_set_clause_checks_sit_around_the_operand_checks() {
     replay_on(INDEXED_TABLE, ROUND_NINE).await;
+}
+
+/// A write naming an index and a read of a multi-attribute index beside other
+/// members of a batch, writes naming an index in a transaction, a size's
+/// arithmetic refused ahead of its operands, the parameter count ahead of a
+/// call's operand, and a DELETE and an INSERT sent with a NextToken, which
+/// run as an UPDATE does.
+#[tokio::test]
+async fn index_members_arithmetic_and_write_next_tokens_answer_as_dynamodb_does() {
+    replay_on(INDEXED_TABLE, ROUND_TEN).await;
+}
+
+/// A write naming an index is refused ahead of the parameter count and its
+/// operands on every surface. A read of a multi-attribute index is refused
+/// ahead of the parameter count, a COUNT projection and its operands on
+/// ExecuteStatement and in a batch; in a transaction those come first.
+#[tokio::test]
+async fn index_refusals_rank_against_the_statement_checks() {
+    replay_on(INDEXED_TABLE, ROUND_ELEVEN).await;
+}
+
+/// A size given two operands and standing as a condition by itself, beside
+/// another, or under IS, is refused for its operand count on every surface,
+/// as the count is reported ahead of the operator a size stands under. The
+/// count is captured under an operator; standing bare it is inferred.
+#[tokio::test]
+async fn a_bare_size_with_two_operands_is_refused_for_its_count() {
+    let url = start_server().await;
+    let count = "Incorrect number of operands for operator or function; operator or function: \
+                 size, number of operands: 2";
+    for clause in ["size(s, s)", "size(s, s) AND n = 1", "size(s, s) IS NULL"] {
+        let select =
+            format!(r#"SELECT pk FROM "{TABLE_NAME}" WHERE pk='a' AND sk='b' AND {clause}"#);
+        let update =
+            format!(r#"UPDATE "{TABLE_NAME}" SET z = 1 WHERE pk='a' AND sk='b' AND {clause}"#);
+        let (status, got) = answer(
+            &url,
+            "ExecuteStatement",
+            &serde_json::json!({ "Statement": select }).to_string(),
+        )
+        .await;
+        assert_eq!(
+            (status, &got["message"]),
+            (400, &serde_json::json!(count)),
+            "{clause}"
+        );
+        let (status, got) = answer(
+            &url,
+            "BatchExecuteStatement",
+            &serde_json::json!({ "Statements": [{ "Statement": select }] }).to_string(),
+        )
+        .await;
+        assert_eq!(status, 200, "{clause}");
+        assert_eq!(
+            got["Responses"][0]["Error"],
+            serde_json::json!({ "Code": "ValidationError", "Message": count }),
+            "{clause}"
+        );
+        let (status, got) = answer(
+            &url,
+            "ExecuteTransaction",
+            &serde_json::json!({ "TransactStatements": [{ "Statement": update }] }).to_string(),
+        )
+        .await;
+        assert_eq!(
+            (status, &got["message"]),
+            (
+                400,
+                &serde_json::json!(format!(
+                    "Validation failed in TransactStatements[0]: {count}"
+                ))
+            ),
+            "{clause}"
+        );
+    }
+}
+
+/// A SELECT on an index keyed on two attributes a side is refused, on
+/// ExecuteStatement and as a batch member, with the table loaded once for it.
+#[tokio::test]
+async fn a_read_of_a_multi_attribute_index_is_refused() {
+    let url = start_server_with(INDEXED_TABLE).await;
+    let refusal = "PartiQL statements cannot be executed on tables with multi-attribute HASH \
+                   keys or multi-attribute RANGE keys.";
+    let select = r#"SELECT * FROM "_capture_20261111_230_m"."hh_rr" WHERE h1 = 'a' AND h2 = 'x'"#;
+    let (status, got) = answer(
+        &url,
+        "ExecuteStatement",
+        &serde_json::json!({ "Statement": select }).to_string(),
+    )
+    .await;
+    assert_eq!(
+        (status, &got["message"]),
+        (400, &serde_json::json!(refusal))
+    );
+    let (status, got) = answer(
+        &url,
+        "BatchExecuteStatement",
+        &serde_json::json!({ "Statements": [{ "Statement": select }] }).to_string(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        got["Responses"][0]["Error"],
+        serde_json::json!({ "Code": "ValidationError", "Message": refusal })
+    );
 }
 
 /// Two more rows are left out, for causes of their own. `SET z = size(true)`
@@ -2847,5 +2956,224 @@ const LEFT_OUT_OTHER: &[LeftOut] = &[
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, s) AND size(true) > 0"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: {B,FS,DOUBLESET,NULL,BOOL,DECIMAL,S,NS,INTSET,SS,HDS,N,DECIMALSET,M,L,HD,FLOAT,DOUBLE,BS,DICT,INT}"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: {S,HDS,N,FS,BS,NULL,DOUBLE,NS,DECIMAL,SS,DECIMALSET,BOOL,HD,DICT,INTSET,M,L,B,FLOAT,INT,DOUBLESET}"}"#,
+    ),
+];
+
+/// Round ten, captured in eu-west-2 against `INDEXED_TABLE`.
+const ROUND_TEN: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName": "_capture_20261111_230_m", "Item": {"id": {"S": "i1"}, "sk": {"S": "s"}, "g": {"S": "g1"}, "h1": {"S": "a"}, "h2": {"S": "x"}, "r1": {"S": "m"}, "r2": {"S": "n"}, "n": {"N": "5"}, "s": {"S": "hello"}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "PutItem",
+        r#"{"TableName": "_capture_20261111_230_m", "Item": {"id": {"S": "i2"}, "sk": {"S": "s"}, "g": {"S": "g2"}, "r1": {"S": "m"}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}, {"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}},{"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}, {"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i2' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}},{"Item":{"r1":{"S":"m"},"sk":{"S":"s"},"id":{"S":"i2"},"g":{"S":"g2"}},"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"single\" WHERE id = 'i1' AND sk = 's'"}, {"Statement": "DELETE FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}},{"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}, {"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i2' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}},{"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}, {"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i2' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}},{"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}, {"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i2' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}},{"Item":{"a":{"N":"1"},"r1":{"S":"m"},"sk":{"S":"s"},"id":{"S":"i2"},"g":{"S":"g2"}},"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"single\" WHERE g = 'g1'"}, {"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i2' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Select statements within BatchExecuteStatement must specify the primary key in the where clause."}},{"Item":{"a":{"N":"1"},"r1":{"S":"m"},"sk":{"S":"s"},"id":{"S":"i2"},"g":{"S":"g2"}},"TableName":"_capture_20261111_230_m"}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}, {"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_m\" SET a = 1 WHERE id = 'i2' AND sk = 's'"}, {"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[1]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"single\" WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's' AND attribute_exists(?)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's' AND size(s) + 1 > size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's' AND size(true) + 1 > size(s)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unsupported operator in Condition Expression. Operator: +"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_m\" WHERE id = 'zz' AND sk = 'zz'", "NextToken": "abc"}"#,
+        r#"{"Items":[]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "INSERT INTO \"_capture_20261111_230_m\" VALUE {'id': 'zz', 'sk': 'zz'}", "NextToken": "abc"}"#,
+        r#"{"Items":[]}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_m\" WHERE id = 'zz' AND sk = 'zz'"}"#,
+        r#"{"Items":[]}"#,
+    ),
+];
+
+/// Round eleven, captured in eu-west-2 against `INDEXED_TABLE`: the index
+/// refusals against the parameter count, a COUNT projection and an operand.
+const ROUND_ELEVEN: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName": "_capture_20261111_230_m", "Item": {"id": {"S": "i1"}, "sk": {"S": "s"}, "g": {"S": "g1"}, "h1": {"S": "a"}, "h2": {"S": "x"}, "r1": {"S": "m"}, "r2": {"S": "n"}, "n": {"N": "5"}, "s": {"S": "hello"}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = ? WHERE id = 'i1' AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = ? WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = ? WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"single\" WHERE id = ? AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"single\" WHERE id = ? AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "DELETE FROM \"_capture_20261111_230_m\".\"single\" WHERE id = ? AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = ? AND h2 = 'x'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = ? AND h2 = 'x'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = ? AND h2 = 'x'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Number of parameters in request and statement don't match."}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT COUNT(*) FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT COUNT(*) FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT COUNT(*) FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Unexpected path component at 1:8:5"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT COUNT(*) FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Unexpected path component at 1:8:5"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT COUNT(*) FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"Unexpected path component at 1:8:5"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT COUNT(*) FROM \"_capture_20261111_230_m\" WHERE id = 'i1' AND sk = 's'"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Unexpected path component at 1:8:5"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND size(true) > 1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"This operation is not supported on an index"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND size(true) > 1"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"This operation is not supported on an index"}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "UPDATE \"_capture_20261111_230_m\".\"single\" SET a = 1 WHERE id = 'i1' AND sk = 's' AND size(true) > 1"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: This operation is not supported on an index"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND size(true) > 1"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND size(true) > 1"}]}"#,
+        r#"{"Responses":[{"Error":{"Code":"ValidationError","Message":"PartiQL statements cannot be executed on tables with multi-attribute HASH keys or multi-attribute RANGE keys."}}]}"#,
+    ),
+    (
+        "ExecuteTransaction",
+        r#"{"TransactStatements": [{"Statement": "SELECT * FROM \"_capture_20261111_230_m\".\"hh_rr\" WHERE h1 = 'a' AND size(true) > 1"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Validation failed in TransactStatements[0]: Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
     ),
 ];

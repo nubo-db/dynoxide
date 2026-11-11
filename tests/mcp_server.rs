@@ -5727,3 +5727,224 @@ fn scan_segments_answer_as_the_http_api_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// `execute_partiql` reports a member error ahead of a parameter it refuses
+/// for its value, and a parameter of the wrong JSON type, or `parameters`
+/// that isn't a list, ahead of both, as ExecuteStatement answers over HTTP
+/// (tests/partiql_member_errors_before_parameters.rs). No table is needed:
+/// each statement is refused before its table is looked up.
+#[test]
+fn execute_partiql_orders_member_and_parameter_errors_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let select = "SELECT * FROM \"Missing\" WHERE pk = ?";
+    let limit_0 = enveloped(
+        "Value '0' at 'limit' failed to satisfy constraint: Member must have value greater \
+         than or equal to 1",
+    );
+    let bad_capacity = "Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: \
+                        Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let empty = "Supplied AttributeValue is empty, must contain exactly one of the supported \
+                 datatypes";
+    let number_to_string = serialization_error("NUMBER_VALUE cannot be converted to String");
+    let bad = json!({"N": "abc"});
+
+    let mut cases: Vec<(Value, (String, String))> = vec![
+        // Member errors beat a number the parameter walk refuses.
+        (
+            json!({"statement": select, "parameters": [bad], "limit": 0}),
+            limit_0.clone(),
+        ),
+        (
+            json!({
+                "statement": select, "parameters": [bad],
+                "return_values_on_condition_check_failure": "BAD"
+            }),
+            enveloped(
+                "Value 'BAD' at 'returnValuesOnConditionCheckFailure' failed to satisfy \
+                 constraint: Member must satisfy enum value set: [ALL_OLD, NONE]",
+            ),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad], "return_consumed_capacity": "BAD"}),
+            enveloped(bad_capacity),
+        ),
+        (
+            json!({"statement": "", "parameters": [bad]}),
+            enveloped(
+                "Value '' at 'statement' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({
+                "statement": select, "parameters": [bad], "limit": 0,
+                "return_consumed_capacity": "BAD"
+            }),
+            validation_error(&format!(
+                "2 validation errors detected: Value '0' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1; {bad_capacity}"
+            )),
+        ),
+        // A parameter of the wrong JSON type fails first.
+        (
+            json!({"statement": select, "parameters": [bad, {"N": 1}]}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {"N": 1}], "limit": 0}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {"S": 1}], "limit": 0}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [{"N": 1}], "limit": 0}),
+            number_to_string,
+        ),
+        (
+            json!({"statement": select, "parameters": ["str"]}),
+            serialization_error("Unexpected value type in payload"),
+        ),
+        (
+            json!({"statement": select, "parameters": ["str"], "limit": 0}),
+            serialization_error("Unexpected value type in payload"),
+        ),
+        // With no member error, the first refused parameter is reported.
+        (
+            json!({"statement": select, "parameters": [bad]}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": [{}, bad]}),
+            validation_error(empty),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {}]}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad], "next_token": "garbage"}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": []}),
+            enveloped(
+                "Value '[]' at 'parameters' failed to satisfy constraint: Member must have \
+                 length greater than or equal to 1",
+            ),
+        ),
+    ];
+    // A limit of 0 beats every kind of parameter refused for its value.
+    for refused in [
+        json!([{}]),
+        json!([{"S": "a", "N": "1"}]),
+        json!([{"NULL": false}]),
+        json!([{"NULL": "false"}]),
+        json!([{"NULL": false, "S": "a"}]),
+        json!([{"X": "a"}]),
+        json!([{"S": null}]),
+        json!([null]),
+        json!([{"NS": ["abc"]}]),
+        json!([{"M": {"a": {"N": "abc"}}}]),
+        json!([{"L": [{"N": "abc"}]}]),
+        json!([{"N": ""}]),
+        json!([{}, {"N": "abc"}]),
+        json!([{"N": "1"}, {"N": "abc"}, {"SS": ["a", "a"]}]),
+    ] {
+        cases.push((
+            json!({"statement": select, "parameters": refused, "limit": 0}),
+            limit_0.clone(),
+        ));
+    }
+    // Parameters that aren't a list fail the request first.
+    for (parameters, message) in [
+        (json!("x"), "Unexpected field type"),
+        (json!(5), "Unexpected field type"),
+        (json!(true), "Unexpected field type"),
+        (
+            json!({}),
+            "Start of structure or map found where not expected",
+        ),
+        (
+            json!({"N": "1"}),
+            "Start of structure or map found where not expected",
+        ),
+    ] {
+        cases.push((
+            json!({"statement": select, "parameters": parameters}),
+            serialization_error(message),
+        ));
+        cases.push((
+            json!({"statement": select, "parameters": parameters, "limit": 0}),
+            serialization_error(message),
+        ));
+    }
+    let mut id = 10;
+    for (args, refusal) in cases {
+        id += 1;
+        let resp = call_tool(&mut child, id, "execute_partiql", args.clone());
+        assert_eq!(tool_error(&resp), refusal, "{args}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `execute_partiql`'s `consistent_read` is ExecuteStatement's
+/// `ConsistentRead` as given, so it answers whatever ExecuteStatement answers
+/// over HTTP, which today refuses a string as malformed.
+#[test]
+fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
+    let mut child = mcp_with_table("Pql");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Pql", "item": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let select = "SELECT * FROM \"Pql\" WHERE pk = 'a'";
+    let mut id = 10;
+    for (flag, units) in [(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({
+                "statement": select, "consistent_read": flag,
+                "return_consumed_capacity": "TOTAL"
+            }),
+        );
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["Items"].as_array().unwrap().len(), 1, "{flag}");
+        assert_eq!(
+            content["ConsumedCapacity"]["CapacityUnits"],
+            json!(units),
+            "{flag}"
+        );
+    }
+    for (flag, refusal) in [
+        (json!("true"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (
+            json!(1),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+    ] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({"statement": select, "consistent_read": flag}),
+        );
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

@@ -603,11 +603,14 @@ pub struct ExecutePartiqlParams {
     #[schemars(description = "Positional parameters for the statement, in DynamoDB JSON format")]
     pub parameters: Option<serde_json::Value>,
 
+    /// Passed to ExecuteStatement's own decoder as given, so it answers as
+    /// ExecuteStatement does over HTTP; the schema still advertises a boolean.
     #[schemars(
-        description = "Whether to use strongly consistent reads. Does not change which rows come back, but it doubles the rate a SELECT is charged at and it makes a SELECT qualified by a GSI a rejection, because a GSI cannot serve one."
+        description = "Whether to use strongly consistent reads. Does not change which rows come back, but it doubles the rate a SELECT is charged at and it makes a SELECT qualified by a GSI a rejection, because a GSI cannot serve one.",
+        with = "Option<bool>"
     )]
     #[serde(default)]
-    pub consistent_read: Option<bool>,
+    pub consistent_read: Option<serde_json::Value>,
 
     #[schemars(
         description = "Maximum number of items to evaluate for SELECT statements (not necessarily the number returned); a filtered page can come back short or empty and still carry a NextToken"
@@ -1934,45 +1937,47 @@ impl McpServer {
                 ));
             }
         }
-        // The action lists a bad ReturnConsumedCapacity with the statement's
-        // other member errors, so it isn't refused on its own here.
-        let parameters: Option<Vec<AttributeValue>> = match params.parameters {
-            Some(val) => match serde_json::from_value(val) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    // Marker-tagged serde failures classify through the shared
-                    // decoder, reporting the request-validation family bare;
-                    // malformed input keeps the field-specific message, with
-                    // the echoed serde text cleaned so neither marker nor
-                    // position suffix can leak.
-                    let msg = e.to_string();
-                    if let Some(err) = crate::serde_errors::classify_marked_serde_error(&msg) {
-                        return Ok(to_tool_error(
-                            crate::validation::strip_request_validation_tag(err),
-                        ));
-                    }
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "Invalid parameters: {}",
-                            crate::serde_errors::clean_serde_message(&msg)
-                        ),
-                        None,
+        // Decoded as ExecuteStatement's wire request, by the HTTP seam's own
+        // decoder, so the tool answers as the HTTP API does: a parameter of
+        // the wrong JSON type, or parameters that aren't a list, first, then
+        // the member errors (a bad ReturnConsumedCapacity among them), then a
+        // parameter refused for its value. Only the member names change,
+        // because these params are snake_case.
+        let mut wire = serde_json::Map::new();
+        wire.insert(
+            "Statement".to_string(),
+            serde_json::Value::from(params.statement),
+        );
+        let optional: [(&str, Option<serde_json::Value>); 6] = [
+            ("Parameters", params.parameters),
+            ("Limit", params.limit.map(serde_json::Value::from)),
+            ("NextToken", params.next_token.map(serde_json::Value::from)),
+            ("ConsistentRead", params.consistent_read),
+            (
+                "ReturnConsumedCapacity",
+                params.return_consumed_capacity.map(serde_json::Value::from),
+            ),
+            (
+                "ReturnValuesOnConditionCheckFailure",
+                params
+                    .return_values_on_condition_check_failure
+                    .map(serde_json::Value::from),
+            ),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                wire.insert(name.to_string(), value);
+            }
+        }
+        let request: crate::actions::execute_statement::ExecuteStatementRequest =
+            match crate::serde_errors::deserialize(&serde_json::Value::Object(wire).to_string()) {
+                Ok(request) => request,
+                Err(err) => {
+                    return Ok(to_tool_error(
+                        crate::validation::strip_request_validation_tag(err),
                     ));
                 }
-            },
-            None => None,
-        };
-
-        let request = crate::actions::execute_statement::ExecuteStatementRequest {
-            statement: params.statement,
-            parameters,
-            limit: params.limit,
-            next_token: params.next_token,
-            consistent_read: params.consistent_read,
-            return_consumed_capacity: params.return_consumed_capacity,
-            return_values_on_condition_check_failure: params
-                .return_values_on_condition_check_failure,
-        };
+            };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),

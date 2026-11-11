@@ -513,7 +513,8 @@ pub enum WhereCondition {
     /// `operand IN [...]` for an operand that isn't a path.
     CompareIn(Operand, Vec<Operand>),
     /// `attribute_type(operand, type)`: the operand's DynamoDB type is `type`.
-    AttributeType(Operand, PartiqlValue),
+    /// A type that isn't a value is refused before the statement runs.
+    AttributeType(Operand, Operand),
     /// A negated condition with no negated form of its own.
     Not(Box<WhereCondition>),
 }
@@ -2616,7 +2617,7 @@ const ATTRIBUTE_TYPES: &[&str] = &["N", "BS", "L", "B", "NULL", "M", "S", "SS", 
 /// operand types it would take, in the order of a Java hash set. The order
 /// differs from host to host (us-east-1 gave another); this is eu-west-2's
 /// (captured 2026-10-09).
-const ATTRIBUTE_TYPE_OPERAND_TYPES: &str = "{S,HDS,N,FS,BS,NULL,DOUBLE,NS,DECIMAL,SS,DECIMALSET,\
+pub(crate) const ATTRIBUTE_TYPE_OPERAND_TYPES: &str = "{S,HDS,N,FS,BS,NULL,DOUBLE,NS,DECIMAL,SS,DECIMALSET,\
      BOOL,HD,DICT,INTSET,M,L,B,FLOAT,INT,DOUBLESET}";
 
 /// `MISSING` anywhere but after IS. It outranks a refused operand, whichever
@@ -2678,30 +2679,30 @@ impl ConditionFunction {
 
     /// The call compared with an operand. It is a boolean: equal only to the
     /// same boolean, so unequal to a missing value, a size or a value of
-    /// another type, and the ordering operators refuse it (captured eu-west-2
-    /// and us-east-1, 2026-10-09 for a literal, 2026-10-10 for a path, a size
-    /// or a parameter). A boolean literal settles it as the call or its
-    /// negation. Anything else is one condition, read item by item rather
-    /// than spelled out as alternatives, so ten `<>` comparisons ANDed stay
-    /// one group and a key condition beside one keeps the read a key read, as
-    /// DynamoDB runs both (captured eu-west-2 and us-east-1, 2026-10-10).
-    fn compared(&self, t: &mut Tokenizer, op: &str, value: Operand) -> Result<BoolExpr, String> {
-        let op = match op {
-            "=" => CompOp::Eq,
-            "<>" | "!=" => CompOp::Ne,
-            other => {
-                t.note_operand_refusal(bool_operand_refusal(other));
-                return self.condition(true);
-            }
-        };
-        if let Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) = value {
+    /// another type, and the ordering operators refuse it, once the operands
+    /// are checked (captured eu-west-2 and us-east-1, 2026-10-09 for a
+    /// literal, 2026-10-10 for a path, a size or a parameter). A boolean
+    /// literal under `=` or `<>` settles it as the call or its negation.
+    /// Anything else is one condition, read item by item rather than spelled
+    /// out as alternatives, so ten `<>` comparisons ANDed stay one group and a
+    /// key condition beside one keeps the read a key read, as DynamoDB runs
+    /// both (captured eu-west-2 and us-east-1, 2026-10-10).
+    ///
+    /// `written_first` says which side the call was written on, so the
+    /// operands are checked in the order written and an ordering operator is
+    /// named as written.
+    fn compared(&self, op: &str, value: Operand, written_first: bool) -> Result<BoolExpr, String> {
+        let op = comparison_operator(op)?;
+        if matches!(op, CompOp::Eq | CompOp::Ne)
+            && let Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) = value
+        {
             return self.condition(b == (op == CompOp::Eq));
         }
-        Ok(BoolExpr::Leaf(WhereCondition::Compare(
-            self.operand(),
-            op,
-            value,
-        )))
+        Ok(BoolExpr::Leaf(if written_first {
+            WhereCondition::Compare(self.operand(), op, value)
+        } else {
+            WhereCondition::Compare(value, op, self.operand())
+        }))
     }
 
     /// The call in a list: true when any member equals it (captured eu-west-2
@@ -2709,14 +2710,6 @@ impl ConditionFunction {
     fn listed(&self, members: Vec<Operand>) -> BoolExpr {
         BoolExpr::Leaf(WhereCondition::CompareIn(self.operand(), members))
     }
-}
-
-/// DynamoDB's refusal of a boolean as the operand of `op`.
-fn bool_operand_refusal(op: &str) -> String {
-    format!(
-        "Incorrect operand type for operator or function; operator or function: {op}, \
-         operand type: BOOL"
-    )
 }
 
 /// Which condition function a name calls, by its canonical name.
@@ -2763,7 +2756,7 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
         let left = parse_value(t, depth)?;
         let op = t.next_token()?.unwrap_or_default();
         return match parse_condition_function(t, depth)? {
-            Some(function) => function.compared(t, &op, Operand::Value(left)),
+            Some(function) => function.compared(&op, Operand::Value(left), false),
             None => Ok(refused_condition()),
         };
     }
@@ -2783,7 +2776,7 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
             let path = parse_dotted_path_from_token(&first, t)?;
             let op = t.next_token()?.unwrap_or_default();
             return match parse_condition_function(t, depth)? {
-                Some(function) => function.compared(t, &op, Operand::Path(path)),
+                Some(function) => function.compared(&op, Operand::Path(path), false),
                 None => Ok(refused_condition()),
             };
         }
@@ -2857,7 +2850,7 @@ fn condition_function_tail(
     if is_comparison_operator(&next) {
         t.next_token()?;
         let right = parse_operand(t, depth)?;
-        return function.compared(t, &next, right);
+        return function.compared(&next, right, true);
     }
     // `NOT BETWEEN` takes BETWEEN's refusal and `NOT IN` is the negation of
     // IN (captured eu-west-2 and us-east-1, 2026-10-10).
@@ -2870,16 +2863,23 @@ fn condition_function_tail(
     } else {
         next
     };
-    // The bounds are read first, so a refusal from a call among them is the
-    // one reported: inferred from the captured rule that a call's own refusal
-    // comes ahead of the operator it stands under (eu-west-2, 2026-11-11).
+    // BETWEEN refuses the call as the boolean it is, once its bounds are
+    // checked (captured eu-west-2, 2026-11-11).
     if is_keyword(&next, "BETWEEN") {
         t.next_token()?;
-        parse_bound_operand(t, depth)?;
+        let low = parse_operand(t, depth)?;
         expect_between_and(t)?;
-        parse_bound_operand(t, depth)?;
-        t.note_operand_refusal(bool_operand_refusal("BETWEEN"));
-        return Ok(refused_condition());
+        let high = parse_operand(t, depth)?;
+        let between = BoolExpr::Leaf(WhereCondition::CompareBetween(
+            function.operand(),
+            low,
+            high,
+        ));
+        return Ok(if negated {
+            BoolExpr::Not(Box::new(between))
+        } else {
+            between
+        });
     }
     // Members read as any IN's do, so a bare name is an attribute rather than
     // a string (captured eu-west-2 and us-east-1, 2026-10-10).
@@ -2994,14 +2994,16 @@ fn call_operands(t: &mut Tokenizer, depth: usize) -> Result<Vec<Operand>, String
     }
 }
 
-/// Read `attribute_type(operand, type)`, noting the refusal of a type it
-/// can't take; `None` once a refusal is noted. A type given as a parameter is
-/// checked once the parameter is bound (captured eu-west-2 and us-east-1,
-/// 2026-10-09).
+/// Read `attribute_type(operand, type)`, noting a wrong number of operands or
+/// a type that is the operand itself; `None` once a refusal is noted. Any
+/// other type it can't take is refused as the statement's operands are
+/// checked, after the operand it tests, as a type given as a parameter is
+/// once the parameter is bound (captured eu-west-2 and us-east-1, 2026-10-09;
+/// a call or a size as either, captured eu-west-2, 2026-11-11).
 fn parse_attribute_type(
     t: &mut Tokenizer,
     depth: usize,
-) -> Result<Option<(Operand, PartiqlValue)>, String> {
+) -> Result<Option<(Operand, Operand)>, String> {
     let mut operands = call_operands(t, depth + 1)?;
     if operands.len() != 2 {
         t.note_operand_refusal(operand_count_refusal("attribute_type", operands.len()));
@@ -3013,33 +3015,12 @@ fn parse_attribute_type(
     let operand = operands
         .pop()
         .unwrap_or(Operand::Value(PartiqlValue::Parameter(0)));
-    let operand_type = |kind: &str| {
-        format!(
-            "Incorrect operand type for operator or function; operator or function: \
-             attribute_type, operand type: {kind}"
-        )
-    };
-    let refusal = match &kind {
-        Operand::Value(PartiqlValue::Literal(AttributeValue::S(name))) => {
-            attribute_type_name_refusal(name)
-        }
-        Operand::Value(PartiqlValue::Literal(other)) => Some(operand_type(other.type_name())),
-        Operand::Value(PartiqlValue::Parameter(_)) => None,
-        Operand::Path(path) if operand == Operand::Path(path.clone()) => {
-            Some(not_distinct("attribute_type", path))
-        }
-        Operand::Path(_) => Some(operand_type(ATTRIBUTE_TYPE_OPERAND_TYPES)),
-        Operand::Size(_) => Some(operand_type("N")),
-        // A call is the boolean it returns (captured eu-west-2, 2026-11-11).
-        Operand::Condition(_) => Some(operand_type("BOOL")),
-    };
-    if let Some(message) = refusal {
-        t.note_operand_refusal(message);
+    if let Operand::Path(path) = &kind
+        && operand == kind
+    {
+        t.note_operand_refusal(not_distinct("attribute_type", path));
         return Ok(None);
     }
-    let Operand::Value(kind) = kind else {
-        return Ok(None);
-    };
     Ok(Some((operand, kind)))
 }
 
@@ -3072,6 +3053,12 @@ fn starts_operand_call(t: &Tokenizer) -> Result<bool, String> {
 /// the operand of `size` or `attribute_type` (captured eu-west-2,
 /// 2026-11-11). A call whose refusal is noted stands as a NULL, never
 /// evaluated.
+///
+/// A BETWEEN bound is read here too, so a bound can be a path, a size or a
+/// call as well as a value, as an IN member can, and `size(s) IN [n]` names
+/// the attribute `n` rather than the string `'n'` (captured eu-west-2 and
+/// us-east-1, 2026-10-09). `MISSING` is refused here as it is anywhere else
+/// an operand can stand.
 fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
     // `size(` and `attribute_type(` come back here for their arguments, so a
     // run of nested calls is held to the same depth as nested brackets.
@@ -3090,13 +3077,14 @@ fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
             true,
         ))));
     }
-    if is_condition_function(&tok) && t.peek_token_at(1)?.as_deref() == Some("(") {
+    let call = starts_operand_call(t)?;
+    if call && is_condition_function(&tok) {
         return Ok(match parse_condition_function(t, depth + 1)? {
             Some(function) => function.operand(),
             None => Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(true))),
         });
     }
-    if is_keyword(&tok, "size") && t.peek_token_at(1)?.as_deref() == Some("(") {
+    if call && is_keyword(&tok, "size") {
         let mut operands = call_operands(t, depth + 1)?;
         if operands.len() != 1 {
             t.note_operand_refusal(operand_count_refusal("size", operands.len()));
@@ -3172,14 +3160,6 @@ fn note_in_operand_count(t: &mut Tokenizer, count: usize) {
     }
 }
 
-/// A BETWEEN bound: a path, a size or a call as well as a value, as an IN
-/// member is, so `size(s) IN [n]` names the attribute `n` rather than the
-/// string `'n'` (captured eu-west-2 and us-east-1, 2026-10-09). `MISSING` is
-/// refused here as it is anywhere else an operand can stand.
-fn parse_bound_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
-    parse_operand(t, depth)
-}
-
 /// Every member's value, when each member is one.
 fn all_values(operands: &[Operand]) -> Option<Vec<PartiqlValue>> {
     operands
@@ -3228,7 +3208,7 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
             // 2026-10-10).
             match parse_operand(t, depth)? {
                 Operand::Condition(holds) => {
-                    ConditionFunction { holds: *holds }.compared(t, &op_tok, left)
+                    ConditionFunction { holds: *holds }.compared(&op_tok, left, false)
                 }
                 right => Ok(BoolExpr::Leaf(comparison(t, left, op, &op_tok, right))),
             }
@@ -3534,7 +3514,7 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
         W::Compare(left, _, right) => operand(left) + operand(right),
         W::CompareBetween(o, low, high) => operand(o) + operand(low) + operand(high),
         W::CompareIn(o, values) => operand(o) + values.iter().map(operand).sum::<usize>(),
-        W::AttributeType(o, v) => operand(o) + value(v),
+        W::AttributeType(o, kind) => operand(o) + operand(kind),
         W::Not(inner) => condition_bytes(inner),
     }
 }
@@ -3802,9 +3782,9 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
 /// makes it a comparison of operands, read item by item. The path itself as a
 /// bound is refused.
 fn path_between(t: &mut Tokenizer, depth: usize, path: String) -> Result<WhereCondition, String> {
-    let low = parse_bound_operand(t, depth)?;
+    let low = parse_operand(t, depth)?;
     expect_between_and(t)?;
-    let high = parse_bound_operand(t, depth)?;
+    let high = parse_operand(t, depth)?;
     if names_path(&[&low, &high], &path) {
         t.note_operand_refusal(not_distinct("BETWEEN", &path));
         return Ok(WhereCondition::Exists(String::new()));

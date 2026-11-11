@@ -3,12 +3,15 @@
 //! string, the ORDER BY refusal for a quoted name, and a condition function
 //! used as an operand.
 //!
-//! Each `const` holds requests sent to eu-west-2 on 11 November 2026, in the
+//! Each `const` holds requests sent to DynamoDB on 11 November 2026, in the
 //! order they were sent, with the answer DynamoDB gave each one, against an
 //! on-demand table keyed `pk` (S) and `sk` (S). They are data captured from
-//! DynamoDB, not written by hand, except where a row says it is inferred. A
-//! test replays its rows in order against a new server and compares each
-//! answer with DynamoDB's as JSON, so key order makes no difference.
+//! DynamoDB, not written by hand. The rounds of requests sent before round
+//! six were captured in eu-west-2 and us-east-1, which gave the same answers;
+//! round six was captured in eu-west-2. A test replays its rows in order
+//! against a new server and compares each answer with DynamoDB's as JSON, so
+//! key order makes no difference, along with the HTTP status: 400 for an
+//! error and 200 otherwise.
 
 #![cfg(feature = "http-server")]
 
@@ -47,8 +50,9 @@ async fn start_server() -> String {
     url
 }
 
-async fn answer(url: &str, operation: &str, body: &str) -> serde_json::Value {
-    reqwest::Client::new()
+/// The HTTP status and the body of the answer to a request.
+async fn answer(url: &str, operation: &str, body: &str) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new()
         .post(url)
         .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
         .header("content-type", "application/x-amz-json-1.0")
@@ -61,10 +65,18 @@ async fn answer(url: &str, operation: &str, body: &str) -> serde_json::Value {
         .body(body.to_string())
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap())
+}
+
+/// The status DynamoDB answers with: 400 for an error, 200 otherwise.
+fn status_of(expected: &serde_json::Value) -> u16 {
+    if expected.get("__type").is_some() {
+        400
+    } else {
+        200
+    }
 }
 
 /// Send every row in order to a new server, and fail listing each answer that
@@ -74,10 +86,11 @@ async fn replay(rows: &[Row]) {
     let mut wrong = Vec::new();
     for &(operation, body, expected) in rows {
         let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
-        let got = answer(&url, operation, body).await;
-        if got != expected {
+        let expected_status = status_of(&expected);
+        let (status, got) = answer(&url, operation, body).await;
+        if got != expected || status != expected_status {
             wrong.push(format!(
-                "{operation} {body}\n  expected {expected}\n  got      {got}"
+                "{operation} {body}\n  expected {expected_status} {expected}\n  got      {status} {got}"
             ));
         }
     }
@@ -98,30 +111,15 @@ async fn an_update_through_a_key_path_is_refused_as_a_key_update() {
     replay(KEY_PATHS).await;
 }
 
-/// With both keys named the sort key is reported, in either order. The key
+/// With both keys named the sort key is reported, in either order, through a
+/// path or by name (round six has the second). The key
 /// refusal loses to a WHERE clause without the whole key and to a parameter
 /// count that doesn't match, and BatchExecuteStatement and ExecuteTransaction
 /// report it against the statement.
 #[tokio::test]
 async fn the_sort_key_is_reported_when_both_keys_are_updated() {
     replay(KEY_PATHS_BOTH_KEYS).await;
-    replay(KEY_NAMES_BOTH_KEYS_INFERRED).await;
 }
-
-/// Inferred from the captured rows that name both keys through a path, in
-/// either order: the captured whole-name rows write `sk` first.
-const KEY_NAMES_BOTH_KEYS_INFERRED: &[Row] = &[
-    (
-        "ExecuteStatement",
-        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET pk = 'z' SET sk = 'z' WHERE pk='zz' AND sk='zz'"}"#,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Cannot update attribute sk. This attribute is part of the key"}"#,
-    ),
-    (
-        "ExecuteStatement",
-        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" REMOVE pk REMOVE sk WHERE pk='zz' AND sk='zz'"}"#,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Cannot update attribute sk. This attribute is part of the key"}"#,
-    ),
-];
 
 /// Round one, the UPDATE rows: each refused update is followed by the item
 /// read back.
@@ -525,13 +523,16 @@ const KEY_PATHS_BOTH_KEYS: &[Row] = &[
 /// `ConsistentRead` on ExecuteStatement and on a BatchExecuteStatement member
 /// is read as GetItem reads it: the strings DynamoDB takes for true and false
 /// read, `null` is absent, and anything else is refused in DynamoDB's words
-/// for what was found. A list is refused with no message, where GetItem names
-/// the type. A string that reads is no fault, so a `Limit` of 0 beside it is
-/// what's reported, and a write statement takes it too.
+/// for what was found. DynamoDB refuses a list here with no message, empty or
+/// not (captured eu-west-2 and us-east-1, 2026-11-11); the shared reader's
+/// different answer for the other operations is not changed here. A string
+/// that reads is no fault, so a `Limit` of 0 beside it is what's reported,
+/// and a write statement takes it too.
 #[tokio::test]
 async fn consistent_read_given_as_a_string_is_read_as_get_item_reads_it() {
     replay(CONSISTENT_READ).await;
     replay(CONSISTENT_READ_MORE).await;
+    replay(CONSISTENT_READ_LISTS).await;
 }
 
 /// Round one, the `ConsistentRead` rows, after the item they read is put.
@@ -782,6 +783,26 @@ const CONSISTENT_READ_MORE: &[Row] = &[
     ),
 ];
 
+/// Round four, `ConsistentRead` given a list, against a table that doesn't
+/// exist: the request is refused before the table is looked for.
+const CONSISTENT_READ_LISTS: &[Row] = &[
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT * FROM \"_capture_20261111_230_none\" WHERE pk = 'a'","ConsistentRead":[]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT * FROM \"_capture_20261111_230_none\" WHERE pk = 'a'","ConsistentRead":[true]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT * FROM \"_capture_20261111_230_none\" WHERE pk = 'a'","ConsistentRead":[]}]}"#,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+    ),
+];
+
 /// An ORDER BY term that isn't a key is refused naming the attribute, so a
 /// quoted name is printed without its quotes.
 #[tokio::test]
@@ -934,17 +955,7 @@ async fn a_condition_function_call_is_a_boolean_operand() {
 #[tokio::test]
 async fn a_call_answers_as_a_boolean_written_in_its_place() {
     replay(CALLS_MORE).await;
-    replay(CALLS_INFERRED).await;
 }
-
-/// Inferred from the captured rule that a refusal from inside a call comes
-/// ahead of the operator it stands under: a call's wrong number of operands
-/// in the bounds of a call's BETWEEN.
-const CALLS_INFERRED: &[Row] = &[(
-    "ExecuteStatement",
-    r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN attribute_exists(n, n) AND 5"}"#,
-    r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
-)];
 
 /// `size` refuses a number, a boolean or a null, as a literal, a parameter,
 /// a call or `size` itself, whatever the item holds, and the first refusal
@@ -954,21 +965,56 @@ async fn size_refuses_a_number_a_boolean_or_a_null() {
     replay(CALLS_TYPES).await;
 }
 
+/// One pass decides which refusal is reported: the operands of a call or of
+/// `size` first, then the operator they stand under, and conditions in the
+/// order written. A wrong number of operands is noted as the statement is
+/// read and comes first. Both keys named by name report the sort key, and a
+/// batch naming one item twice is refused as holding duplicate keys.
+#[tokio::test]
+async fn a_refusal_inside_an_operand_comes_before_its_operator() {
+    replay(ROUND_SIX).await;
+}
+
 /// The captured rows left out of the replays above. `begins_with` and
 /// `contains` take only a path and a plain value here, so these answer
 /// differently: on DynamoDB either can stand as an operand, take a call as an
 /// argument or a first operand that isn't a path, and `begins_with` refuses a
 /// first operand by its type. That is one difference with one cause, larger
-/// than these, and is left for its own fix.
-#[test]
-fn only_begins_with_and_contains_rows_are_left_out() {
-    for (_, body, _) in LEFT_OUT {
-        assert!(
-            body.contains("begins_with(") || body.contains("contains("),
-            "{body}"
-        );
+/// than these, and is left for its own fix. Each is still sent, after the item
+/// its round put, and must answer with a 200 or a 400 that differs from
+/// DynamoDB's.
+#[tokio::test]
+async fn only_begins_with_and_contains_rows_are_left_out() {
+    let rounds = [
+        (CALLS[0], LEFT_OUT_ROUND_ONE),
+        (CALLS_MORE[0], LEFT_OUT_ROUND_TWO),
+        (CALLS_TYPES[0], LEFT_OUT_ROUND_THREE),
+    ];
+    let mut count = 0;
+    let mut wrong = Vec::new();
+    for (put, rows) in rounds {
+        let url = start_server().await;
+        let (status, _) = answer(&url, put.0, put.1).await;
+        assert_eq!(status, 200, "{}", put.1);
+        for &(operation, body, expected) in rows {
+            count += 1;
+            assert!(
+                body.contains("begins_with(") || body.contains("contains("),
+                "{body}"
+            );
+            let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
+            let (status, got) = answer(&url, operation, body).await;
+            if status != 200 && status != 400 {
+                wrong.push(format!("{body}\n  answered {status} {got}"));
+            } else if got == expected && status == status_of(&expected) {
+                wrong.push(format!(
+                    "{body}\n  now matches DynamoDB: move it into the replays above"
+                ));
+            }
+        }
     }
-    assert_eq!(LEFT_OUT.len(), 35);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(count, 35);
 }
 
 /// Round one, the condition rows, after the item they read is put.
@@ -1499,8 +1545,8 @@ const CALLS_TYPES: &[Row] = &[
     ),
 ];
 
-/// Rows left out of the replays, by the rule on `only_begins_with_and_contains_rows_are_left_out`.
-const LEFT_OUT: &[Row] = &[
+/// Round one, the rows left out of `CALLS`.
+const LEFT_OUT_ROUND_ONE: &[Row] = &[
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN begins_with(s,'h') AND 9"}"#,
@@ -1536,6 +1582,10 @@ const LEFT_OUT: &[Row] = &[
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(s, attribute_exists(n))"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
     ),
+];
+
+/// Round two, the rows left out of `CALLS_MORE`.
+const LEFT_OUT_ROUND_TWO: &[Row] = &[
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(true, 'x')"}"#,
@@ -1586,6 +1636,10 @@ const LEFT_OUT: &[Row] = &[
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='zz' AND sk='zz' AND begins_with(s, attribute_exists(n))"}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
     ),
+];
+
+/// Round three, the rows left out of `CALLS_TYPES`.
+const LEFT_OUT_ROUND_THREE: &[Row] = &[
     (
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with('abc','a')"}"#,
@@ -1675,5 +1729,140 @@ const LEFT_OUT: &[Row] = &[
         "ExecuteStatement",
         r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND begins_with(?, 'a')", "Parameters": [{"BOOL": false}]}"#,
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: begins_with, operand type: BOOL"}"#,
+    ),
+];
+
+/// Round six, captured in eu-west-2: refusal order, both keys named by name,
+/// and a batch naming one item twice.
+const ROUND_SIX: &[Row] = &[
+    (
+        "PutItem",
+        r#"{"TableName":"_capture_20261111_230_t","Item":{"pk":{"S":"a"},"sk":{"S":"b"},"n":{"N":"5"},"s":{"S":"hello"},"bt":{"BOOL":true}}}"#,
+        r#"{}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN size(true) AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN 1 AND size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND attribute_type(n, attribute_exists(n))"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, attribute_exists(n)) AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, size(true))"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(n, size(s))"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: attribute_type, operand type: N"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_type(size(true), 'N')"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN true AND 5 AND size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 AND n BETWEEN true AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN attribute_exists(n, n) AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect number of operands for operator or function; operator or function: attribute_exists, number of operands: 2"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) < size(true)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) < attribute_exists(n)"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND attribute_exists(n) BETWEEN 1 AND 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(attribute_type(n, ?)) > 0", "Parameters": [{"S": "N"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n BETWEEN attribute_type(n, ?) AND 5", "Parameters": [{"S": "N"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: BETWEEN, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(size(true)) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n IN [size(true), attribute_exists(n)]"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND NOT size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND size(true) > 0 OR n = 5"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b' AND n = 5 OR size(true) > 0"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Incorrect operand type for operator or function; operator or function: size, operand type: BOOL"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET pk = 'z' SET sk = 'z' WHERE pk='zz' AND sk='zz'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Cannot update attribute sk. This attribute is part of the key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" REMOVE pk REMOVE sk WHERE pk='zz' AND sk='zz'"}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Cannot update attribute sk. This attribute is part of the key"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET \"pk.x\" = 1 WHERE pk='zz' AND sk='zz'"}"#,
+        r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
+    ),
+    (
+        "ExecuteStatement",
+        r#"{"Statement": "UPDATE \"_capture_20261111_230_t\" SET pkx = 1 WHERE pk='zz' AND sk='zz'"}"#,
+        r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
+    ),
+    (
+        "BatchExecuteStatement",
+        r#"{"Statements":[{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"yes"},{"Statement":"SELECT pk FROM \"_capture_20261111_230_t\" WHERE pk='a' AND sk='b'","ConsistentRead":"yes"}]}"#,
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Provided list of item keys contains duplicates"}"#,
     ),
 ];

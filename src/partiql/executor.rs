@@ -1248,7 +1248,7 @@ fn bound_operand(value: &AttributeValue) -> String {
 
 /// Refuse a type given to `attribute_type` as a parameter that isn't the name
 /// of a DynamoDB type.
-fn check_attribute_type_parameter(
+fn check_attribute_type_kind(
     kind: &PartiqlValue,
     parameters: &[AttributeValue],
     reject: fn(&str, &AttributeValue) -> DynoxideError,
@@ -1352,6 +1352,7 @@ fn validate_operand_types(
             Operand::Size(inner) => {
                 check_operand(inner, parameters)?;
                 let measured = match inner.as_ref() {
+                    // A size is a number, whatever it measures.
                     Operand::Size(_) => Some(AttributeValue::N("0".to_string())),
                     other => fixed_value(other, parameters)?,
                 };
@@ -1394,9 +1395,12 @@ fn validate_operand_types(
             // eu-west-2 and us-east-1, 2026-10-10, for `size()`). A size is a
             // number, so a string or boolean against it under `=` or `<>` is
             // simply unequal rather than refused.
+            // Each side's own operands are checked first, in the order
+            // written, so `attribute_type(a, ?) = b` checks the type, and
+            // `size(true) < attribute_exists(n)` is refused as size's
+            // (captured eu-west-2, 2026-11-11). A call is a boolean, so an
+            // ordering operator refuses it after that.
             WhereCondition::Compare(left, op, right) => {
-                // A condition function compared is checked as it would be on
-                // its own: `attribute_type(a, ?) = b` checks the type.
                 for side in [left, right] {
                     check_operand(side, parameters)?;
                 }
@@ -1416,11 +1420,15 @@ fn validate_operand_types(
             // `size()`, 2026-10-10). A bound that isn't a value, such as a path,
             // can't be checked until an item is read; a value beside it is still
             // held to the orderable types (inferred, not captured).
-            // A call as a bound is a boolean, refused as `true` is there
+            // A call as the subject or a bound is a boolean, refused as `true`
+            // is there, once every operand's own operands are checked
             // (captured eu-west-2, 2026-11-11).
             WhereCondition::CompareBetween(operand, low, high) => {
                 for side in [operand, low, high] {
                     check_operand(side, parameters)?;
+                }
+                if let Operand::Condition(_) = operand {
+                    return Err(reject("BETWEEN", &AttributeValue::BOOL(true)));
                 }
                 match (low, high) {
                     (Operand::Value(low), Operand::Value(high)) => check_bounds(
@@ -1443,13 +1451,32 @@ fn validate_operand_types(
                     check_operand(side, parameters)?;
                 }
             }
-            // A type given to `attribute_type` as a parameter is checked
-            // once it is bound, negated or not (captured eu-west-2 and
-            // us-east-1, 2026-10-09), after the operand it tests.
+            // The type `attribute_type` tests for is checked after the
+            // operand it tests and the type's own operands, negated or not: a
+            // type given as a parameter once it is bound (captured eu-west-2
+            // and us-east-1, 2026-10-09), a size as the number it is and a
+            // call as the boolean it returns (captured eu-west-2, 2026-11-11).
             WhereCondition::AttributeType(operand, kind) => {
                 check_operand(operand, parameters)?;
-                if let PartiqlValue::Parameter(_) = kind {
-                    check_attribute_type_parameter(kind, parameters, reject)?;
+                check_operand(kind, parameters)?;
+                match kind {
+                    Operand::Value(kind) => check_attribute_type_kind(kind, parameters, reject)?,
+                    Operand::Size(_) => {
+                        return Err(reject(
+                            "attribute_type",
+                            &AttributeValue::N("0".to_string()),
+                        ));
+                    }
+                    Operand::Condition(_) => {
+                        return Err(reject("attribute_type", &AttributeValue::BOOL(true)));
+                    }
+                    Operand::Path(_) => {
+                        return Err(DynoxideError::ValidationException(format!(
+                            "Incorrect operand type for operator or function; \
+                             operator or function: attribute_type, operand type: {}",
+                            crate::partiql::parser::ATTRIBUTE_TYPE_OPERAND_TYPES
+                        )));
+                    }
                 }
             }
             // A condition with no negated form of its own is checked as it
@@ -4490,7 +4517,7 @@ fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
         WhereCondition::CompareIn(o, list) => {
             operand(o, bound) || list.iter().any(|m| operand(m, bound))
         }
-        WhereCondition::AttributeType(o, kind) => operand(o, bound) || value(kind, bound),
+        WhereCondition::AttributeType(o, kind) => operand(o, bound) || operand(kind, bound),
         WhereCondition::Not(inner) => has_unbound_parameter(inner, bound),
     }
 }
@@ -4687,12 +4714,10 @@ fn operand_condition_holds(
             list.iter()
                 .any(|member| value(member).is_some_and(|m| compare_values(&v, &CompOp::Eq, &m)))
         }),
-        WhereCondition::AttributeType(operand, kind) => {
-            match (value(operand), resolve_value(kind, parameters)) {
-                (Some(v), Ok(AttributeValue::S(kind))) => v.type_name() == kind,
-                _ => false,
-            }
-        }
+        WhereCondition::AttributeType(operand, kind) => match (value(operand), value(kind)) {
+            (Some(v), Some(AttributeValue::S(kind))) => v.type_name() == kind,
+            _ => false,
+        },
         _ => false,
     }
 }

@@ -111,16 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Cannot update attribute pk. This attribute is part of the key`. It used to
   say the document path was invalid, or fail its condition when the item was
   missing. With both keys named, the sort key is the one reported, whichever
-  comes first. `SET m.pk = 2` still runs. Captured against eu-west-2 on
-  11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+  comes first. `SET m.pk = 2` still runs. Captured against eu-west-2 and
+  us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 - ExecuteStatement and a BatchExecuteStatement member read a `ConsistentRead`
   written as a string, such as `"true"` or `"no"`, as GetItem does, where they
   used to refuse it with a `SerializationException`. A list there is refused
-  with no message, as DynamoDB refuses it on these two operations. Captured
-  against eu-west-2 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+  with no message, as DynamoDB refuses it. Captured against eu-west-2 and
+  us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 - The refusal of an ORDER BY term that isn't a key prints a quoted name
   without its quotes, so `ORDER BY "a.b"` names `a.b`. Captured against
-  eu-west-2 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+  eu-west-2 and us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 - In a PartiQL WHERE clause, a call to `attribute_exists`,
   `attribute_not_exists` or `attribute_type` can be a BETWEEN bound or
   subject, the operand of `size` or `attribute_type`, or the argument of
@@ -129,8 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute_exists(n) AND 5` is refused for its boolean bound. These used to
   fail to parse. `size` now refuses a number, a boolean or a null operand, as
   a literal, a parameter, a call or another `size`, where it used to match
-  nothing. A refusal from inside a call is reported ahead of the operator it
-  stands under. Captured against eu-west-2 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+  nothing. A refusal from inside a call or a `size` is reported ahead of the
+  operator it stands under, and the first condition written that is refused
+  is the one reported, so `size(true) < attribute_exists(n)` is refused for
+  size's boolean. Captured against eu-west-2 on 11 November 2026, and against
+  us-east-1 for all but the order of refusals ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 
 ## [1.6.0] - 2026-11-07
 

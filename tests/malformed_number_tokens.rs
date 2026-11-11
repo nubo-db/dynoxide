@@ -1016,6 +1016,59 @@ const CAPTURED: &[(&str, &str, &str)] = &[
         r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":0}}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
     ),
+    // A global secondary index's throughput is read as the table's is.
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'g' at 'globalSecondaryIndexes.1.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":1.5.5,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Bad number format"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'g' at 'globalSecondaryIndexes.1.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":-,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'g' at 'globalSecondaryIndexes.1.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value '0' at 'globalSecondaryIndexes.1.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":1e,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Bad number format"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":0.5,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value 'g' at 'globalSecondaryIndexes.1.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value '0' at 'globalSecondaryIndexes.1.member.provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+    ),
+    (
+        "CreateTable",
+        r##"{"TableName":"no_such_table","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"ProvisionedThroughput":{"ReadCapacityUnits":1,"WriteCapacityUnits":1},"GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"gk","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":1.5,"WriteCapacityUnits":1}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'g' at 'globalSecondaryIndexes.1.member.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3"}"##,
+    ),
+    // A table named with a stand-in's digits, plainly or through an escape,
+    // keeps its name.
+    (
+        "UpdateTable",
+        r##"{"TableName":"_capture_\u0037310000001","ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":1}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: _capture_7310000001 not found"}"##,
+    ),
+    (
+        "UpdateTable",
+        r##"{"TableName":"_capture_7310000001","ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":1}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: _capture_7310000001 not found"}"##,
+    ),
+    (
+        "UpdateTable",
+        r##"{"TableName":"_capture_731000000\u0031","ProvisionedThroughput":{"ReadCapacityUnits":01,"WriteCapacityUnits":1}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found: Table: _capture_7310000001 not found"}"##,
+    ),
 ];
 
 /// Bodies whose answer depends on which of two faults DynamoDB meets first in
@@ -1062,7 +1115,7 @@ async fn every_captured_body_is_answered_as_dynamodb_answers_it() {
         (CAPTURED.len(), skipped),
         // The `0.5` body of the second list was captured twice.
         (
-            195,
+            205,
             WRITTEN_ORDER.len() + KEY_SCHEMA_BESIDE_THROUGHPUT.len() + 1
         ),
         "every captured row is checked or named"

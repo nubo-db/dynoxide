@@ -201,10 +201,12 @@ fn long_key(i: usize) -> HashMap<String, AttributeValue> {
     )])
 }
 
-/// TransactWriteItems lists its actions when it holds more than 100. A hundred
-/// and one puts of a 20,000-character attribute are about 2 MB of request.
+/// TransactWriteItems refuses more than 100 actions without listing them, in
+/// the older form (captured eu-west-2 and us-east-1, 2026-11-11), so however
+/// large the request the message stays short. A hundred and one puts of a
+/// 20,000-character attribute are about 2 MB of request.
 #[test]
-fn a_transaction_write_listing_is_bounded() {
+fn a_transaction_write_over_100_actions_is_not_listed() {
     let db = Database::memory().unwrap();
     let transact_items = (0..101)
         .map(|i| TransactWriteItem {
@@ -222,13 +224,11 @@ fn a_transaction_write_listing_is_bounded() {
             ..Default::default()
         })
         .unwrap_err();
-    let message = message(err);
-    assert!(
-        message.starts_with("1 validation error detected: Value '[TransactWriteItem("),
-        "unexpected message start: {}",
-        &message[..message.len().min(200)]
+    assert_eq!(
+        message(err),
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
     );
-    assert_cut(&message);
 }
 
 /// TransactGetItems lists its gets when it holds more than 100, in the same

@@ -174,6 +174,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol error, as ExecuteStatement does over HTTP. `consistent_read` goes
   to ExecuteStatement as given, so a string gets ExecuteStatement's answer
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- An empty `ClientRequestToken` is refused on TransactWriteItems and
+  ExecuteTransaction. Before, it was accepted and the request went on to look
+  up its tables. TransactWriteItems now checks its members in the order
+  DynamoDB does. A required member left out (`TransactItems`, or an action's
+  `TableName`, `Item`, `Key` or a ConditionCheck's `ConditionExpression`) is
+  reported first as `Value null at '...'`, with a bad token and
+  `ReturnConsumedCapacity` listed after it, where it used to be a serde
+  `missing field` error. Then the token's length and the length of
+  `TransactItems` are reported on their own, in DynamoDB's older wording with
+  no value or list echoed (`Value at 'ClientRequestToken' ...`), ahead of a bad
+  enum, an empty action or a number refused in an item. An item with no action
+  now gets DynamoDB's `Value '' at 'transactItems'` message, listed with a bad
+  `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics`, and a bad
+  `ReturnValuesOnConditionCheckFailure` is reported only when those two are
+  right. ExecuteTransaction lists the empty token first, and a missing
+  `TransactStatements` is `Value null at 'transactStatements'`
+  ([#318](https://github.com/nubo-db/dynoxide/issues/318)).
 
 ## [1.6.0] - 2026-11-07
 

@@ -6376,3 +6376,319 @@ fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+// ---------------------------------------------------------------------------
+// The same request over MCP and over the HTTP API
+// ---------------------------------------------------------------------------
+
+/// What a request came back with, on either surface.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    Ok(Value),
+    Err(String, String),
+}
+
+/// A tool call's answer. A call the argument decoder refuses, before the
+/// tool runs, comes back as plain text rather than a tool error's JSON.
+fn mcp_answer(resp: &Value) -> Answer {
+    if let Some(message) = resp["error"]["message"].as_str() {
+        return Answer::Err("JSON-RPC error".to_string(), message.to_string());
+    }
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    if serde_json::from_str::<Value>(text).is_err() {
+        return Answer::Err("Unparsed arguments".to_string(), text.to_string());
+    }
+    if is_tool_error(resp) {
+        let (error_type, message) = tool_error(resp);
+        Answer::Err(error_type, message)
+    } else {
+        Answer::Ok(tool_content(resp))
+    }
+}
+
+/// A `dynoxide` HTTP server from the same build, so a test can ask the HTTP
+/// API for its answer to the request it sends a tool.
+struct HttpApi {
+    port: u16,
+    _server: common::Server,
+}
+
+impl HttpApi {
+    fn start() -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dynoxide"));
+        command.args(["--port", "0"]).stdin(Stdio::null());
+        let server = common::Server::spawn(command);
+        let port = server.port(common::Listener::Http);
+        Self {
+            port,
+            _server: server,
+        }
+    }
+
+    /// Send `operation` with `body` and return the status and parsed body.
+    fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        use std::io::Read;
+        let body = body.to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+             X-Amz-Target: DynamoDB_20120810.{operation}\r\n\
+             Content-Type: application/x-amz-json-1.0\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential=key/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=sig\r\n\
+             X-Amz-Date: 20260101T000000Z\r\n\
+             Content-Length: {len}\r\n\r\n{body}",
+            port = self.port,
+            len = body.len(),
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").expect("an HTTP response");
+        let status = head
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .expect("a status line");
+        (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    }
+
+    /// The HTTP API's answer, in the shape [`mcp_answer`] gives a tool's.
+    fn answer(&self, operation: &str, body: &Value) -> Answer {
+        let (status, body) = self.call(operation, body);
+        if status == 200 {
+            return Answer::Ok(body);
+        }
+        let error_type = body["__type"].as_str().unwrap_or_default();
+        let error_type = error_type
+            .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let message = body
+            .get("message")
+            .or_else(|| body.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Answer::Err(error_type, message)
+    }
+}
+
+/// An MCP server and an HTTP server, each holding a hash-only table called
+/// `table` with the same items in it.
+fn both_with_items(table: &str, items: &[Value]) -> (std::process::Child, HttpApi) {
+    let mut child = mcp_with_table(table);
+    let http = HttpApi::start();
+    let (status, body) = http.call(
+        "CreateTable",
+        &json!({
+            "TableName": table,
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    for (id, item) in (900..).zip(items) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": table, "item": item}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+        let (status, body) = http.call("PutItem", &json!({"TableName": table, "Item": item}));
+        assert_eq!(status, 200, "{body}");
+    }
+    (child, http)
+}
+
+/// Send each `(tool, arguments, operation, body)` to both surfaces and list
+/// the cases whose answers differ, with both answers.
+fn differences(
+    child: &mut std::process::Child,
+    http: &HttpApi,
+    cases: Vec<(&str, Value, &str, Value)>,
+) -> Vec<String> {
+    let mut differ = Vec::new();
+    for (id, (tool, args, operation, body)) in (1000..).zip(cases) {
+        let over_mcp = mcp_answer(&call_tool(child, id, tool, args.clone()));
+        let over_http = http.answer(operation, &body);
+        if over_mcp != over_http {
+            differ.push(format!(
+                "{tool} {args}\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+            ));
+        }
+    }
+    differ
+}
+
+/// A tool's arguments and the HTTP body for the same request, from pairs of
+/// (tool argument, wire member, value).
+fn same_request(members: &[(&str, &str, Value)]) -> (Value, Value) {
+    let mut args = json!({});
+    let mut body = json!({});
+    for (arg, member, value) in members {
+        args[*arg] = value.clone();
+        body[*member] = value.clone();
+    }
+    (args, body)
+}
+
+/// `query` and `scan` read their arguments as Query and Scan read the same
+/// members over HTTP: `limit`, `segment` and `total_segments` given as a
+/// negative, a fraction, a value past 32 bits or a string; an expression
+/// value or start key that is refused, beside a bad
+/// `return_consumed_capacity` or alone. Every expectation is the HTTP API's
+/// answer to the same request.
+#[test]
+fn query_and_scan_answer_as_the_http_api_does() {
+    let (mut child, http) = both_with_items("Reads", &[json!({"pk": {"S": "a"}})]);
+    let table = ("table_name", "TableName", json!("Reads"));
+    let key_condition = (
+        "key_condition_expression",
+        "KeyConditionExpression",
+        json!("pk = :v"),
+    );
+    let key_value = |v: Value| {
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":v": v}),
+        )
+    };
+    let bogus = (
+        "return_consumed_capacity",
+        "ReturnConsumedCapacity",
+        json!("BOGUS"),
+    );
+    let mut requests: Vec<(&str, Vec<(&str, &str, Value)>)> = Vec::new();
+    let numbers = [
+        json!(-1),
+        json!(0),
+        json!(1),
+        json!(1.5),
+        json!(3_000_000_000_u64),
+        json!(1e20),
+        json!("5"),
+    ];
+    for n in &numbers {
+        requests.push((
+            "query",
+            vec![
+                table.clone(),
+                key_condition.clone(),
+                key_value(json!({"S": "a"})),
+                ("limit", "Limit", n.clone()),
+            ],
+        ));
+        requests.push(("scan", vec![table.clone(), ("limit", "Limit", n.clone())]));
+        requests.push((
+            "scan",
+            vec![
+                table.clone(),
+                ("segment", "Segment", n.clone()),
+                ("total_segments", "TotalSegments", json!(4)),
+            ],
+        ));
+        requests.push((
+            "scan",
+            vec![
+                table.clone(),
+                ("segment", "Segment", json!(0)),
+                ("total_segments", "TotalSegments", n.clone()),
+            ],
+        ));
+    }
+    // A limit read as 32 bits beside a bad mode moves to the older wording.
+    requests.push((
+        "scan",
+        vec![table.clone(), ("limit", "Limit", json!(1.5)), bogus.clone()],
+    ));
+    requests.push((
+        "query",
+        vec![
+            table.clone(),
+            key_condition.clone(),
+            key_value(json!({"S": "a"})),
+            ("limit", "Limit", json!(-1)),
+            bogus.clone(),
+        ],
+    ));
+    let refused = [
+        json!({"S": null}),
+        json!({"NULL": "no"}),
+        json!({"N": "abc"}),
+        json!({"S": "a", "N": "1"}),
+        json!({"S": ""}),
+    ];
+    for value in &refused {
+        for with_mode in [false, true] {
+            let mut query = vec![
+                table.clone(),
+                key_condition.clone(),
+                key_value(value.clone()),
+            ];
+            let mut scan = vec![
+                table.clone(),
+                ("filter_expression", "FilterExpression", json!("x = :v")),
+                key_value(value.clone()),
+            ];
+            let mut start = vec![
+                table.clone(),
+                (
+                    "exclusive_start_key",
+                    "ExclusiveStartKey",
+                    json!({"pk": value}),
+                ),
+            ];
+            if with_mode {
+                query.push(bogus.clone());
+                scan.push(bogus.clone());
+                start.push(bogus.clone());
+            }
+            requests.push(("query", query));
+            requests.push(("scan", scan));
+            requests.push(("scan", start));
+        }
+    }
+    requests.push((
+        "scan",
+        vec![
+            table.clone(),
+            ("exclusive_start_key", "ExclusiveStartKey", json!("x")),
+        ],
+    ));
+    requests.push(("scan", vec![table.clone(), bogus.clone()]));
+    requests.push((
+        "query",
+        vec![
+            table.clone(),
+            key_condition.clone(),
+            key_value(json!({"S": "a"})),
+            bogus.clone(),
+        ],
+    ));
+
+    let checked = requests.len();
+    let cases = requests
+        .into_iter()
+        .map(|(tool, members)| {
+            let (args, body) = same_request(&members);
+            let operation = if tool == "query" { "Query" } else { "Scan" };
+            (tool, args, operation, body)
+        })
+        .collect();
+    let differ = differences(&mut child, &http, cases);
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

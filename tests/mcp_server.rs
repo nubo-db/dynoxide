@@ -5705,7 +5705,7 @@ fn other_tools_read_values_on_their_operations_layer() {
     // And put_item, straight after, is back on the current layer.
     let resp = call_tool(
         &mut child,
-       31,
+        31,
         "put_item",
         json!({"table_name": "Layers", "item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}),
     );

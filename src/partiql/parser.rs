@@ -378,18 +378,68 @@ pub(crate) enum WrittenClause {
     And(Vec<WrittenClause>),
     Or(Vec<WrittenClause>),
     Not(Box<WrittenClause>),
+    /// A value standing where a condition should, `size(s) AND ...`. Its own
+    /// operands are checked where it stands; the operator it stands under
+    /// refuses it after its other terms, as a [`WhereCondition::Refused`]
+    /// leaf. Only a refused clause holds one.
+    Operand(Operand),
 }
 
 impl WrittenClause {
     fn of(expr: &BoolExpr) -> Self {
         match expr {
             BoolExpr::Leaf(cond) => WrittenClause::Leaf(Arc::new(cond.clone())),
-            BoolExpr::And(terms) => WrittenClause::And(terms.iter().map(Self::of).collect()),
-            BoolExpr::Or(terms) => WrittenClause::Or(terms.iter().map(Self::of).collect()),
-            BoolExpr::Not(inner) => WrittenClause::Not(Box::new(Self::of(inner))),
-            // Refused once the clause is read, so its shape never matters.
-            BoolExpr::NonBoolean(_) => WrittenClause::And(Vec::new()),
+            BoolExpr::And(terms) => Self::joined(terms, "AND", WrittenClause::And),
+            BoolExpr::Or(terms) => Self::joined(terms, "OR", WrittenClause::Or),
+            BoolExpr::Not(inner) => match inner.as_ref() {
+                BoolExpr::NonBoolean(kind, operand) => {
+                    Self::non_boolean(vec![Self::Operand(operand.clone())], Some("NOT"), kind)
+                }
+                inner => WrittenClause::Not(Box::new(Self::of(inner))),
+            },
+            BoolExpr::NonBoolean(kind, operand) => {
+                Self::non_boolean(vec![Self::Operand(operand.clone())], None, kind)
+            }
         }
+    }
+
+    /// The terms of an AND or an OR, with the operator's refusal of the first
+    /// term that is a value after them all.
+    fn joined(terms: &[BoolExpr], operator: &'static str, join: fn(Vec<Self>) -> Self) -> Self {
+        let mut written = Vec::with_capacity(terms.len());
+        let mut kind = None;
+        for term in terms {
+            match term {
+                BoolExpr::NonBoolean(term_kind, operand) => {
+                    kind.get_or_insert(*term_kind);
+                    written.push(Self::Operand(operand.clone()));
+                }
+                term => written.push(Self::of(term)),
+            }
+        }
+        match kind {
+            Some(kind) => Self::non_boolean(written, Some(operator), kind),
+            None => join(written),
+        }
+    }
+
+    /// `terms` followed by the refusal of a value of type `kind` standing
+    /// where a condition should, under `operator` or as the whole clause.
+    fn non_boolean(mut terms: Vec<Self>, operator: Option<&str>, kind: &str) -> Self {
+        let message = match operator {
+            Some(operator) => format!(
+                "Incorrect operand type for operator or function; operator or function: \
+                 {operator}, operand type: {kind}"
+            ),
+            None => "WHERE clause must contain an expression that resolves to a boolean".into(),
+        };
+        terms.push(WrittenClause::Leaf(Arc::new(WhereCondition::Refused(
+            Box::new(Refused {
+                operands: Vec::new(),
+                message,
+            }),
+        ))));
+        WrittenClause::And(terms)
     }
 }
 
@@ -414,9 +464,9 @@ impl ConditionTree {
             BoolExpr::Not(_) => {
                 unreachable!("push_not_down removes every Not before the tree is kept")
             }
-            // push_not_down replaces it with a refused condition.
-            BoolExpr::NonBoolean(_) => {
-                ConditionTree::Leaf(Arc::new(WhereCondition::Exists(String::new())))
+            // A clause holding one is refused before it is flattened.
+            BoolExpr::NonBoolean(..) => {
+                unreachable!("a clause with a value for a condition is never flattened")
             }
         }
     }
@@ -517,6 +567,20 @@ pub enum WhereCondition {
     AttributeType(Operand, Operand),
     /// A negated condition with no negated form of its own.
     Not(Box<WhereCondition>),
+    /// A condition DynamoDB refuses for itself, once its operands are checked:
+    /// a call given the wrong number of operands, an operand that isn't
+    /// distinct, an IN with too many. Never evaluated: the statement is
+    /// refused before it runs.
+    Refused(Box<Refused>),
+}
+
+/// What DynamoDB refuses a call or an operator for, with the operands it was
+/// written with. The operands are checked first, in the order written, so a
+/// refusal inside one of them is the one reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refused {
+    pub operands: Vec<Operand>,
+    pub message: String,
 }
 
 /// One side of a comparison that isn't `path op value`.
@@ -531,6 +595,8 @@ pub enum Operand {
     /// A condition function's call, `attribute_exists(a)` and the like, as
     /// the boolean it returns for an item.
     Condition(Box<WhereCondition>),
+    /// A call DynamoDB refuses for itself, `size(s, s)`. Never evaluated.
+    Refused(Box<Refused>),
 }
 
 /// What `IS <type>` tests in a WHERE clause: the types DynamoDB supports there
@@ -613,17 +679,90 @@ impl From<&str> for ParseFailure {
     }
 }
 
-/// Parse a PartiQL statement string with no parameter count to check it
-/// against. A request parses through [`parse_with_parameters`]; this is for
-/// tests.
+/// Parse a PartiQL statement string with no parameters, for tests: a
+/// statement holding a call or an operator DynamoDB refuses for itself, or a
+/// refused `set_add` or `set_delete` call, is refused as a request would be,
+/// without the type checks that need parameter values. A request is read
+/// through `executor::checked_statement`.
 #[cfg(test)]
 pub(crate) fn parse(input: &str) -> Result<Statement, ParseError> {
-    parse_counting_placeholders(input)
-        .map(|(statement, _)| statement)
-        .map_err(|failure| match failure {
-            ParseFailure::Statement(error) => error,
-            ParseFailure::Literal(message) => ParseError::Validation(message),
-        })
+    let parsed = parse_statement(input).map_err(|failure| match failure {
+        ParseFailure::Statement(error) => error,
+        ParseFailure::Literal(message) => ParseError::Validation(message),
+    })?;
+    let fault = statement_where(&parsed.statement)
+        .and_then(|wc| tests_support::clause_fault(&wc.written))
+        .or(parsed.set_refusal);
+    match fault {
+        Some(message) => Err(ParseError::Validation(message)),
+        None => Ok(parsed.statement),
+    }
+}
+
+/// The WHERE clause of a statement that has one.
+#[cfg(test)]
+fn statement_where(statement: &Statement) -> Option<&WhereClause> {
+    match statement {
+        Statement::Select { where_clause, .. }
+        | Statement::Update { where_clause, .. }
+        | Statement::Delete { where_clause, .. } => where_clause.as_ref(),
+        Statement::Insert { .. } => None,
+    }
+}
+
+/// The first fault a refused clause holds, operands first, in the order
+/// written, for [`parse`].
+#[cfg(test)]
+mod tests_support {
+    use super::{Operand, Refused, WhereCondition, WrittenClause};
+
+    pub(super) fn clause_fault(clause: &WrittenClause) -> Option<String> {
+        match clause {
+            WrittenClause::Leaf(condition) => condition_fault(condition),
+            WrittenClause::And(terms) | WrittenClause::Or(terms) => {
+                terms.iter().find_map(clause_fault)
+            }
+            WrittenClause::Not(inner) => clause_fault(inner),
+            WrittenClause::Operand(operand) => operand_fault(operand),
+        }
+    }
+
+    fn refused_fault(refused: &Refused) -> Option<String> {
+        refused
+            .operands
+            .iter()
+            .find_map(operand_fault)
+            .or_else(|| Some(refused.message.clone()))
+    }
+
+    fn operand_fault(operand: &Operand) -> Option<String> {
+        match operand {
+            Operand::Size(inner) => operand_fault(inner),
+            Operand::Condition(condition) => condition_fault(condition),
+            Operand::Refused(refused) => refused_fault(refused),
+            Operand::Path(_) | Operand::Value(_) => None,
+        }
+    }
+
+    fn condition_fault(condition: &WhereCondition) -> Option<String> {
+        match condition {
+            WhereCondition::Compare(left, _, right) => {
+                [left, right].into_iter().find_map(operand_fault)
+            }
+            WhereCondition::CompareBetween(operand, low, high) => {
+                [operand, low, high].into_iter().find_map(operand_fault)
+            }
+            WhereCondition::CompareIn(operand, members) => std::iter::once(operand)
+                .chain(members)
+                .find_map(operand_fault),
+            WhereCondition::AttributeType(operand, kind) => {
+                [operand, kind].into_iter().find_map(operand_fault)
+            }
+            WhereCondition::Not(inner) => condition_fault(inner),
+            WhereCondition::Refused(refused) => refused_fault(refused),
+            _ => None,
+        }
+    }
 }
 
 /// DynamoDB's refusal of a statement with more `?` than the request has
@@ -631,28 +770,20 @@ pub(crate) fn parse(input: &str) -> Result<Statement, ParseError> {
 pub(crate) const PARAMETER_COUNT_MISMATCH: &str =
     "Number of parameters in request and statement don't match.";
 
-/// Parse a PartiQL statement for a request carrying `supplied` parameters,
-/// saying whether a failure came from a literal DynamoDB refuses. A
-/// statement with more placeholders than that is refused once it has parsed;
-/// more parameters than placeholders are accepted and the extra ignored
-/// (captured eu-west-2 and us-east-1, 2026-10-10). Refused as a statement
-/// failure, so in a batch only that statement fails and it takes no part in
-/// the mixed read and write or duplicate checks, as on DynamoDB.
-pub(crate) fn parse_with_parameters(
-    input: &str,
-    supplied: usize,
-) -> Result<Statement, ParseFailure> {
-    let (statement, placeholders) = parse_counting_placeholders(input)?;
-    if placeholders > supplied {
-        return Err(ParseFailure::Statement(ParseError::Validation(
-            PARAMETER_COUNT_MISMATCH.to_string(),
-        )));
-    }
-    Ok(statement)
+/// A statement as read, before the checks DynamoDB makes of a statement that
+/// reads: how many `?` placeholders it holds, and the first refusal of a
+/// `set_add` or `set_delete` call in its SET clause, reported after the WHERE
+/// clause's operands are checked (captured eu-west-2, 2026-11-11).
+pub(crate) struct ParsedStatement {
+    pub(crate) statement: Statement,
+    pub(crate) placeholders: usize,
+    pub(crate) set_refusal: Option<String>,
 }
 
-/// Parse a PartiQL statement, with the number of `?` placeholders it holds.
-fn parse_counting_placeholders(input: &str) -> Result<(Statement, usize), ParseFailure> {
+/// Parse a PartiQL statement, saying whether a failure came from a literal
+/// DynamoDB refuses. A request's statement is read through
+/// `executor::checked_statement`, which makes the checks that follow.
+pub(crate) fn parse_statement(input: &str) -> Result<ParsedStatement, ParseFailure> {
     let mut tokenizer = Tokenizer::new(input)?;
     let first = tokenizer
         .next_token()?
@@ -701,17 +832,21 @@ fn parse_counting_placeholders(input: &str) -> Result<(Statement, usize), ParseF
     // a second statement (captured eu-west-2 and us-east-1, 2026-10-09).
     end_of_statement(&mut tokenizer)?;
 
-    // A term or literal DynamoDB refuses, or an operand an operator can't
-    // take, is refused once the statement has parsed and before anything is
-    // looked up, without the syntax envelope: a missing table, a missing item
-    // or an ordering comparison on a type with no ordering all come second.
+    // A term or literal DynamoDB refuses is refused once the statement has
+    // parsed and before anything is looked up, without the syntax envelope:
+    // the statement checks, a missing table and a missing item all come
+    // second.
     // A literal's message is DynamoDB's own, with the path inside the value,
     // `under root.x` (captured eu-west-2 and us-east-1, 2026-10-09).
     if let Some(failure) = tokenizer.first_refusal() {
         return Err(failure);
     }
 
-    Ok((statement, tokenizer.param_counter))
+    Ok(ParsedStatement {
+        statement,
+        placeholders: tokenizer.param_counter,
+        set_refusal: tokenizer.set_refusal,
+    })
 }
 
 /// Check that the statement has ended: nothing left, or one semicolon and
@@ -2173,7 +2308,7 @@ fn parse_set_call(t: &mut Tokenizer, target: &str, delete: bool) -> Result<SetVa
     match args.as_slice() {
         [(_, first), (_, second)] => {
             if first.as_deref() != Ok(target) {
-                t.note_operand_refusal(format!(
+                t.note_set_refusal(format!(
                     "The first argument to {name} must equal the assignment value at {call_at}"
                 ));
             } else if !matches!(
@@ -2183,7 +2318,7 @@ fn parse_set_call(t: &mut Tokenizer, target: &str, delete: bool) -> Result<SetVa
                         AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
                     ))
             ) {
-                t.note_operand_refusal(format!(
+                t.note_set_refusal(format!(
                     "The second argument to {name} must be a value with type SET at {first_at}"
                 ));
             }
@@ -2191,7 +2326,7 @@ fn parse_set_call(t: &mut Tokenizer, target: &str, delete: bool) -> Result<SetVa
                 members = value.clone();
             }
         }
-        _ => t.note_operand_refusal(format!(
+        _ => t.note_set_refusal(format!(
             "{name} must have exactly two arguments at {call_at}"
         )),
     }
@@ -2403,15 +2538,6 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
     let expr = parse_or_expr(t, 0);
     t.reading_where = false;
     let expr = expr?;
-    if let Some((operator, kind)) = non_boolean(&expr, None) {
-        t.note_operand_refusal(match operator {
-            Some(operator) => format!(
-                "Incorrect operand type for operator or function; operator or function: \
-                 {operator}, operand type: {kind}"
-            ),
-            None => "WHERE clause must contain an expression that resolves to a boolean".into(),
-        });
-    }
     let mut top_level_equalities = Vec::new();
     collect_top_level_equalities(&expr, &mut top_level_equalities);
     // A statement already holding a refusal is refused with it, so its clause
@@ -2429,6 +2555,16 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
         return Ok(refused());
     }
     let written = WrittenClause::of(&expr);
+    // A clause holding a call or an operator DynamoDB refuses for itself is
+    // refused once its operands have been checked in the order written, so
+    // it is kept whole, as written, for that check, and not flattened: the
+    // flattening's budget would otherwise answer first for a long one.
+    if t.operand_fault || holds_non_boolean(&expr) {
+        return Ok(ParsedConditions {
+            written,
+            ..refused()
+        });
+    }
     let flattened = push_not_down(expr, false).and_then(|expr| {
         let tree = ConditionTree::of(expr);
         if tree.bytes() > MAX_CLAUSE_BYTES {
@@ -2474,18 +2610,14 @@ fn collect_top_level_equalities(expr: &BoolExpr, out: &mut Vec<Condition>) {
     }
 }
 
-/// The first value in an expression that stands where a condition should, as
-/// the operator it stands under (`None` for the whole clause) and its type.
-fn non_boolean(
-    expr: &BoolExpr,
-    operator: Option<&'static str>,
-) -> Option<(Option<&'static str>, &'static str)> {
+/// Whether a value stands anywhere in an expression where a condition
+/// should.
+fn holds_non_boolean(expr: &BoolExpr) -> bool {
     match expr {
-        BoolExpr::NonBoolean(kind) => Some((operator, kind)),
-        BoolExpr::And(terms) => terms.iter().find_map(|e| non_boolean(e, Some("AND"))),
-        BoolExpr::Or(terms) => terms.iter().find_map(|e| non_boolean(e, Some("OR"))),
-        BoolExpr::Not(inner) => non_boolean(inner, Some("NOT")),
-        BoolExpr::Leaf(_) => None,
+        BoolExpr::NonBoolean(..) => true,
+        BoolExpr::And(terms) | BoolExpr::Or(terms) => terms.iter().any(holds_non_boolean),
+        BoolExpr::Not(inner) => holds_non_boolean(inner),
+        BoolExpr::Leaf(_) => false,
     }
 }
 
@@ -2501,8 +2633,8 @@ enum BoolExpr {
     Or(Vec<BoolExpr>),
     Not(Box<BoolExpr>),
     /// A value standing where a condition should, by its DynamoDB type: refused
-    /// once the clause is read, naming the operator it stands under.
-    NonBoolean(&'static str),
+    /// once its own operands are checked, naming the operator it stands under.
+    NonBoolean(&'static str, Operand),
 }
 
 /// `depth` counts the nesting levels above this expression: one per set of
@@ -2755,10 +2887,7 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
     {
         let left = parse_value(t, depth)?;
         let op = t.next_token()?.unwrap_or_default();
-        return match parse_condition_function(t, depth)? {
-            Some(function) => function.compared(&op, Operand::Value(left), false),
-            None => Ok(refused_condition()),
-        };
+        return parse_condition_function(t, depth)?.compared(&op, Operand::Value(left), false);
     }
 
     // A path compared with a condition function, `b = attribute_exists(a)`:
@@ -2775,10 +2904,7 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
             let first = t.next_token()?.unwrap_or_default();
             let path = parse_dotted_path_from_token(&first, t)?;
             let op = t.next_token()?.unwrap_or_default();
-            return match parse_condition_function(t, depth)? {
-                Some(function) => function.compared(&op, Operand::Path(path), false),
-                None => Ok(refused_condition()),
-            };
+            return parse_condition_function(t, depth)?.compared(&op, Operand::Path(path), false);
         }
     }
 
@@ -2796,10 +2922,7 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
             return Ok(refused_condition());
         }
         if is_condition_function(&tok) {
-            let Some(function) = parse_condition_function(t, depth)? else {
-                skip_comparison(t, depth)?;
-                return Ok(refused_condition());
-            };
+            let function = parse_condition_function(t, depth)?;
             return condition_function_tail(t, depth, function);
         }
         if is_keyword(&tok, "size") {
@@ -2886,8 +3009,13 @@ fn condition_function_tail(
     if is_keyword(&next, "IN") {
         t.next_token()?;
         let members = parse_in_list(t, depth, parse_operand)?;
-        note_in_operand_count(t, members.len());
-        let listed = function.listed(members);
+        let listed = match in_limit_refusal(members.len()) {
+            Some(message) => {
+                let operands = std::iter::once(function.operand()).chain(members).collect();
+                BoolExpr::Leaf(WhereCondition::Refused(t.refused(operands, message)))
+            }
+            None => function.listed(members),
+        };
         return Ok(if negated {
             BoolExpr::Not(Box::new(listed))
         } else {
@@ -2898,26 +3026,21 @@ fn condition_function_tail(
 }
 
 /// Read `attribute_exists(...)`, `attribute_not_exists(...)` or
-/// `attribute_type(...)`, noting the refusal of operands it can't take; `None`
-/// once a refusal is noted.
-fn parse_condition_function(
-    t: &mut Tokenizer,
-    depth: usize,
-) -> Result<Option<ConditionFunction>, String> {
+/// `attribute_type(...)`. A call DynamoDB refuses for its operands holds a
+/// [`WhereCondition::Refused`] with the operands it was given.
+fn parse_condition_function(t: &mut Tokenizer, depth: usize) -> Result<ConditionFunction, String> {
     if t.peek_token()?
         .is_some_and(|tok| is_keyword(&tok, "attribute_type"))
     {
-        return Ok(
-            parse_attribute_type(t, depth)?.map(|(operand, kind)| ConditionFunction {
-                holds: WhereCondition::AttributeType(operand, kind),
-            }),
-        );
+        return Ok(ConditionFunction {
+            holds: parse_attribute_type(t, depth)?,
+        });
     }
     let name_tok = t.next_token()?.unwrap_or_default();
     let name = condition_function_name(&name_tok).unwrap_or("attribute_exists");
     expect_char(t, "(")?;
-    // Each operand, as the path it names or `None` for a value.
-    let mut operands: Vec<Option<String>> = Vec::new();
+    // Each operand as written: a path, a value or a call.
+    let mut operands: Vec<Operand> = Vec::new();
     if t.peek_token()?.as_deref() == Some(")") {
         t.next_token()?;
     } else {
@@ -2928,14 +3051,12 @@ fn parse_condition_function(
             if starts_operand_call(t)? {
                 // A call is no document path: `attribute_exists(size(s))`
                 // (captured eu-west-2, 2026-11-11).
-                parse_operand(t, depth + 1)?;
-                operands.push(None);
+                operands.push(parse_operand(t, depth + 1)?);
             } else if is_name(&tok) {
                 t.next_token()?;
-                operands.push(Some(parse_dotted_path_from_token(&tok, t)?));
+                operands.push(Operand::Path(parse_dotted_path_from_token(&tok, t)?));
             } else {
-                parse_value(t, depth)?;
-                operands.push(None);
+                operands.push(Operand::Value(parse_value(t, depth)?));
             }
             match t.next_token()?.as_deref() {
                 Some(",") => continue,
@@ -2945,26 +3066,25 @@ fn parse_condition_function(
             }
         }
     }
-    let path = match operands.as_slice() {
-        [Some(path)] => path.clone(),
-        [None] => {
-            t.note_operand_refusal(format!(
-                "Operator or function requires a document path; operator or function: {name}"
-            ));
-            String::new()
-        }
-        _ => {
-            t.note_operand_refusal(operand_count_refusal(name, operands.len()));
-            String::new()
-        }
+    let refusal = match operands.as_slice() {
+        [Operand::Path(_)] => None,
+        [_] => Some(format!(
+            "Operator or function requires a document path; operator or function: {name}"
+        )),
+        _ => Some(operand_count_refusal(name, operands.len())),
     };
-    Ok(Some(ConditionFunction {
-        holds: if name == "attribute_exists" {
+    let holds = match (refusal, operands.pop()) {
+        (Some(message), last) => {
+            operands.extend(last);
+            WhereCondition::Refused(t.refused(operands, message))
+        }
+        (None, Some(Operand::Path(path))) if name == "attribute_exists" => {
             WhereCondition::Exists(path)
-        } else {
-            WhereCondition::NotExists(path)
-        },
-    }))
+        }
+        (None, Some(Operand::Path(path))) => WhereCondition::NotExists(path),
+        (None, _) => unreachable!("one path operand is the only one without a refusal"),
+    };
+    Ok(ConditionFunction { holds })
 }
 
 fn operand_count_refusal(name: &str, count: usize) -> String {
@@ -2994,20 +3114,17 @@ fn call_operands(t: &mut Tokenizer, depth: usize) -> Result<Vec<Operand>, String
     }
 }
 
-/// Read `attribute_type(operand, type)`, noting a wrong number of operands or
-/// a type that is the operand itself; `None` once a refusal is noted. Any
-/// other type it can't take is refused as the statement's operands are
+/// Read `attribute_type(operand, type)`. A wrong number of operands, or a
+/// type that is the operand itself, is held as a [`WhereCondition::Refused`].
+/// Any other type it can't take is refused as the statement's operands are
 /// checked, after the operand it tests, as a type given as a parameter is
 /// once the parameter is bound (captured eu-west-2 and us-east-1, 2026-10-09;
 /// a call or a size as either, captured eu-west-2, 2026-11-11).
-fn parse_attribute_type(
-    t: &mut Tokenizer,
-    depth: usize,
-) -> Result<Option<(Operand, Operand)>, String> {
+fn parse_attribute_type(t: &mut Tokenizer, depth: usize) -> Result<WhereCondition, String> {
     let mut operands = call_operands(t, depth + 1)?;
     if operands.len() != 2 {
-        t.note_operand_refusal(operand_count_refusal("attribute_type", operands.len()));
-        return Ok(None);
+        let message = operand_count_refusal("attribute_type", operands.len());
+        return Ok(WhereCondition::Refused(t.refused(operands, message)));
     }
     let kind = operands
         .pop()
@@ -3018,10 +3135,12 @@ fn parse_attribute_type(
     if let Operand::Path(path) = &kind
         && operand == kind
     {
-        t.note_operand_refusal(not_distinct("attribute_type", path));
-        return Ok(None);
+        let message = not_distinct("attribute_type", path);
+        return Ok(WhereCondition::Refused(
+            t.refused(vec![operand, kind], message),
+        ));
     }
-    Ok(Some((operand, kind)))
+    Ok(WhereCondition::AttributeType(operand, kind))
 }
 
 /// DynamoDB's refusal of a type `attribute_type` doesn't know, if it doesn't.
@@ -3051,8 +3170,9 @@ fn starts_operand_call(t: &Tokenizer) -> Result<bool, String> {
 /// `attribute_exists(a) = attribute_exists(b)`, `? IN [attribute_exists(a)]`
 /// and `b IN [attribute_exists(a)]` run), and a BETWEEN bound or subject or
 /// the operand of `size` or `attribute_type` (captured eu-west-2,
-/// 2026-11-11). A call whose refusal is noted stands as a NULL, never
-/// evaluated.
+/// 2026-11-11). A call DynamoDB refuses for its operands stands as an
+/// [`Operand::Refused`], or a call to a condition function holding a
+/// [`WhereCondition::Refused`], and is never evaluated.
 ///
 /// A BETWEEN bound is read here too, so a bound can be a path, a size or a
 /// call as well as a value, as an IN member can, and `size(s) IN [n]` names
@@ -3079,18 +3199,13 @@ fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
     }
     let call = starts_operand_call(t)?;
     if call && is_condition_function(&tok) {
-        return Ok(match parse_condition_function(t, depth + 1)? {
-            Some(function) => function.operand(),
-            None => Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(true))),
-        });
+        return Ok(parse_condition_function(t, depth + 1)?.operand());
     }
     if call && is_keyword(&tok, "size") {
         let mut operands = call_operands(t, depth + 1)?;
         if operands.len() != 1 {
-            t.note_operand_refusal(operand_count_refusal("size", operands.len()));
-            return Ok(Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(
-                true,
-            ))));
+            let message = operand_count_refusal("size", operands.len());
+            return Ok(Operand::Refused(t.refused(operands, message)));
         }
         let inner = operands
             .pop()
@@ -3120,8 +3235,8 @@ fn expect_between_and(t: &mut Tokenizer) -> Result<(), String> {
 
 /// An IN list, `[...]` or `(...)`, each member read by `member`. The closing
 /// token must match the opener. Its operand count is the caller's to check,
-/// with `note_in_operand_count`, once it has checked anything DynamoDB
-/// reports first.
+/// with `in_limit_refusal`, once it has checked anything DynamoDB reports
+/// first.
 fn parse_in_list<T>(
     t: &mut Tokenizer,
     depth: usize,
@@ -3148,16 +3263,14 @@ fn parse_in_list<T>(
     }
 }
 
-/// Refuse an IN list of more than `MAX_IN_OPERANDS` members in DynamoDB's
-/// words once the statement has parsed. Reported in the order written against
-/// a refused operand, below a refused term or literal, and after the list's
-/// own path among its members (captured eu-west-2 and us-east-1, 2026-10-10).
-fn note_in_operand_count(t: &mut Tokenizer, count: usize) {
-    if count > MAX_IN_OPERANDS {
-        t.note_operand_refusal(format!(
-            "The IN operator is provided with too many operands; number of operands: {count}"
-        ));
-    }
+/// DynamoDB's refusal of an IN list of more than `MAX_IN_OPERANDS` members,
+/// if this one has more. It is the IN's own refusal, so it comes after its
+/// operands', and after the list's own path among its members (captured
+/// eu-west-2 and us-east-1, 2026-10-10; eu-west-2, 2026-11-11).
+fn in_limit_refusal(count: usize) -> Option<String> {
+    (count > MAX_IN_OPERANDS).then(|| {
+        format!("The IN operator is provided with too many operands; number of operands: {count}")
+    })
 }
 
 /// Every member's value, when each member is one.
@@ -3178,17 +3291,29 @@ fn all_values(operands: &[Operand]) -> Option<Vec<PartiqlValue>> {
 /// DynamoDB says so by naming the operator it stands under once the clause is
 /// read (captured eu-west-2 and us-east-1, 2026-10-09).
 fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<BoolExpr, String> {
-    // Arithmetic on a size is refused term by term; a loop, so a long run of
-    // `+ 1` reads in constant stack.
-    if matches!(left, Operand::Size(_)) {
-        while let Some(op) = t.peek_token()?.filter(|op| op == "+" || op == "-") {
-            t.note_operand_refusal(format!(
-                "Unsupported operator in Condition Expression. Operator: {op}"
-            ));
+    // Arithmetic on a size is refused, once the size and the terms after the
+    // first operator are checked; a loop, so a long run of `+ 1` reads in
+    // constant stack. What follows is read and has no say: the refusal comes
+    // first.
+    if matches!(left, Operand::Size(_))
+        && let Some(op) = t.peek_token()?.filter(|op| op == "+" || op == "-")
+    {
+        let message = format!("Unsupported operator in Condition Expression. Operator: {op}");
+        let mut operands = vec![left];
+        while t.peek_token()?.is_some_and(|op| op == "+" || op == "-") {
             t.next_token()?;
-            parse_operand(t, depth)?;
+            operands.push(parse_operand(t, depth)?);
         }
+        let left = operands[0].clone();
+        let refused = t.refused(operands, message);
+        finish_operator(t, depth, left)?;
+        return Ok(BoolExpr::Leaf(WhereCondition::Refused(refused)));
     }
+    finish_operator(t, depth, left)
+}
+
+/// The operator after a comparison's left operand and what follows it.
+fn finish_operator(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<BoolExpr, String> {
     let next = t.peek_token()?;
     match next.as_deref() {
         Some(tok)
@@ -3225,11 +3350,17 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
         Some(tok) if is_keyword(tok, "IN") => {
             t.next_token()?;
             let members = parse_in_list(t, depth, parse_operand)?;
-            note_in_operand_count(t, members.len());
-            Ok(BoolExpr::Leaf(WhereCondition::CompareIn(left, members)))
+            Ok(BoolExpr::Leaf(match in_limit_refusal(members.len()) {
+                Some(message) => {
+                    let operands = std::iter::once(left).chain(members).collect();
+                    WhereCondition::Refused(t.refused(operands, message))
+                }
+                None => WhereCondition::CompareIn(left, members),
+            }))
         }
         Some(tok) if is_keyword(tok, "IS") && matches!(left, Operand::Size(_)) => {
-            t.note_operand_refusal(
+            let refused = t.refused(
+                vec![left],
                 "The left hand side argument to IS must be a Variable Reference, Literal, or \
                  Path"
                     .to_string(),
@@ -3239,9 +3370,9 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
                 t.next_token()?;
             }
             read_type_name(t)?;
-            Ok(refused_condition())
+            Ok(BoolExpr::Leaf(WhereCondition::Refused(refused)))
         }
-        _ if matches!(left, Operand::Size(_)) => Ok(BoolExpr::NonBoolean("N")),
+        _ if matches!(left, Operand::Size(_)) => Ok(BoolExpr::NonBoolean("N", left)),
         _ => Err("Expected operator after attribute path".to_string()),
     }
 }
@@ -3265,8 +3396,8 @@ fn comparison(
             value,
         }),
         (Operand::Path(a), Operand::Path(b)) if a == b => {
-            t.note_operand_refusal(not_distinct(op_tok, &a));
-            WhereCondition::Exists(String::new())
+            let message = not_distinct(op_tok, &a);
+            WhereCondition::Refused(t.refused(vec![Operand::Path(a), Operand::Path(b)], message))
         }
         (left, right) => WhereCondition::Compare(left, op, right),
     }
@@ -3353,7 +3484,9 @@ fn push_not_down(expr: BoolExpr, negated: bool) -> Result<BoolExpr, String> {
                 Ok(BoolExpr::Leaf(cond))
             }
         }
-        BoolExpr::NonBoolean(_) => Ok(refused_condition()),
+        BoolExpr::NonBoolean(..) => {
+            unreachable!("a clause with a value for a condition is never flattened")
+        }
     }
 }
 
@@ -3402,6 +3535,8 @@ fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
                 .collect(),
         ),
         W::Not(inner) => (*inner).into(),
+        // Refused before it runs, so its negation is itself.
+        refused @ W::Refused(_) => refused.into(),
         other @ (W::Compare(..)
         | W::CompareBetween(..)
         | W::CompareIn(..)
@@ -3497,6 +3632,7 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
             Operand::Value(v) => value(v),
             Operand::Size(inner) => operand(inner),
             Operand::Condition(inner) => condition_bytes(inner),
+            Operand::Refused(refused) => refused.operands.iter().map(operand).sum(),
         }
     }
     use WhereCondition as W;
@@ -3516,6 +3652,7 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
         W::CompareIn(o, values) => operand(o) + values.iter().map(operand).sum::<usize>(),
         W::AttributeType(o, kind) => operand(o) + operand(kind),
         W::Not(inner) => condition_bytes(inner),
+        W::Refused(refused) => refused.operands.iter().map(operand).sum(),
     }
 }
 
@@ -3786,8 +3923,10 @@ fn path_between(t: &mut Tokenizer, depth: usize, path: String) -> Result<WhereCo
     expect_between_and(t)?;
     let high = parse_operand(t, depth)?;
     if names_path(&[&low, &high], &path) {
-        t.note_operand_refusal(not_distinct("BETWEEN", &path));
-        return Ok(WhereCondition::Exists(String::new()));
+        let message = not_distinct("BETWEEN", &path);
+        return Ok(WhereCondition::Refused(
+            t.refused(vec![Operand::Path(path), low, high], message),
+        ));
     }
     Ok(match (low, high) {
         (Operand::Value(low), Operand::Value(high)) => WhereCondition::Between(path, low, high),
@@ -3799,11 +3938,17 @@ fn path_between(t: &mut Tokenizer, depth: usize, path: String) -> Result<WhereCo
 /// pushdown reads; a path or size among them makes it a comparison of
 /// operands, read item by item. The path itself among the members is refused.
 fn path_in(t: &mut Tokenizer, path: String, members: Vec<Operand>) -> WhereCondition {
-    if names_path(&members.iter().collect::<Vec<_>>(), &path) {
-        t.note_operand_refusal(not_distinct("IN", &path));
-        return WhereCondition::Exists(String::new());
+    let refusal = if names_path(&members.iter().collect::<Vec<_>>(), &path) {
+        Some(not_distinct("IN", &path))
+    } else {
+        in_limit_refusal(members.len())
+    };
+    if let Some(message) = refusal {
+        let operands = std::iter::once(Operand::Path(path))
+            .chain(members)
+            .collect();
+        return WhereCondition::Refused(t.refused(operands, message));
     }
-    note_in_operand_count(t, members.len());
     match all_values(&members) {
         Some(values) => WhereCondition::In(path, values),
         None => WhereCondition::CompareIn(Operand::Path(path), members),
@@ -4799,9 +4944,13 @@ struct Tokenizer {
     /// store (a number out of range, a value nested too deep, a bag it can't
     /// hold), a function it doesn't recognise, a type `IS` can't test.
     refusals: Vec<Refusal>,
-    /// The first operand an operator or function can't take, as its refusal:
-    /// reported after every refusal above and before the table lookup.
-    operand_refusal: Option<String>,
+    /// Whether the WHERE clause holds a call or an operator DynamoDB refuses
+    /// for itself. The refusal stays on the node it belongs to, for the
+    /// statement's operand check to report in the order written.
+    operand_fault: bool,
+    /// The first refusal of a `set_add` or `set_delete` call in an UPDATE's
+    /// SET clause: reported after the WHERE clause's operands are checked.
+    set_refusal: Option<String>,
     /// How deep the reader for a statement with no verb has nested.
     depth: usize,
     /// How many operators the WHERE clause has held so far.
@@ -4849,7 +4998,8 @@ impl Tokenizer {
             clause: LiteralClause::Where,
             value_path: Vec::new(),
             refusals: Vec::new(),
-            operand_refusal: None,
+            operand_fault: false,
+            set_refusal: None,
             depth: 0,
             operators: 0,
             reading_where: false,
@@ -4895,7 +5045,7 @@ impl Tokenizer {
     /// Whether the statement already holds any refusal, in any clause, so
     /// that it will be refused whatever else is read.
     fn holds_refusal(&self) -> bool {
-        !self.refusals.is_empty() || self.operand_refusal.is_some()
+        !self.refusals.is_empty()
     }
 
     /// Count an operator in the WHERE clause, refusing the one past
@@ -4964,9 +5114,17 @@ impl Tokenizer {
         }
     }
 
-    /// Note an operand a condition function can't take.
-    fn note_operand_refusal(&mut self, message: String) {
-        self.operand_refusal.get_or_insert(message);
+    /// A call or an operator DynamoDB refuses for itself, with the operands
+    /// it was written with.
+    fn refused(&mut self, operands: Vec<Operand>, message: String) -> Box<Refused> {
+        self.operand_fault = true;
+        Box::new(Refused { operands, message })
+    }
+
+    /// Note a `set_add` or `set_delete` call DynamoDB refuses; the first is
+    /// kept.
+    fn note_set_refusal(&mut self, message: String) {
+        self.set_refusal.get_or_insert(message);
     }
 
     /// Note a number literal as it is read. One DynamoDB would refuse is
@@ -5008,8 +5166,9 @@ impl Tokenizer {
 
     /// What DynamoDB reports first for a statement that parsed: the first
     /// refusal from the clause it reads first (an UPDATE's WHERE clause comes
-    /// before its SET clause), the first written within a clause, and only
-    /// then an operand refusal (captured eu-west-2 and us-east-1, 2026-10-09).
+    /// before its SET clause) and the first written within a clause (captured
+    /// eu-west-2 and us-east-1, 2026-10-09). An operand's refusal is the
+    /// statement check's to report, after these.
     fn first_refusal(&self) -> Option<ParseFailure> {
         [
             LiteralClause::Where,
@@ -5024,11 +5183,6 @@ impl Tokenizer {
             } else {
                 ParseFailure::Statement(ParseError::Validation(r.message.clone()))
             }
-        })
-        .or_else(|| {
-            self.operand_refusal
-                .clone()
-                .map(|m| ParseFailure::Statement(ParseError::Validation(m)))
         })
     }
 
@@ -6790,5 +6944,71 @@ mod tests {
             ")".repeat(10_000)
         );
         assert!(parse(&statement).is_err());
+    }
+
+    /// A call or an operator DynamoDB refuses for itself no longer stops the
+    /// statement parsing: the refusal stays on the node it belongs to, with
+    /// the operands it was written with, for the statement check to report
+    /// in the order written.
+    #[test]
+    fn a_refused_call_is_kept_where_it_was_written() {
+        let parsed = parse_statement(
+            r#"SELECT * FROM "t" WHERE n BETWEEN size(true) AND attribute_exists(n, n)"#,
+        )
+        .ok()
+        .expect("parses");
+        let Statement::Select {
+            where_clause: Some(wc),
+            ..
+        } = parsed.statement
+        else {
+            panic!("SELECT with a WHERE clause")
+        };
+        let WrittenClause::Leaf(condition) = &wc.written else {
+            panic!("one condition: {:?}", wc.written)
+        };
+        let WhereCondition::CompareBetween(Operand::Path(path), low, high) = condition.as_ref()
+        else {
+            panic!("BETWEEN on a path: {condition:?}")
+        };
+        assert_eq!(path, "n");
+        assert_eq!(
+            low,
+            &Operand::Size(Box::new(Operand::Value(PartiqlValue::Literal(
+                AttributeValue::BOOL(true)
+            ))))
+        );
+        let Operand::Condition(call) = high else {
+            panic!("a call as the upper bound: {high:?}")
+        };
+        let WhereCondition::Refused(refused) = call.as_ref() else {
+            panic!("a refused call: {call:?}")
+        };
+        assert_eq!(
+            refused.operands,
+            vec![Operand::Path("n".into()), Operand::Path("n".into())]
+        );
+        assert_eq!(
+            refused.message,
+            "Incorrect number of operands for operator or function; operator or function: \
+             attribute_exists, number of operands: 2"
+        );
+    }
+
+    #[test]
+    fn a_statement_whose_only_fault_is_an_operand_parses() {
+        for clause in [
+            "n = n",
+            "attribute_exists(n, n)",
+            "size(s, s) > 0",
+            "s IN [s]",
+            "size(s) + 1 > 0",
+            "size(s) AND n = 1",
+        ] {
+            assert!(
+                parse_statement(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).is_ok(),
+                "{clause}"
+            );
+        }
     }
 }

@@ -207,18 +207,23 @@ pub async fn execute<S: StorageBackend>(
 
     // The parser says which envelope its rejection takes: a malformed statement
     // gets DynamoDB's "wasn't well formed" wrapper, while a rejection DynamoDB
-    // reports on its own terms is passed through bare.
-    let supplied = request.parameters.as_ref().map_or(0, Vec::len);
-    let stmt = partiql::parser::parse_with_parameters(&request.statement, supplied).map_err(
-        |failure| {
-            DynoxideError::ValidationException(match failure {
-                partiql::parser::ParseFailure::Statement(e) => e.into_message(),
-                partiql::parser::ParseFailure::Literal(message) => message,
-            })
-        },
-    )?;
-
+    // reports on its own terms, the statement checks' among them, is passed
+    // through bare.
     let params = request.parameters.unwrap_or_default();
+    let stmt = partiql::executor::checked_statement(
+        storage,
+        &request.statement,
+        &params,
+        partiql::executor::StatementSource::ExecuteStatement,
+    )
+    .await
+    .map_err(|failure| {
+        DynoxideError::ValidationException(match failure {
+            partiql::parser::ParseFailure::Statement(e) => e.into_message(),
+            partiql::parser::ParseFailure::Literal(message) => message,
+        })
+    })?;
+
     // The statement's text goes with it, so a continuation token is bound to
     // the statement as written, as DynamoDB binds it.
     let run = partiql::executor::execute_written_page(

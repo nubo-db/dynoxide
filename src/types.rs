@@ -597,8 +597,11 @@ pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
 
 /// Deserialise `ConsistentRead` on ExecuteStatement or a BatchExecuteStatement
 /// member: by [`deserialize_lenient_flag`]'s rule, except that a list is
-/// refused with no message, where GetItem names the type (captured eu-west-2,
-/// 2026-11-11).
+/// refused with no message, as DynamoDB refuses it (captured eu-west-2 and
+/// us-east-1, 2026-11-11). The shared reader answers a list differently for
+/// the other operations, and that is not changed here. The same rule for
+/// ExecuteStatement's own field is in `serialization_checks::check_types`,
+/// which reads the request first.
 pub(crate) fn deserialize_statement_flag<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<bool>, D::Error> {

@@ -106,6 +106,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It holds over HTTP and in the wasm engine. Captured against eu-west-2 and
   us-east-1 on 9 October 2026, and the map order against eu-west-2 on
   9 November 2026 ([#261](https://github.com/nubo-db/dynoxide/issues/261)).
+- The MCP tools read `consistent_read` (`get_item`, and `ConsistentRead`
+  inside `batch_get_item`'s `request_items`) and `scan_index_forward`
+  (`query`) as the HTTP API does: the strings DynamoDB reads as booleans,
+  such as `"true"`, `"yes"`, `"0"` and `"N"`, work, and anything else is
+  refused with the HTTP API's `SerializationException`. A string used to be
+  refused as a malformed argument on `get_item` and `query`, and inside
+  `batch_get_item` it was dropped without a word, so `"true"` read eventually
+  consistent. The listed schema still says boolean
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP tools read values on the validation layer the HTTP API would use
+  for the same request. Arguments holding a `BOOL` or `NULL` written as a
+  string, or a value with two members, move the call to the older layer,
+  where `put_item`, `update_item` and `delete_item` report a refused value
+  bare rather than inside `1 validation error detected: `, and `update_item`
+  names the key in `expression_attribute_values`. The batch, transaction and
+  PartiQL tools now read on their operation's older layer too, so
+  `batch_write_item` calls `1e2147483647` an underflow, as BatchWriteItem
+  does ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP `scan` tool takes a negative `segment` or `total_segments` and
+  answers with Scan's member check, such as `Value at 'Segment' failed to
+  satisfy constraint: Member must have value greater than or equal to 0`. It
+  used to refuse it as a malformed argument. A value past 32 bits reads as
+  the largest 32-bit integer, as it does over HTTP
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP `execute_partiql` tool reports a member error (`limit` 0, a bad
+  `return_consumed_capacity` or `return_values_on_condition_check_failure`,
+  an empty statement) ahead of a parameter refused for its value, and
+  `parameters` that isn't a list as a `SerializationException` rather than a
+  protocol error, as ExecuteStatement does over HTTP. `consistent_read` goes
+  to ExecuteStatement as given, so a string gets ExecuteStatement's answer
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 
 ## [1.6.0] - 2026-11-07
 

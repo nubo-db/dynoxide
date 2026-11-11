@@ -8,15 +8,19 @@
 //! words. It is an ordinary value fault, met where DynamoDB's walk over the
 //! request meets it: an attribute map's members in the order a Java `HashMap`
 //! iterates them, a list's in written order, and an item or key before the
-//! request's expression values. A null also puts the request on the older
-//! validation layer, so a bad number beside it is refused bare.
+//! request's expression values (in a TransactWriteItems action, the
+//! expression values before the item or key). A null also puts the request on
+//! the older validation layer, so a bad number beside it in the item is
+//! refused bare, and one in the expression values is named by key.
 //!
 //! The rows are the requests sent to eu-west-2 and us-east-1 on 11 November
-//! 2026 and the answers DynamoDB gave, which agree in both regions, held as
-//! data captured from DynamoDB, not written by hand. Every request names a
-//! table that doesn't exist. Answers are compared as parsed JSON, with the
-//! HTTP status DynamoDB gives them: 200 for a BatchExecuteStatement, whose
-//! statements carry their own errors, and 400 for the rest.
+//! 2026 and the answers DynamoDB gave, held as data captured from DynamoDB,
+//! not written by hand. The first three sets agree in both regions; the
+//! fourth is held as a set of right answers for each request (see
+//! [`Choices`]). Every request names a table that doesn't exist. Answers are
+//! compared as parsed JSON, with the HTTP status DynamoDB gives them: 200 for
+//! a BatchExecuteStatement, whose statements carry their own errors, and 400
+//! for the rest.
 
 #![cfg(feature = "http-server")]
 
@@ -205,6 +209,48 @@ async fn first_set_answers_as_dynamodb_did() {
 async fn second_set_answers_as_dynamodb_did() {
     assert_eq!(SECOND.len(), 34);
     assert_rows("second", SECOND).await;
+}
+
+#[tokio::test]
+async fn third_set_answers_as_dynamodb_did() {
+    assert_eq!(THIRD.len(), 20);
+    assert_rows("third", THIRD).await;
+}
+
+/// A captured request with two faulty `ExpressionAttributeValues` and the
+/// answers that are right for it. DynamoDB's choice between two faulty
+/// expression values varies between its hosts: eu-west-2 and us-east-1 named
+/// different members for five of these requests. Each holds the answer each
+/// region gave and, where a null is one of the two, the answer naming the
+/// other member, built from the words DynamoDB uses for that member's fault in
+/// the rest of the set. Whichever member Dynoxide reports, its message must be
+/// exactly what DynamoDB says for that member.
+type Choices = (usize, &'static str, &'static str, &'static [&'static str]);
+
+#[tokio::test]
+async fn fourth_set_answers_as_dynamodb_did() {
+    assert_eq!(FOURTH.len(), 19);
+    let url = start_server().await;
+    let mut wrong = Vec::new();
+    for &(number, operation, body, answers) in FOURTH {
+        let got = send(&url, operation, body).await;
+        let right = answers.iter().any(|answer| {
+            let answer: serde_json::Value = serde_json::from_str(answer).unwrap();
+            got == (status_of(&answer), answer)
+        });
+        if !right {
+            wrong.push(format!(
+                "fourth row {number}: {operation} {body}\n  expected one of {answers:#?}\n  got {got:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} rows differ:\n{}",
+        wrong.len(),
+        FOURTH.len(),
+        wrong.join("\n")
+    );
 }
 
 /// The library's own reader refuses a null in the same words as the wire.
@@ -827,5 +873,296 @@ const SECOND: &[Row] = &[
         "PutItem",
         r##"{"Item": {"pk": null}}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null"}"##,
+    ),
+];
+
+const THIRD: &[Row] = &[
+    (
+        1,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExclusiveStartKey": {"pk": null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The provided starting key is invalid: The supplied Item contains a null AttributeValue: pk is null"}"##,
+    ),
+    (
+        2,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExclusiveStartKey": {"pk": null}, "FilterExpression": "a = :v", "ExpressionAttributeValues": {":v": null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The provided starting key is invalid: The supplied Item contains a null AttributeValue: pk is null"}"##,
+    ),
+    (
+        3,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "a = :v", "ExpressionAttributeValues": {":v": null}, "ExclusiveStartKey": {"pk": null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The provided starting key is invalid: The supplied Item contains a null AttributeValue: pk is null"}"##,
+    ),
+    (
+        4,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExclusiveStartKey": {"pk": null}, "Limit": 0}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+    ),
+    (
+        5,
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :v", "ExpressionAttributeValues": {":v": {"S": "a"}}, "ExclusiveStartKey": {"pk": null}, "Limit": 0}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+    ),
+    (
+        6,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExclusiveStartKey": {"pk": null, "x": {"N": "abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        7,
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditions": {"pk": {"AttributeValueList": [{"S": "a"}], "ComparisonOperator": "EQ"}}, "QueryFilter": {"a": null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The filter condition for an attribute cannot be null: a"}"##,
+    ),
+    (
+        8,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ScanFilter": {"a": null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The filter condition for an attribute cannot be null: a"}"##,
+    ),
+    (
+        9,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ScanFilter": {"a": {"AttributeValueList": [null], "ComparisonOperator": "EQ"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue"}"##,
+    ),
+    (
+        10,
+        "TransactWriteItems",
+        r##"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": null}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": null}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :v"}"##,
+    ),
+    (
+        11,
+        "TransactWriteItems",
+        r##"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": null}, "Item": {"pk": null}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :v"}"##,
+    ),
+    (
+        12,
+        "TransactWriteItems",
+        r##"{"TransactItems": [{"Update": {"TableName": "_capture_20261111_317_none", "UpdateExpression": "SET a = :v", "ExpressionAttributeValues": {":v": null}, "Key": {"pk": null}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :v"}"##,
+    ),
+    (
+        13,
+        "TransactWriteItems",
+        r##"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}}}, {"Delete": {"TableName": "_capture_20261111_317_none", "Key": {"pk": null}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: pk is null"}"##,
+    ),
+    (
+        14,
+        "TransactGetItems",
+        r##"{"TransactItems": [{"Get": {"TableName": "_capture_20261111_317_none", "Key": {"pk": null}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: pk is null"}"##,
+    ),
+    (
+        15,
+        "ExecuteStatement",
+        r##"{"Statement": "SELECT * FROM \"_capture_20261111_317_none\" WHERE pk = ?", "Parameters": [null], "ReturnConsumedCapacity": "BAD"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"##,
+    ),
+    (
+        16,
+        "ExecuteStatement",
+        r##"{"Statement": "SELECT * FROM \"_capture_20261111_317_none\" WHERE pk = ? AND a = ?", "Parameters": [null, {"N": "abc"}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue"}"##,
+    ),
+    (
+        17,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "a = :a AND b = :b", "ExpressionAttributeValues": {":b": {"N": "abc"}, ":a": null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :b"}"##,
+    ),
+    (
+        18,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "a = :a AND b = :b", "ExpressionAttributeValues": {":b": null, ":a": {"S": 1}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"##,
+    ),
+    (
+        19,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"m": {"M": {"a": null, "b": {"N": "abc"}}}, "pk": {"S": "a"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: a is null"}"##,
+    ),
+    (
+        20,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"m": {"M": {"b": {"N": "abc"}, "a": null}}, "pk": {"S": "a"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: a is null"}"##,
+    ),
+];
+
+const FOURTH: &[Choices] = &[
+    (
+        1,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":a": null, ":b": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :a"}"##,
+        ],
+    ),
+    (
+        2,
+        "UpdateItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :a, y = :b", "ExpressionAttributeValues": {":a": null, ":b": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :a"}"##,
+        ],
+    ),
+    (
+        3,
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :a", "FilterExpression": "x = :b", "ExpressionAttributeValues": {":a": null, ":b": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :a"}"##,
+        ],
+    ),
+    (
+        4,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":a": null, ":b": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :a"}"##,
+        ],
+    ),
+    (
+        5,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":b": null, ":a": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :a"}"##,
+        ],
+    ),
+    (
+        6,
+        "UpdateItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :a, y = :b", "ExpressionAttributeValues": {":b": null, ":a": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :a"}"##,
+        ],
+    ),
+    (
+        7,
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :a", "FilterExpression": "x = :b", "ExpressionAttributeValues": {":b": null, ":a": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :a"}"##,
+        ],
+    ),
+    (
+        8,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":b": null, ":a": {"N": "abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The supplied Item contains a null AttributeValue for key :b"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :a"}"##,
+        ],
+    ),
+    (
+        9,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":b": {"N": "abc"}, ":a": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        10,
+        "UpdateItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :a, y = :b", "ExpressionAttributeValues": {":b": {"N": "abc"}, ":a": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        11,
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :a", "FilterExpression": "x = :b", "ExpressionAttributeValues": {":b": {"N": "abc"}, ":a": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        12,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":b": {"N": "abc"}, ":a": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        13,
+        "PutItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        14,
+        "UpdateItem",
+        r##"{"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :a, y = :b", "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: abc"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        15,
+        "Query",
+        r##"{"TableName": "_capture_20261111_317_none", "KeyConditionExpression": "pk = :a", "FilterExpression": "x = :b", "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        16,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "FilterExpression": "x = :a AND y = :b", "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"N": "xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        17,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "Limit": 0}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+        ],
+    ),
+    (
+        18,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExclusiveStartKey": {"pk": {"S": "a"}}, "Limit": 0}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+        ],
+    ),
+    (
+        19,
+        "Scan",
+        r##"{"TableName": "_capture_20261111_317_none", "ExclusiveStartKey": {"pk": {"N": "abc"}}, "Limit": 0}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+        ],
     ),
 ];

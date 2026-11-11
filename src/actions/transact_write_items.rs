@@ -20,14 +20,88 @@ pub struct TransactWriteItemsRequest {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TransactWriteItem {
-    #[serde(rename = "Put", default)]
+    #[serde(rename = "Put", default, deserialize_with = "read_action")]
     pub put: Option<TransactPut>,
-    #[serde(rename = "Update", default)]
+    #[serde(rename = "Update", default, deserialize_with = "read_action")]
     pub update: Option<TransactUpdate>,
-    #[serde(rename = "Delete", default)]
+    #[serde(rename = "Delete", default, deserialize_with = "read_action")]
     pub delete: Option<TransactDelete>,
-    #[serde(rename = "ConditionCheck", default)]
+    #[serde(rename = "ConditionCheck", default, deserialize_with = "read_action")]
     pub condition_check: Option<TransactConditionCheck>,
+}
+
+/// Read one action, first refusing it for [`refusal_ahead_of_action`].
+fn read_action<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error;
+    let Some(action) = Option::<Box<serde_json::value::RawValue>>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    if let Some(refusal) = refusal_ahead_of_action(action.get()) {
+        return Err(D::Error::custom(refusal));
+    }
+    serde_json::from_str(action.get()).map_err(D::Error::custom)
+}
+
+/// The refusal an action (a `Put`, `Update`, `Delete` or `ConditionCheck`,
+/// given as its JSON text) gets ahead of the rest of it, if any, as the raw
+/// serde message.
+///
+/// DynamoDB reads an action's `ExpressionAttributeValues` ahead of its `Item`
+/// or `Key`, whichever is written first: with a null in each, the value is
+/// the one named (captured eu-west-2 and us-east-1, 2026-11-11). PutItem and
+/// UpdateItem read them the other way round. A value of the wrong JSON type
+/// still fails the request where it is written, ahead of both.
+pub(crate) fn refusal_ahead_of_action(action: &str) -> Option<String> {
+    fn written_members<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<(String, Box<serde_json::value::RawValue>)>, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Vec<(String, Box<serde_json::value::RawValue>)>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(members)
+            }
+        }
+        deserializer.deserialize_map(Visit)
+    }
+    // An action that isn't a map is refused as the action is read.
+    let members = written_members(&mut serde_json::Deserializer::from_str(action)).ok()?;
+    let mut held = None;
+    for (name, value) in &members {
+        let refusal = match name.as_str() {
+            "Item" | "Key" => serde_json::from_str::<types::AttributeMap>(value.get()).err(),
+            "ExpressionAttributeValues" => types::deserialize_older_expression_values(
+                &mut serde_json::Deserializer::from_str(value.get()),
+            )
+            .err(),
+            _ => None,
+        };
+        let Some(refusal) = refusal.map(|e| e.to_string()) else {
+            continue;
+        };
+        if !crate::serde_errors::is_validation_refusal(&refusal) {
+            return Some(refusal);
+        }
+        if name == "ExpressionAttributeValues" {
+            held = Some(refusal);
+        }
+    }
+    held
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

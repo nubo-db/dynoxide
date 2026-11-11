@@ -60,7 +60,7 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
         let item = item.map_err(serde::de::Error::custom)?;
         let expression_attribute_values = raw
             .expression_attribute_values
-            .map(|values| values.read(types::deserialize_named_nulls))
+            .map(|values| values.read(types::read_put_item_values))
             .transpose()
             .map_err(serde::de::Error::custom)?;
 

@@ -58,16 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named (`: pk is null`); one in an `L`, a PartiQL parameter or an
   `AttributeValueList` is not. `ExpressionAttributeValues` and
   `ExclusiveStartKey` wrap it as they wrap their other faults, and a null
-  given for a whole `Expected`, `AttributeUpdates` or `KeyConditions` entry
-  gets the message DynamoDB has for each. In BatchExecuteStatement it fails
-  only its own statement. The faults in an item or key are now met in the
-  order DynamoDB walks them (its Java `HashMap` order, with a value of the
-  wrong JSON type ahead of the rest), an item or key is checked before
-  `ExpressionAttributeValues` and a starting key before Query's, and a null
-  puts the request on the older validation layer, so a bad number beside one
-  comes back without the `1 validation error detected:` envelope. An
-  `AttributeUpdates` entry with no value and an action other than `DELETE`
-  is now refused inside that envelope
+  given for a whole `Expected`, `AttributeUpdates`, `KeyConditions`,
+  `QueryFilter` or `ScanFilter` entry gets the message DynamoDB has for each.
+  In BatchExecuteStatement it fails only its own statement. The faults in an
+  item or key are now met in the order DynamoDB walks them (its Java
+  `HashMap` order, with a value of the wrong JSON type ahead of the rest), as
+  are those in PutItem's expression values and in any request's expression
+  values once a null is present. An item or key is checked before
+  `ExpressionAttributeValues`, except in a TransactWriteItems action, where
+  the values come first, and a starting key before Query's. A null puts the
+  request on the older validation layer, so a bad number beside one in an
+  item comes back without the `1 validation error detected:` envelope, and
+  one in the expression values is named by its key; a null in a starting key
+  puts a Query's or Scan's `Limit` error in that layer's words. The MCP
+  tools give the same answers. An `AttributeUpdates` entry with no value and
+  an action other than `DELETE` is now refused inside that envelope
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages

@@ -1987,9 +1987,8 @@ pub fn extract_key_strings(
 pub(crate) fn read_values_after_start_key(
     values: Option<crate::types::HeldValues>,
     read: impl FnOnce(
-        serde_json::Value,
-    )
-        -> std::result::Result<Option<HashMap<String, AttributeValue>>, serde_json::Error>,
+        Vec<(String, serde_json::Value)>,
+    ) -> std::result::Result<HashMap<String, AttributeValue>, String>,
     start_key: Option<&serde_json::Value>,
     read_start_key: impl FnOnce(&serde_json::Value) -> Result<HashMap<String, AttributeValue>>,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, String> {
@@ -2003,6 +2002,17 @@ pub(crate) fn read_values_after_start_key(
             _ => Err(refusal),
         },
     }
+}
+
+/// Whether a Query's or Scan's `ExclusiveStartKey` holds a JSON null for a
+/// value, which hands the request to the older validation layer: beside a
+/// `Limit` of 0 it answers `Value '0' at 'limit'`, where a starting key
+/// without one, or with a bad number, answers `Value at 'Limit'` (captured
+/// eu-west-2 and us-east-1, 2026-11-11).
+pub(crate) fn start_key_holds_null(start_key: Option<&serde_json::Value>) -> bool {
+    start_key
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|key| key.values().any(serde_json::Value::is_null))
 }
 
 /// Parse an `ExclusiveStartKey` from a raw `serde_json::Value`.
@@ -2484,7 +2494,7 @@ fn validate_comparison_type_compat(comp_op: &str, type_name: &str) -> Result<()>
 /// validation order (filters are validated before ExclusiveStartKey).
 pub fn validate_filter_conditions_raw(
     value: Option<&serde_json::Value>,
-    param_name: &str,
+    _param_name: &str,
 
     layer: crate::validation::ValueLayer,
 ) -> Result<()> {
@@ -2494,12 +2504,12 @@ pub fn validate_filter_conditions_raw(
     };
 
     let obj = val.as_object().unwrap();
-    // A KeyConditions entry given as null is refused before the table is
-    // looked up (captured eu-west-2 and us-east-1, 2026-11-11).
-    if param_name == "KeyConditions"
-        && let Some(name) = obj
-            .iter()
-            .find_map(|(name, condition)| condition.is_null().then_some(name))
+    // A KeyConditions, QueryFilter or ScanFilter entry given as null is
+    // refused before the table is looked up (captured eu-west-2 and
+    // us-east-1, 2026-11-11).
+    if let Some(name) = obj
+        .iter()
+        .find_map(|(name, condition)| condition.is_null().then_some(name))
     {
         return Err(DynoxideError::ValidationException(format!(
             "The filter condition for an attribute cannot be null: {name}"

@@ -6226,3 +6226,99 @@ fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// A JSON null where an attribute value belongs gets the HTTP API's answer
+/// through the tools too: named after its attribute in an item or a key,
+/// named by key in the expression values, and wrapped as the starting key's
+/// fault in an `exclusive_start_key` (captured eu-west-2 and us-east-1,
+/// 2026-11-11, and pinned over HTTP in tests/null_attribute_values.rs).
+#[test]
+fn a_null_value_is_refused_through_the_tools_as_over_http() {
+    const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
+    let mut child = mcp_with_table("Nulls");
+    let member = validation_error(&format!("{NULL_VALUE}: pk is null"));
+    let cases: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": null}}),
+            member.clone(),
+        ),
+        (
+            "get_item",
+            json!({"table_name": "Nulls", "key": {"pk": null}}),
+            member.clone(),
+        ),
+        (
+            "delete_item",
+            json!({"table_name": "Nulls", "key": {"pk": null}}),
+            member.clone(),
+        ),
+        (
+            "update_item",
+            json!({"table_name": "Nulls", "key": {"pk": null}, "update_expression": "SET a = :v",
+                "expression_attribute_values": {":v": {"S": "x"}}}),
+            member.clone(),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": {"S": "a"}},
+                "condition_expression": "a = :v", "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "update_item",
+            json!({"table_name": "Nulls", "key": {"pk": {"S": "a"}}, "update_expression": "SET a = :v",
+                "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "delete_item",
+            json!({"table_name": "Nulls", "key": {"pk": {"S": "a"}},
+                "condition_expression": "a = :v", "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "query",
+            json!({"table_name": "Nulls", "key_condition_expression": "pk = :v",
+                "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "scan",
+            json!({"table_name": "Nulls", "filter_expression": "a = :v",
+                "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "scan",
+            json!({"table_name": "Nulls", "exclusive_start_key": {"pk": null}}),
+            validation_error(&format!(
+                "The provided starting key is invalid: {NULL_VALUE}: pk is null"
+            )),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": {"S": "a"}},
+                "condition_expression": "x = :a AND y = :b",
+                "expression_attribute_values": {":b": null, ":a": {"N": "abc"}}}),
+            named(NULL_VALUE, ":b"),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (tool, args, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

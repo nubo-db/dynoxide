@@ -99,7 +99,8 @@ pub(crate) struct ScanMembers<'a> {
     pub segment: Option<i64>,
     pub total_segments: Option<i64>,
     /// Whether `Limit`, `Segment` or `TotalSegments` saturated or lost a
-    /// fraction as it was read.
+    /// fraction as it was read, or the `ExclusiveStartKey` holds a null
+    /// value. Either hands the request to the older layer.
     pub coerced: bool,
 }
 
@@ -113,9 +114,10 @@ impl ScanMembers<'_> {
     ///
     /// 1. A missing table name, a legacy condition with no
     ///    `ComparisonOperator`, or a `Limit`, `Segment` or `TotalSegments` that
-    ///    saturated or lost a fraction as it was read hands the request to the
-    ///    older layer, which reports every member error it finds, in its
-    ///    wording and in this order: `Select`, `TotalSegments` (outside 1 to
+    ///    saturated or lost a fraction as it was read, or a null in the
+    ///    `ExclusiveStartKey`, hands the request to the older layer, which
+    ///    reports every member error it finds, in its wording and in this
+    ///    order: `Select`, `TotalSegments` (outside 1 to
     ///    1000000), `ReturnConsumedCapacity`, the table name (missing or
     ///    empty), `ConditionalOperator`, the missing operators, `Segment`
     ///    (outside 0 to 999999), `Limit` below 1.
@@ -246,7 +248,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
         let expression_attribute_values = helpers::read_values_after_start_key(
             raw.expression_attribute_values,
-            crate::types::deserialize_named_nulls,
+            crate::types::read_scan_values,
             raw.exclusive_start_key.as_ref(),
             |key| helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current),
         )
@@ -272,7 +274,8 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             coerced: [raw.limit, raw.segment, raw.total_segments]
                 .iter()
                 .flatten()
-                .any(|n| n.coerced),
+                .any(|n| n.coerced)
+                || helpers::start_key_holds_null(raw.exclusive_start_key.as_ref()),
         })
         .rejection()
         {
@@ -337,7 +340,7 @@ pub async fn execute<S: StorageBackend>(
         limit: request.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)),
         segment: request.segment.map(i64::from),
         total_segments: request.total_segments.map(i64::from),
-        coerced: false,
+        coerced: helpers::start_key_holds_null(request.exclusive_start_key_raw.as_ref()),
     })
     .rejection()
     {

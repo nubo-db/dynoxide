@@ -123,7 +123,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             .map_err(serde::de::Error::custom)?;
         let expression_attribute_values = raw
             .expression_attribute_values
-            .map(|values| values.read(types::deserialize_named_null_refusals))
+            .map(|values| values.read(types::read_update_item_values))
             .transpose()
             .map_err(serde::de::Error::custom)?;
 

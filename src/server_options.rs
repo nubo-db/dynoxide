@@ -4,6 +4,23 @@
 //! Lives outside both server modules because either can be compiled without
 //! the other (`mcp-server` without `http-server` is a supported build).
 
+use std::io::Write;
+
+/// Writes an informational line to stderr, ignoring a failed write.
+///
+/// `eprintln!` panics when the write fails, and stderr fails as soon as a
+/// launcher that read it through a pipe has been killed. The panic would land
+/// in the shutdown that follows, and the release build aborts on panic, so the
+/// database would never close. A line nobody can read isn't worth that.
+#[doc(hidden)]
+pub fn stderr_line(args: std::fmt::Arguments<'_>) {
+    write_line(&mut std::io::stderr(), args);
+}
+
+fn write_line(out: &mut impl Write, args: std::fmt::Arguments<'_>) {
+    let _ = out.write_fmt(args).and_then(|()| out.write_all(b"\n"));
+}
+
 /// Options controlling the output of the DynamoDB HTTP server
 /// (`server::start_with_options`) and the MCP HTTP transport
 /// (`mcp::serve_http_with_options`).
@@ -81,3 +98,33 @@ const _: () = {
     }
     let _ = assert_auto_traits::<ServerOptions>;
 };
+
+#[cfg(test)]
+mod stderr_line_tests {
+    use super::write_line;
+    use std::io::{self, Write};
+
+    /// Fails every write, as stderr does once its reader has gone.
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn a_line_nobody_can_read_is_dropped_without_a_panic() {
+        write_line(&mut BrokenPipe, format_args!("Shutting down..."));
+    }
+
+    #[test]
+    fn a_line_with_a_reader_arrives_whole() {
+        let mut out = Vec::new();
+        write_line(&mut out, format_args!("listening on {}", 8000));
+        assert_eq!(out, b"listening on 8000\n");
+    }
+}

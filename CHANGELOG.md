@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package gains TypeScript types and an `exports` map that keeps
   `dynoxide/bin/dynoxide` and `dynoxide/package.json` importable.
 
+### Fixed
+
+- **A server whose launcher was killed now shuts down cleanly.** If the
+  launcher had been reading the server's stderr through a pipe, the shutdown
+  line failed to write and the release build aborted before closing the
+  database, leaving its write-ahead log behind. Writes weren't lost, but the
+  shutdown wasn't the clean one `--exit-with-parent` promises. Informational
+  lines on the `serve` path now drop a failed write instead.
+
 ## [1.7.0-rc.1] - 2026-11-10
 
 A release candidate, so wrappers in other languages can be tested against a

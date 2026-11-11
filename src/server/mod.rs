@@ -89,7 +89,7 @@ pub async fn start_with_options(
         .map_err(|e| format!("failed to read listener address: {e}"))?;
 
     if !options.suppresses_informational_messages() {
-        eprintln!("Dynoxide listening on http://{local_addr}");
+        crate::stderr_line(format_args!("Dynoxide listening on http://{local_addr}"));
     }
     if options.prints_ready_line() {
         print_ready_line(local_addr)?;
@@ -341,7 +341,7 @@ async fn shutdown_signal(
         }
     }
     if !suppress_informational_messages {
-        eprintln!("\nShutting down...");
+        crate::stderr_line(format_args!("\nShutting down..."));
     }
 }
 

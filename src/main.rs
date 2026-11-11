@@ -590,7 +590,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let n = dynoxide::import::scaffold_from_schema(&db, schema_path)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         if !is_quiet(args.log) {
-            eprintln!("Scaffolded {} table(s) from schema", n);
+            dynoxide::stderr_line(format_args!("Scaffolded {} table(s) from schema", n));
         }
     }
 
@@ -626,10 +626,10 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mcp_options = server_options.clone();
 
         if !quiet {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
                 args.host, args.port, args.mcp_host, args.mcp_port
-            );
+            ));
         }
 
         let (http_result, mcp_result) = tokio::join!(
@@ -751,11 +751,11 @@ fn load_data_model(
             let model = dynoxide::schema::onetable::parse_onetable_file(p)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             if !quiet {
-                eprintln!(
+                dynoxide::stderr_line(format_args!(
                     "Loaded data model: {} ({} entities)",
                     model.schema_format,
                     model.entities.len()
-                );
+                ));
             }
             Ok(Some(model))
         }

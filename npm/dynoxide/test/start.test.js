@@ -443,6 +443,13 @@ test(
   const dbPath = path.join(tmp(), "data.db");
   const { port } = await hardKill("hard-kill-child.js", [dbPath]);
   assert.ok(await waitUntil(async () => !(await answers(port)), 3000), "the server outlived its runner");
+  // A clean close checkpoints the write-ahead log and removes it. A server
+  // that died mid-shutdown leaves it behind, and its writes would still be
+  // readable, so the item alone doesn't prove the shutdown was clean.
+  assert.ok(
+    await waitUntil(async () => !fs.existsSync(`${dbPath}-wal`), 3000),
+    "the server didn't close the database cleanly: its -wal file is still there"
+  );
   const server = await start({ dbPath });
   const got = await dynamo(server.endpoint, "GetItem", { TableName: "kept", Key: { pk: { S: "after-kill" } } });
   await server.stop();

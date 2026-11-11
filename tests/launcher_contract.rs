@@ -670,6 +670,62 @@ fn writes_survive_a_shutdown_through_stdin() {
     assert!(body.contains("\"one\""), "the item was lost: {body}");
 }
 
+/// A launcher that reads stderr through a pipe loses that pipe's reader when
+/// it's killed, so the shutdown that follows writes to a broken pipe. The
+/// write must fail quietly: a panic there aborts the release build before the
+/// database closes, leaving its write-ahead log behind.
+#[test]
+fn a_shutdown_with_no_one_reading_stderr_still_closes_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("data.db");
+    let mut server = KillOnDrop(
+        serve(&[
+            "--port",
+            "0",
+            "--ready-json",
+            "--exit-with-parent",
+            "--db-path",
+            db.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dynoxide"),
+    );
+    let mut stdout = BufReader::new(server.0.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let ready: serde_json::Value = serde_json::from_str(&line).expect("a ready line");
+    let endpoint = ready["endpoint"].as_str().unwrap().to_owned();
+    let create = r#"{"TableName":"Kept","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+    assert_eq!(dynamo(&endpoint, "CreateTable", create).0, 200);
+
+    // What a killed launcher leaves: nobody reading either output stream.
+    drop(server.0.stderr.take());
+    drop(stdout);
+    drop(server.0.stdin.take());
+
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    let status = loop {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server kept running after stdin closed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "exit status {status}");
+    let wal = dir.path().join("data.db-wal");
+    assert!(
+        !wal.exists(),
+        "the database wasn't closed: {} is still there",
+        wal.display()
+    );
+}
+
 #[test]
 fn a_server_started_with_stdin_already_closed_stops_at_once() {
     // Passing the flag with no stdin is a launcher bug, and it shows up as a

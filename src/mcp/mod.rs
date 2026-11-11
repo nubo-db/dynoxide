@@ -159,7 +159,9 @@ pub async fn serve_http_with_options(
     let local_addr = listener.local_addr()?;
 
     if !options.suppresses_informational_messages() {
-        eprintln!("MCP HTTP server listening on http://{local_addr}/mcp");
+        crate::stderr_line(format_args!(
+            "MCP HTTP server listening on http://{local_addr}/mcp"
+        ));
     }
 
     // Don't use with_graceful_shutdown for the MCP transport: persistent

@@ -313,6 +313,12 @@ const readmeSkip = !real
   ? "DYNOXIDE_BINARY isn't set"
   : !sdkInstalled() && !process.env.DYNOXIDE_EXTRA_CHECKS && "the AWS SDK isn't installed in test-fixtures";
 
+test("the README's example is the code the next test runs", () => {
+  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+  const example = fs.readFileSync(path.join(FIXTURES, "readme-example.mjs"), "utf8").trimEnd();
+  assert.ok(readme.includes("```js\n" + example + "\n```"), "the README's start() example and test-fixtures/readme-example.mjs differ");
+});
+
 test("the README example runs as written", { skip: readmeSkip }, () => {
   const run = spawnSync(process.execPath, [path.join(FIXTURES, "readme-example.mjs")], {
     encoding: "utf8",

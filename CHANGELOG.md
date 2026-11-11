@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The npm package exports `start()`**, which runs Dynoxide on a free port
+  for a test suite and returns its endpoint, region, credentials and a
+  `stop()`. It follows `docs/launcher.md`, which is no longer a draft. The
+  package gains TypeScript types and an `exports` map that keeps
+  `dynoxide/bin/dynoxide` and `dynoxide/package.json` importable.
+
 ## [1.7.0-rc.1] - 2026-11-10
 
 A release candidate, so wrappers in other languages can be tested against a

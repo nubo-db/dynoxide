@@ -1,6 +1,6 @@
 # Writing a launcher
 
-**Status: draft, launcher contract 1. Needs Dynoxide 1.7.0 or later.**
+**Status: launcher contract 1. Needs Dynoxide 1.7.0 or later.**
 
 This is for anyone wrapping Dynoxide for another language: an npm `start()`,
 a Composer package for PHPUnit, a pytest fixture, a JVM test helper. Each of
@@ -9,9 +9,9 @@ endpoint and stop it again, including when the test runner is killed. This
 page says how, so every wrapper gets those details right in the same way and a
 developer moving between languages sees the same behaviour.
 
-It is a draft until a published wrapper implements it and the behaviour below
-has been checked in practice. Until then the rules can still change, and
-feedback is welcome as an issue on the repository.
+The npm package's `start()` and the Composer package `nubo-db/dynoxide` for
+PHP implement it. Changes are listed at the end of this page, and feedback is
+welcome as an issue on the repository.
 `docs/versioning.md` covers what the engine itself promises.
 
 ## The short version
@@ -496,3 +496,4 @@ them on `rc.1`.
   where to export the environment, and PHP's first working SDK version. The
   export also sets `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` to `false`, which the
   first version missed: with it set to `true`, tests reached AWS.
+  No longer a draft once the npm package's `start()` implemented it.

@@ -99,36 +99,69 @@ async fn answer(url: &str, operation: &str, body: &str) -> Option<(String, Optio
 /// order with `BOOL` and `NULL` first, and stops at the first fault it reads
 /// rather than parsing the whole request before validating it. A member of the
 /// wrong JSON type in the same place has the same gap, so these wait on that.
-const ORDER_NOT_FOLLOWED: &[(&str, usize, &str)] = &[
-    ("round 1", 65, "a bad number in an attribute written first"),
+/// Each is still sent: it must still differ from DynamoDB's answer, and come
+/// back as the exception named here, which is Dynoxide's answer today.
+const ORDER_NOT_FOLLOWED: &[(&str, usize, &str, &str)] = &[
+    (
+        "round 1",
+        65,
+        "a bad number in an attribute written first",
+        "ValidationException",
+    ),
     (
         "round 1",
         66,
         "an empty value in an attribute written first",
+        "ValidationException",
     ),
     (
         "round 1",
         72,
         "a bad BOOL read ahead of the B written first",
+        "SerializationException",
     ),
-    ("round 1", 76, "ReturnValues of the wrong JSON type"),
+    (
+        "round 1",
+        76,
+        "ReturnValues of the wrong JSON type",
+        "SerializationException",
+    ),
     (
         "round 5",
         10,
         "a bad BOOL read ahead of the B written first",
+        "SerializationException",
     ),
-    ("round 5", 11, "S of the wrong JSON type written ahead of B"),
+    (
+        "round 5",
+        11,
+        "S of the wrong JSON type written ahead of B",
+        "SerializationException",
+    ),
     (
         "round 5",
         15,
         "a bad NULL read ahead of the B written first",
+        "SerializationException",
     ),
-    ("round 5", 17, "a duplicate member key"),
-    ("round 5", 18, "a duplicate member key"),
+    // The later of the two `B` members is read, and it is valid.
+    (
+        "round 5",
+        17,
+        "a duplicate member key",
+        "ResourceNotFoundException",
+    ),
+    (
+        "round 5",
+        18,
+        "a duplicate member key",
+        "SerializationException",
+    ),
     (
         "round 5",
         27,
         "map values read in key order, not as written",
+        "SerializationException",
     ),
 ];
 
@@ -136,15 +169,25 @@ async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
     let mut wrong = Vec::new();
     let mut compared = 0;
     for &(number, operation, body, kind, message) in rows {
-        if ORDER_NOT_FOLLOWED
-            .iter()
-            .any(|&(r, n, _)| r == round && n == number)
-        {
-            continue;
-        }
-        compared += 1;
         let expected = Some((kind.to_string(), message.map(str::to_string)));
         let got = answer(url, operation, body).await;
+        compared += 1;
+        if let Some(&(_, _, reason, today)) = ORDER_NOT_FOLLOWED
+            .iter()
+            .find(|&&(r, n, _, _)| r == round && n == number)
+        {
+            if got == expected {
+                wrong.push(format!(
+                    "{round} row {number} ({reason}) now answers as DynamoDB did: \
+                     drop it from ORDER_NOT_FOLLOWED"
+                ));
+            } else if got.as_ref().map(|(kind, _)| kind.as_str()) != Some(today) {
+                wrong.push(format!(
+                    "{round} row {number}: {operation} {body}\n  expected a {today}\n  got      {got:?}"
+                ));
+            }
+            continue;
+        }
         if got != expected {
             wrong.push(format!(
                 "{round} row {number}: {operation} {body}\n  expected {expected:?}\n  got      {got:?}"
@@ -289,6 +332,94 @@ async fn accepted_forms_are_stored_as_the_bytes_dynamodb_stored() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Round 3 values, each with the answer DynamoDB gave for it as a `B` on its
+/// own (captured eu-west-2, 2026-11-11). Round 1 shows a `BS` member and a
+/// `B` nested in an `L` or `M` are read and refused the same way, so the
+/// same answers are expected there.
+const ROUND_3_SAMPLE: &[(&str, Option<&str>)] = &[
+    ("!Q==", Some("")),
+    (".QQQ", Some("")),
+    ("\u{7f}QQQ", Some("")),
+    (
+        "Q(==",
+        Some("Invalid last non-pad Base64 character dectected"),
+    ),
+    (
+        "QQ~=",
+        Some("Invalid last non-pad Base64 character dectected"),
+    ),
+    ("(Q==", None),
+    ("Q~Q=", None),
+];
+
+#[tokio::test]
+async fn round_3_values_answer_the_same_in_a_set_and_a_list() {
+    let url = start_server().await;
+    let mut wrong = Vec::new();
+    for &(value, refusal) in ROUND_3_SAMPLE {
+        let expected = match refusal {
+            // An empty refusal is an exception with no message.
+            Some(message) => Some((
+                "SerializationException".to_string(),
+                Some(message.to_string()).filter(|m| !m.is_empty()),
+            )),
+            None => Some(("ResourceNotFoundException".to_string(), None)),
+        };
+        for item in [
+            serde_json::json!({"pk": {"BS": [value]}}),
+            serde_json::json!({"pk": {"L": [{"B": value}]}}),
+            serde_json::json!({"pk": {"M": {"a": {"B": value}}}}),
+        ] {
+            let body = serde_json::json!({"TableName": "Missing", "Item": item}).to_string();
+            let got = answer(&url, "PutItem", &body).await;
+            if got != expected {
+                wrong.push(format!(
+                    "{body}\n  expected {expected:?}\n  got      {got:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Lenient forms written as `BS` members and nested in an `L` and an `M` read
+/// back as the canonical base64 DynamoDB stored for each (captured eu-west-2,
+/// 2026-11-11, as `B` values; `STORED` above).
+#[tokio::test]
+async fn accepted_forms_in_sets_lists_and_maps_read_back_canonical() {
+    let url = start_server().await;
+    let put = serde_json::json!({
+        "TableName": "Tab",
+        "Item": {
+            "pk": {"S": "nested"},
+            "bs": {"BS": ["QQ", "QUI", "-QQ=", "QQQQQ-Q="]},
+            "l": {"L": [{"B": "Q=Q="}, {"B": "abcdQQ="}]},
+            "m": {"M": {"a": {"B": "-w=="}, "b": {"B": "abcdefg"}}},
+        },
+    });
+    let (status, json) = send(&url, "PutItem", &put.to_string()).await;
+    assert_eq!(status, 200, "{json}");
+    let get = serde_json::json!({"TableName": "Tab", "Key": {"pk": {"S": "nested"}}});
+    let (_, json) = send(&url, "GetItem", &get.to_string()).await;
+    let item = &json["Item"];
+    let mut set: Vec<&str> = item["bs"]["BS"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    set.sort_unstable();
+    assert_eq!(set, ["/QQ=", "QQ==", "QQQQ//Q=", "QUI="], "{item}");
+    assert_eq!(
+        item["l"],
+        serde_json::json!({"L": [{"B": "//Q="}, {"B": "abcdQQ=="}]})
+    );
+    assert_eq!(
+        item["m"],
+        serde_json::json!({"M": {"a": {"B": "/w=="}, "b": {"B": "abcdefg="}}})
+    );
 }
 
 /// Round 1: lengths, padding, alphabet, whitespace and non-ASCII; `BS`, nested values; order beside other faults; every operation that takes a value.

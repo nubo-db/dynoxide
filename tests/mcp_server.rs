@@ -5063,3 +5063,358 @@ fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
         "the dropped line should be logged on stderr, got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Arguments read as the HTTP API reads them
+// ---------------------------------------------------------------------------
+//
+// Every expectation below is the HTTP API's answer to the same request, as
+// pinned in tests/bool_and_null_values_http.rs, tests/value_layers.rs,
+// tests/partiql_member_errors_before_parameters.rs and the scan member checks.
+
+const UNEXPECTED_TOKEN: &str = "Unexpected token received from parser";
+
+/// Spawn a server holding a hash-only table called `table`.
+fn mcp_with_table(table: &str) -> std::process::Child {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": table,
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    child
+}
+
+/// The error type and message of a tool error, failing if the call succeeded.
+fn tool_error(resp: &Value) -> (String, String) {
+    assert!(is_tool_error(resp), "expected a tool error: {resp}");
+    let raw = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !raw.contains("VALIDATION") && !raw.contains("SERIALIZATION") && !raw.contains(" at line "),
+        "internal marker or serde position leaked: {raw}"
+    );
+    let content = tool_content(resp);
+    (
+        content["error_type"].as_str().unwrap().to_string(),
+        content["message"].as_str().unwrap().to_string(),
+    )
+}
+
+fn serialization_error(message: &str) -> (String, String) {
+    ("SerializationException".to_string(), message.to_string())
+}
+
+fn validation_error(message: &str) -> (String, String) {
+    ("ValidationException".to_string(), message.to_string())
+}
+
+/// What the HTTP API answers for a flag it can't read as a boolean.
+fn refused_flags() -> Vec<(Value, (String, String))> {
+    vec![
+        (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("off"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(""), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(" true"), serialization_error(UNEXPECTED_TOKEN)),
+        (
+            json!(1),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!(0),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!(1.5),
+            serialization_error("DECIMAL_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!([true]),
+            serialization_error("Unrecognized collection type class java.lang.Boolean"),
+        ),
+        (
+            json!({"a": true}),
+            serialization_error("Start of structure or map found where not expected"),
+        ),
+    ]
+}
+
+const TRUTHY: [&str; 9] = ["true", "TRUE", "True", "t", "T", "yes", "y", "Y", "1"];
+const FALSY: [&str; 10] = ["false", "FALSE", "f", "F", "no", "No", "n", "N", "0", "nO"];
+
+/// `get_item`'s `consistent_read` reads a string as GetItem's `ConsistentRead`
+/// does over HTTP: one that reads as true is a strongly consistent read,
+/// charged 1.0 for a small item, one that reads as false an eventually
+/// consistent one, charged 0.5, and anything else is refused as malformed.
+#[test]
+fn get_item_reads_consistent_read_as_the_http_api_does() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Flags", "item": {"pk": {"S": "c"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let mut id = 10;
+    let mut get = |child: &mut std::process::Child, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "get_item",
+            json!({
+                "table_name": "Flags", "key": {"pk": {"S": "c"}},
+                "consistent_read": flag, "return_consumed_capacity": "TOTAL"
+            }),
+        )
+    };
+    let mut flags: Vec<(Value, f64)> = Vec::new();
+    flags.extend(TRUTHY.iter().map(|t| (json!(t), 1.0)));
+    flags.extend(FALSY.iter().map(|t| (json!(t), 0.5)));
+    flags.extend([(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)]);
+    for (flag, units) in flags {
+        let resp = get(&mut child, flag.clone());
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["Item"]["pk"], json!({"S": "c"}), "{flag}");
+        assert_eq!(
+            content["ConsumedCapacity"]["CapacityUnits"],
+            json!(units),
+            "{flag}"
+        );
+    }
+    for (flag, refusal) in refused_flags() {
+        let resp = get(&mut child, flag.clone());
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A flag that doesn't read fails the request as it is decoded, so it is the
+/// error reported beside a `return_consumed_capacity` outside the enum, which
+/// is checked later.
+#[test]
+fn an_unreadable_flag_is_reported_ahead_of_a_bad_capacity_mode() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({
+            "table_name": "Flags", "key": {"pk": {"S": "c"}},
+            "consistent_read": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+    let resp = call_tool(
+        &mut child,
+        3,
+        "query",
+        json!({
+            "table_name": "Flags", "key_condition_expression": "pk = :p",
+            "expression_attribute_values": {":p": {"S": "c"}},
+            "scan_index_forward": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `query`'s `scan_index_forward` reads a string as Query's `ScanIndexForward`
+/// does over HTTP: one that reads as false reads the sort key descending, one
+/// that reads as true ascending, and anything else is refused as malformed.
+#[test]
+fn query_reads_scan_index_forward_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Sorted",
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [
+                {"attribute_name": "pk", "key_type": "HASH"},
+                {"attribute_name": "sk", "key_type": "RANGE"}
+            ],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "sk", "attribute_type": "N"}
+            ]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    for (id, sk) in [(2, "1"), (3, "2"), (4, "3")] {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Sorted", "item": {"pk": {"S": "p"}, "sk": {"N": sk}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+
+    let mut id = 10;
+    let mut query = |child: &mut std::process::Child, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "query",
+            json!({
+                "table_name": "Sorted", "key_condition_expression": "pk = :p",
+                "expression_attribute_values": {":p": {"S": "p"}},
+                "scan_index_forward": flag
+            }),
+        )
+    };
+    let order = |resp: &Value| -> Vec<String> {
+        tool_content(resp)["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["sk"]["N"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let mut flags: Vec<(Value, [&str; 3])> = Vec::new();
+    flags.extend(TRUTHY.iter().map(|t| (json!(t), ["1", "2", "3"])));
+    flags.extend(FALSY.iter().map(|t| (json!(t), ["3", "2", "1"])));
+    flags.extend([
+        (json!(true), ["1", "2", "3"]),
+        (json!(false), ["3", "2", "1"]),
+        (Value::Null, ["1", "2", "3"]),
+    ]);
+    for (flag, expected) in flags {
+        let resp = query(&mut child, flag.clone());
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        assert_eq!(order(&resp), expected, "{flag}");
+    }
+    for (flag, refusal) in refused_flags() {
+        let resp = query(&mut child, flag.clone());
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `ConsistentRead` inside `batch_get_item`'s `request_items` reads as
+/// BatchGetItem's does over HTTP, under either spelling. A string used to be
+/// dropped without a word, so `"true"` read eventually consistent.
+#[test]
+fn batch_get_item_reads_consistent_read_as_the_http_api_does() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Flags", "item": {"pk": {"S": "c"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let mut id = 10;
+    let mut batch = |child: &mut std::process::Child, member: &str, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "batch_get_item",
+            json!({
+                "request_items": {"Flags": {"keys": [{"pk": {"S": "c"}}], member: flag}},
+                "return_consumed_capacity": "TOTAL"
+            }),
+        )
+    };
+    for member in ["ConsistentRead", "consistent_read"] {
+        for (flag, units) in [
+            (json!("true"), 1.0),
+            (json!("Yes"), 1.0),
+            (json!("1"), 1.0),
+            (json!(true), 1.0),
+            (json!("false"), 0.5),
+            (json!("n"), 0.5),
+            (json!(false), 0.5),
+            (Value::Null, 0.5),
+        ] {
+            let resp = batch(&mut child, member, flag.clone());
+            assert!(!is_tool_error(&resp), "{member} {flag}: {resp}");
+            assert_eq!(
+                tool_content(&resp)["ConsumedCapacity"][0]["CapacityUnits"],
+                json!(units),
+                "{member} {flag}"
+            );
+        }
+        for (flag, refusal) in refused_flags() {
+            let resp = batch(&mut child, member, flag.clone());
+            assert_eq!(tool_error(&resp), refusal, "{member} {flag}");
+        }
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Strings are read but not advertised: each flag's listed schema is the
+/// boolean it has always been.
+#[test]
+fn the_flags_still_advertise_a_boolean() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let property = |tool: &str, name: &str| {
+        let tool = tools.iter().find(|t| t["name"] == tool).unwrap();
+        assert!(
+            !tool["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&json!(name))),
+            "{name} is optional"
+        );
+        tool["inputSchema"]["properties"][name].clone()
+    };
+    assert_eq!(
+        property("get_item", "consistent_read"),
+        json!({
+            "default": null,
+            "description": "Whether to use strongly consistent reads",
+            "type": ["boolean", "null"]
+        })
+    );
+    assert_eq!(
+        property("query", "scan_index_forward"),
+        json!({
+            "description": "Whether to scan forward (true, default) or backward (false) by sort key",
+            "type": ["boolean", "null"]
+        })
+    );
+    assert_eq!(
+        property("execute_partiql", "consistent_read"),
+        json!({
+            "default": null,
+            "description": "Whether to use strongly consistent reads. Does not change which rows \
+                            come back, but it doubles the rate a SELECT is charged at and it makes \
+                            a SELECT qualified by a GSI a rejection, because a GSI cannot serve one.",
+            "type": ["boolean", "null"]
+        })
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

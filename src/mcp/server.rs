@@ -321,9 +321,14 @@ pub struct GetItemParams {
     #[schemars(description = "Substitution tokens for expression attribute names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
-    #[schemars(description = "Whether to use strongly consistent reads")]
+    /// Read by [`read_flag`], so a string reads as the HTTP API reads it; the
+    /// schema still advertises a boolean.
+    #[schemars(
+        description = "Whether to use strongly consistent reads",
+        with = "Option<bool>"
+    )]
     #[serde(default)]
-    pub consistent_read: Option<bool>,
+    pub consistent_read: Option<serde_json::Value>,
 
     #[schemars(
         description = RETURN_CONSUMED_CAPACITY,
@@ -441,10 +446,12 @@ pub struct QueryParams {
     )]
     pub expression_attribute_values: Option<serde_json::Value>,
 
+    /// Read by [`read_flag`], as `consistent_read` is on `get_item`.
     #[schemars(
-        description = "Whether to scan forward (true, default) or backward (false) by sort key"
+        description = "Whether to scan forward (true, default) or backward (false) by sort key",
+        with = "Option<bool>"
     )]
-    pub scan_index_forward: Option<bool>,
+    pub scan_index_forward: Option<serde_json::Value>,
 
     #[schemars(description = "Maximum number of items to evaluate")]
     pub limit: Option<usize>,
@@ -1006,6 +1013,28 @@ fn canonicalise_member_names(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Read a request's own boolean member (`ConsistentRead`, `ScanIndexForward`)
+/// as the HTTP API reads it: JSON `true` or `false`, or a string DynamoDB reads
+/// as one, with JSON `null` leaving it unset. Anything else is refused with the
+/// `SerializationException` the HTTP API gives. The tools take these as JSON
+/// rather than as `bool` so that refusal is a tool error in DynamoDB's words,
+/// not the argument decoder's own.
+fn read_flag(value: Option<serde_json::Value>) -> Result<Option<bool>, CallToolResult> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    crate::types::deserialize_lenient_flag(value).map_err(|e| {
+        let msg = e.to_string();
+        to_tool_error(
+            crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
+                crate::errors::DynoxideError::SerializationException(
+                    crate::serde_errors::clean_serde_message(&msg).to_string(),
+                )
+            }),
+        )
+    })
+}
+
 /// Return a tool-level validation error (keeps the agent conversation flowing,
 /// unlike McpError which may abort it).
 fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
@@ -1447,6 +1476,12 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetItemParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Over HTTP a flag that doesn't read fails the request as it is
+        // decoded, before the capacity mode is checked.
+        let consistent_read = match read_flag(params.consistent_read) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
@@ -1464,7 +1499,7 @@ impl McpServer {
             key,
             projection_expression: params.projection_expression,
             expression_attribute_names: params.expression_attribute_names,
-            consistent_read: params.consistent_read,
+            consistent_read,
             return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
@@ -1608,6 +1643,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Read ahead of the capacity mode, as on `get_item`.
+        let scan_index_forward = match read_flag(params.scan_index_forward) {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
@@ -1635,7 +1675,7 @@ impl McpServer {
             projection_expression: params.projection_expression,
             expression_attribute_names: params.expression_attribute_names,
             expression_attribute_values,
-            scan_index_forward: params.scan_index_forward.unwrap_or(true),
+            scan_index_forward: scan_index_forward.unwrap_or(true),
             limit: self.apply_item_limit(params.limit),
             exclusive_start_key,
             index_name: params.index_name,
@@ -2710,10 +2750,12 @@ fn parse_batch_get_request_items(
             .or_else(|| attrs.get("expression_attribute_names"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        let consistent_read = attrs
-            .get("ConsistentRead")
-            .or_else(|| attrs.get("consistent_read"))
-            .and_then(|v| v.as_bool());
+        let consistent_read = read_flag(
+            attrs
+                .get("ConsistentRead")
+                .or_else(|| attrs.get("consistent_read"))
+                .cloned(),
+        )?;
 
         result.insert(
             table_name.clone(),

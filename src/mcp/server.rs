@@ -3300,6 +3300,9 @@ mod tool_operation_tests {
                 ValueLayer::Current
             };
             assert_eq!(layer, Some(expected), "{tool}");
+            // And the layer a call to the tool is dispatched on, given
+            // arguments that don't move it to the older layer.
+            assert_eq!(tool_value_layer(tool, None), expected, "{tool} dispatch");
         }
     }
 }

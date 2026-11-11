@@ -5295,6 +5295,15 @@ fn batch_get_item_reports_a_bad_capacity_mode_where_batch_get_item_does() {
             json!({"Flags": {"Keys": [{"pk": {"BOOL": "no"}}]}}),
             enveloped(bogus),
         ),
+        (
+            json!({"Flags": {"Keys": (0..101)
+                .map(|i| json!({"pk": {"S": i.to_string()}}))
+                .collect::<Vec<_>>()}}),
+            enveloped(
+                "Value at 'RequestItems.Flags.member.Keys' failed to satisfy constraint: Member \
+                 must have length less than or equal to 100",
+            ),
+        ),
     ];
     let checked = cases.len();
     let mut mismatches = Vec::new();
@@ -5913,6 +5922,22 @@ fn scan_segments_answer_as_the_http_api_does() {
         // A limit past what a 32-bit integer holds is read as the largest one,
         // which moves a segment's refusal to the older wording too, whether
         // or not the segment itself is past 32 bits.
+        // With no segment, the limit's own read leaves an enum refusal as it
+        // is worded on either layer.
+        (
+            json!({"limit": 3_000_000_000_u64, "return_consumed_capacity": "BOGUS"}),
+            one(
+                "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+            ),
+        ),
+        (
+            json!({"limit": 3_000_000_000_u64, "select": "BOGUS"}),
+            one(
+                "Value 'BOGUS' at 'select' failed to satisfy constraint: Member must satisfy enum \
+                 value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
+            ),
+        ),
         (
             json!({"total_segments": 0, "limit": 3_000_000_000_u64}),
             one(
@@ -5947,15 +5972,35 @@ fn scan_segments_answer_as_the_http_api_does() {
     );
     assert!(!is_tool_error(&resp), "{resp}");
     assert_eq!(tool_content(&resp)["Count"], json!(0));
-    // And so does a limit past 32 bits with no segments.
+    // And so does a limit past 32 bits with no segments, which reads every
+    // item rather than stopping short.
+    for (id, pk) in (3..).zip(["a", "b", "c"]) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Segments", "item": {"pk": {"S": pk}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
     let resp = call_tool(
         &mut child,
-        3,
+        6,
         "scan",
         json!({"table_name": "Segments", "limit": 3_000_000_000_u64}),
     );
     assert!(!is_tool_error(&resp), "{resp}");
-    assert_eq!(tool_content(&resp)["Count"], json!(0));
+    let content = tool_content(&resp);
+    assert_eq!(content["Count"], json!(3), "{content}");
+    let mut keys: Vec<&str> = content["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["pk"]["S"].as_str().unwrap())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["a", "b", "c"]);
+    assert!(content.get("LastEvaluatedKey").is_none(), "{content}");
 
     drop(child.stdin.take());
     let _ = child.wait();

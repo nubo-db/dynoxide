@@ -6525,9 +6525,12 @@ fn differences(
     differ
 }
 
+/// One request member: (tool argument, wire member, value).
+type Member<'a> = (&'a str, &'a str, Value);
+
 /// A tool's arguments and the HTTP body for the same request, from pairs of
 /// (tool argument, wire member, value).
-fn same_request(members: &[(&str, &str, Value)]) -> (Value, Value) {
+fn same_request(members: &[Member]) -> (Value, Value) {
     let mut args = json!({});
     let mut body = json!({});
     for (arg, member, value) in members {
@@ -6564,7 +6567,7 @@ fn query_and_scan_answer_as_the_http_api_does() {
         "ReturnConsumedCapacity",
         json!("BOGUS"),
     );
-    let mut requests: Vec<(&str, Vec<(&str, &str, Value)>)> = Vec::new();
+    let mut requests: Vec<(&str, Vec<Member>)> = Vec::new();
     let numbers = [
         json!(-1),
         json!(0),
@@ -6711,7 +6714,7 @@ fn the_other_numeric_arguments_answer_as_the_http_api_does() {
             ("top_k", "TopK", n),
         ]
     };
-    let mut requests: Vec<(&str, &str, Vec<(&str, &str, Value)>)> = Vec::new();
+    let mut requests: Vec<(&str, &str, Vec<Member>)> = Vec::new();
     // A TopK that is not a 32-bit integer and a negative stream limit are
     // answered with serde's text and its position, which the HTTP API passes
     // through; they are checked on their own below.
@@ -6889,7 +6892,7 @@ fn item_tools_check_their_members_as_the_http_api_does() {
         json!("X"),
     );
     let fine = json!({"S": "a"});
-    let mut requests: Vec<(&str, &str, Vec<(&str, &str, Value)>)> = Vec::new();
+    let mut requests: Vec<(&str, &str, Vec<Member>)> = Vec::new();
     // Values refused beside a bad mode.
     for bad in [
         json!({"N": "abc"}),

@@ -1102,8 +1102,9 @@ async fn every_captured_body_is_answered_as_dynamodb_answers_it() {
         let matches = if expected.is_empty() {
             status == 200
         } else {
-            serde_json::from_str::<Value>(&got).ok()
-                == Some(serde_json::from_str::<Value>(expected).unwrap())
+            status == 400
+                && serde_json::from_str::<Value>(&got).ok()
+                    == Some(serde_json::from_str::<Value>(expected).unwrap())
         };
         if !matches {
             wrong.push(format!(

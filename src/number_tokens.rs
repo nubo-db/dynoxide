@@ -769,12 +769,23 @@ mod tests {
     }
 
     #[test]
+    fn an_escaped_quote_does_not_end_the_string_whose_escapes_are_read() {
+        // The first string holds an escaped quote before the escaped digits,
+        // and the second string's escapes must still be read after it.
+        let b = '\\';
+        let body =
+            format!(r#"{{"T":"a{b}"731000000{b}u0031","U":"{b}"731000000{b}u0032","A":01}}"#);
+        let (out, _) = replaced(&body);
+        assert!(out.ends_with(r#""A":-7310000003}"#), "{out}");
+    }
+
+    #[test]
     fn a_body_holding_many_candidates_still_gets_unique_absent_stand_ins() {
         let taken = 3000;
         let strings: Vec<String> = (0..taken)
             .map(|n| format!("\"{}\"", FIRST_STAND_IN + n))
             .collect();
-        let tokens = vec!["01"; 3000];
+        let tokens = vec!["01"; taken as usize];
         let body = format!(
             r#"{{"S":[{}],"A":[{}]}}"#,
             strings.join(","),

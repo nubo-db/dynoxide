@@ -3218,6 +3218,89 @@ mod tool_operation_tests {
             assert!(tools.iter().any(|t| t == name), "{name} isn't listed");
             assert_eq!(tool_operation(name), None, "{name} has an operation");
         }
+        for (tool, _) in OPERATIONS {
+            assert!(tools.iter().any(|t| t == tool), "{tool} isn't listed");
+        }
+        assert_eq!(
+            tools.len(),
+            OPERATIONS.len() + WITHOUT_AN_OPERATION.len(),
+            "a listed tool is in neither table"
+        );
+    }
+
+    /// Each tool's operation, spelt as `ValueLayer::for_operation` and the
+    /// HTTP dispatch spell it. A misspelt name would read on the current layer
+    /// without a word, so the whole map is pinned.
+    const OPERATIONS: [(&str, &str); 28] = [
+        ("list_tables", "ListTables"),
+        ("describe_table", "DescribeTable"),
+        ("create_table", "CreateTable"),
+        ("delete_table", "DeleteTable"),
+        ("update_table", "UpdateTable"),
+        ("put_item", "PutItem"),
+        ("get_item", "GetItem"),
+        ("update_item", "UpdateItem"),
+        ("delete_item", "DeleteItem"),
+        ("search_vectors", "SearchVectors"),
+        ("query", "Query"),
+        ("scan", "Scan"),
+        ("batch_write_item", "BatchWriteItem"),
+        ("batch_get_item", "BatchGetItem"),
+        ("transact_write_items", "TransactWriteItems"),
+        ("transact_get_items", "TransactGetItems"),
+        ("execute_partiql", "ExecuteStatement"),
+        ("batch_execute_partiql", "BatchExecuteStatement"),
+        ("execute_transaction_partiql", "ExecuteTransaction"),
+        ("update_time_to_live", "UpdateTimeToLive"),
+        ("describe_time_to_live", "DescribeTimeToLive"),
+        ("tag_resource", "TagResource"),
+        ("untag_resource", "UntagResource"),
+        ("list_tags_of_resource", "ListTagsOfResource"),
+        ("list_streams", "ListStreams"),
+        ("describe_stream", "DescribeStream"),
+        ("get_shard_iterator", "GetShardIterator"),
+        ("get_records", "GetRecords"),
+    ];
+
+    /// The tools whose operation reads values on the older layer.
+    const ON_THE_OLDER_LAYER: [&str; 6] = [
+        "batch_write_item",
+        "transact_write_items",
+        "transact_get_items",
+        "execute_partiql",
+        "batch_execute_partiql",
+        "execute_transaction_partiql",
+    ];
+
+    #[test]
+    fn each_tool_maps_to_its_operation() {
+        let wrong: Vec<String> = OPERATIONS
+            .iter()
+            .filter(|(tool, operation)| tool_operation(tool) != Some(*operation))
+            .map(|(tool, operation)| {
+                format!("{tool}: {:?}, expected {operation}", tool_operation(tool))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{} of {} tools map wrongly: {wrong:?}",
+            wrong.len(),
+            OPERATIONS.len()
+        );
+    }
+
+    #[test]
+    fn the_batch_transaction_and_partiql_tools_read_on_the_older_layer() {
+        use crate::validation::ValueLayer;
+        for (tool, _) in OPERATIONS {
+            let layer = tool_operation(tool).map(ValueLayer::for_operation);
+            let expected = if ON_THE_OLDER_LAYER.contains(&tool) {
+                ValueLayer::Older
+            } else {
+                ValueLayer::Current
+            };
+            assert_eq!(layer, Some(expected), "{tool}");
+        }
     }
 }
 

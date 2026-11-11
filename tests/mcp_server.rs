@@ -5705,6 +5705,11 @@ fn other_tools_read_values_on_their_operations_layer() {
                      supported range";
     let tiny = json!({"N": "1e2147483647"});
     let select = "SELECT * FROM \"Layers\" WHERE pk = ?";
+    // The batch_write_item, transact_write_items Put and transact_get_items
+    // cases read on the older layer only through the tool's entry in the
+    // operation map. The transact_write_items Update case and the three
+    // PartiQL cases get the same answer without it, from the actions
+    // themselves, so they pin the tool's answer whatever the map says.
     let older: Vec<(&str, Value, (String, String))> = vec![
         (
             "batch_write_item",

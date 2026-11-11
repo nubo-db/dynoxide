@@ -99,50 +99,70 @@ async fn answer(url: &str, operation: &str, body: &str) -> Option<(String, Optio
 /// order with `BOOL` and `NULL` first, and stops at the first fault it reads
 /// rather than parsing the whole request before validating it. A member of the
 /// wrong JSON type in the same place has the same gap, so these wait on that.
-/// Each is still sent: it must still differ from DynamoDB's answer, and come
-/// back as the exception named here, which is Dynoxide's answer today.
-const ORDER_NOT_FOLLOWED: &[(&str, usize, &str, &str)] = &[
+/// Each is still sent: it must still differ from DynamoDB's answer, and give
+/// the answer recorded here, which is Dynoxide's answer today (the exception,
+/// and its message or `None` for none).
+type Excepted = (
+    &'static str,
+    usize,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+);
+
+const ORDER_NOT_FOLLOWED: &[Excepted] = &[
     (
         "round 1",
         65,
         "a bad number in an attribute written first",
         "ValidationException",
+        Some(
+            "1 validation error detected: The parameter cannot be converted to a numeric value: abc",
+        ),
     ),
     (
         "round 1",
         66,
         "an empty value in an attribute written first",
         "ValidationException",
+        Some(
+            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+        ),
     ),
     (
         "round 1",
         72,
         "a bad BOOL read ahead of the B written first",
         "SerializationException",
+        Some("Unexpected token received from parser"),
     ),
     (
         "round 1",
         76,
         "ReturnValues of the wrong JSON type",
         "SerializationException",
+        Some("NUMBER_VALUE cannot be converted to String"),
     ),
     (
         "round 5",
         10,
         "a bad BOOL read ahead of the B written first",
         "SerializationException",
+        Some("Unexpected token received from parser"),
     ),
     (
         "round 5",
         11,
         "S of the wrong JSON type written ahead of B",
         "SerializationException",
+        Some("Base64 encoded length is expected a multiple of 4 bytes but found: 2"),
     ),
     (
         "round 5",
         15,
         "a bad NULL read ahead of the B written first",
         "SerializationException",
+        Some("Unexpected token received from parser"),
     ),
     // The later of the two `B` members is read, and it is valid.
     (
@@ -150,40 +170,46 @@ const ORDER_NOT_FOLLOWED: &[(&str, usize, &str, &str)] = &[
         17,
         "a duplicate member key",
         "ResourceNotFoundException",
+        None,
     ),
     (
         "round 5",
         18,
         "a duplicate member key",
         "SerializationException",
+        Some("Base64 encoded length is expected a multiple of 4 bytes but found: 2"),
     ),
     (
         "round 5",
         27,
         "map values read in key order, not as written",
         "SerializationException",
+        Some("NUMBER_VALUE cannot be converted to String"),
     ),
 ];
 
 async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
     let mut wrong = Vec::new();
     let mut compared = 0;
+    let mut excepted_met = 0;
     for &(number, operation, body, kind, message) in rows {
         let expected = Some((kind.to_string(), message.map(str::to_string)));
         let got = answer(url, operation, body).await;
         compared += 1;
-        if let Some(&(_, _, reason, today)) = ORDER_NOT_FOLLOWED
+        if let Some(&(_, _, reason, today_kind, today_message)) = ORDER_NOT_FOLLOWED
             .iter()
-            .find(|&&(r, n, _, _)| r == round && n == number)
+            .find(|&&(r, n, _, _, _)| r == round && n == number)
         {
+            excepted_met += 1;
+            let today = Some((today_kind.to_string(), today_message.map(str::to_string)));
             if got == expected {
                 wrong.push(format!(
                     "{round} row {number} ({reason}) now answers as DynamoDB did: \
                      drop it from ORDER_NOT_FOLLOWED"
                 ));
-            } else if got.as_ref().map(|(kind, _)| kind.as_str()) != Some(today) {
+            } else if got != today {
                 wrong.push(format!(
-                    "{round} row {number}: {operation} {body}\n  expected a {today}\n  got      {got:?}"
+                    "{round} row {number}: {operation} {body}\n  expected {today:?}\n  got      {got:?}"
                 ));
             }
             continue;
@@ -195,6 +221,14 @@ async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
         }
     }
     assert!(compared > 0);
+    let excepted_listed = ORDER_NOT_FOLLOWED
+        .iter()
+        .filter(|&&(r, _, _, _, _)| r == round)
+        .count();
+    assert_eq!(
+        excepted_met, excepted_listed,
+        "ORDER_NOT_FOLLOWED lists {excepted_listed} {round} rows but {excepted_met} are in the round"
+    );
     assert!(
         wrong.is_empty(),
         "{} of {compared} rows differ:\n{}",

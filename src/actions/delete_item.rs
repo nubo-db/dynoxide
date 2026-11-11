@@ -88,8 +88,13 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
         let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
         let table_name = raw.table_name.unwrap_or_default();
 
-        // Key constraint
+        // A missing key hands the request to the older layer, which lists a
+        // ConditionalOperator outside its enum just ahead of the key, as
+        // UpdateItem does (captured eu-west-2 and us-east-1, 2026-11-11).
         if raw.key.is_none() {
+            errors.extend(crate::validation::conditional_operator_rejection(
+                raw.conditional_operator.as_deref(),
+            ));
             errors.push(
                 "Value null at 'key' failed to satisfy constraint: \
                  Member must not be null"
@@ -267,7 +272,7 @@ async fn execute_inner<S: StorageBackend>(
         crate::validation::legacy_condition_count(request.expected.as_ref()),
     ) {
         return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(msg),
+            crate::validation::envelope_message(&msg),
         ));
     }
 

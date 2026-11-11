@@ -134,9 +134,10 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         //
         // With no TableName at all, the request goes to the older layer, which
         // reports every member error together: Select, ReturnConsumedCapacity,
-        // the missing name, then a Limit below 1 with its value echoed and the
-        // member spelled 'limit', as Scan does (captured eu-west-2 and
-        // us-east-1, 2026-10-09 and 2026-10-20).
+        // the missing name, a ConditionalOperator outside its enum whatever
+        // the number of filter conditions, then a Limit below 1 with its value
+        // echoed and the member spelled 'limit', as Scan does (captured
+        // eu-west-2 and us-east-1, 2026-10-09, 2026-10-20 and 2026-11-11).
         //
         // A Limit that saturated or lost a fraction as it was read (see
         // `helpers::Int32`) is checked by the older layer the same way: the
@@ -157,6 +158,9 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
                     crate::validation::TableNameContext::ReadWrite,
                 ));
             }
+            errors.extend(crate::validation::conditional_operator_rejection(
+                raw.conditional_operator.as_deref(),
+            ));
             // The missing operators' place is inferred from Scan's.
             errors.extend(helpers::missing_comparison_operators(
                 raw.key_conditions.as_ref(),
@@ -323,7 +327,11 @@ pub async fn execute<S: StorageBackend>(
         if request.conditional_operator.is_some() {
             non_expr.push("ConditionalOperator");
         }
-        if request.key_conditions.is_some()
+        // KeyConditions conflicts only with KeyConditionExpression: beside a
+        // FilterExpression or a ProjectionExpression alone DynamoDB runs the
+        // query, and the mixing message leaves it out (captured eu-west-2 and
+        // us-east-1, 2026-11-11).
+        if request.key_condition_expression.is_some()
             && request
                 .key_conditions
                 .as_ref()
@@ -360,7 +368,7 @@ pub async fn execute<S: StorageBackend>(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.query_filter.as_ref()),
     ) {
-        return Err(DynoxideError::ValidationException(msg.to_string()));
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     // ---- Select, after the mixing check (captured 2026-10-09) ----

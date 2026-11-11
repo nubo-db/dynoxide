@@ -406,7 +406,7 @@ pub async fn execute<S: StorageBackend>(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.scan_filter.as_ref()),
     ) {
-        return Err(DynoxideError::ValidationException(msg.to_string()));
+        return Err(DynoxideError::ValidationException(msg));
     }
     // ---- A ScanFilter value nested too deep is refused first ----
     crate::value_nesting::check_scan_filter(request.scan_filter.as_ref())?;

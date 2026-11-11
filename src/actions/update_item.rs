@@ -388,7 +388,7 @@ async fn execute_inner<S: StorageBackend>(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.expected.as_ref()),
     ) {
-        return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
+        return Err(DynoxideError::EnvelopedValidation(msg));
     }
     // A key, AttributeUpdates value or Expected value nested too deep is
     // refused, inside the envelope, before the key is matched to the schema or

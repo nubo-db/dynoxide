@@ -52,6 +52,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `ConditionalOperator` other than `AND` or `OR` is refused in the words
+  DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
+  constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has
+  changed this message since October, when it named neither the value nor
+  the member and listed `[ALL, OR]`, and the Parity Suite's Query ordering
+  test caught the difference. Lower case and the empty string are refused the
+  same way on Query, Scan, PutItem, UpdateItem and DeleteItem. With no table
+  name, a Query now lists the operator beside the missing name, as Scan
+  already did, and so does a PutItem; a DeleteItem with no key lists it ahead
+  of the key, as UpdateItem does. `KeyConditions` now conflicts only with
+  `KeyConditionExpression`, so a Query that pairs it with a `FilterExpression`
+  or a `ProjectionExpression` runs, where it used to be refused, and the
+  mixing message no longer names it beside a `FilterExpression`
+  ([#319](https://github.com/nubo-db/dynoxide/issues/319)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages
   (`Buffer is too short for base64 encoding` for one character, `Base64

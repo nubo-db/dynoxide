@@ -395,8 +395,11 @@ pub struct SearchVectorsParams {
     )]
     pub search_vector: serde_json::Value,
 
-    #[schemars(description = "How many nearest entries to return.")]
-    pub top_k: i64,
+    /// Passed to SearchVectors' own decoder as given, so a fraction or a value
+    /// past 32 bits is refused as the HTTP API refuses it; the schema still
+    /// advertises the integer it always has.
+    #[schemars(description = "How many nearest entries to return.", with = "i64")]
+    pub top_k: serde_json::Value,
 
     #[schemars(
         description = "Optional equality conditions over the index's SearchSchema attributes, e.g. \"tenant = :t\". Equality only, one condition per attribute, and mandatory when the schema declares a HASH element."
@@ -629,10 +632,13 @@ pub struct ExecutePartiqlParams {
     #[serde(default)]
     pub consistent_read: Option<serde_json::Value>,
 
+    /// Passed to ExecuteStatement's own decoder as given, as `limit` is on
+    /// `query`; the schema still advertises an unsigned integer.
     #[schemars(
-        description = "Maximum number of items to evaluate for SELECT statements (not necessarily the number returned); a filtered page can come back short or empty and still carry a NextToken"
+        description = "Maximum number of items to evaluate for SELECT statements (not necessarily the number returned); a filtered page can come back short or empty and still carry a NextToken",
+        with = "Option<usize>"
     )]
-    pub limit: Option<usize>,
+    pub limit: Option<serde_json::Value>,
 
     #[schemars(
         description = "Continuation token from a previous SELECT response, to fetch the next page. Pass back the NextToken the last call returned; its absence means there are no more pages. The statement must stay identical character for character across pages, and so must the parameters; a token replayed with any difference is rejected with a ValidationException. A statement with a list or map parameter cannot be paged past its first page, as on DynamoDB."
@@ -811,8 +817,13 @@ pub struct ListStreamsParams {
     #[schemars(description = "Filter streams by table name")]
     pub table_name: Option<String>,
 
-    #[schemars(description = "Maximum number of streams to return")]
-    pub limit: Option<usize>,
+    /// Passed to the operation's own decoder as given, as the HTTP API reads
+    /// it; the schema still advertises an unsigned integer.
+    #[schemars(
+        description = "Maximum number of streams to return",
+        with = "Option<usize>"
+    )]
+    pub limit: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -820,8 +831,13 @@ pub struct DescribeStreamParams {
     #[schemars(description = "ARN of the stream to describe")]
     pub stream_arn: String,
 
-    #[schemars(description = "Maximum number of shards to return")]
-    pub limit: Option<usize>,
+    /// Passed to the operation's own decoder as given, as the HTTP API reads
+    /// it; the schema still advertises an unsigned integer.
+    #[schemars(
+        description = "Maximum number of shards to return",
+        with = "Option<usize>"
+    )]
+    pub limit: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -848,8 +864,13 @@ pub struct GetRecordsParams {
     #[schemars(description = "Shard iterator from get_shard_iterator")]
     pub shard_iterator: String,
 
-    #[schemars(description = "Maximum number of records to return")]
-    pub limit: Option<usize>,
+    /// Passed to the operation's own decoder as given, as the HTTP API reads
+    /// it; the schema still advertises an unsigned integer.
+    #[schemars(
+        description = "Maximum number of records to return",
+        with = "Option<usize>"
+    )]
+    pub limit: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1652,66 +1673,43 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchVectorsParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
-        let expression_attribute_values = match parse_optional_dynamo_map(
-            params.expression_attribute_values,
-            "expression_attribute_values",
-            crate::validation::strip_request_validation_tag,
-        ) {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-
-        // Built as wire JSON and deserialised through the request's own
-        // `Deserialize`, rather than assembled field by field. That is where
-        // the `topK`, `SearchVector` and `IndexName` bounds live, so building
-        // the struct directly skipped every one of them and answered an agent
-        // with the operation-layer message where a wire client gets the
-        // enveloped member-path constraint. The values go across as given; only
-        // the member names change, because these params are snake_case.
-        let mut wire = serde_json::json!({
-            "TableName": params.table_name,
-            "IndexName": params.index_name,
-            "SearchVector": params.search_vector,
-            "TopK": params.top_k,
-        });
-        let optional: [(&str, Option<serde_json::Value>); 5] = [
-            (
-                "SearchConditionExpression",
-                params
-                    .search_condition_expression
-                    .map(serde_json::Value::from),
-            ),
-            (
-                "ProjectionExpression",
-                params.projection_expression.map(serde_json::Value::from),
-            ),
-            (
-                "ExpressionAttributeNames",
-                params
-                    .expression_attribute_names
-                    .and_then(|v| serde_json::to_value(v).ok()),
-            ),
-            (
-                "ExpressionAttributeValues",
-                expression_attribute_values.and_then(|v| serde_json::to_value(v).ok()),
-            ),
-            (
-                "ReturnConsumedCapacity",
-                params.return_consumed_capacity.map(serde_json::Value::from),
-            ),
-        ];
-        for (name, value) in optional {
-            if let Some(value) = value {
-                wire[name] = value;
-            }
-        }
+        // Decoded as SearchVectors' wire request, by the HTTP seam's own
+        // decoder, rather than assembled field by field. That is where the
+        // `TopK`, `SearchVector` and `IndexName` bounds, the strict reading of
+        // the expression values and the capacity mode's place among the
+        // member checks live, so the tool answers as the HTTP API does.
         let request: crate::actions::search_vectors::SearchVectorsRequest =
-            match parse_json_param(wire, "search_request") {
-                Ok(r) => r,
-                Err(e) => return Ok(e),
+            match decode_wire_request(
+                "SearchVectors",
+                vec![
+                    ("TableName", Some(params.table_name.into())),
+                    ("IndexName", Some(params.index_name.into())),
+                    ("SearchVector", Some(params.search_vector)),
+                    ("TopK", Some(params.top_k)),
+                    (
+                        "SearchConditionExpression",
+                        string_member(params.search_condition_expression),
+                    ),
+                    (
+                        "ProjectionExpression",
+                        string_member(params.projection_expression),
+                    ),
+                    (
+                        "ExpressionAttributeNames",
+                        names_member(params.expression_attribute_names),
+                    ),
+                    (
+                        "ExpressionAttributeValues",
+                        params.expression_attribute_values,
+                    ),
+                    (
+                        "ReturnConsumedCapacity",
+                        string_member(params.return_consumed_capacity),
+                    ),
+                ],
+            ) {
+                Ok(request) => request,
+                Err(err) => return Ok(err),
             };
         match self.db.search_vectors(request) {
             Ok(resp) => {
@@ -1962,40 +1960,27 @@ impl McpServer {
         // the member errors (a bad ReturnConsumedCapacity among them), then a
         // parameter refused for its value. Only the member names change,
         // because these params are snake_case.
-        let mut wire = serde_json::Map::new();
-        wire.insert(
-            "Statement".to_string(),
-            serde_json::Value::from(params.statement),
-        );
-        let optional: [(&str, Option<serde_json::Value>); 6] = [
-            ("Parameters", params.parameters),
-            ("Limit", params.limit.map(serde_json::Value::from)),
-            ("NextToken", params.next_token.map(serde_json::Value::from)),
-            ("ConsistentRead", params.consistent_read),
-            (
-                "ReturnConsumedCapacity",
-                params.return_consumed_capacity.map(serde_json::Value::from),
-            ),
-            (
-                "ReturnValuesOnConditionCheckFailure",
-                params
-                    .return_values_on_condition_check_failure
-                    .map(serde_json::Value::from),
-            ),
-        ];
-        for (name, value) in optional {
-            if let Some(value) = value {
-                wire.insert(name.to_string(), value);
-            }
-        }
         let request: crate::actions::execute_statement::ExecuteStatementRequest =
-            match crate::serde_errors::deserialize(&serde_json::Value::Object(wire).to_string()) {
+            match decode_wire_request(
+                "ExecuteStatement",
+                vec![
+                    ("Statement", Some(params.statement.into())),
+                    ("Parameters", params.parameters),
+                    ("Limit", params.limit),
+                    ("NextToken", string_member(params.next_token)),
+                    ("ConsistentRead", params.consistent_read),
+                    (
+                        "ReturnConsumedCapacity",
+                        string_member(params.return_consumed_capacity),
+                    ),
+                    (
+                        "ReturnValuesOnConditionCheckFailure",
+                        string_member(params.return_values_on_condition_check_failure),
+                    ),
+                ],
+            ) {
                 Ok(request) => request,
-                Err(err) => {
-                    return Ok(to_tool_error(
-                        crate::validation::strip_request_validation_tag(err),
-                    ));
-                }
+                Err(err) => return Ok(err),
             };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),
@@ -2553,10 +2538,17 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<ListStreamsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let request = crate::actions::list_streams::ListStreamsRequest {
-            table_name: params.table_name,
-            limit: params.limit,
-            ..Default::default()
+        // Decoded as ListStreams' wire request, so `limit` is read as the
+        // HTTP API reads it.
+        let request: crate::actions::list_streams::ListStreamsRequest = match decode_wire_request(
+            "ListStreams",
+            vec![
+                ("TableName", string_member(params.table_name)),
+                ("Limit", params.limit),
+            ],
+        ) {
+            Ok(request) => request,
+            Err(err) => return Ok(err),
         };
         match self.db.list_streams(request) {
             Ok(resp) => json_result(&resp),
@@ -2569,11 +2561,18 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<DescribeStreamParams>,
     ) -> Result<CallToolResult, McpError> {
-        let request = crate::actions::describe_stream::DescribeStreamRequest {
-            stream_arn: params.stream_arn,
-            limit: params.limit,
-            ..Default::default()
-        };
+        // Decoded as DescribeStream's wire request, as on `list_streams`.
+        let request: crate::actions::describe_stream::DescribeStreamRequest =
+            match decode_wire_request(
+                "DescribeStream",
+                vec![
+                    ("StreamArn", Some(params.stream_arn.into())),
+                    ("Limit", params.limit),
+                ],
+            ) {
+                Ok(request) => request,
+                Err(err) => return Ok(err),
+            };
         match self.db.describe_stream(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),
@@ -2604,9 +2603,16 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetRecordsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let request = crate::actions::get_records::GetRecordsRequest {
-            shard_iterator: params.shard_iterator,
-            limit: params.limit,
+        // Decoded as GetRecords' wire request, as on `list_streams`.
+        let request: crate::actions::get_records::GetRecordsRequest = match decode_wire_request(
+            "GetRecords",
+            vec![
+                ("ShardIterator", Some(params.shard_iterator.into())),
+                ("Limit", params.limit),
+            ],
+        ) {
+            Ok(request) => request,
+            Err(err) => return Ok(err),
         };
         match self.db.get_records(request) {
             Ok(resp) => json_result(&resp),

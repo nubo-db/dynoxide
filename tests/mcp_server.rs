@@ -6692,3 +6692,157 @@ fn query_and_scan_answer_as_the_http_api_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// `limit` on `execute_partiql` and the stream tools, and `top_k` on
+/// `search_vectors`, are read as the HTTP operation reads the same member, so
+/// a negative, a fraction, a value past 32 bits or a string gets the HTTP
+/// API's answer. The searches and stream reads name nothing that exists, so
+/// a value the request reads reaches the same lookup on both surfaces.
+#[test]
+fn the_other_numeric_arguments_answer_as_the_http_api_does() {
+    let (mut child, http) = both_with_items("Counted", &[json!({"pk": {"S": "a"}})]);
+    let select = json!("SELECT * FROM \"Counted\"");
+    let arn = json!("arn:aws:dynamodb:dynoxide:000000000000:table/Gone/stream/1.0");
+    let search = |n: Value| {
+        vec![
+            ("table_name", "TableName", json!("Gone")),
+            ("index_name", "IndexName", json!("vix")),
+            ("search_vector", "SearchVector", json!([{"N": "1"}])),
+            ("top_k", "TopK", n),
+        ]
+    };
+    let mut requests: Vec<(&str, &str, Vec<(&str, &str, Value)>)> = Vec::new();
+    // A TopK that is not a 32-bit integer and a negative stream limit are
+    // answered with serde's text and its position, which the HTTP API passes
+    // through; they are checked on their own below.
+    for n in [
+        json!(-1),
+        json!(0),
+        json!(1),
+        json!(1.5),
+        json!(3_000_000_000_u64),
+        json!(1e20),
+        json!("5"),
+    ] {
+        requests.push((
+            "execute_partiql",
+            "ExecuteStatement",
+            vec![
+                ("statement", "Statement", select.clone()),
+                ("limit", "Limit", n.clone()),
+            ],
+        ));
+        if [json!(-1), json!(0), json!(1)].contains(&n) {
+            requests.push(("search_vectors", "SearchVectors", search(n.clone())));
+        }
+        if n != json!(-1) {
+            requests.push((
+                "list_streams",
+                "ListStreams",
+                vec![("limit", "Limit", n.clone())],
+            ));
+            requests.push((
+                "describe_stream",
+                "DescribeStream",
+                vec![
+                    ("stream_arn", "StreamArn", arn.clone()),
+                    ("limit", "Limit", n.clone()),
+                ],
+            ));
+            requests.push((
+                "get_records",
+                "GetRecords",
+                vec![
+                    ("shard_iterator", "ShardIterator", json!("nothing")),
+                    ("limit", "Limit", n.clone()),
+                ],
+            ));
+        }
+    }
+    // SearchVectors checks the capacity mode among its member checks, and
+    // reads expression values strictly.
+    let mut with_mode = search(json!(0));
+    with_mode.push((
+        "return_consumed_capacity",
+        "ReturnConsumedCapacity",
+        json!("BOGUS"),
+    ));
+    requests.push(("search_vectors", "SearchVectors", with_mode));
+    let mut with_mode = search(json!(5));
+    with_mode.push((
+        "return_consumed_capacity",
+        "ReturnConsumedCapacity",
+        json!("BOGUS"),
+    ));
+    requests.push(("search_vectors", "SearchVectors", with_mode));
+    let with_value = |value: Value| {
+        let mut members = search(json!(5));
+        members.push((
+            "search_condition_expression",
+            "SearchConditionExpression",
+            json!("t = :t"),
+        ));
+        members.push((
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":t": value}),
+        ));
+        members
+    };
+    for value in [json!({"N": "abc"}), json!({"S": "a", "N": "1"})] {
+        requests.push(("search_vectors", "SearchVectors", with_value(value)));
+    }
+    let checked = requests.len();
+    let cases = requests
+        .into_iter()
+        .map(|(tool, operation, members)| {
+            let (args, body) = same_request(&members);
+            (tool, args, operation, body)
+        })
+        .collect();
+    let differ = differences(&mut child, &http, cases);
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    // The answers that carry serde's position: the same text on both
+    // surfaces, the request being written the same way.
+    let raw = |resp: &Value| -> Value {
+        assert!(is_tool_error(resp), "expected a tool error: {resp}");
+        let content = tool_content(resp);
+        json!([content["error_type"], content["message"]])
+    };
+    let mut id = 2000;
+    let mut positioned = vec![(
+        "list_streams",
+        "ListStreams",
+        vec![("limit", "Limit", json!(-1))],
+    )];
+    for n in [
+        json!(1.5),
+        json!(3_000_000_000_u64),
+        json!(1e20),
+        json!("5"),
+    ] {
+        positioned.push(("search_vectors", "SearchVectors", search(n)));
+    }
+    for value in [json!({"S": null}), json!({"X": "a"})] {
+        positioned.push(("search_vectors", "SearchVectors", with_value(value)));
+    }
+    for (tool, operation, members) in positioned {
+        let (args, body) = same_request(&members);
+        id += 1;
+        let over_mcp = raw(&call_tool(&mut child, id, tool, args));
+        let (status, body) = http.call(operation, &body);
+        assert_eq!(status, 400, "{body}");
+        let message = body.get("message").or_else(|| body.get("Message")).unwrap();
+        let error_type = body["__type"].as_str().unwrap().rsplit('#').next().unwrap();
+        assert_eq!(over_mcp, json!([error_type, message]), "{tool}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

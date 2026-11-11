@@ -605,7 +605,9 @@ pub struct ExecutePartiqlParams {
     )]
     pub statement: String,
 
-    #[schemars(description = "Positional parameters for the statement, in DynamoDB JSON format")]
+    #[schemars(
+        description = "A JSON array of positional parameters in DynamoDB JSON, one for each ? in the statement, in order. For example, [{\"S\": \"user#1\"}, {\"N\": \"42\"}] for WHERE pk = ? AND n = ?."
+    )]
     pub parameters: Option<serde_json::Value>,
 
     /// Passed to ExecuteStatement's own decoder as given, so it answers as

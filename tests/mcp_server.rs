@@ -5680,6 +5680,26 @@ fn delete_item_reads_its_key_on_the_layer_the_http_api_uses() {
     let _ = child.wait();
 }
 
+/// An argument that isn't DynamoDB JSON at all is refused with the tool's own
+/// message naming the argument, with no serde marker or position in it.
+#[test]
+fn a_map_argument_that_is_not_dynamodb_json_names_the_argument() {
+    let mut child = mcp_with_table("Layers");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Layers", "item": [1]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        validation_error("Invalid DynamoDB JSON in 'item': invalid type: sequence, expected a map")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 /// The tools without the envelope keep their operation's own layer: GetItem
 /// reads values on the current layer, bare, and the batch, transaction and
 /// PartiQL operations on the older one, which reads `1e2147483647` as Java's

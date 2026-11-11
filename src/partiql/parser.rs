@@ -3254,9 +3254,10 @@ fn is_arithmetic_operator(tok: &str) -> bool {
 /// How DynamoDB refuses arithmetic in a condition.
 const ARITHMETIC_REFUSAL: &str = "Unsupported operator in Condition Expression. Operator: ";
 
-/// Arithmetic after `left`, the operator not yet read. DynamoDB takes none in
-/// a condition and refuses the first operator ahead of anything wrong with
-/// its operands, whatever they are and wherever the arithmetic stands, so
+/// Arithmetic after `left`, the operator not yet read, where it starts the
+/// left side of a condition, bracketed or not. DynamoDB takes none in a
+/// condition and refuses the first operator ahead of anything wrong with its
+/// operands, whatever they are, so
 /// `size(true) + 1 > size(s)`, `1 + size(s, s) > 0` and `n + 1 > 0` are each
 /// refused for the `+` (captured eu-west-2, 2026-11-11). The terms are read in
 /// a loop, so a long run of `+ 1` reads in constant stack, and the comparison

@@ -1086,27 +1086,11 @@ async fn empty_next_tokens_is_on_a_size_and_arithmetic_answer_as_dynamodb_does()
 }
 
 /// A batch member refused for its WHERE clause writes nothing, and the
-/// member beside it writes as it would alone.
+/// member beside it writes as it would alone, whether the refusal is a size's
+/// operand count or arithmetic.
 #[tokio::test]
 async fn a_refused_batch_member_writes_nothing() {
     let url = start_server().await;
-    for sk in ["b", "c"] {
-        let item = serde_json::json!({
-            "TableName": TABLE_NAME,
-            "Item": {"pk": {"S": "a"}, "sk": {"S": sk}, "n": {"N": "1"}, "s": {"S": "x"}}
-        });
-        assert_eq!(answer(&url, "PutItem", &item.to_string()).await.0, 200);
-    }
-    let batch = serde_json::json!({ "Statements": [
-        {"Statement": format!(
-            r#"UPDATE "{TABLE_NAME}" SET z = 1 WHERE pk='a' AND sk='b' AND size(s, s) AND n = 1"#
-        )},
-        {"Statement": format!(r#"UPDATE "{TABLE_NAME}" SET z = 2 WHERE pk='a' AND sk='c'"#)},
-    ]});
-    let (status, got) = answer(&url, "BatchExecuteStatement", &batch.to_string()).await;
-    assert_eq!(status, 200);
-    assert_eq!(got["Responses"][0]["Error"]["Code"], "ValidationError");
-    assert!(got["Responses"][1].get("Error").is_none(), "{got}");
     let z = |sk: &str| {
         let url = url.clone();
         let key = serde_json::json!({
@@ -1116,8 +1100,44 @@ async fn a_refused_batch_member_writes_nothing() {
         });
         async move { answer(&url, "GetItem", &key.to_string()).await.1["Item"]["z"].clone() }
     };
-    assert_eq!(z("b").await, serde_json::Value::Null);
-    assert_eq!(z("c").await, serde_json::json!({"N": "2"}));
+    for (refused, message) in [
+        (
+            "size(s, s) AND n = 1",
+            "Incorrect number of operands for operator or function; operator or function: \
+             size, number of operands: 2",
+        ),
+        (
+            "n + 1 > 0",
+            "Unsupported operator in Condition Expression. Operator: +",
+        ),
+    ] {
+        for sk in ["b", "c"] {
+            let item = serde_json::json!({
+                "TableName": TABLE_NAME,
+                "Item": {"pk": {"S": "a"}, "sk": {"S": sk}, "n": {"N": "1"}, "s": {"S": "x"}}
+            });
+            assert_eq!(answer(&url, "PutItem", &item.to_string()).await.0, 200);
+        }
+        let batch = serde_json::json!({ "Statements": [
+            {"Statement": format!(
+                r#"UPDATE "{TABLE_NAME}" SET z = 1 WHERE pk='a' AND sk='b' AND {refused}"#
+            )},
+            {"Statement": format!(r#"UPDATE "{TABLE_NAME}" SET z = 2 WHERE pk='a' AND sk='c'"#)},
+        ]});
+        let (status, got) = answer(&url, "BatchExecuteStatement", &batch.to_string()).await;
+        assert_eq!(status, 200, "{refused}");
+        assert_eq!(
+            got["Responses"][0]["Error"],
+            serde_json::json!({"Code": "ValidationError", "Message": message}),
+            "{refused}"
+        );
+        assert!(
+            got["Responses"][1].get("Error").is_none(),
+            "{refused}: {got}"
+        );
+        assert_eq!(z("b").await, serde_json::Value::Null, "{refused}");
+        assert_eq!(z("c").await, serde_json::json!({"N": "2"}), "{refused}");
+    }
 }
 
 /// A write sent with a NextToken taken from a real page of a SELECT runs once,

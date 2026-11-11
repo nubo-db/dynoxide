@@ -511,12 +511,12 @@ pub struct ScanParams {
     #[schemars(
         description = "Segment number for parallel scan (0-based). Must be used with total_segments."
     )]
-    pub segment: Option<u32>,
+    pub segment: Option<i64>,
 
     #[schemars(
         description = "Total number of parallel scan segments (1 to 1000000). Must be used with segment."
     )]
-    pub total_segments: Option<u32>,
+    pub total_segments: Option<i64>,
 
     #[schemars(
         description = RETURN_CONSUMED_CAPACITY,
@@ -1096,6 +1096,42 @@ fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
     crate::validation::reject_bad_capacity_mode(mode)
         .err()
         .map(to_tool_error)
+}
+
+/// Refuse a `segment` or `total_segments` that is negative or past what a
+/// 32-bit integer holds, as Scan's member checks refuse it over HTTP. The HTTP
+/// API reads both as 32-bit integers, so a value past either end is read as
+/// that end and the request moves to the older wording, which echoes the value
+/// and lists the request's other member errors with it. Anything in range is
+/// left to the action, which runs the same checks.
+fn refuse_segments_outside_int32(params: &ScanParams) -> Option<CallToolResult> {
+    let int32 = |value: i64| {
+        let read = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+        (read, read != value)
+    };
+    let segment = params.segment.map(int32);
+    let total_segments = params.total_segments.map(int32);
+    let read = [segment, total_segments];
+    if !read
+        .iter()
+        .flatten()
+        .any(|&(value, coerced)| coerced || value < 0)
+    {
+        return None;
+    }
+    crate::actions::scan::ScanMembers {
+        table_name: Some(&params.table_name),
+        select: params.select.as_deref(),
+        return_consumed_capacity: params.return_consumed_capacity.as_deref(),
+        conditional_operator: None,
+        scan_filter: None,
+        limit: params.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)),
+        segment: segment.map(|(value, _)| value),
+        total_segments: total_segments.map(|(value, _)| value),
+        coerced: read.iter().flatten().any(|&(_, coerced)| coerced),
+    }
+    .rejection()
+    .map(|msg| to_tool_error(crate::errors::DynoxideError::ValidationException(msg)))
 }
 
 /// Parse a required JSON value into a typed result, returning a tool validation
@@ -1726,6 +1762,9 @@ impl McpServer {
         description = "Scan an entire table or GSI/LSI, optionally applying a filter expression. Use query instead when you know the partition key. Use select=COUNT to get only Count and ScannedCount without items. Use Segment and TotalSegments for parallel scan; segment filtering uses FNV-1a hash at the SQLite level."
     )]
     fn scan(&self, Parameters(params): Parameters<ScanParams>) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_segments_outside_int32(&params) {
+            return Ok(err);
+        }
         if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
@@ -1756,8 +1795,9 @@ impl McpServer {
             exclusive_start_key,
             index_name: params.index_name,
             select: params.select,
-            segment: params.segment,
-            total_segments: params.total_segments,
+            // In range here: anything negative or past 32 bits was refused above.
+            segment: params.segment.and_then(|s| u32::try_from(s).ok()),
+            total_segments: params.total_segments.and_then(|t| u32::try_from(t).ok()),
             return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };

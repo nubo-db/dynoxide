@@ -5612,3 +5612,118 @@ fn other_tools_read_values_on_their_operations_layer() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// `scan`'s `segment` and `total_segments` answer as Scan's member checks do
+/// over HTTP (tests/scan_member_stages.rs): a negative one gets the member
+/// check's message rather than failing argument decoding, and one past what
+/// a 32-bit integer holds is read as the largest one, which moves the request
+/// to the older wording with the value echoed.
+#[test]
+fn scan_segments_answer_as_the_http_api_does() {
+    let mut child = mcp_with_table("Segments");
+    let one = |m: &str| validation_error(&format!("1 validation error detected: {m}"));
+    let segment_min = "Value at 'Segment' failed to satisfy constraint: Member must have value \
+                       greater than or equal to 0";
+    let total_min = "Value at 'TotalSegments' failed to satisfy constraint: Member must have \
+                     value greater than or equal to 1";
+    let zero_based = validation_error(
+        "The Segment parameter is zero-based and must be less than parameter TotalSegments",
+    );
+    let cases: Vec<(Value, (String, String))> = vec![
+        (
+            json!({"segment": -1, "total_segments": 2}),
+            one(segment_min),
+        ),
+        (json!({"segment": -1}), one(segment_min)),
+        (json!({"segment": 0, "total_segments": -1}), one(total_min)),
+        (json!({"total_segments": -1}), one(total_min)),
+        (json!({"segment": 0, "total_segments": 0}), one(total_min)),
+        (
+            json!({"segment": -1, "total_segments": -1}),
+            validation_error(&format!(
+                "2 validation errors detected: {segment_min}; {total_min}"
+            )),
+        ),
+        (
+            json!({"segment": 2, "total_segments": 2}),
+            zero_based.clone(),
+        ),
+        (json!({"segment": 3, "total_segments": 2}), zero_based),
+        (
+            json!({"segment": 0, "total_segments": 1_000_001}),
+            one(
+                "Value at 'TotalSegments' failed to satisfy constraint: Member must have value \
+                 less than or equal to 1000000",
+            ),
+        ),
+        (
+            json!({"segment": 3_000_000_000_u64, "total_segments": 2}),
+            one(
+                "Value '2147483647' at 'segment' failed to satisfy constraint: Member must have \
+                 value less than or equal to 999999",
+            ),
+        ),
+        (
+            json!({"segment": 4_294_967_296_u64, "total_segments": 2}),
+            one(
+                "Value '2147483647' at 'segment' failed to satisfy constraint: Member must have \
+                 value less than or equal to 999999",
+            ),
+        ),
+        (
+            json!({"segment": -3_000_000_000_i64, "total_segments": 2}),
+            one(
+                "Value '-2147483648' at 'segment' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 0",
+            ),
+        ),
+        (
+            json!({"segment": 0, "total_segments": 4_294_967_296_u64}),
+            one(
+                "Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must \
+                 have value less than or equal to 1000000",
+            ),
+        ),
+        // The member checks come ahead of the capacity mode, and the older
+        // wording lists the mode and the limit with the segment.
+        (
+            json!({"segment": -1, "total_segments": 2, "return_consumed_capacity": "BOGUS"}),
+            one(segment_min),
+        ),
+        (
+            json!({
+                "segment": 3_000_000_000_u64, "total_segments": 2,
+                "limit": 0, "return_consumed_capacity": "BOGUS"
+            }),
+            validation_error(
+                "3 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed \
+                 to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, \
+                 NONE]; Value '2147483647' at 'segment' failed to satisfy constraint: Member \
+                 must have value less than or equal to 999999; Value '0' at 'limit' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1",
+            ),
+        ),
+    ];
+    let mut id = 10;
+    for (segments, refusal) in cases {
+        let mut args = json!({"table_name": "Segments"});
+        for (k, v) in segments.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        id += 1;
+        let resp = call_tool(&mut child, id, "scan", args);
+        assert_eq!(tool_error(&resp), refusal, "{segments}");
+    }
+    // A segment in range still scans.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "scan",
+        json!({"table_name": "Segments", "segment": 1, "total_segments": 2}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(tool_content(&resp)["Count"], json!(0));
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

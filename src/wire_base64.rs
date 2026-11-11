@@ -21,6 +21,7 @@
 //!
 //! Encoding on the way out stays canonical padded base64.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
 
 /// Why DynamoDB refuses a value's base64 text.
@@ -55,14 +56,43 @@ impl Refusal {
 
 /// Whether DynamoDB reads `text` as base64, without decoding it.
 pub(crate) fn check(text: &str) -> Result<(), Refusal> {
+    if is_canonical(text.as_bytes()) {
+        return Ok(());
+    }
     read(text.as_bytes(), None)
 }
 
 /// The bytes DynamoDB reads `text` as.
 pub(crate) fn decode(text: &str) -> Result<Vec<u8>, Refusal> {
+    // Canonical padded base64, all a stored item ever holds, reads as the
+    // `base64` crate reads it; anything else takes the reader below.
+    if let Ok(bytes) = STANDARD.decode(text) {
+        return Ok(bytes);
+    }
     let mut bytes = Vec::with_capacity(text.len() / 4 * 3 + 2);
     read(text.as_bytes(), Some(&mut bytes))?;
     Ok(bytes)
+}
+
+/// Whether `text` is canonical padded base64: a multiple of 4 long, every
+/// character in the alphabet apart from up to two trailing `=`, and no unused
+/// bits set in the last character before them. The reader below accepts all
+/// of these, so a `true` here needs no further reading.
+fn is_canonical(text: &[u8]) -> bool {
+    if text.is_empty() || !text.len().is_multiple_of(4) {
+        return false;
+    }
+    let pads = text
+        .iter()
+        .rev()
+        .take(2)
+        .take_while(|&&b| b == b'=')
+        .count();
+    let data = &text[..text.len() - pads];
+    // Written as comparisons folded without short-circuiting, so the
+    // compiler can test many bytes at a time.
+    let all_in_alphabet = data.iter().fold(true, |acc, &b| acc & in_alphabet(b));
+    all_in_alphabet && (pads == 0 || sextet(data[data.len() - 1]) & unused_bits(pads) == 0)
 }
 
 fn read(text: &[u8], out: Option<&mut Vec<u8>>) -> Result<(), Refusal> {
@@ -75,16 +105,30 @@ fn read(text: &[u8], out: Option<&mut Vec<u8>>) -> Result<(), Refusal> {
     }
 }
 
+/// Whether a byte is in the standard alphabet.
+fn in_alphabet(b: u8) -> bool {
+    (b.wrapping_sub(b'A') < 26)
+        | (b.wrapping_sub(b'a') < 26)
+        | (b.wrapping_sub(b'0') < 10)
+        | (b == b'+')
+        | (b == b'/')
+}
+
+/// Each byte's value in the standard alphabet, or -1.
+const SEXTETS: [i8; 256] = {
+    let mut table = [-1i8; 256];
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut i = 0;
+    while i < alphabet.len() {
+        table[alphabet[i] as usize] = i as i8;
+        i += 1;
+    }
+    table
+};
+
 /// A character's value in the standard alphabet, or -1.
 fn sextet(byte: u8) -> i32 {
-    match byte {
-        b'A'..=b'Z' => i32::from(byte - b'A'),
-        b'a'..=b'z' => i32::from(byte - b'a') + 26,
-        b'0'..=b'9' => i32::from(byte - b'0') + 52,
-        b'+' => 62,
-        b'/' => 63,
-        _ => -1,
-    }
+    i32::from(SEXTETS[usize::from(byte)])
 }
 
 /// The bits of the last character before `pads` padding characters that no
@@ -179,7 +223,7 @@ fn read_padded(text: &[u8], out: Option<&mut Vec<u8>>) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
 
     /// The outcome class of reading `text`: `Ok` or the refusal.
     fn class(text: &str) -> Result<(), Refusal> {
@@ -292,35 +336,17 @@ mod tests {
         );
     }
 
-    /// Captured eu-west-2, 2026-11-11: the lenient forms DynamoDB accepted,
-    /// and the canonical base64 it returned for each when scanned.
+    /// Captured eu-west-2, 2026-11-11: a few of the lenient forms DynamoDB
+    /// accepted, and the canonical base64 a scan returned for each. The whole
+    /// captured set is written and read back over HTTP in
+    /// `tests/binary_base64_values.rs`.
     const STORED: &[(&str, &str)] = &[
         ("QQ", "QQ=="),
-        ("QQ=", "QQ=="),
-        ("QQ==", "QQ=="),
-        ("QUI", "QUI="),
-        ("QUI=", "QUI="),
-        ("abc", "abc="),
-        ("abcdefg", "abcdefg="),
-        ("QQQQQQ", "QQQQQQ=="),
-        ("abcdQUI", "abcdQUI="),
         ("abcdQQ=", "abcdQQ=="),
         ("-Q==", "/Q=="),
-        ("{Q==", "/Q=="),
-        ("*Q==", "/Q=="),
-        ("(Q==", "/Q=="),
-        ("~Q==", "/Q=="),
-        ("\u{7f}Q==", "/Q=="),
-        ("=Q==", "/Q=="),
-        ("Q-Q=", "//Q="),
         ("Q=Q=", "//Q="),
         ("-QQ=", "/QQ="),
-        ("QQQQ-Q==", "QQQQ/Q=="),
         ("QQQQQ-Q=", "QQQQ//Q="),
-        ("--Q=", "//Q="),
-        ("-w==", "/w=="),
-        ("-/Q=", "//Q="),
-        ("/-Q=", "//Q="),
     ];
 
     #[test]
@@ -340,9 +366,22 @@ mod tests {
         assert_eq!(decode(" "), Err(Refusal::TooShort));
     }
 
-    #[test]
-    fn every_canonical_padded_value_reads_as_the_base64_crate_reads_it() {
-        // Every byte string up to two long, and a spread of longer ones.
+    /// The reader on its own, without the `base64` crate's fast path.
+    fn read_all(text: &str) -> Result<Vec<u8>, Refusal> {
+        let mut bytes = Vec::new();
+        read(text.as_bytes(), Some(&mut bytes)).map(|()| bytes)
+    }
+
+    fn xorshift(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// Canonical encodings of every byte string up to two long and a spread
+    /// of longer ones.
+    fn canonical_inputs() -> Vec<String> {
         let mut inputs: Vec<Vec<u8>> = vec![Vec::new()];
         for len in 1..=2usize {
             let count = 1usize << (8 * len);
@@ -351,23 +390,69 @@ mod tests {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         for len in 3..=8usize {
             for _ in 0..2000 {
-                inputs.push(
-                    (0..len)
-                        .map(|_| {
-                            seed ^= seed << 13;
-                            seed ^= seed >> 7;
-                            seed ^= seed << 17;
-                            seed as u8
-                        })
-                        .collect(),
-                );
+                inputs.push((0..len).map(|_| xorshift(&mut seed) as u8).collect());
             }
         }
-        for bytes in inputs {
-            let encoded = STANDARD.encode(&bytes);
-            assert_eq!(STANDARD.decode(&encoded).unwrap(), bytes);
-            assert_eq!(decode(&encoded), Ok(bytes), "{encoded}");
+        inputs.iter().map(|bytes| STANDARD.encode(bytes)).collect()
+    }
+
+    /// Short strings from characters in and out of the alphabet, padding and
+    /// non-ASCII: every string up to five long from a small set, and random
+    /// ones up to twelve long from a larger one.
+    fn arbitrary_inputs() -> Vec<String> {
+        let small = ['A', 'Q', 'w', '/', '=', '-', '!', '\u{e9}'];
+        let mut inputs = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..5 {
+            layer = layer
+                .iter()
+                .flat_map(|prefix| small.iter().map(move |&c| format!("{prefix}{c}")))
+                .collect();
+            inputs.extend(layer.iter().cloned());
         }
+        let large: Vec<char> = (0u8..=0x7F)
+            .map(char::from)
+            .chain(['\u{80}', '\u{e9}', '\u{1F600}'])
+            .collect();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            let len = (xorshift(&mut seed) % 13) as usize;
+            inputs.push(
+                (0..len)
+                    .map(|_| large[(xorshift(&mut seed) % large.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        inputs
+    }
+
+    #[test]
+    fn every_canonical_padded_value_reads_as_the_base64_crate_reads_it() {
+        for encoded in canonical_inputs() {
+            let expected = STANDARD.decode(&encoded).unwrap();
+            assert_eq!(read_all(&encoded), Ok(expected), "{encoded}");
+        }
+    }
+
+    /// `check` and `decode` take short cuts for canonical base64. Whatever
+    /// the input, they must answer as the reader does on its own.
+    #[test]
+    fn the_short_cuts_answer_as_the_reader_does() {
+        let mut accepted_by_crate = 0;
+        for text in canonical_inputs().into_iter().chain(arbitrary_inputs()) {
+            let reader = read_all(&text);
+            if let Ok(bytes) = STANDARD.decode(&text) {
+                accepted_by_crate += 1;
+                assert_eq!(reader.as_ref(), Ok(&bytes), "{text:?}");
+            }
+            assert_eq!(
+                check(&text),
+                reader.as_ref().map(drop).map_err(|&e| e),
+                "check {text:?}"
+            );
+            assert_eq!(decode(&text), reader, "decode {text:?}");
+        }
+        assert!(accepted_by_crate > 70_000, "{accepted_by_crate}");
     }
 
     #[test]

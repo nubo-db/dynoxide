@@ -109,6 +109,79 @@ const NOT_FOLLOWED_YET: &[Excepted] = &[
     ),
 ];
 
+/// Rows where a member name is written twice somewhere other than an item, a
+/// key or `ExpressionAttributeValues`. DynamoDB refuses each with `Duplicate
+/// key found in payload`; Dynoxide doesn't yet, and following it is a separate
+/// change. Each is still sent: it must still differ from DynamoDB's answer and
+/// give the answer recorded here, which is Dynoxide's answer today.
+const DUPLICATE_NAMES_ELSEWHERE: &[(&str, usize, &str)] = &[
+    (
+        "sixth",
+        11,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "sixth",
+        14,
+        r##"{"Message":"duplicate field `TableName` at line 1 column 77","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        "seventh",
+        10,
+        r##"{"Message":"duplicate field `TableName` at line 1 column 53","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        "seventh",
+        11,
+        r##"{"Message":"duplicate field `Key` at line 1 column 70","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        "seventh",
+        12,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "seventh",
+        13,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "seventh",
+        14,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "seventh",
+        15,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "seventh",
+        16,
+        r##"{"Message":"duplicate field `Item` at line 1 column 92","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        "seventh",
+        17,
+        r##"{"Message":"duplicate field `TableName` at line 1 column 102","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        "seventh",
+        18,
+        r##"{"Message":"duplicate field `TableName` at line 1 column 54","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        "seventh",
+        19,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        "seventh",
+        20,
+        r##"{"Message":"duplicate field `Statement` at line 1 column 71","__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+];
+
 async fn start_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -228,23 +301,53 @@ type Choices = (usize, &'static str, &'static str, &'static [&'static str]);
 async fn assert_choices(set: &str, rows: &[Choices]) {
     let url = start_server().await;
     let mut wrong = Vec::new();
+    let mut compared = 0;
+    let mut pinned_met = 0;
     for &(number, operation, body, answers) in rows {
         let got = send(&url, operation, body).await;
+        compared += 1;
         let right = answers.iter().any(|answer| {
             let answer: serde_json::Value = serde_json::from_str(answer).unwrap();
             got == (status_of(&answer), answer)
         });
+        if let Some(&(_, _, today)) = DUPLICATE_NAMES_ELSEWHERE
+            .iter()
+            .find(|&&(s, n, _)| s == set && n == number)
+        {
+            pinned_met += 1;
+            let today: serde_json::Value = serde_json::from_str(today).unwrap();
+            if right {
+                wrong.push(format!(
+                    "{set} row {number} now answers as DynamoDB did: \
+                     drop it from DUPLICATE_NAMES_ELSEWHERE"
+                ));
+            } else if got != (status_of(&today), today.clone()) {
+                wrong.push(format!(
+                    "{set} row {number}: {operation} {body}\n  expected {today}\n  got      {got:?}"
+                ));
+            }
+            continue;
+        }
         if !right {
             wrong.push(format!(
                 "{set} row {number}: {operation} {body}\n  expected one of {answers:#?}\n  got {got:?}"
             ));
         }
     }
+    println!("{set} set: {compared} rows compared, {pinned_met} of them pinned");
+    assert_eq!(compared, rows.len());
+    let pinned_listed = DUPLICATE_NAMES_ELSEWHERE
+        .iter()
+        .filter(|&&(s, _, _)| s == set)
+        .count();
+    assert_eq!(
+        pinned_met, pinned_listed,
+        "DUPLICATE_NAMES_ELSEWHERE lists {pinned_listed} {set} rows but {pinned_met} are in the set"
+    );
     assert!(
         wrong.is_empty(),
-        "{} of {} rows differ:\n{}",
+        "{} of {compared} rows differ:\n{}",
         wrong.len(),
-        rows.len(),
         wrong.join("\n")
     );
 }
@@ -267,6 +370,38 @@ async fn fourth_set_answers_as_dynamodb_did() {
 async fn fifth_set_answers_as_dynamodb_did() {
     assert_eq!(FIFTH.len(), 24);
     assert_choices("fifth", FIFTH).await;
+}
+
+/// The sixth set: a null in a later TransactWriteItems action against an
+/// earlier action's expression values, a name written twice in an item and
+/// in a nested `M`, a null name in `ExpressionAttributeNames` and a null
+/// member of a string set (captured from DynamoDB on 12 November 2026, in
+/// eu-west-2 and us-east-1). Row 5, two bad numbers in one item, differs by
+/// region.
+#[tokio::test]
+async fn sixth_set_answers_as_dynamodb_did() {
+    assert_eq!(SIXTH.len(), 14);
+    assert_choices("sixth", SIXTH).await;
+}
+
+/// The seventh set: a null name in `ExpressionAttributeNames` is read as an
+/// empty one, a null member of a set is refused as a value fault, and a
+/// member name written twice outside an item, a key or the expression values
+/// (captured from DynamoDB on 12 November 2026, in eu-west-2 and us-east-1).
+#[tokio::test]
+async fn seventh_set_answers_as_dynamodb_did() {
+    assert_eq!(SEVENTH.len(), 20);
+    assert_choices("seventh", SEVENTH).await;
+}
+
+/// The eighth set: a null type member in `ExclusiveStartKey` beside a bad
+/// `Limit` or a bad number, and a legacy `Expected` or `AttributeUpdates`
+/// entry with a null `Value` for an attribute named like a type member
+/// (captured from DynamoDB on 12 November 2026, in eu-west-2 and us-east-1).
+#[tokio::test]
+async fn eighth_set_answers_as_dynamodb_did() {
+    assert_eq!(EIGHTH.len(), 13);
+    assert_choices("eighth", EIGHTH).await;
 }
 
 /// TransactWriteItems with no null in the request: an action's item or key
@@ -1584,5 +1719,404 @@ const TRANSACTION_ORDER: &[(&str, usize, &str, &str)] = &[
         3,
         r##"{"TransactItems": [{"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"N": "abc"}}}}, {"Put": {"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}, "ConditionExpression": "a = :v", "ExpressionAttributeValues": {":v": {"N": "xyz"}}}}]}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+];
+
+const SIXTH: &[Choices] = &[
+    (
+        1,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"N":"abc"}},"ConditionExpression":"a = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}},{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":null}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: xyz for key :a"}"##,
+        ],
+    ),
+    (
+        2,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"N":"abc"}},"ConditionExpression":"a = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}},{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":null}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: xyz for key :a"}"##,
+        ],
+    ),
+    (
+        3,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"N":"abc"}},"ConditionExpression":"a = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}},{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"b","N":null}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: xyz for key :a"}"##,
+        ],
+    ),
+    (
+        4,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"N":"abc"}},"ConditionExpression":"a = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        5,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"b":{"N":"xyz"},"x":{"N":"abc"}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        6,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"a = :a AND b = :b","ExpressionAttributeValues":{":a":{"N":"abc"},":b":{"N":"xyz"}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        7,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"Item":{"pk":{"S":"a"},"pk":{"S":"b"}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    (
+        8,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"pk":{"S":"b"}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}}}},{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"b","N":null}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+        ],
+    ),
+    (
+        10,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"1"},"x":{"S":"2"}}}}}"##,
+        &[
+            r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        11,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":"a","#n":"b"},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    (
+        12,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
+        ],
+    ),
+    (
+        13,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null]}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        14,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_317_none"}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+];
+
+const SEVENTH: &[Choices] = &[
+    (
+        1,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+        ],
+    ),
+    (
+        2,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a AND #m = :a","ExpressionAttributeNames":{"#n":"a","#m":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #m"}"##,
+        ],
+    ),
+    (
+        3,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","KeyConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+        ],
+    ),
+    (
+        4,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","ExpressionAttributeNames":{"#n":null}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
+        ],
+    ),
+    (
+        5,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"NS":[null]}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Numeric sets may not contain null"}"##,
+        ],
+    ),
+    (
+        6,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"BS":[null]}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Binary sets may not contain null or empty values"}"##,
+        ],
+    ),
+    (
+        7,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":["a",null]}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+        ],
+    ),
+    (
+        8,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","ExpressionAttributeValues":{":a":{"SS":[null]}},"KeyConditionExpression":"pk = :a"}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: One or more parameter values were invalid: An string set may not have a null string as a member for key :a"}"##,
+        ],
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null]}}}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        10,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","TableName":"_capture_20261111_317_none"}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        11,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"Key":{"pk":{"S":"a"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        12,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","KeyConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":"a","#n":"b"},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        13,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","KeyConditions":{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"},"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        14,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"Expected":{"a":{"Exists":false},"a":{"Exists":false}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        15,
+        "BatchGetItem",
+        r##"{"RequestItems":{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"b"}}]}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        16,
+        "BatchWriteItem",
+        r##"{"RequestItems":{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}},"Item":{"pk":{"S":"a"}}}}]}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        17,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"TableName":"_capture_20261111_317_none"}}]}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        18,
+        "CreateTable",
+        r##"{"TableName":"_capture_20261111_317_nonex","TableName":"_capture_20261111_317_nonex"}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        19,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a","S":"b"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+    // A name written twice outside an item, key or expression values is a separate change.
+    (
+        20,
+        "ExecuteStatement",
+        r##"{"Statement":"SELECT * FROM \"_capture_20261111_317_none\"","Statement":"SELECT * FROM \"_capture_20261111_317_none\""}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+        ],
+    ),
+];
+
+const EIGHTH: &[Choices] = &[
+    (
+        1,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":null}},"Limit":0}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+        ],
+    ),
+    (
+        2,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":null},"sk":{"N":"abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        3,
+        "Scan",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":null}},"Limit":0}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"}"##,
+        ],
+    ),
+    (
+        4,
+        "Scan",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":null}},"FilterExpression":"a = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The provided starting key is invalid: Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"}"##,
+        ],
+    ),
+    (
+        5,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":null}},"KeyConditionExpression":"pk = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The provided starting key is invalid: Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"}"##,
+        ],
+    ),
+    (
+        6,
+        "Query",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":"a"}},"KeyConditionExpression":"pk = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        7,
+        "Scan",
+        r##"{"TableName":"_capture_20261111_317_none","ExclusiveStartKey":{"pk":{"S":"a"},"sk":{"N":"abc"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+        ],
+    ),
+    (
+        8,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"AttributeUpdates":{"M":{"Action":"DELETE","Value":null}},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        9,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"AttributeUpdates":{"X":{"Action":"DELETE","Value":null}},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        10,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"Expected":{"M":{"Exists":false,"Value":null}},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        11,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"Expected":{"X":{"Exists":false,"Value":null}},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        12,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"Expected":{"S":{"Exists":false,"Value":null}},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
+    ),
+    (
+        13,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"AttributeUpdates":{"M":{"Action":"DELETE"}},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
+        ],
     ),
 ];

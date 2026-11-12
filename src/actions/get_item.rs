@@ -24,7 +24,11 @@ struct GetItemRequestRaw {
     consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
@@ -134,7 +138,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
 
     // Validate expression/non-expression parameter conflicts
     {

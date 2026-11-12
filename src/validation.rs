@@ -503,7 +503,7 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
 /// legacy `Expected` would put it there, and the current layer otherwise.
 pub(crate) fn single_write_layer(expected: Option<&serde_json::Value>) -> ValueLayer {
     if crate::types::current_value_layer() == ValueLayer::Older
-        || expected.is_some_and(crate::types::reads_on_older_layer)
+        || expected.is_some_and(crate::types::conditions_read_on_older_layer)
     {
         ValueLayer::Older
     } else {

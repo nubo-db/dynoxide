@@ -20,7 +20,11 @@ struct QueryRequestRaw {
     filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<crate::types::HeldValues>,
@@ -315,7 +319,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
     if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
         .is_some()
     {

@@ -48,7 +48,11 @@ struct Put {
     item: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
@@ -66,7 +70,11 @@ struct Update {
     update_expression: Option<String>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
@@ -82,7 +90,11 @@ struct Delete {
     key: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
@@ -98,7 +110,11 @@ struct ConditionCheck {
     key: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,

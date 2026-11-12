@@ -23,7 +23,11 @@ pub struct KeysAndAttributes {
     pub keys: Vec<HashMap<String, AttributeValue>>,
     #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(
         rename = "ConsistentRead",
@@ -140,7 +144,7 @@ pub async fn execute<S: StorageBackend>(
         {
             return Err(crate::empty_names::bare());
         }
-        crate::empty_names::check_names(ka.expression_attribute_names.as_ref())?;
+        crate::empty_names::check_names_early(ka.expression_attribute_names.as_ref())?;
     }
 
     // Reject a request that pairs an expression projection with a non-expression
@@ -190,6 +194,9 @@ pub async fn execute<S: StorageBackend>(
                     )));
                 }
             }
+            // An empty name left to here, on the older layer (see
+            // `empty_names::names_checked_early`).
+            crate::empty_names::check_names(Some(ean))?;
         }
 
         // Empty ProjectionExpression

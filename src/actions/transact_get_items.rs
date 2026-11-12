@@ -91,7 +91,11 @@ pub struct TransactGet {
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 }
 

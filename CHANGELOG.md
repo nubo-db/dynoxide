@@ -81,7 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same answers, and refuse expression values that aren't a map as the HTTP
   API does, where `delete_item` used to ignore them. An `AttributeUpdates`
   entry with no value and an action other than `DELETE` is now refused
-  inside that envelope
+  inside that envelope. A `null` name in `ExpressionAttributeNames` is now
+  read as an empty name, puts the request on the older layer and is checked
+  with the expressions, and a `null` member of an `SS`, `NS` or `BS` is
+  refused in DynamoDB's words where it used to be a `SerializationException`
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

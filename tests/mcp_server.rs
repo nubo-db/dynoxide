@@ -6678,6 +6678,98 @@ fn a_null_value_is_refused_through_the_tools_as_over_http() {
     let _ = child.wait();
 }
 
+/// A null name in `expression_attribute_names` is read as an empty one, and a
+/// null member of a set is a value fault, through the tools as over HTTP
+/// (captured from DynamoDB on 12 November 2026, and pinned over HTTP in
+/// tests/null_attribute_values.rs).
+#[test]
+fn a_null_name_or_set_member_is_refused_through_the_tools_as_over_http() {
+    const EMPTY_NAME: &str = "ExpressionAttributeNames contains invalid value: \
+                              Empty attribute name for key #n";
+    const NAMES_WITHOUT_EXPRESSIONS: &str =
+        "ExpressionAttributeNames can only be specified when using expressions";
+    const NULL_STRING: &str = "One or more parameter values were invalid: \
+                               An string set may not have a null string as a member";
+    let mut child = mcp_with_table("NullNames");
+    let cases: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"}},
+                "condition_expression": "#n = :a", "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"}},
+                "expression_attribute_names": {"#n": null}}),
+            validation_error(NAMES_WITHOUT_EXPRESSIONS),
+        ),
+        (
+            "get_item",
+            json!({"table_name": "NullNames", "key": {"pk": {"S": "a"}},
+                "projection_expression": "#n", "expression_attribute_names": {"#n": null}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "update_item",
+            json!({"table_name": "NullNames", "key": {"pk": {"S": "a"}},
+                "update_expression": "SET #n = :a", "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "delete_item",
+            json!({"table_name": "NullNames", "key": {"pk": {"S": "a"}},
+                "condition_expression": "#n = :a", "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "query",
+            json!({"table_name": "NullNames", "key_condition_expression": "#n = :a",
+                "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "scan",
+            json!({"table_name": "NullNames", "filter_expression": "#n = :a",
+                "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"}, "s": {"SS": [null]}}}),
+            validation_error(NULL_STRING),
+        ),
+        (
+            "query",
+            json!({"table_name": "NullNames", "key_condition_expression": "pk = :a",
+                "expression_attribute_values": {":a": {"SS": [null]}}}),
+            named(NULL_STRING, ":a"),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (tool, args, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 /// Expression values that aren't a map of values are refused as the HTTP API
 /// refuses the same body, and `delete_item` deletes nothing.
 #[test]

@@ -61,7 +61,11 @@ pub struct TransactPut {
     pub item: Item,
     #[serde(rename = "ConditionExpression", default)]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -82,7 +86,11 @@ pub struct TransactUpdate {
     pub update_expression: String,
     #[serde(rename = "ConditionExpression", default)]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -101,7 +109,11 @@ pub struct TransactDelete {
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "ConditionExpression", default)]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -120,7 +132,11 @@ pub struct TransactConditionCheck {
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: String,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,

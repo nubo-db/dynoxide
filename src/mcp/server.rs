@@ -284,6 +284,7 @@ pub struct PutItemParams {
     #[schemars(
         description = "Substitution tokens for expression attribute names, e.g. {\"#n\": \"name\"}"
     )]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -319,6 +320,7 @@ pub struct GetItemParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     /// Passed to GetItem's own decoder as given, so a string reads as the
@@ -359,6 +361,7 @@ pub struct UpdateItemParams {
     pub condition_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -412,6 +415,7 @@ pub struct SearchVectorsParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Optional expression attribute name substitutions")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<std::collections::HashMap<String, String>>,
 
     #[schemars(description = "Optional expression attribute values as DynamoDB-typed JSON")]
@@ -442,6 +446,7 @@ pub struct QueryParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -497,6 +502,7 @@ pub struct ScanParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -561,6 +567,7 @@ pub struct DeleteItemParams {
     pub condition_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -2798,18 +2805,23 @@ fn tool_operation(tool: &str) -> Option<&'static str> {
 /// The layer a tool call's values are read on, decided as the HTTP API
 /// decides it for the same request: the older layer when the arguments hold a
 /// `BOOL` or `NULL` written as a string, a value with more than one member, or
-/// a JSON null for a value in the item, the key or the expression values, and
-/// otherwise the operation's own.
+/// a JSON null for a value in the item, the key or the expression values or
+/// for an expression name, and otherwise the operation's own.
 fn tool_value_layer(
     tool: &str,
     arguments: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> crate::validation::ValueLayer {
     let older = arguments.is_some_and(|args| {
         args.values().any(crate::types::reads_on_older_layer)
-            || ["item", "key", "expression_attribute_values"]
-                .iter()
-                .filter_map(|name| args.get(*name)?.as_object())
-                .any(|values| values.values().any(serde_json::Value::is_null))
+            || [
+                "item",
+                "key",
+                "expression_attribute_values",
+                "expression_attribute_names",
+            ]
+            .iter()
+            .filter_map(|name| args.get(*name)?.as_object())
+            .any(|values| values.values().any(serde_json::Value::is_null))
     });
     if older {
         crate::validation::ValueLayer::Older

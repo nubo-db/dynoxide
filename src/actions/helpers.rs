@@ -814,6 +814,14 @@ pub fn validate_expression_params(
             }
             reject_non_ascii_placeholder("ExpressionAttributeNames", key)?;
         }
+        // An empty name, or one given as null, is refused here on the older
+        // layer, which doesn't check it ahead of everything else (see
+        // `empty_names::names_checked_early`).
+        if let Some(placeholder) = crate::empty_names::empty_placeholder(Some(names)) {
+            return Err(ClassifiedValidationError::enveloped(
+                crate::empty_names::placeholder_message(placeholder),
+            ));
+        }
     }
 
     // ExpressionAttributeValues: prefer raw JSON if available (for key-specific errors)
@@ -2112,15 +2120,15 @@ pub(crate) fn read_values_after_start_key(
     }
 }
 
-/// Whether a Query's or Scan's `ExclusiveStartKey` holds a JSON null for a
-/// value, which hands the request to the older validation layer: beside a
-/// `Limit` of 0 it answers `Value '0' at 'limit'`, where a starting key
-/// without one, or with a bad number, answers `Value at 'Limit'` (captured
-/// eu-west-2 and us-east-1, 2026-11-11).
+/// Whether a Query's or Scan's `ExclusiveStartKey` holds a JSON null where a
+/// value belongs, which hands the request to the older validation layer:
+/// beside a `Limit` of 0 it answers `Value '0' at 'limit'`, where a starting
+/// key without one, or with a bad number, answers `Value at 'Limit'`
+/// (captured eu-west-2 and us-east-1, 2026-11-11). A null type member, as in
+/// `{"S": null}`, is such a null too, as it is wherever the request's layer
+/// is decided (captured eu-west-2 and us-east-1, 2026-11-12).
 pub(crate) fn start_key_holds_null(start_key: Option<&serde_json::Value>) -> bool {
-    start_key
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|key| key.values().any(serde_json::Value::is_null))
+    start_key.is_some_and(crate::types::attribute_map_holds_null)
 }
 
 /// Parse an `ExclusiveStartKey` from a raw `serde_json::Value`.

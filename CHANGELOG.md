@@ -52,6 +52,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `ConditionalOperator` other than `AND` or `OR` is refused in the words
+  DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
+  constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has
+  changed this message since October, when it named neither the value nor
+  the member and listed `[ALL, OR]`, and the Parity Suite's Query ordering
+  test caught the difference. Lower case and the empty string are refused the
+  same way on Query, Scan, PutItem, UpdateItem and DeleteItem. With no table
+  name, a Query now lists the operator beside the missing name, as Scan
+  already did, and so does a PutItem; a DeleteItem with no key lists it ahead
+  of the key, as UpdateItem does. `KeyConditions` now conflicts only with
+  `KeyConditionExpression`, so a Query that pairs it with a `FilterExpression`
+  or a `ProjectionExpression` runs, where it used to be refused, and the
+  mixing message no longer names it beside a `FilterExpression`. The
+  placeholders Dynoxide names the key conditions through internally never
+  take the place of the caller's own, so a caller's `:kc_v0` or `#kc_0` means
+  what the caller defined. Query, Scan, GetItem and BatchGetItem now check
+  their expressions through before the table is looked up, as DynamoDB does:
+  syntax, a name or value nobody defined, overlapping projection paths, and
+  then a name or value no expression uses. A filter value nobody defined used
+  to go unnoticed when no item was read. A key condition value nobody defined
+  is named as the key condition's, and a projection syntax error, such as
+  `#a,,` or `a[-1]`, names the offending token and where it sits, in
+  DynamoDB's usual form. A BatchGetItem reports a fault in a table's
+  projection ahead of a repeated key. `ExpressionAttributeValues` on a Query or Scan
+  with only a `ProjectionExpression` is now refused, and on Query and Scan the
+  refusal no longer ends with `: FilterExpression is null`
+  ([#319](https://github.com/nubo-db/dynoxide/issues/319)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages
   (`Buffer is too short for base64 encoding` for one character, `Base64

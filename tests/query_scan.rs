@@ -1881,15 +1881,26 @@ fn a_range_condition_on_a_one_attribute_partition_key_is_not_supported() {
     // (`pk > :a AND sk = :b`).
     let db = setup_db();
     create_test_table(&db, "RangeOnPartition");
-    for key_condition in ["pk > :pk AND sk = :v", "begins_with(pk, :pk)"] {
-        let err = query_key_condition(
-            &db,
-            "RangeOnPartition",
-            key_condition,
-            serde_json::json!({"S": "1"}),
-        )
-        .unwrap_err()
-        .to_string();
+    // Each request defines only the values its condition uses, as an unused
+    // one is refused ahead of the key schema check.
+    for (key_condition, values) in [
+        (
+            "pk > :pk AND sk = :v",
+            serde_json::json!({":pk": {"S": "a"}, ":v": {"S": "1"}}),
+        ),
+        ("begins_with(pk, :v)", serde_json::json!({":v": {"S": "1"}})),
+    ] {
+        let err = db
+            .query(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "RangeOnPartition",
+                    "KeyConditionExpression": key_condition,
+                    "ExpressionAttributeValues": values
+                }))
+                .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("Query key condition not supported"),
             "{key_condition}: got {err}"

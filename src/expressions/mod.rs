@@ -82,6 +82,9 @@ pub struct TrackedExpressionAttributes<'a> {
     pub values: &'a Option<HashMap<String, AttributeValue>>,
     used_names: RefCell<HashSet<String>>,
     used_values: RefCell<HashSet<String>>,
+    /// The value references in the order the tracked expressions first use
+    /// them, for reporting the first one that isn't defined.
+    value_order: RefCell<Vec<String>>,
     /// When false, resolve_name/resolve_value skip HashSet insertions.
     /// Used in the per-item hot loop where tracking has already been done pre-loop.
     tracking_enabled: bool,
@@ -97,6 +100,7 @@ impl<'a> TrackedExpressionAttributes<'a> {
             values,
             used_names: RefCell::new(HashSet::new()),
             used_values: RefCell::new(HashSet::new()),
+            value_order: RefCell::new(Vec::new()),
             tracking_enabled: true,
         }
     }
@@ -113,6 +117,7 @@ impl<'a> TrackedExpressionAttributes<'a> {
             values,
             used_names: RefCell::new(HashSet::new()),
             used_values: RefCell::new(HashSet::new()),
+            value_order: RefCell::new(Vec::new()),
             tracking_enabled: false,
         }
     }
@@ -141,7 +146,7 @@ impl<'a> TrackedExpressionAttributes<'a> {
     /// Resolve an attribute value reference `:name` and track usage.
     pub fn resolve_value<'b>(&'b self, name: &str) -> Result<&'a AttributeValue, String> {
         if self.tracking_enabled {
-            self.used_values.borrow_mut().insert(name.to_string());
+            self.use_value(name);
         }
         match self.values {
             Some(map) => map.get(name).ok_or_else(|| {
@@ -206,9 +211,7 @@ impl<'a> TrackedExpressionAttributes<'a> {
             condition::Operand::Path(path) | condition::Operand::Size(path) => {
                 self.walk_path_elements(path);
             }
-            condition::Operand::ValueRef(name) => {
-                self.used_values.borrow_mut().insert(name.clone());
-            }
+            condition::Operand::ValueRef(name) => self.use_value(name),
         }
     }
 
@@ -240,15 +243,11 @@ impl<'a> TrackedExpressionAttributes<'a> {
         }
         for action in &expr.add_actions {
             self.walk_path_elements(&action.path);
-            self.used_values
-                .borrow_mut()
-                .insert(action.value_ref.clone());
+            self.use_value(&action.value_ref);
         }
         for action in &expr.delete_actions {
             self.walk_path_elements(&action.path);
-            self.used_values
-                .borrow_mut()
-                .insert(action.value_ref.clone());
+            self.use_value(&action.value_ref);
         }
     }
 
@@ -265,9 +264,7 @@ impl<'a> TrackedExpressionAttributes<'a> {
     fn walk_set_operand(&self, operand: &update::SetOperand) {
         match operand {
             update::SetOperand::Path(path) => self.walk_path_elements(path),
-            update::SetOperand::ValueRef(name) => {
-                self.used_values.borrow_mut().insert(name.clone());
-            }
+            update::SetOperand::ValueRef(name) => self.use_value(name),
             update::SetOperand::IfNotExists(path, default) => {
                 self.walk_path_elements(path);
                 self.walk_set_operand(default);
@@ -278,6 +275,44 @@ impl<'a> TrackedExpressionAttributes<'a> {
             }
             update::SetOperand::Group(inner) => self.walk_set_value(inner),
         }
+    }
+
+    /// Record the value references a parsed key condition uses. Parsing has
+    /// already recorded its names; its values are only read once it is bound
+    /// to a table's key.
+    pub(crate) fn track_key_condition(&self, condition: &key_condition::KeyCondition) {
+        use key_condition::SortKeyCondition as C;
+        for clause in &condition.clauses {
+            match clause {
+                C::Eq(_, v)
+                | C::Lt(_, v)
+                | C::Le(_, v)
+                | C::Gt(_, v)
+                | C::Ge(_, v)
+                | C::BeginsWith(_, v) => self.use_value(v),
+                C::Between(_, lo, hi) => {
+                    self.use_value(lo);
+                    self.use_value(hi);
+                }
+            }
+        }
+    }
+
+    /// Record a value reference as used, keeping the order of first use.
+    fn use_value(&self, name: &str) {
+        if self.used_values.borrow_mut().insert(name.to_string()) {
+            self.value_order.borrow_mut().push(name.to_string());
+        }
+    }
+
+    /// The first value reference, in the order the tracked expressions use
+    /// them, that `ExpressionAttributeValues` doesn't define.
+    pub(crate) fn first_undefined_value(&self) -> Option<String> {
+        self.value_order
+            .borrow()
+            .iter()
+            .find(|v| !self.values.as_ref().is_some_and(|map| map.contains_key(*v)))
+            .cloned()
     }
 
     /// Check for unused names/values. Returns an error listing all unused keys.

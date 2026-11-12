@@ -3,7 +3,9 @@
 //! Parses comma-separated attribute paths, supports dot notation and bracket indexing.
 //! Always includes key attributes in the result.
 
-use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
+use crate::expressions::tokenizer::{
+    Token, TokenSpan, TokenStream, syntax_error_at, tokenize, tokenizer_syntax_error,
+};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, format_path_for_error, resolve_path,
     resolve_path_elements,
@@ -18,58 +20,69 @@ pub struct ProjectionExpr {
 }
 
 /// Parse a ProjectionExpression string.
+///
+/// A fault in the path grammar is DynamoDB's syntax error at the token where
+/// the parse stops, or at the end of the expression: `Syntax error; token:
+/// "b", near: "a b"` (captured eu-west-2 and us-east-1, 2026-11-11, for a
+/// path that doesn't start with a name, a dot or bracket with nothing usable
+/// after it, an unclosed bracket and a token after a complete path).
 pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
     // Prefix the size error like every other ProjectionExpression error; real
     // DynamoDB returns "Invalid ProjectionExpression: Expression size has
     // exceeded the maximum allowed size". Confirmed against real DynamoDB
     // (eu-west-2).
     super::check_expression_size(expr).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
-    let tokens = tokenize(expr).map_err(|err| {
-        // A character the tokenizer can't read (e.g. a stray `!`).
-        format!(
-            "Invalid ProjectionExpression: {}",
-            tokenizer_syntax_error(expr, &err)
-        )
-    })?;
+    let invalid = |message: String| format!("Invalid ProjectionExpression: {message}");
+    let tokens = match tokenize(expr) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            // A character the tokenizer can't read (a stray `!`, or a digit
+            // outside brackets). A syntax fault at an earlier token comes
+            // first, as the expression is read in order: `a[-1]` is refused at
+            // the `-` (captured eu-west-2 and us-east-1, 2026-11-11).
+            let read = tokenize(&expr[..err.position]).unwrap_or_default();
+            let mut spans: Vec<TokenSpan> = read.iter().map(|(_, span)| *span).collect();
+            let read_len = spans.len();
+            let mut stream = TokenStream::new(read);
+            if let Err(Fault::Syntax) = parse_paths(&mut stream)
+                && stream.pos() < read_len
+            {
+                spans.push(TokenSpan::new(err.position, err.bad_len));
+                return Err(invalid(syntax_error_at(expr, &spans, stream.pos())));
+            }
+            return Err(invalid(tokenizer_syntax_error(expr, &err)));
+        }
+    };
     let mut stream = TokenStream::new(tokens);
-
-    // Whitespace alone names no attribute, and is refused at its end (GetItem
-    // captured eu-west-2 and us-east-1, 2026-10-10). The caller refuses an
-    // empty string before this.
-    if stream.at_end() {
-        return Err(format!(
-            "Invalid ProjectionExpression: {}",
-            stream.syntax_error(expr)
-        ));
+    match parse_paths(&mut stream) {
+        Ok(paths) => Ok(ProjectionExpr { paths }),
+        // Whitespace alone is refused at its end the same way (GetItem
+        // captured eu-west-2 and us-east-1, 2026-10-10); the caller refuses
+        // an empty string before this.
+        Err(Fault::Syntax) => Err(invalid(stream.syntax_error(expr))),
+        Err(Fault::Message(message)) => Err(invalid(message)),
     }
-
-    let mut paths = Vec::new();
-
-    paths.push(parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?);
-
-    while matches!(stream.peek(), Some(Token::Comma)) {
-        stream.next();
-        paths.push(
-            parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?,
-        );
-    }
-
-    if !stream.at_end() {
-        return Err(format!(
-            "Unexpected token in ProjectionExpression: {}",
-            stream.peek().unwrap()
-        ));
-    }
-
-    Ok(ProjectionExpr { paths })
 }
 
-/// Wrap a parser-level ProjectionExpression error in the standard envelope.
-/// For now this is a passthrough through the existing message shape; if the
-/// conformance suite later pins a `near:` window for parser-level projection
-/// errors, the stream's position says where the parse stopped.
-fn projection_parser_error(_expr: &str, _stream: &mut TokenStream, msg: String) -> String {
-    format!("Invalid ProjectionExpression: {msg}")
+/// Why a projection's paths don't parse.
+enum Fault {
+    /// A syntax error at the token the stream is stopped at, or at the end.
+    Syntax,
+    /// A fault with a message of its own, such as a reserved word.
+    Message(String),
+}
+
+/// Every comma-separated path, to the end of the expression.
+fn parse_paths(stream: &mut TokenStream) -> Result<Vec<Vec<PathElement>>, Fault> {
+    let mut paths = vec![parse_path(stream)?];
+    while matches!(stream.peek(), Some(Token::Comma)) {
+        stream.next();
+        paths.push(parse_path(stream)?);
+    }
+    if !stream.at_end() {
+        return Err(Fault::Syntax);
+    }
+    Ok(paths)
 }
 
 /// Validate a ProjectionExpression before any item is read: reject undefined
@@ -182,60 +195,56 @@ fn common_prefix_len(a: &[PathElement], b: &[PathElement]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
-    let first = match stream.next() {
-        Some(Token::Identifier(name)) => {
-            if super::reserved::is_reserved_keyword(name) {
-                return Err(format!(
-                    "Attribute name is a reserved keyword; reserved keyword: {name}"
-                ));
-            }
-            PathElement::Attribute(name.clone())
-        }
-        Some(Token::NameRef(name)) => PathElement::Attribute(name.clone()),
-        Some(t) => return Err(format!("Expected attribute name, got {t}")),
-        None => return Err("Expected attribute name, got end of expression".to_string()),
-    };
-
+/// One path: a name, then any number of `.name` and `[n]`. On a syntax fault
+/// the stream is left at the offending token.
+fn parse_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, Fault> {
+    let first = path_name(stream)?;
     let mut path = vec![first];
-
     loop {
         match stream.peek() {
             Some(Token::Dot) => {
                 stream.next();
-                match stream.next() {
-                    Some(Token::Identifier(name)) => {
-                        if super::reserved::is_reserved_keyword(name) {
-                            return Err(format!(
-                                "Attribute name is a reserved keyword; reserved keyword: {name}"
-                            ));
-                        }
-                        path.push(PathElement::Attribute(name.clone()));
-                    }
-                    Some(Token::NameRef(name)) => {
-                        path.push(PathElement::Attribute(name.clone()));
-                    }
-                    Some(t) => return Err(format!("Expected attribute name after '.', got {t}")),
-                    None => return Err("Expected attribute name after '.'".to_string()),
-                }
+                path.push(path_name(stream)?);
             }
             Some(Token::LBracket) => {
                 stream.next();
-                match stream.next() {
+                match stream.peek() {
                     Some(Token::Number(n)) => {
-                        let idx: usize = n.parse().map_err(|_| format!("Invalid index: {n}"))?;
+                        let idx: usize = n
+                            .parse()
+                            .map_err(|_| Fault::Message(format!("Invalid index: {n}")))?;
+                        stream.next();
                         path.push(PathElement::Index(idx));
                     }
-                    Some(t) => return Err(format!("Expected number in brackets, got {t}")),
-                    None => return Err("Expected number in brackets".to_string()),
+                    _ => return Err(Fault::Syntax),
                 }
-                stream.expect(&Token::RBracket)?;
+                if !matches!(stream.peek(), Some(Token::RBracket)) {
+                    return Err(Fault::Syntax);
+                }
+                stream.next();
             }
             _ => break,
         }
     }
-
     Ok(path)
+}
+
+/// A name in a path, plain or a `#name` placeholder.
+fn path_name(stream: &mut TokenStream) -> Result<PathElement, Fault> {
+    let element = match stream.peek() {
+        Some(Token::Identifier(name)) => {
+            if super::reserved::is_reserved_keyword(name) {
+                return Err(Fault::Message(format!(
+                    "Attribute name is a reserved keyword; reserved keyword: {name}"
+                )));
+            }
+            PathElement::Attribute(name.clone())
+        }
+        Some(Token::NameRef(name)) => PathElement::Attribute(name.clone()),
+        _ => return Err(Fault::Syntax),
+    };
+    stream.next();
+    Ok(element)
 }
 
 /// Create the appropriate default structure for the next path element.

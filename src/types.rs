@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::de;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -253,8 +254,10 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // A member of the wrong JSON type is refused as the value is parsed,
         // ahead of the checks made on a parsed value: an empty set, a number
         // that doesn't read, a false NULL and a second member (captured
-        // eu-west-2 and us-east-1, 2026-11-08, for the second member).
-        if let Some(refusal) = wrong_json_type_in(obj) {
+        // eu-west-2 and us-east-1, 2026-11-08, for the second member). Base64
+        // that DynamoDB doesn't read is refused here too, in the same order
+        // (captured eu-west-2, 2026-11-11).
+        if let Some(refusal) = unreadable_member_in(obj) {
             return Err(de::Error::custom(format!(
                 "{}{refusal}",
                 crate::serde_errors::SERIALIZATION_MARKER
@@ -356,10 +359,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 let encoded = val
                     .as_str()
                     .expect("a member of the wrong JSON type is refused above");
-                let bytes = BASE64
-                    .decode(encoded)
-                    .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
-                Ok(AttributeValue::B(bytes))
+                Ok(AttributeValue::B(decode_base64(encoded)?))
             }
             // Both were read above; a NULL that reached here reads as true.
             "BOOL" => Ok(AttributeValue::BOOL(boolean.is_some_and(|b| b.value))),
@@ -401,11 +401,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     let encoded = item
                         .as_str()
                         .ok_or_else(|| de::Error::custom("expected string in BS"))?;
-                    decoded.push(
-                        BASE64
-                            .decode(encoded)
-                            .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?,
-                    );
+                    decoded.push(decode_base64(encoded)?);
                 }
                 Ok(AttributeValue::BS(decoded))
             }
@@ -436,13 +432,27 @@ impl<'de> Deserialize<'de> for AttributeValue {
     }
 }
 
+/// The bytes a `B` value or `BS` member reads as. The walk over the value
+/// refuses base64 DynamoDB doesn't read before this runs; should it not have,
+/// the refusal is the same one.
+fn decode_base64<E: de::Error>(encoded: &str) -> std::result::Result<Vec<u8>, E> {
+    crate::wire_base64::decode(encoded).map_err(|refusal| {
+        E::custom(format!(
+            "{}{}",
+            crate::serde_errors::SERIALIZATION_MARKER,
+            refusal.message()
+        ))
+    })
+}
+
 /// What an attribute value member, or a member of one of its lists or maps,
 /// holds as JSON.
 #[derive(Clone, Copy)]
 enum JsonSlot {
     /// A string: `S`, `N`, and the members of `SS` and `NS`.
     Text,
-    /// A base64 string: `B`, and the members of `BS`.
+    /// A base64 string: `B`, and the members of `BS`. The text is read as
+    /// DynamoDB reads it (`wire_base64`), and refused in its words.
     Bytes,
     /// An array: `SS`, `NS`, `BS` and `L`.
     List,
@@ -455,10 +465,24 @@ enum JsonSlot {
 
 impl JsonSlot {
     /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong
-    /// (captured eu-west-2 and us-east-1, 2026-11-08); `None` when the type is
-    /// right, or for JSON null, which the readers below deal with. An empty
-    /// refusal is a `SerializationException` with no message.
-    fn refusal(self, value: &serde_json::Value) -> Option<&'static str> {
+    /// (captured eu-west-2 and us-east-1, 2026-11-08), or when it is base64
+    /// text DynamoDB doesn't read (captured eu-west-2, 2026-11-11); `None`
+    /// when the value reads, or for JSON null, which the readers below deal
+    /// with. An empty refusal is a `SerializationException` with no message.
+    fn refusal(self, value: &serde_json::Value) -> Option<Cow<'static, str>> {
+        self.json_type_refusal(value)
+            .map(Cow::Borrowed)
+            .or_else(|| match (self, value) {
+                (Self::Bytes, serde_json::Value::String(text)) => {
+                    crate::wire_base64::check(text).err().map(|r| r.message())
+                }
+                _ => None,
+            })
+    }
+
+    /// DynamoDB's refusal of `value` in this slot when its JSON type is wrong;
+    /// `None` when the type is right, or for JSON null.
+    fn json_type_refusal(self, value: &serde_json::Value) -> Option<&'static str> {
         use serde_json::Value;
         const MAP_HERE: &str = "Start of structure or map found where not expected";
         match (self, value) {
@@ -487,20 +511,23 @@ impl JsonSlot {
 
 /// DynamoDB's refusal of an attribute value, written as the JSON object
 /// `value`, when one of its type members, or anything nested in its `L` or
-/// `M`, has the wrong JSON type; `None` when the JSON types are right.
+/// `M`, has the wrong JSON type or is base64 DynamoDB doesn't read; `None`
+/// when every member reads.
 /// DynamoDB refuses these as it parses the whole value, so a fault nested in
 /// an `L` or `M` comes ahead of the outer value's own faults, such as a second
 /// member. Members are looked at in key order, which serde_json keeps sorted.
-fn wrong_json_type_in(value: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+fn unreadable_member_in(
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Cow<'static, str>> {
     value
         .iter()
-        .find_map(|(type_key, member)| wrong_json_type(type_key, member))
+        .find_map(|(type_key, member)| unreadable_member(type_key, member))
 }
 
 /// DynamoDB's refusal of an attribute value's `type_key` member when it, or
-/// anything in it, has the wrong JSON type; `None` when the JSON types are
-/// right, and for a member that isn't one of these types.
-fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<&'static str> {
+/// anything in it, has the wrong JSON type or is base64 DynamoDB doesn't
+/// read; `None` when it reads, and for a member that isn't one of these types.
+fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'static, str>> {
     let (slot, members) = match type_key {
         "S" | "N" => (JsonSlot::Text, None),
         "B" => (JsonSlot::Bytes, None),
@@ -516,7 +543,7 @@ fn wrong_json_type(type_key: &str, value: &serde_json::Value) -> Option<&'static
     let members = members?;
     let member_refusal = |item: &serde_json::Value| {
         members.refusal(item).or_else(|| match item {
-            serde_json::Value::Object(nested) => wrong_json_type_in(nested),
+            serde_json::Value::Object(nested) => unreadable_member_in(nested),
             _ => None,
         })
     };
@@ -595,6 +622,24 @@ pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+/// Deserialise `ConsistentRead` on ExecuteStatement or a BatchExecuteStatement
+/// member: by [`deserialize_lenient_flag`]'s rule, except that a list is
+/// refused with no message, as DynamoDB refuses it (captured eu-west-2 and
+/// us-east-1, 2026-11-11). The shared reader answers a list differently for
+/// the other operations, and that is not changed here. The same rule for
+/// ExecuteStatement's own field is in `serialization_checks::check_types`,
+/// which reads the request first.
+pub(crate) fn deserialize_statement_flag<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        value => read_lenient_bool(&value)
+            .map(|flag| Some(flag.value))
+            .map_err(de::Error::custom),
+    }
+}
+
 /// The malformed-request error, marked for a `SerializationException`, for the
 /// first `Exists` or value in a legacy condition map (`QueryFilter`,
 /// `ScanFilter`, `KeyConditions`, `Expected`) that can't be read: a `BOOL`,
@@ -639,7 +684,12 @@ pub(crate) fn malformed_condition_value(conditions: Option<&serde_json::Value>) 
 
 /// Whether a request's own boolean member written as a string reads as a
 /// boolean, by the rule [`deserialize_lenient_flag`] follows.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) fn reads_as_flag(text: &str) -> bool {
     lenient_bool_text(text).is_some()
 }
@@ -810,8 +860,9 @@ pub(crate) fn with_value_layer<T>(
 /// Run `future` with values read under `layer`, set around each of its polls
 /// and restored after, so the layer holds across the future's awaits without
 /// reaching anything polled in between. The wasm engine's single thread runs
-/// other requests between those polls.
-#[cfg(any(feature = "wasm-sqlite", test))]
+/// other requests between those polls, and the MCP server's runtime can run
+/// another tool call on the same thread.
+#[cfg(any(feature = "mcp-server", feature = "wasm-sqlite", test))]
 pub(crate) async fn with_value_layer_async<F: std::future::Future>(
     layer: crate::validation::ValueLayer,
     future: F,
@@ -841,45 +892,6 @@ pub(crate) async fn with_value_layer_async<F: std::future::Future>(
 /// rule, which [`validate_parameter_number`] holds.
 pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
     with_value_layer(crate::validation::ValueLayer::Older, read)
-}
-
-/// Deserialise an operation's `ExpressionAttributeValues` on the older
-/// validation layer, which refuses a number it can't store inside the
-/// `ExpressionAttributeValues contains invalid value: ... for key :k` wrapper
-/// (TransactWriteItems in three of four regions, Scan in seven of ten;
-/// 2026-10-09). Every other value error passes through as it is.
-pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    let Some(raw) =
-        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
-    else {
-        return Ok(None);
-    };
-    let mut values = HashMap::with_capacity(raw.len());
-    for (key, value) in raw {
-        let read = with_value_layer(crate::validation::ValueLayer::Older, || {
-            serde_json::from_value::<AttributeValue>(value)
-        });
-        match read {
-            Ok(av) => {
-                values.insert(key, av);
-            }
-            Err(e) => {
-                use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
-                let msg = e.to_string();
-                return Err(de::Error::custom(match value_refusal(&msg) {
-                    ValueRefusal::Number(inner) => format!(
-                        "{}{}",
-                        crate::serde_errors::VALIDATION_MARKER,
-                        named_value_refusal(inner, &key)
-                    ),
-                    _ => msg,
-                }));
-            }
-        }
-    }
-    Ok(Some(values))
 }
 
 /// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
@@ -968,6 +980,199 @@ pub(crate) fn deserialize_parameters<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Vec<AttributeValue>>, D::Error> {
     reading_parameters(|| Option::<Vec<AttributeValue>>::deserialize(deserializer))
+}
+
+/// A statement's `Parameters` as read off the wire, with the first value
+/// DynamoDB refuses held back.
+///
+/// DynamoDB reads the whole request, then checks its members (`Limit`, the
+/// modes, the statement, the token), then walks the parameters, so a member
+/// error comes back ahead of a parameter it refuses, while a parameter of the
+/// wrong JSON type fails the request ahead of both, even after one refused
+/// for its value (captured eu-west-2, 10 November 2026). The request decoder
+/// raises [`HeldParameters::refusal`] once its member checks pass.
+#[derive(Debug, Default)]
+pub(crate) struct HeldParameters {
+    /// The parameters, each refused one replaced by `{"NULL": true}` so the
+    /// list keeps the length it was sent with. Never run: the refusal is
+    /// raised first.
+    pub(crate) values: Option<Vec<AttributeValue>>,
+    /// The first refusal, as the decoder raised it, marker and all.
+    pub(crate) refusal: Option<String>,
+}
+
+/// Deserialise a statement's `Parameters`, reading their numbers as PartiQL
+/// parameters, into [`HeldParameters`]. Each value is read on its own, in
+/// order, so one refused for its value doesn't stop a later one failing the
+/// request as malformed. Values are read one at a time off the stream, so
+/// only one parameter's JSON is held at once.
+pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HeldParameters, D::Error> {
+    struct List;
+
+    impl<'de> de::Visitor<'de> for List {
+        type Value = HeldParameters;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            // `serde_errors` maps a wrong-type list by this exact wording.
+            f.write_str("a sequence")
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<HeldParameters, E> {
+            Ok(HeldParameters::default())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<HeldParameters, E> {
+            Ok(HeldParameters::default())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<HeldParameters, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<HeldParameters, A::Error> {
+            let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(256));
+            let mut refusal = None;
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                // A parameter that isn't an object (or null) is malformed, as
+                // an `L` or `M` member would be: `"str"` answers `Unexpected
+                // value type in payload`, ahead of `Limit` (captured
+                // eu-west-2, 10 November 2026).
+                if let Some(malformed) = JsonSlot::Value.refusal(&value) {
+                    return Err(de::Error::custom(format!(
+                        "{}{malformed}",
+                        crate::serde_errors::SERIALIZATION_MARKER
+                    )));
+                }
+                match reading_parameters(|| serde_json::from_value::<AttributeValue>(value)) {
+                    Ok(value) => values.push(value),
+                    Err(e) => {
+                        let message = e.to_string();
+                        if !crate::serde_errors::is_validation_refusal(&message) {
+                            return Err(de::Error::custom(message));
+                        }
+                        refusal.get_or_insert(message);
+                        values.push(AttributeValue::NULL(true));
+                    }
+                }
+            }
+            Ok(HeldParameters {
+                values: Some(values),
+                refusal,
+            })
+        }
+    }
+
+    deserializer.deserialize_option(List)
+}
+
+/// A map of attribute values read off the wire, such as a transaction
+/// action's `Item`, `Key` or `ExpressionAttributeValues`, with the first value
+/// DynamoDB refuses held back, as [`HeldParameters`] holds a parameter. A
+/// value of the wrong JSON type still fails the read there and then, wherever
+/// it sits in the map, as DynamoDB fails the request ahead of its member
+/// checks. The request decoder raises the refusal once those checks pass.
+#[derive(Debug, Default)]
+pub(crate) struct HeldValues {
+    /// The values read, each refused one left out. `None` when the map was
+    /// left out or given as null.
+    pub(crate) values: Option<HashMap<String, AttributeValue>>,
+    /// The first refusal, as the reader raised it, marker and all.
+    pub(crate) refusal: Option<String>,
+}
+
+impl HeldValues {
+    /// Whether the map was left out or given as null.
+    pub(crate) fn is_null(&self) -> bool {
+        self.values.is_none() && self.refusal.is_none()
+    }
+
+    /// The values, this map's refusal kept in `refusal` if none is yet.
+    pub(crate) fn take(
+        self,
+        refusal: &mut Option<String>,
+    ) -> Option<HashMap<String, AttributeValue>> {
+        if let Some(held) = self.refusal {
+            refusal.get_or_insert(held);
+        }
+        self.values
+    }
+}
+
+/// Sort the message one value's read failed with: a refusal DynamoDB raises
+/// once the request's members pass is returned to be held, and anything else,
+/// a value of the wrong JSON type, fails the read.
+fn hold<E: de::Error>(message: String) -> std::result::Result<String, E> {
+    if crate::serde_errors::is_validation_refusal(&message) {
+        Ok(message)
+    } else {
+        Err(E::custom(message))
+    }
+}
+
+/// Deserialise an `Item`, a `Key` or `ExpressionAttributeValues` into
+/// [`HeldValues`], one value at a time in the order written. Every value is
+/// read through the one `from_value` call below, with its attribute's name or
+/// placeholder in hand, so that is where a refusal that names it belongs.
+pub(crate) fn deserialize_held_attributes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HeldValues, D::Error> {
+    struct Attributes;
+
+    impl<'de> de::Visitor<'de> for Attributes {
+        type Value = HeldValues;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a map")
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
+            Ok(HeldValues::default())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
+            Ok(HeldValues::default())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<HeldValues, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<HeldValues, A::Error> {
+            let mut values = HashMap::with_capacity(map.size_hint().unwrap_or(0).min(256));
+            let mut refusal = None;
+            while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
+                match serde_json::from_value::<AttributeValue>(value) {
+                    Ok(value) => {
+                        values.insert(name, value);
+                    }
+                    Err(e) => {
+                        let held = hold::<A::Error>(e.to_string())?;
+                        refusal.get_or_insert(held);
+                    }
+                }
+            }
+            Ok(HeldValues {
+                values: Some(values),
+                refusal,
+            })
+        }
+    }
+
+    deserializer.deserialize_option(Attributes)
 }
 
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's
@@ -2282,29 +2487,46 @@ pub fn f32_number_string(v: f32) -> String {
 }
 
 /// Provisioned throughput settings (stored but not enforced).
+///
+/// A unit is read as DynamoDB reads a Long member: a fraction truncates and a
+/// malformed number token is read by its integer rule (see
+/// `number_tokens::deserialize_units`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvisionedThroughput {
-    #[serde(rename = "ReadCapacityUnits", alias = "read_capacity_units", default)]
+    #[serde(
+        rename = "ReadCapacityUnits",
+        alias = "read_capacity_units",
+        default,
+        deserialize_with = "crate::number_tokens::deserialize_units"
+    )]
     pub read_capacity_units: Option<i64>,
-    #[serde(rename = "WriteCapacityUnits", alias = "write_capacity_units", default)]
+    #[serde(
+        rename = "WriteCapacityUnits",
+        alias = "write_capacity_units",
+        default,
+        deserialize_with = "crate::number_tokens::deserialize_units"
+    )]
     pub write_capacity_units: Option<i64>,
 }
 
 /// On-demand (PAY_PER_REQUEST) throughput ceilings (stored but not enforced).
+/// The units are read as [`ProvisionedThroughput`]'s are.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct OnDemandThroughput {
     #[serde(
         rename = "MaxReadRequestUnits",
         alias = "max_read_request_units",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::number_tokens::deserialize_units"
     )]
     pub max_read_request_units: Option<i64>,
     #[serde(
         rename = "MaxWriteRequestUnits",
         alias = "max_write_request_units",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::number_tokens::deserialize_units"
     )]
     pub max_write_request_units: Option<i64>,
 }
@@ -2611,6 +2833,22 @@ mod tests {
                 assert!(read.is_ok(), "{value} panicked");
             }
         }
+    }
+
+    #[test]
+    fn base64_reaching_the_decoder_unread_is_refused_not_panicked() {
+        let refused = decode_base64::<serde_json::Error>("!!").unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "{}Base64 encoded length is expected a multiple of 4 bytes but found: 2",
+                crate::serde_errors::SERIALIZATION_MARKER
+            )
+        );
+        assert_eq!(
+            decode_base64::<serde_json::Error>("QQ").unwrap(),
+            vec![0x41]
+        );
     }
 
     use super::*;

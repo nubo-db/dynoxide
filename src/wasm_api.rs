@@ -156,6 +156,41 @@ pub async fn dispatch_http<S: StorageBackend>(
     body: &str,
     auth: crate::auth_material::AuthMaterial<'_>,
 ) -> HttpOutcome {
+    // A number token JSON doesn't allow is read as DynamoDB reads it, as on
+    // the native server (see `number_tokens`). The table is set around every
+    // poll, since this thread answers other requests between them.
+    match crate::number_tokens::stand_in_malformed_numbers(body) {
+        Some((body, stand_ins)) => {
+            crate::number_tokens::with_stand_ins_async(
+                Some(stand_ins),
+                answer_http(backend, ctx, target, &body, auth),
+            )
+            .await
+        }
+        None => answer_http(backend, ctx, target, body, auth).await,
+    }
+}
+
+/// The error outcome for `e`, or a bare `SerializationException` when the
+/// answer would quote a stand-in for a malformed number token: that comes from
+/// a member that doesn't read such tokens, and gets the answer the token got
+/// before DynamoDB's reading of them was known.
+fn error_outcome(e: DynoxideError, operation: &str) -> HttpOutcome {
+    let json = e.to_json_for(operation);
+    if crate::number_tokens::error_quotes_stand_in(&json) {
+        return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+    }
+    HttpOutcome::new(e.status_code(), json)
+}
+
+/// [`dispatch_http`] once malformed number tokens have stand-ins.
+async fn answer_http<S: StorageBackend>(
+    backend: &S,
+    ctx: &DispatchContext<'_>,
+    target: Option<&str>,
+    body: &str,
+    auth: crate::auth_material::AuthMaterial<'_>,
+) -> HttpOutcome {
     // Non-JSON body → bare SerializationException, before the target is read.
     // Valid JSON nested deeper than the parser follows is still read, as
     // DynamoDB reads it: see `deep_nesting`.
@@ -202,15 +237,24 @@ pub async fn dispatch_http<S: StorageBackend>(
         return HttpOutcome::new(501, unsupported_envelope(operation));
     }
 
+    // PartiQL parameters fail on whichever fault DynamoDB's walk meets first
+    // (see `deep_nesting::parameter_order`). A rewrite can leave the body
+    // shallow enough to parse, so whether it is too deep is decided again.
+    let in_walk_order = crate::deep_nesting::in_walk_order(operation, body);
+    if let Some((_, still_too_deep)) = &in_walk_order {
+        too_deep = *still_too_deep;
+    }
+    let body = in_walk_order
+        .as_ref()
+        .map_or(body, |(rewritten, _)| rewritten.as_str());
+
     let rewritten;
     let body = if too_deep {
         match crate::deep_nesting::resolve(operation, body) {
             crate::deep_nesting::DeepBody::Unreadable => {
                 return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
             }
-            crate::deep_nesting::DeepBody::Refuse(e) => {
-                return HttpOutcome::new(e.status_code(), e.to_json_for(operation));
-            }
+            crate::deep_nesting::DeepBody::Refuse(e) => return error_outcome(e, operation),
             crate::deep_nesting::DeepBody::Run(body) => {
                 rewritten = body;
                 rewritten.as_str()
@@ -225,7 +269,7 @@ pub async fn dispatch_http<S: StorageBackend>(
     // serialised envelope. Same source of truth as the native server.
     match route(backend, ctx, operation, body).await {
         Ok(json) => HttpOutcome::new(200, json),
-        Err(e) => HttpOutcome::new(e.status_code(), e.to_json_for(operation)),
+        Err(e) => error_outcome(e, operation),
     }
 }
 
@@ -263,6 +307,40 @@ pub async fn dispatch<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
+    // A number token JSON doesn't allow is read as DynamoDB reads it, as on
+    // the wire (see `dispatch_http`).
+    let Some((request_json, stand_ins)) =
+        crate::number_tokens::stand_in_malformed_numbers(request_json)
+    else {
+        return answer(backend, ctx, op, request_json).await;
+    };
+    crate::number_tokens::with_stand_ins_async(Some(stand_ins), async {
+        answer(backend, ctx, op, &request_json)
+            .await
+            .map_err(|json| {
+                if crate::number_tokens::error_quotes_stand_in(&json) {
+                    SERIALIZATION_EXCEPTION_BARE.to_string()
+                } else {
+                    json
+                }
+            })
+    })
+    .await
+}
+
+/// [`dispatch`] once malformed number tokens have stand-ins.
+async fn answer<S: StorageBackend>(
+    backend: &S,
+    ctx: &DispatchContext<'_>,
+    op: &str,
+    request_json: &str,
+) -> std::result::Result<String, String> {
+    // PartiQL parameters fail on whichever fault DynamoDB's walk meets first
+    // (see `deep_nesting::parameter_order`).
+    let in_walk_order = crate::deep_nesting::in_walk_order(op, request_json);
+    let request_json = in_walk_order
+        .as_ref()
+        .map_or(request_json, |(rewritten, _)| rewritten.as_str());
     match route(backend, ctx, op, request_json).await {
         Ok(json) => Ok(json),
         // A request nested deeper than the parser follows fails to decode before
@@ -399,14 +477,7 @@ async fn route<S: StorageBackend>(
     // serialising, and give ExecuteStatement's condition failure carrying an
     // item its own shape.
     result.map_err(|e| {
-        let resolved = match layer {
-            crate::validation::ValueLayer::Older => {
-                crate::validation::strip_request_validation_tag(e)
-            }
-            crate::validation::ValueLayer::Current => {
-                crate::validation::resolve_request_validation_tag(op, e)
-            }
-        };
+        let resolved = crate::validation::resolve_request_validation_on(op, layer, e);
         crate::errors::for_operation(op, resolved)
     })
 }
@@ -685,6 +756,46 @@ mod tests {
             );
             assert_eq!(v["Message"], expected, "{body}");
         }
+    }
+
+    #[test]
+    fn base64_dynamodb_refuses_is_refused_in_its_words() {
+        // The wasm surface reads values with the same decoder as the HTTP
+        // server (captured eu-west-2, 2026-11-11).
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for (value, expected) in [
+            (
+                "!!",
+                Some("Base64 encoded length is expected a multiple of 4 bytes but found: 2"),
+            ),
+            (
+                "ab==",
+                Some("Invalid last non-pad Base64 character dectected"),
+            ),
+            ("!!!!", None),
+        ] {
+            let body = format!(
+                r#"{{"TableName":"Music","Item":{{"artist":{{"S":"a"}},"song":{{"S":"a"}},"b":{{"B":"{value}"}}}}}}"#
+            );
+            let err = run(&backend, "PutItem", &body).unwrap_err();
+            let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert!(
+                v["__type"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SerializationException"),
+                "{value}: got {v}"
+            );
+            assert_eq!(
+                v.get("Message").and_then(|m| m.as_str()),
+                expected,
+                "{value}: got {v}"
+            );
+        }
+        let body =
+            r#"{"TableName":"Music","Item":{"artist":{"S":"a"},"song":{"S":"a"},"b":{"B":"QQ"}}}"#;
+        run(&backend, "PutItem", body).unwrap();
     }
 
     #[test]
@@ -1019,6 +1130,34 @@ mod tests {
     }
 
     #[test]
+    fn a_partiql_member_error_comes_before_a_refused_parameter() {
+        // Captured eu-west-2, 10 November 2026.
+        let backend = Storage::memory().unwrap();
+        let select = r#""Statement":"SELECT * FROM \"Missing\" WHERE pk = ?""#;
+        for (op, body, message) in [
+            (
+                "ExecuteStatement",
+                format!(r#"{{{select},"Parameters":[{{"N":"abc"}}],"Limit":0}}"#),
+                "1 validation error detected: Value '0' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1",
+            ),
+            (
+                "ExecuteTransaction",
+                format!(
+                    r#"{{"TransactStatements":[{{{select},"Parameters":[{{}}]}}],"ReturnConsumedCapacity":"BAD"}}"#
+                ),
+                "1 validation error detected: Value 'BAD' at 'returnConsumedCapacity' failed \
+                 to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, \
+                 NONE]",
+            ),
+        ] {
+            let err = run(&backend, op, &body).unwrap_err();
+            let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+            assert_eq!(v["message"], message, "{op}: {err}");
+        }
+    }
+
+    #[test]
     fn malformed_request_json_is_a_serialization_error() {
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "PutItem", "{ this is not json").unwrap_err();
@@ -1326,6 +1465,81 @@ mod tests {
         );
         let err = run(&backend, "PutItem", &deep_music_item(2001)).unwrap_err();
         assert_eq!(err, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    /// An ExecuteStatement on Music with these two parameters.
+    fn two_parameter_statement(first: &str, second: &str) -> String {
+        format!(
+            r#"{{"Statement":"SELECT * FROM \"Music\" WHERE artist = 'a' AND x = ? AND y = ?","Parameters":[{first},{second}]}}"#
+        )
+    }
+
+    #[test]
+    fn malformed_number_tokens_are_read_as_dynamodb_reads_them_on_both_entry_points() {
+        // Captured eu-west-2, 9 and 10 November 2026: a malformed token is
+        // accepted where nothing reads it and read by the integer rule in
+        // `Limit`. A member outside that rule refuses it, quoting nothing.
+        const BAD_NUMBER: &str = r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Bad number format"}"#;
+        const AT_LEAST_1: &str = "1 validation error detected: Value '0' at 'limit' failed to \
+                                  satisfy constraint: Member must have value greater than or equal to 1";
+        let backend = Storage::memory().unwrap();
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        let both = |op: &str, body: &str| {
+            let out = http(&backend, Some(&format!("DynamoDB_20120810.{op}")), body);
+            let run = run(&backend, op, body);
+            (out, run)
+        };
+        for body in [r#"{"Foo":1.5.5,"Bar":[01,-,1e]}"#, r#"{"Limit":01}"#] {
+            let (out, run) = both("ListTables", body);
+            assert_eq!(out.status, 200, "{body}: {}", out.body);
+            assert_eq!(json(&out.body), json(&run.unwrap()), "{body}");
+        }
+        let (out, run) = both("ListTables", r#"{"Limit":-}"#);
+        assert_eq!(json(&out.body)["message"], AT_LEAST_1);
+        assert_eq!(json(&run.unwrap_err())["message"], AT_LEAST_1);
+        let (out, run) = both("ListTables", r#"{"Limit":1.5.5}"#);
+        assert_eq!(json(&out.body), json(BAD_NUMBER));
+        assert_eq!(json(&run.unwrap_err()), json(BAD_NUMBER));
+        let dimensions = r#"{"TableName":"vectors","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","VectorIndexes":[{"IndexName":"v","VectorAttribute":{"AttributeName":"vec"},"Dimensions":01,"DistanceFunction":"COSINE","Projection":{"ProjectionType":"ALL"}}]}"#;
+        let (out, run) = both("CreateTable", dimensions);
+        assert_eq!(
+            (out.status, out.body.as_str()),
+            (400, SERIALIZATION_EXCEPTION_BARE)
+        );
+        assert_eq!(run.unwrap_err(), SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    #[test]
+    fn a_deep_parameter_and_a_bad_number_are_reported_in_walk_order_on_both_entry_points() {
+        // Captured eu-west-2 and us-east-1, 2026-10-09: the first fault in
+        // the list wins, at a depth the parser follows and one it doesn't.
+        const ABC: &str = "The parameter cannot be converted to a numeric value: abc";
+        const BAD: &str = r#"{"N":"abc"}"#;
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        for depth in [40, 100] {
+            let deep = format!(
+                "{}{{\"S\":\"leaf\"}}{}",
+                "{\"M\":{\"n\":".repeat(depth),
+                "}}".repeat(depth)
+            );
+            for (body, answer) in [
+                (
+                    two_parameter_statement(&deep, BAD),
+                    crate::validation::NESTING_LIMIT_MESSAGE,
+                ),
+                (two_parameter_statement(BAD, &deep), ABC),
+            ] {
+                let out = http(&backend, Some("DynamoDB_20120810.ExecuteStatement"), &body);
+                assert_eq!(out.status, 400, "{}", out.body);
+                let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+                assert_eq!(v["message"], answer, "depth {depth}: {}", out.body);
+
+                let err = run(&backend, "ExecuteStatement", &body).unwrap_err();
+                let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+                assert_eq!(v["message"], answer, "depth {depth}: {err}");
+            }
+        }
     }
 
     #[test]

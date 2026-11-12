@@ -83,10 +83,19 @@ pub(crate) mod set_order;
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.
 pub(crate) mod serde_errors;
-// Shared by the HTTP server and the wasm dispatch: both must reject a
-// mistyped field with the same SerializationException, or the two surfaces
-// disagree on requests neither has deserialised yet.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+// Number tokens DynamoDB reads that JSON doesn't: the stand-ins the wire
+// seams put in their place and the integer members' reading of them.
+pub(crate) mod number_tokens;
+// Shared by the HTTP server, the wasm dispatch and the MCP tools that decode
+// a wire request: all must reject a mistyped field with the same
+// SerializationException, or the surfaces disagree on requests none has
+// deserialised yet.
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) mod serialization_checks;
 // Nesting checks for values outside an item or an expression: keys, start
 // keys, legacy conditions and PartiQL parameters.
@@ -114,6 +123,8 @@ pub mod streams;
 pub mod ttl;
 pub mod types;
 pub mod validation;
+// How DynamoDB reads the base64 text of a binary value in a request.
+pub(crate) mod wire_base64;
 // The single source of truth for DynamoDB operation names, shared by the HTTP
 // server and the wasm engine API so the two lists cannot drift. Compiled only
 // for the builds that consume it.
@@ -276,7 +287,7 @@ const MAX_TOKEN_LEN: usize = 36;
 /// than this are evicted on the next token-bearing call.
 const TOKEN_EXPIRY_SECS: u64 = 600;
 
-/// Reject a token longer than DynamoDB accepts, with its exact message.
+/// Reject a token of a length DynamoDB refuses, with its exact message.
 fn validate_token(token: Option<&str>) -> Result<()> {
     match token_constraint_error(token) {
         Some(msg) => Err(DynoxideError::ValidationException(
@@ -286,16 +297,39 @@ fn validate_token(token: Option<&str>) -> Result<()> {
     }
 }
 
-/// The constraint error for a token longer than DynamoDB accepts, without the
-/// envelope, so a caller can report it alongside the request's other member
-/// errors.
-pub(crate) fn token_constraint_error(token: Option<&str>) -> Option<String> {
+/// The length constraint a token breaks: empty, or longer than DynamoDB
+/// accepts. A token left out, or given as `null`, breaks none.
+fn token_length_constraint(token: Option<&str>) -> Option<String> {
     match token {
+        Some("") => Some("Member must have length greater than or equal to 1".to_string()),
         Some(token) if token.len() > MAX_TOKEN_LEN => Some(format!(
-            "Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
+            "Member must have length less than or equal to {MAX_TOKEN_LEN}"
         )),
         _ => None,
     }
+}
+
+/// The constraint error for a token of a length DynamoDB refuses, in the
+/// newer form that echoes the value, without the envelope, so a caller can
+/// report it alongside the request's other member errors. ExecuteTransaction
+/// always words it this way, as TransactWriteItems does beside a required
+/// member left null (captured eu-west-2 and us-east-1, 2026-11-11).
+pub(crate) fn token_constraint_error(token: Option<&str>) -> Option<String> {
+    let constraint = token_length_constraint(token)?;
+    let token = token.unwrap_or_default();
+    Some(format!(
+        "Value '{token}' at 'clientRequestToken' failed to satisfy constraint: {constraint}"
+    ))
+}
+
+/// The same error in the older form, with no value echoed and the member
+/// named as it is spelt on the wire, as TransactWriteItems reports it when no
+/// required member is null (captured eu-west-2 and us-east-1, 2026-11-11).
+pub(crate) fn older_token_constraint_error(token: Option<&str>) -> Option<String> {
+    let constraint = token_length_constraint(token)?;
+    Some(format!(
+        "Value at 'ClientRequestToken' failed to satisfy constraint: {constraint}"
+    ))
 }
 
 /// Hash the idempotency key material.
@@ -2296,6 +2330,18 @@ mod idempotency_tests {
                 "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
             )
         );
+    }
+
+    #[test]
+    fn an_empty_token_is_rejected_with_dynamodbs_message() {
+        let cache = cache();
+        let err = drive(&cache, Some(""), async { Ok(7) }).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 validation error detected: Value '' at 'clientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1"
+        );
+        assert!(cache.lock().unwrap().is_empty());
     }
 
     #[test]

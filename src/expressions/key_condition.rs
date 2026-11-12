@@ -903,7 +903,11 @@ fn resolve_path_to_name(
     match &path[0] {
         PathElement::Attribute(name) => {
             if name.starts_with('#') {
-                tracker.resolve_name(name)
+                // An undefined name carries the expression's prefix (captured
+                // eu-west-2 and us-east-1, 2026-11-11).
+                tracker
+                    .resolve_name(name)
+                    .map_err(|e| format!("Invalid KeyConditionExpression: {e}"))
             } else {
                 Ok(name.clone())
             }

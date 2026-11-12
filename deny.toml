@@ -32,6 +32,12 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "MPL-2.0",
+    # sqlcipher-src, a build dependency of libsqlite3-sys that only the
+    # encryption features compile, is "MIT AND BSD-3-Clause AND blessing AND
+    # WTFPL". blessing is SQLite's public-domain dedication; WTFPL is
+    # permissive. about.toml skips build dependencies, so it needs neither.
+    "blessing",
+    "WTFPL",
 ]
 # A few allowed licences (ISC, OpenSSL, MIT-0, CC0-1.0) are only reachable under
 # certain feature combinations; keep them for about.toml parity without warning

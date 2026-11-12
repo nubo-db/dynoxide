@@ -71,12 +71,17 @@ fn java_string_value(s: &str) -> String {
     )
 }
 
-fn token_message(token: &str) -> String {
-    format!(
-        "Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have \
-         length less than or equal to 36"
-    )
-}
+/// An item in TransactItems that names no action.
+const EMPTY_ACTION: &str = "Value '' at 'transactItems' failed to satisfy constraint: \
+                            TransactWriteRequest should contain Delete or Put or Update or \
+                            ConditionCheck";
+
+/// An overlong token as TransactWriteItems words it when no required member is
+/// null: the older form, with no value echoed, reported with nothing else
+/// beside it but the length of `TransactItems` (captured eu-west-2 and
+/// us-east-1, 2026-11-11).
+const TOKEN_TOO_LONG: &str = "Value at 'ClientRequestToken' failed to satisfy constraint: Member \
+                              must have length less than or equal to 36";
 
 fn bad_name_message(name: &str, path: &str) -> String {
     format!(
@@ -190,15 +195,14 @@ fn request_member_errors_are_reported_together() {
         format!("2 validation errors detected: {RCC}; {RICM}"),
         "TransactWriteItems, both enums"
     );
+    // The token's length is a stage of its own: the enums are not listed
+    // beside it (captured eu-west-2 and us-east-1, 2026-11-11).
     assert_eq!(
         transact(serde_json::json!({
             "ClientRequestToken": token,
             "ReturnItemCollectionMetrics": "BOGUS2"
         })),
-        format!(
-            "2 validation errors detected: {}; {RICM}",
-            token_message(&token)
-        ),
+        one(TOKEN_TOO_LONG),
         "TransactWriteItems, the token and ReturnItemCollectionMetrics"
     );
     assert_eq!(
@@ -207,17 +211,17 @@ fn request_member_errors_are_reported_together() {
             "ReturnConsumedCapacity": "BOGUS",
             "ReturnItemCollectionMetrics": "BOGUS2"
         })),
-        format!(
-            "3 validation errors detected: {}; {RCC}; {RICM}",
-            token_message(&token)
-        ),
+        one(TOKEN_TOO_LONG),
         "TransactWriteItems, the token and both enums"
     );
     assert!(!stored(&db, "t"));
 }
 
+/// BatchWriteItem and TransactGetItems check a table name after the request's
+/// enums. TransactWriteItems checks it after the token and lists it with a bad
+/// enum.
 #[test]
-fn a_table_name_is_checked_after_the_request_enums_and_the_token() {
+fn a_table_name_follows_the_enums_except_in_a_transaction_write_which_lists_them_together() {
     let db = setup();
     let token = "x".repeat(37);
 
@@ -229,20 +233,26 @@ fn a_table_name_is_checked_after_the_request_enums_and_the_token() {
         .unwrap_err();
     assert_eq!(validation_message(err), one(RICM), "BatchWriteItem");
 
+    // A refused table name is listed with a bad enum, the name first: "TW bad
+    // name put + RCC" and "TW bad name + RICM" in the 2026-10-09
+    // valid-txbatch capture, where eu-west-2 and eu-north-1 listed both and
+    // the ten other regions the enum alone, and the same requests in
+    // eu-west-2 and us-east-1 on 2026-11-11, which both listed both.
     let bad_put =
         serde_json::json!([{"Put": {"TableName": "bad!name", "Item": {"pk": {"S": "a"}}}}]);
+    let bad_name = bad_name_message("bad!name", "transactItems.1.member.put.tableName");
     for (extra, expected) in [
         (
             serde_json::json!({"ReturnConsumedCapacity": "BOGUS"}),
-            one(RCC),
+            format!("2 validation errors detected: {bad_name}; {RCC}"),
         ),
         (
             serde_json::json!({"ReturnItemCollectionMetrics": "BOGUS2"}),
-            one(RICM),
+            format!("2 validation errors detected: {bad_name}; {RICM}"),
         ),
         (
             serde_json::json!({"ClientRequestToken": token}),
-            one(&token_message(&token)),
+            one(TOKEN_TOO_LONG),
         ),
     ] {
         let mut value = serde_json::json!({"TransactItems": bad_put});
@@ -526,8 +536,9 @@ fn a_transaction_item_must_carry_exactly_one_action() {
     let write = |value: serde_json::Value| {
         validation_message(db.transact_write_items(request(value)).unwrap_err())
     };
-    let no_action =
-        "Invalid Request: TransactWriteRequest should contain Delete or Put or Update request";
+    // An item naming no action is a member error in the newer form (captured
+    // eu-west-2 and us-east-1, 2026-11-11).
+    let no_action = one(EMPTY_ACTION);
 
     assert_eq!(
         write(serde_json::json!({"TransactItems": [{}]})),
@@ -542,10 +553,12 @@ fn a_transaction_item_must_carry_exactly_one_action() {
         no_action,
         "an action with no operation wins over a malformed table name"
     );
+    // Listed together with the request's enums, the empty action first
+    // (captured eu-west-2 and us-east-1, 2026-11-11, third round row 3).
     assert_eq!(
         write(serde_json::json!({"TransactItems": [{}], "ReturnItemCollectionMetrics": "BOGUS2"})),
-        one(RICM),
-        "the request enums come first"
+        format!("2 validation errors detected: {EMPTY_ACTION}; {RICM}"),
+        "listed with the request enums"
     );
 
     assert_eq!(
@@ -658,10 +671,10 @@ async fn a_transact_get_item_without_its_get_is_refused_with_dynamodbs_message()
 }
 
 /// `ReturnValuesOnConditionCheckFailure` on a transaction action is a member of
-/// the request, checked in the first pass: every action's, in request order,
-/// ahead of the token and the two enums, and ahead of an empty action and a
-/// table name. Captured in us-east-1 and five more regions, 2026-10-09
-/// (eu-west-2 reports the token, the enums or a table name instead).
+/// the request: the first action's that is wrong, in request order, ahead of a
+/// table name. The token's length comes first, reported alone, then the two
+/// enums when either is wrong, then an empty action (captured eu-west-2 and
+/// us-east-1, 2026-11-11).
 #[test]
 fn a_transaction_actions_return_values_on_condition_check_failure_is_a_member_error() {
     let db = setup();
@@ -711,11 +724,16 @@ fn a_transaction_actions_return_values_on_condition_check_failure_is_a_member_er
     );
     assert_eq!(
         write(serde_json::json!({"TransactItems": [put], "ReturnConsumedCapacity": "BOGUS"})),
-        format!(
-            "2 validation errors detected: {}; {RCC}",
-            rvoccf("1.member.put", "BOGUS")
+        one(RCC),
+        "behind the capacity mode (third round row 5)"
+    );
+    assert_eq!(
+        write(
+            serde_json::json!({"TransactItems": [put], "ReturnConsumedCapacity": "BOGUS",
+            "ReturnItemCollectionMetrics": "BOGUS2"})
         ),
-        "ahead of the capacity mode"
+        format!("2 validation errors detected: {RCC}; {RICM}"),
+        "behind both enums"
     );
     let token = "x".repeat(37);
     assert_eq!(
@@ -723,36 +741,42 @@ fn a_transaction_actions_return_values_on_condition_check_failure_is_a_member_er
             serde_json::json!({"TransactItems": [put], "ClientRequestToken": token,
             "ReturnConsumedCapacity": "BOGUS", "ReturnItemCollectionMetrics": "BOGUS2"})
         ),
-        format!(
-            "4 validation errors detected: {}; {}; {RCC}; {RICM}",
-            rvoccf("1.member.put", "BOGUS"),
-            token_message(&token)
-        ),
-        "ahead of the token and both enums"
+        one(TOKEN_TOO_LONG),
+        "behind the token, which is reported alone"
     );
+    // Behind a malformed table name: "TW Put RVOCCF + bad name" in eu-west-2
+    // in the 2026-10-09 valid-order capture (the other regions then gave the
+    // mode), and a table name ahead of an item naming two actions ahead of a
+    // mode in all four regions on 2026-11-11 (seventh round rows 11 and 12).
     assert_eq!(
         write(serde_json::json!({"TransactItems": [
             {"Put": {"TableName": "bad!name", "Item": {"pk": {"S": "a"}},
                 "ReturnValuesOnConditionCheckFailure": "BOGUS"}}
         ]})),
-        one(&rvoccf("1.member.put", "BOGUS")),
-        "ahead of a malformed table name"
+        one(&bad_name_message(
+            "bad!name",
+            "transactItems.1.member.put.tableName"
+        )),
+        "behind a malformed table name"
     );
+    // An empty action wins whichever item comes first (third round rows 1
+    // and 2).
     assert_eq!(
         write(serde_json::json!({"TransactItems": [{}, put]})),
-        one(&rvoccf("2.member.put", "BOGUS")),
-        "ahead of an empty action"
+        one(EMPTY_ACTION),
+        "behind an empty action written first"
+    );
+    assert_eq!(
+        write(serde_json::json!({"TransactItems": [put, {}]})),
+        one(EMPTY_ACTION),
+        "behind an empty action written second"
     );
     assert_eq!(
         write(
             serde_json::json!({"TransactItems": [put, {"Delete": {"TableName": "TestTable",
             "Key": {"pk": {"S": "b"}}, "ReturnValuesOnConditionCheckFailure": "BAD"}}]})
         ),
-        format!(
-            "2 validation errors detected: {}; {}",
-            rvoccf("1.member.put", "BOGUS"),
-            rvoccf("2.member.delete", "BAD")
-        ),
-        "every action's, in order"
+        one(&rvoccf("1.member.put", "BOGUS")),
+        "only the first action's (third round row 7)"
     );
 }

@@ -705,9 +705,12 @@ pub struct ExpressionParamContext<'a> {
     pub non_expression_params: Vec<&'a str>,
     /// Names of expression parameters that are present (e.g. "ConditionExpression", "UpdateExpression", "ProjectionExpression")
     pub expression_params: Vec<&'a str>,
-    /// All expression parameter names that could carry expressions
-    /// (used to build the "is null" message for ExpressionAttributeValues)
-    pub all_expression_param_names: Vec<&'a str>,
+    /// The expression parameters that can use ExpressionAttributeValues, where
+    /// only some of the operation's can: without one of them, values are
+    /// refused even beside another expression (a Query's or Scan's
+    /// ProjectionExpression, captured eu-west-2 and us-east-1, 2026-11-11).
+    /// Empty where any expression will do.
+    pub value_expression_params: &'a [&'a str],
     pub expression_attribute_names: &'a Option<HashMap<String, String>>,
     pub expression_attribute_values: &'a Option<HashMap<String, AttributeValue>>,
     /// Raw JSON for ExpressionAttributeValues: when present, used for key
@@ -779,21 +782,20 @@ pub fn validate_expression_params(
         ));
     }
 
-    // ExpressionAttributeValues without any expression
-    if has_values && !has_expressions {
-        let null_parts: Vec<String> = ctx
-            .all_expression_param_names
+    // ExpressionAttributeValues without an expression that can use them. The
+    // message is the same on every operation, with nothing after it (Query and
+    // Scan captured eu-west-2 and us-east-1, 2026-11-11).
+    let can_use_values = if ctx.value_expression_params.is_empty() {
+        has_expressions
+    } else {
+        ctx.expression_params
             .iter()
-            .map(|n| format!("{n} is null"))
-            .collect();
-        let suffix = if null_parts.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", null_parts.join(" and "))
-        };
-        return Err(ClassifiedValidationError::enveloped(format!(
-            "ExpressionAttributeValues can only be specified when using expressions{suffix}"
-        )));
+            .any(|p| ctx.value_expression_params.contains(p))
+    };
+    if has_values && !can_use_values {
+        return Err(ClassifiedValidationError::enveloped(
+            "ExpressionAttributeValues can only be specified when using expressions",
+        ));
     }
 
     // Empty ExpressionAttributeNames
@@ -1740,15 +1742,118 @@ pub struct ConvertedCondition {
     pub attribute_names: HashMap<String, String>,
 }
 
+/// The expressions a read carries: Query, Scan, GetItem and BatchGetItem.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ReadExpressions<'a> {
+    pub filter: Option<&'a str>,
+    pub key_condition: Option<&'a str>,
+    pub projection: Option<&'a str>,
+}
+
+/// The checks a read makes on its expressions and their attributes before the
+/// table is looked up, in DynamoDB's order: a value the FilterExpression uses
+/// but nobody defined, then one the KeyConditionExpression uses, then the
+/// ProjectionExpression (its syntax, a name nobody defined in written order,
+/// overlapping paths), and only then a name and then a value no expression
+/// uses (captured eu-west-2 and us-east-1, 2026-11-11). The FilterExpression's
+/// and KeyConditionExpression's syntax and names are checked by the caller
+/// before this, so a fault there is not reported again. Returns the parsed
+/// ProjectionExpression for the read to apply.
+pub(crate) fn validate_read_expressions(
+    names: &Option<HashMap<String, String>>,
+    values: &Option<HashMap<String, AttributeValue>>,
+    expressions: ReadExpressions<'_>,
+) -> Result<Option<crate::expressions::projection::ProjectionExpr>> {
+    use crate::expressions::{condition, key_condition, projection};
+    let tracker = crate::expressions::TrackedExpressionAttributes::new(names, values);
+    let undefined_value = |expression: &str| {
+        tracker.first_undefined_value().map(|value| {
+            DynoxideError::ValidationException(format!(
+                "Invalid {expression}: An expression attribute value used in expression \
+                 is not defined; attribute value: {value}"
+            ))
+        })
+    };
+    if let Some(Ok(filter)) = expressions
+        .filter
+        .filter(|fe| !fe.is_empty())
+        .map(condition::parse)
+    {
+        tracker.track_condition_expr(&filter);
+        if let Some(err) = undefined_value("FilterExpression") {
+            return Err(err);
+        }
+    }
+    if let Some(Ok(key_condition)) = expressions
+        .key_condition
+        .filter(|kce| !kce.is_empty())
+        .map(|kce| key_condition::parse(kce, &tracker))
+    {
+        tracker.track_key_condition(&key_condition);
+        if let Some(err) = undefined_value("KeyConditionExpression") {
+            return Err(err);
+        }
+    }
+    let projection = match expressions.projection.filter(|pe| !pe.is_empty()) {
+        Some(expr) => {
+            let parsed = projection::parse(expr).map_err(DynoxideError::ValidationException)?;
+            tracker.track_projection_expr(&parsed);
+            projection::validate(&parsed, &tracker).map_err(DynoxideError::ValidationException)?;
+            Some(parsed)
+        }
+        None => None,
+    };
+    tracker.check_unused()?;
+    Ok(projection)
+}
+
+/// The request's own `ExpressionAttributeNames` and `ExpressionAttributeValues`,
+/// which a legacy condition's generated placeholders are merged into and so
+/// must never share a key with.
+#[derive(Clone, Copy)]
+pub struct CallerPlaceholders<'a> {
+    pub names: Option<&'a HashMap<String, String>>,
+    pub values: Option<&'a HashMap<String, AttributeValue>>,
+}
+
+impl CallerPlaceholders<'_> {
+    /// A prefix for generated placeholders, `#<prefix>_<n>` and
+    /// `:<prefix>_v<n>`, that none of the caller's keys starts with, so no
+    /// generated key can be one of them: `base`, or `base` followed by the
+    /// first number that is free.
+    fn free_prefix(&self, base: &str) -> String {
+        let taken = |prefix: &str| {
+            let name_start = format!("#{prefix}_");
+            let value_start = format!(":{prefix}_");
+            self.names
+                .is_some_and(|names| names.keys().any(|k| k.starts_with(&name_start)))
+                || self
+                    .values
+                    .is_some_and(|values| values.keys().any(|k| k.starts_with(&value_start)))
+        };
+        if !taken(base) {
+            return base.to_string();
+        }
+        (1u32..)
+            .map(|n| format!("{base}{n}"))
+            .find(|prefix| !taken(prefix))
+            .expect("a finite set of keys leaves some prefix free")
+    }
+}
+
 /// Convert legacy `KeyConditions` to a KeyConditionExpression + ExpressionAttributeValues.
 ///
 /// If `partition_key_name` is provided, the partition key condition is placed
 /// first in the expression so that the key condition parser identifies it
-/// correctly (important when both hash and range use EQ).
+/// correctly (important when both hash and range use EQ). The generated
+/// placeholders never share a key with `caller`'s, which a FilterExpression or
+/// ProjectionExpression beside the conditions may use.
 pub fn convert_key_conditions(
     key_conditions: &HashMap<String, KeyCondition>,
     partition_key_name: Option<&str>,
+    caller: CallerPlaceholders<'_>,
 ) -> Result<ConvertedCondition> {
+    let prefix = caller.free_prefix("kc");
     let mut parts = Vec::new();
     let mut values = HashMap::new();
     let mut names = HashMap::new();
@@ -1769,7 +1874,7 @@ pub fn convert_key_conditions(
     // (`-`, `.`, anything outside ASCII).
     for (index, attr_name) in ordered_keys.into_iter().enumerate() {
         let cond = &key_conditions[attr_name];
-        let name_ref = format!("#kc_{index}");
+        let name_ref = format!("#{prefix}_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
         // Operators are matched as written: DynamoDB refuses `eq`.
@@ -1792,7 +1897,7 @@ pub fn convert_key_conditions(
             cond.attribute_value_list.as_deref(),
             op,
             count..=count,
-            "kc",
+            &prefix,
             &mut val_idx,
             &mut values,
         )?;
@@ -1825,10 +1930,13 @@ pub struct FilterCondition {
 }
 
 /// Convert legacy `QueryFilter` / `ScanFilter` to a FilterExpression + values + names.
+/// The generated placeholders never share a key with `caller`'s.
 pub fn convert_filter_conditions(
     conditions: &HashMap<String, FilterCondition>,
     conditional_operator: Option<&str>,
+    caller: CallerPlaceholders<'_>,
 ) -> Result<ConvertedCondition> {
+    let prefix = caller.free_prefix("qf");
     let joiner = match conditional_operator {
         Some(op) if op.eq_ignore_ascii_case("OR") => " OR ",
         _ => " AND ",
@@ -1844,7 +1952,7 @@ pub fn convert_filter_conditions(
     let mut ordered: Vec<(&String, &FilterCondition)> = conditions.iter().collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
     for (index, (attr_name, cond)) in ordered.into_iter().enumerate() {
-        let name_ref = format!("#qf_{index}");
+        let name_ref = format!("#{prefix}_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
         // Operators are matched as written: DynamoDB refuses `eq`. An unknown
@@ -1866,7 +1974,7 @@ pub fn convert_filter_conditions(
             cond.attribute_value_list.as_deref(),
             op,
             counts,
-            "qf",
+            &prefix,
             &mut val_idx,
             &mut values,
         )?;
@@ -2569,8 +2677,9 @@ fn validate_filter_attribute_value(
 }
 
 /// An integer member as DynamoDB reads it: a 32-bit signed integer that
-/// saturates at either end, truncating a fraction. A value that saturated or
-/// was written with a fraction or exponent is flagged, because the member is
+/// saturates at either end, truncating a fraction. A value that saturated, was
+/// written with a fraction or exponent, or was a token JSON doesn't allow (see
+/// `number_tokens::read_integer`) is flagged, because the member is
 /// then checked by the older layer, which reports the value as read (captured
 /// eu-west-2 and eu-central-1, 20 October 2026). `0.0` is flagged though it
 /// loses nothing: Query reports it as read, as it does `0.5` (captured
@@ -2594,38 +2703,26 @@ pub(crate) fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
     else {
         return Ok(None);
     };
-    let number = match serde_json::from_str::<serde_json::Number>(raw.get()) {
-        Ok(number) => number,
-        Err(e) if crate::serde_errors::is_number_out_of_range(&e) => {
-            let value = if raw.get().starts_with('-') {
-                i32::MIN
-            } else {
-                i32::MAX
-            };
-            return Ok(Some(Int32 {
-                value: i64::from(value),
-                coerced: true,
-            }));
+    // A malformed token is read by DynamoDB's integer rule or refused as
+    // `Bad number format` (see `number_tokens::integer_text`).
+    let crate::number_tokens::Integer {
+        value: wide,
+        lenient,
+    } = match crate::number_tokens::read_integer(raw.get()) {
+        Ok(integer) => integer,
+        Err(crate::number_tokens::IntegerFault::BadNumber) => {
+            return Err(crate::number_tokens::bad_number());
         }
-        // Anything other than a number keeps serde's own wording, which the
-        // caller maps as it did when the member was read as a number.
-        Err(e) => return Err(D::Error::custom(e)),
-    };
-    let mut float = false;
-    let wide = if let Some(i) = number.as_i64() {
-        i128::from(i)
-    } else if let Some(u) = number.as_u64() {
-        i128::from(u)
-    } else {
-        // A fraction truncates toward zero; NaN and the infinities cannot
-        // appear in JSON.
-        float = true;
-        number.as_f64().unwrap_or(0.0).trunc() as i128
+        // Anything other than a number keeps serde's own wording, which
+        // the caller maps as it did when the member was read as a number.
+        Err(crate::number_tokens::IntegerFault::NotANumber(e)) => {
+            return Err(D::Error::custom(e));
+        }
     };
     let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
     Ok(Some(Int32 {
         value: clamped as i64,
-        coerced: float || clamped != wide,
+        coerced: lenient || clamped != wide,
     }))
 }
 

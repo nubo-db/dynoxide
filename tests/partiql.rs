@@ -3402,22 +3402,29 @@ fn test_next_token_minted_for_one_table_is_rejected_by_another() {
     );
 }
 
+/// A write sent with a NextToken runs as it would without one; only a SELECT
+/// reads the token (captured eu-west-2, 2026-11-11, for INSERT, UPDATE and
+/// DELETE).
 #[test]
-fn test_next_token_is_rejected_on_a_write_statement() {
+fn test_next_token_is_ignored_on_a_write_statement() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Paged");
 
-    let err = db
+    let response = db
         .execute_statement(ExecuteStatementRequest {
             statement: "INSERT INTO \"Paged\" VALUE {'pk': 'k1'}".to_string(),
             next_token: Some("anything".to_string()),
             ..Default::default()
         })
-        .unwrap_err();
-    assert!(
-        matches!(err, DynoxideError::ValidationException(_)),
-        "{err:?}"
-    );
+        .unwrap();
+    assert!(response.next_token.is_none());
+    let read = db
+        .execute_statement(ExecuteStatementRequest {
+            statement: "SELECT pk FROM \"Paged\" WHERE pk = 'k1'".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(read.items.map(|items| items.len()), Some(1));
 }
 
 #[test]

@@ -405,11 +405,16 @@ impl fmt::Display for ErrorResponse {
 pub type Result<T> = std::result::Result<T, DynoxideError>;
 
 /// The error as `operation` puts it on the wire, for the HTTP and wasm
-/// dispatch seams: `ExecuteStatement`'s condition failure carrying an item is
+/// dispatch seams and the MCP tools: `ExecuteStatement`'s condition failure carrying an item is
 /// written in its own shape (see
 /// [`DynoxideError::StatementConditionalCheckFailed`]). Every other error
 /// passes through unchanged.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) fn for_operation(operation: &str, err: DynoxideError) -> DynoxideError {
     match (operation, err) {
         (

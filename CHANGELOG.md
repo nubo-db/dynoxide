@@ -7,28 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Security
 
-- **The npm package exports `start()`**, which runs Dynoxide on a free port
-  for a test suite and returns its endpoint, region, credentials and a
-  `stop()`. It follows `docs/launcher.md`, which is no longer a draft. The
-  package gains TypeScript types and an `exports` map that keeps
-  `dynoxide/bin/dynoxide` and `dynoxide/package.json` importable.
+- **`rusqlite` moves to 0.42.0, which brings `libsqlite3-sys` 0.40.0 and
+  SQLite 3.54.1,** for RUSTSEC-2026-0459 (CVE-2026-119375). SQLite before
+  3.54.0 can return stale memory when it opens a database together with a
+  `-wal` file whose page size differs, so a crafted pair of files could leak
+  bytes from the process. Every native build bundles SQLite, so this reaches
+  any Dynoxide that opens a database file someone else could have written.
+  The encrypted builds (the `encryption`, `encryption-cc` and
+  `encrypted-full` features) get the same fix through SQLCipher 4.20.0,
+  which is built on SQLite 3.54.1. Crate users get the fix from
+  `dynoxide-rs` 4.0.0, since the `rusqlite` move changes public types (see
+  Breaking below).
+- **`rmcp` moves to 3.9.0** for RUSTSEC-2026-0457 and RUSTSEC-2026-0462.
+  Both are in `rmcp`'s HTTP client code, which Dynoxide does not compile: the
+  MCP server uses only `rmcp`'s server features. cargo-deny checks the whole
+  dependency, so it moves anyway.
 
-### Fixed
+### Behaviour changes
 
-- **A server whose launcher was killed now shuts down cleanly.** If the
-  launcher had been reading the server's stderr through a pipe, the shutdown
-  line failed to write and the release build aborted before closing the
-  database, leaving its write-ahead log behind. Writes weren't lost, but the
-  shutdown wasn't the clean one `--exit-with-parent` promises. Informational
-  lines on the `serve` path now drop a failed write instead.
-
-## [1.7.0-rc.1] - 2026-11-10
-
-A release candidate, so wrappers in other languages can be tested against a
-published build before 1.7.0. The crate stays at `dynoxide-rs` 3.3.0 and is not
-published from it.
+- **The MCP HTTP server refuses request bodies over 16 MiB with a 413**, the
+  same limit as the DynamoDB endpoint. `rmcp` 2 had no limit, and `rmcp` 3
+  defaults to 4 MiB, which would have refused a large `bulk_put_items`. Over
+  stdio, `rmcp` 3 now drops a single message line longer than 16 MiB.
+- **A stdio MCP server (`dynoxide mcp`, `dynoxide import --mcp`) writes its
+  log output to stderr**, so stdout carries only MCP messages. Before, a log
+  line could reach the client mixed in with them. Every other mode still logs
+  to stdout.
+- MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
+  serves without an `initialize` step. Clients on earlier versions see no
+  change.
 
 ### Added
 
@@ -48,17 +57,74 @@ published from it.
   library gains `ServerOptions::with_shutdown_trigger`, which stops the HTTP
   server when a `tokio::sync::watch` channel says so.
 - **`docs/launcher.md` describes how a wrapper for another language finds,
-  verifies, starts and stops Dynoxide**, so wrappers behave alike. It is a
-  draft for now.
+  verifies, starts and stops Dynoxide**, so wrappers behave alike.
+- **The npm package exports `start()`**, which runs Dynoxide on a free port
+  for a test suite and returns its endpoint, region, credentials and a
+  `stop()`. It follows `docs/launcher.md`. The package gains TypeScript types and an `exports` map that keeps
+  `dynoxide/bin/dynoxide` and `dynoxide/package.json` importable.
 
 ### Changed
 
+- The declared MSRV is now 1.89, which `rusqlite` 0.42 needs.
+
+#### Breaking (Rust API)
+
+- `Storage::conn()`, `DynoxideError::SqliteError` and
+  `storage_backend::from_rusqlite` now use `rusqlite` 0.42's types, so code
+  that passes them to or from its own `rusqlite` needs 0.42 too. The next
+  crate release is `dynoxide-rs` 4.0.0.
 - **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
   emulator verified against AWS**, rather than a drop-in replacement for
   DynamoDB Local.
 
 ### Fixed
 
+- **A server whose launcher was killed now shuts down cleanly.** If the
+  launcher had been reading the server's stderr through a pipe, the shutdown
+  line failed to write and the release build aborted before closing the
+  database, leaving its write-ahead log behind. Writes weren't lost, but the
+  shutdown wasn't the clean one `--exit-with-parent` promises. Informational
+  lines on the `serve` path now drop a failed write instead.
+
+- A `ConditionalOperator` other than `AND` or `OR` is refused in the words
+  DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
+  constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has
+  changed this message since October, when it named neither the value nor
+  the member and listed `[ALL, OR]`, and the Parity Suite's Query ordering
+  test caught the difference. Lower case and the empty string are refused the
+  same way on Query, Scan, PutItem, UpdateItem and DeleteItem. With no table
+  name, a Query now lists the operator beside the missing name, as Scan
+  already did, and so does a PutItem; a DeleteItem with no key lists it ahead
+  of the key, as UpdateItem does. `KeyConditions` now conflicts only with
+  `KeyConditionExpression`, so a Query that pairs it with a `FilterExpression`
+  or a `ProjectionExpression` runs, where it used to be refused, and the
+  mixing message no longer names it beside a `FilterExpression`. The
+  placeholders Dynoxide names the key conditions through internally never
+  take the place of the caller's own, so a caller's `:kc_v0` or `#kc_0` means
+  what the caller defined. Query, Scan, GetItem and BatchGetItem now check
+  their expressions through before the table is looked up, as DynamoDB does:
+  syntax, a name or value nobody defined, overlapping projection paths, and
+  then a name or value no expression uses. A filter value nobody defined used
+  to go unnoticed when no item was read. A key condition value nobody defined
+  is named as the key condition's, and a projection syntax error, such as
+  `#a,,` or `a[-1]`, names the offending token and where it sits, in
+  DynamoDB's usual form. A BatchGetItem reports a fault in a table's
+  projection ahead of a repeated key. `ExpressionAttributeValues` on a Query or Scan
+  with only a `ProjectionExpression` is now refused, and on Query and Scan the
+  refusal no longer ends with `: FilterExpression is null`
+  ([#319](https://github.com/nubo-db/dynoxide/issues/319)).
+- A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
+  The refusals now carry DynamoDB's `SerializationException` messages
+  (`Buffer is too short for base64 encoding` for one character, `Base64
+  encoded length is expected a multiple of 4 bytes but found: 2` for `!!`,
+  `Invalid last non-pad Base64 character dectected` for `ab==`, or no
+  message at all) and come ahead of the request's validation, where before
+  they gave the base64 crate's error with a line and column. Values DynamoDB
+  accepts that Dynoxide used to refuse are now accepted as the same bytes:
+  unpadded and part-padded values such as `QQ`, `QQ=` and `QUI`, and the
+  final-group forms such as `-Q==`, which DynamoDB stores as `0xfd`. The
+  crate's own `AttributeValue` deserialiser reads them the same way
+  ([#316](https://github.com/nubo-db/dynoxide/issues/316)).
 - **Opening a database checks what it reads before it changes anything.** A
   schema version that isn't a whole number, or is too large to be one, is
   refused rather than read as no version, which ran every migration on the
@@ -74,6 +140,35 @@ published from it.
   had already ended now says it was not committed, and what SQLite kept,
   rather than giving SQLite's bare commit error
   ([#235](https://github.com/nubo-db/dynoxide/issues/235)).
+- ExecuteStatement and ExecuteTransaction report a request's member errors
+  (`Limit`, `ReturnConsumedCapacity`, a statement's mode or text, the token,
+  an empty `Parameters`) ahead of a parameter they refuse, as DynamoDB does.
+  `Limit: 0` beside `{"N":"abc"}` used to come back as the number error, and
+  so did any other parameter refused for its value: an empty one, one with
+  two types, a `NULL` that isn't true. A parameter of the wrong JSON type,
+  such as `{"N":1}` or a bare string, still fails the request first, now even
+  when an earlier parameter was refused for its value. A bare string now
+  answers `Unexpected value type in payload`
+  ([#308](https://github.com/nubo-db/dynoxide/issues/308)).
+- A number written in a way JSON doesn't allow, such as `1.5.5`, `1e`, `01`
+  or `-`, is read as DynamoDB reads it, rather than failing the whole request
+  with a bare `SerializationException`. Where DynamoDB doesn't read the member
+  it is accepted. Where the member holds another type it gets the answer a
+  well-formed number gets: `DECIMAL_VALUE cannot be converted to String` for
+  one with a point or an exponent and `NUMBER_VALUE` for one without, `Unexpected
+  field type` in a list or map member, `Unexpected value type in payload` as an
+  attribute value or PartiQL parameter. In `Limit`, Scan's `Segment` and
+  `TotalSegments` and the throughput units, DynamoDB's looser rule applies:
+  `-`, `00` and `-.5` read as 0, `01` as 1 and `1.e5` as 100000, while a token
+  it can't read, such as `1.5.5`, `1e` or `--1`, is refused with `Bad number
+  format`. `1e400.5` no longer leaks the parser's own message. ListTables
+  `Limit` and the throughput units also read a well-formed fraction or a number
+  past the range as Query's `Limit` does, so `0.5` gets the at-least-1 error
+  instead of serde's `floating point` text, and ListTables `Limit: 1e400` the
+  at-most-100 error. Streams `Limit`, SearchVectors `TopK` and a vector index's
+  `Dimensions` still refuse such a token with a bare `SerializationException`,
+  since DynamoDB's reading there hasn't been captured
+  ([#309](https://github.com/nubo-db/dynoxide/issues/309)).
 - An attribute value with a member of the wrong JSON type is refused with
   DynamoDB's `SerializationException` message, which names what was found and
   what was expected. A number where `S` or `N` belongs gives `NUMBER_VALUE
@@ -90,6 +185,191 @@ published from it.
   internal message, or come back as a `ValidationException`. Captured against
   eu-west-2 and us-east-1 on 6 and 8 November 2026
   ([#294](https://github.com/nubo-db/dynoxide/issues/294)).
+- A PartiQL statement whose parameters hold both a value nested past 32 levels
+  and a number DynamoDB can't read, such as `abc` or `1e126`, is refused for
+  whichever DynamoDB meets first. It walks a list in written order and a map's
+  members in the order a Java `HashMap` holding them iterates, which is
+  usually not the order they were written in. Dynoxide used to give the number
+  error whenever the value was shallow enough to parse, and past that lost a
+  bad number written inside or after the deep value. This holds on
+  ExecuteStatement and per statement on BatchExecuteStatement.
+  ExecuteTransaction reads every statement's parameters as one list, so a deep
+  value in the first statement now comes ahead of a bad number in the second.
+  It holds over HTTP and in the wasm engine. Captured against eu-west-2 and
+  us-east-1 on 9 October 2026, and the map order against eu-west-2 on
+  9 November 2026 ([#261](https://github.com/nubo-db/dynoxide/issues/261)).
+- A PartiQL UPDATE that sets or removes a path into a key attribute, such as
+  `SET pk.x = 1` or `REMOVE sk[0]`, is refused as an update of that key:
+  `Cannot update attribute pk. This attribute is part of the key`. It used to
+  say the document path was invalid, or fail its condition when the item was
+  missing. With both keys named, the sort key is the one reported, whichever
+  comes first. `SET m.pk = 2` still runs. Captured against eu-west-2 and
+  us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- ExecuteStatement and a BatchExecuteStatement member read a `ConsistentRead`
+  written as a string, such as `"true"` or `"no"`, as GetItem does, where they
+  used to refuse it with a `SerializationException`. A list there is refused
+  with no message, as DynamoDB refuses it. Captured against eu-west-2 and
+  us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- The refusal of an ORDER BY term that isn't a key prints a quoted name
+  without its quotes, so `ORDER BY "a.b"` names `a.b`. Captured against
+  eu-west-2 and us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- In a PartiQL WHERE clause, a call to `attribute_exists`,
+  `attribute_not_exists` or `attribute_type` can be a BETWEEN bound or
+  subject, the operand of `size` or `attribute_type`, or the argument of
+  `attribute_exists`, and it answers as a boolean written there would.
+  `attribute_type(attribute_exists(n), 'BOOL')` is true, and `n BETWEEN
+  attribute_exists(n) AND 5` is refused for its boolean bound. These used to
+  fail to parse. `size` now refuses a number, a boolean or a null operand, as
+  a literal, a parameter, a call or another `size`, where it used to match
+  nothing. Captured against eu-west-2 and us-east-1 on 11 November 2026
+  ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- A PartiQL WHERE clause is checked in one pass, in the order it's written,
+  and the first fault met is the one reported. Inside a condition each
+  operand comes before its operator, and an operand's own operands before it,
+  so `size(true) < attribute_exists(n)` is refused for size's boolean and
+  `attribute_exists(size(s, s))` for size's operand count. A wrong operand
+  count, a type a call or operator can't take, an operand that isn't
+  distinct, an IN with more than 100 operands and a parameter of the wrong
+  type all count as faults in the same pass. Before, some of these were
+  reported ahead of others wherever they were written. A `size` given two
+  operands and standing on its own, as in `WHERE size(s, s) AND n = 1`, is
+  refused for its count, where it used to be called a malformed statement.
+- That pass is the statement's own validation. A write naming an index is
+  refused first, then a read of an index keyed on more than one attribute
+  outside a transaction, then the parameter count, then the pass, and only
+  after that are the table, the key, ORDER BY and RETURNING looked at. A
+  refused `set_add` or `set_delete` comes after the pass. In
+  BatchExecuteStatement a fault is that member's own error, and the other
+  members run; the member is no longer counted for the duplicate, mixed read
+  and write, or missing key checks. In ExecuteTransaction it is
+  `Validation failed in TransactStatements[i]`, ahead of the same-item check
+  and never a cancellation reason. A `COUNT(*)` read of a multi-attribute
+  index in a batch is refused for the index, as ExecuteStatement refuses it.
+- Arithmetic that starts the left side of a condition is refused for its
+  first `+` or `-` ahead of anything wrong with its operands, on a size, a
+  value or a path, and inside brackets: `size(true) + 1 > size(s)`,
+  `1 + size(s) > 0`, `(size(s) + 1) > 0` and `n + 1 > 0` all name the `+`.
+  All but the first used to be called malformed statements. Arithmetic on
+  the right of a comparison, in a BETWEEN bound or in an IN list is still
+  called malformed. IS on any `size` is refused for the IS, even one given
+  two operands.
+- A PartiQL UPDATE, DELETE or INSERT sent with a `NextToken` runs as it
+  would without one, where it used to be refused. An empty `NextToken` is
+  refused as a member error on any statement. This and the three entries
+  above were captured against eu-west-2 on 11 November 2026, in rounds five
+  to thirteen of the capture; rounds one to four went to us-east-1 as well,
+  and the regions agreed ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- The MCP tools read `consistent_read` (`get_item`, and `ConsistentRead`
+  inside `batch_get_item`'s `request_items`) and `scan_index_forward`
+  (`query`) as the HTTP API does: the strings DynamoDB reads as booleans,
+  such as `"true"`, `"yes"`, `"0"` and `"N"`, work, and anything else is
+  refused with the HTTP API's `SerializationException`. A string used to be
+  refused as a malformed argument on `get_item` and `query`, and inside
+  `batch_get_item` it was dropped without a word, so `"true"` read eventually
+  consistent. The listed schema still says boolean. One difference remains:
+  a flag given as `-0`, or as an integer past 64 bits, is refused as a
+  `DECIMAL_VALUE` where the HTTP API says `NUMBER_VALUE`, because MCP
+  arguments arrive already parsed
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP tools read values on the validation layer the HTTP API would use
+  for the same request. Arguments holding a `BOOL` or `NULL` written as a
+  string, or a value with two members, move the call to the older layer,
+  where `put_item`, `update_item` and `delete_item` report a refused value
+  bare rather than inside `1 validation error detected: `, and `update_item`
+  names the key in `expression_attribute_values`. The batch, transaction and
+  PartiQL tools now read on their operation's older layer too, so
+  `batch_write_item` calls `1e2147483647` an underflow, as BatchWriteItem
+  does ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP `scan` tool takes a negative `segment` or `total_segments` and
+  answers with Scan's member check, such as `Value at 'Segment' failed to
+  satisfy constraint: Member must have value greater than or equal to 0`. It
+  used to refuse it as a malformed argument. An integer past what 32 bits
+  hold reads as the nearest 32-bit integer, as it does over HTTP, and so does
+  `limit`; either moves a segment refusal to the older wording, which echoes
+  the value. A fraction, an integer past 64 bits or a string now gets Scan's
+  own answer too, where it used to be refused as a malformed argument
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- The MCP `execute_partiql` tool reports a member error (`limit` 0, a bad
+  `return_consumed_capacity` or `return_values_on_condition_check_failure`,
+  an empty statement) ahead of a parameter refused for its value, and
+  `parameters` that isn't a list as a `SerializationException` rather than a
+  protocol error, as ExecuteStatement does over HTTP. `consistent_read` goes
+  to ExecuteStatement as given, so a string gets ExecuteStatement's answer:
+  one DynamoDB reads as a boolean runs, and any other is refused
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- An empty `ClientRequestToken` is refused on TransactWriteItems and
+  ExecuteTransaction. Before, it was accepted and the request went on to look
+  up its tables. TransactWriteItems now checks its members in the order
+  DynamoDB does. A required member left out (`TransactItems`, or an action's
+  `TableName`, `Item`, `Key`, `UpdateExpression` or a ConditionCheck's
+  `ConditionExpression`) is reported first as `Value null at '...'`, with a
+  bad `ReturnValuesOnConditionCheckFailure` on the same action, a bad token
+  and the request's enums listed beside it, where it used to be a serde
+  `missing field` error. Then the token's length and the length of
+  `TransactItems` are reported on their own, in DynamoDB's older wording with
+  no value or list echoed (`Value at 'ClientRequestToken' ...`). An item with
+  no action comes next, as `Value '' at 'transactItems'`, or else every table
+  name refused, either listed with a bad `ReturnConsumedCapacity` or
+  `ReturnItemCollectionMetrics`. Then an item naming more than one action,
+  then the first number refused in an item, key or expression value, then
+  the first action's bad `ReturnValuesOnConditionCheckFailure` rather than
+  every one. An item given as null is refused with `TransactItems can't be
+  null` unless a member left out, the token, an enum or another item's bad
+  `ReturnValuesOnConditionCheckFailure` is reported first. An item given as a
+  string, a number or a list with anything in it, or an action given as a
+  list, gets a `SerializationException`; before, an item given as a list was
+  read by position and could run as a Put. TransactWriteItems reads its
+  numbers and sets as DynamoDB now does in every region: a refused expression
+  value is no longer wrapped in `ExpressionAttributeValues contains invalid
+  value: ... for key`, `1e2147483647` is an overflow, as on PutItem, and a
+  repeated string set member is listed quoted and sorted. The MCP `transact_write_items`
+  tool reads its arguments the same way. ExecuteTransaction lists the empty
+  token first, and a missing `TransactStatements` is
+  `Value null at 'transactStatements'`
+  ([#318](https://github.com/nubo-db/dynoxide/issues/318)).
+- An MCP tool error for a failed condition asked for `ALL_OLD` writes the
+  item's number sets in the order the HTTP API uses for that operation:
+  numeric for `put_item`, `update_item` and `delete_item`, and DynamoDB's
+  hash order for `execute_partiql`, which used to give them numerically
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- A cancelled transaction from `transact_write_items` or
+  `execute_transaction_partiql` now carries `cancellation_reasons` in the
+  tool error, one entry per action or statement as the HTTP API's
+  `CancellationReasons` gives them, `{"Code": "None"}` entries included, with
+  the `ALL_OLD` item where one was asked for. Before, the reasons were only
+  in the message
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- `query` and `scan` decode their whole request as Query and Scan do over
+  HTTP, so `limit` takes a negative, fractional or string value and answers
+  with the operation's own check, and member errors (`limit`, `select`,
+  `return_consumed_capacity`, `segment`) come in the operation's order and
+  wording. `limit` on `execute_partiql`, `list_streams`, `describe_stream`
+  and `get_records`, and `top_k` on `search_vectors`, are read the same way.
+  `search_vectors` also reports a bad `return_consumed_capacity` bare, as
+  SearchVectors does, and reads its expression values as SearchVectors does
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- `get_item`, `put_item`, `update_item` and `delete_item` check their members
+  as their operations do: a refused key, item or expression value comes ahead
+  of a bad `return_consumed_capacity`, `return_values` and the capacity mode
+  are listed together where the operation lists them, and `update_item`
+  reports a bad mode bare. `return_values_on_condition_check_failure` outside
+  `ALL_OLD` and `NONE` is now refused on the three write tools, where it was
+  ignored. `delete_item` reads `expression_attribute_values` after the member
+  checks and names a refused value by its key, as DeleteItem does, and
+  `batch_write_item` reports a bad capacity mode after a refused value
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- `batch_get_item` and `batch_write_item` decode `request_items` as
+  BatchGetItem and BatchWriteItem do, after the snake_case spellings they
+  accept (`keys`, `projection_expression`, `expression_attribute_names`,
+  `consistent_read`, `put_request`, `item`, `delete_request`, `key`) are
+  given their wire names; where an entry gives both spellings, the wire one
+  is read. A malformed entry now gets the HTTP API's answer rather than an
+  `InvalidRequestItems` error of the tools' own. `batch_get_item` now applies
+  an entry's `AttributesToGet` and returns only those attributes, as
+  BatchGetItem does; it used to ignore it and return the whole item. A
+  non-string `ProjectionExpression`, malformed `ExpressionAttributeNames` or
+  a bad `AttributesToGet`, which the tool also ignored, are now refused
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 
 ## [1.6.0] - 2026-11-07
 
@@ -2212,8 +2492,7 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.7.0-rc.1...HEAD
-[1.7.0-rc.1]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...v1.7.0-rc.1
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...HEAD
 [1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0

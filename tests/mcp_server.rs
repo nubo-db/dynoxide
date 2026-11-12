@@ -506,6 +506,156 @@ fn a_failed_condition_hands_back_the_item_when_asked() {
     let _ = child.wait();
 }
 
+/// The item a failed condition hands back writes a number set in the order
+/// the HTTP API writes it for the same operation: ExecuteStatement in hash
+/// order, PutItem in numeric order (both as the HTTP API answers on this
+/// build, which follows DynamoDB's captures).
+#[test]
+fn a_failed_condition_writes_number_sets_in_the_operations_order() {
+    let mut child = mcp_with_table("Ordered");
+    let stored = json!({"pk": {"S": "a"}, "ns": {"NS": ["3", "1", "2"]}, "v": {"N": "1"}});
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Ordered", "item": stored}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "execute_partiql",
+        json!({
+            "statement": r#"UPDATE "Ordered" SET v = 2 WHERE pk = 'a' AND v = 9"#,
+            "return_values_on_condition_check_failure": "ALL_OLD"
+        }),
+    );
+    assert_eq!(tool_error(&resp).0, "ConditionalCheckFailedException");
+    assert_eq!(
+        tool_content(&resp)["item"]["ns"],
+        json!({"NS": ["3", "2", "1"]})
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "put_item",
+        json!({
+            "table_name": "Ordered",
+            "item": {"pk": {"S": "a"}},
+            "condition_expression": "attribute_not_exists(pk)",
+            "return_values_on_condition_check_failure": "ALL_OLD"
+        }),
+    );
+    assert_eq!(tool_error(&resp).0, "ConditionalCheckFailedException");
+    assert_eq!(
+        tool_content(&resp)["item"]["ns"],
+        json!({"NS": ["1", "2", "3"]})
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `ALL_OLD` through the batch and transaction tools hands back the item a
+/// failed condition was evaluated against where the HTTP API does: on the
+/// member's `Error` for `batch_execute_partiql`, and on the statement's or
+/// action's cancellation reason for `execute_transaction_partiql` and
+/// `transact_write_items`, one reason per entry with `Code: None` for those
+/// that would have succeeded. Each expectation is the HTTP API's answer for
+/// the same request on this build.
+#[test]
+fn all_old_reaches_the_batch_and_transaction_tools_as_over_http() {
+    let mut child = mcp_with_table("Guarded");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Guarded",
+            "item": {"pk": {"S": "a"}, "ns": {"NS": ["3", "1", "2"]}, "v": {"N": "1"}}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    // Hash order, as every one of these writes the item over HTTP.
+    let item = json!({"pk": {"S": "a"}, "ns": {"NS": ["3", "2", "1"]}, "v": {"N": "1"}});
+    let failed = json!({
+        "Code": "ConditionalCheckFailed",
+        "Message": "The conditional request failed",
+        "Item": item
+    });
+    let update = r#"UPDATE "Guarded" SET v = 2 WHERE pk = 'a' AND v = 9"#;
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "batch_execute_partiql",
+        json!({"statements": [
+            {"Statement": update, "ReturnValuesOnConditionCheckFailure": "ALL_OLD"}
+        ]}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(
+        tool_content(&resp),
+        json!({"Responses": [{"Error": failed, "TableName": "Guarded"}]})
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "execute_transaction_partiql",
+        json!({"transact_statements": [
+            {"Statement": update, "ReturnValuesOnConditionCheckFailure": "ALL_OLD"},
+            {"Statement": r#"INSERT INTO "Guarded" VALUE {'pk': 'b'}"#}
+        ]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        (
+            "TransactionCanceledException".to_string(),
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [ConditionalCheckFailed, None]"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        tool_content(&resp)["cancellation_reasons"],
+        json!([failed, {"Code": "None"}])
+    );
+
+    let resp = call_tool(
+        &mut child,
+        5,
+        "transact_write_items",
+        json!({"transact_items": [
+            {"Put": {"TableName": "Guarded", "Item": {"pk": {"S": "c"}}}},
+            {"ConditionCheck": {
+                "TableName": "Guarded", "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": "v = :n",
+                "ExpressionAttributeValues": {":n": {"N": "9"}},
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+            }}
+        ]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        (
+            "TransactionCanceledException".to_string(),
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [None, ConditionalCheckFailed]"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        tool_content(&resp)["cancellation_reasons"],
+        json!([{"Code": "None"}, failed])
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn the_instructions_say_capacity_can_be_requested() {
     let mut child = spawn_mcp();
@@ -2321,6 +2471,157 @@ fn test_transact_write_items_null_false_bare() {
     let _ = child.wait();
 }
 
+/// A transaction write with every kind of action, expression names and values,
+/// a token and a capacity mode goes through the tool, and a second call with
+/// the same token succeeds without writing again.
+#[test]
+fn the_transaction_write_tool_runs_every_action_and_replays_its_token() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    for (id, pk) in (2..).zip(["update", "delete", "check"]) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Parity", "item": {"pk": {"S": pk}, "n": {"N": "1"}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+
+    let args = json!({
+        "transact_items": [
+            {"Put": {
+                "TableName": "Parity",
+                "Item": {"pk": {"S": "put"}, "n": {"N": "7"}},
+                "ConditionExpression": "attribute_not_exists(#p)",
+                "ExpressionAttributeNames": {"#p": "pk"}
+            }},
+            {"Update": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "update"}},
+                "UpdateExpression": "SET #n = #n + :one",
+                "ConditionExpression": "#n = :was",
+                "ExpressionAttributeNames": {"#n": "n"},
+                "ExpressionAttributeValues": {":one": {"N": "1"}, ":was": {"N": "1"}}
+            }},
+            {"Delete": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "delete"}},
+                "ConditionExpression": "#n = :was",
+                "ExpressionAttributeNames": {"#n": "n"},
+                "ExpressionAttributeValues": {":was": {"N": "1"}}
+            }},
+            {"ConditionCheck": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "check"}},
+                "ConditionExpression": "attribute_exists(#p) AND #n = :was",
+                "ExpressionAttributeNames": {"#p": "pk", "#n": "n"},
+                "ExpressionAttributeValues": {":was": {"N": "1"}}
+            }}
+        ],
+        "client_request_token": "round-trip-token",
+        "return_consumed_capacity": "TOTAL"
+    });
+    let first = call_tool(&mut child, 10, "transact_write_items", args.clone());
+    assert!(!is_tool_error(&first), "{first}");
+    let first = tool_content(&first);
+    assert_eq!(
+        first["ConsumedCapacity"],
+        json!([{"TableName": "Parity", "CapacityUnits": 8.0, "WriteCapacityUnits": 8.0}]),
+        "{first}"
+    );
+
+    let replay = call_tool(&mut child, 11, "transact_write_items", args);
+    assert!(!is_tool_error(&replay), "{replay}");
+    // The replay is billed as a transactional read of the same items.
+    assert_eq!(
+        tool_content(&replay)["ConsumedCapacity"],
+        json!([{"TableName": "Parity", "CapacityUnits": 8.0, "ReadCapacityUnits": 8.0}])
+    );
+
+    let stored = |child: &mut std::process::Child, id: u64, pk: &str| {
+        let resp = call_tool(
+            child,
+            id,
+            "get_item",
+            json!({"table_name": "Parity", "key": {"pk": {"S": pk}}, "consistent_read": true}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+        tool_content(&resp)["Item"].clone()
+    };
+    assert_eq!(
+        stored(&mut child, 12, "put"),
+        json!({"pk": {"S": "put"}, "n": {"N": "7"}})
+    );
+    assert_eq!(
+        stored(&mut child, 13, "update"),
+        json!({"pk": {"S": "update"}, "n": {"N": "2"}})
+    );
+    assert_eq!(stored(&mut child, 14, "delete"), Value::Null);
+    assert_eq!(
+        stored(&mut child, 15, "check"),
+        json!({"pk": {"S": "check"}, "n": {"N": "1"}})
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The transaction write tool answers its member checks as the HTTP API does:
+/// a table name left out, an empty token ahead of a number refused in an item
+/// and ahead of a bad capacity mode, and an item naming no action beside a
+/// bad capacity mode (captured eu-west-2 and us-east-1, 2026-11-11).
+#[test]
+fn the_transaction_write_tool_checks_its_members_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let cases = [
+        (
+            json!({"transact_items": [{"Put": {"Item": {"pk": {"S": "a"}}}}]}),
+            "1 validation error detected: Value null at 'transactItems.1.member.put.tableName' \
+             failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            json!({
+                "transact_items": [{"Put": {"TableName": "Parity", "Item": {"pk": {"N": "abc"}}}}],
+                "client_request_token": ""
+            }),
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1",
+        ),
+        (
+            json!({
+                "transact_items": [{"Put": {"TableName": "Parity", "Item": {"pk": {"N": "abc"}}}}],
+                "client_request_token": "",
+                "return_consumed_capacity": "BAD"
+            }),
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1",
+        ),
+        (
+            json!({
+                "transact_items": [{}, {"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}],
+                "return_consumed_capacity": "BAD"
+            }),
+            "2 validation errors detected: Value '' at 'transactItems' failed to satisfy \
+             constraint: TransactWriteRequest should contain Delete or Put or Update or \
+             ConditionCheck; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy \
+             constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+        ),
+    ];
+    for (id, (args, expected)) in (2..).zip(cases) {
+        let resp = call_tool(&mut child, id, "transact_write_items", args);
+        assert_validation_tool_error(&resp, expected);
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn test_update_item_duplicate_set_in_eav_enveloped() {
     let mut child = spawn_mcp();
@@ -3048,9 +3349,9 @@ fn test_http_transport_dns_rebinding_defences() {
         String::from_utf8_lossy(&buf).into_owned()
     };
 
-    // Ordering is load-bearing: with stateful_mode=false the Host and Origin
-    // checks run before session lookup, so per-request rejection cannot leak
-    // state. If stateful_mode ever flips, revisit this ordering.
+    // Ordering is load-bearing: with legacy_session_mode=false the Host and
+    // Origin checks run before session lookup, so per-request rejection cannot
+    // leak state. If legacy_session_mode ever flips, revisit this ordering.
     let loopback = send(&format!("127.0.0.1:{port}"), None);
     assert!(
         loopback.starts_with("HTTP/1.1 2"),
@@ -3562,9 +3863,14 @@ fn mcp_request(connect_port: u16, host: &str, auth: Option<&str>) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Split a raw HTTP response into (head, body) at the blank line.
+/// The body of a raw HTTP response: everything after the blank line.
 fn response_body(resp: &str) -> &str {
     resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+}
+
+/// The status line and headers of a raw HTTP response.
+fn response_head(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(resp)
 }
 
 /// Run the binary expecting it to exit non-zero before serving; returns
@@ -4756,4 +5062,2927 @@ async fn test_import_serve_mcp_reports_accepted_exposure_over_http() {
     assert_accepted_exposure_report(&tool_content(&resp));
 
     drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP transport behaviour: response format, origins, body size, protocol
+// versions. These pin what an MCP client sees over HTTP, so an rmcp upgrade
+// that changes any of it fails here rather than in a client.
+// ---------------------------------------------------------------------------
+
+const HTTP_TOKEN: &str = "http-behaviour-token";
+
+/// POST a JSON-RPC body to `/mcp` with the bearer token and return the raw
+/// HTTP response. `extra_headers` is inserted verbatim, one `Name: value\r\n`
+/// per header. A write error is ignored so a server that refuses a large body
+/// early still has its response read.
+fn mcp_post(port: u16, extra_headers: &str, body: &str) -> String {
+    use std::io::Read;
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {HTTP_TOKEN}\r\n\
+         {extra_headers}\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let _ = stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(body.as_bytes()));
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The JSON-RPC message in a JSON (not event-stream) response body.
+fn json_rpc_body(resp: &str) -> Value {
+    let body = response_body(resp);
+    let start = body
+        .find('{')
+        .unwrap_or_else(|| panic!("no JSON in: {resp}"));
+    let end = body.rfind('}').unwrap();
+    serde_json::from_str(&body[start..=end]).unwrap_or_else(|e| panic!("{e}: {resp}"))
+}
+
+fn content_type(resp: &str) -> String {
+    response_head(resp)
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-type:")
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn list_tables_call(id: u64, extra_params: Value) -> Value {
+    let mut params = json!({"name": "list_tables", "arguments": {}});
+    if let (Some(p), Some(extra)) = (params.as_object_mut(), extra_params.as_object()) {
+        for (k, v) in extra {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params})
+}
+
+fn tool_names(list: &Value) -> Vec<String> {
+    let mut names: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tools in {list}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn http_lists_the_same_tools_as_stdio_and_answers_in_json() {
+    let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
+
+    let init = mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN));
+    assert!(init.starts_with("HTTP/1.1 200"), "got: {init}");
+    assert_eq!(
+        json_rpc_body(&init)["result"]["serverInfo"]["name"],
+        "dynoxide"
+    );
+
+    let list = mcp_post(
+        port,
+        "",
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string(),
+    );
+    assert!(list.starts_with("HTTP/1.1 200"), "got: {list}");
+    let http_tools = tool_names(&json_rpc_body(&list));
+
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let stdio_list = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(http_tools, tool_names(&stdio_list));
+
+    // A tool call is answered with a single JSON body, not an event stream.
+    let call = mcp_post(port, "", &list_tables_call(3, json!({})).to_string());
+    assert!(call.starts_with("HTTP/1.1 200"), "got: {call}");
+    assert!(
+        content_type(&call).starts_with("application/json"),
+        "expected a JSON response, got: {call}"
+    );
+    assert!(
+        json_rpc_body(&call)["result"]["content"].is_array(),
+        "got: {call}"
+    );
+}
+
+#[test]
+fn http_accepts_an_allowed_origin_on_any_port() {
+    // Browser clients send an Origin with the page's port. The allowlist
+    // entries are written with an explicit `:*`, so a dev server on 3000 and
+    // an --allowed-host name on another port both pass.
+    let (port, _srv) = spawn_authed_mcp_host(
+        HTTP_TOKEN,
+        "127.0.0.1",
+        &["--allowed-host", "dynoxide.test"],
+    );
+    for origin in [
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://dynoxide.test:8080",
+    ] {
+        let resp = mcp_post(
+            port,
+            &format!("Origin: {origin}\r\n"),
+            &list_tables_call(1, json!({})).to_string(),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "Origin {origin} should be accepted, got: {resp}"
+        );
+    }
+    // `:*` widens the port only: another scheme, or a host that merely starts
+    // with an allowed one, is still refused.
+    for origin in [
+        "https://localhost:3000",
+        "http://localhost.evil.example:3000",
+    ] {
+        let resp = mcp_post(
+            port,
+            &format!("Origin: {origin}\r\n"),
+            &list_tables_call(1, json!({})).to_string(),
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 403") && resp.contains("Origin header is not allowed"),
+            "Origin {origin} should be refused, got: {resp}"
+        );
+    }
+}
+
+#[test]
+fn http_request_bodies_up_to_16_mib_are_accepted_and_larger_ones_refused() {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
+    // list_tables ignores arguments it does not know, so padding one out
+    // makes a body of exactly the wanted size without depending on tool
+    // behaviour.
+    let body_of = |total: usize| {
+        let with_padding = |n: usize| {
+            list_tables_call(1, json!({"arguments": {"padding": "x".repeat(n)}})).to_string()
+        };
+        let body = with_padding(total - with_padding(0).len());
+        assert_eq!(body.len(), total);
+        body
+    };
+
+    let at_limit = mcp_post(port, "", &body_of(LIMIT));
+    assert!(
+        at_limit.starts_with("HTTP/1.1 200"),
+        "a body of exactly 16 MiB should be accepted, got: {}",
+        &at_limit[..at_limit.len().min(300)]
+    );
+
+    let over_limit = mcp_post(port, "", &body_of(LIMIT + 1));
+    assert!(
+        over_limit.starts_with("HTTP/1.1 413"),
+        "a body one byte over 16 MiB should be refused with 413, got: {}",
+        &over_limit[..over_limit.len().min(300)]
+    );
+}
+
+#[test]
+fn http_answers_a_2026_07_28_request_like_an_initialised_one() {
+    // Protocol 2026-07-28 has no initialize: each request carries its version
+    // and client capabilities in `_meta`, and names its method and tool in
+    // headers. The tool result must match the one a client gets after a
+    // 2025-03-26 initialize. The 2026-07-28 call goes first, to a server that
+    // has seen no initialize at all.
+    let (port, _srv) = spawn_authed_mcp(HTTP_TOKEN);
+    let call_2026 = list_tables_call(
+        2,
+        json!({"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}),
+    )
+    .to_string();
+
+    let new = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: tools/call\r\n\
+         Mcp-Name: list_tables\r\n",
+        &call_2026,
+    );
+    assert!(new.starts_with("HTTP/1.1 200"), "got: {new}");
+
+    // A 2026-07-28 request must name its method in a header.
+    let no_method = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Name: list_tables\r\n",
+        &call_2026,
+    );
+    assert!(
+        no_method.starts_with("HTTP/1.1 400") && no_method.contains("Mcp-Method"),
+        "got: {no_method}"
+    );
+
+    // The server reads the version in `_meta`: one that disagrees with the
+    // header is refused, so the call above was checked as a 2026-07-28 request
+    // rather than served as a legacy one.
+    let mismatched = mcp_post(
+        port,
+        "MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: tools/call\r\n\
+         Mcp-Name: list_tables\r\n",
+        &list_tables_call(
+            3,
+            json!({"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2025-03-26",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}),
+        )
+        .to_string(),
+    );
+    assert!(
+        mismatched.starts_with("HTTP/1.1 400") && mismatched.contains("_meta"),
+        "got: {mismatched}"
+    );
+
+    assert!(
+        mcp_request(port, &format!("127.0.0.1:{port}"), Some(HTTP_TOKEN))
+            .starts_with("HTTP/1.1 200")
+    );
+    let old = mcp_post(port, "", &list_tables_call(2, json!({})).to_string());
+    assert_eq!(
+        json_rpc_body(&new)["result"]["content"],
+        json_rpc_body(&old)["result"]["content"],
+        "2026-07-28: {new}\n2025-03-26: {old}"
+    );
+}
+
+#[test]
+fn stdio_drops_an_oversized_line_without_writing_anything_else_to_stdout() {
+    // rmcp discards a stdio line over 16 MiB and logs an error as it does.
+    // That log must not land on stdout, where the client expects only
+    // JSON-RPC: the next response read here would fail to parse. RUST_LOG is
+    // pinned so an inherited `off` cannot silence the log and pass vacuously.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dynoxide"))
+        .arg("mcp")
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dynoxide mcp");
+    init_mcp(&mut child);
+
+    let stdin = child.stdin.as_mut().unwrap();
+    let oversized = "x".repeat(17 * 1024 * 1024);
+    writeln!(stdin, "{oversized}").unwrap();
+    stdin.flush().unwrap();
+
+    let resp = call_tool(&mut child, 2, "list_tables", json!({}));
+    assert_eq!(resp["id"], 2, "got: {resp}");
+    assert_eq!(tool_content(&resp)["TableNames"], json!([]));
+
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeded the maximum line length"),
+        "the dropped line should be logged on stderr, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Arguments read as the HTTP API reads them
+// ---------------------------------------------------------------------------
+//
+// Every expectation below is the HTTP API's answer to the same request, as
+// pinned in tests/bool_and_null_values_http.rs, tests/value_layers.rs,
+// tests/partiql_member_errors_before_parameters.rs and the scan member checks.
+
+const UNEXPECTED_TOKEN: &str = "Unexpected token received from parser";
+
+/// Spawn a server holding a hash-only table called `table`.
+fn mcp_with_table(table: &str) -> std::process::Child {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": table,
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    child
+}
+
+/// The error type and message of a tool error, failing if the call succeeded.
+fn tool_error(resp: &Value) -> (String, String) {
+    assert!(is_tool_error(resp), "expected a tool error: {resp}");
+    let raw = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !raw.contains("VALIDATION") && !raw.contains("SERIALIZATION") && !raw.contains(" at line "),
+        "internal marker or serde position leaked: {raw}"
+    );
+    let content = tool_content(resp);
+    (
+        content["error_type"].as_str().unwrap().to_string(),
+        content["message"].as_str().unwrap().to_string(),
+    )
+}
+
+fn serialization_error(message: &str) -> (String, String) {
+    ("SerializationException".to_string(), message.to_string())
+}
+
+fn validation_error(message: &str) -> (String, String) {
+    ("ValidationException".to_string(), message.to_string())
+}
+
+/// What the HTTP API answers for a flag it can't read as a boolean.
+fn refused_flags() -> Vec<(Value, (String, String))> {
+    vec![
+        (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("off"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(""), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(" true"), serialization_error(UNEXPECTED_TOKEN)),
+        (
+            json!(1),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!(0),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            json!(1.5),
+            serialization_error("DECIMAL_VALUE cannot be converted to Boolean"),
+        ),
+        // Pinned to the HTTP API's present answer for a list, which the tool
+        // follows if that answer changes.
+        (
+            json!([true]),
+            serialization_error("Unrecognized collection type class java.lang.Boolean"),
+        ),
+        (
+            json!({"a": true}),
+            serialization_error("Start of structure or map found where not expected"),
+        ),
+    ]
+}
+
+const TRUTHY: [&str; 9] = ["true", "TRUE", "True", "t", "T", "yes", "y", "Y", "1"];
+const FALSY: [&str; 10] = ["false", "FALSE", "f", "F", "no", "No", "n", "N", "0", "nO"];
+
+/// `get_item`'s `consistent_read` reads a string as GetItem's `ConsistentRead`
+/// does over HTTP: one that reads as true is a strongly consistent read,
+/// charged 1.0 for a small item, one that reads as false an eventually
+/// consistent one, charged 0.5, and anything else is refused as malformed.
+#[test]
+fn get_item_reads_consistent_read_as_the_http_api_does() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Flags", "item": {"pk": {"S": "c"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let mut id = 10;
+    let mut get = |child: &mut std::process::Child, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "get_item",
+            json!({
+                "table_name": "Flags", "key": {"pk": {"S": "c"}},
+                "consistent_read": flag, "return_consumed_capacity": "TOTAL"
+            }),
+        )
+    };
+    let mut flags: Vec<(Value, f64)> = Vec::new();
+    flags.extend(TRUTHY.iter().map(|t| (json!(t), 1.0)));
+    flags.extend(FALSY.iter().map(|t| (json!(t), 0.5)));
+    flags.extend([(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)]);
+    for (flag, units) in flags {
+        let resp = get(&mut child, flag.clone());
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["Item"]["pk"], json!({"S": "c"}), "{flag}");
+        assert_eq!(
+            content["ConsumedCapacity"]["CapacityUnits"],
+            json!(units),
+            "{flag}"
+        );
+    }
+    for (flag, refusal) in refused_flags() {
+        let resp = get(&mut child, flag.clone());
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A flag that doesn't read fails the request as it is decoded, so it is the
+/// error reported beside a `return_consumed_capacity` outside the enum, which
+/// is checked later. That holds for `ConsistentRead` inside `batch_get_item`'s
+/// `request_items` too, as BatchGetItem answers over HTTP.
+#[test]
+fn an_unreadable_flag_is_reported_ahead_of_a_bad_capacity_mode() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({
+            "table_name": "Flags", "key": {"pk": {"S": "c"}},
+            "consistent_read": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+    let resp = call_tool(
+        &mut child,
+        3,
+        "query",
+        json!({
+            "table_name": "Flags", "key_condition_expression": "pk = :p",
+            "expression_attribute_values": {":p": {"S": "c"}},
+            "scan_index_forward": "x", "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+    let resp = call_tool(
+        &mut child,
+        4,
+        "batch_get_item",
+        json!({
+            "request_items": {"Flags": {"Keys": [{"pk": {"S": "c"}}], "ConsistentRead": "x"}},
+            "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert_eq!(tool_error(&resp), serialization_error(UNEXPECTED_TOKEN));
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `batch_get_item` leaves a `return_consumed_capacity` outside the enum to
+/// BatchGetItem's own checks, so the request's member errors and a refused
+/// key value are reported in the order BatchGetItem reports them over HTTP.
+#[test]
+fn batch_get_item_reports_a_bad_capacity_mode_where_batch_get_item_does() {
+    let mut child = mcp_with_table("Flags");
+    let bogus = "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let cases: Vec<(Value, (String, String))> = vec![
+        (
+            json!({}),
+            enveloped(
+                "Value at 'RequestItems' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"Flags": {"Keys": []}}),
+            enveloped(
+                "Value at 'RequestItems.Flags.member.Keys' failed to satisfy constraint: Member \
+                 must have length greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"T": {"Keys": [{"pk": {"S": "a"}}]}}),
+            validation_error(&format!(
+                "2 validation errors detected: Value '{{\"T\":{{\"Keys\":[{{\"pk\":{{\"S\":\"a\"}}}}]}}}}' \
+                 at 'requestItems' failed to satisfy constraint: Map keys must satisfy \
+                 constraint: [Member must have length less than or equal to 255, Member must \
+                 have length greater than or equal to 3, Member must satisfy regular \
+                 expression pattern: [a-zA-Z0-9_.-]+]; {bogus}"
+            )),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"S": "a"}}]}}),
+            enveloped(bogus),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"N": "abc"}}]}}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"S": "a", "N": "1"}}]}}),
+            validation_error(TWO_TYPES),
+        ),
+        (
+            json!({"Flags": {"Keys": [{"pk": {"BOOL": "no"}}]}}),
+            enveloped(bogus),
+        ),
+        (
+            json!({"Flags": {"Keys": (0..101)
+                .map(|i| json!({"pk": {"S": i.to_string()}}))
+                .collect::<Vec<_>>()}}),
+            enveloped(
+                "Value at 'RequestItems.Flags.member.Keys' failed to satisfy constraint: Member \
+                 must have length less than or equal to 100",
+            ),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (request_items, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "batch_get_item",
+            json!({"request_items": request_items, "return_consumed_capacity": "BOGUS"}),
+        );
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{request_items}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `query`'s `scan_index_forward` reads a string as Query's `ScanIndexForward`
+/// does over HTTP: one that reads as false reads the sort key descending, one
+/// that reads as true ascending, and anything else is refused as malformed.
+#[test]
+fn query_reads_scan_index_forward_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Sorted",
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [
+                {"attribute_name": "pk", "key_type": "HASH"},
+                {"attribute_name": "sk", "key_type": "RANGE"}
+            ],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "sk", "attribute_type": "N"}
+            ]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    for (id, sk) in [(2, "1"), (3, "2"), (4, "3")] {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Sorted", "item": {"pk": {"S": "p"}, "sk": {"N": sk}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+
+    let mut id = 10;
+    let mut query = |child: &mut std::process::Child, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "query",
+            json!({
+                "table_name": "Sorted", "key_condition_expression": "pk = :p",
+                "expression_attribute_values": {":p": {"S": "p"}},
+                "scan_index_forward": flag
+            }),
+        )
+    };
+    let order = |resp: &Value| -> Vec<String> {
+        tool_content(resp)["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["sk"]["N"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let mut flags: Vec<(Value, [&str; 3])> = Vec::new();
+    flags.extend(TRUTHY.iter().map(|t| (json!(t), ["1", "2", "3"])));
+    flags.extend(FALSY.iter().map(|t| (json!(t), ["3", "2", "1"])));
+    flags.extend([
+        (json!(true), ["1", "2", "3"]),
+        (json!(false), ["3", "2", "1"]),
+        (Value::Null, ["1", "2", "3"]),
+    ]);
+    for (flag, expected) in flags {
+        let resp = query(&mut child, flag.clone());
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        assert_eq!(order(&resp), expected, "{flag}");
+    }
+    for (flag, refusal) in refused_flags() {
+        let resp = query(&mut child, flag.clone());
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `ConsistentRead` inside `batch_get_item`'s `request_items` reads as
+/// BatchGetItem's does over HTTP, under either spelling. A string used to be
+/// dropped without a word, so `"true"` read eventually consistent.
+#[test]
+fn batch_get_item_reads_consistent_read_as_the_http_api_does() {
+    let mut child = mcp_with_table("Flags");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Flags", "item": {"pk": {"S": "c"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let mut id = 10;
+    let mut batch = |child: &mut std::process::Child, member: &str, flag: Value| {
+        id += 1;
+        call_tool(
+            child,
+            id,
+            "batch_get_item",
+            json!({
+                "request_items": {"Flags": {"keys": [{"pk": {"S": "c"}}], member: flag}},
+                "return_consumed_capacity": "TOTAL"
+            }),
+        )
+    };
+    for member in ["ConsistentRead", "consistent_read"] {
+        for (flag, units) in [
+            (json!("true"), 1.0),
+            (json!("Yes"), 1.0),
+            (json!("1"), 1.0),
+            (json!(true), 1.0),
+            (json!("false"), 0.5),
+            (json!("n"), 0.5),
+            (json!(false), 0.5),
+            (Value::Null, 0.5),
+        ] {
+            let resp = batch(&mut child, member, flag.clone());
+            assert!(!is_tool_error(&resp), "{member} {flag}: {resp}");
+            assert_eq!(
+                tool_content(&resp)["ConsumedCapacity"][0]["CapacityUnits"],
+                json!(units),
+                "{member} {flag}"
+            );
+        }
+        for (flag, refusal) in refused_flags() {
+            let resp = batch(&mut child, member, flag.clone());
+            assert_eq!(tool_error(&resp), refusal, "{member} {flag}");
+        }
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Strings are read but not advertised: each flag's listed schema is the
+/// boolean it has always been.
+#[test]
+fn the_flags_still_advertise_a_boolean() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let property = |tool: &str, name: &str| {
+        let tool = tools.iter().find(|t| t["name"] == tool).unwrap();
+        assert!(
+            !tool["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&json!(name))),
+            "{name} is optional"
+        );
+        tool["inputSchema"]["properties"][name].clone()
+    };
+    assert_eq!(
+        property("get_item", "consistent_read"),
+        json!({
+            "default": null,
+            "description": "Whether to use strongly consistent reads",
+            "type": ["boolean", "null"]
+        })
+    );
+    assert_eq!(
+        property("query", "scan_index_forward"),
+        json!({
+            "description": "Whether to scan forward (true, default) or backward (false) by sort key",
+            "type": ["boolean", "null"]
+        })
+    );
+    assert_eq!(
+        property("execute_partiql", "consistent_read"),
+        json!({
+            "default": null,
+            "description": "Whether to use strongly consistent reads. Does not change which rows \
+                            come back, but it doubles the rate a SELECT is charged at and it makes \
+                            a SELECT qualified by a GSI a rejection, because a GSI cannot serve one.",
+            "type": ["boolean", "null"]
+        })
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `scan`'s `segment` and `total_segments` take a negative value now, but the
+/// listed schema is the unsigned integer it has always been.
+#[test]
+fn the_segments_still_advertise_an_unsigned_integer() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let scan = tools.iter().find(|t| t["name"] == "scan").unwrap();
+    let properties = &scan["inputSchema"]["properties"];
+    assert_eq!(
+        properties["segment"],
+        json!({
+            "description": "Segment number for parallel scan (0-based). Must be used with \
+                            total_segments.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+        })
+    );
+    assert_eq!(
+        properties["total_segments"],
+        json!({
+            "description": "Total number of parallel scan segments (1 to 1000000). Must be used \
+                            with segment.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": ["integer", "null"]
+        })
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+const ABC_NUMBER: &str = "The parameter cannot be converted to a numeric value: abc";
+const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value \
+                             types must have the value of true";
+const TWO_TYPES: &str = "Supplied AttributeValue has more than one datatypes set, must contain \
+                         exactly one of the supported datatypes";
+
+fn enveloped(message: &str) -> (String, String) {
+    validation_error(&format!("1 validation error detected: {message}"))
+}
+
+fn named(message: &str, key: &str) -> (String, String) {
+    validation_error(&format!(
+        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+    ))
+}
+
+/// A request holding a `BOOL` or `NULL` written as a string, or a value with
+/// two members, is read on the older layer, as tests/value_layers.rs pins over
+/// HTTP: its refusals are bare on `put_item`, and `update_item` names the key,
+/// where the same refusal alone is enveloped. The cases run in one process, so
+/// a current-layer call after an older-layer one shows the layer doesn't leak.
+#[test]
+fn item_tools_read_values_on_the_layer_the_http_api_uses() {
+    let mut child = mcp_with_table("Layers");
+    let bad_number = json!({"N": "abc"});
+    let string_bool = json!({"BOOL": "no"});
+    let cases = vec![
+        (
+            vec![("v", bad_number.clone())],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("v", bad_number.clone()), ("w", string_bool.clone())],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", bad_number.clone())],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("w", string_bool.clone()), ("v", bad_number.clone())],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", bad_number.clone()), ("w", json!({"BOOL": true}))],
+            enveloped(ABC_NUMBER),
+            enveloped(ABC_NUMBER),
+        ),
+        (
+            vec![("v", json!({"NULL": false}))],
+            enveloped(NULL_NOT_TRUE),
+            enveloped(NULL_NOT_TRUE),
+        ),
+        (
+            vec![("v", json!({"NULL": "no"}))],
+            validation_error(NULL_NOT_TRUE),
+            named(NULL_NOT_TRUE, ":v"),
+        ),
+        (
+            vec![("v", json!({"S": "x", "N": "1"}))],
+            validation_error(TWO_TYPES),
+            named(TWO_TYPES, ":v"),
+        ),
+        (
+            vec![("v", json!({"N": "abc", "S": "x"}))],
+            validation_error(ABC_NUMBER),
+            named(ABC_NUMBER, ":v"),
+        ),
+        (
+            vec![("v", json!({"NULL": false}))],
+            enveloped(NULL_NOT_TRUE),
+            enveloped(NULL_NOT_TRUE),
+        ),
+    ];
+    let mut id = 10;
+    for (pairs, on_put, on_update) in cases {
+        let mut item = json!({"pk": {"S": "m1"}});
+        let mut values = json!({});
+        let mut set = Vec::new();
+        for (name, value) in &pairs {
+            item[name] = value.clone();
+            values[format!(":{name}")] = value.clone();
+            set.push(format!("{name} = :{name}"));
+        }
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Layers", "item": item}),
+        );
+        assert_eq!(tool_error(&resp), on_put, "put_item {pairs:?}");
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "update_item",
+            json!({
+                "table_name": "Layers", "key": {"pk": {"S": "m1"}},
+                "update_expression": format!("SET {}", set.join(", ")),
+                "expression_attribute_values": values
+            }),
+        );
+        assert_eq!(tool_error(&resp), on_update, "update_item {pairs:?}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `delete_item` follows the layer too: a key value it refuses is enveloped
+/// on its own and bare beside a string-read `BOOL`, as DeleteItem answers over
+/// HTTP.
+#[test]
+fn delete_item_reads_its_key_on_the_layer_the_http_api_uses() {
+    let mut child = mcp_with_table("Layers");
+    let older = json!({
+        "table_name": "Layers", "key": {"pk": {"N": "abc"}},
+        "condition_expression": "w = :w",
+        "expression_attribute_values": {":w": {"BOOL": "no"}}
+    });
+    let current = json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}}});
+    for (id, args, refusal) in [
+        (2, current.clone(), enveloped(ABC_NUMBER)),
+        (3, older, validation_error(ABC_NUMBER)),
+        (4, current, enveloped(ABC_NUMBER)),
+    ] {
+        let resp = call_tool(&mut child, id, "delete_item", args.clone());
+        assert_eq!(tool_error(&resp), refusal, "{args}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// An argument that isn't DynamoDB JSON at all is refused with the tool's own
+/// message naming the argument, with no serde marker or position in it.
+#[test]
+fn a_map_argument_that_is_not_dynamodb_json_names_the_argument() {
+    let mut child = mcp_with_table("Layers");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Layers", "item": [1]}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        validation_error("Invalid DynamoDB JSON in 'item': invalid type: sequence, expected a map")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The tools without the envelope keep their operation's own layer: GetItem
+/// and TransactWriteItems read values on the current layer, bare, and the
+/// batch, TransactGetItems and PartiQL operations on the older one, which
+/// reads `1e2147483647` as Java's `BigDecimal` does and calls it an underflow
+/// (tests/value_layers.rs).
+#[test]
+fn other_tools_read_values_on_their_operations_layer() {
+    let mut child = mcp_with_table("Layers");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "get_item",
+        json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}}}),
+    );
+    assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({"table_name": "Layers", "key": {"pk": {"N": "abc"}, "x": {"BOOL": "no"}}}),
+    );
+    assert_eq!(tool_error(&resp), validation_error(ABC_NUMBER));
+    let underflow = "Number underflow. Attempting to store a number with magnitude smaller than \
+                     supported range";
+    let tiny = json!({"N": "1e2147483647"});
+    let select = "SELECT * FROM \"Layers\" WHERE pk = ?";
+    // The batch_write_item and transact_get_items cases read on the older
+    // layer only through the tool's entry in the operation map. The three
+    // PartiQL cases get the same answer without it, from the actions
+    // themselves, so they pin the tool's answer whatever the map says.
+    let older: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "batch_write_item",
+            json!({"request_items": {"Layers": [
+                {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": tiny}}}
+            ]}}),
+            validation_error(underflow),
+        ),
+        (
+            "transact_get_items",
+            json!({"transact_items": [{"Get": {"TableName": "Layers", "Key": {"pk": tiny}}}]}),
+            validation_error(underflow),
+        ),
+        (
+            "execute_partiql",
+            json!({"statement": select, "parameters": [tiny]}),
+            validation_error(underflow),
+        ),
+        (
+            "execute_transaction_partiql",
+            json!({"transact_statements": [{"Statement": select, "Parameters": [tiny]}]}),
+            validation_error(underflow),
+        ),
+    ];
+    let checked = older.len() + 1;
+    let mut mismatches = Vec::new();
+    let mut id = 10;
+    for (tool, args, refusal) in older {
+        id += 1;
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    // BatchExecuteStatement answers each statement in its own response.
+    let resp = call_tool(
+        &mut child,
+        30,
+        "batch_execute_partiql",
+        json!({"statements": [{"Statement": select, "Parameters": [tiny]}]}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let responses = &tool_content(&resp)["Responses"];
+    if *responses != json!([{"Error": {"Code": "ValidationError", "Message": underflow}}]) {
+        mismatches.push(format!("batch_execute_partiql: {responses}"));
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} older-layer answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+    // transact_write_items reads its values and its items on the current
+    // layer, bare (captured eu-west-2, us-east-1, eu-west-1 and us-west-2,
+    // 2026-11-11).
+    let overflow = "Number overflow. Attempting to store a number with magnitude larger than \
+                    supported range";
+    for (id, action) in [
+        json!({"Update": {
+            "TableName": "Layers", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET v = :v",
+            "ExpressionAttributeValues": {":v": tiny}
+        }}),
+        json!({"Put": {"TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = call_tool(
+            &mut child,
+            40 + id as u64,
+            "transact_write_items",
+            json!({"transact_items": [action]}),
+        );
+        assert_eq!(tool_error(&resp), validation_error(overflow), "{action}");
+    }
+    // And put_item, straight after, is back on the current layer.
+    let resp = call_tool(
+        &mut child,
+        31,
+        "put_item",
+        json!({"table_name": "Layers", "item": {"pk": {"S": "a"}, "v": {"N": "1e2147483647"}}}),
+    );
+    assert_eq!(
+        tool_error(&resp),
+        enveloped(
+            "Number overflow. Attempting to store a number with magnitude larger than \
+             supported range"
+        )
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `scan`'s `segment` and `total_segments` answer as Scan's member checks do
+/// over HTTP (tests/scan_member_stages.rs): a negative one gets the member
+/// check's message rather than failing argument decoding, and one past what
+/// a 32-bit integer holds is read as the largest one, which moves the request
+/// to the older wording with the value echoed.
+#[test]
+fn scan_segments_answer_as_the_http_api_does() {
+    let mut child = mcp_with_table("Segments");
+    let one = |m: &str| validation_error(&format!("1 validation error detected: {m}"));
+    let segment_min = "Value at 'Segment' failed to satisfy constraint: Member must have value \
+                       greater than or equal to 0";
+    let total_min = "Value at 'TotalSegments' failed to satisfy constraint: Member must have \
+                     value greater than or equal to 1";
+    let zero_based = validation_error(
+        "The Segment parameter is zero-based and must be less than parameter TotalSegments",
+    );
+    let cases: Vec<(Value, (String, String))> = vec![
+        (
+            json!({"segment": -1, "total_segments": 2}),
+            one(segment_min),
+        ),
+        (json!({"segment": -1}), one(segment_min)),
+        (json!({"segment": 0, "total_segments": -1}), one(total_min)),
+        (json!({"total_segments": -1}), one(total_min)),
+        (json!({"segment": 0, "total_segments": 0}), one(total_min)),
+        (
+            json!({"segment": -1, "total_segments": -1}),
+            validation_error(&format!(
+                "2 validation errors detected: {segment_min}; {total_min}"
+            )),
+        ),
+        (
+            json!({"segment": 2, "total_segments": 2}),
+            zero_based.clone(),
+        ),
+        (json!({"segment": 3, "total_segments": 2}), zero_based),
+        (
+            json!({"segment": 0, "total_segments": 1_000_001}),
+            one(
+                "Value at 'TotalSegments' failed to satisfy constraint: Member must have value \
+                 less than or equal to 1000000",
+            ),
+        ),
+        (
+            json!({"segment": 3_000_000_000_u64, "total_segments": 2}),
+            one(
+                "Value '2147483647' at 'segment' failed to satisfy constraint: Member must have \
+                 value less than or equal to 999999",
+            ),
+        ),
+        (
+            json!({"segment": 4_294_967_296_u64, "total_segments": 2}),
+            one(
+                "Value '2147483647' at 'segment' failed to satisfy constraint: Member must have \
+                 value less than or equal to 999999",
+            ),
+        ),
+        (
+            json!({"segment": -3_000_000_000_i64, "total_segments": 2}),
+            one(
+                "Value '-2147483648' at 'segment' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 0",
+            ),
+        ),
+        (
+            json!({"segment": 0, "total_segments": 4_294_967_296_u64}),
+            one(
+                "Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must \
+                 have value less than or equal to 1000000",
+            ),
+        ),
+        // The member checks come ahead of the capacity mode, and the older
+        // wording lists the mode and the limit with the segment.
+        (
+            json!({"segment": -1, "total_segments": 2, "return_consumed_capacity": "BOGUS"}),
+            one(segment_min),
+        ),
+        (
+            json!({
+                "segment": 3_000_000_000_u64, "total_segments": 2,
+                "limit": 0, "return_consumed_capacity": "BOGUS"
+            }),
+            validation_error(
+                "3 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed \
+                 to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, \
+                 NONE]; Value '2147483647' at 'segment' failed to satisfy constraint: Member \
+                 must have value less than or equal to 999999; Value '0' at 'limit' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1",
+            ),
+        ),
+        // A limit past what a 32-bit integer holds is read as the largest one,
+        // which moves a segment's refusal to the older wording too, whether
+        // or not the segment itself is past 32 bits.
+        // With no segment, the limit's own read leaves an enum refusal as it
+        // is worded on either layer.
+        (
+            json!({"limit": 3_000_000_000_u64, "return_consumed_capacity": "BOGUS"}),
+            one(
+                "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member \
+                 must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+            ),
+        ),
+        (
+            json!({"limit": 3_000_000_000_u64, "select": "BOGUS"}),
+            one(
+                "Value 'BOGUS' at 'select' failed to satisfy constraint: Member must satisfy enum \
+                 value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
+            ),
+        ),
+        (
+            json!({"total_segments": 0, "limit": 3_000_000_000_u64}),
+            one(
+                "Value '0' at 'totalSegments' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({"segment": -1, "total_segments": 2, "limit": 3_000_000_000_u64}),
+            one(
+                "Value '-1' at 'segment' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 0",
+            ),
+        ),
+    ];
+    let mut id = 10;
+    for (segments, refusal) in cases {
+        let mut args = json!({"table_name": "Segments"});
+        for (k, v) in segments.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        id += 1;
+        let resp = call_tool(&mut child, id, "scan", args);
+        assert_eq!(tool_error(&resp), refusal, "{segments}");
+    }
+    // A segment in range still scans.
+    let resp = call_tool(
+        &mut child,
+        2,
+        "scan",
+        json!({"table_name": "Segments", "segment": 1, "total_segments": 2}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(tool_content(&resp)["Count"], json!(0));
+    // And so does a limit past 32 bits with no segments, which reads every
+    // item rather than stopping short.
+    for (id, pk) in (3..).zip(["a", "b", "c"]) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Segments", "item": {"pk": {"S": pk}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+    let resp = call_tool(
+        &mut child,
+        6,
+        "scan",
+        json!({"table_name": "Segments", "limit": 3_000_000_000_u64}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["Count"], json!(3), "{content}");
+    let mut keys: Vec<&str> = content["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["pk"]["S"].as_str().unwrap())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["a", "b", "c"]);
+    assert!(content.get("LastEvaluatedKey").is_none(), "{content}");
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `execute_partiql` reports a member error ahead of a parameter it refuses
+/// for its value, and a parameter of the wrong JSON type, or `parameters`
+/// that isn't a list, ahead of both, as ExecuteStatement answers over HTTP
+/// (tests/partiql_member_errors_before_parameters.rs). No table is needed:
+/// each statement is refused before its table is looked up.
+#[test]
+fn execute_partiql_orders_member_and_parameter_errors_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let select = "SELECT * FROM \"Missing\" WHERE pk = ?";
+    let limit_0 = enveloped(
+        "Value '0' at 'limit' failed to satisfy constraint: Member must have value greater \
+         than or equal to 1",
+    );
+    let bad_capacity = "Value 'BAD' at 'returnConsumedCapacity' failed to satisfy constraint: \
+                        Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+    let empty = "Supplied AttributeValue is empty, must contain exactly one of the supported \
+                 datatypes";
+    let number_to_string = serialization_error("NUMBER_VALUE cannot be converted to String");
+    let bad = json!({"N": "abc"});
+
+    let mut cases: Vec<(Value, (String, String))> = vec![
+        // Member errors beat a number the parameter walk refuses.
+        (
+            json!({"statement": select, "parameters": [bad], "limit": 0}),
+            limit_0.clone(),
+        ),
+        (
+            json!({
+                "statement": select, "parameters": [bad],
+                "return_values_on_condition_check_failure": "BAD"
+            }),
+            enveloped(
+                "Value 'BAD' at 'returnValuesOnConditionCheckFailure' failed to satisfy \
+                 constraint: Member must satisfy enum value set: [ALL_OLD, NONE]",
+            ),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad], "return_consumed_capacity": "BAD"}),
+            enveloped(bad_capacity),
+        ),
+        (
+            json!({"statement": "", "parameters": [bad]}),
+            enveloped(
+                "Value '' at 'statement' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ),
+        (
+            json!({
+                "statement": select, "parameters": [bad], "limit": 0,
+                "return_consumed_capacity": "BAD"
+            }),
+            validation_error(&format!(
+                "2 validation errors detected: Value '0' at 'limit' failed to satisfy \
+                 constraint: Member must have value greater than or equal to 1; {bad_capacity}"
+            )),
+        ),
+        // A parameter of the wrong JSON type fails first.
+        (
+            json!({"statement": select, "parameters": [bad, {"N": 1}]}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {"N": 1}], "limit": 0}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {"S": 1}], "limit": 0}),
+            number_to_string.clone(),
+        ),
+        (
+            json!({"statement": select, "parameters": [{"N": 1}], "limit": 0}),
+            number_to_string,
+        ),
+        (
+            json!({"statement": select, "parameters": ["str"]}),
+            serialization_error("Unexpected value type in payload"),
+        ),
+        (
+            json!({"statement": select, "parameters": ["str"], "limit": 0}),
+            serialization_error("Unexpected value type in payload"),
+        ),
+        // With no member error, the first refused parameter is reported.
+        (
+            json!({"statement": select, "parameters": [bad]}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": [{}, bad]}),
+            validation_error(empty),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad, {}]}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": [bad], "next_token": "garbage"}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            json!({"statement": select, "parameters": []}),
+            enveloped(
+                "Value '[]' at 'parameters' failed to satisfy constraint: Member must have \
+                 length greater than or equal to 1",
+            ),
+        ),
+    ];
+    // A limit of 0 beats every kind of parameter refused for its value.
+    for refused in [
+        json!([{}]),
+        json!([{"S": "a", "N": "1"}]),
+        json!([{"NULL": false}]),
+        json!([{"NULL": "false"}]),
+        json!([{"NULL": false, "S": "a"}]),
+        json!([{"X": "a"}]),
+        json!([{"S": null}]),
+        json!([null]),
+        json!([{"NS": ["abc"]}]),
+        json!([{"M": {"a": {"N": "abc"}}}]),
+        json!([{"L": [{"N": "abc"}]}]),
+        json!([{"N": ""}]),
+        json!([{}, {"N": "abc"}]),
+        json!([{"N": "1"}, {"N": "abc"}, {"SS": ["a", "a"]}]),
+    ] {
+        cases.push((
+            json!({"statement": select, "parameters": refused, "limit": 0}),
+            limit_0.clone(),
+        ));
+    }
+    // Parameters that aren't a list fail the request first.
+    for (parameters, message) in [
+        (json!("x"), "Unexpected field type"),
+        (json!(5), "Unexpected field type"),
+        (json!(true), "Unexpected field type"),
+        (
+            json!({}),
+            "Start of structure or map found where not expected",
+        ),
+        (
+            json!({"N": "1"}),
+            "Start of structure or map found where not expected",
+        ),
+    ] {
+        cases.push((
+            json!({"statement": select, "parameters": parameters}),
+            serialization_error(message),
+        ));
+        cases.push((
+            json!({"statement": select, "parameters": parameters, "limit": 0}),
+            serialization_error(message),
+        ));
+    }
+    let mut id = 10;
+    for (args, refusal) in cases {
+        id += 1;
+        let resp = call_tool(&mut child, id, "execute_partiql", args.clone());
+        assert_eq!(tool_error(&resp), refusal, "{args}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `execute_partiql`'s `consistent_read` is ExecuteStatement's
+/// `ConsistentRead` as given, so it answers whatever ExecuteStatement answers
+/// over HTTP. A string DynamoDB reads as a boolean, in any case, reads as
+/// GetItem reads it, and the read is charged by the consistency it names
+/// (captured eu-west-2 and us-east-1, 2026-11-11: `"true"`, `"t"`, `"yes"`,
+/// `"y"`, `"1"`, `"TRUE"`, `"Yes"`, `"false"`, `"f"`, `"no"`, `"n"` and `"0"`
+/// run). Any other string, `"on"` and `" true"` among them, is refused as a
+/// token the parser didn't expect (captured eu-west-2 and us-east-1,
+/// 2026-11-11). A number is refused as GetItem refuses it (captured eu-west-2,
+/// 2026-11-10), and a list with no message (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
+#[test]
+fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
+    let mut child = mcp_with_table("Pql");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Pql", "item": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let select = "SELECT * FROM \"Pql\" WHERE pk = 'a'";
+    let mut id = 10;
+    let consistent = ["true", "t", "yes", "y", "1", "TRUE", "Yes"].map(|s| (json!(s), 1.0));
+    let eventual = ["false", "f", "no", "n", "0"].map(|s| (json!(s), 0.5));
+    let read = [(json!(true), 1.0), (json!(false), 0.5), (Value::Null, 0.5)]
+        .into_iter()
+        .chain(consistent)
+        .chain(eventual);
+    for (flag, units) in read {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({
+                "statement": select, "consistent_read": flag,
+                "return_consumed_capacity": "TOTAL"
+            }),
+        );
+        assert!(!is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["Items"].as_array().unwrap().len(), 1, "{flag}");
+        assert_eq!(
+            content["ConsumedCapacity"]["CapacityUnits"],
+            json!(units),
+            "{flag}"
+        );
+    }
+    for (flag, refusal) in [
+        (json!("x"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!("on"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(" true"), serialization_error(UNEXPECTED_TOKEN)),
+        (json!(""), serialization_error(UNEXPECTED_TOKEN)),
+        (
+            json!(1),
+            serialization_error("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+    ] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({"statement": select, "consistent_read": flag}),
+        );
+        assert_eq!(tool_error(&resp), refusal, "{flag}");
+    }
+    for flag in [json!([]), json!([true])] {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({"statement": select, "consistent_read": flag}),
+        );
+        assert!(is_tool_error(&resp), "{flag}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["error_type"], "SerializationException", "{flag}");
+        assert!(
+            content["message"].as_str().is_none_or(str::is_empty),
+            "{flag}: {content}"
+        );
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+// ---------------------------------------------------------------------------
+// The same request over MCP and over the HTTP API
+// ---------------------------------------------------------------------------
+
+/// What a request came back with, on either surface.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    Ok(Value),
+    Err(String, String),
+}
+
+/// A tool call's answer. A call the argument decoder refuses, before the
+/// tool runs, comes back as plain text rather than a tool error's JSON.
+fn mcp_answer(resp: &Value) -> Answer {
+    if let Some(message) = resp["error"]["message"].as_str() {
+        return Answer::Err("JSON-RPC error".to_string(), message.to_string());
+    }
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    if serde_json::from_str::<Value>(text).is_err() {
+        return Answer::Err("Unparsed arguments".to_string(), text.to_string());
+    }
+    if is_tool_error(resp) {
+        let (error_type, message) = tool_error(resp);
+        Answer::Err(error_type, message)
+    } else {
+        Answer::Ok(tool_content(resp))
+    }
+}
+
+/// A `dynoxide` HTTP server from the same build, so a test can ask the HTTP
+/// API for its answer to the request it sends a tool.
+struct HttpApi {
+    port: u16,
+    _server: common::Server,
+}
+
+impl HttpApi {
+    fn start() -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dynoxide"));
+        command.args(["--port", "0"]).stdin(Stdio::null());
+        let server = common::Server::spawn(command);
+        let port = server.port(common::Listener::Http);
+        Self {
+            port,
+            _server: server,
+        }
+    }
+
+    /// Send `operation` with `body` and return the status and parsed body.
+    fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        use std::io::Read;
+        let body = body.to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+             X-Amz-Target: DynamoDB_20120810.{operation}\r\n\
+             Content-Type: application/x-amz-json-1.0\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential=key/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host, Signature=sig\r\n\
+             X-Amz-Date: 20260101T000000Z\r\n\
+             Content-Length: {len}\r\n\r\n{body}",
+            port = self.port,
+            len = body.len(),
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").expect("an HTTP response");
+        let status = head
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .expect("a status line");
+        (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    }
+
+    /// The HTTP API's answer, in the shape [`mcp_answer`] gives a tool's.
+    fn answer(&self, operation: &str, body: &Value) -> Answer {
+        let (status, body) = self.call(operation, body);
+        if status == 200 {
+            return Answer::Ok(body);
+        }
+        let error_type = body["__type"].as_str().unwrap_or_default();
+        let error_type = error_type
+            .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let message = body
+            .get("message")
+            .or_else(|| body.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Answer::Err(error_type, message)
+    }
+}
+
+/// An MCP server and an HTTP server, each holding a hash-only table called
+/// `table` with the same items in it.
+fn both_with_items(table: &str, items: &[Value]) -> (std::process::Child, HttpApi) {
+    let mut child = mcp_with_table(table);
+    let http = HttpApi::start();
+    let (status, body) = http.call(
+        "CreateTable",
+        &json!({
+            "TableName": table,
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]
+        }),
+    );
+    assert_eq!(status, 200, "{body}");
+    for (id, item) in (900..).zip(items) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": table, "item": item}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+        let (status, body) = http.call("PutItem", &json!({"TableName": table, "Item": item}));
+        assert_eq!(status, 200, "{body}");
+    }
+    (child, http)
+}
+
+/// Send each `(tool, arguments, operation, body)` to both surfaces and list
+/// the cases whose answers differ, with both answers.
+fn differences(
+    child: &mut std::process::Child,
+    http: &HttpApi,
+    cases: Vec<(&str, Value, &str, Value)>,
+) -> Vec<String> {
+    let mut differ = Vec::new();
+    for (id, (tool, args, operation, body)) in (1000..).zip(cases) {
+        let over_mcp = mcp_answer(&call_tool(child, id, tool, args.clone()));
+        let over_http = http.answer(operation, &body);
+        if over_mcp != over_http {
+            differ.push(format!(
+                "{tool} {args}\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+            ));
+        }
+    }
+    differ
+}
+
+/// One request member: (tool argument, wire member, value).
+type Member<'a> = (&'a str, &'a str, Value);
+
+/// A tool's arguments and the HTTP body for the same request, from pairs of
+/// (tool argument, wire member, value).
+fn same_request(members: &[Member]) -> (Value, Value) {
+    let mut args = json!({});
+    let mut body = json!({});
+    for (arg, member, value) in members {
+        args[*arg] = value.clone();
+        body[*member] = value.clone();
+    }
+    (args, body)
+}
+
+/// `query` and `scan` read their arguments as Query and Scan read the same
+/// members over HTTP: `limit`, `segment` and `total_segments` given as a
+/// negative, a fraction, a value past 32 bits or a string; an expression
+/// value or start key that is refused, beside a bad
+/// `return_consumed_capacity` or alone. Every expectation is the HTTP API's
+/// answer to the same request.
+#[test]
+fn query_and_scan_answer_as_the_http_api_does() {
+    let (mut child, http) = both_with_items("Reads", &[json!({"pk": {"S": "a"}})]);
+    let table = ("table_name", "TableName", json!("Reads"));
+    let key_condition = (
+        "key_condition_expression",
+        "KeyConditionExpression",
+        json!("pk = :v"),
+    );
+    let key_value = |v: Value| {
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":v": v}),
+        )
+    };
+    let bogus = (
+        "return_consumed_capacity",
+        "ReturnConsumedCapacity",
+        json!("BOGUS"),
+    );
+    let mut requests: Vec<(&str, Vec<Member>)> = Vec::new();
+    let numbers = [
+        json!(-1),
+        json!(0),
+        json!(1),
+        json!(1.5),
+        json!(3_000_000_000_u64),
+        json!(1e20),
+        json!("5"),
+    ];
+    for n in &numbers {
+        requests.push((
+            "query",
+            vec![
+                table.clone(),
+                key_condition.clone(),
+                key_value(json!({"S": "a"})),
+                ("limit", "Limit", n.clone()),
+            ],
+        ));
+        requests.push(("scan", vec![table.clone(), ("limit", "Limit", n.clone())]));
+        requests.push((
+            "scan",
+            vec![
+                table.clone(),
+                ("segment", "Segment", n.clone()),
+                ("total_segments", "TotalSegments", json!(4)),
+            ],
+        ));
+        requests.push((
+            "scan",
+            vec![
+                table.clone(),
+                ("segment", "Segment", json!(0)),
+                ("total_segments", "TotalSegments", n.clone()),
+            ],
+        ));
+    }
+    // A limit read as 32 bits beside a bad mode moves to the older wording.
+    requests.push((
+        "scan",
+        vec![table.clone(), ("limit", "Limit", json!(1.5)), bogus.clone()],
+    ));
+    requests.push((
+        "query",
+        vec![
+            table.clone(),
+            key_condition.clone(),
+            key_value(json!({"S": "a"})),
+            ("limit", "Limit", json!(-1)),
+            bogus.clone(),
+        ],
+    ));
+    let refused = [
+        json!({"S": null}),
+        json!({"NULL": "no"}),
+        json!({"N": "abc"}),
+        json!({"S": "a", "N": "1"}),
+        json!({"S": ""}),
+    ];
+    for value in &refused {
+        for with_mode in [false, true] {
+            let mut query = vec![
+                table.clone(),
+                key_condition.clone(),
+                key_value(value.clone()),
+            ];
+            let mut scan = vec![
+                table.clone(),
+                ("filter_expression", "FilterExpression", json!("x = :v")),
+                key_value(value.clone()),
+            ];
+            let mut start = vec![
+                table.clone(),
+                (
+                    "exclusive_start_key",
+                    "ExclusiveStartKey",
+                    json!({"pk": value}),
+                ),
+            ];
+            if with_mode {
+                query.push(bogus.clone());
+                scan.push(bogus.clone());
+                start.push(bogus.clone());
+            }
+            requests.push(("query", query));
+            requests.push(("scan", scan));
+            requests.push(("scan", start));
+        }
+    }
+    requests.push((
+        "scan",
+        vec![
+            table.clone(),
+            ("exclusive_start_key", "ExclusiveStartKey", json!("x")),
+        ],
+    ));
+    requests.push(("scan", vec![table.clone(), bogus.clone()]));
+    requests.push((
+        "query",
+        vec![
+            table.clone(),
+            key_condition.clone(),
+            key_value(json!({"S": "a"})),
+            bogus.clone(),
+        ],
+    ));
+
+    let checked = requests.len();
+    let cases = requests
+        .into_iter()
+        .map(|(tool, members)| {
+            let (args, body) = same_request(&members);
+            let operation = if tool == "query" { "Query" } else { "Scan" };
+            (tool, args, operation, body)
+        })
+        .collect();
+    let differ = differences(&mut child, &http, cases);
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `limit` on `execute_partiql` and the stream tools, and `top_k` on
+/// `search_vectors`, are read as the HTTP operation reads the same member, so
+/// a negative, a fraction, a value past 32 bits or a string gets the HTTP
+/// API's answer. The searches and stream reads name nothing that exists, so
+/// a value the request reads reaches the same lookup on both surfaces.
+#[test]
+fn the_other_numeric_arguments_answer_as_the_http_api_does() {
+    let (mut child, http) = both_with_items("Counted", &[json!({"pk": {"S": "a"}})]);
+    let select = json!("SELECT * FROM \"Counted\"");
+    let arn = json!("arn:aws:dynamodb:dynoxide:000000000000:table/Gone/stream/1.0");
+    let search = |n: Value| {
+        vec![
+            ("table_name", "TableName", json!("Gone")),
+            ("index_name", "IndexName", json!("vix")),
+            ("search_vector", "SearchVector", json!([{"N": "1"}])),
+            ("top_k", "TopK", n),
+        ]
+    };
+    let mut requests: Vec<(&str, &str, Vec<Member>)> = Vec::new();
+    // A TopK that is not a 32-bit integer and a negative stream limit are
+    // answered with serde's text and its position, which the HTTP API passes
+    // through; they are checked on their own below.
+    for n in [
+        json!(-1),
+        json!(0),
+        json!(1),
+        json!(1.5),
+        json!(3_000_000_000_u64),
+        json!(1e20),
+        json!("5"),
+    ] {
+        requests.push((
+            "execute_partiql",
+            "ExecuteStatement",
+            vec![
+                ("statement", "Statement", select.clone()),
+                ("limit", "Limit", n.clone()),
+            ],
+        ));
+        if [json!(-1), json!(0), json!(1)].contains(&n) {
+            requests.push(("search_vectors", "SearchVectors", search(n.clone())));
+        }
+        if n != json!(-1) {
+            requests.push((
+                "list_streams",
+                "ListStreams",
+                vec![("limit", "Limit", n.clone())],
+            ));
+            requests.push((
+                "describe_stream",
+                "DescribeStream",
+                vec![
+                    ("stream_arn", "StreamArn", arn.clone()),
+                    ("limit", "Limit", n.clone()),
+                ],
+            ));
+            requests.push((
+                "get_records",
+                "GetRecords",
+                vec![
+                    ("shard_iterator", "ShardIterator", json!("nothing")),
+                    ("limit", "Limit", n.clone()),
+                ],
+            ));
+        }
+    }
+    // SearchVectors checks the capacity mode among its member checks, and
+    // reads expression values strictly.
+    let mut with_mode = search(json!(0));
+    with_mode.push((
+        "return_consumed_capacity",
+        "ReturnConsumedCapacity",
+        json!("BOGUS"),
+    ));
+    requests.push(("search_vectors", "SearchVectors", with_mode));
+    let mut with_mode = search(json!(5));
+    with_mode.push((
+        "return_consumed_capacity",
+        "ReturnConsumedCapacity",
+        json!("BOGUS"),
+    ));
+    requests.push(("search_vectors", "SearchVectors", with_mode));
+    let with_value = |value: Value| {
+        let mut members = search(json!(5));
+        members.push((
+            "search_condition_expression",
+            "SearchConditionExpression",
+            json!("t = :t"),
+        ));
+        members.push((
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":t": value}),
+        ));
+        members
+    };
+    for value in [json!({"N": "abc"}), json!({"S": "a", "N": "1"})] {
+        requests.push(("search_vectors", "SearchVectors", with_value(value)));
+    }
+    let checked = requests.len();
+    let cases = requests
+        .into_iter()
+        .map(|(tool, operation, members)| {
+            let (args, body) = same_request(&members);
+            (tool, args, operation, body)
+        })
+        .collect();
+    let differ = differences(&mut child, &http, cases);
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    // The answers that carry serde's position: the same text on both
+    // surfaces, the request being written the same way.
+    let raw = |resp: &Value| -> Value {
+        assert!(is_tool_error(resp), "expected a tool error: {resp}");
+        let content = tool_content(resp);
+        json!([content["error_type"], content["message"]])
+    };
+    let mut id = 2000;
+    let mut positioned = vec![(
+        "list_streams",
+        "ListStreams",
+        vec![("limit", "Limit", json!(-1))],
+    )];
+    for n in [
+        json!(1.5),
+        json!(3_000_000_000_u64),
+        json!(1e20),
+        json!("5"),
+    ] {
+        positioned.push(("search_vectors", "SearchVectors", search(n)));
+    }
+    for value in [json!({"S": null}), json!({"X": "a"})] {
+        positioned.push(("search_vectors", "SearchVectors", with_value(value)));
+    }
+    for (tool, operation, members) in positioned {
+        let (args, body) = same_request(&members);
+        id += 1;
+        let over_mcp = raw(&call_tool(&mut child, id, tool, args));
+        let (status, body) = http.call(operation, &body);
+        assert_eq!(status, 400, "{body}");
+        let message = body.get("message").or_else(|| body.get("Message")).unwrap();
+        let error_type = body["__type"].as_str().unwrap().rsplit('#').next().unwrap();
+        assert_eq!(over_mcp, json!([error_type, message]), "{tool}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The item tools read their values first and then check the request's
+/// members as the HTTP operation does: a refused key, item or expression
+/// value ahead of a bad `return_consumed_capacity`, the member errors listed
+/// together where the operation lists them, UpdateItem's single enum error
+/// in its own wording, and `return_values_on_condition_check_failure`
+/// outside its enum refused. `delete_item` reads its expression values after
+/// the member checks, as DeleteItem does. Every expectation is the HTTP API's
+/// answer to the same request.
+#[test]
+fn item_tools_check_their_members_as_the_http_api_does() {
+    let table = "Members";
+    let (mut child, http) = both_with_items(table, &[json!({"pk": {"S": "a"}, "v": {"N": "1"}})]);
+    let name = ("table_name", "TableName", json!(table));
+    let key = |v: Value| ("key", "Key", json!({"pk": v}));
+    let item = |v: Value| ("item", "Item", json!({"pk": {"S": "q"}, "x": v}));
+    let values = |v: Value| {
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":x": v}),
+        )
+    };
+    let condition = (
+        "condition_expression",
+        "ConditionExpression",
+        json!("x = :x"),
+    );
+    let update = ("update_expression", "UpdateExpression", json!("SET y = :x"));
+    let mode = |m: &str| {
+        (
+            "return_consumed_capacity",
+            "ReturnConsumedCapacity",
+            json!(m),
+        )
+    };
+    let return_values = ("return_values", "ReturnValues", json!("BAD"));
+    let on_failure = (
+        "return_values_on_condition_check_failure",
+        "ReturnValuesOnConditionCheckFailure",
+        json!("X"),
+    );
+    let fine = json!({"S": "a"});
+    let mut requests: Vec<(&str, &str, Vec<Member>)> = Vec::new();
+    // Values refused beside a bad mode.
+    for bad in [
+        json!({"N": "abc"}),
+        json!({"S": "a", "N": "1"}),
+        json!({"BOOL": "no"}),
+        json!({"S": ""}),
+        json!({"NULL": "no"}),
+    ] {
+        requests.push((
+            "get_item",
+            "GetItem",
+            vec![name.clone(), key(bad.clone()), mode("BOGUS")],
+        ));
+        requests.push((
+            "put_item",
+            "PutItem",
+            vec![name.clone(), item(bad.clone()), mode("BOGUS")],
+        ));
+        requests.push((
+            "put_item",
+            "PutItem",
+            vec![
+                name.clone(),
+                item(fine.clone()),
+                condition.clone(),
+                values(bad.clone()),
+                mode("BOGUS"),
+            ],
+        ));
+        requests.push((
+            "update_item",
+            "UpdateItem",
+            vec![
+                name.clone(),
+                key(bad.clone()),
+                update.clone(),
+                values(json!({"N": "1"})),
+                mode("BOGUS"),
+            ],
+        ));
+        requests.push((
+            "update_item",
+            "UpdateItem",
+            vec![
+                name.clone(),
+                key(fine.clone()),
+                update.clone(),
+                values(bad.clone()),
+                mode("BOGUS"),
+            ],
+        ));
+        requests.push((
+            "delete_item",
+            "DeleteItem",
+            vec![name.clone(), key(bad.clone()), mode("BOGUS")],
+        ));
+        for with_mode in [false, true] {
+            let mut members = vec![
+                name.clone(),
+                key(json!({"S": "z"})),
+                condition.clone(),
+                values(bad.clone()),
+            ];
+            if with_mode {
+                members.push(mode("BOGUS"));
+            }
+            requests.push(("delete_item", "DeleteItem", members));
+        }
+        requests.push((
+            "batch_write_item",
+            "BatchWriteItem",
+            vec![
+                (
+                    "request_items",
+                    "RequestItems",
+                    json!({table: [{"PutRequest": {"Item": {"pk": {"S": "q"}, "x": bad}}}]}),
+                ),
+                mode("BOGUS"),
+            ],
+        ));
+    }
+    // The members alone and together.
+    let enums: Vec<Vec<(&str, &str, Value)>> = vec![
+        vec![mode("BOGUS")],
+        vec![return_values.clone()],
+        vec![return_values.clone(), mode("BOGUS")],
+        vec![on_failure.clone()],
+        vec![on_failure.clone(), mode("BOGUS")],
+        vec![return_values.clone(), on_failure.clone(), mode("BOGUS")],
+    ];
+    for members in enums {
+        let with = |mut base: Vec<(&'static str, &'static str, Value)>| {
+            base.extend(members.iter().cloned());
+            base
+        };
+        requests.push((
+            "put_item",
+            "PutItem",
+            with(vec![name.clone(), item(fine.clone())]),
+        ));
+        requests.push((
+            "update_item",
+            "UpdateItem",
+            with(vec![
+                name.clone(),
+                key(fine.clone()),
+                update.clone(),
+                values(json!({"N": "1"})),
+            ]),
+        ));
+        requests.push((
+            "delete_item",
+            "DeleteItem",
+            with(vec![name.clone(), key(json!({"S": "z"}))]),
+        ));
+    }
+    for tool_and_operation in [
+        ("get_item", "GetItem"),
+        ("delete_item", "DeleteItem"),
+        ("update_item", "UpdateItem"),
+    ] {
+        requests.push((
+            tool_and_operation.0,
+            tool_and_operation.1,
+            vec![
+                ("table_name", "TableName", json!("ab")),
+                key(fine.clone()),
+                mode("BOGUS"),
+            ],
+        ));
+    }
+    requests.push((
+        "put_item",
+        "PutItem",
+        vec![
+            ("table_name", "TableName", json!("ab")),
+            item(fine.clone()),
+            mode("BOGUS"),
+        ],
+    ));
+
+    let checked = requests.len();
+    let cases = requests
+        .into_iter()
+        .map(|(tool, operation, members)| {
+            let (args, body) = same_request(&members);
+            (tool, args, operation, body)
+        })
+        .collect();
+    let differ = differences(&mut child, &http, cases);
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A tool error's type and message as given, serde's position included, for
+/// the answers the HTTP API gives with one.
+fn mcp_answer_as_given(resp: &Value) -> Answer {
+    if !is_tool_error(resp) {
+        return mcp_answer(resp);
+    }
+    let content = tool_content(resp);
+    Answer::Err(
+        content["error_type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        content["message"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// `batch_get_item` and `batch_write_item` decode `request_items` as their
+/// operations' requests do, after the snake_case spellings the tools accept
+/// are given their wire names, so a malformed entry gets the HTTP API's
+/// answer for the same request items. The HTTP API's answers for several of
+/// these differ from DynamoDB's and will change; the tools follow them, so
+/// each is compared with the HTTP API's answer here rather than pinned.
+#[test]
+fn batch_request_items_answer_as_the_http_api_does() {
+    let table = "Batch";
+    let (mut child, http) = both_with_items(table, &[json!({"pk": {"S": "a"}})]);
+    let keys = json!([{"pk": {"S": "a"}}]);
+    let item = |pk: &str| json!({"pk": {"S": pk}});
+    // (tool, the tool's request_items, operation, the wire's RequestItems)
+    let mut cases: Vec<(&str, Value, &str, Value)> = Vec::new();
+    let mut same = |tool: &'static str, operation: &'static str, items: Value| {
+        cases.push((tool, items.clone(), operation, items));
+    };
+    for items in [
+        json!("x"),
+        json!([]),
+        json!({}),
+        json!({table: {}}),
+        json!({table: "x"}),
+        json!({table: []}),
+        json!({table: {"Keys": "x"}}),
+        json!({table: {"Keys": [1]}}),
+        json!({table: {"Keys": ["x"]}}),
+        json!({table: {"Keys": [{"pk": "x"}]}}),
+        json!({table: {"Keys": null}}),
+        json!({table: {"Keys": keys, "ProjectionExpression": 5}}),
+        json!({table: {"Keys": keys, "ExpressionAttributeNames": "x"}}),
+        json!({table: {"Keys": keys, "ExpressionAttributeNames": {"#a": 5}}}),
+        json!({table: {"Keys": keys, "ConsistentRead": "x"}}),
+        json!({table: {"Keys": keys, "AttributesToGet": "pk"}}),
+        json!({table: {"Keys": keys, "AttributesToGet": ["pk"]}}),
+        json!({table: {"Keys": keys}}),
+    ] {
+        same("batch_get_item", "BatchGetItem", items);
+    }
+    for items in [
+        json!("x"),
+        json!([]),
+        json!({}),
+        json!({table: "x"}),
+        json!({table: {}}),
+        json!({table: []}),
+        json!({table: [1]}),
+        json!({table: ["x"]}),
+        json!({table: [[]]}),
+        json!({table: [{}]}),
+        json!({table: [null]}),
+        json!({table: [{"PutRequest": "x"}]}),
+        json!({table: [{"PutRequest": {}}]}),
+        json!({table: [{"DeleteRequest": {}}]}),
+        json!({table: [{"PutRequest": {"Item": "x"}}]}),
+        json!({table: [{"PutRequest": {"Item": {"pk": "x"}}}]}),
+        json!({table: [{"DeleteRequest": {"Key": "x"}}]}),
+        json!({table: [{"PutRequest": {"Item": item("b")}, "DeleteRequest": {"Key": item("a")}}]}),
+        json!({table: [{"PutRequest": {"Item": item("b")}}]}),
+    ] {
+        same("batch_write_item", "BatchWriteItem", items);
+    }
+    // The snake_case spellings, given their wire names; where an entry gives
+    // both, the wire spelling is the one read.
+    cases.push((
+        "batch_get_item",
+        json!({table: {"keys": keys, "projection_expression": "pk", "consistent_read": "yes"}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys, "ProjectionExpression": "pk", "ConsistentRead": "yes"}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"keys": keys, "projection_expression": 5}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys, "ProjectionExpression": 5}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"keys": keys, "expression_attribute_names": "x"}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys, "ExpressionAttributeNames": "x"}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"projection_expression": "pk"}}),
+        "BatchGetItem",
+        json!({table: {"ProjectionExpression": "pk"}}),
+    ));
+    cases.push((
+        "batch_get_item",
+        json!({table: {"Keys": keys, "keys": "x"}}),
+        "BatchGetItem",
+        json!({table: {"Keys": keys}}),
+    ));
+    cases.push((
+        "batch_write_item",
+        json!({table: [
+            {"put_request": {"item": item("c")}},
+            {"delete_request": {"key": item("b")}}
+        ]}),
+        "BatchWriteItem",
+        json!({table: [
+            {"PutRequest": {"Item": item("c")}},
+            {"DeleteRequest": {"Key": item("b")}}
+        ]}),
+    ));
+    cases.push((
+        "batch_write_item",
+        json!({table: [{"put_request": {}}]}),
+        "BatchWriteItem",
+        json!({table: [{"PutRequest": {}}]}),
+    ));
+    cases.push((
+        "batch_write_item",
+        json!({table: [{"PutRequest": {"Item": item("d"), "item": "x"}, "put_request": "x"}]}),
+        "BatchWriteItem",
+        json!({table: [{"PutRequest": {"Item": item("d")}}]}),
+    ));
+
+    let checked = cases.len();
+    let mut differ = Vec::new();
+    for (id, (tool, items, operation, wire)) in (3000..).zip(cases) {
+        let over_mcp = mcp_answer_as_given(&call_tool(
+            &mut child,
+            id,
+            tool,
+            json!({"request_items": items}),
+        ));
+        let over_http = http.answer(operation, &json!({"RequestItems": wire}));
+        if over_mcp != over_http {
+            differ.push(format!(
+                "{tool} {items}\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+            ));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} of {checked} answers differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Run one request on both surfaces during setup, failing if either refuses.
+fn on_both(
+    child: &mut std::process::Child,
+    http: &HttpApi,
+    id: u64,
+    call: (&str, Value, &str, Value),
+) {
+    let (tool, args, operation, body) = call;
+    let resp = call_tool(child, id, tool, args);
+    assert!(!is_tool_error(&resp), "{tool}: {resp}");
+    let (status, answer) = http.call(operation, &body);
+    assert_eq!(status, 200, "{operation}: {answer}");
+}
+
+/// Two copies of the same data, one behind a `dynoxide mcp` subprocess and
+/// one behind the HTTP API: `Rich` (pk, sk) with a sparse index `byG` on
+/// (g, sk), and `Vecs` with a vector index `vix` on `emb`.
+fn both_with_rich_data() -> (std::process::Child, HttpApi) {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let http = HttpApi::start();
+    on_both(
+        &mut child,
+        &http,
+        800,
+        (
+            "create_table",
+            json!({
+                "table_name": "Rich",
+                "billing_mode": "PAY_PER_REQUEST",
+                "key_schema": [
+                    {"attribute_name": "pk", "key_type": "HASH"},
+                    {"attribute_name": "sk", "key_type": "RANGE"}
+                ],
+                "attribute_definitions": [
+                    {"attribute_name": "pk", "attribute_type": "S"},
+                    {"attribute_name": "sk", "attribute_type": "N"},
+                    {"attribute_name": "g", "attribute_type": "S"}
+                ],
+                "global_secondary_indexes": [{
+                    "index_name": "byG",
+                    "key_schema": [
+                        {"attribute_name": "g", "key_type": "HASH"},
+                        {"attribute_name": "sk", "key_type": "RANGE"}
+                    ],
+                    "projection": {"projection_type": "ALL"}
+                }]
+            }),
+            "CreateTable",
+            json!({
+                "TableName": "Rich",
+                "BillingMode": "PAY_PER_REQUEST",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "N"},
+                    {"AttributeName": "g", "AttributeType": "S"}
+                ],
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": "byG",
+                    "KeySchema": [
+                        {"AttributeName": "g", "KeyType": "HASH"},
+                        {"AttributeName": "sk", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                }]
+            }),
+        ),
+    );
+    on_both(
+        &mut child,
+        &http,
+        801,
+        (
+            "create_table",
+            json!({
+                "table_name": "Vecs",
+                "billing_mode": "PAY_PER_REQUEST",
+                "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+                "attribute_definitions": [
+                    {"attribute_name": "pk", "attribute_type": "S"},
+                    {"attribute_name": "t", "attribute_type": "S"}
+                ],
+                "vector_indexes": [{
+                    "index_name": "vix",
+                    "vector_attribute": {"attribute_name": "emb"},
+                    "search_schema": [
+                        {"attribute_name": "t", "search_schema_element_type": "INLINE_FILTER"}
+                    ],
+                    "projection": {"projection_type": "ALL"},
+                    "dimensions": 3,
+                    "distance_function": "COSINE"
+                }]
+            }),
+            "CreateTable",
+            json!({
+                "TableName": "Vecs",
+                "BillingMode": "PAY_PER_REQUEST",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "t", "AttributeType": "S"}
+                ],
+                "VectorIndexes": [{
+                    "IndexName": "vix",
+                    "VectorAttribute": {"AttributeName": "emb"},
+                    "SearchSchema": [
+                        {"AttributeName": "t", "SearchSchemaElementType": "INLINE_FILTER"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "Dimensions": 3,
+                    "DistanceFunction": "COSINE"
+                }]
+            }),
+        ),
+    );
+    let mut items = Vec::new();
+    for sk in 1..=6 {
+        let mut item = json!({
+            "pk": {"S": "a"},
+            "sk": {"N": sk.to_string()},
+            "t": {"S": if sk % 2 == 1 { "keep" } else { "drop" }},
+            "v": {"N": (sk * 10).to_string()},
+            "o": {"S": "other"}
+        });
+        if sk <= 3 {
+            item["g"] = json!({"S": "x"});
+        }
+        items.push(("Rich", item));
+    }
+    items.push((
+        "Rich",
+        json!({"pk": {"S": "b"}, "sk": {"N": "1"}, "g": {"S": "y"}, "t": {"S": "keep"}}),
+    ));
+    for (pk, emb, t) in [
+        ("v1", ["1", "0", "0"], "keep"),
+        ("v2", ["0.9", "0.1", "0"], "drop"),
+        ("v3", ["0", "1", "0"], "keep"),
+        ("v4", ["0", "0", "1"], "drop"),
+    ] {
+        let emb: Vec<Value> = emb.iter().map(|n| json!({"N": n})).collect();
+        items.push((
+            "Vecs",
+            json!({"pk": {"S": pk}, "emb": {"L": emb}, "t": {"S": t}, "o": {"S": "other"}}),
+        ));
+    }
+    for (id, (table, item)) in (810..).zip(items) {
+        on_both(
+            &mut child,
+            &http,
+            id,
+            (
+                "put_item",
+                json!({"table_name": table, "item": item}),
+                "PutItem",
+                json!({"TableName": table, "Item": item}),
+            ),
+        );
+    }
+    (child, http)
+}
+
+/// Valid calls that each use one optional argument in a way that changes the
+/// result answer as the HTTP API does, whole successful bodies included. A
+/// tool that dropped the argument on the way to the operation would answer
+/// differently.
+#[test]
+fn valid_calls_answer_as_the_http_api_does() {
+    let (mut child, http) = both_with_rich_data();
+    let rich = ("table_name", "TableName", json!("Rich"));
+    let vecs = ("table_name", "TableName", json!("Vecs"));
+    let on_a = [
+        (
+            "key_condition_expression",
+            "KeyConditionExpression",
+            json!("pk = :p"),
+        ),
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":p": {"S": "a"}}),
+        ),
+    ];
+    let query = |extra: Vec<Member<'static>>| {
+        let mut members = vec![rich.clone(), on_a[0].clone(), on_a[1].clone()];
+        for member in extra {
+            members.retain(|(arg, _, _)| *arg != member.0);
+            members.push(member);
+        }
+        ("query", "Query", members)
+    };
+    let key = json!({"pk": {"S": "a"}, "sk": {"N": "3"}});
+    let vector = json!([{"N": "1"}, {"N": "0"}, {"N": "0"}]);
+    let search = |extra: Vec<Member<'static>>| {
+        let mut members = vec![
+            vecs.clone(),
+            ("index_name", "IndexName", json!("vix")),
+            ("search_vector", "SearchVector", vector.clone()),
+            ("top_k", "TopK", json!(2)),
+        ];
+        members.extend(extra);
+        ("search_vectors", "SearchVectors", members)
+    };
+
+    // A page boundary taken from the HTTP API's own first page.
+    let (status, first_page) = http.call(
+        "Query",
+        &json!({
+            "TableName": "Rich", "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "a"}}, "Limit": 2
+        }),
+    );
+    assert_eq!(status, 200, "{first_page}");
+    let start_key = first_page["LastEvaluatedKey"].clone();
+    assert!(
+        start_key.is_object(),
+        "the first page ends early: {first_page}"
+    );
+
+    let requests: Vec<(&str, &str, Vec<Member>)> = vec![
+        query(vec![
+            ("filter_expression", "FilterExpression", json!("t = :t")),
+            (
+                "expression_attribute_values",
+                "ExpressionAttributeValues",
+                json!({":p": {"S": "a"}, ":t": {"S": "keep"}}),
+            ),
+        ]),
+        query(vec![(
+            "projection_expression",
+            "ProjectionExpression",
+            json!("sk, t"),
+        )]),
+        query(vec![
+            (
+                "projection_expression",
+                "ProjectionExpression",
+                json!("#t, sk"),
+            ),
+            (
+                "expression_attribute_names",
+                "ExpressionAttributeNames",
+                json!({"#t": "t"}),
+            ),
+        ]),
+        query(vec![
+            ("limit", "Limit", json!(2)),
+            (
+                "exclusive_start_key",
+                "ExclusiveStartKey",
+                start_key.clone(),
+            ),
+        ]),
+        query(vec![("select", "Select", json!("COUNT"))]),
+        query(vec![
+            ("select", "Select", json!("SPECIFIC_ATTRIBUTES")),
+            ("projection_expression", "ProjectionExpression", json!("v")),
+        ]),
+        query(vec![
+            ("index_name", "IndexName", json!("byG")),
+            (
+                "key_condition_expression",
+                "KeyConditionExpression",
+                json!("g = :g"),
+            ),
+            (
+                "expression_attribute_values",
+                "ExpressionAttributeValues",
+                json!({":g": {"S": "x"}}),
+            ),
+        ]),
+        (
+            "scan",
+            "Scan",
+            vec![
+                rich.clone(),
+                (
+                    "projection_expression",
+                    "ProjectionExpression",
+                    json!("pk, sk"),
+                ),
+            ],
+        ),
+        (
+            "scan",
+            "Scan",
+            vec![
+                rich.clone(),
+                (
+                    "projection_expression",
+                    "ProjectionExpression",
+                    json!("#o, sk"),
+                ),
+                (
+                    "expression_attribute_names",
+                    "ExpressionAttributeNames",
+                    json!({"#o": "o"}),
+                ),
+            ],
+        ),
+        (
+            "scan",
+            "Scan",
+            vec![rich.clone(), ("index_name", "IndexName", json!("byG"))],
+        ),
+        (
+            "get_item",
+            "GetItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", key.clone()),
+                ("projection_expression", "ProjectionExpression", json!("t")),
+            ],
+        ),
+        (
+            "get_item",
+            "GetItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", key.clone()),
+                ("projection_expression", "ProjectionExpression", json!("#v")),
+                (
+                    "expression_attribute_names",
+                    "ExpressionAttributeNames",
+                    json!({"#v": "v"}),
+                ),
+            ],
+        ),
+        search(vec![
+            (
+                "search_condition_expression",
+                "SearchConditionExpression",
+                json!("t = :t"),
+            ),
+            (
+                "expression_attribute_values",
+                "ExpressionAttributeValues",
+                json!({":t": {"S": "keep"}}),
+            ),
+        ]),
+        search(vec![(
+            "projection_expression",
+            "ProjectionExpression",
+            json!("pk"),
+        )]),
+        // BatchGetItem applies AttributesToGet, so the tool does too.
+        (
+            "batch_get_item",
+            "BatchGetItem",
+            vec![(
+                "request_items",
+                "RequestItems",
+                json!({"Rich": {"Keys": [key.clone()], "AttributesToGet": ["t", "sk"]}}),
+            )],
+        ),
+        // The writes come last, as they change the data the reads see.
+        (
+            "put_item",
+            "PutItem",
+            vec![
+                rich.clone(),
+                (
+                    "item",
+                    "Item",
+                    json!({"pk": {"S": "a"}, "sk": {"N": "1"}, "v": {"N": "11"}}),
+                ),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("v = :v"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":v": {"N": "10"}}),
+                ),
+                ("return_values", "ReturnValues", json!("ALL_OLD")),
+            ],
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", key.clone()),
+                ("update_expression", "UpdateExpression", json!("SET w = :w")),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("attribute_exists(pk)"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":w": {"S": "new"}}),
+                ),
+                ("return_values", "ReturnValues", json!("ALL_NEW")),
+            ],
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            vec![
+                rich.clone(),
+                ("key", "Key", json!({"pk": {"S": "a"}, "sk": {"N": "9"}})),
+                ("update_expression", "UpdateExpression", json!("SET w = :w")),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("attribute_exists(pk)"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":w": {"S": "new"}}),
+                ),
+            ],
+        ),
+        (
+            "put_item",
+            "PutItem",
+            vec![
+                rich.clone(),
+                ("item", "Item", json!({"pk": {"S": "a"}, "sk": {"N": "2"}})),
+                (
+                    "condition_expression",
+                    "ConditionExpression",
+                    json!("v = :v"),
+                ),
+                (
+                    "expression_attribute_values",
+                    "ExpressionAttributeValues",
+                    json!({":v": {"N": "999"}}),
+                ),
+            ],
+        ),
+    ];
+
+    let checked = requests.len();
+    let mut differ = Vec::new();
+    for (id, (tool, operation, members)) in (4000..).zip(requests) {
+        let (args, body) = same_request(&members);
+        let over_mcp = mcp_answer(&call_tool(&mut child, id, tool, args.clone()));
+        let over_http = http.answer(operation, &body);
+        // Each read and the first two writes are meant to succeed, so an
+        // argument the tool dropped can't hide behind an error both give.
+        if !matches!(over_http, Answer::Ok(_))
+            && !matches!(&over_http, Answer::Err(t, _) if t == "ConditionalCheckFailedException")
+        {
+            differ.push(format!("{tool} {args}\n  HTTP refused it: {over_http:?}"));
+        }
+        if over_mcp != over_http {
+            differ.push(format!(
+                "{tool} {args}\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+            ));
+        }
+    }
+
+    // A refusal that carries more than a message: the failed condition's item
+    // and a cancelled transaction's reasons, against the HTTP API's `Item`
+    // and `CancellationReasons`.
+    let failed_put = vec![
+        rich.clone(),
+        ("item", "Item", json!({"pk": {"S": "a"}, "sk": {"N": "4"}})),
+        (
+            "condition_expression",
+            "ConditionExpression",
+            json!("v = :v"),
+        ),
+        (
+            "expression_attribute_values",
+            "ExpressionAttributeValues",
+            json!({":v": {"N": "999"}}),
+        ),
+        (
+            "return_values_on_condition_check_failure",
+            "ReturnValuesOnConditionCheckFailure",
+            json!("ALL_OLD"),
+        ),
+    ];
+    let cancelled = vec![(
+        "transact_items",
+        "TransactItems",
+        json!([
+            {"Put": {"TableName": "Rich", "Item": {"pk": {"S": "c"}, "sk": {"N": "1"}}}},
+            {"ConditionCheck": {
+                "TableName": "Rich", "Key": {"pk": {"S": "a"}, "sk": {"N": "5"}},
+                "ConditionExpression": "v = :v",
+                "ExpressionAttributeValues": {":v": {"N": "999"}},
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+            }}
+        ]),
+    )];
+    for (id, (tool, operation, members, mcp_field, http_field)) in (4200..).zip([
+        ("put_item", "PutItem", failed_put, "item", "Item"),
+        (
+            "transact_write_items",
+            "TransactWriteItems",
+            cancelled,
+            "cancellation_reasons",
+            "CancellationReasons",
+        ),
+    ]) {
+        let (args, body) = same_request(&members);
+        let resp = call_tool(&mut child, id, tool, args);
+        assert!(is_tool_error(&resp), "{tool} succeeded: {resp}");
+        let (status, over_http) = http.call(operation, &body);
+        assert_eq!(status, 400, "{over_http}");
+        assert!(
+            !over_http[http_field].is_null(),
+            "{operation} gave no {http_field}, so a match would prove nothing: {over_http}"
+        );
+        let over_mcp = tool_content(&resp);
+        // TransactWriteItems spells its message `Message`.
+        let http_message = over_http
+            .get("message")
+            .or_else(|| over_http.get("Message"));
+        if over_mcp[mcp_field] != over_http[http_field]
+            || Some(&over_mcp["message"]) != http_message
+        {
+            differ.push(format!(
+                "{tool} {mcp_field}\n  MCP:  {over_mcp}\n  HTTP: {over_http}"
+            ));
+        }
+    }
+
+    // ExecuteStatement pages with each surface's own token, so the second
+    // page is asked for separately on each and compared.
+    let statement = r#"SELECT * FROM "Rich" WHERE pk = 'a'"#;
+    let over_mcp = tool_content(&call_tool(
+        &mut child,
+        4100,
+        "execute_partiql",
+        json!({"statement": statement, "limit": 2}),
+    ));
+    let (status, over_http) = http.call(
+        "ExecuteStatement",
+        &json!({"Statement": statement, "Limit": 2}),
+    );
+    assert_eq!(status, 200, "{over_http}");
+    assert_eq!(over_mcp["Items"], over_http["Items"]);
+    let (mcp_token, http_token) = (
+        over_mcp["NextToken"].clone(),
+        over_http["NextToken"].clone(),
+    );
+    assert!(
+        http_token.is_string(),
+        "the first page ends early: {over_http}"
+    );
+    let over_mcp = mcp_answer(&call_tool(
+        &mut child,
+        4101,
+        "execute_partiql",
+        json!({"statement": statement, "limit": 2, "next_token": mcp_token}),
+    ));
+    let over_http = http.answer(
+        "ExecuteStatement",
+        &json!({"Statement": statement, "Limit": 2, "NextToken": http_token}),
+    );
+    if over_mcp != over_http {
+        differ.push(format!(
+            "execute_partiql second page\n  MCP:  {over_mcp:?}\n  HTTP: {over_http:?}"
+        ));
+    }
+
+    assert!(
+        differ.is_empty(),
+        "{} of {} answers differ:\n{}",
+        differ.len(),
+        checked + 3,
+        differ.join("\n")
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
 }

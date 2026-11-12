@@ -10,7 +10,7 @@ documentation = "https://docs.rs/dynoxide-rs"
 readme = "README-crate.md"
 keywords = ["dynamodb", "sqlite", "emulator", "aws", "testing"]
 categories = ["database-implementations", "emulators"]
-rust-version = "1.88"
+rust-version = "1.89"
 
 [lib]
 name = "dynoxide"
@@ -58,7 +58,7 @@ wasm-harness = ["wasm-sqlite"]
 full = ["native-sqlite", "http-server", "mcp-server", "import", "cli"]
 
 [dependencies]
-rusqlite = { version = "0.36", features = ["backup", "functions"], optional = true }
+rusqlite = { version = "0.42", features = ["backup", "functions"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
@@ -92,7 +92,7 @@ socket2 = { version = "0.6", optional = true }
 crc32fast = { version = "1", optional = true }
 
 # Optional MCP server dependencies
-rmcp = { version = "2", features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
+rmcp = { version = "3.9", features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
 schemars = { version = "1", optional = true }
 tokio-util = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
@@ -146,7 +146,7 @@ proptest = "1"
 # rustls-pemfile 1.0, none of which have a patched release, and all of which
 # were reported against a dev-dependency the published crate never ships.
 # The minimums keep aws-smithy-json at 0.63 or later (GHSA-8ffr-xgwf-xj56).
-# These releases need Rust 1.94.1, above the crate's 1.88, so without them the
+# These releases need Rust 1.94.1, above the crate's 1.89, so without them the
 # MSRV-aware resolver would fall back to the vulnerable versions. Only the
 # tests and benchmarks build them.
 aws-sdk-dynamodb = { version = "1.130", default-features = false, features = [

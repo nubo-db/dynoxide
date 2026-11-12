@@ -134,9 +134,10 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         //
         // With no TableName at all, the request goes to the older layer, which
         // reports every member error together: Select, ReturnConsumedCapacity,
-        // the missing name, then a Limit below 1 with its value echoed and the
-        // member spelled 'limit', as Scan does (captured eu-west-2 and
-        // us-east-1, 2026-10-09 and 2026-10-20).
+        // the missing name, a ConditionalOperator outside its enum whatever
+        // the number of filter conditions, then a Limit below 1 with its value
+        // echoed and the member spelled 'limit', as Scan does (captured
+        // eu-west-2 and us-east-1, 2026-10-09, 2026-10-20 and 2026-11-11).
         //
         // A Limit that saturated or lost a fraction as it was read (see
         // `helpers::Int32`) is checked by the older layer the same way: the
@@ -157,6 +158,9 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
                     crate::validation::TableNameContext::ReadWrite,
                 ));
             }
+            errors.extend(crate::validation::conditional_operator_rejection(
+                raw.conditional_operator.as_deref(),
+            ));
             // The missing operators' place is inferred from Scan's.
             errors.extend(helpers::missing_comparison_operators(
                 raw.key_conditions.as_ref(),
@@ -323,7 +327,11 @@ pub async fn execute<S: StorageBackend>(
         if request.conditional_operator.is_some() {
             non_expr.push("ConditionalOperator");
         }
-        if request.key_conditions.is_some()
+        // KeyConditions conflicts only with KeyConditionExpression: beside a
+        // FilterExpression or a ProjectionExpression alone DynamoDB runs the
+        // query, and the mixing message leaves it out (captured eu-west-2 and
+        // us-east-1, 2026-11-11).
+        if request.key_condition_expression.is_some()
             && request
                 .key_conditions
                 .as_ref()
@@ -344,7 +352,7 @@ pub async fn execute<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr,
-            all_expression_param_names: vec!["FilterExpression", "KeyConditionExpression"],
+            value_expression_params: &["FilterExpression", "KeyConditionExpression"],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
@@ -360,7 +368,7 @@ pub async fn execute<S: StorageBackend>(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.query_filter.as_ref()),
     ) {
-        return Err(DynoxideError::ValidationException(msg.to_string()));
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     // ---- Select, after the mixing check (captured 2026-10-09) ----
@@ -481,6 +489,19 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // Every expression is checked through, its attributes with it, before the
+    // table is looked up (captured eu-west-2 and us-east-1, 2026-11-11). Only
+    // what needs the table's key schema waits for it.
+    let projection_expr = helpers::validate_read_expressions(
+        &request.expression_attribute_names,
+        &request.expression_attribute_values,
+        helpers::ReadExpressions {
+            filter: request.filter_expression.as_deref(),
+            key_condition: request.key_condition_expression.as_deref(),
+            projection: request.projection_expression.as_deref(),
+        },
+    )?;
+
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let table_key_schema = helpers::parse_key_schema(&meta)?;
 
@@ -517,7 +538,14 @@ pub async fn execute<S: StorageBackend>(
         && !kc.is_empty()
     {
         check_legacy_key_condition_types(&kc, &meta)?;
-        let converted = helpers::convert_key_conditions(&kc, Some(&effective_pk_for_kc))?;
+        let converted = helpers::convert_key_conditions(
+            &kc,
+            Some(&effective_pk_for_kc),
+            helpers::CallerPlaceholders {
+                names: request.expression_attribute_names.as_ref(),
+                values: request.expression_attribute_values.as_ref(),
+            },
+        )?;
         request.key_condition_expression = Some(converted.expression);
         let expr_values = request
             .expression_attribute_values
@@ -540,8 +568,14 @@ pub async fn execute<S: StorageBackend>(
     if let Some(qf) = query_filter
         && !qf.is_empty()
     {
-        let converted =
-            helpers::convert_filter_conditions(&qf, request.conditional_operator.as_deref())?;
+        let converted = helpers::convert_filter_conditions(
+            &qf,
+            request.conditional_operator.as_deref(),
+            helpers::CallerPlaceholders {
+                names: request.expression_attribute_names.as_ref(),
+                values: request.expression_attribute_values.as_ref(),
+            },
+        )?;
         if !converted.expression.is_empty() {
             request.filter_expression = Some(converted.expression);
             let expr_values = request
@@ -880,29 +914,11 @@ pub async fn execute<S: StorageBackend>(
         .transpose()
         .map_err(DynoxideError::ValidationException)?;
 
-    // Parse projection expression if present; fall back to legacy AttributesToGet
-    let projection = if let Some(ref proj_expr) = request.projection_expression {
-        Some(
-            expressions::projection::parse(proj_expr)
-                .map_err(DynoxideError::ValidationException)?,
-        )
-    } else {
-        legacy_projection.clone()
-    };
+    // The ProjectionExpression checked before the lookup, or the legacy
+    // AttributesToGet.
+    let projection = projection_expr.or_else(|| legacy_projection.clone());
 
-    // Pre-register expression references so unused check works even with zero items
-    if let Some(ref filter) = filter_expr {
-        tracker.track_condition_expr(filter);
-    }
-    if let Some(ref proj) = projection {
-        tracker.track_projection_expr(proj);
-        // Reject undefined names and overlapping paths before the row loop, so a
-        // zero-match query still rejects.
-        expressions::projection::validate(proj, &tracker)
-            .map_err(DynoxideError::ValidationException)?;
-    }
-
-    // Untracked variant for the per-item hot loop: tracking already done above
+    // Untracked: the expressions' attributes were checked before the lookup
     let loop_tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
         &request.expression_attribute_names,
         &request.expression_attribute_values,
@@ -1029,9 +1045,6 @@ pub async fn execute<S: StorageBackend>(
             items.push(result_item);
         }
     }
-
-    // Check for unused expression attribute names/values
-    tracker.check_unused()?;
 
     let count = if is_count {
         filtered_count

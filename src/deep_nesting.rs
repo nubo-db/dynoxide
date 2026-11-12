@@ -29,6 +29,10 @@
 //! just past the limit and run as usual, which keeps every check DynamoDB
 //! makes first, such as `Limit`, in its place.
 
+mod parameter_order;
+
+pub(crate) use parameter_order::in_walk_order;
+
 use crate::errors::DynoxideError;
 use crate::validation::{NESTING_LIMIT_MESSAGE, RETURN_VALUES_NOT_HONOURED};
 
@@ -514,13 +518,14 @@ struct Frame {
     nesting: u32,
 }
 
-/// The role of a value that starts inside `parent` under member name `key`.
-fn child_role(parent: Option<&Frame>, key: &[u8]) -> Role {
-    let Some(parent) = parent else {
+/// The role of a value that starts inside a container with role `parent`
+/// (and whether it is an object) under member name `key`.
+fn child_role(parent: Option<(Role, bool)>, key: &[u8]) -> Role {
+    let Some((parent, parent_is_object)) = parent else {
         return Role::Other;
     };
-    match parent.role {
-        Role::Other if parent.is_object => match key {
+    match parent {
+        Role::Other if parent_is_object => match key {
             b"Item" | b"Key" => Role::Values(Origin::Plain),
             b"ExclusiveStartKey" => Role::Values(Origin::StartKey),
             b"ExpressionAttributeValues" => Role::Values(Origin::ExpressionValue),
@@ -598,7 +603,7 @@ fn scan(body: &str) -> Option<Vec<Value>> {
                 }
                 let parent = stack.last();
                 let key = parent.map_or(&b""[..], |p| &bytes[p.key.0..p.key.1]);
-                let mut role = child_role(parent, key);
+                let mut role = child_role(parent.map(|p| (p.role, p.is_object)), key);
                 let is_object = b == b'{';
                 let (mut value, mut nesting) = (0, 0);
                 match role {

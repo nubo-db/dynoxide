@@ -530,12 +530,12 @@ impl Storage {
             1,
             rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
                 | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            |ctx: &rusqlite::functions::Context| -> rusqlite::Result<i64> {
+            |ctx: &mut rusqlite::functions::Context| -> rusqlite::Result<i64> {
                 let pk_ref = ctx.get_raw(0);
                 let pk_bytes = match pk_ref {
                     rusqlite::types::ValueRef::Text(bytes) => bytes,
                     _ => {
-                        return Err(rusqlite::Error::InvalidFunctionParameterType(
+                        return Err(rusqlite::Error::InvalidParameterType(
                             0,
                             rusqlite::types::Type::Text,
                         ));

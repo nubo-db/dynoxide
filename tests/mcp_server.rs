@@ -6900,6 +6900,142 @@ fn over_100_gets_are_answered_through_the_tool_as_over_http() {
     let _ = child.wait();
 }
 
+/// A malformed expression value (an array for the map, for a value or inside
+/// one) is refused by the write tools ahead of a null or a bad number in the
+/// item or key, and ahead of an empty value or a bad number in another
+/// value, with the message the HTTP API gives for the same request (captured
+/// from DynamoDB on 12 November 2026, and pinned over HTTP in
+/// tests/null_attribute_values.rs).
+#[test]
+fn a_malformed_expression_value_is_refused_first_through_the_tools_as_over_http() {
+    let cases: [(&str, &str, Value, Value); 6] = [
+        (
+            "put_item",
+            "PutItem",
+            json!({"table_name": "T", "item": {"pk": null},
+                "expression_attribute_values": {":a": [], ":b": {"S": "y"}},
+                "condition_expression": "a = :a AND b = :b"}),
+            json!({"TableName": "T", "Item": {"pk": null},
+                "ExpressionAttributeValues": {":a": [], ":b": {"S": "y"}},
+                "ConditionExpression": "a = :a AND b = :b"}),
+        ),
+        (
+            "put_item",
+            "PutItem",
+            json!({"table_name": "T", "item": {"pk": {"N": "abc"}},
+                "expression_attribute_values": [], "condition_expression": "a = :a"}),
+            json!({"TableName": "T", "Item": {"pk": {"N": "abc"}},
+                "ExpressionAttributeValues": [], "ConditionExpression": "a = :a"}),
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            json!({"table_name": "T", "key": {"pk": {"S": "a"}},
+                "update_expression": "SET a = :a, b = :b",
+                "expression_attribute_values": {":a": {}, ":b": {"L": [[]]}}}),
+            json!({"TableName": "T", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET a = :a, b = :b",
+                "ExpressionAttributeValues": {":a": {}, ":b": {"L": [[]]}}}),
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            json!({"table_name": "T", "key": {"pk": {"S": "a"}},
+                "update_expression": "SET a = :a, b = :b",
+                "expression_attribute_values": {":a": {"N": "abc"}, ":b": {"L": [[]]}}}),
+            json!({"TableName": "T", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET a = :a, b = :b",
+                "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"L": [[]]}}}),
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            json!({"table_name": "T", "key": {"pk": null},
+                "update_expression": "SET a = :a",
+                "expression_attribute_values": {":a": {"L": [[]]}}}),
+            json!({"TableName": "T", "Key": {"pk": null},
+                "UpdateExpression": "SET a = :a",
+                "ExpressionAttributeValues": {":a": {"L": [[]]}}}),
+        ),
+        (
+            "delete_item",
+            "DeleteItem",
+            json!({"table_name": "T", "key": {"pk": null},
+                "expression_attribute_values": {":a": []}, "condition_expression": "a = :a"}),
+            json!({"TableName": "T", "Key": {"pk": null},
+                "ExpressionAttributeValues": {":a": []}, "ConditionExpression": "a = :a"}),
+        ),
+    ];
+
+    let over_http: Vec<(String, String)> =
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(dynoxide::server::serve_on(
+                listener,
+                dynoxide::Database::memory().unwrap(),
+            ));
+            let mut answers = Vec::new();
+            for (_, operation, _, body) in &cases {
+                let answer: Value = reqwest::Client::new()
+                .post(&url)
+                .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+                .header("content-type", "application/x-amz-json-1.0")
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                     SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+                )
+                .header("x-amz-date", "20260101T000000Z")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+                let kind = answer["__type"].as_str().unwrap();
+                answers.push((
+                    kind.rsplit('#').next().unwrap().to_string(),
+                    answer
+                        .get("message")
+                        .or_else(|| answer.get("Message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            }
+            answers
+        });
+    assert!(
+        over_http
+            .iter()
+            .all(|answer| answer == &serialization_error("")),
+        "{over_http:?}"
+    );
+
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let mut mismatches = Vec::new();
+    for ((id, (tool, _, args, _)), http) in (10..).zip(&cases).zip(&over_http) {
+        let answer = tool_error(&call_tool(&mut child, id, tool, args.clone()));
+        if &answer != http {
+            mismatches.push(format!(
+                "{tool} {args}:\n  tool {answer:?}\n  http {http:?}"
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} answers differ: {mismatches:#?}",
+        mismatches.len(),
+        cases.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 /// Expression values that aren't a map of values are refused as the HTTP API
 /// refuses the same body, and `delete_item` deletes nothing.
 #[test]

@@ -2116,7 +2116,7 @@ pub fn extract_key_strings(
 pub(crate) fn read_values_after_start_key(
     values: Option<crate::types::HeldValues>,
     read: impl FnOnce(
-        Vec<(String, serde_json::Value)>,
+        Vec<(String, crate::types::Written)>,
     ) -> std::result::Result<HashMap<String, AttributeValue>, String>,
     start_key: Option<&serde_json::Value>,
     read_start_key: impl FnOnce(&serde_json::Value) -> Result<HashMap<String, AttributeValue>>,

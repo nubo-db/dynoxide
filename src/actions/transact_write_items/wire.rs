@@ -443,7 +443,7 @@ impl Item {
                     .0
                     .0
                     .iter()
-                    .any(|(_, value)| value.is_null() || types::holds_null(value))
+                    .any(|(_, value)| value.is_null() || types::holds_null(&value.to_value()))
             })
         };
         let null_name = |names: &Option<crate::empty_names::WrittenNames>| {

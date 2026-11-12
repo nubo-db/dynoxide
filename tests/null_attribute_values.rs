@@ -560,6 +560,18 @@ async fn thirteenth_set_answers_as_dynamodb_did() {
     assert_rows("thirteenth", THIRTEENTH).await;
 }
 
+/// The fourteenth set: nulls and bad numbers inside an `M` whose names share
+/// a bucket of DynamoDB's map, met in the order written; an array given for a
+/// value beside the same name written twice; and a malformed expression value
+/// beside a null or a bad number in the item, key or other values (captured
+/// from DynamoDB on 12 November 2026; eu-west-2 and us-east-1 agree except on
+/// two rows, where either answer is taken).
+#[tokio::test]
+async fn fourteenth_set_answers_as_dynamodb_did() {
+    assert_eq!(FOURTEENTH.len(), 18);
+    assert_choices("fourteenth", FOURTEENTH).await;
+}
+
 /// TransactWriteItems with no null in the request: an action's item or key
 /// is reported ahead of its expression values, whichever is written first,
 /// and a bad number in the values is reported bare, as is the first action's
@@ -2739,5 +2751,134 @@ const THIRTEENTH: &[Row] = &[
         "TransactGetItems",
         r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}},{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}}]}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: Member must have length less than or equal to 100"}"##,
+    ),
+];
+
+const FOURTEENTH: &[Choices] = &[
+    (
+        1,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"BB":null,"Aa":null}}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: BB is null"}"##,
+        ],
+    ),
+    (
+        2,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"Aa":null,"BB":null}}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: Aa is null"}"##,
+        ],
+    ),
+    (
+        3,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"BB":null,"Aa":null}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: BB is null"}"##,
+        ],
+    ),
+    (
+        4,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"Aa":null,"BB":null}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: Aa is null"}"##,
+        ],
+    ),
+    // eu-west-2 and us-east-1 differ here, as for two bad numbers elsewhere.
+    (
+        5,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"BB":{"N":"x1"},"Aa":{"N":"y1"}}}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: y1"}"##,
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: x1"}"##,
+        ],
+    ),
+    (
+        6,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"Aa":{"N":"y1"},"BB":{"N":"x1"}}}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: y1"}"##,
+        ],
+    ),
+    (
+        7,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"b":null,"a":null}}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: a is null"}"##,
+        ],
+    ),
+    (
+        8,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"a":null,"b":null}}}}"##,
+        &[
+            r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: a is null"}"##,
+        ],
+    ),
+    (
+        9,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"pk":[]}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        10,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":[],"pk":{"S":"a"}}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        11,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"},"pk":[]}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        12,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":[],"pk":{"S":"a"}}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        13,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":null},"ExpressionAttributeValues":{":a":[],":b":{"S":"y"}},"ConditionExpression":"a = :a AND b = :b"}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        14,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"N":"abc"}},"ExpressionAttributeValues":[],"ConditionExpression":"a = :a"}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        15,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET a = :a, b = :b","ExpressionAttributeValues":{":a":{},":b":{"L":[[]]}}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        16,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET a = :a, b = :b","ExpressionAttributeValues":{":a":{"N":"abc"},":b":{"L":[[]]}}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        17,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET a = :a, b = :b","ExpressionAttributeValues":{":b":{"L":[[]]},":a":{"N":"abc"}}}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+    (
+        18,
+        "DeleteItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":null},"ExpressionAttributeValues":{":a":[]},"ConditionExpression":"a = :a"}"##,
+        &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
     ),
 ];

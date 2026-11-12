@@ -977,6 +977,37 @@ fn resolve_single_write(err: crate::DynoxideError) -> crate::DynoxideError {
     )
 }
 
+/// The refusal for `expression_attribute_values` that is malformed rather
+/// than refused for what it holds: not a map of attribute value structs (see
+/// [`values_shape_refusal`]), or a value refused as it is parsed, such as one
+/// holding an array. The HTTP API refuses these as the request is parsed,
+/// ahead of a null or a bad number in the item or key and of an empty value
+/// or a bad number in another expression value (captured eu-west-2 and
+/// us-east-1, 2026-11-12), so the tools ask here before reading the item or
+/// key.
+fn malformed_values_refusal(
+    val: Option<&serde_json::Value>,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
+) -> Option<CallToolResult> {
+    if let Some(refusal) = values_shape_refusal(val) {
+        return Some(refusal);
+    }
+    let serde_json::Value::Object(values) = val? else {
+        return None;
+    };
+    values.values().find_map(|value| {
+        let msg = AttributeValue::read_written::<serde_json::Error>(value.clone().into())
+            .err()?
+            .to_string();
+        (!crate::serde_errors::is_validation_refusal(&msg)).then(|| {
+            to_tool_error(resolve(classify_decode_error(
+                &msg,
+                "expression_attribute_values",
+            )))
+        })
+    })
+}
+
 /// Decode a tool's `expression_attribute_values` with the reader its
 /// operation's wire request uses (`types::read_put_item_values` and its
 /// siblings), which names the key of a value refused as that operation names
@@ -992,9 +1023,14 @@ fn parse_expression_values(
     }
     match val {
         None => Ok(None),
-        Some(serde_json::Value::Object(values)) => read(values.into_iter().collect())
-            .map(Some)
-            .map_err(|msg| to_tool_error(resolve(classify_decode_error(&msg, FIELD)))),
+        Some(serde_json::Value::Object(values)) => read(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, crate::types::Written::from(value)))
+                .collect(),
+        )
+        .map(Some)
+        .map_err(|msg| to_tool_error(resolve(classify_decode_error(&msg, FIELD)))),
         Some(other) => parse_optional_dynamo_map(Some(other), FIELD, resolve),
     }
 }
@@ -1150,7 +1186,10 @@ fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
 /// One known difference remains: the arguments arrive already parsed, so a
 /// number written as `-0`, or as an integer past 64 bits, is read as the
 /// value it parsed to rather than as written. For a boolean member that is a
-/// `DECIMAL_VALUE` refusal where the HTTP API says `NUMBER_VALUE`.
+/// `DECIMAL_VALUE` refusal where the HTTP API says `NUMBER_VALUE`. For the
+/// same reason the order members were written in, and a name written twice,
+/// are gone, so where two faults tie on written order the tool may report
+/// the other one.
 fn decode_wire_request<T: serde::de::DeserializeOwned>(
     operation: &str,
     members: Vec<(&str, Option<serde_json::Value>)>,
@@ -1562,6 +1601,12 @@ impl McpServer {
         // an argument that isn't DynamoDB JSON at all. The request is then
         // decoded as PutItem's wire request, which checks its members in
         // PutItem's order and words, after the values, as over HTTP.
+        if let Some(err) = malformed_values_refusal(
+            params.expression_attribute_values.as_ref(),
+            resolve_single_write,
+        ) {
+            return Ok(err);
+        }
         if let Err(err) = parse_dynamo_map(params.item.clone(), "item", resolve_single_write) {
             return Ok(err);
         }
@@ -1666,6 +1711,12 @@ impl McpServer {
         // The values are read first, as on `put_item`, then the request as
         // UpdateItem's wire request, which reports the first enum member it
         // refuses in UpdateItem's own words.
+        if let Some(err) = malformed_values_refusal(
+            params.expression_attribute_values.as_ref(),
+            resolve_single_write,
+        ) {
+            return Ok(err);
+        }
         if let Err(err) = parse_dynamo_map(params.key.clone(), "key", resolve_single_write) {
             return Ok(err);
         }
@@ -1891,6 +1942,12 @@ impl McpServer {
         // DeleteItem's wire request. DeleteItem reads its expression values
         // after the member checks, naming a refused one by its key, so they
         // are passed on as given.
+        if let Some(err) = malformed_values_refusal(
+            params.expression_attribute_values.as_ref(),
+            resolve_single_write,
+        ) {
+            return Ok(err);
+        }
         if let Err(err) = parse_dynamo_map(params.key.clone(), "key", resolve_single_write) {
             return Ok(err);
         }

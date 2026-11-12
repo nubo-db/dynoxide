@@ -297,7 +297,7 @@ fn deserialize_attribute_updates<'de, D: serde::Deserializer<'de>>(
             )));
             continue;
         }
-        match serde_json::from_value::<AttributeValueUpdate>(update) {
+        match serde_json::from_value::<AttributeValueUpdate>(update.to_value()) {
             Ok(update) => {
                 updates.insert(name, update);
             }

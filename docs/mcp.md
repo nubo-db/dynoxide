@@ -126,7 +126,7 @@ An index added to a live table through `update_table` is not searchable straight
 
 The search is exact brute-force KNN over the whole index, so the top-k it returns is the true top-k. That is one of four things about vector search that will never match AWS, all of which can make a test pass here and fail there; `docs/compatibility-summary.md` sets them out in plain terms. `COSINE` and `EUCLIDEAN` score as distances, where a self match is 0; `DOT_PRODUCT` scores as a similarity and can be negative. The vector attribute is left out of results unless a projection expression names it and the index projects it. A table carrying a vector index has to be `PAY_PER_REQUEST`.
 
-The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would.
+The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would. A tool's arguments arrive already parsed, without the order they were written in or a name written twice, so where DynamoDB would report whichever of two faults was written first, a tool may report the other one.
 
 ## Consumed capacity
 

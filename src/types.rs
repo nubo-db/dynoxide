@@ -213,8 +213,17 @@ impl<'de> Deserialize<'de> for AttributeValue {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize as raw JSON Value first so we can inspect all keys
-        let raw = serde_json::Value::deserialize(deserializer)?;
+        Self::read_written(Written::deserialize(deserializer)?)
+    }
+}
+
+impl AttributeValue {
+    /// Read a value from its JSON as written. The members of an `M` are read
+    /// in the order they were written, at any depth, as an item's are (see
+    /// [`read_attribute_map`]).
+    pub(crate) fn read_written<E: de::Error>(written: Written) -> Result<Self, E> {
+        // Inspect all keys as JSON first.
+        let raw = written.to_value();
 
         // A JSON null where a value belongs has a refusal of its own, which a
         // reader of a map of attributes names after its attribute
@@ -432,25 +441,20 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 Ok(AttributeValue::BS(decoded))
             }
             "L" => {
-                let arr = val
-                    .as_array()
-                    .expect("a member of the wrong JSON type is refused above");
-                let list: Result<Vec<AttributeValue>, _> = arr
-                    .iter()
-                    .map(|v| serde_json::from_value(v.clone()).map_err(de::Error::custom))
-                    .collect();
+                let Some(Written::Array(items)) = written.into_member("L") else {
+                    unreachable!("a member of the wrong JSON type is refused above")
+                };
+                let list: Result<Vec<AttributeValue>, E> =
+                    items.into_iter().map(Self::read_written).collect();
                 Ok(AttributeValue::L(list?))
             }
             "M" => {
-                let map_val = val
-                    .as_object()
-                    .expect("a member of the wrong JSON type is refused above");
-                // The written order is gone by now, so members that share a
-                // bucket of DynamoDB's map are taken in key order.
-                let members = map_val
-                    .iter()
-                    .map(|(name, member)| (name.clone(), member.clone()))
-                    .collect();
+                // The members in the order they were written, so those that
+                // share a bucket of DynamoDB's map are met as written (captured
+                // eu-west-2 and us-east-1, 2026-11-12).
+                let Some(Written::Object(members)) = written.into_member("M") else {
+                    unreachable!("a member of the wrong JSON type is refused above")
+                };
                 read_attribute_map(members)
                     .map(AttributeValue::M)
                     .map_err(de::Error::custom)
@@ -599,13 +603,163 @@ fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'s
 /// DynamoDB's refusal of a map that names a member twice.
 const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
 
+/// A JSON value as written: an object's members are kept in the order they
+/// were written, which `serde_json::Value` doesn't keep. DynamoDB meets the
+/// members of a map that share a bucket of its hash map in written order, at
+/// any depth.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Written {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<Written>),
+    Object(Vec<(String, Written)>),
+}
+
+impl Written {
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// The value as `serde_json::Value`, a name written twice in an object
+    /// keeping its last value, as serde_json keeps it.
+    pub(crate) fn to_value(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(*b),
+            Self::Number(n) => serde_json::Value::Number(n.clone()),
+            Self::String(s) => serde_json::Value::String(s.clone()),
+            Self::Array(items) => {
+                serde_json::Value::Array(items.iter().map(Self::to_value).collect())
+            }
+            Self::Object(members) => serde_json::Value::Object(
+                members
+                    .iter()
+                    .map(|(name, member)| (name.clone(), member.to_value()))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// An object's member `name`, its last value if written twice.
+    fn into_member(self, name: &str) -> Option<Written> {
+        match self {
+            Self::Object(members) => members
+                .into_iter()
+                .rev()
+                .find_map(|(n, member)| (n == name).then_some(member)),
+            _ => None,
+        }
+    }
+}
+
+impl From<serde_json::Value> for Written {
+    /// A value already parsed, an object's members in key order.
+    fn from(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(b),
+            serde_json::Value::Number(n) => Self::Number(n),
+            serde_json::Value::String(s) => Self::String(s),
+            serde_json::Value::Array(items) => {
+                Self::Array(items.into_iter().map(Self::from).collect())
+            }
+            serde_json::Value::Object(members) => Self::Object(
+                members
+                    .into_iter()
+                    .map(|(name, member)| (name, Self::from(member)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Written {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Json;
+
+        impl<'de> de::Visitor<'de> for Json {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any valid JSON value")
+            }
+
+            fn visit_bool<E: de::Error>(self, b: bool) -> std::result::Result<Written, E> {
+                Ok(Written::Bool(b))
+            }
+
+            fn visit_i64<E: de::Error>(self, n: i64) -> std::result::Result<Written, E> {
+                Ok(Written::Number(n.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, n: u64) -> std::result::Result<Written, E> {
+                Ok(Written::Number(n.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, n: f64) -> std::result::Result<Written, E> {
+                // As serde_json reads it: a float JSON can't hold is null.
+                Ok(serde_json::Number::from_f64(n).map_or(Written::Null, Written::Number))
+            }
+
+            fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Written, E> {
+                Ok(Written::String(s.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(self, s: String) -> std::result::Result<Written, E> {
+                Ok(Written::String(s))
+            }
+
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Written, E> {
+                Ok(Written::Null)
+            }
+
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Written, E> {
+                Ok(Written::Null)
+            }
+
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> std::result::Result<Written, D::Error> {
+                Written::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Written, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(256));
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Written::Array(items))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Written, A::Error> {
+                let mut members = Vec::with_capacity(map.size_hint().unwrap_or(0).min(256));
+                while let Some(member) = map.next_entry::<String, Written>()? {
+                    members.push(member);
+                }
+                Ok(Written::Object(members))
+            }
+        }
+
+        deserializer.deserialize_any(Json)
+    }
+}
+
 /// A map's members in the order they were written, each read as JSON and no
 /// further. A name written twice is refused as a malformed request. A request's item or key is read this way so its values can be
 /// walked in the order DynamoDB walks them ([`read_attribute_map`]), and its
 /// expression values so they can wait until the item or key has been read
 /// ([`HeldValues`]).
 #[derive(Debug, Default)]
-pub(crate) struct WrittenMembers(pub(crate) Vec<(String, serde_json::Value)>);
+pub(crate) struct WrittenMembers(pub(crate) Vec<(String, Written)>);
 
 impl<'de> Deserialize<'de> for WrittenMembers {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
@@ -623,18 +777,29 @@ impl<'de> Deserialize<'de> for WrittenMembers {
                 self,
                 mut map: A,
             ) -> std::result::Result<WrittenMembers, A::Error> {
-                let mut members: Vec<(String, serde_json::Value)> =
-                    Vec::with_capacity(map.size_hint().unwrap_or(0));
-                let mut seen = std::collections::HashSet::new();
-                while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
+                let mut members: Vec<(String, Written)> =
+                    Vec::with_capacity(map.size_hint().unwrap_or(0).min(256));
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                while let Some((name, value)) = map.next_entry::<String, Written>()? {
                     // A name written twice is refused as the request is
-                    // parsed (captured eu-west-2 and us-east-1, 2026-11-11).
-                    if !seen.insert(name.clone()) {
+                    // parsed (captured eu-west-2 and us-east-1, 2026-11-11),
+                    // unless either copy is an array, which is refused with no
+                    // message whichever is written first (captured eu-west-2
+                    // and us-east-1, 2026-11-12).
+                    if let Some(&at) = seen.get(&name) {
+                        let copies: [&Written; 2] = [&members[at].1, &value];
+                        let refusal = if copies.iter().any(|copy| matches!(copy, Written::Array(_)))
+                        {
+                            ""
+                        } else {
+                            DUPLICATE_MEMBER
+                        };
                         return Err(de::Error::custom(format!(
-                            "{}{DUPLICATE_MEMBER}",
+                            "{}{refusal}",
                             crate::serde_errors::SERIALIZATION_MARKER
                         )));
                     }
+                    seen.insert(name.clone(), members.len());
                     members.push((name, value));
                 }
                 Ok(WrittenMembers(members))
@@ -656,7 +821,7 @@ impl<'de> Deserialize<'de> for WrittenMembers {
 /// member is named after its attribute. The error is the raw serde message,
 /// marker and all.
 pub(crate) fn read_attribute_map(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     let read: Vec<(String, std::result::Result<AttributeValue, String>)> = members
         .into_iter()
@@ -668,7 +833,7 @@ pub(crate) fn read_attribute_map(
                     crate::serde_errors::null_member_refusal(&name)
                 ))
             } else {
-                serde_json::from_value::<AttributeValue>(value).map_err(|e| e.to_string())
+                AttributeValue::read_written::<serde_json::Error>(value).map_err(|e| e.to_string())
             };
             (name, value)
         })
@@ -785,7 +950,7 @@ impl<'de> Deserialize<'de> for HeldValues {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let members = WrittenMembers::deserialize(deserializer)?;
         for (_, value) in &members.0 {
-            if let Err(e) = serde_json::from_value::<AttributeValue>(value.clone()) {
+            if let Err(e) = AttributeValue::read_written::<serde_json::Error>(value.clone()) {
                 let refusal = e.to_string();
                 if !crate::serde_errors::is_validation_refusal(&refusal) {
                     return Err(de::Error::custom(refusal));
@@ -802,7 +967,7 @@ impl HeldValues {
     pub(crate) fn read(
         self,
         read: impl FnOnce(
-            Vec<(String, serde_json::Value)>,
+            Vec<(String, Written)>,
         ) -> std::result::Result<HashMap<String, AttributeValue>, String>,
     ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
         read(self.0.0)
@@ -1317,13 +1482,12 @@ struct ValueNaming {
 /// An `ExpressionAttributeValues` reader: the values in written order, read
 /// into a map or refused with the raw serde message.
 #[cfg(feature = "mcp-server")]
-pub(crate) type ValuesReader = fn(
-    Vec<(String, serde_json::Value)>,
-) -> std::result::Result<HashMap<String, AttributeValue>, String>;
+pub(crate) type ValuesReader =
+    fn(Vec<(String, Written)>) -> std::result::Result<HashMap<String, AttributeValue>, String>;
 
 /// Read PutItem's `ExpressionAttributeValues`, in written order.
 pub(crate) fn read_put_item_values(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     read_named_values(
         members,
@@ -1342,7 +1506,7 @@ pub(crate) fn read_put_item_values(
 /// one member or an empty set beside another member (captured eu-west-2 and
 /// us-east-1, 2026-10-10).
 pub(crate) fn read_update_item_values(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     read_named_values(
         members,
@@ -1361,7 +1525,7 @@ pub(crate) fn read_update_item_values(
 /// eu-west-2 and us-east-1, 2026-10-10: `{":v": {"S": null}}` and `{":v":
 /// {"NULL": "no"}}`).
 pub(crate) fn read_query_values(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     read_named_values(
         members,
@@ -1381,7 +1545,7 @@ pub(crate) fn read_query_values(
 /// null too, and reports it bare otherwise (captured eu-west-2 and us-east-1,
 /// 2026-11-11).
 pub(crate) fn read_transaction_values(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
     name_numbers: bool,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     read_named_values(
@@ -1398,7 +1562,7 @@ pub(crate) fn read_transaction_values(
 
 /// Read Scan's `ExpressionAttributeValues`, in written order.
 pub(crate) fn read_scan_values(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     read_named_values(
         members,
@@ -1422,7 +1586,7 @@ pub(crate) fn read_scan_values(
 /// which of two faulty values DynamoDB reports on the current layer varies
 /// between its hosts. The error is the raw serde message, marker and all.
 fn read_named_values(
-    members: Vec<(String, serde_json::Value)>,
+    members: Vec<(String, Written)>,
     naming: ValueNaming,
 ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
     use crate::serde_errors::{
@@ -1433,7 +1597,7 @@ fn read_named_values(
     let read: Vec<(String, std::result::Result<AttributeValue, String>)> = members
         .into_iter()
         .map(|(key, value)| {
-            let read = serde_json::from_value::<AttributeValue>(value).map_err(|e| {
+            let read = AttributeValue::read_written::<serde_json::Error>(value).map_err(|e| {
                 let msg = e.to_string();
                 let named = |inner: &str| {
                     format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
@@ -1453,6 +1617,15 @@ fn read_named_values(
         .collect();
     if older || naming.map_order {
         return refuse_in_map_order(read);
+    }
+    // A value refused as it is parsed comes first, in written order, as for
+    // an item (captured eu-west-2 and us-east-1, 2026-11-12).
+    if let Some((_, Err(malformed))) = read.iter().find(|(_, value)| {
+        value
+            .as_ref()
+            .is_err_and(|refusal| !crate::serde_errors::is_validation_refusal(refusal))
+    }) {
+        return Err(malformed.clone());
     }
     // A key written twice keeps its last value, as in a map.
     let by_key: std::collections::BTreeMap<_, _> = read.into_iter().collect();

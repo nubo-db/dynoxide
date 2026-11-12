@@ -106,6 +106,7 @@ unchanged.
 - [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker
 - [HTTP server](https://github.com/nubo-db/dynoxide/blob/main/docs/http-server.md) - running the DynamoDB-compatible HTTP API
 - [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
+- [Laravel](https://github.com/nubo-db/dynoxide/blob/main/docs/laravel.md) - the DynamoDB cache, locks, sessions and failed jobs, run locally
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
 - [Import CLI](https://github.com/nubo-db/dynoxide/blob/main/docs/import.md) - loading data, table filtering, and anonymisation

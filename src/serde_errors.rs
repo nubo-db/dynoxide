@@ -102,7 +102,12 @@ pub(crate) fn is_number_out_of_range(err: &serde_json::Error) -> bool {
 /// bits as floats. So when the body holds either, it is read again with each
 /// such number standing in as a zero written the same way. The member's own
 /// reader takes the number from the body as written.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Error> {
     match serde_json::from_str(body) {
         Err(e) if is_number_out_of_range(&e) => serde_json::from_str(&numbers_as_written(body)),
@@ -112,7 +117,12 @@ pub(crate) fn body_value(body: &str) -> Result<serde_json::Value, serde_json::Er
 }
 
 /// Whether a JSON value holds a number serde_json read as a float.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 fn holds_float(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Number(n) => n.is_f64(),
@@ -126,7 +136,12 @@ fn holds_float(value: &serde_json::Value) -> bool {
 /// though it was written whole, standing in as `0.0`, or as `0` when it was
 /// written with no point or exponent. Strings are skipped whole, escapes
 /// included, so text that looks like a number inside one is left alone.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 fn numbers_as_written(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());

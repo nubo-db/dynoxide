@@ -86,10 +86,16 @@ pub(crate) mod serde_errors;
 // Number tokens DynamoDB reads that JSON doesn't: the stand-ins the wire
 // seams put in their place and the integer members' reading of them.
 pub(crate) mod number_tokens;
-// Shared by the HTTP server and the wasm dispatch: both must reject a
-// mistyped field with the same SerializationException, or the two surfaces
-// disagree on requests neither has deserialised yet.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+// Shared by the HTTP server, the wasm dispatch and the MCP tools that decode
+// a wire request: all must reject a mistyped field with the same
+// SerializationException, or the surfaces disagree on requests none has
+// deserialised yet.
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) mod serialization_checks;
 // Nesting checks for values outside an item or an expression: keys, start
 // keys, legacy conditions and PartiQL parameters.

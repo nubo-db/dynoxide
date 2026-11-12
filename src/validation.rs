@@ -360,17 +360,6 @@ pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<S
     ))
 }
 
-/// [`return_consumed_capacity_rejection`] as an error, in the single-error
-/// envelope a wire client gets. For callers that check the mode outside a
-/// deserialiser, where there is no errors vec to push onto: the MCP tools.
-#[cfg(feature = "mcp-server")]
-pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
-    match return_consumed_capacity_rejection(mode) {
-        Some(msg) => Err(DynoxideError::ValidationException(envelope_message(&msg))),
-        None => Ok(()),
-    }
-}
-
 /// The values `ReturnValues` accepts on a write.
 pub(crate) const RETURN_VALUES: [&str; 5] =
     ["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];

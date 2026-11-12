@@ -6796,6 +6796,114 @@ fn a_null_name_or_set_member_is_refused_through_the_tools_as_over_http() {
     let _ = child.wait();
 }
 
+/// More than 100 Gets are answered by the tool as by the HTTP API: listed
+/// when a name is null, the null name printed `null`, and in the short form
+/// without one, a capacity mode outside the enum included (captured from
+/// DynamoDB on 12 November 2026, and pinned over HTTP in
+/// tests/null_attribute_values.rs).
+#[test]
+fn over_100_gets_are_answered_through_the_tool_as_over_http() {
+    let gets = |first: Value| {
+        let mut gets = vec![json!({"Get": first})];
+        gets.extend(
+            (0..100)
+                .map(|i| json!({"Get": {"TableName": "T", "Key": {"pk": {"S": format!("g{i}")}}}})),
+        );
+        gets
+    };
+    let key = json!({"pk": {"S": "a"}});
+    let cases = [
+        (
+            json!({"TableName": "T", "Key": key, "ExpressionAttributeNames": {"#n": null}}),
+            None,
+        ),
+        (
+            json!({"TableName": "T", "Key": key, "ProjectionExpression": "#n",
+                "ExpressionAttributeNames": {"#n": null, "#m": "x"}}),
+            None,
+        ),
+        (
+            json!({"TableName": "T", "Key": key, "ExpressionAttributeNames": {"#n": "x"}}),
+            None,
+        ),
+        (json!({"TableName": "T", "Key": key}), None),
+        (json!({"TableName": "T", "Key": key}), Some("EVERYTHING")),
+        (
+            json!({"TableName": "T", "Key": key, "ExpressionAttributeNames": {"#n": null}}),
+            Some("EVERYTHING"),
+        ),
+    ];
+
+    let over_http: Vec<String> = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(dynoxide::server::serve_on(
+            listener,
+            dynoxide::Database::memory().unwrap(),
+        ));
+        let mut messages = Vec::new();
+        for (first, mode) in &cases {
+            let mut body = json!({"TransactItems": gets(first.clone())});
+            if let Some(mode) = mode {
+                body["ReturnConsumedCapacity"] = json!(mode);
+            }
+            let answer: Value = reqwest::Client::new()
+                .post(&url)
+                .header("x-amz-target", "DynamoDB_20120810.TransactGetItems")
+                .header("content-type", "application/x-amz-json-1.0")
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                     SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+                )
+                .header("x-amz-date", "20260101T000000Z")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            messages.push(answer["message"].as_str().unwrap().to_string());
+        }
+        messages
+    });
+    assert!(over_http[0].contains("expressionAttributeNames={#n=null}"));
+    assert!(over_http[1].contains("expressionAttributeNames={#m=x, #n=null}"));
+    assert_eq!(
+        over_http[2],
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
+    );
+
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let mut mismatches = Vec::new();
+    for ((id, (first, mode)), http) in (10..).zip(&cases).zip(&over_http) {
+        let mut args = json!({"transact_items": gets(first.clone())});
+        if let Some(mode) = mode {
+            args["return_consumed_capacity"] = json!(mode);
+        }
+        let answer = tool_error(&call_tool(&mut child, id, "transact_get_items", args));
+        if answer != validation_error(http) {
+            mismatches.push(format!(
+                "{first} {mode:?}:\n  tool {}\n  http {}",
+                &answer.1[..answer.1.len().min(300)],
+                &http[..http.len().min(300)]
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} answers differ: {mismatches:#?}",
+        mismatches.len(),
+        cases.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 /// Expression values that aren't a map of values are refused as the HTTP API
 /// refuses the same body, and `delete_item` deletes nothing.
 #[test]

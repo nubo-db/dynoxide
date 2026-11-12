@@ -5436,12 +5436,8 @@ fn refused_flags() -> Vec<(Value, (String, String))> {
             json!(1.5),
             serialization_error("DECIMAL_VALUE cannot be converted to Boolean"),
         ),
-        // Pinned to the HTTP API's present answer for a list, which the tool
-        // follows if that answer changes.
-        (
-            json!([true]),
-            serialization_error("Unrecognized collection type class java.lang.Boolean"),
-        ),
+        // A list is refused with no message, as it is over the HTTP API.
+        (json!([true]), serialization_error("")),
         (
             json!({"a": true}),
             serialization_error("Start of structure or map found where not expected"),

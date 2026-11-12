@@ -425,6 +425,15 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
                 crate::serde_errors::SERIALIZATION_AS_READ_MARKER
             } else if msg.starts_with("invalid value: ") {
                 crate::serde_errors::VALIDATION_AS_READ_MARKER
+            } else if msg.starts_with("invalid length ") {
+                // A body given as an array, read by position and running
+                // short. No capture covers SearchVectors here, so it keeps the
+                // answer it has given all along, where the other operations
+                // refuse an array body with no message.
+                return serde::de::Error::custom(format!(
+                    "{}Start of structure or map found where not expected",
+                    crate::serde_errors::SERIALIZATION_MARKER
+                ));
             } else {
                 return e;
             };

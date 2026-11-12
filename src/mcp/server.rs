@@ -1134,7 +1134,7 @@ fn decode_wire_request<T: serde::de::DeserializeOwned>(
         .collect();
     let body = serde_json::Value::Object(wire).to_string();
     crate::serialization_checks::pre_check_serialization_types(operation, &body)
-        .and_then(|()| crate::serde_errors::deserialize(&body))
+        .and_then(|body| crate::serde_errors::deserialize(&body))
         .map_err(|err| {
             to_tool_error(crate::validation::resolve_request_validation_on(
                 operation,

@@ -393,11 +393,19 @@ async fn route<S: StorageBackend>(
     // are read on: the operation's own, or the older layer for a request that
     // holds a boolean written as a string or a value with more than one
     // member. The layer is set around the read and around every poll of the
-    // handler, as the HTTP server holds it for the whole call.
+    // handler, as the HTTP server holds it for the whole call. The request is
+    // read from the body the checks return, which rewrites a form DynamoDB
+    // reads by position to its object form.
     let checked = crate::serialization_checks::pre_check_and_read_layer(op, request_json);
-    let layer = checked
-        .as_ref()
-        .map_or_else(|_| crate::validation::ValueLayer::for_operation(op), |l| *l);
+    let layer = checked.as_ref().map_or_else(
+        |_| crate::validation::ValueLayer::for_operation(op),
+        |(_, l)| *l,
+    );
+    let (request_json, checked) = match checked {
+        Ok((body, _)) => (body, Ok(())),
+        Err(e) => (std::borrow::Cow::Borrowed(request_json), Err(e)),
+    };
+    let request_json: &str = &request_json;
     fn read<T: serde::de::DeserializeOwned>(
         layer: crate::validation::ValueLayer,
         json: &str,
@@ -447,7 +455,7 @@ async fn route<S: StorageBackend>(
 
     let result: crate::Result<String> = match checked {
         Err(e) => Err(e),
-        Ok(_) => match op {
+        Ok(()) => match op {
             "CreateTable" => run!(create_table),
             "DeleteTable" => run_lifecycle!(delete_table),
             "DescribeTable" => run_lifecycle!(describe_table),
@@ -1540,6 +1548,423 @@ mod tests {
                 assert_eq!(v["message"], answer, "depth {depth}: {err}");
             }
         }
+    }
+
+    /// Requests whose body is not a JSON object, or is a form DynamoDB reads
+    /// by position, with DynamoDB's answers (captured eu-west-2 and us-east-1
+    /// on 11 and 12 November 2026; where the regions differ, eu-west-2's).
+    /// Each names a table that doesn't exist. The operations the wasm engine
+    /// does not serve are left out.
+    const BODY_ROWS: &[(&str, usize, &str, &str, &str)] = &[
+        (
+            "first",
+            1,
+            "PutItem",
+            r#"["_capture_20261111_317_none", {"pk": {"S": "a"}}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            2,
+            "PutItem",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            3,
+            "PutItem",
+            r#"["x"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            4,
+            "PutItem",
+            r#""x""#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+        ),
+        (
+            "first",
+            5,
+            "PutItem",
+            r#"5"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+        ),
+        (
+            "first",
+            6,
+            "PutItem",
+            r#"null"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Request payload does not contain the input model"}"#,
+        ),
+        (
+            "first",
+            7,
+            "PutItem",
+            r#"true"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+        ),
+        (
+            "first",
+            8,
+            "PutItem",
+            r#"[{"TableName": "_capture_20261111_317_none", "Item": {"pk": {"S": "a"}}}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            9,
+            "GetItem",
+            r#"["_capture_20261111_317_none", {"pk": {"S": "a"}}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            10,
+            "GetItem",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            11,
+            "DeleteItem",
+            r#"["_capture_20261111_317_none", {"pk": {"S": "a"}}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            12,
+            "UpdateItem",
+            r#"["_capture_20261111_317_none", {"pk": {"S": "a"}}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            13,
+            "Query",
+            r#"["_capture_20261111_317_none"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            14,
+            "Query",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            15,
+            "Scan",
+            r#"["_capture_20261111_317_none"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            16,
+            "Scan",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            17,
+            "Scan",
+            r#""x""#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+        ),
+        (
+            "first",
+            20,
+            "TransactGetItems",
+            r#"[[{"Get": {"TableName": "_capture_20261111_317_none", "Key": {"pk": {"S": "a"}}}}]]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            21,
+            "BatchGetItem",
+            r#"[{"_capture_20261111_317_none": {"Keys": [{"pk": {"S": "a"}}]}}]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "first",
+            22,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none": [{"PutRequest": {"Item": {"pk": {"S": "a"}}}}]}]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "first",
+            23,
+            "ExecuteStatement",
+            r#"["SELECT * FROM \"_capture_20261111_317_none\""]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            24,
+            "DescribeTable",
+            r#"["_capture_20261111_317_none"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            25,
+            "DescribeTable",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            26,
+            "ListTables",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            27,
+            "ListTables",
+            r#"[1]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            28,
+            "ListTables",
+            r#""x""#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+        ),
+        (
+            "first",
+            29,
+            "CreateTable",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            30,
+            "PutItem",
+            r#""#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            31,
+            "ListTables",
+            r#""#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "first",
+            32,
+            "PutItem",
+            r#"{"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            1,
+            "BatchGetItem",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            2,
+            "BatchGetItem",
+            r#"[{}]"#,
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+        (
+            "second",
+            4,
+            "BatchGetItem",
+            r#"[{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}]}},"TOTAL"]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "second",
+            5,
+            "BatchGetItem",
+            r#"[{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}]}},"BOGUS"]"#,
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+        ),
+        (
+            "second",
+            6,
+            "BatchGetItem",
+            r#"["x"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            7,
+            "BatchWriteItem",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            9,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL"]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "second",
+            10,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "second",
+            11,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "second",
+            12,
+            "TransactGetItems",
+            r#"[{}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            13,
+            "ListTables",
+            r#"[{}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            14,
+            "DescribeTable",
+            r#"[{}]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            15,
+            "BatchExecuteStatement",
+            r#"[[{"Statement":"SELECT * FROM \"_capture_20261111_317_none\""}]]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            16,
+            "ExecuteTransaction",
+            r#"[[{"Statement":"SELECT * FROM \"_capture_20261111_317_none\" WHERE pk='a'"}]]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "second",
+            40,
+            "Bogus",
+            r#"[]"#,
+            r#"{"__type":"com.amazon.coral.service#UnknownOperationException"}"#,
+        ),
+        (
+            "second",
+            41,
+            "Bogus",
+            r#""x""#,
+            r#"{"__type":"com.amazon.coral.service#UnknownOperationException"}"#,
+        ),
+        (
+            "second",
+            42,
+            "Bogus",
+            r#"null"#,
+            r#"{"__type":"com.amazon.coral.service#UnknownOperationException"}"#,
+        ),
+        (
+            "sixth",
+            9,
+            "BatchGetItem",
+            r#"[{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}]}},5]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "sixth",
+            10,
+            "BatchGetItem",
+            r#"[{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}]}},null]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "sixth",
+            11,
+            "BatchGetItem",
+            r#"[null]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "sixth",
+            12,
+            "BatchGetItem",
+            r#"[null,"TOTAL"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+    ];
+
+    /// The wasm entry points give the HTTP server's answers to a body that
+    /// isn't an object: `dispatch_http` for every row, and the RPC `dispatch`
+    /// for every row whose body is JSON and whose operation it serves.
+    #[test]
+    fn a_body_that_is_not_an_object_answers_as_on_the_http_server() {
+        let backend = Storage::memory().unwrap();
+        let mut wrong = Vec::new();
+        let (mut over_http, mut over_rpc) = (0, 0);
+        for &(round, number, op, body, answer) in BODY_ROWS {
+            let expected: serde_json::Value = serde_json::from_str(answer).unwrap();
+            let status = if expected.get("__type").is_some() {
+                400
+            } else {
+                200
+            };
+            let target = format!("DynamoDB_20120810.{op}");
+            let out = http(&backend, Some(&target), body);
+            over_http += 1;
+            let got: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+            if out.status != status || got != expected {
+                wrong.push(format!(
+                    "{round} round row {number} over HTTP: {op} {body}\n  expected {status} \
+                     {expected}\n  got      {} {got}",
+                    out.status
+                ));
+            }
+            if SUPPORTED_OPS.contains(&op)
+                && serde_json::from_str::<serde_json::Value>(body).is_ok()
+            {
+                over_rpc += 1;
+                let got = match run(&backend, op, body) {
+                    Ok(json) | Err(json) => {
+                        serde_json::from_str::<serde_json::Value>(&json).unwrap()
+                    }
+                };
+                if got != expected {
+                    wrong.push(format!(
+                        "{round} round row {number} over RPC: {op} {body}\n  expected {expected}\n  \
+                         got      {got}"
+                    ));
+                }
+            }
+        }
+        assert_eq!((over_http, over_rpc), (51, 45));
+        assert!(
+            wrong.is_empty(),
+            "{} answers differ:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 
     #[test]

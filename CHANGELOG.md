@@ -52,6 +52,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A JSON array where DynamoDB doesn't expect one is refused as DynamoDB
+  refuses it. A request body that is an array is a `SerializationException`
+  with no message on every operation, where Dynoxide used to read it by
+  position and run it: `["Tab", {"pk": {"S": "a"}}]` sent to PutItem wrote
+  the item. A body that is a string, number or boolean is refused as
+  `Unexpected value type in payload`, and `null` as `Request payload does not
+  contain the input model`. An array given for a string, number, boolean,
+  map or structure inside a request is a `SerializationException` with no
+  message, where Dynoxide printed `Unrecognized collection type ...`, which
+  DynamoDB no longer says. The forms DynamoDB does read by position are read:
+  a BatchGetItem or BatchWriteItem body of `[RequestItems]` or
+  `[RequestItems, ReturnConsumedCapacity]`, a BatchWriteItem `PutRequest`
+  given as `[Item]` and `DeleteRequest` as `[Key]`, and on Query and Scan a
+  condition given as `[AttributeValueList, ComparisonOperator]`. BatchGetItem
+  no longer accepts a table's keys given as an array.
+
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
   constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has

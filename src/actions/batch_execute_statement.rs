@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for BatchStatementRequest {
             #[serde(
                 rename = "ConsistentRead",
                 default,
-                deserialize_with = "crate::types::deserialize_statement_flag"
+                deserialize_with = "crate::types::deserialize_lenient_flag"
             )]
             consistent_read: Option<bool>,
             #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]

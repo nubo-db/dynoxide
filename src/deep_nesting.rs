@@ -416,7 +416,8 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
     use crate::actions::*;
     use crate::serde_errors::deserialize;
 
-    crate::serialization_checks::pre_check_serialization_types(operation, body)?;
+    let body = &crate::serialization_checks::pre_check_serialization_types(operation, body)?;
+    let body: &str = body;
     match operation {
         "PutItem" => deserialize::<put_item::PutItemRequest>(body).and_then(|request| {
             check_older_conditional_operator(request.conditional_operator.as_deref())

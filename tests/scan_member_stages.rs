@@ -15,6 +15,14 @@
 //! layer moves again, capture the same requests afresh and replace the tables
 //! whole rather than editing single expectations.
 //!
+//! One exception: the three answers for a `ConditionalOperator` of `BOGUS`
+//! joining two `ScanFilter` conditions take the wording DynamoDB moved to
+//! later, which names the value and the member and lists `[AND, OR]`
+//! (captured eu-west-2 and us-east-1, 11 November 2026, for the same shapes
+//! with `XOR`, `xor` and an empty string; see
+//! `tests/conditional_operator_enum.rs`). On 20 October the message named
+//! neither and listed `[ALL, OR]`.
+//!
 //! Requests with a `Limit` that saturates or loses a fraction beside a check
 //! made after the members are left out on purpose. DynamoDB puts such a request
 //! on the older layer whole and answers every later check in its wording;
@@ -544,7 +552,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         r##"ConditionalOperator BOGUS with a two-element ScanFilter"##,
         r##"{"ConditionalOperator":"BOGUS","ScanFilter":{"a":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"x"}]},"b":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"y"}]}}}"##,
-        r##"Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]"##,
+        r##"Value 'BOGUS' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]"##,
     ),
     (
         r##"ConditionalOperator AND with a two-element ScanFilter (valid)"##,
@@ -559,7 +567,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         r##"ConditionalOperator BOGUS with a two-element ScanFilter + Select BOGUS"##,
         r##"{"ConditionalOperator":"BOGUS","ScanFilter":{"a":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"x"}]},"b":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"y"}]}},"Select":"BOGUS"}"##,
-        r##"Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]"##,
+        r##"Value 'BOGUS' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]"##,
     ),
     (
         r##"ConditionalOperator AND + FilterExpression"##,
@@ -1140,7 +1148,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         r##"r10 plain ConditionalOperator BOGUS, two-element ScanFilter"##,
         r##"{"ConditionalOperator":"BOGUS","ScanFilter":{"a":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"x"}]},"b":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"y"}]}}}"##,
-        r##"Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]"##,
+        r##"Value 'BOGUS' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]"##,
     ),
     (
         r##"r10 plain ScanFilter operator BOGUS"##,

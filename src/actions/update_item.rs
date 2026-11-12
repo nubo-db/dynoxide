@@ -371,7 +371,7 @@ async fn execute_inner<S: StorageBackend>(
             // DynamoDB names no expression after its "can only be specified
             // when using expressions" message on the single-item writes
             // (eu-west-2 and us-east-1, 2026-10-09).
-            all_expression_param_names: vec![],
+            value_expression_params: &[],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
@@ -388,7 +388,7 @@ async fn execute_inner<S: StorageBackend>(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.expected.as_ref()),
     ) {
-        return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
+        return Err(DynoxideError::EnvelopedValidation(msg));
     }
     // A key, AttributeUpdates value or Expected value nested too deep is
     // refused, inside the envelope, before the key is matched to the schema or

@@ -9,8 +9,8 @@ use crate::expressions::key_condition::{
     ResolvedSortKeyCondition, SortKeyBound, sk_condition_groups_to_sql,
 };
 use crate::partiql::parser::{
-    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
-    WhereClause, WhereCondition, WrittenClause,
+    CompOp, Operand, OrderByTerm, ParseError, ParseFailure, PartiqlValue, Refused,
+    ReturningVariant, SetTerm, SetValue, Statement, WhereClause, WhereCondition, WrittenClause,
 };
 use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
@@ -333,7 +333,7 @@ fn reject_negated_key_filters(
                 vec![(branches.as_slice(), under_not)]
             }
             WrittenClause::Not(inner) => groups(inner, true),
-            WrittenClause::Leaf(_) => Vec::new(),
+            WrittenClause::Leaf(_) | WrittenClause::Operand(_) => Vec::new(),
         }
     }
     // Each condition in a clause, with whether a `NOT` is written over it or
@@ -361,6 +361,8 @@ fn reject_negated_key_filters(
                 terms.iter().for_each(|term| leaves(term, under_not, out))
             }
             WrittenClause::Not(inner) => leaves(inner, true, out),
+            // Only a clause refused before it runs holds one.
+            WrittenClause::Operand(_) => {}
         }
     }
 
@@ -1056,9 +1058,11 @@ fn check_order_terms(
         if !names_attribute(&term.path, read_pk)
             && !read_sk.is_some_and(|sk| names_attribute(&term.path, sk))
         {
+            // Named as the attribute, so `"a.b"` is printed `a.b` (captured
+            // eu-west-2, 2026-11-11).
             return Err(reject(format!(
                 "Attribute {} in ORDER BY clause must be part of the primary key",
-                term.path
+                root_attribute(&term.path)
             )));
         }
     }
@@ -1246,7 +1250,7 @@ fn bound_operand(value: &AttributeValue) -> String {
 
 /// Refuse a type given to `attribute_type` as a parameter that isn't the name
 /// of a DynamoDB type.
-fn check_attribute_type_parameter(
+fn check_attribute_type_kind(
     kind: &PartiqlValue,
     parameters: &[AttributeValue],
     reject: fn(&str, &AttributeValue) -> DynoxideError,
@@ -1261,7 +1265,15 @@ fn check_attribute_type_parameter(
     }
 }
 
-/// Reject an operand of a type its operator does not take.
+/// Check a WHERE clause's operands in one pass, and refuse the first fault.
+///
+/// Conditions are visited in the order written, through AND, OR, NOT and
+/// brackets. Inside a condition each operand is checked in the order written,
+/// its own operands first, and then the operator. An operand's faults are a
+/// wrong number of operands and a type a call can't take; an operator's are a
+/// type it can't take, an operand that isn't distinct and an IN with too many
+/// operands. A type that comes from a parameter is checked in the same pass
+/// (captured eu-west-2, 2026-11-11).
 ///
 /// DynamoDB orders `S`, `N` and `B` and nothing else, and it rejects the
 /// statement outright rather than declining to match: the check fires before the
@@ -1325,6 +1337,62 @@ fn validate_operand_types(
         }
         Ok(())
     }
+    // An operand's value when it is the same for every item, for the checks
+    // of the operator it stands under: a literal or a parameter, or a call as
+    // the boolean it returns. A path, or a size, has none until an item is
+    // read.
+    fn fixed_value(
+        operand: &Operand,
+        parameters: &[AttributeValue],
+    ) -> Result<Option<AttributeValue>> {
+        Ok(match operand {
+            Operand::Value(value) => Some(resolve_value(value, parameters)?),
+            Operand::Condition(_) => Some(AttributeValue::BOOL(true)),
+            Operand::Path(_) | Operand::Size(_) | Operand::Refused(_) => None,
+        })
+    }
+    // A call's own operands are checked before the operator it stands under,
+    // in the order written, so `n BETWEEN size(attribute_exists(n)) AND 5` is
+    // refused as size's (captured eu-west-2, 2026-11-11). `size` measures a
+    // string, a binary, a list, a map or a set: a number, a boolean or a null
+    // is refused whatever the item holds, a call being a boolean and a size a
+    // number (captured eu-west-2, 2026-11-11).
+    fn check_operand(operand: &Operand, parameters: &[AttributeValue]) -> Result<()> {
+        match operand {
+            Operand::Size(inner) => {
+                check_operand(inner, parameters)?;
+                let measured = match inner.as_ref() {
+                    // A size is a number, whatever it measures.
+                    Operand::Size(_) => Some(AttributeValue::N("0".to_string())),
+                    other => fixed_value(other, parameters)?,
+                };
+                if let Some(value) = measured.filter(|value| {
+                    matches!(
+                        value,
+                        AttributeValue::N(_) | AttributeValue::BOOL(_) | AttributeValue::NULL(_)
+                    )
+                }) {
+                    return Err(reject("size", &value));
+                }
+            }
+            Operand::Condition(inner) => check(inner, parameters)?,
+            Operand::Refused(refused) => return Err(refuse(refused, parameters)),
+            Operand::Path(_) | Operand::Value(_) => {}
+        }
+        Ok(())
+    }
+    // A call or an operator refused for itself, once its operands are
+    // checked, in the order written (captured eu-west-2, 2026-11-11).
+    fn refuse(refused: &Refused, parameters: &[AttributeValue]) -> DynoxideError {
+        match refused
+            .operands
+            .iter()
+            .try_for_each(|operand| check_operand(operand, parameters))
+        {
+            Err(inner) => inner,
+            Ok(()) => DynoxideError::ValidationException(refused.message.clone()),
+        }
+    }
     fn check(condition: &WhereCondition, parameters: &[AttributeValue]) -> Result<()> {
         match condition {
             // A negated comparison is checked too: `NOT a < ?` reads the
@@ -1350,23 +1418,23 @@ fn validate_operand_types(
             // eu-west-2 and us-east-1, 2026-10-10, for `size()`). A size is a
             // number, so a string or boolean against it under `=` or `<>` is
             // simply unequal rather than refused.
+            // Each side's own operands are checked first, in the order
+            // written, so `attribute_type(a, ?) = b` checks the type, and
+            // `size(true) < attribute_exists(n)` is refused as size's
+            // (captured eu-west-2, 2026-11-11). A call is a boolean, so an
+            // ordering operator refuses it after that.
             WhereCondition::Compare(left, op, right) => {
-                // A condition function compared is checked as it would be on
-                // its own: `attribute_type(a, ?) = b` checks the type.
                 for side in [left, right] {
-                    if let Operand::Condition(inner) = side {
-                        check(inner, parameters)?;
-                    }
+                    check_operand(side, parameters)?;
                 }
                 let Some(op) = ordering_op(op) else {
                     return Ok(());
                 };
                 for side in [left, right] {
-                    if let Operand::Value(value) = side {
-                        let value = resolve_value(value, parameters)?;
-                        if !orderable(&value) {
-                            return Err(reject(op, &value));
-                        }
+                    if let Some(value) = fixed_value(side, parameters)?
+                        && !orderable(&value)
+                    {
+                        return Err(reject(op, &value));
                     }
                 }
             }
@@ -1375,39 +1443,71 @@ fn validate_operand_types(
             // `size()`, 2026-10-10). A bound that isn't a value, such as a path,
             // can't be checked until an item is read; a value beside it is still
             // held to the orderable types (inferred, not captured).
-            WhereCondition::CompareBetween(_, low, high) => match (low, high) {
-                (Operand::Value(low), Operand::Value(high)) => check_bounds(
-                    &resolve_value(low, parameters)?,
-                    &resolve_value(high, parameters)?,
-                )?,
-                _ => {
-                    for bound in [low, high] {
-                        if let Operand::Value(value) = bound {
-                            let value = resolve_value(value, parameters)?;
-                            if !orderable(&value) {
+            // A call as the subject or a bound is a boolean, refused as `true`
+            // is there, once every operand's own operands are checked
+            // (captured eu-west-2, 2026-11-11).
+            WhereCondition::CompareBetween(operand, low, high) => {
+                for side in [operand, low, high] {
+                    check_operand(side, parameters)?;
+                }
+                if let Operand::Condition(_) = operand {
+                    return Err(reject("BETWEEN", &AttributeValue::BOOL(true)));
+                }
+                match (low, high) {
+                    (Operand::Value(low), Operand::Value(high)) => check_bounds(
+                        &resolve_value(low, parameters)?,
+                        &resolve_value(high, parameters)?,
+                    )?,
+                    _ => {
+                        for bound in [low, high] {
+                            if let Some(value) = fixed_value(bound, parameters)?
+                                && !orderable(&value)
+                            {
                                 return Err(reject("BETWEEN", &value));
                             }
                         }
                     }
                 }
-            },
+            }
             WhereCondition::CompareIn(operand, members) => {
                 for side in std::iter::once(operand).chain(members) {
-                    if let Operand::Condition(inner) = side {
-                        check(inner, parameters)?;
-                    }
+                    check_operand(side, parameters)?;
                 }
             }
-            // A type given to `attribute_type` as a parameter is checked
-            // once it is bound, negated or not (captured eu-west-2 and
-            // us-east-1, 2026-10-09).
-            WhereCondition::AttributeType(_, kind @ PartiqlValue::Parameter(_)) => {
-                check_attribute_type_parameter(kind, parameters, reject)?;
+            // The type `attribute_type` tests for is checked after the
+            // operand it tests and the type's own operands, negated or not: a
+            // type given as a parameter once it is bound (captured eu-west-2
+            // and us-east-1, 2026-10-09), a size as the number it is and a
+            // call as the boolean it returns (captured eu-west-2, 2026-11-11).
+            WhereCondition::AttributeType(operand, kind) => {
+                check_operand(operand, parameters)?;
+                check_operand(kind, parameters)?;
+                match kind {
+                    Operand::Value(kind) => check_attribute_type_kind(kind, parameters, reject)?,
+                    Operand::Size(_) => {
+                        return Err(reject(
+                            "attribute_type",
+                            &AttributeValue::N("0".to_string()),
+                        ));
+                    }
+                    Operand::Condition(_) => {
+                        return Err(reject("attribute_type", &AttributeValue::BOOL(true)));
+                    }
+                    Operand::Refused(_) => unreachable!("check_operand refuses it above"),
+                    Operand::Path(_) => {
+                        return Err(DynoxideError::ValidationException(format!(
+                            "Incorrect operand type for operator or function; \
+                             operator or function: attribute_type, operand type: {}",
+                            crate::partiql::parser::ATTRIBUTE_TYPE_OPERAND_TYPES
+                        )));
+                    }
+                }
             }
             // A condition with no negated form of its own is checked as it
             // would be without the NOT. Inferred, not captured: no capture
             // holds a refused negated size or BETWEEN.
             WhereCondition::Not(inner) => check(inner, parameters)?,
+            WhereCondition::Refused(refused) => return Err(refuse(refused, parameters)),
             // `begins_with` takes a string or binary operand (captured
             // eu-west-2 and us-east-1, 2026-10-09).
             WhereCondition::BeginsWith(_, prefix) | WhereCondition::NotBeginsWith(_, prefix) => {
@@ -1421,14 +1521,148 @@ fn validate_operand_types(
         Ok(())
     }
 
-    let Some(wc) = where_clause else {
-        return Ok(());
-    };
-    for condition in wc.tree.conditions() {
-        check(condition, parameters)?;
+    // The clause as written, through AND, OR, NOT and brackets, so the first
+    // fault written is the one reported (captured eu-west-2, 2026-11-11).
+    fn walk(clause: &WrittenClause, parameters: &[AttributeValue]) -> Result<()> {
+        match clause {
+            WrittenClause::Leaf(condition) => check(condition, parameters),
+            WrittenClause::And(terms) | WrittenClause::Or(terms) => {
+                terms.iter().try_for_each(|term| walk(term, parameters))
+            }
+            WrittenClause::Not(inner) => walk(inner, parameters),
+            WrittenClause::Operand(operand) => check_operand(operand, parameters),
+        }
     }
-    Ok(())
+
+    match where_clause {
+        Some(wc) => walk(&wc.written, parameters),
+        None => Ok(()),
+    }
 }
+
+/// The refusal a statement's WHERE clause check gives with no parameters, for
+/// the parser's tests.
+#[cfg(test)]
+pub(crate) fn where_clause_refusal(stmt: &Statement) -> Option<String> {
+    validate_operand_types(statement_where_clause(stmt), &[])
+        .err()
+        .map(|error| match error {
+            DynoxideError::ValidationException(message) => message,
+            other => other.to_string(),
+        })
+}
+
+/// Which request a statement arrived in, for the checks that differ between
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementSource {
+    ExecuteStatement,
+    BatchMember,
+    TransactionMember,
+}
+
+/// Read a statement and make DynamoDB's checks of a statement as such, in
+/// DynamoDB's order: a term or literal it refuses as it reads, a write naming
+/// an index, a read of an index with a multi-attribute key (not in a
+/// transaction, and only when the table and the index exist), the parameter
+/// count, the WHERE clause's operands in the order written, and an UPDATE's
+/// `set_add` or `set_delete` calls. Everything about the table, the key,
+/// ORDER BY and RETURNING comes after (captured eu-west-2, 2026-11-11).
+///
+/// A refusal is the statement's own: ExecuteStatement reports it as it is,
+/// a batch member fails alone and takes no part in the batch's checks, and a
+/// transaction reports it against the statement's index, never as a
+/// cancellation reason. Any other failure, such as one reading the table, is
+/// passed on as it is. Every statement a request runs is read here, so no
+/// clause reaches evaluation without its operands checked.
+pub(crate) async fn checked_statement<S: StorageBackend>(
+    storage: &S,
+    input: &str,
+    parameters: &[AttributeValue],
+    source: StatementSource,
+) -> std::result::Result<CheckedStatement, CheckFailure> {
+    let refuse = |message: String| {
+        CheckFailure::Refused(ParseFailure::Statement(ParseError::Validation(message)))
+    };
+    let parsed = crate::partiql::parser::parse_statement(input).map_err(CheckFailure::Refused)?;
+    let stmt = parsed.statement;
+    // A write naming an index is refused before its table is resolved, so a
+    // qualified UPDATE against a table that does not exist reports the index
+    // (captured eu-west-2 2026-08-15), and ahead of its WHERE clause's
+    // operands (captured eu-west-2, 2026-11-11).
+    if !matches!(stmt, Statement::Select { .. })
+        && crate::partiql::parser::index_name(&stmt).is_some()
+    {
+        return Err(refuse(WRITE_ON_INDEX_REFUSAL.to_string()));
+    }
+    // A read of an index whose key has more than one attribute on either side
+    // is refused ahead of the parameter count and its operands, outside a
+    // transaction, when the table and the index exist; a table that doesn't
+    // is left to the checks that report it, in their usual order (captured
+    // eu-west-2 and us-east-1, 2026-10-09, and eu-west-2, 2026-11-11). In a
+    // transaction the read is refused later, after the statement checks. The
+    // table is kept, so the read resolves it once.
+    let mut table = None;
+    if source != StatementSource::TransactionMember
+        && let Statement::Select {
+            table_name,
+            index_name: Some(index_name),
+            ..
+        } = &stmt
+    {
+        match ResolvedTable::load(storage, table_name).await {
+            Ok(resolved) => {
+                reject_multi_attribute_index(&resolved, index_name).map_err(statement_refusal)?;
+                table = Some(resolved);
+            }
+            Err(DynoxideError::ResourceNotFoundException(_)) => {}
+            Err(other) => return Err(CheckFailure::Failed(other)),
+        }
+    }
+    // More parameters than placeholders are accepted and the extra ignored
+    // (captured eu-west-2 and us-east-1, 2026-10-10).
+    if parsed.placeholders > parameters.len() {
+        return Err(refuse(
+            crate::partiql::parser::PARAMETER_COUNT_MISMATCH.to_string(),
+        ));
+    }
+    validate_operand_types(statement_where_clause(&stmt), parameters).map_err(statement_refusal)?;
+    if let Some(message) = parsed.set_refusal {
+        return Err(refuse(message));
+    }
+    Ok(CheckedStatement {
+        statement: stmt,
+        table,
+    })
+}
+
+/// A statement that passed [`checked_statement`], with the table it loaded
+/// for an index read, when it loaded one.
+pub(crate) struct CheckedStatement {
+    pub(crate) statement: Statement,
+    pub(crate) table: Option<ResolvedTable>,
+}
+
+/// Why [`checked_statement`] stopped: a refusal of the statement, or a failure
+/// that isn't about the statement at all, passed on as it is.
+pub(crate) enum CheckFailure {
+    Refused(ParseFailure),
+    Failed(DynoxideError),
+}
+
+/// A statement check's refusal as the statement's own. A check's failure
+/// that isn't a refusal is passed on as it is.
+fn statement_refusal(error: DynoxideError) -> CheckFailure {
+    match error {
+        DynoxideError::ValidationException(message) => {
+            CheckFailure::Refused(ParseFailure::Statement(ParseError::Validation(message)))
+        }
+        other => CheckFailure::Failed(other),
+    }
+}
+
+/// DynamoDB's refusal of an UPDATE or DELETE naming an index.
+const WRITE_ON_INDEX_REFUSAL: &str = "This operation is not supported on an index";
 
 /// Run one page of a parsed statement, `written` being its text as the
 /// request carried it. A continuation token is bound to that text exactly as
@@ -1456,58 +1690,20 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
     resolved: Option<&ResolvedTable>,
     old_on_condition_failure: bool,
 ) -> Result<StatementPage> {
-    if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
-        return Err(DynoxideError::ValidationException(
-            "NextToken is only valid on a SELECT statement".to_string(),
-        ));
-    }
-    // A read of an index whose key has more than one attribute on either side
-    // is refused before anything else about the read is checked, its operands
-    // included. The table is loaded for it here and passed on, so the read
-    // resolves it once; a table that cannot be loaded is left to the checks
-    // that report it, in their usual order (captured eu-west-2 and us-east-1,
-    // 2026-10-09).
-    let loaded;
-    let resolved = match (stmt, resolved) {
-        (
-            Statement::Select {
-                table_name,
-                index_name: Some(_),
-                ..
-            },
-            None,
-        ) => {
-            loaded = ResolvedTable::load(storage, table_name).await.ok();
-            loaded.as_ref()
-        }
-        (_, resolved) => resolved,
-    };
-    if let (
-        Statement::Select {
-            table_name,
-            index_name: Some(index_name),
-            ..
-        },
-        Some(table),
-    ) = (stmt, resolved)
-        && table.table_name == *table_name
-    {
-        reject_multi_attribute_index(table, index_name)?;
-    }
+    // A write takes a NextToken and runs as it would without one; only a
+    // SELECT reads it (captured eu-west-2, 2026-11-11, for UPDATE, DELETE and
+    // INSERT).
+    let next_token = next_token.filter(|_| matches!(stmt, Statement::Select { .. }));
 
-    validate_operand_types(statement_where_clause(stmt), parameters)?;
-
-    // DynamoDB rejects an index qualifier on a write statement before it
-    // resolves the table, so a qualified UPDATE against a table that does not
-    // exist reports the index problem rather than the missing table. Captured
-    // eu-west-2 2026-08-15.
-    if !matches!(stmt, Statement::Select { .. })
-        && crate::partiql::parser::index_name(stmt).is_some()
-    {
-        return Err(DynoxideError::ValidationException(
-            "This operation is not supported on an index".to_string(),
-        ));
-    }
+    // Every statement is read through `checked_statement` first, which
+    // refuses a write naming an index, then a read of a multi-attribute
+    // index, then checks the WHERE clause's operands, so none of those is
+    // checked again here.
+    debug_assert!(validate_operand_types(statement_where_clause(stmt), parameters).is_ok());
+    debug_assert!(
+        matches!(stmt, Statement::Select { .. })
+            || crate::partiql::parser::index_name(stmt).is_none()
+    );
 
     // A resolution is an optimisation the caller passes in, and taking it on
     // trust means applying whatever key schema it holds. A caller that handed
@@ -2333,8 +2529,8 @@ pub(crate) fn reject_multi_attribute_index(
 }
 
 /// [`reject_multi_attribute_index`] for a statement refused before it is
-/// parsed. A table that cannot be loaded is left to the statement's own
-/// rejection.
+/// parsed. A table that doesn't exist is left to the statement's own
+/// rejection; any other failure to read it is passed on.
 pub(crate) async fn reject_multi_attribute_index_by_name<S: StorageBackend>(
     storage: &S,
     table_name: &str,
@@ -2342,7 +2538,8 @@ pub(crate) async fn reject_multi_attribute_index_by_name<S: StorageBackend>(
 ) -> Result<()> {
     match ResolvedTable::load(storage, table_name).await {
         Ok(resolved) => reject_multi_attribute_index(&resolved, index_name),
-        Err(_) => Ok(()),
+        Err(DynoxideError::ResourceNotFoundException(_)) => Ok(()),
+        Err(other) => Err(other),
     }
 }
 
@@ -3444,18 +3641,22 @@ async fn execute_update<S: StorageBackend>(
     // A key attribute can't be set or removed: the item would be stored under
     // its old key with another key value in it. Refused in UpdateItem's words
     // before the item is read, so a missing item or a false condition makes no
-    // difference (captured eu-west-2 and us-east-1, 10 October 2026).
-    let paths = set_clauses
+    // difference (captured eu-west-2 and us-east-1, 10 October 2026). A path
+    // into a key, `pk.x` or `pk[0]`, is an update of that key too, and with
+    // both keys named the sort key is the one reported, whichever is written
+    // first (captured eu-west-2, 2026-11-11).
+    let roots: Vec<_> = set_clauses
         .iter()
-        .map(|clause| clause.path.as_str())
-        .chain(remove_paths.iter().map(String::as_str));
-    for path in paths {
-        let key = std::iter::once(key_schema.partition_key.as_str())
-            .chain(key_schema.sort_key.as_deref())
-            .find(|key| names_attribute(path, key));
-        if let Some(key) = key {
-            return Err(crate::actions::helpers::key_attribute_update_refusal(key));
-        }
+        .map(|clause| root_attribute(&clause.path))
+        .chain(remove_paths.iter().map(|path| root_attribute(path)))
+        .collect();
+    let updated_key = key_schema
+        .sort_key
+        .iter()
+        .chain(std::iter::once(&key_schema.partition_key))
+        .find(|key| roots.iter().any(|root| root == key.as_str()));
+    if let Some(key) = updated_key {
+        return Err(crate::actions::helpers::key_attribute_update_refusal(key));
     }
 
     // No two paths of one statement may overlap, the later clause being `path
@@ -4413,6 +4614,7 @@ fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
             Operand::Value(v) => value(v, bound),
             Operand::Size(inner) => operand(inner, bound),
             Operand::Condition(inner) => has_unbound_parameter(inner, bound),
+            Operand::Refused(refused) => refused.operands.iter().any(|o| operand(o, bound)),
         }
     }
     match condition {
@@ -4438,8 +4640,9 @@ fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
         WhereCondition::CompareIn(o, list) => {
             operand(o, bound) || list.iter().any(|m| operand(m, bound))
         }
-        WhereCondition::AttributeType(o, kind) => operand(o, bound) || value(kind, bound),
+        WhereCondition::AttributeType(o, kind) => operand(o, bound) || operand(kind, bound),
         WhereCondition::Not(inner) => has_unbound_parameter(inner, bound),
+        WhereCondition::Refused(refused) => refused.operands.iter().any(|o| operand(o, bound)),
     }
 }
 
@@ -4635,12 +4838,10 @@ fn operand_condition_holds(
             list.iter()
                 .any(|member| value(member).is_some_and(|m| compare_values(&v, &CompOp::Eq, &m)))
         }),
-        WhereCondition::AttributeType(operand, kind) => {
-            match (value(operand), resolve_value(kind, parameters)) {
-                (Some(v), Ok(AttributeValue::S(kind))) => v.type_name() == kind,
-                _ => false,
-            }
-        }
+        WhereCondition::AttributeType(operand, kind) => match (value(operand), value(kind)) {
+            (Some(v), Some(AttributeValue::S(kind))) => v.type_name() == kind,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -4674,6 +4875,10 @@ fn operand_value(
                 _ => return None,
             };
             Some(AttributeValue::N(size.to_string()))
+        }
+        Operand::Refused(_) => {
+            debug_assert!(false, "a refused operand reached evaluation");
+            None
         }
     }
 }
@@ -4755,7 +4960,6 @@ fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partiql::parser::parse;
 
     /// `set_add` appends the members it doesn't hold, in the order written,
     /// once each; `set_delete` keeps the held members it doesn't name. A
@@ -4804,8 +5008,14 @@ mod tests {
         }
     }
 
+    /// A statement's WHERE clause as read, without the statement check, so a
+    /// clause can be evaluated with fewer parameters than it holds.
     fn where_of(statement: &str) -> WhereClause {
-        match parse(statement).unwrap() {
+        match crate::partiql::parser::parse_statement(statement)
+            .ok()
+            .expect("parses")
+            .statement
+        {
             Statement::Select {
                 where_clause: Some(wc),
                 ..
@@ -4923,5 +5133,69 @@ mod tests {
                 "{clause}"
             );
         }
+    }
+
+    /// The first refusal the statement check finds in a SELECT's WHERE clause.
+    fn operand_refusal(clause: &str, parameters: &[AttributeValue]) -> Option<String> {
+        let parsed = crate::partiql::parser::parse_statement(&format!(
+            r#"SELECT * FROM "t" WHERE {clause}"#
+        ))
+        .ok()
+        .expect("parses");
+        validate_operand_types(statement_where_clause(&parsed.statement), parameters)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// A refused call keeps the operands it was written with, so a refusal
+    /// inside one of them comes first, a type among them included.
+    #[test]
+    fn a_refused_call_reports_its_operands_first() {
+        let count = |name: &str, n: usize| {
+            format!(
+                "Incorrect number of operands for operator or function; operator or function: \
+                 {name}, number of operands: {n}"
+            )
+        };
+        let size_bool = "Incorrect operand type for operator or function; operator or function: \
+                         size, operand type: BOOL";
+        assert_eq!(
+            operand_refusal("attribute_exists(size(s, s))", &[]),
+            Some(count("size", 2))
+        );
+        assert_eq!(
+            operand_refusal("size(size(true), 1) > 0", &[]),
+            Some(size_bool.to_string())
+        );
+        assert_eq!(
+            operand_refusal(
+                "attribute_type(size(?, 1), 'N')",
+                &[AttributeValue::S("a".into())]
+            ),
+            Some(count("size", 2))
+        );
+        assert_eq!(
+            operand_refusal("size(?) > 0 AND n = n", &[AttributeValue::BOOL(true)]),
+            Some(size_bool.to_string())
+        );
+        assert_eq!(operand_refusal("size(s) > 0 AND n = 1", &[]), None);
+    }
+
+    /// A clause refused for an operand is checked as written, not flattened,
+    /// so one too long for the flattening's budget still reports the IN.
+    #[test]
+    fn a_long_refused_clause_reports_its_in_limit() {
+        let path = "a".repeat(4_000);
+        let values = vec!["1"; 101].join(",");
+        assert_eq!(
+            operand_refusal(
+                &format!("NOT {path} IN [{values}] AND (x = 1 OR x = 2)"),
+                &[]
+            ),
+            Some(
+                "The IN operator is provided with too many operands; number of operands: 101"
+                    .to_string()
+            )
+        );
     }
 }

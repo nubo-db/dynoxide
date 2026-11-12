@@ -15,7 +15,7 @@ lives in `Cargo.toml`.
 They were one number until 1.1.0. The split happened because a change to a
 public Rust type forced a major on every artefact whose users never touch the
 Rust API, and stranding everyone on `^1.x` and `dynoxide:1` to report a change
-they cannot observe is a poor trade. The current mapping is product **1.6.0**,
+they cannot observe is a poor trade. The current mapping is product **1.7.0**,
 crate **3.3.0**.
 
 This page says what each number promises. It is not a claim that conformance is
@@ -26,7 +26,7 @@ finished.
 | Contract | Surface | Stream |
 |---|---|---|
 | Rust API | Public types, traits, signatures, feature flags, MSRV | Crate |
-| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` and `Server` headers, container entrypoint and port, the `GET /` health response and the startup line | Product |
+| CLI and wire | `dynoxide` argv and exit codes, HTTP responses, error strings, the `x-dynoxide-version` and `Server` headers, container entrypoint and port, the `GET /` health response, the startup line, the `--ready-json` ready line, `--exit-with-parent` and the `--version` output | Product |
 | Browser JS API | The Worker client API and message protocol | Product |
 | Engine behaviour | How the engine answers, across every surface above | Both |
 
@@ -58,6 +58,8 @@ additive and ships as a minor; changing or removing one is not.
 | Container entrypoint or exposed port change | Product | major |
 | `GET /` health status or body change | Product | major |
 | Startup line text, or the stream it goes to | Product | major |
+| Ready line field removed, renamed or changed in meaning | Product | major |
+| Ready line field added | Product | minor |
 | Engine behaviour change | Both | major, unless it is a capture-backed conformance fix |
 | Conformance fix, capture-backed | Both | minor |
 | New DynamoDB operation | Both | minor |
@@ -89,6 +91,41 @@ on `GET /` works with either logging mode.
 `tests/container_contract.rs` holds both. Worth knowing if you change either:
 the container's own `HEALTHCHECK` reads the status line and never the body, so
 without those tests nothing would notice the body change.
+
+## What a launcher reads
+
+A wrapper that starts Dynoxide from another language passes `--ready-json` and
+reads one line instead of parsing the startup line. Once the listener is
+bound, the server prints a single JSON object to **stdout**:
+
+```json
+{"event":"ready","schema":1,"version":"1.7.0","endpoint":"http://127.0.0.1:54321","host":"127.0.0.1","port":54321,"pid":4242}
+```
+
+With the flag, stdout carries this line and nothing else: tracing goes to
+stderr instead, whatever `RUST_LOG` asks for. The line prints even with
+`--log quiet`. `host` is the address bound; `endpoint` is the URL to give an
+SDK, so a wildcard bind (`0.0.0.0` or `[::]`) reports the loopback address of
+the same family there. `version` is the product version.
+
+`schema` versions the line's shape. A new field can arrive in any minor
+release, so read the fields you need and ignore the rest. Removing or renaming
+a field, or changing what one means, bumps `schema` and is a product major.
+Without the flag nothing changes: no line, and tracing stays on stdout.
+
+`--exit-with-parent` makes the server treat stdin closing as a request to
+stop: it shuts down the way it does on SIGTERM and exits `0`. A launcher keeps
+stdin on a pipe it holds, so the server stops when the launcher closes the
+pipe or dies, on Windows as well as Unix. With stdin closed or at `/dev/null`
+the server stops as soon as it starts, so only pass the flag with a pipe
+attached. Without the flag, stdin is ignored, as before.
+
+A launcher handed a binary of unknown version reads `dynoxide --version`, which
+prints `dynoxide <product version>` on one line. That format is part of this
+contract too.
+
+`tests/launcher_contract.rs` holds all three, and `docs/launcher.md` describes
+the rest of what a launcher does.
 
 ## The storage backend seam
 

@@ -39,6 +39,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serves without an `initialize` step. Clients on earlier versions see no
   change.
 
+### Added
+
+- **`--ready-json` prints one JSON line to stdout once the server is ready**,
+  so a launcher in another language can read the endpoint, port and process ID
+  without parsing the human startup line. With the flag, stdout carries only
+  that line and log output moves to stderr. It works on `serve` and the
+  no-subcommand form, and `dynoxide mcp` refuses it. The line's fields and how
+  they may change are in `docs/versioning.md`. The library gains
+  `ServerOptions::with_ready_line`.
+- **`--exit-with-parent` shuts the server down gracefully when stdin closes**,
+  so a server started by a test runner stops when the runner exits, even if
+  the runner is killed outright. Closing stdin is also a graceful way to stop
+  the server on Windows, where there is no SIGTERM. Only pass it with stdin on
+  a pipe: with stdin closed, the server stops as soon as it starts. `dynoxide
+  mcp` refuses it, because stdio mode already exits when stdin closes. The
+  library gains `ServerOptions::with_shutdown_trigger`, which stops the HTTP
+  server when a `tokio::sync::watch` channel says so.
+- **`docs/launcher.md` describes how a wrapper for another language finds,
+  verifies, starts and stops Dynoxide**, so wrappers behave alike.
+- **The npm package exports `start()`**, which runs Dynoxide on a free port
+  for a test suite and returns its endpoint, region, credentials and a
+  `stop()`. It follows `docs/launcher.md`. The package gains TypeScript types and an `exports` map that keeps
+  `dynoxide/bin/dynoxide` and `dynoxide/package.json` importable.
+
 ### Changed
 
 - The declared MSRV is now 1.89, which `rusqlite` 0.42 needs.
@@ -49,8 +73,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `storage_backend::from_rusqlite` now use `rusqlite` 0.42's types, so code
   that passes them to or from its own `rusqlite` needs 0.42 too. The next
   crate release is `dynoxide-rs` 4.0.0.
+- **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
+  emulator verified against AWS**, rather than a drop-in replacement for
+  DynamoDB Local.
 
 ### Fixed
+
+- **A server whose launcher was killed now shuts down cleanly.** If the
+  launcher had been reading the server's stderr through a pipe, the shutdown
+  line failed to write and the release build aborted before closing the
+  database, leaving its write-ahead log behind. Writes weren't lost, but the
+  shutdown wasn't the clean one `--exit-with-parent` promises. Informational
+  lines on the `serve` path now drop a failed write instead.
 
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

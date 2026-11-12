@@ -156,6 +156,9 @@ pub use types::{AttributeValue, ConversionError, Item};
 
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 pub use server_options::ServerOptions;
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+#[doc(hidden)]
+pub use server_options::stderr_line;
 
 /// The product version: what `dynoxide --version`, the HTTP headers and the
 /// MCP server report, and what the CLI, containers, browser engine and npm

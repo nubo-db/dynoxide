@@ -894,45 +894,6 @@ pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
     with_value_layer(crate::validation::ValueLayer::Older, read)
 }
 
-/// Deserialise an operation's `ExpressionAttributeValues` on the older
-/// validation layer, which refuses a number it can't store inside the
-/// `ExpressionAttributeValues contains invalid value: ... for key :k` wrapper
-/// (TransactWriteItems in three of four regions, Scan in seven of ten;
-/// 2026-10-09). Every other value error passes through as it is.
-pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    let Some(raw) =
-        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
-    else {
-        return Ok(None);
-    };
-    let mut values = HashMap::with_capacity(raw.len());
-    for (key, value) in raw {
-        let read = with_value_layer(crate::validation::ValueLayer::Older, || {
-            serde_json::from_value::<AttributeValue>(value)
-        });
-        match read {
-            Ok(av) => {
-                values.insert(key, av);
-            }
-            Err(e) => {
-                use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
-                let msg = e.to_string();
-                return Err(de::Error::custom(match value_refusal(&msg) {
-                    ValueRefusal::Number(inner) => format!(
-                        "{}{}",
-                        crate::serde_errors::VALIDATION_MARKER,
-                        named_value_refusal(inner, &key)
-                    ),
-                    _ => msg,
-                }));
-            }
-        }
-    }
-    Ok(Some(values))
-}
-
 /// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
 /// NULL refused as it was parsed (a string that reads as false, or false
 /// beside another member) the way DynamoDB does: `ExpressionAttributeValues
@@ -1110,6 +1071,108 @@ pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
     }
 
     deserializer.deserialize_option(List)
+}
+
+/// A map of attribute values read off the wire, such as a transaction
+/// action's `Item`, `Key` or `ExpressionAttributeValues`, with the first value
+/// DynamoDB refuses held back, as [`HeldParameters`] holds a parameter. A
+/// value of the wrong JSON type still fails the read there and then, wherever
+/// it sits in the map, as DynamoDB fails the request ahead of its member
+/// checks. The request decoder raises the refusal once those checks pass.
+#[derive(Debug, Default)]
+pub(crate) struct HeldValues {
+    /// The values read, each refused one left out. `None` when the map was
+    /// left out or given as null.
+    pub(crate) values: Option<HashMap<String, AttributeValue>>,
+    /// The first refusal, as the reader raised it, marker and all.
+    pub(crate) refusal: Option<String>,
+}
+
+impl HeldValues {
+    /// Whether the map was left out or given as null.
+    pub(crate) fn is_null(&self) -> bool {
+        self.values.is_none() && self.refusal.is_none()
+    }
+
+    /// The values, this map's refusal kept in `refusal` if none is yet.
+    pub(crate) fn take(
+        self,
+        refusal: &mut Option<String>,
+    ) -> Option<HashMap<String, AttributeValue>> {
+        if let Some(held) = self.refusal {
+            refusal.get_or_insert(held);
+        }
+        self.values
+    }
+}
+
+/// Sort the message one value's read failed with: a refusal DynamoDB raises
+/// once the request's members pass is returned to be held, and anything else,
+/// a value of the wrong JSON type, fails the read.
+fn hold<E: de::Error>(message: String) -> std::result::Result<String, E> {
+    if crate::serde_errors::is_validation_refusal(&message) {
+        Ok(message)
+    } else {
+        Err(E::custom(message))
+    }
+}
+
+/// Deserialise an `Item`, a `Key` or `ExpressionAttributeValues` into
+/// [`HeldValues`], one value at a time in the order written. Every value is
+/// read through the one `from_value` call below, with its attribute's name or
+/// placeholder in hand, so that is where a refusal that names it belongs.
+pub(crate) fn deserialize_held_attributes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HeldValues, D::Error> {
+    struct Attributes;
+
+    impl<'de> de::Visitor<'de> for Attributes {
+        type Value = HeldValues;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a map")
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
+            Ok(HeldValues::default())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
+            Ok(HeldValues::default())
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<HeldValues, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<HeldValues, A::Error> {
+            let mut values = HashMap::with_capacity(map.size_hint().unwrap_or(0).min(256));
+            let mut refusal = None;
+            while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
+                match serde_json::from_value::<AttributeValue>(value) {
+                    Ok(value) => {
+                        values.insert(name, value);
+                    }
+                    Err(e) => {
+                        let held = hold::<A::Error>(e.to_string())?;
+                        refusal.get_or_insert(held);
+                    }
+                }
+            }
+            Ok(HeldValues {
+                values: Some(values),
+                refusal,
+            })
+        }
+    }
+
+    deserializer.deserialize_option(Attributes)
 }
 
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's

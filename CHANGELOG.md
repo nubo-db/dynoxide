@@ -263,6 +263,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to ExecuteStatement as given, so a string gets ExecuteStatement's answer:
   one DynamoDB reads as a boolean runs, and any other is refused
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- An empty `ClientRequestToken` is refused on TransactWriteItems and
+  ExecuteTransaction. Before, it was accepted and the request went on to look
+  up its tables. TransactWriteItems now checks its members in the order
+  DynamoDB does. A required member left out (`TransactItems`, or an action's
+  `TableName`, `Item`, `Key`, `UpdateExpression` or a ConditionCheck's
+  `ConditionExpression`) is reported first as `Value null at '...'`, with a
+  bad `ReturnValuesOnConditionCheckFailure` on the same action, a bad token
+  and the request's enums listed beside it, where it used to be a serde
+  `missing field` error. Then the token's length and the length of
+  `TransactItems` are reported on their own, in DynamoDB's older wording with
+  no value or list echoed (`Value at 'ClientRequestToken' ...`). An item with
+  no action comes next, as `Value '' at 'transactItems'`, or else every table
+  name refused, either listed with a bad `ReturnConsumedCapacity` or
+  `ReturnItemCollectionMetrics`. Then an item naming more than one action,
+  then the first number refused in an item, key or expression value, then
+  the first action's bad `ReturnValuesOnConditionCheckFailure` rather than
+  every one. An item given as null is refused with `TransactItems can't be
+  null` unless a member left out, the token, an enum or another item's bad
+  `ReturnValuesOnConditionCheckFailure` is reported first. An item given as a
+  string, a number or a list with anything in it, or an action given as a
+  list, gets a `SerializationException`; before, an item given as a list was
+  read by position and could run as a Put. TransactWriteItems reads its
+  numbers and sets as DynamoDB now does in every region: a refused expression
+  value is no longer wrapped in `ExpressionAttributeValues contains invalid
+  value: ... for key`, `1e2147483647` is an overflow, as on PutItem, and a
+  repeated string set member is listed quoted and sorted. The MCP `transact_write_items`
+  tool reads its arguments the same way. ExecuteTransaction lists the empty
+  token first, and a missing `TransactStatements` is
+  `Value null at 'transactStatements'`
+  ([#318](https://github.com/nubo-db/dynoxide/issues/318)).
 - An MCP tool error for a failed condition asked for `ALL_OLD` writes the
   item's number sets in the order the HTTP API uses for that operation:
   numeric for `put_item`, `update_item` and `delete_item`, and DynamoDB's

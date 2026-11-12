@@ -2471,6 +2471,157 @@ fn test_transact_write_items_null_false_bare() {
     let _ = child.wait();
 }
 
+/// A transaction write with every kind of action, expression names and values,
+/// a token and a capacity mode goes through the tool, and a second call with
+/// the same token succeeds without writing again.
+#[test]
+fn the_transaction_write_tool_runs_every_action_and_replays_its_token() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    for (id, pk) in (2..).zip(["update", "delete", "check"]) {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Parity", "item": {"pk": {"S": pk}, "n": {"N": "1"}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+
+    let args = json!({
+        "transact_items": [
+            {"Put": {
+                "TableName": "Parity",
+                "Item": {"pk": {"S": "put"}, "n": {"N": "7"}},
+                "ConditionExpression": "attribute_not_exists(#p)",
+                "ExpressionAttributeNames": {"#p": "pk"}
+            }},
+            {"Update": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "update"}},
+                "UpdateExpression": "SET #n = #n + :one",
+                "ConditionExpression": "#n = :was",
+                "ExpressionAttributeNames": {"#n": "n"},
+                "ExpressionAttributeValues": {":one": {"N": "1"}, ":was": {"N": "1"}}
+            }},
+            {"Delete": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "delete"}},
+                "ConditionExpression": "#n = :was",
+                "ExpressionAttributeNames": {"#n": "n"},
+                "ExpressionAttributeValues": {":was": {"N": "1"}}
+            }},
+            {"ConditionCheck": {
+                "TableName": "Parity",
+                "Key": {"pk": {"S": "check"}},
+                "ConditionExpression": "attribute_exists(#p) AND #n = :was",
+                "ExpressionAttributeNames": {"#p": "pk", "#n": "n"},
+                "ExpressionAttributeValues": {":was": {"N": "1"}}
+            }}
+        ],
+        "client_request_token": "round-trip-token",
+        "return_consumed_capacity": "TOTAL"
+    });
+    let first = call_tool(&mut child, 10, "transact_write_items", args.clone());
+    assert!(!is_tool_error(&first), "{first}");
+    let first = tool_content(&first);
+    assert_eq!(
+        first["ConsumedCapacity"],
+        json!([{"TableName": "Parity", "CapacityUnits": 8.0, "WriteCapacityUnits": 8.0}]),
+        "{first}"
+    );
+
+    let replay = call_tool(&mut child, 11, "transact_write_items", args);
+    assert!(!is_tool_error(&replay), "{replay}");
+    // The replay is billed as a transactional read of the same items.
+    assert_eq!(
+        tool_content(&replay)["ConsumedCapacity"],
+        json!([{"TableName": "Parity", "CapacityUnits": 8.0, "ReadCapacityUnits": 8.0}])
+    );
+
+    let stored = |child: &mut std::process::Child, id: u64, pk: &str| {
+        let resp = call_tool(
+            child,
+            id,
+            "get_item",
+            json!({"table_name": "Parity", "key": {"pk": {"S": pk}}, "consistent_read": true}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+        tool_content(&resp)["Item"].clone()
+    };
+    assert_eq!(
+        stored(&mut child, 12, "put"),
+        json!({"pk": {"S": "put"}, "n": {"N": "7"}})
+    );
+    assert_eq!(
+        stored(&mut child, 13, "update"),
+        json!({"pk": {"S": "update"}, "n": {"N": "2"}})
+    );
+    assert_eq!(stored(&mut child, 14, "delete"), Value::Null);
+    assert_eq!(
+        stored(&mut child, 15, "check"),
+        json!({"pk": {"S": "check"}, "n": {"N": "1"}})
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The transaction write tool answers its member checks as the HTTP API does:
+/// a table name left out, an empty token ahead of a number refused in an item
+/// and ahead of a bad capacity mode, and an item naming no action beside a
+/// bad capacity mode (captured eu-west-2 and us-east-1, 2026-11-11).
+#[test]
+fn the_transaction_write_tool_checks_its_members_as_the_http_api_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    create_parity_table(&mut child);
+
+    let cases = [
+        (
+            json!({"transact_items": [{"Put": {"Item": {"pk": {"S": "a"}}}}]}),
+            "1 validation error detected: Value null at 'transactItems.1.member.put.tableName' \
+             failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            json!({
+                "transact_items": [{"Put": {"TableName": "Parity", "Item": {"pk": {"N": "abc"}}}}],
+                "client_request_token": ""
+            }),
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1",
+        ),
+        (
+            json!({
+                "transact_items": [{"Put": {"TableName": "Parity", "Item": {"pk": {"N": "abc"}}}}],
+                "client_request_token": "",
+                "return_consumed_capacity": "BAD"
+            }),
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1",
+        ),
+        (
+            json!({
+                "transact_items": [{}, {"Put": {"TableName": "x", "Item": {"pk": {"S": "a"}}}}],
+                "return_consumed_capacity": "BAD"
+            }),
+            "2 validation errors detected: Value '' at 'transactItems' failed to satisfy \
+             constraint: TransactWriteRequest should contain Delete or Put or Update or \
+             ConditionCheck; Value 'BAD' at 'returnConsumedCapacity' failed to satisfy \
+             constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]",
+        ),
+    ];
+    for (id, (args, expected)) in (2..).zip(cases) {
+        let resp = call_tool(&mut child, id, "transact_write_items", args);
+        assert_validation_tool_error(&resp, expected);
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn test_update_item_duplicate_set_in_eav_enveloped() {
     let mut child = spawn_mcp();
@@ -5863,9 +6014,10 @@ fn a_map_argument_that_is_not_dynamodb_json_names_the_argument() {
 }
 
 /// The tools without the envelope keep their operation's own layer: GetItem
-/// reads values on the current layer, bare, and the batch, transaction and
-/// PartiQL operations on the older one, which reads `1e2147483647` as Java's
-/// `BigDecimal` does and calls it an underflow (tests/value_layers.rs).
+/// and TransactWriteItems read values on the current layer, bare, and the
+/// batch, TransactGetItems and PartiQL operations on the older one, which
+/// reads `1e2147483647` as Java's `BigDecimal` does and calls it an underflow
+/// (tests/value_layers.rs).
 #[test]
 fn other_tools_read_values_on_their_operations_layer() {
     let mut child = mcp_with_table("Layers");
@@ -5887,9 +6039,8 @@ fn other_tools_read_values_on_their_operations_layer() {
                      supported range";
     let tiny = json!({"N": "1e2147483647"});
     let select = "SELECT * FROM \"Layers\" WHERE pk = ?";
-    // The batch_write_item, transact_write_items Put and transact_get_items
-    // cases read on the older layer only through the tool's entry in the
-    // operation map. The transact_write_items Update case and the three
+    // The batch_write_item and transact_get_items cases read on the older
+    // layer only through the tool's entry in the operation map. The three
     // PartiQL cases get the same answer without it, from the actions
     // themselves, so they pin the tool's answer whatever the map says.
     let older: Vec<(&str, Value, (String, String))> = vec![
@@ -5898,22 +6049,6 @@ fn other_tools_read_values_on_their_operations_layer() {
             json!({"request_items": {"Layers": [
                 {"PutRequest": {"Item": {"pk": {"S": "a"}, "v": tiny}}}
             ]}}),
-            validation_error(underflow),
-        ),
-        (
-            "transact_write_items",
-            json!({"transact_items": [{"Update": {
-                "TableName": "Layers", "Key": {"pk": {"S": "a"}},
-                "UpdateExpression": "SET v = :v",
-                "ExpressionAttributeValues": {":v": tiny}
-            }}]}),
-            named(underflow, ":v"),
-        ),
-        (
-            "transact_write_items",
-            json!({"transact_items": [{"Put": {
-                "TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}
-            }}]}),
             validation_error(underflow),
         ),
         (
@@ -5960,6 +6095,30 @@ fn other_tools_read_values_on_their_operations_layer() {
         "{} of {checked} older-layer answers differ: {mismatches:#?}",
         mismatches.len()
     );
+    // transact_write_items reads its values and its items on the current
+    // layer, bare (captured eu-west-2, us-east-1, eu-west-1 and us-west-2,
+    // 2026-11-11).
+    let overflow = "Number overflow. Attempting to store a number with magnitude larger than \
+                    supported range";
+    for (id, action) in [
+        json!({"Update": {
+            "TableName": "Layers", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET v = :v",
+            "ExpressionAttributeValues": {":v": tiny}
+        }}),
+        json!({"Put": {"TableName": "Layers", "Item": {"pk": {"S": "a"}, "v": tiny}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let resp = call_tool(
+            &mut child,
+            40 + id as u64,
+            "transact_write_items",
+            json!({"transact_items": [action]}),
+        );
+        assert_eq!(tool_error(&resp), validation_error(overflow), "{action}");
+    }
     // And put_item, straight after, is back on the current layer.
     let resp = call_tool(
         &mut child,

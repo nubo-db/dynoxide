@@ -24,8 +24,8 @@ impl<'de> Deserialize<'de> for ExecuteTransactionRequest {
         /// The request as it arrives on the wire.
         #[derive(Deserialize)]
         struct Wire {
-            #[serde(rename = "TransactStatements")]
-            transact_statements: Vec<WireStatement>,
+            #[serde(rename = "TransactStatements", default)]
+            transact_statements: Option<Vec<WireStatement>>,
             #[serde(rename = "ClientRequestToken", default)]
             client_request_token: Option<String>,
             #[serde(rename = "ReturnConsumedCapacity", default)]
@@ -48,13 +48,29 @@ impl<'de> Deserialize<'de> for ExecuteTransactionRequest {
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        // A statement list left out is a member error of its own, listed
+        // after the token and ahead of ReturnConsumedCapacity (captured
+        // eu-west-2 and us-east-1, 2026-11-11).
+        let Some(wire_statements) = wire.transact_statements else {
+            let violations = violations_of(
+                wire.client_request_token.as_deref(),
+                None,
+                wire.return_consumed_capacity.as_deref(),
+            );
+            let msg = crate::validation::format_validation_errors(&violations)
+                .expect("a statement list left out is always a violation");
+            return Err(serde::de::Error::custom(format!(
+                "{}{msg}",
+                crate::serde_errors::VALIDATION_MARKER
+            )));
+        };
         // DynamoDB walks every statement's parameters as one list, after the
         // request's member errors, so the first statement's refusal is the
         // one answered, and only when no member error is (captured
         // eu-west-2, 10 November 2026).
         let mut refusal = None;
-        let mut transact_statements = Vec::with_capacity(wire.transact_statements.len());
-        for s in wire.transact_statements {
+        let mut transact_statements = Vec::with_capacity(wire_statements.len());
+        for s in wire_statements {
             refusal = refusal.or(s.parameters.refusal);
             transact_statements.push(ParameterizedStatement {
                 statement: s.statement,
@@ -239,26 +255,59 @@ fn write_statements(
 /// them, after the token and ahead of the statements, echoing the list: `[]`
 /// when empty, each statement's Java `toString` when too long (captured
 /// eu-west-2 and us-east-1, 2026-10-10; the empty list in six regions).
+///
+/// The token is refused empty as well as too long, first in the list either
+/// way (captured eu-west-2 and us-east-1, 2026-11-11).
 fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
-    let mut violations = Vec::new();
-    violations.extend(crate::token_constraint_error(
+    violations_of(
         request.client_request_token.as_deref(),
+        Some(&request.transact_statements),
+        request.return_consumed_capacity.as_deref(),
+    )
+}
+
+/// [`member_violations`] for a request read off the wire, whose statement list
+/// may have been left out: `None` lists it as null in the list's place.
+fn violations_of(
+    token: Option<&str>,
+    statements: Option<&[ParameterizedStatement]>,
+    return_consumed_capacity: Option<&str>,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    violations.extend(crate::token_constraint_error(token));
+    match statements {
+        None => violations.push(
+            "Value null at 'transactStatements' failed to satisfy constraint: Member must not \
+             be null"
+                .to_string(),
+        ),
+        Some(statements) => violations.extend(statement_violations(statements)),
+    }
+    violations.extend(crate::validation::return_consumed_capacity_rejection(
+        return_consumed_capacity,
     ));
-    if request.transact_statements.is_empty() {
+    violations
+}
+
+/// The statement list's own violations: its length, then each statement's
+/// mode, text and parameters by index.
+fn statement_violations(statements: &[ParameterizedStatement]) -> Vec<String> {
+    let mut violations = Vec::new();
+    if statements.is_empty() {
         violations.push(
             "Value '[]' at 'transactStatements' failed to satisfy constraint: Member must \
              have length greater than or equal to 1"
                 .to_string(),
         );
     }
-    if request.transact_statements.len() > 100 {
+    if statements.len() > 100 {
         violations.push(format!(
             "Value '{}' at 'transactStatements' failed to satisfy constraint: Member must \
              have length less than or equal to 100",
-            statements_echo(&request.transact_statements)
+            statements_echo(statements)
         ));
     }
-    for (i, statement) in request.transact_statements.iter().enumerate() {
+    for (i, statement) in statements.iter().enumerate() {
         let member = format!("transactStatements.{}.member", i + 1);
         violations.extend(
             crate::validation::return_values_on_condition_check_failure_rejection(
@@ -277,9 +326,6 @@ fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
             &format!("{member}.parameters"),
         ));
     }
-    violations.extend(crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ));
     violations
 }
 

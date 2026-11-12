@@ -86,6 +86,14 @@ Or run it in Docker, a drop-in for `amazon/dynamodb-local`:
 docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
 ```
 
+Or start it in a GitHub Actions job:
+
+```yaml
+- uses: nubo-db/dynoxide/action@v1.6.0
+  with:
+    port: 8000
+```
+
 Point any AWS SDK or DynamoDB client at `http://localhost:8000`. For Homebrew, Cargo, pre-built binaries, and embedding as a Rust library, see the [installation guide](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md).
 
 Add `--log quiet` to suppress informational startup and shutdown messages on
@@ -98,12 +106,15 @@ unchanged.
 - [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker
 - [HTTP server](https://github.com/nubo-db/dynoxide/blob/main/docs/http-server.md) - running the DynamoDB-compatible HTTP API
 - [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
+- [Laravel](https://github.com/nubo-db/dynoxide/blob/main/docs/laravel.md) - the DynamoDB cache, locks, sessions and failed jobs, run locally
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
 - [Import CLI](https://github.com/nubo-db/dynoxide/blob/main/docs/import.md) - loading data, table filtering, and anonymisation
 - [WebAssembly](https://github.com/nubo-db/dynoxide/blob/main/docs/wasm.md) - the browser build and embed contract
 - [Using as a Rust library](https://github.com/nubo-db/dynoxide/blob/main/docs/library.md) - embedded mode and feature flags
 - [Compatibility](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md) - operation, expression, and PartiQL coverage versus DynamoDB
+- [Differences from DynamoDB](https://github.com/nubo-db/dynoxide/blob/main/docs/differences-from-dynamodb.md) - what knowingly behaves differently, and why
+- [Troubleshooting](https://github.com/nubo-db/dynoxide/blob/main/docs/troubleshooting.md) - common errors and what they mean
 - [Versioning](https://github.com/nubo-db/dynoxide/blob/main/docs/versioning.md) - what the version number promises and what forces a major
 - [Releasing](https://github.com/nubo-db/dynoxide/blob/main/docs/RELEASING.md) - release cadence and process
 
@@ -133,7 +144,7 @@ A few behavioural differences are also worth knowing when you test against it:
 - Streams expose a single shard. `DescribeStream` returns one shard, and its `ExclusiveStartShardId` and `Limit` paging parameters are accepted but ignored.
 - Transaction-contention errors (`TransactionConflictException`, `TransactionInProgressException`) aren't emulated - there's no concurrent contention in a single process.
 
-For the per-feature support matrix, see the [live capability matrix](https://paritysuite.org/capabilities); the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
+[Differences from DynamoDB](https://github.com/nubo-db/dynoxide/blob/main/docs/differences-from-dynamodb.md) gathers every known difference in one place. For the per-feature support matrix, see the [live capability matrix](https://paritysuite.org/capabilities); the full operation-by-operation breakdown is in the [compatibility summary](https://github.com/nubo-db/dynoxide/blob/main/docs/compatibility-summary.md).
 
 ## Acknowledgements
 

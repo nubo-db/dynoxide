@@ -38,6 +38,20 @@ curl -fsSL https://github.com/nubo-db/dynoxide/releases/latest/download/dynoxide
 sudo mv dynoxide /usr/local/bin/
 ```
 
+To check the archive before unpacking it, download it with the release's
+`sha256sums.txt` and verify it first:
+
+```sh
+base=https://github.com/nubo-db/dynoxide/releases/latest/download
+curl -fsSLO "$base/dynoxide-x86_64-unknown-linux-musl.tar.gz"
+curl -fsSLO "$base/sha256sums.txt"
+sha256sum -c --ignore-missing sha256sums.txt   # macOS: shasum -a 256 -c --ignore-missing sha256sums.txt
+tar xzf dynoxide-x86_64-unknown-linux-musl.tar.gz
+```
+
+[Verifying a release](RELEASING.md#verifying-a-release) covers the other
+artefacts.
+
 ## Cargo
 
 ```sh
@@ -129,7 +143,7 @@ became `#[non_exhaustive]`:
 
 **Running the binary** (Homebrew, npm, the release archives, or the Docker image)? One change affects you:
 
-- **MCP over HTTP now requires a bearer token.** Existing HTTP-transport clients break until they send an `Authorization: Bearer <token>` header. A loopback bind generates and persists a token on first run; a non-loopback bind will not start without one (`--mcp-token` or `DYNOXIDE_MCP_AUTH_TOKEN`). The stdio transport is unaffected, and plain `dynoxide serve` (DynamoDB only, no MCP) is unchanged. See [MCP Server](#mcp-server).
+- **MCP over HTTP now requires a bearer token.** Existing HTTP-transport clients break until they send an `Authorization: Bearer <token>` header. A loopback bind generates and persists a token on first run; a non-loopback bind will not start without one (`--mcp-token` or `DYNOXIDE_MCP_AUTH_TOKEN`). The stdio transport is unaffected, and plain `dynoxide serve` (DynamoDB only, no MCP) is unchanged. See [MCP Server](mcp.md).
 
 **Depending on the `dynoxide-rs` crate?** Also note:
 
@@ -188,6 +202,49 @@ headroom for a loaded host rather than a window a healthy container uses.
 Needs Docker Engine 25.0 or newer. See [Testcontainers](testcontainers.md) for
 how to wait on it from a test suite.
 
+### Docker Compose
+
+The image's own healthcheck is enough for `depends_on` to wait until Dynoxide
+answers, so the service needs no `healthcheck` block of its own:
+
+```yaml
+services:
+  dynamodb:
+    image: ghcr.io/nubo-db/dynoxide
+    ports:
+      - "8000:8000"
+    # To keep data between runs, uncomment both of these:
+    # command: serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
+    # volumes:
+    #   - ./data:/data
+
+  app:
+    build: .
+    environment:
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb:8000
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: dynoxide
+      AWS_SECRET_ACCESS_KEY: dynoxide
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+```
+
+`docker compose up --wait` returns once the healthcheck passes.
+
+### Verifying the image
+
+Each release's image carries SLSA provenance and an SBOM on GHCR. To check an
+image was built from this repository by its release workflow:
+
+```sh
+gh attestation verify oci://ghcr.io/nubo-db/dynoxide:<version> --owner nubo-db
+```
+
+[Verifying a release](RELEASING.md#verifying-a-release) covers the binaries
+and npm packages too.
+
 ### Running as nonroot
 
 For security-conscious operators, opt into a nonroot uid:
@@ -210,7 +267,7 @@ The default in-memory mode needs no flags whether root or nonroot. The uid 65532
 
 ### MCP over HTTP in Docker
 
-The default image serves DynamoDB only. To also expose the [MCP](#mcp-server) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind. Pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
+The default image serves DynamoDB only. To also expose the [MCP](mcp.md) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind. Pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
 
 ```sh
 TOKEN=$(openssl rand -base64 24)
@@ -222,7 +279,7 @@ docker run --rm -p 8000:8000 -p 19280:19280 \
         --mcp --mcp-host 0.0.0.0 --mcp-port 19280
 ```
 
-DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localhost:19280/mcp`. Point an HTTP-transport MCP client at the latter with an `Authorization: Bearer <token>` header. See [MCP Server](#mcp-server) for the client config shape.
+DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localhost:19280/mcp`. Point an HTTP-transport MCP client at the latter with an `Authorization: Bearer <token>` header. See [MCP Server](mcp.md) for the client config shape.
 
 A few things to know:
 

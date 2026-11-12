@@ -11,7 +11,51 @@ Laravel's own DynamoDB integration tests pass against it: on 11 November 2026,
 (commit `c33d357`) ran against Dynoxide 1.6.0, with the environment Laravel's
 own CI uses for `amazon/dynamodb-local`: 18 tests, all passing.
 
-## The tables
+## With the package
+
+On Laravel 12 or 13, [`nubo-db/dynoxide-laravel`](https://github.com/nubo-db/dynoxide-laravel)
+does the setup for you. It reads your app's config, so custom table names and
+key attributes need nothing extra.
+
+```sh
+composer require --dev nubo-db/dynoxide-laravel
+```
+
+For tests, put its trait on your base test case:
+
+```php
+use Dynoxide\Laravel\Testing\UsesDynoxide;
+
+abstract class TestCase extends BaseTestCase
+{
+    use UsesDynoxide;
+}
+```
+
+The trait starts Dynoxide once per test process, points the DynamoDB cache,
+rate limiter, sessions and failed jobs at it, creates the tables your config
+names and empties them after each test. It doesn't change which drivers the
+app uses, so in `phpunit.xml` change the `array` lines Laravel generates,
+and add the failed-job one if failed jobs go to DynamoDB too:
+
+```xml
+<env name="CACHE_STORE" value="dynamodb"/>
+<env name="SESSION_DRIVER" value="dynamodb"/>
+<env name="QUEUE_FAILED_DRIVER" value="dynamodb"/>
+```
+
+For local development, `php artisan dynoxide:serve` runs Dynoxide on port
+8800 with the same tables already created. The
+[package README](https://github.com/nubo-db/dynoxide-laravel#readme) covers
+the `.env` settings, ParaTest, and what to watch for when the app reads the
+cache in `boot()`.
+
+## Without the package
+
+On Laravel 11 and earlier, or to keep the setup in your own hands, Dynoxide
+can run beside the app and Laravel can point at it with configuration alone.
+
+### The tables
 
 Laravel expects two tables, and Dynoxide can create them as it starts. Save
 this as `dynamodb-tables.json` beside your `docker-compose.yml`:
@@ -47,7 +91,7 @@ this as `dynamodb-tables.json` beside your `docker-compose.yml`:
 the sessions. You only need `failed_jobs` if failed jobs go to DynamoDB too.
 Both names are Laravel's defaults.
 
-## Run Dynoxide
+### Run Dynoxide
 
 With Docker Compose:
 
@@ -72,7 +116,7 @@ Either way the data lives in memory and goes when Dynoxide stops, which is
 what a test suite wants. To keep it, add `--db-path`; see
 [Docker](installation.md#docker).
 
-## Point Laravel at it
+### Point Laravel at it
 
 In `.env`:
 
@@ -96,12 +140,12 @@ never checks the signature.
 `config/cache.php` already reads `DYNAMODB_ENDPOINT` for its `dynamodb` store,
 so the cache and locks need nothing more.
 
-### Sessions
+#### Sessions
 
 Set `SESSION_DRIVER=dynamodb`. Sessions then go through the `dynamodb` cache
 store and its table.
 
-### Failed jobs
+#### Failed jobs
 
 Set `QUEUE_FAILED_DRIVER=dynamodb`. Unlike the cache store, the `failed` entry
 in Laravel's generated `config/queue.php` has no credentials, region or
@@ -119,7 +163,7 @@ endpoint, so add them:
 ],
 ```
 
-## In GitHub Actions
+### In GitHub Actions
 
 Swap the image in the service container:
 

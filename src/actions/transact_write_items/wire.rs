@@ -433,7 +433,9 @@ impl Item {
 
     /// Whether any action of this item holds a JSON null where an attribute
     /// value belongs, in its item, key or expression values (see
-    /// [`types::holds_null`]).
+    /// [`types::holds_null`]), or a null name in its expression names, which
+    /// puts the request on the older layer as it does a single-item write
+    /// (captured eu-west-2 and us-east-1, 2026-11-12).
     fn holds_null(&self) -> bool {
         let held = |values: &Option<HeldValues>| {
             values.as_ref().is_some_and(|values| {
@@ -444,21 +446,28 @@ impl Item {
                     .any(|(_, value)| value.is_null() || types::holds_null(value))
             })
         };
-        self.put
-            .as_ref()
-            .is_some_and(|a| held(&a.item) || held(&a.expression_attribute_values))
-            || self
-                .update
+        let null_name = |names: &Option<crate::empty_names::WrittenNames>| {
+            names
                 .as_ref()
-                .is_some_and(|a| held(&a.key) || held(&a.expression_attribute_values))
-            || self
-                .delete
-                .as_ref()
-                .is_some_and(|a| held(&a.key) || held(&a.expression_attribute_values))
-            || self
-                .condition_check
-                .as_ref()
-                .is_some_and(|a| held(&a.key) || held(&a.expression_attribute_values))
+                .is_some_and(|names| names.values().any(Option::is_none))
+        };
+        self.put.as_ref().is_some_and(|a| {
+            held(&a.item)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        }) || self.update.as_ref().is_some_and(|a| {
+            held(&a.key)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        }) || self.delete.as_ref().is_some_and(|a| {
+            held(&a.key)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        }) || self.condition_check.as_ref().is_some_and(|a| {
+            held(&a.key)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        })
     }
 
     /// The public item, once no required member is null, with the first value

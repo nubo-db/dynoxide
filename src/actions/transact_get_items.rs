@@ -24,11 +24,12 @@ struct TransactGetItemsRequestRaw {
 #[derive(Deserialize)]
 struct TransactGetItemRaw {
     #[serde(rename = "Get", default)]
-    get: Option<TransactGetRaw>,
+    get: Option<TransactGet>,
 }
 
 /// A `Get` as it arrives, its names as written (see
-/// [`crate::empty_names::action_names`]).
+/// [`crate::empty_names::action_names`]). Every reader of a `Get`, the MCP
+/// tool's included, goes through it.
 #[derive(Deserialize)]
 struct TransactGetRaw {
     #[serde(rename = "TableName")]
@@ -98,7 +99,7 @@ impl<'de> Deserialize<'de> for TransactGetItemsRequest {
                 .transact_items
                 .into_iter()
                 .filter_map(|item| item.get)
-                .map(|get| TransactGetItem { get: get.into() })
+                .map(|get| TransactGetItem { get })
                 .collect(),
             return_consumed_capacity: raw.return_consumed_capacity,
         })
@@ -112,21 +113,11 @@ pub struct TransactGetItem {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(from = "TransactGetRaw")]
 pub struct TransactGet {
-    #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(
-        rename = "Key",
-        deserialize_with = "crate::types::deserialize_required_attribute_map"
-    )]
     pub key: HashMap<String, AttributeValue>,
-    #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,
-    #[serde(
-        rename = "ExpressionAttributeNames",
-        default,
-        deserialize_with = "crate::empty_names::deserialize_names"
-    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 }
 

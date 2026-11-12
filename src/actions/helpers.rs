@@ -739,6 +739,23 @@ fn reject_non_ascii_placeholder(
     )))
 }
 
+/// DynamoDB's refusal of a request that holds both expression and
+/// non-expression parameters, naming each.
+pub(crate) fn mixed_parameters_refusal(
+    non_expression_params: &[&str],
+    expression_params: &[&str],
+) -> Option<String> {
+    if non_expression_params.is_empty() || expression_params.is_empty() {
+        return None;
+    }
+    let non_expr = non_expression_params.join(", ");
+    let expr = expression_params.join(", ");
+    Some(format!(
+        "Can not use both expression and non-expression parameters in the same request: \
+         Non-expression parameters: {{{non_expr}}} Expression parameters: {{{expr}}}"
+    ))
+}
+
 /// Validate expression vs non-expression parameter conflicts and basic
 /// ExpressionAttributeNames/Values key format.
 ///
@@ -759,20 +776,16 @@ pub fn validate_expression_params(
     ctx: &ExpressionParamContext<'_>,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, ClassifiedValidationError> {
     let has_expressions = !ctx.expression_params.is_empty();
-    let has_non_expressions = !ctx.non_expression_params.is_empty();
     let has_names = ctx.expression_attribute_names.is_some();
     // EAV is present if either parsed or raw is Some
     let has_values =
         ctx.expression_attribute_values.is_some() || ctx.expression_attribute_values_raw.is_some();
 
     // Check expression/non-expression conflict
-    if has_expressions && has_non_expressions {
-        let non_expr = ctx.non_expression_params.join(", ");
-        let expr = ctx.expression_params.join(", ");
-        return Err(ClassifiedValidationError::enveloped(format!(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {{{non_expr}}} Expression parameters: {{{expr}}}"
-        )));
+    if let Some(message) =
+        mixed_parameters_refusal(&ctx.non_expression_params, &ctx.expression_params)
+    {
+        return Err(ClassifiedValidationError::enveloped(message));
     }
 
     // ExpressionAttributeNames without any expression

@@ -138,9 +138,10 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
 
-    // Validate expression/non-expression parameter conflicts
+    // Validate expression/non-expression parameter conflicts. The conflict
+    // comes ahead of an empty expression name, on either layer (captured
+    // eu-west-2 and us-east-1, 2026-11-12).
     {
         let mut non_expr = Vec::new();
         let mut expr_params = Vec::new();
@@ -150,6 +151,10 @@ pub async fn execute<S: StorageBackend>(
         if request.projection_expression.is_some() {
             expr_params.push("ProjectionExpression");
         }
+        if let Some(message) = helpers::mixed_parameters_refusal(&non_expr, &expr_params) {
+            return Err(DynoxideError::ValidationException(message));
+        }
+        crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr_params,

@@ -138,32 +138,26 @@ pub(crate) fn check_names_early(names: Option<&HashMap<String, String>>) -> Resu
 pub(crate) type WrittenNames = HashMap<String, Option<String>>;
 
 /// The names a transaction action is read with. A null name is read as an
-/// empty one when the action has an expression, and refused as such, and is
-/// left out when it has none: DynamoDB then goes on to the table lookup
-/// (captured eu-west-2 and us-east-1, 2026-11-12, for a TransactWriteItems
-/// `Put` and a TransactGetItems `Get`). An empty name is kept either way and
-/// refused as it is today.
+/// empty one when the action has an expression, and refused as such. When it
+/// has none, names holding a null are not checked at all, and DynamoDB goes
+/// on to the table lookup, whatever the other names are (captured eu-west-2
+/// and us-east-1, 2026-11-12, for a TransactWriteItems `Put` and a
+/// TransactGetItems `Get`). Names without a null are read as written either
+/// way.
 pub(crate) fn action_names(
     names: Option<WrittenNames>,
     has_expression: bool,
 ) -> Option<HashMap<String, String>> {
     let names = names?;
-    let had_names = !names.is_empty();
-    let read: HashMap<String, String> = names
-        .into_iter()
-        .filter_map(|(placeholder, name)| match name {
-            Some(name) => Some((placeholder, name)),
-            None if has_expression => Some((placeholder, String::new())),
-            None => None,
-        })
-        .collect();
-    // A map that held only null names, in an action with no expression, is
-    // read as no map at all.
-    if read.is_empty() && had_names {
-        None
-    } else {
-        Some(read)
+    if !has_expression && names.values().any(Option::is_none) {
+        return None;
     }
+    Some(
+        names
+            .into_iter()
+            .map(|(placeholder, name)| (placeholder, name.unwrap_or_default()))
+            .collect(),
+    )
 }
 
 /// Refuse an ExpressionAttributeNames entry whose name is empty, bare, with

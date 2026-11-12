@@ -36,7 +36,9 @@ type Row = (usize, &'static str, &'static str, &'static str);
 /// missing `TableName`, a bad `ReturnValues`) ahead of every value fault but a
 /// wrong JSON type, and Dynoxide reports the value fault. An empty value in
 /// place of the null gets the same wrong order, so that gap is not the null's.
-/// Each is still sent: it must still differ from DynamoDB's answer and give the
+/// Two more depend on the order a value's type members were written in,
+/// which the value reader doesn't keep: it meets them in key order. Each is
+/// still sent: it must still differ from DynamoDB's answer and give the
 /// answer recorded here, which is Dynoxide's answer today.
 type Excepted = (&'static str, usize, &'static str, &'static str);
 
@@ -112,6 +114,18 @@ const NOT_FOLLOWED_YET: &[Excepted] = &[
         26,
         "a bad ReturnValues beside a null set member",
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"#,
+    ),
+    (
+        "tenth",
+        15,
+        "a value's members read in the order written",
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"#,
+    ),
+    (
+        "tenth",
+        17,
+        "a value's members read in the order written",
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"}"#,
     ),
 ];
 
@@ -419,6 +433,18 @@ async fn eighth_set_answers_as_dynamodb_did() {
 async fn ninth_set_answers_as_dynamodb_did() {
     assert_eq!(NINTH.len(), 30);
     assert_rows("ninth", NINTH).await;
+}
+
+/// The tenth set: an item attribute named like a request member, where an
+/// empty or null name ranks against a malformed names key and the expression
+/// against non-expression conflict, a null name in a transaction action with
+/// and without an expression, and a null set member in a value with more
+/// than one member (captured from DynamoDB on 12 November 2026; eu-west-2 and
+/// us-east-1 agree on every row).
+#[tokio::test]
+async fn tenth_set_answers_as_dynamodb_did() {
+    assert_eq!(TENTH.len(), 17);
+    assert_rows("tenth", TENTH).await;
 }
 
 /// TransactWriteItems with no null in the request: an action's item or key
@@ -2318,5 +2344,110 @@ const NINTH: &[Row] = &[
         "UpdateItem",
         r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET s = :a","ExpressionAttributeValues":{":a":{"NS":[null]}}}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: One or more parameter values were invalid: Numeric sets may not contain null for key :a"}"##,
+    ),
+];
+
+const TENTH: &[Row] = &[
+    (
+        1,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"b":{"BOOL":"true"}},"ProjectionExpression":"#u","ExpressionAttributeNames":{"#u":"","x":"y"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid key: Syntax error; key: \"x\""}"##,
+    ),
+    (
+        2,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"b":{"BOOL":"true"}},"ProjectionExpression":"#u","AttributesToGet":["a"],"ExpressionAttributeNames":{"#u":""}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"}"##,
+    ),
+    (
+        3,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"a = :a","ExpressionAttributeNames":{"u":""},"ExpressionAttributeValues":{":a":{"BOOL":"true"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid key: Syntax error; key: \"u\""}"##,
+    ),
+    (
+        4,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"b":{"S":"a"}},"ProjectionExpression":"#u","ExpressionAttributeNames":{"#u":"","x":"y"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #u"}"##,
+    ),
+    (
+        5,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"b":{"S":"a"}},"ProjectionExpression":"#u","AttributesToGet":["a"],"ExpressionAttributeNames":{"#u":""}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"}"##,
+    ),
+    (
+        6,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"a = :a","ExpressionAttributeNames":{"u":""},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: ExpressionAttributeNames contains invalid value: Empty attribute name for key u"}"##,
+    ),
+    (
+        7,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"b":{"BOOL":"true"}},"ProjectionExpression":"#u","ExpressionAttributeNames":{"#u":null,"x":"y"}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid key: Syntax error; key: \"x\""}"##,
+    ),
+    (
+        8,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"Expected":{"BOOL":"true"},"n":{"N":"abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        9,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"x":{"BOOL":"true"},"n":{"N":"abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        10,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"ScanFilter":{"M":{"a":null}},"n":{"N":"abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: a is null"}"##,
+    ),
+    (
+        11,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"x":{"M":{"a":null}},"n":{"N":"abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: a is null"}"##,
+    ),
+    (
+        12,
+        "TransactGetItems",
+        r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null,"#m":"x"}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        13,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null,"#m":"x"}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        14,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: xyz for key :a"}"##,
+    ),
+    (
+        15,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null],"N":"abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        16,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"N":"abc","NS":[null]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        17,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null],"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
     ),
 ];

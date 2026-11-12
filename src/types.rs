@@ -1079,6 +1079,14 @@ pub(crate) fn reads_on_older_layer(value: &serde_json::Value) -> bool {
     walk_older_layer(value, Shape::Request)
 }
 
+/// [`reads_on_older_layer`] for a part of a request that is not its root
+/// object, such as an MCP tool's item or key: no key in it is a request
+/// member, so none is read as a legacy condition map.
+#[cfg(feature = "mcp-server")]
+pub(crate) fn part_reads_on_older_layer(value: &serde_json::Value) -> bool {
+    walk_older_layer(value, Shape::Part)
+}
+
 /// [`reads_on_older_layer`] for a request's legacy `Expected`,
 /// `AttributeUpdates`, `KeyConditions`, `QueryFilter` or `ScanFilter` alone,
 /// whose keys are attribute names.
@@ -1089,9 +1097,25 @@ pub(crate) fn conditions_read_on_older_layer(conditions: &serde_json::Value) -> 
 /// What the object being walked holds, so a name is read for what it is.
 #[derive(Clone, Copy)]
 enum Shape {
-    /// A request, a part of one, or an attribute value: its keys are member
-    /// names, type members or attribute names.
+    /// A request's root object: its keys are the request's members, so the
+    /// legacy ones hold condition maps. Only a wire seam reads a whole
+    /// request (see [`reads_on_older_layer`]).
+    #[cfg_attr(
+        not(any(
+            feature = "http-server",
+            feature = "wasm-sqlite",
+            feature = "mcp-server",
+            test
+        )),
+        expect(dead_code, reason = "only a wire seam reads a whole request")
+    )]
     Request,
+    /// Anything below the root (an item, a key, a value, a transaction
+    /// action, an MCP tool's argument): its keys are type members, attribute
+    /// names or an action's members, and an attribute may be called
+    /// `Expected` or `ScanFilter` like any other, so none is read as a
+    /// condition map (captured eu-west-2 and us-east-1, 2026-11-12).
+    Part,
     /// A legacy condition map: its keys are attribute names and its values
     /// conditions or updates.
     Conditions,
@@ -1109,7 +1133,7 @@ const LEGACY_CONDITIONS: [&str; 5] = [
 
 fn walk_older_layer(value: &serde_json::Value, shape: Shape) -> bool {
     match (value, shape) {
-        (serde_json::Value::Object(map), Shape::Request) => {
+        (serde_json::Value::Object(map), Shape::Request | Shape::Part) => {
             let string_flag = ["BOOL", "NULL", "Exists"]
                 .iter()
                 .any(|member| map.get(*member).is_some_and(serde_json::Value::is_string));
@@ -1123,33 +1147,33 @@ fn walk_older_layer(value: &serde_json::Value, shape: Shape) -> bool {
                 || holds_null_value(map)
                 || map
                     .iter()
-                    .any(|(name, member)| walk_older_layer(member, member_shape(name)))
+                    .any(|(name, member)| walk_older_layer(member, member_shape(name, shape)))
         }
         // Each condition is walked as a part of the request; the attribute
         // names it is keyed by are not.
         (serde_json::Value::Object(conditions), Shape::Conditions) => conditions
             .values()
-            .any(|condition| walk_older_layer(condition, Shape::Request)),
-        (serde_json::Value::Array(items), _) => items
-            .iter()
-            .any(|item| walk_older_layer(item, Shape::Request)),
+            .any(|condition| walk_older_layer(condition, Shape::Part)),
+        (serde_json::Value::Array(items), _) => {
+            items.iter().any(|item| walk_older_layer(item, Shape::Part))
+        }
         _ => false,
     }
 }
 
-/// The shape of a request member's value, by the member's name.
-fn member_shape(name: &str) -> Shape {
-    if LEGACY_CONDITIONS.contains(&name) {
-        Shape::Conditions
-    } else {
-        Shape::Request
+/// The shape of the value under `name` in an object of shape `parent`: a
+/// legacy condition map only for the root's own legacy members.
+fn member_shape(name: &str, parent: Shape) -> Shape {
+    match parent {
+        Shape::Request if LEGACY_CONDITIONS.contains(&name) => Shape::Conditions,
+        _ => Shape::Part,
     }
 }
 
-/// Whether a request, or a part of one, holds a JSON null where an attribute
-/// value belongs, at any depth (see [`holds_null_value`]).
+/// Whether a part of a request (a value, an item, a key), holds a JSON null
+/// where an attribute value belongs, at any depth (see [`holds_null_value`]).
 pub(crate) fn holds_null(value: &serde_json::Value) -> bool {
-    walk_null(value, Shape::Request)
+    walk_null(value, Shape::Part)
 }
 
 /// Whether an attribute map, such as an item, a key or an `ExclusiveStartKey`,
@@ -1165,17 +1189,17 @@ pub(crate) fn attribute_map_holds_null(map: &serde_json::Value) -> bool {
 
 fn walk_null(value: &serde_json::Value, shape: Shape) -> bool {
     match (value, shape) {
-        (serde_json::Value::Object(map), Shape::Request) => {
+        (serde_json::Value::Object(map), Shape::Request | Shape::Part) => {
             holds_null_value(map)
                 || map
                     .iter()
-                    .any(|(name, member)| walk_null(member, member_shape(name)))
+                    .any(|(name, member)| walk_null(member, member_shape(name, shape)))
         }
         (serde_json::Value::Object(conditions), Shape::Conditions) => conditions
             .values()
-            .any(|condition| walk_null(condition, Shape::Request)),
+            .any(|condition| walk_null(condition, Shape::Part)),
         (serde_json::Value::Array(items), _) => {
-            items.iter().any(|item| walk_null(item, Shape::Request))
+            items.iter().any(|item| walk_null(item, Shape::Part))
         }
         _ => false,
     }
@@ -1184,8 +1208,9 @@ fn walk_null(value: &serde_json::Value, shape: Shape) -> bool {
 /// Whether an object holds a JSON null where an attribute value belongs: in a
 /// map of attributes it names, in a list of values, or as a value's type
 /// member; or a null member of a set, or a null name in its
-/// `ExpressionAttributeNames`. A legacy condition map never reaches here: its keys are attribute
-/// names, so an attribute called `M` or `S` is not a type member.
+/// `ExpressionAttributeNames`. A legacy condition map never reaches here: its
+/// keys are attribute names, so an attribute called `M` or `S` is not a type
+/// member.
 fn holds_null_value(map: &serde_json::Map<String, serde_json::Value>) -> bool {
     map.iter()
         .any(|(name, member)| match (name.as_str(), member) {
@@ -3809,7 +3834,7 @@ mod tests {
             for name in ["M", "L", "S", "SS", "NS", "Item", "X"] {
                 for condition in [serde_json::json!({"Value": null}), serde_json::Value::Null] {
                     let request = serde_json::json!({ member: { name: condition } });
-                    assert!(!holds_null(&request), "{request}");
+                    assert!(!walk_null(&request, Shape::Request), "{request}");
                     assert!(!reads_on_older_layer(&request), "{request}");
                     assert!(
                         !conditions_read_on_older_layer(&request[member]),
@@ -3826,12 +3851,47 @@ mod tests {
                     serde_json::json!({"Value": {"NS": [null]}}),
                 ] {
                     let request = serde_json::json!({ member: { name: condition } });
-                    assert!(holds_null(&request), "{request}");
+                    assert!(walk_null(&request, Shape::Request), "{request}");
                     assert!(reads_on_older_layer(&request), "{request}");
                     assert!(
                         conditions_read_on_older_layer(&request[member]),
                         "{request}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_attribute_named_like_a_legacy_member_is_an_ordinary_attribute() {
+        // Below the request's root, a key called `Expected` or `ScanFilter`
+        // is an attribute or placeholder like any other: its value is walked
+        // as a value, wherever it sits.
+        for name in LEGACY_CONDITIONS {
+            for value in [
+                serde_json::json!({"BOOL": "true"}),
+                serde_json::json!({"M": {"a": null}}),
+                serde_json::json!({"S": null}),
+                serde_json::json!({"SS": [null]}),
+            ] {
+                let attributes = serde_json::json!({ "pk": {"S": "a"}, name: value });
+                for (member, map) in [
+                    ("Item", attributes.clone()),
+                    ("Key", attributes.clone()),
+                    (
+                        "ExpressionAttributeValues",
+                        serde_json::json!({ ":a": {"S": "a"}, name: value }),
+                    ),
+                ] {
+                    let request = serde_json::json!({ "TableName": "t", member: map });
+                    assert!(reads_on_older_layer(&request), "{request}");
+                    let action = serde_json::json!({"TransactItems": [{"Put": { member: map }}]});
+                    assert!(reads_on_older_layer(&action), "{action}");
+                    if value.get("BOOL").is_none() {
+                        assert!(walk_null(&request, Shape::Request), "{request}");
+                        assert!(walk_null(&action, Shape::Request), "{action}");
+                        assert!(holds_null(&map), "{map}");
+                    }
                 }
             }
         }

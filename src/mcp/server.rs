@@ -2812,7 +2812,7 @@ fn tool_value_layer(
     arguments: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> crate::validation::ValueLayer {
     let older = arguments.is_some_and(|args| {
-        args.values().any(crate::types::reads_on_older_layer)
+        args.values().any(crate::types::part_reads_on_older_layer)
             || [
                 "item",
                 "key",

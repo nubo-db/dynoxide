@@ -6750,6 +6750,21 @@ fn a_null_name_or_set_member_is_refused_through_the_tools_as_over_http() {
                 "expression_attribute_values": {":a": {"SS": [null]}}}),
             named(NULL_STRING, ":a"),
         ),
+        (
+            "transact_get_items",
+            json!({"transact_items": [{"Get": {"TableName": "NullNames", "Key": {"pk": {"S": "a"}},
+                "ProjectionExpression": "#n", "ExpressionAttributeNames": {"#n": null}}}]}),
+            validation_error(EMPTY_NAME),
+        ),
+        // An item attribute named like a legacy request member is an
+        // ordinary attribute: a boolean written as a string in it puts the
+        // call on the older layer, so a bad number beside it is bare.
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"},
+                "Expected": {"BOOL": "true"}, "n": {"N": "abc"}}}),
+            validation_error("The parameter cannot be converted to a numeric value: abc"),
+        ),
     ];
     let checked = cases.len();
     let mut mismatches = Vec::new();
@@ -6765,6 +6780,17 @@ fn a_null_name_or_set_member_is_refused_through_the_tools_as_over_http() {
         "{} of {checked} answers differ: {mismatches:#?}",
         mismatches.len()
     );
+
+    // A `Get` with no expression whose names hold a null goes on to the
+    // table, as over HTTP, whatever its other names.
+    let resp = call_tool(
+        &mut child,
+        99,
+        "transact_get_items",
+        json!({"transact_items": [{"Get": {"TableName": "NullNames", "Key": {"pk": {"S": "a"}},
+            "ExpressionAttributeNames": {"#n": null, "#m": "x"}}}]}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
 
     drop(child.stdin.take());
     let _ = child.wait();

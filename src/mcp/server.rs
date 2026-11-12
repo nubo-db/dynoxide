@@ -1001,21 +1001,19 @@ fn parse_expression_values(
 
 /// The refusal for `expression_attribute_values` that isn't a map of
 /// attribute value structs, in the HTTP API's words for the same body: a
-/// SerializationException such as `Unexpected field type`.
+/// SerializationException such as `Unexpected field type`, or with no message
+/// for an array, whether for the map or for a value in it.
 fn values_shape_refusal(val: Option<&serde_json::Value>) -> Option<CallToolResult> {
-    const CLASS: &str = "com.amazonaws.dynamodb.v20120810.AttributeValue";
     let message = match val? {
         serde_json::Value::Null => return None,
         serde_json::Value::Object(values) => match values
             .values()
             .find(|value| !value.is_object() && !value.is_null())?
         {
-            serde_json::Value::Array(_) => format!("Unrecognized collection type class {CLASS}"),
+            serde_json::Value::Array(_) => String::new(),
             _ => "Unexpected value type in payload".to_string(),
         },
-        serde_json::Value::Array(_) => {
-            format!("Unrecognized collection type java.util.Map<java.lang.String, {CLASS}>")
-        }
+        serde_json::Value::Array(_) => String::new(),
         _ => "Unexpected field type".to_string(),
     };
     Some(to_tool_error(
@@ -1163,7 +1161,7 @@ fn decode_wire_request<T: serde::de::DeserializeOwned>(
         .collect();
     let body = serde_json::Value::Object(wire).to_string();
     crate::serialization_checks::pre_check_serialization_types(operation, &body)
-        .and_then(|()| crate::serde_errors::deserialize(&body))
+        .and_then(|body| crate::serde_errors::deserialize(&body))
         .map_err(|err| {
             to_tool_error(crate::validation::resolve_request_validation_on(
                 operation,
@@ -3165,6 +3163,40 @@ fn find_attribute_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool decodes the request the wire checks return, so a write request
+    /// BatchWriteItem reads by position decodes as its object form, as it does
+    /// over HTTP, and one it refuses is refused with no message.
+    #[test]
+    fn a_write_request_given_by_position_decodes_as_its_object_form() {
+        let decode = |items: serde_json::Value| {
+            decode_wire_request::<crate::actions::batch_write_item::BatchWriteItemRequest>(
+                "BatchWriteItem",
+                vec![("RequestItems", Some(items))],
+            )
+        };
+        let request = decode(serde_json::json!({"tab": [
+            {"PutRequest": [{"pk": {"S": "b"}}]},
+            {"DeleteRequest": [{"pk": {"S": "a"}}]},
+        ]}))
+        .unwrap();
+        let [put, delete] = &request.request_items["tab"][..] else {
+            panic!("{request:?}");
+        };
+        assert_eq!(
+            put.put_request.as_ref().unwrap().item["pk"],
+            crate::types::AttributeValue::S("b".into())
+        );
+        assert_eq!(
+            delete.delete_request.as_ref().unwrap().key["pk"],
+            crate::types::AttributeValue::S("a".into())
+        );
+        let refused = decode(serde_json::json!({"tab": [{"PutRequest": [{}, {}]}]})).unwrap_err();
+        assert_eq!(
+            refused,
+            to_tool_error(crate::DynoxideError::SerializationException(String::new()))
+        );
+    }
 
     fn report(exposures: usize, cautions: usize, accepted: bool) -> ImportReport {
         let mut notices = Vec::new();

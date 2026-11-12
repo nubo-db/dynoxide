@@ -393,11 +393,14 @@ async fn route<S: StorageBackend>(
     // are read on: the operation's own, or the older layer for a request that
     // holds a boolean written as a string or a value with more than one
     // member. The layer is set around the read and around every poll of the
-    // handler, as the HTTP server holds it for the whole call.
+    // handler, as the HTTP server holds it for the whole call. The request is
+    // read from the body the checks return, which rewrites a form DynamoDB
+    // reads by position to its object form.
     let checked = crate::serialization_checks::pre_check_and_read_layer(op, request_json);
-    let layer = checked
-        .as_ref()
-        .map_or_else(|_| crate::validation::ValueLayer::for_operation(op), |l| *l);
+    let layer = checked.as_ref().map_or_else(
+        |_| crate::validation::ValueLayer::for_operation(op),
+        |(_, l)| *l,
+    );
     fn read<T: serde::de::DeserializeOwned>(
         layer: crate::validation::ValueLayer,
         json: &str,
@@ -405,8 +408,8 @@ async fn route<S: StorageBackend>(
         crate::types::with_value_layer(layer, || crate::serde_errors::deserialize(json))
     }
     macro_rules! run {
-        ($module:ident) => {{
-            match read(layer, request_json) {
+        ($module:ident, $body:expr) => {{
+            match read(layer, $body) {
                 Ok(request) => match crate::types::with_value_layer_async(
                     layer,
                     actions::$module::execute(backend, request),
@@ -426,8 +429,8 @@ async fn route<S: StorageBackend>(
     // lifecycle take it from the context, so a browser session walks the same
     // window a wire client does.
     macro_rules! run_lifecycle {
-        ($module:ident) => {{
-            match read(layer, request_json) {
+        ($module:ident, $body:expr) => {{
+            match read(layer, $body) {
                 Ok(request) => {
                     match crate::types::with_value_layer_async(
                         layer,
@@ -447,29 +450,32 @@ async fn route<S: StorageBackend>(
 
     let result: crate::Result<String> = match checked {
         Err(e) => Err(e),
-        Ok(_) => match op {
-            "CreateTable" => run!(create_table),
-            "DeleteTable" => run_lifecycle!(delete_table),
-            "DescribeTable" => run_lifecycle!(describe_table),
-            "UpdateTable" => run_lifecycle!(update_table),
-            "ListTables" => run!(list_tables),
-            "PutItem" => run!(put_item),
-            "GetItem" => run!(get_item),
-            "DeleteItem" => run!(delete_item),
-            "UpdateItem" => run!(update_item),
-            "Query" => run!(query),
-            "Scan" => run!(scan),
-            "BatchGetItem" => run!(batch_get_item),
-            "BatchWriteItem" => run!(batch_write_item),
-            "TransactGetItems" => run!(transact_get_items),
-            "ExecuteStatement" => run!(execute_statement),
-            "BatchExecuteStatement" => run!(batch_execute_statement),
-            "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
-            "SearchVectors" => run_lifecycle!(search_vectors),
-            other => Err(DynoxideError::InternalServerError(format!(
-                "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
-            ))),
-        },
+        Ok((body, _)) => {
+            let body: &str = &body;
+            match op {
+                "CreateTable" => run!(create_table, body),
+                "DeleteTable" => run_lifecycle!(delete_table, body),
+                "DescribeTable" => run_lifecycle!(describe_table, body),
+                "UpdateTable" => run_lifecycle!(update_table, body),
+                "ListTables" => run!(list_tables, body),
+                "PutItem" => run!(put_item, body),
+                "GetItem" => run!(get_item, body),
+                "DeleteItem" => run!(delete_item, body),
+                "UpdateItem" => run!(update_item, body),
+                "Query" => run!(query, body),
+                "Scan" => run!(scan, body),
+                "BatchGetItem" => run!(batch_get_item, body),
+                "BatchWriteItem" => run!(batch_write_item, body),
+                "TransactGetItems" => run!(transact_get_items, body),
+                "ExecuteStatement" => run!(execute_statement, body),
+                "BatchExecuteStatement" => run!(batch_execute_statement, body),
+                "ExecuteTransaction" => execute_transaction(backend, ctx, body).await,
+                "SearchVectors" => run_lifecycle!(search_vectors, body),
+                other => Err(DynoxideError::InternalServerError(format!(
+                    "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
+                ))),
+            }
+        }
     };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
@@ -1540,6 +1546,116 @@ mod tests {
                 assert_eq!(v["message"], answer, "depth {depth}: {err}");
             }
         }
+    }
+
+    /// The captured rows the HTTP server's tests replay: requests holding a
+    /// JSON array where DynamoDB doesn't expect one, with DynamoDB's answers.
+    const ARRAY_ROWS: &str = include_str!("../tests/fixtures/arrays_where_not_expected.json");
+
+    /// The wasm entry points give DynamoDB's answers to every captured row
+    /// whose operation the engine serves, both through `dispatch_http` and,
+    /// for a body that is JSON, through the RPC `dispatch`. Each round runs in
+    /// order on an engine of its own, once per entry point, and a round that
+    /// names a table runs against it holding `{pk: a, x: 1}`. A row left out
+    /// of the HTTP server's tests must give the answer recorded for it.
+    #[test]
+    fn every_captured_array_row_answers_as_dynamodb_did() {
+        let doc: serde_json::Value = serde_json::from_str(ARRAY_ROWS).unwrap();
+        let left_out = doc["left_out"].as_array().unwrap();
+        let mut wrong = Vec::new();
+        let (mut rows, mut over_http, mut over_rpc) = (0, 0, 0);
+        for round in doc["rounds"].as_array().unwrap() {
+            let name = round["name"].as_str().unwrap();
+            let fresh = || {
+                let backend = Storage::memory().unwrap();
+                if let Some(table) = round["table"].as_str() {
+                    run(
+                        &backend,
+                        "CreateTable",
+                        &format!(
+                            r#"{{"TableName":"{table}","AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}],"KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],"BillingMode":"PAY_PER_REQUEST"}}"#
+                        ),
+                    )
+                    .unwrap();
+                    run(
+                        &backend,
+                        "PutItem",
+                        &format!(r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"a"}},"x":{{"N":"1"}}}}}}"#),
+                    )
+                    .unwrap();
+                }
+                backend
+            };
+            let (over_http_backend, over_rpc_backend) = (fresh(), fresh());
+            for row in round["rows"].as_array().unwrap() {
+                rows += 1;
+                let number = row["row"].as_u64().unwrap();
+                let op = row["operation"].as_str().unwrap();
+                let body = row["body"].as_str().unwrap();
+                if !SUPPORTED_OPS.contains(&op) {
+                    continue;
+                }
+                let recorded = left_out
+                    .iter()
+                    .find(|l| l["round"] == name && l["row"] == number);
+                let expected = match (recorded, row.get("answer")) {
+                    (Some(l), _) => &l["answer"],
+                    (None, Some(answer)) => answer,
+                    (None, None) => match row["follows"].as_str().unwrap() {
+                        "eu-west-2" => &row["eu_west_2"],
+                        _ => &row["us_east_1"],
+                    },
+                };
+                let status = if expected.get("__type").is_some() {
+                    400
+                } else {
+                    200
+                };
+                let target = format!("DynamoDB_20120810.{op}");
+                let out = http(&over_http_backend, Some(&target), body);
+                over_http += 1;
+                let got: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+                if out.status != status || got != *expected {
+                    wrong.push(format!(
+                        "{name} row {number} over HTTP: {op} {body}\n  expected {status} \
+                         {expected}\n  got      {} {got}",
+                        out.status
+                    ));
+                }
+                // The RPC entry point takes JSON; a body too deep for the
+                // parser is still JSON.
+                if serde_json::from_str::<serde::de::IgnoredAny>(body)
+                    .is_err_and(|e| !crate::deep_nesting::is_depth_failure(&e))
+                {
+                    continue;
+                }
+                over_rpc += 1;
+                let got = match run(&over_rpc_backend, op, body) {
+                    Ok(json) | Err(json) => {
+                        serde_json::from_str::<serde_json::Value>(&json).unwrap()
+                    }
+                };
+                if got != *expected {
+                    wrong.push(format!(
+                        "{name} row {number} over RPC: {op} {body}\n  expected {expected}\n  \
+                         got      {got}"
+                    ));
+                }
+            }
+        }
+        println!("{rows} captured rows: {over_http} sent over HTTP, {over_rpc} over RPC");
+        // Every row in the fixture is read. 18 name an operation the engine
+        // doesn't serve (TransactWriteItems, UpdateTimeToLive, TagResource,
+        // UpdateContinuousBackups and a made-up one) and go over neither
+        // entry point. 3 more have a body that isn't JSON (empty, or cut
+        // short), which the RPC entry point can't be given.
+        assert_eq!((rows, over_http, over_rpc), (288, 270, 267));
+        assert!(
+            wrong.is_empty(),
+            "{} answers differ:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
     }
 
     #[test]

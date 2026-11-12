@@ -5436,12 +5436,8 @@ fn refused_flags() -> Vec<(Value, (String, String))> {
             json!(1.5),
             serialization_error("DECIMAL_VALUE cannot be converted to Boolean"),
         ),
-        // Pinned to the HTTP API's present answer for a list, which the tool
-        // follows if that answer changes.
-        (
-            json!([true]),
-            serialization_error("Unrecognized collection type class java.lang.Boolean"),
-        ),
+        // A list is refused with no message, as it is over the HTTP API.
+        (json!([true]), serialization_error("")),
         (
             json!({"a": true}),
             serialization_error("Start of structure or map found where not expected"),
@@ -6919,12 +6915,9 @@ fn malformed_expression_values_are_refused_and_delete_nothing() {
     let cases = [
         (json!("x"), "Unexpected field type"),
         (json!(5), "Unexpected field type"),
-        (
-            json!([]),
-            "Unrecognized collection type java.util.Map<java.lang.String, \
-             com.amazonaws.dynamodb.v20120810.AttributeValue>",
-        ),
+        (json!([]), ""),
         (json!({":v": "x"}), "Unexpected value type in payload"),
+        (json!({":v": []}), ""),
     ];
     let mut id = 10;
     for (values, message) in cases {

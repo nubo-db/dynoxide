@@ -229,6 +229,13 @@ impl<'de> Deserialize<'de> for AttributeValue {
             )));
         }
 
+        // A value given as an array is malformed, refused with no message
+        // wherever it appears (captured eu-west-2 and us-east-1, 12 November
+        // 2026), not read as a value with no members.
+        if raw.is_array() {
+            return Err(de::Error::custom(crate::serde_errors::SERIALIZATION_MARKER));
+        }
+
         let obj = raw
             .as_object()
             .ok_or_else(|| de::Error::custom("empty AttributeValue object"))?;
@@ -853,31 +860,10 @@ fn read_lenient_bool(value: &serde_json::Value) -> Result<LenientBool, String> {
 /// `ScanIndexForward`, a legacy condition's `Exists`) the way DynamoDB reads
 /// it: by the rule a `BOOL` member follows, so the strings that read as a
 /// boolean there read as one here too, and JSON `null` leaves the member
-/// unset (captured eu-west-2 and us-east-1, 2026-10-10). A list is refused as
-/// the member's own type, as the request's other members are.
+/// unset (captured eu-west-2 and us-east-1, 2026-10-10). A list is refused
+/// with no message, as an array is wherever DynamoDB expects a scalar
+/// (captured eu-west-2 and us-east-1, 11 and 12 November 2026).
 pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<bool>, D::Error> {
-    match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::Array(_) => Err(de::Error::custom(format!(
-            "{}Unrecognized collection type class java.lang.Boolean",
-            crate::serde_errors::SERIALIZATION_MARKER
-        ))),
-        value => read_lenient_bool(&value)
-            .map(|flag| Some(flag.value))
-            .map_err(de::Error::custom),
-    }
-}
-
-/// Deserialise `ConsistentRead` on ExecuteStatement or a BatchExecuteStatement
-/// member: by [`deserialize_lenient_flag`]'s rule, except that a list is
-/// refused with no message, as DynamoDB refuses it (captured eu-west-2 and
-/// us-east-1, 2026-11-11). The shared reader answers a list differently for
-/// the other operations, and that is not changed here. The same rule for
-/// ExecuteStatement's own field is in `serialization_checks::check_types`,
-/// which reads the request first.
-pub(crate) fn deserialize_statement_flag<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<bool>, D::Error> {
     match serde_json::Value::deserialize(deserializer)? {

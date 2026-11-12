@@ -80,17 +80,14 @@ fn accumulate_index_units(
 /// Also run on the request-parsing path for a body nested too deep to decode,
 /// so a member error there is still reported ahead of the nesting error.
 pub(crate) fn check_request(request: &BatchWriteItemRequest) -> Result<()> {
-    // Validate RequestItems is not empty.
-    // AWS routes the empty-map case through a separate parameter-required path
-    // rather than the standard "N validation errors detected" envelope.
-    //
-    // Do not align this with BatchGetItem, which now answers the standard
-    // envelope. The two have diverged: as of the 2026-09-02 sweep 31 of the 33
-    // regions observed still return this sentence for BatchWriteItem, against
-    // 1 of 33 for BatchGetItem. Matching them would break the common case here.
+    // An empty RequestItems is a length error in the standard envelope, as
+    // BatchGetItem answers it. DynamoDB's regions differed on this when
+    // captured (11 and 12 November 2026), and Dynoxide follows eu-west-2.
     if request.request_items.is_empty() {
         return Err(DynoxideError::ValidationException(
-            "The requestItems parameter is required for BatchWriteItem".to_string(),
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: \
+             Member must have length greater than or equal to 1"
+                .to_string(),
         ));
     }
 

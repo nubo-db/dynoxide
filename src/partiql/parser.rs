@@ -3402,8 +3402,8 @@ fn comparison(
 /// call's name is at `t.pos` and its `(` after it.
 fn subquery_select(t: &Tokenizer) -> Option<usize> {
     let mut open = 0usize;
-    for i in t.pos + 1..t.tokens.len() {
-        match t.tokens[i].as_str() {
+    for (i, tok) in t.tokens.iter().enumerate().skip(t.pos + 1) {
+        match tok.as_str() {
             "(" => open += 1,
             ")" => {
                 open -= 1;

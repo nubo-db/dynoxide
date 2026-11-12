@@ -1479,14 +1479,9 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
         "unexpected message: {message}"
     );
 
-    // A Create or Delete inside VectorIndexUpdates names the vector action,
-    // not the GSI one. The two share a field name and the class the message
-    // reports is decided by the parent, so resolving on the field name alone
-    // told a caller their vector update was a global secondary index action.
-    for (field, class) in [
-        ("Create", "CreateVectorIndexAction"),
-        ("Delete", "DeleteVectorIndexAction"),
-    ] {
+    // A Create or Delete inside VectorIndexUpdates given as a list is refused
+    // with no message, as an array is wherever DynamoDB expects a structure.
+    for field in ["Create", "Delete"] {
         let resp = dynamo_request(
             &url,
             "UpdateTable",
@@ -1499,14 +1494,13 @@ async fn test_search_vectors_serialization_shapes_over_the_wire() {
         assert_eq!(resp.status(), 400);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
-            body["Message"],
-            format!("Unrecognized collection type class com.amazonaws.dynamodb.v20120810.{class}"),
+            body,
+            json!({"__type": "com.amazon.coral.service#SerializationException"}),
             "field {field}"
         );
     }
 
-    // A scalar in the same position answers as it does under the GSI family:
-    // only the collection class differs by parent, not the scalar wording.
+    // A scalar in the same position answers as it does under the GSI family.
     let resp = dynamo_request(
         &url,
         "UpdateTable",

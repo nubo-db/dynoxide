@@ -1,0 +1,2593 @@
+{
+ "about": "Requests holding a JSON array where DynamoDB doesn't expect one, sent to eu-west-2 and us-east-1 on 11 and 12 November 2026, with the answers DynamoDB gave. Where the regions differ both answers are kept and `follows` names the one Dynoxide gives. The third round runs in order against a table holding {pk: a, x: 1}; every other request names a table that doesn't exist.",
+ "rounds": [
+  {
+   "name": "first round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "PutItem",
+     "body": "[\"_capture_20261111_317_none\", {\"pk\": {\"S\": \"a\"}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "PutItem",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "PutItem",
+     "body": "[\"x\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "PutItem",
+     "body": "\"x\"",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Unexpected value type in payload"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "PutItem",
+     "body": "5",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Unexpected value type in payload"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "PutItem",
+     "body": "null",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Request payload does not contain the input model"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "PutItem",
+     "body": "true",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Unexpected value type in payload"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "PutItem",
+     "body": "[{\"TableName\": \"_capture_20261111_317_none\", \"Item\": {\"pk\": {\"S\": \"a\"}}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "GetItem",
+     "body": "[\"_capture_20261111_317_none\", {\"pk\": {\"S\": \"a\"}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "GetItem",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "DeleteItem",
+     "body": "[\"_capture_20261111_317_none\", {\"pk\": {\"S\": \"a\"}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "UpdateItem",
+     "body": "[\"_capture_20261111_317_none\", {\"pk\": {\"S\": \"a\"}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "Query",
+     "body": "[\"_capture_20261111_317_none\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "Query",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "Scan",
+     "body": "[\"_capture_20261111_317_none\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "Scan",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "Scan",
+     "body": "\"x\"",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Unexpected value type in payload"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "TransactWriteItems",
+     "body": "[[{\"Put\": {\"TableName\": \"_capture_20261111_317_none\", \"Item\": {\"pk\": {\"S\": \"a\"}}}}]]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 19,
+     "operation": "TransactWriteItems",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 20,
+     "operation": "TransactGetItems",
+     "body": "[[{\"Get\": {\"TableName\": \"_capture_20261111_317_none\", \"Key\": {\"pk\": {\"S\": \"a\"}}}}]]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 21,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\": {\"Keys\": [{\"pk\": {\"S\": \"a\"}}]}}]",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 22,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\": [{\"PutRequest\": {\"Item\": {\"pk\": {\"S\": \"a\"}}}}]}]",
+     "eu_west_2": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 23,
+     "operation": "ExecuteStatement",
+     "body": "[\"SELECT * FROM \\\"_capture_20261111_317_none\\\"\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 24,
+     "operation": "DescribeTable",
+     "body": "[\"_capture_20261111_317_none\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 25,
+     "operation": "DescribeTable",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 26,
+     "operation": "ListTables",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 27,
+     "operation": "ListTables",
+     "body": "[1]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 28,
+     "operation": "ListTables",
+     "body": "\"x\"",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Unexpected value type in payload"
+     }
+    },
+    {
+     "row": 29,
+     "operation": "CreateTable",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 30,
+     "operation": "PutItem",
+     "body": "",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 31,
+     "operation": "ListTables",
+     "body": "",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 32,
+     "operation": "PutItem",
+     "body": "{",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "second round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "BatchGetItem",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "BatchGetItem",
+     "body": "[{}]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "BatchGetItem",
+     "body": "[{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},\"TOTAL\"]",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},\"BOGUS\"]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "BatchGetItem",
+     "body": "[\"x\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "BatchWriteItem",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "BatchWriteItem",
+     "body": "[{}]",
+     "eu_west_2": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 9,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]},\"TOTAL\"]",
+     "eu_west_2": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 10,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]}]",
+     "eu_west_2": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 11,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]}]",
+     "eu_west_2": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 12,
+     "operation": "TransactGetItems",
+     "body": "[{}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "ListTables",
+     "body": "[{}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "DescribeTable",
+     "body": "[{}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "BatchExecuteStatement",
+     "body": "[[{\"Statement\":\"SELECT * FROM \\\"_capture_20261111_317_none\\\"\"}]]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "ExecuteTransaction",
+     "body": "[[{\"Statement\":\"SELECT * FROM \\\"_capture_20261111_317_none\\\" WHERE pk='a'\"}]]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[[\"pk\",\"S\"]],\"KeySchema\":[[\"pk\",\"HASH\"]],\"BillingMode\":\"PAY_PER_REQUEST\"}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"ProvisionedThroughput\":[1,1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 19,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"StreamSpecification\":[true,\"NEW_IMAGE\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 20,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"SSESpecification\":[true]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 21,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"Tags\":[[\"k\",\"v\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 22,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"GlobalSecondaryIndexes\":[[\"g\",[[\"pk\",\"HASH\"]],[\"ALL\"]]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 23,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Put\":[\"_capture_20261111_317_none\",{\"pk\":{\"S\":\"a\"}}]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 24,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[[{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}}}]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 25,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[{\"Get\":[{\"pk\":{\"S\":\"a\"}},\"_capture_20261111_317_none\"]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 26,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[[{\"pk\":{\"S\":\"a\"}}]]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 27,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[[{\"Item\":{\"pk\":{\"S\":\"a\"}}}]]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 28,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":[{\"pk\":{\"S\":\"a\"}}]}]}}",
+     "eu_west_2": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 29,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"DeleteRequest\":[{\"pk\":{\"S\":\"a\"}}]}]}}",
+     "eu_west_2": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 30,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":[\"a\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 31,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"Expected\":{\"pk\":[true]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 32,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 33,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ScanFilter\":{\"pk\":[[{\"S\":\"a\"}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 34,
+     "operation": "UpdateItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"AttributeUpdates\":{\"x\":[{\"S\":\"a\"},\"PUT\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 35,
+     "operation": "BatchExecuteStatement",
+     "body": "{\"Statements\":[[\"SELECT * FROM \\\"_capture_20261111_317_none\\\"\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 36,
+     "operation": "ExecuteTransaction",
+     "body": "{\"TransactStatements\":[[\"SELECT * FROM \\\"_capture_20261111_317_none\\\" WHERE pk='a'\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 37,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ProvisionedThroughput\":[1,1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 38,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"GlobalSecondaryIndexUpdates\":[[{\"IndexName\":\"g\"}]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 39,
+     "operation": "UpdateTimeToLive",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"TimeToLiveSpecification\":[true,\"ttl\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 40,
+     "operation": "Bogus",
+     "body": "[]",
+     "answer": {
+      "__type": "com.amazon.coral.service#UnknownOperationException"
+     }
+    },
+    {
+     "row": 41,
+     "operation": "Bogus",
+     "body": "\"x\"",
+     "answer": {
+      "__type": "com.amazon.coral.service#UnknownOperationException"
+     }
+    },
+    {
+     "row": 42,
+     "operation": "Bogus",
+     "body": "null",
+     "answer": {
+      "__type": "com.amazon.coral.service#UnknownOperationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "third round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}],\"EQ\"]}}",
+     "answer": {
+      "Count": 1,
+      "Items": [
+       {
+        "pk": {
+         "S": "a"
+        },
+        "x": {
+         "N": "1"
+        }
+       }
+      ],
+      "ScannedCount": 1
+     }
+    },
+    {
+     "row": 2,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":[\"EQ\",[{\"S\":\"a\"}]]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":[]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}]]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}],\"EQ\",\"extra\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[{\"S\":\"a\"}],\"ComparisonOperator\":\"EQ\"}},\"QueryFilter\":{\"x\":[[{\"N\":\"1\"}],\"EQ\"]}}",
+     "answer": {
+      "Count": 1,
+      "Items": [
+       {
+        "pk": {
+         "S": "a"
+        },
+        "x": {
+         "N": "1"
+        }
+       }
+      ],
+      "ScannedCount": 1
+     }
+    },
+    {
+     "row": 7,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[{\"S\":\"a\"}],\"ComparisonOperator\":\"EQ\"}},\"QueryFilter\":{\"x\":[[{\"N\":\"2\"}],\"EQ\"]}}",
+     "answer": {
+      "Count": 0,
+      "Items": [],
+      "ScannedCount": 1
+     }
+    },
+    {
+     "row": 8,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"ScanFilter\":{\"x\":[[{\"N\":\"1\"}],\"EQ\"]}}",
+     "answer": {
+      "Count": 1,
+      "Items": [
+       {
+        "pk": {
+         "S": "a"
+        },
+        "x": {
+         "N": "1"
+        }
+       }
+      ],
+      "ScannedCount": 1
+     }
+    },
+    {
+     "row": 9,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"ScanFilter\":{\"x\":[[{\"N\":\"2\"}],\"EQ\"]}}",
+     "answer": {
+      "Count": 0,
+      "Items": [],
+      "ScannedCount": 1
+     }
+    },
+    {
+     "row": 10,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261112_arr\",\"ScanFilter\":{\"x\":[]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261112_arr\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},\"TOTAL\"]",
+     "answer": {
+      "ConsumedCapacity": [
+       {
+        "CapacityUnits": 0.5,
+        "TableName": "_capture_20261112_arr"
+       }
+      ],
+      "Responses": {
+       "_capture_20261112_arr": [
+        {
+         "pk": {
+          "S": "a"
+         },
+         "x": {
+          "N": "1"
+         }
+        }
+       ]
+      },
+      "UnprocessedKeys": {}
+     }
+    },
+    {
+     "row": 12,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261112_arr\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},\"TOTAL\",\"extra\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261112_arr\":[[{\"pk\":{\"S\":\"a\"}}]]}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261112_arr\":[[{\"pk\":{\"S\":\"a\"}}]]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261112_arr\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"b\"}}}}]}]",
+     "eu_west_2": {
+      "UnprocessedItems": {}
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 16,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261112_arr\":[{\"PutRequest\":[{\"pk\":{\"S\":\"c\"}}]}]}}",
+     "eu_west_2": {
+      "UnprocessedItems": {}
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 17,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261112_arr\":[{\"DeleteRequest\":[{\"pk\":{\"S\":\"a\"}}]}]}}",
+     "eu_west_2": {
+      "UnprocessedItems": {}
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 18,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261112_arr\"}",
+     "eu_west_2": {
+      "Count": 2,
+      "Items": [
+       {
+        "pk": {
+         "S": "b"
+        }
+       },
+       {
+        "pk": {
+         "S": "c"
+        }
+       }
+      ],
+      "ScannedCount": 2
+     },
+     "us_east_1": {
+      "Count": 1,
+      "Items": [
+       {
+        "pk": {
+         "S": "a"
+        },
+        "x": {
+         "N": "1"
+        }
+       }
+      ],
+      "ScannedCount": 1
+     },
+     "follows": "eu-west-2"
+    }
+   ],
+   "table": "_capture_20261112_arr"
+  },
+  {
+   "name": "fourth round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "PutItem",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"],\"Item\":{\"pk\":{\"S\":\"a\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "GetItem",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"],\"Key\":{\"pk\":{\"S\":\"a\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "DeleteItem",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"],\"Key\":{\"pk\":{\"S\":\"a\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "UpdateItem",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"],\"Key\":{\"pk\":{\"S\":\"a\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "Query",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "Scan",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "DescribeTable",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "DeleteTable",
+     "body": "{\"TableName\":[\"_capture_20261111_317_none\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":[\"_capture_20261111_317_nonex\"],\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\"}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":[\"PAY_PER_REQUEST\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":[\"pk\"],\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\"}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"ProvisionedThroughput\":{\"ReadCapacityUnits\":[1],\"WriteCapacityUnits\":1}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"StreamSpecification\":{\"StreamEnabled\":[true]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "ListTables",
+     "body": "{\"Limit\":[1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "ListTables",
+     "body": "{\"ExclusiveStartTableName\":[\"x\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Limit\":[1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Select\":[\"COUNT\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditionExpression\":[\"pk = :a\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 19,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ScanIndexForward\":[true]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 20,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Limit\":[1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 21,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Segment\":[0],\"TotalSegments\":1}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 22,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"FilterExpression\":[\"a = :a\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 23,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"ReturnValues\":[\"NONE\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 24,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"ConditionExpression\":[\"a = :a\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 25,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"ExpressionAttributeNames\":{\"#a\":[\"x\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 26,
+     "operation": "GetItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"ProjectionExpression\":[\"a\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 27,
+     "operation": "GetItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"AttributesToGet\":[[\"a\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 28,
+     "operation": "UpdateItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"UpdateExpression\":[\"SET a = :a\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 29,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}],\"ConsistentRead\":[true]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 30,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},\"ReturnConsumedCapacity\":[\"TOTAL\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 31,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]},\"ReturnConsumedCapacity\":[\"TOTAL\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 32,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Put\":{\"TableName\":[\"_capture_20261111_317_none\"],\"Item\":{\"pk\":{\"S\":\"a\"}}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 33,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Put\":{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}}}}],\"ClientRequestToken\":[\"x\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 34,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[{\"Get\":{\"TableName\":[\"_capture_20261111_317_none\"],\"Key\":{\"pk\":{\"S\":\"a\"}}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 35,
+     "operation": "ExecuteStatement",
+     "body": "{\"Statement\":[\"SELECT * FROM \\\"_capture_20261111_317_none\\\"\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 36,
+     "operation": "ExecuteStatement",
+     "body": "{\"Statement\":\"SELECT * FROM \\\"_capture_20261111_317_none\\\"\",\"Limit\":[1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 37,
+     "operation": "BatchExecuteStatement",
+     "body": "{\"Statements\":[{\"Statement\":[\"SELECT * FROM \\\"_capture_20261111_317_none\\\"\"]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 38,
+     "operation": "UpdateTimeToLive",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"TimeToLiveSpecification\":{\"Enabled\":[true],\"AttributeName\":\"ttl\"}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 39,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":[\"a\"]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 40,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"N\":[\"1\"]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 41,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"},\"b\":{\"BOOL\":[true]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 42,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[{\"S\":\"a\"}],\"ComparisonOperator\":[\"EQ\"]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "fifth round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":[{\"pk\":{\"S\":\"a\"}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "GetItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "DeleteItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":[{\"pk\":{\"S\":\"a\"}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "UpdateItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"ExpressionAttributeValues\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"ExpressionAttributeNames\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"Expected\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ExpressionAttributeValues\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ExclusiveStartKey\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ScanFilter\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ExpressionAttributeNames\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "UpdateItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"AttributeUpdates\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":[]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[[]]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}],\"ExpressionAttributeNames\":[]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 19,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":[]}}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 20,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Put\":{\"TableName\":\"_capture_20261111_317_none\",\"Item\":[]}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 21,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[{\"Get\":{\"TableName\":\"_capture_20261111_317_none\",\"Key\":[]}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 22,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"},\"m\":{\"M\":[]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "sixth round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}],5]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[\"x\",\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}],\"BOGUS\"]}}",
+     "eu_west_2": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Value 'BOGUS' at 'keyConditions.pk.member.comparisonOperator' failed to satisfy constraint: Member must satisfy enum value set: [IN, NULL, BETWEEN, LT, NOT_CONTAINS, EQ, GT, NOT_NULL, NE, LE, BEGINS_WITH, GE, CONTAINS]"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "One or more parameter values were invalid: Invalid comparison operator"
+     },
+     "follows": "us-east-1",
+     "why": "an operator outside the enum is worded differently by the regions whatever form the condition takes, and Dynoxide uses us-east-1's words"
+    },
+    {
+     "row": 4,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"S\":\"a\"}],null]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[null,\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "One or more parameter values were invalid: Invalid number of argument(s) for the EQ ComparisonOperator"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ScanFilter\":{\"x\":[[{\"S\":\"a\"}],{}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[{\"S\":\"a\"}],\"ComparisonOperator\":5}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "NUMBER_VALUE cannot be converted to String"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":\"x\",\"ComparisonOperator\":\"EQ\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException",
+      "Message": "Unexpected field type"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},5]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"S\":\"a\"}}]}},null]",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "BatchGetItem",
+     "body": "[null]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "BatchGetItem",
+     "body": "[null,\"TOTAL\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "seventh round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[[]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[{\"Get\":[]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[[],{\"Get\":{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[[]]}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"StreamSpecification\":[true,\"NEW_IMAGE\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"SSESpecification\":[true]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"SSESpecification\":[true,\"KMS\",\"k\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"AttributeDefinitions\":[[\"pk\",\"S\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"GlobalSecondaryIndexUpdates\":[{\"Create\":[\"g\",[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],{\"ProjectionType\":\"ALL\"}]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"GlobalSecondaryIndexUpdates\":[{\"Delete\":[\"g\"]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"GlobalSecondaryIndexUpdates\":[{\"Update\":[\"g\",{\"ReadCapacityUnits\":1,\"WriteCapacityUnits\":1}]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"OnDemandThroughput\":[1,1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "UpdateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ReplicaUpdates\":[[{\"RegionName\":\"eu-west-1\"}]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"GlobalSecondaryIndexes\":[{\"IndexName\":\"g\",\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"Projection\":[\"ALL\"]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"GlobalSecondaryIndexes\":[{\"IndexName\":\"g\",\"KeySchema\":[[\"pk\",\"HASH\"]],\"Projection\":{\"ProjectionType\":\"ALL\"}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"LocalSecondaryIndexes\":[[\"l\",[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],{\"ProjectionType\":\"ALL\"}]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"OnDemandThroughput\":[1,1]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"StreamSpecification\":[true]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 19,
+     "operation": "CreateTable",
+     "body": "{\"TableName\":\"_capture_20261111_317_nonex\",\"AttributeDefinitions\":[{\"AttributeName\":\"pk\",\"AttributeType\":\"S\"}],\"KeySchema\":[{\"AttributeName\":\"pk\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\",\"SSESpecification\":[true,\"KMS\",\"k\"]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 20,
+     "operation": "TagResource",
+     "body": "{\"ResourceArn\":\"arn:aws:dynamodb:eu-west-2:000000000000:table/_capture_20261111_317_none\",\"Tags\":[[\"k\",\"v\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 21,
+     "operation": "UpdateContinuousBackups",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"PointInTimeRecoverySpecification\":[true]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 22,
+     "operation": "ExecuteStatement",
+     "body": "{\"Statement\":\"SELECT * FROM \\\"_capture_20261111_317_none\\\" WHERE pk = ?\",\"Parameters\":[[\"a\"]]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 23,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]},\"TOTAL\",\"SIZE\"]",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 24,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]},\"TOTAL\",\"SIZE\",\"x\"]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 25,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]},\"TOTAL\",\"BOGUS\"]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value 'BOGUS' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"
+     }
+    },
+    {
+     "row": 26,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]},\"BOGUS\"]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+     }
+    },
+    {
+     "row": 27,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":[{\"pk\":{\"S\":\"a\"}},\"x\"]}]}}",
+     "answer": {
+      "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+      "message": "Requested resource not found"
+     }
+    },
+    {
+     "row": 28,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":[]}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 29,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"DeleteRequest\":[null]}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 30,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+     }
+    },
+    {
+     "row": 31,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+     }
+    }
+   ]
+  },
+  {
+   "name": "eighth round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"},\"v\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}}}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"},\"v\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}}}]}]",
+     "eu_west_2": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 5,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":[{\"pk\":{\"S\":\"a\"},\"v\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}]}}",
+     "eu_west_2": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     },
+     "us_east_1": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     },
+     "follows": "eu-west-2"
+    },
+    {
+     "row": 6,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"ComparisonOperator\":\"EQ\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ScanFilter\":{\"x\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "PutItem",
+     "body": "[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"},\"v\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}}}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "BatchWriteItem",
+     "body": "[{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"},\"v\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}}}]}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":[{\"pk\":{\"S\":\"a\"},\"v\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"ComparisonOperator\":\"EQ\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "Scan",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ScanFilter\":{\"x\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "PutItem",
+     "body": "[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "ninth round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":[\"a\"]}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"PutRequest\":{\"Item\":{\"pk\":[\"a\"]}}}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "BatchWriteItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":[{\"DeleteRequest\":{\"Key\":{\"pk\":[\"a\"]}}}]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "TransactGetItems",
+     "body": "{\"TransactItems\":[{\"Get\":{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":[\"a\"]}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Put\":{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":[\"a\"]}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Delete\":{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":[\"a\"]}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "TransactWriteItems",
+     "body": "{\"TransactItems\":[{\"Update\":{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"UpdateExpression\":\"SET a = :a\",\"ExpressionAttributeValues\":{\":a\":[\"x\"]}}}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "BatchExecuteStatement",
+     "body": "{\"Statements\":[{\"Statement\":\"SELECT * FROM \\\"_capture_20261111_317_none\\\" WHERE pk = ?\",\"Parameters\":[[\"a\"]]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "ExecuteTransaction",
+     "body": "{\"TransactStatements\":[{\"Statement\":\"SELECT * FROM \\\"_capture_20261111_317_none\\\" WHERE pk = ?\",\"Parameters\":[[\"a\"]]}]}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "GetItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":[\"a\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditionExpression\":\"pk = :a\",\"ExpressionAttributeValues\":{\":a\":[\"x\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"ExclusiveStartKey\":{\"pk\":[\"a\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":{\"AttributeValueList\":[[\"a\"]],\"ComparisonOperator\":\"EQ\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "UpdateItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Key\":{\"pk\":{\"S\":\"a\"}},\"AttributeUpdates\":{\"x\":{\"Value\":[\"a\"],\"Action\":\"PUT\"}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"}},\"Expected\":{\"x\":{\"Value\":[\"a\"]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"},\"l\":{\"L\":[[\"a\"]]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "PutItem",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"Item\":{\"pk\":{\"S\":\"a\"},\"m\":{\"M\":{\"x\":[\"a\"]}}}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    }
+   ]
+  },
+  {
+   "name": "tenth round",
+   "rows": [
+    {
+     "row": 1,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 2,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 3,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 4,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 5,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 6,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 7,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 8,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 9,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 10,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 11,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 12,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 13,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 14,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 15,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 16,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 17,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 18,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 19,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 20,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 21,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 22,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 23,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 24,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 25,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 26,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 27,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 28,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 29,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 30,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 31,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 32,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 33,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 34,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 35,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 36,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 37,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 38,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 39,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 40,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 41,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 42,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 43,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 44,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 45,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 46,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 47,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 48,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 49,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 50,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 51,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    },
+    {
+     "row": 52,
+     "operation": "BatchGetItem",
+     "body": "[{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}]",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 53,
+     "operation": "Query",
+     "body": "{\"TableName\":\"_capture_20261111_317_none\",\"KeyConditions\":{\"pk\":[[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}],\"EQ\"]}}",
+     "answer": {
+      "__type": "com.amazon.coral.service#SerializationException"
+     }
+    },
+    {
+     "row": 54,
+     "operation": "BatchGetItem",
+     "body": "{\"RequestItems\":{\"_capture_20261111_317_none\":{\"Keys\":[{\"pk\":{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"L\":[{\"S\":\"a\"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}}]}}}",
+     "answer": {
+      "__type": "com.amazon.coral.validate#ValidationException",
+      "message": "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+     }
+    }
+   ]
+  }
+ ],
+ "left_out": [
+  {
+   "round": "second round",
+   "row": 3,
+   "answer": {
+    "__type": "com.amazon.coral.validate#ValidationException",
+    "message": "missing field `Keys` at line 1 column 90"
+   },
+   "reason": "an array holding an object with a RequestItems member is read by position as a RequestItems map naming a table called RequestItems, whose entry has no Keys; the column in the message counts within the body as rewritten to its object form"
+  },
+  {
+   "round": "seventh round",
+   "row": 21,
+   "answer": {
+    "__type": "com.amazon.coral.service#UnknownOperationException"
+   },
+   "reason": "UpdateContinuousBackups is not implemented"
+  },
+  {
+   "round": "seventh round",
+   "row": 27,
+   "answer": {
+    "__type": "com.amazon.coral.service#SerializationException"
+   },
+   "reason": "a PutRequest given as [Item, \"x\"] is read with the second element ignored; one row is not enough to know the rule for elements past the first"
+  }
+ ]
+}

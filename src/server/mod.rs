@@ -455,14 +455,15 @@ fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String>
     // as a string or a value with more than one member; the layer decides how
     // a value it refuses is worded. The operation runs to completion on this
     // thread (the database blocks on it), so the layer holds for the whole
-    // call.
+    // call. The request is read from the body the checks return, which
+    // rewrites a form DynamoDB reads by position to its object form.
     let checked = pre_check_and_read_layer(operation, body);
     let layer = checked.as_ref().map_or_else(
         |_| crate::validation::ValueLayer::for_operation(operation),
-        |l| *l,
+        |(_, l)| *l,
     );
-    let result = checked.and_then(|layer| {
-        crate::types::with_value_layer(layer, || dispatch_operation(db, operation, body))
+    let result = checked.and_then(|(body, layer)| {
+        crate::types::with_value_layer(layer, || dispatch_operation(db, operation, &body))
     });
 
     // DynamoDB wraps the request-validation family in the

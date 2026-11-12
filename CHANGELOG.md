@@ -52,6 +52,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A JSON array where DynamoDB doesn't expect one is refused as DynamoDB
+  refuses it. A request body that is an array is a `SerializationException`
+  with no message on every operation, where Dynoxide used to read it by
+  position and run it: `["Tab", {"pk": {"S": "a"}}]` sent to PutItem wrote
+  the item. A body that is a string, number or boolean is refused as
+  `Unexpected value type in payload`, and `null` as `Request payload does not
+  contain the input model`. An array given for a string, number, boolean,
+  map or structure inside a request is a `SerializationException` with no
+  message, where Dynoxide printed `Unrecognized collection type ...`, which
+  DynamoDB no longer says. The forms DynamoDB does read by position are read:
+  a BatchGetItem or BatchWriteItem body of `[RequestItems]` or
+  `[RequestItems, ReturnConsumedCapacity]`, a BatchWriteItem body of
+  `[RequestItems, ReturnConsumedCapacity, ReturnItemCollectionMetrics]`, a
+  BatchWriteItem `PutRequest` given as `[Item]` and `DeleteRequest` as
+  `[Key]`, and on Query and Scan a condition given as
+  `[AttributeValueList, ComparisonOperator]`. DynamoDB's regions differed on
+  BatchWriteItem's forms when captured, and Dynoxide reads them as eu-west-2
+  does. One of these forms holding a value nested too deep for DynamoDB's
+  parser is refused with no message, where the object form gets the nesting
+  error.
+
+- An attribute value given as an array is a `SerializationException` with no
+  message wherever it appears. In a transaction, a batch of PartiQL
+  statements, a legacy `Expected` or `AttributeUpdates` value and a
+  BatchGetItem key, Dynoxide answered `Supplied AttributeValue is empty` or
+  `Unexpected value type in payload`.
+
+- BatchWriteItem with an empty `RequestItems` is refused as BatchGetItem
+  refuses it, `1 validation error detected: Value at 'RequestItems' failed to
+  satisfy constraint: Member must have length greater than or equal to 1`.
+  It used to say `The requestItems parameter is required for BatchWriteItem`.
+  DynamoDB's regions differed on this when captured, and Dynoxide follows
+  eu-west-2.
+
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
   constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has

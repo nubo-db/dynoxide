@@ -22,7 +22,7 @@ impl<'de> Deserialize<'de> for TransactWriteItemsRequest {
     /// Read the request as it arrives on the wire, where a required member
     /// may be left out, and raise the first stage of DynamoDB's member checks
     /// that finds anything ahead of a value refused in an item. The stages
-    /// after that run in [`check_request`].
+    /// after that run in `check_request`.
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {

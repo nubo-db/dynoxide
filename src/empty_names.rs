@@ -141,9 +141,8 @@ pub(crate) type WrittenNames = HashMap<String, Option<String>>;
 /// empty one when the action has an expression, and refused as such. When it
 /// has none, names holding a null are not checked at all, and DynamoDB goes
 /// on to the table lookup, whatever the other names are (captured eu-west-2
-/// and us-east-1, 2026-11-12, for a TransactWriteItems `Put` and a
-/// TransactGetItems `Get`). Names without a null are read as written either
-/// way.
+/// and us-east-1, 2026-11-12, for a TransactWriteItems `Put`). Names without
+/// a null are read as written either way.
 pub(crate) fn action_names(
     names: Option<WrittenNames>,
     has_expression: bool,

@@ -87,8 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names that hold one. A `null` member of an `SS`, `NS` or `BS` puts the
   request on the older layer too and is refused in DynamoDB's words, in its
   place among the set's members, where it used to be a
-  `SerializationException`. GetItem now reports `ProjectionExpression` beside
-  `AttributesToGet` ahead of an empty name in `ExpressionAttributeNames`
+  `SerializationException`. GetItem and BatchGetItem now report
+  `ProjectionExpression` beside `AttributesToGet` ahead of an empty name in
+  `ExpressionAttributeNames`, and a TransactGetItems `Get` with no
+  `ProjectionExpression` no longer refuses an empty or unused name, going on
+  to the table lookup as DynamoDB does
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

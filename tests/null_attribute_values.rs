@@ -445,6 +445,84 @@ async fn ninth_set_answers_as_dynamodb_did() {
 async fn tenth_set_answers_as_dynamodb_did() {
     assert_eq!(TENTH.len(), 17);
     assert_rows("tenth", TENTH).await;
+    a_legacy_member_name_in_a_key_or_value_is_an_ordinary_attribute().await;
+}
+
+/// Bodies with `@` standing for an attribute name inside a key or inside an
+/// expression value, beside a null or a bad number.
+const ATTRIBUTE_NAMED_AT: &[(&str, &str)] = &[
+    (
+        "GetItem",
+        r##"{"TableName":"t","Key":{"pk":{"S":"a"},"@":{"BOOL":"true"},"n":{"N":"abc"}}}"##,
+    ),
+    (
+        "DeleteItem",
+        r##"{"TableName":"t","Key":{"pk":{"S":"a"},"@":{"M":{"a":null}},"n":{"N":"abc"}}}"##,
+    ),
+    (
+        "UpdateItem",
+        r##"{"TableName":"t","Key":{"pk":{"S":"a"},"@":{"BOOL":"true"}},"UpdateExpression":"SET n = :n","ExpressionAttributeValues":{":n":{"N":"abc"}}}"##,
+    ),
+    (
+        "UpdateItem",
+        r##"{"TableName":"t","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET n = :n","ExpressionAttributeValues":{":n":{"M":{"@":{"BOOL":"true"},"n":{"N":"abc"}}}}}"##,
+    ),
+    (
+        "PutItem",
+        r##"{"TableName":"t","Item":{"pk":{"S":"a"}},"ConditionExpression":"a = :v","ExpressionAttributeValues":{":v":{"M":{"@":{"M":{"a":null}}}},":n":{"N":"abc"}}}"##,
+    ),
+    (
+        "Query",
+        r##"{"TableName":"t","KeyConditionExpression":"pk = :k","FilterExpression":"a = :v","ExpressionAttributeValues":{":k":{"S":"a"},":v":{"M":{"@":{"BOOL":"true"},"n":{"N":"abc"}}}}}"##,
+    ),
+];
+
+/// Each of the five legacy condition member names, used as an attribute name
+/// inside a key or an expression value, is answered as an attribute named `x`
+/// is: only the request's own members are conditions.
+async fn a_legacy_member_name_in_a_key_or_value_is_an_ordinary_attribute() {
+    let url = start_server().await;
+    let mut wrong = Vec::new();
+    let mut compared = 0;
+    for &(op, body) in ATTRIBUTE_NAMED_AT {
+        let plain = send(&url, op, &body.replace('@', "x")).await;
+        for name in [
+            "Expected",
+            "AttributeUpdates",
+            "KeyConditions",
+            "QueryFilter",
+            "ScanFilter",
+        ] {
+            let named = body.replace('@', name);
+            let got = send(&url, op, &named).await;
+            compared += 1;
+            if got != plain {
+                wrong.push(format!(
+                    "{op} {named}\n  as for x {plain:?}\n  got      {got:?}"
+                ));
+            }
+        }
+    }
+    println!("legacy names in keys and values: {compared} bodies compared");
+    assert_eq!(compared, ATTRIBUTE_NAMED_AT.len() * 5);
+    assert!(
+        wrong.is_empty(),
+        "{} of {compared} bodies differ:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// The eleventh set: a null name beside an empty one in a transaction action
+/// with no expression, a TransactGetItems `Get` with names and no
+/// projection, a null name in one action beside a bad number in another, and
+/// BatchGetItem's expression against non-expression conflict beside an empty
+/// name (captured from DynamoDB on 12 November 2026; eu-west-2 and us-east-1
+/// agree on every row).
+#[tokio::test]
+async fn eleventh_set_answers_as_dynamodb_did() {
+    assert_eq!(ELEVENTH.len(), 10);
+    assert_rows("eleventh", ELEVENTH).await;
 }
 
 /// TransactWriteItems with no null in the request: an action's item or key
@@ -2449,5 +2527,68 @@ const TENTH: &[Row] = &[
         "PutItem",
         r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null],"S":"x"}}}"##,
         r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+];
+
+const ELEVENTH: &[Row] = &[
+    (
+        1,
+        "TransactGetItems",
+        r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null,"#m":""}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        2,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null,"#m":""}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        3,
+        "TransactGetItems",
+        r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#m":""}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        4,
+        "TransactGetItems",
+        r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#m":"x"}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        5,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#m":"x"}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        6,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null}}},{"Update":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"b"}},"UpdateExpression":"SET a = :a","ExpressionAttributeValues":{":a":{"N":"abc"}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: abc for key :a"}"##,
+    ),
+    (
+        7,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}}}},{"Update":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"b"}},"UpdateExpression":"SET a = :a","ExpressionAttributeValues":{":a":{"N":"abc"}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        8,
+        "BatchGetItem",
+        r##"{"RequestItems":{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}],"ProjectionExpression":"#u","AttributesToGet":["a"],"ExpressionAttributeNames":{"#u":""}}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"}"##,
+    ),
+    (
+        9,
+        "BatchGetItem",
+        r##"{"RequestItems":{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}],"ProjectionExpression":"#u","ExpressionAttributeNames":{"#u":""}}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #u"}"##,
+    ),
+    (
+        10,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null,"#m":""}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
     ),
 ];

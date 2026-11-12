@@ -325,7 +325,9 @@ fn a_transaction_projection_is_refused_before_the_table_is_looked_up() {
 
 /// Between two Gets, the earlier Get's name error wins whichever kind it is:
 /// an unused name on the first beats an undefined name on the second, as it
-/// did when these checks ran after the read (order uncaptured).
+/// did when these checks ran after the read (order uncaptured). The first Get
+/// has a projection, as a Get without one has its names ignored (captured
+/// eu-west-2 and us-east-1, 2026-11-12).
 #[test]
 fn the_first_gets_name_error_wins_in_a_transaction() {
     let db = db();
@@ -333,6 +335,7 @@ fn the_first_gets_name_error_wins_in_a_transaction() {
         "TransactItems": [
             {"Get": {
                 "TableName": "Tbl", "Key": key(),
+                "ProjectionExpression": "pk",
                 "ExpressionAttributeNames": {"#u": "x"}
             }},
             {"Get": {

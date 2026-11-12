@@ -46,11 +46,13 @@ struct TransactGetRaw {
 }
 
 impl From<TransactGetRaw> for TransactGet {
+    /// A null name is read as an empty one. Without a `ProjectionExpression`
+    /// the names are not checked at all, so a null needs no case of its own.
     fn from(raw: TransactGetRaw) -> Self {
         TransactGet {
             expression_attribute_names: crate::empty_names::action_names(
                 raw.expression_attribute_names,
-                raw.projection_expression.is_some(),
+                true,
             ),
             table_name: raw.table_name,
             key: raw.key,
@@ -220,13 +222,17 @@ pub async fn execute<S: StorageBackend>(
 
     // An empty attribute name in a key or the expression names is a top-level
     // rejection, not a cancellation reason, ahead of the table lookups
-    // (captured in ten regions).
+    // (captured in ten regions). A `Get` with no `ProjectionExpression` has
+    // its names ignored, empty or unused alike, and goes on to the table
+    // lookup (captured eu-west-2 and us-east-1, 2026-11-12).
     for transact_item in &request.transact_items {
         let get = &transact_item.get;
         if crate::empty_names::map_has_empty_name(&get.key) {
             return Err(crate::empty_names::bare());
         }
-        crate::empty_names::check_names(get.expression_attribute_names.as_ref())?;
+        if get.projection_expression.is_some() {
+            crate::empty_names::check_names(get.expression_attribute_names.as_ref())?;
+        }
     }
 
     // A key nested too deep fails the whole request at the top level, before
@@ -275,8 +281,8 @@ pub async fn execute<S: StorageBackend>(
             tracker.track_projection_expr(&projection);
             expressions::projection::validate(&projection, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
+            tracker.check_unused()?;
         }
-        tracker.check_unused()?;
     }
 
     // Per-action validation pass.

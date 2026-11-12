@@ -184,6 +184,11 @@ jobs:
       - name: Clippy (encryption)
         run: cargo clippy --no-default-features --features encryption --lib -- -D warnings
 
+      # The MCP server without the HTTP one, so code the two share can't be
+      # left behind an HTTP-only gate.
+      - name: Clippy (MCP without HTTP)
+        run: cargo clippy --no-default-features --features native-sqlite,mcp-server --lib -- -D warnings
+
       - name: Format
         run: cargo fmt --check
 

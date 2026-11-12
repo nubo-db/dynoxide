@@ -283,8 +283,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to refuse it as a malformed argument. An integer past what 32 bits
   hold reads as the nearest 32-bit integer, as it does over HTTP, and so does
   `limit`; either moves a segment refusal to the older wording, which echoes
-  the value. A fraction, or an integer past 64 bits, is still refused as a
-  malformed argument
+  the value. A fraction, an integer past 64 bits or a string now gets Scan's
+  own answer too, where it used to be refused as a malformed argument
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 - The MCP `execute_partiql` tool reports a member error (`limit` 0, a bad
   `return_consumed_capacity` or `return_values_on_condition_check_failure`,
@@ -324,6 +324,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token first, and a missing `TransactStatements` is
   `Value null at 'transactStatements'`
   ([#318](https://github.com/nubo-db/dynoxide/issues/318)).
+- An MCP tool error for a failed condition asked for `ALL_OLD` writes the
+  item's number sets in the order the HTTP API uses for that operation:
+  numeric for `put_item`, `update_item` and `delete_item`, and DynamoDB's
+  hash order for `execute_partiql`, which used to give them numerically
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- A cancelled transaction from `transact_write_items` or
+  `execute_transaction_partiql` now carries `cancellation_reasons` in the
+  tool error, one entry per action or statement as the HTTP API's
+  `CancellationReasons` gives them, `{"Code": "None"}` entries included, with
+  the `ALL_OLD` item where one was asked for. Before, the reasons were only
+  in the message
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- `query` and `scan` decode their whole request as Query and Scan do over
+  HTTP, so `limit` takes a negative, fractional or string value and answers
+  with the operation's own check, and member errors (`limit`, `select`,
+  `return_consumed_capacity`, `segment`) come in the operation's order and
+  wording. `limit` on `execute_partiql`, `list_streams`, `describe_stream`
+  and `get_records`, and `top_k` on `search_vectors`, are read the same way.
+  `search_vectors` also reports a bad `return_consumed_capacity` bare, as
+  SearchVectors does, and reads its expression values as SearchVectors does
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- `get_item`, `put_item`, `update_item` and `delete_item` check their members
+  as their operations do: a refused key, item or expression value comes ahead
+  of a bad `return_consumed_capacity`, `return_values` and the capacity mode
+  are listed together where the operation lists them, and `update_item`
+  reports a bad mode bare. `return_values_on_condition_check_failure` outside
+  `ALL_OLD` and `NONE` is now refused on the three write tools, where it was
+  ignored. `delete_item` reads `expression_attribute_values` after the member
+  checks and names a refused value by its key, as DeleteItem does, and
+  `batch_write_item` reports a bad capacity mode after a refused value
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- `batch_get_item` and `batch_write_item` decode `request_items` as
+  BatchGetItem and BatchWriteItem do, after the snake_case spellings they
+  accept (`keys`, `projection_expression`, `expression_attribute_names`,
+  `consistent_read`, `put_request`, `item`, `delete_request`, `key`) are
+  given their wire names; where an entry gives both spellings, the wire one
+  is read. A malformed entry now gets the HTTP API's answer rather than an
+  `InvalidRequestItems` error of the tools' own. `batch_get_item` now applies
+  an entry's `AttributesToGet` and returns only those attributes, as
+  BatchGetItem does; it used to ignore it and return the whole item. A
+  non-string `ProjectionExpression`, malformed `ExpressionAttributeNames` or
+  a bad `AttributesToGet`, which the tool also ignored, are now refused
+  ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 
 ## [1.6.0] - 2026-11-07
 

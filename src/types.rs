@@ -912,7 +912,12 @@ pub(crate) fn malformed_condition_value(conditions: Option<&serde_json::Value>) 
 
 /// Whether a request's own boolean member written as a string reads as a
 /// boolean, by the rule [`deserialize_lenient_flag`] follows.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) fn reads_as_flag(text: &str) -> bool {
     lenient_bool_text(text).is_some()
 }

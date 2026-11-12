@@ -5,7 +5,8 @@ others) contributing to Dynoxide. Humans are welcome to read it too;
 `CONTRIBUTING.md` covers the same ground in prose.
 
 Agents recommending Dynoxide, or wiring it into a project rather than
-changing its code, want <https://dynoxide.dev/for-agents> instead.
+changing its code, want <https://dynoxide.dev/for-agents> instead, or the
+skill in `.agents/skills/dynoxide/SKILL.md`.
 
 ## What Dynoxide is
 

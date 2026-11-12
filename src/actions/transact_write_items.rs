@@ -6,165 +6,48 @@ use crate::types::{self, AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct TransactWriteItemsRequest {
-    #[serde(rename = "TransactItems", deserialize_with = "read_actions")]
+    #[serde(rename = "TransactItems")]
     pub transact_items: Vec<TransactWriteItem>,
-    #[serde(rename = "ClientRequestToken", default)]
+    #[serde(rename = "ClientRequestToken")]
     pub client_request_token: Option<String>,
-    #[serde(rename = "ReturnConsumedCapacity", default)]
+    #[serde(rename = "ReturnConsumedCapacity")]
     pub return_consumed_capacity: Option<String>,
-    #[serde(rename = "ReturnItemCollectionMetrics", default)]
+    #[serde(rename = "ReturnItemCollectionMetrics")]
     pub return_item_collection_metrics: Option<String>,
 }
 
+impl<'de> Deserialize<'de> for TransactWriteItemsRequest {
+    /// Read the request as it arrives on the wire, where a required member
+    /// may be left out, and raise the first stage of DynamoDB's member checks
+    /// that finds anything ahead of a value refused in an item. The stages
+    /// after that run in `check_request`.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        wire::Request::deserialize(deserializer)?
+            .into_request()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// One action of a transaction write.
+///
+/// This type and the four action types keep a derived `Deserialize` only so
+/// the public API stays as it was. Neither the HTTP API nor the MCP tool reads
+/// them with it: both read [`TransactWriteItemsRequest`], whose reader runs
+/// DynamoDB's member checks in its order.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TransactWriteItem {
-    #[serde(rename = "Put", default, deserialize_with = "read_action")]
+    #[serde(rename = "Put", default)]
     pub put: Option<TransactPut>,
-    #[serde(rename = "Update", default, deserialize_with = "read_action")]
+    #[serde(rename = "Update", default)]
     pub update: Option<TransactUpdate>,
-    #[serde(rename = "Delete", default, deserialize_with = "read_action")]
+    #[serde(rename = "Delete", default)]
     pub delete: Option<TransactDelete>,
-    #[serde(rename = "ConditionCheck", default, deserialize_with = "read_action")]
+    #[serde(rename = "ConditionCheck", default)]
     pub condition_check: Option<TransactConditionCheck>,
-}
-
-thread_local! {
-    /// Whether the request being read holds a JSON null where an attribute
-    /// value belongs, which changes how its actions are read (see
-    /// [`refusal_ahead_of_action`]). Set around the read of `TransactItems`.
-    static NULL_IN_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Read `TransactItems`, noting for each action's read whether any of them
-/// holds a null where an attribute value belongs.
-fn read_actions<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Vec<TransactWriteItem>, D::Error> {
-    use serde::de::Error;
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            NULL_IN_REQUEST.with(|cell| cell.set(self.0));
-        }
-    }
-    let actions = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-    let holds_null = serde_json::from_str::<serde_json::Value>(actions.get())
-        .is_ok_and(|actions| types::holds_null(&actions));
-    let _restore = Restore(NULL_IN_REQUEST.with(|cell| cell.replace(holds_null)));
-    serde_json::from_str(actions.get()).map_err(D::Error::custom)
-}
-
-/// Read one action, first refusing it for [`refusal_ahead_of_action`].
-fn read_action<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    use serde::de::Error;
-    let Some(action) = Option::<Box<serde_json::value::RawValue>>::deserialize(deserializer)?
-    else {
-        return Ok(None);
-    };
-    let null_in_request = NULL_IN_REQUEST.with(std::cell::Cell::get);
-    if let Some(refusal) = refusal_ahead_of_action::<T>(action.get(), null_in_request) {
-        return Err(D::Error::custom(refusal));
-    }
-    serde_json::from_str(action.get()).map_err(D::Error::custom)
-}
-
-/// The refusal an action (a `Put`, `Update`, `Delete` or `ConditionCheck`,
-/// given as its JSON text and read as `T`) gets ahead of the rest of it, if
-/// any, as the raw serde message. `null_in_request` says whether the request
-/// holds a JSON null where an attribute value belongs, in this action or
-/// another.
-///
-/// A member of the wrong JSON type fails the action first, in written order,
-/// whether it is a value or `TableName: 5`. After that, the action's `Item` or
-/// `Key` and its `ExpressionAttributeValues` are reported in an order that
-/// turns on the null, whichever is written first (captured eu-west-2 and
-/// us-east-1, 2026-11-11):
-///
-/// - Without a null, the `Item` or `Key` comes first, and a bad number in the
-///   values is reported bare.
-/// - With one, the values come first, and a bad number in them is named by
-///   key, as a null is.
-pub(crate) fn refusal_ahead_of_action<T: serde::de::DeserializeOwned>(
-    action: &str,
-    null_in_request: bool,
-) -> Option<String> {
-    use crate::serde_errors::is_validation_refusal;
-    fn written_members<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Vec<(String, Box<serde_json::value::RawValue>)>, D::Error> {
-        struct Visit;
-        impl<'de> serde::de::Visitor<'de> for Visit {
-            type Value = Vec<(String, Box<serde_json::value::RawValue>)>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a map")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let mut members = Vec::new();
-                while let Some(member) = map.next_entry()? {
-                    members.push(member);
-                }
-                Ok(members)
-            }
-        }
-        deserializer.deserialize_map(Visit)
-    }
-    // An action that isn't a map is refused as the action is read.
-    let members = written_members(&mut serde_json::Deserializer::from_str(action)).ok()?;
-    let mut attributes = None;
-    let mut values = None;
-    let mut stand_ins = Vec::with_capacity(members.len());
-    for (name, value) in &members {
-        let refusal = match name.as_str() {
-            "Item" | "Key" => serde_json::from_str::<types::AttributeMap>(value.get())
-                .err()
-                .map(|e| e.to_string()),
-            "ExpressionAttributeValues" => {
-                match serde_json::from_str::<types::WrittenMembers>(value.get()) {
-                    Ok(types::WrittenMembers(read)) => {
-                        types::with_value_layer(crate::validation::ValueLayer::Older, || {
-                            types::read_transaction_values(read, null_in_request)
-                        })
-                        .err()
-                    }
-                    Err(e) => Some(e.to_string()),
-                }
-            }
-            _ => None,
-        };
-        let held = refusal.filter(|refusal| is_validation_refusal(refusal));
-        // A value map whose only faults are held stands in as empty, so the
-        // read below finds the action's members of the wrong JSON type.
-        let stand_in = if held.is_some() { "{}" } else { value.get() };
-        stand_ins.push(format!(
-            "{}:{stand_in}",
-            serde_json::Value::String(name.clone())
-        ));
-        match name.as_str() {
-            "Item" | "Key" => attributes = attributes.or(held),
-            "ExpressionAttributeValues" => values = values.or(held),
-            _ => {}
-        }
-    }
-    if let Err(e) = serde_json::from_str::<T>(&format!("{{{}}}", stand_ins.join(","))) {
-        let refusal = e.to_string();
-        if !is_validation_refusal(&refusal) {
-            return Some(refusal);
-        }
-    }
-    if null_in_request {
-        values.or(attributes)
-    } else {
-        attributes.or(values)
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -180,11 +63,7 @@ pub struct TransactPut {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_transaction_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -205,11 +84,7 @@ pub struct TransactUpdate {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_transaction_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -228,11 +103,7 @@ pub struct TransactDelete {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_transaction_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -251,11 +122,7 @@ pub struct TransactConditionCheck {
     pub condition_expression: String,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_transaction_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -344,160 +211,132 @@ fn empty_name_in_write_action(item: &TransactWriteItem) -> Result<()> {
     Ok(())
 }
 
-/// The action list as DynamoDB echoes it in a constraint message: each
-/// action's Java `toString`, every field named, in the form us-east-1,
-/// eu-west-1 and us-west-2 gave on 2026-10-10. eu-west-2 echoes no list
-/// (`Value at 'TransactItems'`), and some hosts print each attribute value as
-/// an object hash; the form most regions give is the one followed. Bounded by
-/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
-fn items_echo(items: &[TransactWriteItem]) -> String {
-    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
-    let _ = write_items(&mut out, items);
-    out.finish()
-}
+/// `TransactItems` holding no action, or more than 100, in the older form
+/// DynamoDB words it in, with no list echoed.
+const NO_ACTIONS: &str = "Value at 'TransactItems' failed to satisfy constraint: Member must have length greater than or equal to 1";
+const TOO_MANY_ACTIONS: &str = "Value at 'TransactItems' failed to satisfy constraint: Member must have length less than or equal to 100";
 
-fn write_items(out: &mut dyn std::fmt::Write, items: &[TransactWriteItem]) -> std::fmt::Result {
-    use crate::actions::batch_write_item::{
-        write_java_item, write_java_names, write_java_text, write_java_values,
-    };
-    // The members every action shares, after its key or item.
-    let conditions = |out: &mut dyn std::fmt::Write,
-                      condition: Option<&str>,
-                      names: Option<&HashMap<String, String>>,
-                      values: Option<&HashMap<String, AttributeValue>>,
-                      return_values: Option<&str>|
-     -> std::fmt::Result {
-        out.write_str(", conditionExpression=")?;
-        write_java_text(out, condition)?;
-        out.write_str(", expressionAttributeNames=")?;
-        write_java_names(out, names)?;
-        out.write_str(", expressionAttributeValues=")?;
-        write_java_values(out, values)?;
-        out.write_str(", returnValuesOnConditionCheckFailure=")?;
-        write_java_text(out, return_values)?;
-        out.write_str(", workloadProfileName=null)")
-    };
-    out.write_str("[")?;
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            out.write_str(", ")?;
-        }
-        out.write_str("TransactWriteItem(conditionCheck=")?;
-        match item.condition_check {
-            Some(ref check) => {
-                out.write_str("ConditionCheck(key=")?;
-                write_java_item(out, &check.key)?;
-                write!(out, ", tableName={}", check.table_name)?;
-                conditions(
-                    out,
-                    Some(&check.condition_expression),
-                    check.expression_attribute_names.as_ref(),
-                    check.expression_attribute_values.as_ref(),
-                    check.return_values_on_condition_check_failure.as_deref(),
-                )?;
-            }
-            None => out.write_str("null")?,
-        }
-        out.write_str(", put=")?;
-        match item.put {
-            Some(ref put) => {
-                out.write_str("Put(item=")?;
-                write_java_item(out, &put.item)?;
-                write!(out, ", tableName={}", put.table_name)?;
-                conditions(
-                    out,
-                    put.condition_expression.as_deref(),
-                    put.expression_attribute_names.as_ref(),
-                    put.expression_attribute_values.as_ref(),
-                    put.return_values_on_condition_check_failure.as_deref(),
-                )?;
-            }
-            None => out.write_str("null")?,
-        }
-        out.write_str(", delete=")?;
-        match item.delete {
-            Some(ref delete) => {
-                out.write_str("Delete(key=")?;
-                write_java_item(out, &delete.key)?;
-                write!(out, ", tableName={}", delete.table_name)?;
-                conditions(
-                    out,
-                    delete.condition_expression.as_deref(),
-                    delete.expression_attribute_names.as_ref(),
-                    delete.expression_attribute_values.as_ref(),
-                    delete.return_values_on_condition_check_failure.as_deref(),
-                )?;
-            }
-            None => out.write_str("null")?,
-        }
-        out.write_str(", update=")?;
-        match item.update {
-            Some(ref update) => {
-                out.write_str("Update(key=")?;
-                write_java_item(out, &update.key)?;
-                write!(
-                    out,
-                    ", updateExpression={}, tableName={}",
-                    update.update_expression, update.table_name
-                )?;
-                conditions(
-                    out,
-                    update.condition_expression.as_deref(),
-                    update.expression_attribute_names.as_ref(),
-                    update.expression_attribute_values.as_ref(),
-                    update.return_values_on_condition_check_failure.as_deref(),
-                )?;
-            }
-            None => out.write_str("null")?,
-        }
-        out.write_str(")")?;
+/// An item that names no action, as DynamoDB words it beside the request's
+/// enums.
+const EMPTY_ACTION: &str = "Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck";
+
+/// The second stage of the member checks: the token's length, then the
+/// length of `TransactItems`, in the older form and listed together. When
+/// either is wrong nothing else is listed beside them, not the request's enums,
+/// an empty action or a value refused in an item (captured eu-west-2 and
+/// us-east-1, 2026-11-11).
+fn length_errors(token: Option<&str>, actions: usize) -> Option<String> {
+    let mut errors: Vec<String> = Vec::new();
+    errors.extend(crate::older_token_constraint_error(token));
+    if actions == 0 {
+        errors.push(NO_ACTIONS.to_string());
+    } else if actions > 100 {
+        errors.push(TOO_MANY_ACTIONS.to_string());
     }
-    out.write_str("]")
+    crate::validation::format_validation_errors(&errors)
 }
 
-/// The request-level checks, in the order DynamoDB reports them: the
-/// `TransactItems` length; then the request's own members, `ClientRequestToken`,
-/// `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`, reported together
-/// in one message; then whether each item carries exactly one action; then
-/// every action's table name, again in one message.
-///
-/// That is what us-east-1 and nine more regions answered on 2026-10-09.
-/// eu-west-2 and eu-north-1 have moved transactions to a newer validation
-/// layer, which reports a table name or an empty action together with the
-/// enums, words the empty action and the token differently, and reports an
-/// overlong token alone.
-///
-/// Called at the entry point ahead of the idempotency cache as well as at the
-/// start of `execute_cached`. A same-token replay never reaches
-/// `execute_cached`, and the token is keyed on the items alone, so a second
-/// call may carry a capacity mode the first one never did. Running the same
-/// checks in both places keeps their order the same whichever path answers.
-pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
-    let items = &request.transact_items;
+/// How many of the four actions an item names.
+fn action_count(item: &TransactWriteItem) -> usize {
+    [
+        item.put.is_some(),
+        item.update.is_some(),
+        item.delete.is_some(),
+        item.condition_check.is_some(),
+    ]
+    .into_iter()
+    .filter(|&present| present)
+    .count()
+}
 
-    // Validate: at least 1 action
-    if items.is_empty() {
-        return Err(DynoxideError::ValidationException(
-            "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),
+/// The request's two enums refused, if either is.
+fn enum_errors(
+    return_consumed_capacity: Option<&str>,
+    return_item_collection_metrics: Option<&str>,
+) -> Vec<String> {
+    [
+        crate::validation::return_consumed_capacity_rejection(return_consumed_capacity),
+        crate::validation::return_item_collection_metrics_rejection(return_item_collection_metrics),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Every action's table name errors, under its position and action type, such
+/// as `transactItems.2.member.update.tableName`.
+fn table_name_errors(items: &[TransactWriteItem]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (position, item) in items.iter().enumerate() {
+        let (action, table_name) = if let Some(ref put) = item.put {
+            ("put", &put.table_name)
+        } else if let Some(ref update) = item.update {
+            ("update", &update.table_name)
+        } else if let Some(ref delete) = item.delete {
+            ("delete", &delete.table_name)
+        } else if let Some(ref check) = item.condition_check {
+            ("conditionCheck", &check.table_name)
+        } else {
+            continue;
+        };
+        errors.extend(crate::validation::member_table_name_errors(
+            table_name,
+            &format!("transactItems.{}.member.{action}.tableName", position + 1),
         ));
     }
+    errors
+}
 
-    // Validate: up to 100 actions, echoing the list as DynamoDB does.
-    if items.len() > 100 {
-        return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
-            items_echo(items)
-        )));
-    }
+/// The third stage of the member checks. An item naming no action is
+/// reported ahead of a bad `ReturnConsumedCapacity` or
+/// `ReturnItemCollectionMetrics`, and every refused table name is left out
+/// beside it. Otherwise every refused table name is listed, ahead of either
+/// enum (captured eu-west-2 and us-east-1, 2026-11-11).
+fn enum_stage_errors(
+    items: &[TransactWriteItem],
+    return_consumed_capacity: Option<&str>,
+    return_item_collection_metrics: Option<&str>,
+) -> Option<String> {
+    let enums = enum_errors(return_consumed_capacity, return_item_collection_metrics);
+    let ahead = if items.iter().any(|item| action_count(item) == 0) {
+        vec![EMPTY_ACTION.to_string()]
+    } else {
+        table_name_errors(items)
+    };
+    crate::validation::format_validation_errors(&[ahead, enums].concat())
+}
 
-    // The request's own members, reported together before anything is read or
-    // written: every action's ReturnValuesOnConditionCheckFailure in request
-    // order, then the token and the two enums (captured 2026-10-09, six of
-    // seven regions). The idempotency layer checks the token again, for the
-    // operations that reach it without coming through here.
-    let mut member_errors: Vec<String> = Vec::new();
-    for (position, item) in items.iter().enumerate() {
-        let actions = [
+/// The stages of the member checks a value refused in an item comes after:
+/// the token's length and the length of `TransactItems` (see
+/// [`length_errors`]), then the request's enums with an item naming no action
+/// or the table names (see [`enum_stage_errors`]), then whether any item names
+/// more than one action (captured eu-west-2, us-east-1, eu-west-1 and
+/// us-west-2, 2026-11-11). The request decoder runs them when it holds such a
+/// value, and [`check_request`] runs them first.
+fn stages_before_values(request: &TransactWriteItemsRequest) -> Option<String> {
+    let items = &request.transact_items;
+    length_errors(request.client_request_token.as_deref(), items.len())
+        .or_else(|| {
+            enum_stage_errors(
+                items,
+                request.return_consumed_capacity.as_deref(),
+                request.return_item_collection_metrics.as_deref(),
+            )
+        })
+        .or_else(|| {
+            items.iter().any(|item| action_count(item) > 1).then(|| {
+                "TransactItems can only contain one of Check, Put, Update or Delete".to_string()
+            })
+        })
+}
+
+/// The first action, in request order, whose
+/// `ReturnValuesOnConditionCheckFailure` DynamoDB refuses. Only that one is
+/// reported, however many are wrong (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
+fn first_mode_error(items: &[TransactWriteItem]) -> Option<String> {
+    items.iter().enumerate().find_map(|(position, item)| {
+        [
             (
                 "put",
                 item.put
@@ -522,93 +361,47 @@ pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
                     .as_ref()
                     .map(|a| &a.return_values_on_condition_check_failure),
             ),
-        ];
-        for (action, value) in actions {
-            if let Some(msg) = value.and_then(|value| {
-                crate::validation::return_values_on_condition_check_failure_rejection(
-                    value.as_deref(),
-                    &format!(
-                        "transactItems.{}.member.{action}.returnValuesOnConditionCheckFailure",
-                        position + 1
-                    ),
-                )
-            }) {
-                member_errors.push(msg);
-            }
-        }
-    }
-    member_errors.extend(
-        [
-            crate::token_constraint_error(request.client_request_token.as_deref()),
-            crate::validation::return_consumed_capacity_rejection(
-                request.return_consumed_capacity.as_deref(),
-            ),
-            crate::validation::return_item_collection_metrics_rejection(
-                request.return_item_collection_metrics.as_deref(),
-            ),
         ]
         .into_iter()
-        .flatten(),
-    );
-    if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
-        return Err(DynoxideError::ValidationException(msg));
-    }
+        .find_map(|(action, value)| {
+            crate::validation::return_values_on_condition_check_failure_rejection(
+                value?.as_deref(),
+                &format!(
+                    "transactItems.{}.member.{action}.returnValuesOnConditionCheckFailure",
+                    position + 1
+                ),
+            )
+        })
+    })
+}
 
-    // Each item carries exactly one action, checked for every item before any
-    // table name is.
-    for item in items {
-        let actions = [
-            item.put.is_some(),
-            item.update.is_some(),
-            item.delete.is_some(),
-            item.condition_check.is_some(),
-        ]
-        .into_iter()
-        .filter(|&present| present)
-        .count();
-        match actions {
-            0 => {
-                return Err(DynoxideError::ValidationException(
-                    "Invalid Request: TransactWriteRequest should contain Delete or Put or Update request"
-                        .to_string(),
-                ));
-            }
-            1 => {}
-            _ => {
-                return Err(DynoxideError::ValidationException(
-                    "TransactItems can only contain one of Check, Put, Update or Delete"
-                        .to_string(),
-                ));
-            }
-        }
-    }
+/// The request-level checks, in the order DynamoDB reports them, as
+/// eu-west-2 and us-east-1 answered on 2026-11-11.
+///
+/// A required member left null comes first, but a request with one never
+/// gets here: it is refused as it is read. So is a value refused in an item,
+/// once the stages [`stages_before_values`] runs have passed. Last comes the
+/// first action's `ReturnValuesOnConditionCheckFailure` that is wrong.
+///
+/// Called at the entry point ahead of the idempotency cache as well as at the
+/// start of `execute_cached`. A same-token replay never reaches
+/// `execute_cached`, and the token is keyed on the items alone, so a second
+/// call may carry a capacity mode the first one never did. Running the same
+/// checks in both places keeps their order the same whichever path answers.
+pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
+    let items = &request.transact_items;
+    let refuse = |msg: String| Err(DynoxideError::ValidationException(msg));
 
-    // Every action's table name, reported together under its position and
-    // action type, such as `transactItems.2.member.update.tableName`.
-    let mut name_errors = Vec::new();
-    for (position, item) in items.iter().enumerate() {
-        let (action, table_name) = if let Some(ref put) = item.put {
-            ("put", &put.table_name)
-        } else if let Some(ref update) = item.update {
-            ("update", &update.table_name)
-        } else if let Some(ref delete) = item.delete {
-            ("delete", &delete.table_name)
-        } else if let Some(ref check) = item.condition_check {
-            ("conditionCheck", &check.table_name)
-        } else {
-            continue;
-        };
-        name_errors.extend(crate::validation::member_table_name_errors(
-            table_name,
-            &format!("transactItems.{}.member.{action}.tableName", position + 1),
-        ));
+    if let Some(msg) = stages_before_values(request) {
+        return refuse(msg);
     }
-    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
-        return Err(DynoxideError::ValidationException(msg));
+    if let Some(msg) = first_mode_error(items) {
+        return refuse(crate::validation::envelope_message(&msg));
     }
-
     Ok(())
 }
+
+mod wire;
 
 pub(crate) async fn execute_cached<S: StorageBackend>(
     storage: &S,
@@ -874,8 +667,9 @@ fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
     // Every action's sets are checked first, empty or with a repeated member,
     // in its item or key and its expression values: ahead of a missing table
     // and a condition's syntax error, as a top-level refusal (us-east-1,
-    // eu-west-1 and us-west-2, 2026-10-09, in the older layer's words;
-    // eu-west-2 uses the current layer's).
+    // eu-west-1 and us-west-2, 2026-10-09), worded on the current layer in
+    // every region (captured eu-west-2, us-east-1, eu-west-1 and us-west-2,
+    // 2026-11-11).
     validate_action_sets(item)?;
     if let Some(ref put) = item.put {
         validate_expression_value_depth(&put.expression_attribute_values)?;
@@ -950,9 +744,11 @@ fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
 }
 
 /// The empty or duplicated sets in one action, item or key first and then its
-/// expression values (named by key, in key order), in the older layer's words.
+/// expression values, each in key order, worded by the layer the request's
+/// values were read on. A refused expression value is reported bare, as
+/// DynamoDB reports it in every region (captured eu-west-2, us-east-1,
+/// eu-west-1 and us-west-2, 2026-11-11).
 fn validate_action_sets(item: &TransactWriteItem) -> Result<()> {
-    use crate::validation::{ValueLayer, find_set_error};
     let (values, values_map) = if let Some(ref put) = item.put {
         (&put.item, &put.expression_attribute_values)
     } else if let Some(ref update) = item.update {
@@ -964,25 +760,18 @@ fn validate_action_sets(item: &TransactWriteItem) -> Result<()> {
     } else {
         return Ok(());
     };
-    let mut names: Vec<&String> = values.keys().collect();
-    names.sort();
-    for name in names {
-        if let Some(message) = find_set_error(&values[name], ValueLayer::Older) {
-            return Err(DynoxideError::ValidationException(message));
-        }
+    let layer = crate::types::current_value_layer();
+    let in_key_order = |map: &HashMap<String, AttributeValue>| {
+        let mut names: Vec<&String> = map.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .find_map(|name| crate::validation::find_set_error(&map[name], layer))
+    };
+    match in_key_order(values).or_else(|| values_map.as_ref().and_then(in_key_order)) {
+        Some(message) => Err(DynoxideError::ValidationException(message)),
+        None => Ok(()),
     }
-    if let Some(eav) = values_map {
-        let mut keys: Vec<&String> = eav.keys().collect();
-        keys.sort();
-        for key in keys {
-            if let Some(message) = find_set_error(&eav[key], ValueLayer::Older) {
-                return Err(DynoxideError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {message} for key {key}"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The names and values an action's expressions refer to, checked from the
@@ -1551,5 +1340,46 @@ async fn get_item_target<S: StorageBackend>(
         Err(DynoxideError::ValidationException(
             "TransactItem must contain exactly one action".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The public action types' own reader stops at the first expression value
+    /// refused for its number and refuses it bare, as the request reader does
+    /// on the current layer (captured eu-west-2, us-east-1, eu-west-1 and
+    /// us-west-2, 2026-11-11).
+    #[test]
+    fn the_derived_read_stops_at_the_first_refused_expression_value() {
+        let values = serde_json::json!({":a": {"N": "xyz"}, ":b": {"N": "abc"}});
+        let expected = format!(
+            "{}The parameter cannot be converted to a numeric value: xyz",
+            crate::serde_errors::REQUEST_VALIDATION_MARKER
+        );
+        let put = serde_json::json!({
+            "TableName": "t",
+            "Item": {"pk": {"S": "a"}},
+            "ConditionExpression": "a = :a AND b = :b",
+            "ExpressionAttributeValues": values
+        });
+        let check = serde_json::json!({
+            "TableName": "t",
+            "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "a = :a AND b = :b",
+            "ExpressionAttributeValues": values
+        });
+        let mut update = check.clone();
+        update["UpdateExpression"] = "SET a = :a, b = :b".into();
+        let errors = [
+            serde_json::from_value::<TransactPut>(put).err(),
+            serde_json::from_value::<TransactUpdate>(update).err(),
+            serde_json::from_value::<TransactDelete>(check.clone()).err(),
+            serde_json::from_value::<TransactConditionCheck>(check).err(),
+        ];
+        for error in errors {
+            assert_eq!(error.expect("the value is refused").to_string(), expected);
+        }
     }
 }

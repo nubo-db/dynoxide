@@ -277,21 +277,25 @@ pub(crate) fn return_values_on_condition_check_failure_rejection(
 pub(crate) fn conditional_operator_misuse(
     operator: Option<&str>,
     conditions: usize,
-) -> Option<&'static str> {
+) -> Option<String> {
     let operator = operator?;
     match conditions {
-        0 => Some("ConditionalOperator cannot be used without Filter or Expected"),
+        0 => Some("ConditionalOperator cannot be used without Filter or Expected".to_string()),
         1 => Some(
             "ConditionalOperator can only be used when Filter or Expected has two or more \
-             elements",
+             elements"
+                .to_string(),
         ),
-        // With conditions to join, a value other than AND or OR gets the
-        // generic enum message, DynamoDB's own `[ALL, OR]` list included
-        // (captured 2026-10-09: PutItem, UpdateItem and DeleteItem in five of
-        // seven regions, Query in six).
-        _ if !["AND", "OR"].contains(&operator) => {
-            Some("Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]")
-        }
+        // With conditions to join, a value other than AND or OR, lower case
+        // and the empty string included, is named with the member and the
+        // list in this order. Query and Scan report it bare, the single-item
+        // writes in the envelope (captured eu-west-2 and us-east-1,
+        // 2026-11-11; on 2026-10-09 the message named neither and listed
+        // `[ALL, OR]`).
+        _ if !["AND", "OR"].contains(&operator) => Some(format!(
+            "Value '{operator}' at 'conditionalOperator' failed to satisfy constraint: \
+             Member must satisfy enum value set: [AND, OR]"
+        )),
         _ => None,
     }
 }
@@ -339,8 +343,9 @@ pub(crate) fn envelope_message(msg: &str) -> String {
 /// skipped sizing its indexes. Every operation that takes the parameter now
 /// asks here: those six, `SearchVectors`, the three PartiQL operations, and
 /// `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
-/// `TransactWriteItems`, which check it in their `execute` once their own
-/// request-level constraints have passed.
+/// `TransactWriteItems`. The batch operations and TransactGetItems check it in
+/// their `execute` once their own request-level constraints have passed;
+/// TransactWriteItems lists it in the stages of its request check.
 ///
 /// Callers that collect several failures push the message onto their own errors
 /// vec, so the multi-error envelope they report is unchanged.
@@ -395,12 +400,13 @@ pub(crate) fn return_values_value_rejection(value: &str) -> String {
     )
 }
 
-/// The rejection for a `ConditionalOperator` outside `[OR, AND]`, or `None`
-/// when the value is one DynamoDB accepts. Only the older validation layer
-/// checks it as an enum member, and a Scan reaches that layer only when a
-/// missing table name or operator, or a coerced integer, hands it the request. The newer layer, which
-/// every operation runs on in most regions, never reports the enum; see
-/// [`conditional_operator_misuse`].
+/// The older validation layer's rejection for a `ConditionalOperator` outside
+/// `[OR, AND]`, or `None` when the value is one DynamoDB accepts. It is checked
+/// as a member, whatever the number of conditions, and a request reaches that
+/// layer only when something else hands it there: a missing table name, a
+/// missing UpdateItem or DeleteItem key, a missing Scan operator or a coerced
+/// integer. The newer layer words the enum its own way, with the list the
+/// other way round; see [`conditional_operator_misuse`].
 pub(crate) fn conditional_operator_rejection(operator: Option<&str>) -> Option<String> {
     let operator = operator?;
     if ["OR", "AND"].contains(&operator) {
@@ -1495,21 +1501,27 @@ fn validate_key_attr_value(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueLayer {
     /// PutItem, UpdateItem and DeleteItem (inside the envelope), and GetItem,
-    /// BatchGetItem, Query and Scan (bare). Numbers by the stored-number rule, an
-    /// empty one ending `: `; duplicates quoted, in the order described at
-    /// [`duplicate_set_message`]; expression values with no
+    /// BatchGetItem, Query, Scan and TransactWriteItems (bare). Numbers by the
+    /// stored-number rule, an empty one ending `: `; duplicates quoted, in the
+    /// order described at [`duplicate_set_message`]; expression values with no
     /// `ExpressionAttributeValues contains invalid value` wrapper.
     Current,
-    /// BatchWriteItem, TransactWriteItems, TransactGetItems and the PartiQL
-    /// operations. Numbers as Java's `BigDecimal` reads them, an empty
-    /// one with no colon; duplicates unquoted, as sent; expression values
-    /// inside the wrapper.
+    /// BatchWriteItem, TransactGetItems and the PartiQL operations. Numbers as
+    /// Java's `BigDecimal` reads them, an empty one with no colon; duplicates
+    /// unquoted, as sent.
     Older,
 }
 
 impl ValueLayer {
     /// The layer DynamoDB runs `operation` on, for the seams that read a
     /// request knowing only the operation's name.
+    ///
+    /// TransactWriteItems reads its items, keys and expression values on the
+    /// current layer. On 2026-10-09 three of four regions (us-east-1,
+    /// eu-west-1 and us-west-2) still read them on the older one and named a
+    /// refused expression value's key; on 11 November 2026 eu-west-2,
+    /// us-east-1, eu-west-1 and us-west-2 all answered bare, by the
+    /// stored-number rule.
     #[cfg(any(
         feature = "http-server",
         feature = "mcp-server",
@@ -1519,7 +1531,6 @@ impl ValueLayer {
     pub(crate) fn for_operation(operation: &str) -> Self {
         match operation {
             "BatchWriteItem"
-            | "TransactWriteItems"
             | "TransactGetItems"
             | "ExecuteStatement"
             | "BatchExecuteStatement"

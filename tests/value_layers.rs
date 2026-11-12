@@ -3,20 +3,20 @@
 //! repeated member, is worded.
 //!
 //! The current layer (PutItem, UpdateItem and DeleteItem inside the
-//! `1 validation error detected: ` envelope; GetItem, BatchGetItem, Query and
-//! Scan bare) reads numbers by the stored-number rule, ends an empty one with
-//! `: `, quotes duplicated members in a particular order and never wraps an
-//! expression value. The older layer (BatchWriteItem, the transactions and
-//! PartiQL) reads numbers as Java's `BigDecimal` does, prints members as sent
-//! and wraps expression values naming the key. Captured in eu-west-2,
-//! us-east-1, eu-west-1 and us-west-2, 2026-10-09; where the regions split
-//! (eu-west-2 runs the current layer on the transactions), Dynoxide follows
-//! the majority. Scan was one of those until 20 October 2026, when 19 of 33
-//! regions read its values on the current layer. By 11 November 2026 a bad
-//! number in a TransactWriteItems action's expression values came back bare
-//! in eu-west-2 and us-east-1 alike, unless the request held a null (see
-//! tests/null_attribute_values.rs), so a transaction's number is no longer
-//! wrapped here; the older layer's number rule is still followed for it.
+//! `1 validation error detected: ` envelope; GetItem, BatchGetItem, Query,
+//! Scan and TransactWriteItems bare) reads numbers by the stored-number rule,
+//! ends an empty one with `: `, quotes duplicated members in a particular
+//! order and never wraps an expression value. The older layer (BatchWriteItem,
+//! TransactGetItems and PartiQL) reads numbers as Java's `BigDecimal` does and
+//! prints members as sent. Captured in eu-west-2, us-east-1, eu-west-1 and
+//! us-west-2, 2026-10-09; where the regions split (eu-west-2 ran the current
+//! layer on the transactions), Dynoxide follows the majority. Scan was one of
+//! those until 20 October 2026, when 19 of 33 regions read its values on the
+//! current layer, and TransactWriteItems' numbers until 11 November 2026, when
+//! all four regions read them, and its sets, on the current layer. A request
+//! that holds a null where a value belongs is read on the older layer, a
+//! transaction's expression values named by key (see
+//! tests/null_attribute_values.rs).
 
 #![cfg(feature = "http-server")]
 
@@ -165,8 +165,12 @@ async fn reads_on_the_current_layer_refuse_numbers_bare() {
     assert_eq!(scan, message);
 }
 
+/// BatchWriteItem reads a number as Java's `BigDecimal` does. TransactWriteItems
+/// used to as well, naming a refused expression value's key, in three of four
+/// regions on 2026-10-09; on 11 November 2026 eu-west-2, us-east-1, eu-west-1
+/// and us-west-2 all read its values on the current layer, bare.
 #[tokio::test]
-async fn the_older_layer_reads_numbers_as_big_decimal() {
+async fn the_older_layer_reads_numbers_as_big_decimal_and_transactions_no_longer_do() {
     let url = start().await;
     let batch = refusal(
         &url,
@@ -182,7 +186,36 @@ async fn the_older_layer_reads_numbers_as_big_decimal() {
             "UpdateExpression": "SET n = :v", "ExpressionAttributeValues": {":v": n("1e2147483647")}}}]}),
     )
     .await;
-    assert_eq!(transaction, UNDERFLOW);
+    assert_eq!(transaction, OVERFLOW);
+}
+
+/// A transaction's expression values are read to the end even after one is
+/// refused for its number, so a later value of the wrong JSON type still fails
+/// the request as it is read, as it does on its own.
+#[tokio::test]
+async fn a_refused_expression_value_does_not_hide_a_later_one_of_the_wrong_type() {
+    let url = start().await;
+    let alone = send(
+        &url,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {"TableName": "Vlt", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :b", "ExpressionAttributeValues": {":b": {"S": 5}}}}]}),
+    )
+    .await;
+    let after_a_refusal = send(
+        &url,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {"TableName": "Vlt", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :a, m = :b",
+            "ExpressionAttributeValues": {":a": n("1e2147483647"), ":b": {"S": 5}}}}]}),
+    )
+    .await;
+    assert_eq!(alone.0, 400);
+    assert_eq!(
+        alone.1["__type"],
+        "com.amazon.coral.service#SerializationException"
+    );
+    assert_eq!(after_a_refusal, alone);
 }
 
 #[tokio::test]
@@ -276,10 +309,14 @@ async fn scan_values_use_the_current_words_with_no_wrapper() {
     );
 }
 
+/// TransactWriteItems refuses a repeated set member in any action before it
+/// runs one, in the current layer's words with no wrapper on an expression
+/// value (captured eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-11-11,
+/// eighth round rows 3 to 6). TransactGetItems is still on the older layer.
 #[tokio::test]
 async fn transactions_check_every_actions_sets_up_front() {
     let url = start().await;
-    let older = format!("{INVALID}Input collection [b, a, b] contains duplicates.");
+    let current = format!(r#"{INVALID}Input collection ["a", "b", "b"] contains duplicates."#);
     // Ahead of a missing table.
     let missing_table = refusal(
         &url,
@@ -288,7 +325,7 @@ async fn transactions_check_every_actions_sets_up_front() {
             "Key": {"pk": {"SS": ["b", "a", "b"]}}}}]}),
     )
     .await;
-    assert_eq!(missing_table, older);
+    assert_eq!(missing_table, current);
     // Ahead of a condition's syntax error, and in a later action.
     let after_a_good_action = refusal(
         &url,
@@ -301,7 +338,7 @@ async fn transactions_check_every_actions_sets_up_front() {
         ]}),
     )
     .await;
-    assert_eq!(after_a_good_action, for_key(&older, ":t"));
+    assert_eq!(after_a_good_action, current);
     let get = refusal(
         &url,
         "TransactGetItems",

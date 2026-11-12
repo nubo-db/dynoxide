@@ -82,7 +82,18 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
                 crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
             )));
         }
-        let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
+        // A missing name hands the request to the older layer, which lists a
+        // ConditionalOperator outside its enum ahead of the name (captured
+        // eu-west-2 and us-east-1, 2026-11-11).
+        let mut errors = Vec::new();
+        if raw.table_name.is_none() {
+            errors.extend(crate::validation::conditional_operator_rejection(
+                raw.conditional_operator.as_deref(),
+            ));
+        }
+        errors.extend(crate::validation::item_table_name_errors(
+            raw.table_name.as_deref(),
+        ));
         let table_name = raw.table_name.unwrap_or_default();
 
         // Item constraint validation
@@ -227,7 +238,7 @@ async fn execute_inner<S: StorageBackend>(
             // DynamoDB names no expression after its "can only be specified
             // when using expressions" message on the single-item writes
             // (eu-west-2 and us-east-1, 2026-10-09).
-            all_expression_param_names: vec![],
+            value_expression_params: &[],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &None,
@@ -245,7 +256,7 @@ async fn execute_inner<S: StorageBackend>(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.expected.as_ref()),
     ) {
-        return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
+        return Err(DynoxideError::EnvelopedValidation(msg));
     }
     // An Expected value nested too deep is refused, inside the envelope.
     crate::value_nesting::check_expected(request.expected.as_ref())?;

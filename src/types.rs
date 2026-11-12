@@ -745,10 +745,12 @@ impl<'de> Deserialize<'de> for HeldAttributeMap {
     }
 }
 
-/// A request's `ExpressionAttributeValues`, read as the request is parsed but
-/// not yet as values: a value of the wrong JSON type fails the request there,
-/// as for [`HeldAttributeMap`], and the operation's own reader reads them all
-/// once the item or key has been read.
+/// A request's `ExpressionAttributeValues`, or a TransactWriteItems action's
+/// item or key, read as the request is parsed but not yet as values: a value
+/// of the wrong JSON type fails the request there, as for
+/// [`HeldAttributeMap`], and the operation's own reader reads them all once
+/// the item or key has been read, or for a transaction once the whole request
+/// has been.
 #[derive(Debug)]
 pub(crate) struct HeldValues(pub(crate) WrittenMembers);
 
@@ -842,6 +844,24 @@ pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
             "{}Unrecognized collection type class java.lang.Boolean",
             crate::serde_errors::SERIALIZATION_MARKER
         ))),
+        value => read_lenient_bool(&value)
+            .map(|flag| Some(flag.value))
+            .map_err(de::Error::custom),
+    }
+}
+
+/// Deserialise `ConsistentRead` on ExecuteStatement or a BatchExecuteStatement
+/// member: by [`deserialize_lenient_flag`]'s rule, except that a list is
+/// refused with no message, as DynamoDB refuses it (captured eu-west-2 and
+/// us-east-1, 2026-11-11). The shared reader answers a list differently for
+/// the other operations, and that is not changed here. The same rule for
+/// ExecuteStatement's own field is in `serialization_checks::check_types`,
+/// which reads the request first.
+pub(crate) fn deserialize_statement_flag<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
         value => read_lenient_bool(&value)
             .map(|flag| Some(flag.value))
             .map_err(de::Error::custom),
@@ -1135,22 +1155,6 @@ pub(crate) async fn with_value_layer_async<F: std::future::Future>(
 /// rule, which [`validate_parameter_number`] holds.
 pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
     with_value_layer(crate::validation::ValueLayer::Older, read)
-}
-
-/// Deserialise a TransactWriteItems action's `ExpressionAttributeValues` as
-/// [`read_transaction_values`] reads them, on the older validation layer,
-/// naming the key of a number refused.
-pub(crate) fn deserialize_transaction_values<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    let Some(WrittenMembers(members)) = Option::<WrittenMembers>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    with_value_layer(crate::validation::ValueLayer::Older, || {
-        read_transaction_values(members, true)
-    })
-    .map(Some)
-    .map_err(de::Error::custom)
 }
 
 /// How an operation's `ExpressionAttributeValues` reader words and orders the

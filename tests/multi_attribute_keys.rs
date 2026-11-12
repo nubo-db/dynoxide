@@ -463,20 +463,24 @@ fn a_multi_attribute_partition_key_needs_every_attribute_and_matches_numbers_by_
 
     // A range condition on a partition key attribute counts as missing it, and
     // every missing attribute is named.
-    for (key_condition, missing) in [
-        ("h1 = :g AND h2 > :one", "h2"),
-        ("s = :one", "h1, h2"),
-        ("h2 = :one", "h1"),
-    ] {
-        let err = typed_query(
-            &db,
-            "byPair",
-            key_condition,
+    // Each request defines only the values its condition uses, as an unused
+    // one is refused ahead of the key schema check.
+    for (key_condition, values, missing) in [
+        (
+            "h1 = :g AND h2 > :one",
             serde_json::json!({":g": {"S": "g"}, ":one": {"N": "1"}}),
-            serde_json::json!({}),
-        )
-        .unwrap_err()
-        .to_string();
+            "h2",
+        ),
+        (
+            "s = :one",
+            serde_json::json!({":one": {"N": "1"}}),
+            "h1, h2",
+        ),
+        ("h2 = :one", serde_json::json!({":one": {"N": "1"}}), "h1"),
+    ] {
+        let err = typed_query(&db, "byPair", key_condition, values, serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains(&format!(
                 "HASH key attributes {missing} must have equality conditions specified in the query"

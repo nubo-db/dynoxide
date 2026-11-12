@@ -441,11 +441,12 @@ fn a_replayed_transact_write_still_rejects_an_unknown_return_consumed_capacity()
 
 /// TransactWriteItems checks `TransactItems` before `ReturnConsumedCapacity`.
 ///
-/// An empty `TransactItems` with an unknown mode reports the `transactItems`
-/// constraint, which is the order the request declares its members. The same
-/// message comes back with and without a `ClientRequestToken`; both go through
-/// the check ahead of the idempotency cache, so this pins the order of that
-/// check rather than comparing two separate paths.
+/// An empty `TransactItems` with an unknown mode reports the `TransactItems`
+/// constraint alone, in the older form with no list echoed (captured eu-west-2
+/// and us-east-1, 2026-11-11). The same message comes back with and without a
+/// `ClientRequestToken`; both go through the check ahead of the idempotency
+/// cache, so this pins the order of that check rather than comparing two
+/// separate paths.
 #[test]
 fn transact_write_checks_transact_items_before_return_consumed_capacity() {
     let db = setup();
@@ -461,9 +462,11 @@ fn transact_write_checks_transact_items_before_return_consumed_capacity() {
         db.transact_write_items(empty(Some("rcc-order-token")))
             .unwrap_err(),
     );
-    assert!(
-        without_token.contains("at 'transactItems'"),
-        "expected the TransactItems constraint first, got {without_token}"
+    assert_eq!(
+        without_token,
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length greater than or equal to 1",
+        "expected the TransactItems constraint alone"
     );
     assert_eq!(with_token, without_token);
 }
@@ -556,10 +559,9 @@ fn batch_write_checks_return_consumed_capacity_before_table_names() {
 
 #[test]
 fn transact_write_checks_client_request_token_before_return_consumed_capacity() {
-    // An overlong ClientRequestToken is reported ahead of the capacity mode, in
-    // the same message. Captured in us-east-1 and nine more regions,
-    // 2026-10-09; eu-west-2 and eu-north-1 report the token alone, in their
-    // newer validation layer's wording.
+    // An overlong ClientRequestToken is reported ahead of the capacity mode,
+    // alone, in the older form with no value echoed (captured eu-west-2 and
+    // us-east-1, 2026-11-11).
     let db = setup();
     let token = "x".repeat(37);
     let err = db
@@ -567,12 +569,8 @@ fn transact_write_checks_client_request_token_before_return_consumed_capacity() 
         .unwrap_err();
     assert_eq!(
         validation_message(err),
-        format!(
-            "2 validation errors detected: Value '{token}' at 'clientRequestToken' failed to \
-             satisfy constraint: Member must have length less than or equal to 36; \
-             {}",
-            BOGUS_MODE_MESSAGE.trim_start_matches("1 validation error detected: ")
-        )
+        "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+         constraint: Member must have length less than or equal to 36"
     );
     assert!(!stored(&db, "tok"));
 }

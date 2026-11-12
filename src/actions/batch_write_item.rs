@@ -733,17 +733,6 @@ pub(crate) fn write_java_names(
     out.write_str("}")
 }
 
-/// An optional attribute map, such as `ExpressionAttributeValues`, or `null`.
-pub(crate) fn write_java_values(
-    out: &mut dyn std::fmt::Write,
-    values: Option<&HashMap<String, AttributeValue>>,
-) -> std::fmt::Result {
-    match values {
-        Some(values) => write_java_item(out, values),
-        None => out.write_str("null"),
-    }
-}
-
 /// An optional string member as the Java model prints it: the text, or `null`.
 pub(crate) fn write_java_text(
     out: &mut dyn std::fmt::Write,

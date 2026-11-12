@@ -161,7 +161,10 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    for keys_and_attrs in request.request_items.values() {
+    // Each table's ProjectionExpression, checked through before any table is
+    // looked up (captured eu-west-2 and us-east-1, 2026-11-11).
+    let mut projections: HashMap<&String, expressions::projection::ProjectionExpr> = HashMap::new();
+    for (table_name, keys_and_attrs) in &request.request_items {
         let has_projection_expr = keys_and_attrs.projection_expression.is_some();
         let has_expr_attr_names = keys_and_attrs.expression_attribute_names.is_some();
 
@@ -196,6 +199,20 @@ pub async fn execute<S: StorageBackend>(
             return Err(DynoxideError::ValidationException(
                 "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
             ));
+        }
+
+        // The projection is checked through ahead of the keys: a fault in it
+        // comes before a bad key value or a repeated key (captured eu-west-2
+        // and us-east-1, 2026-11-11).
+        if let Some(parsed) = helpers::validate_read_expressions(
+            &keys_and_attrs.expression_attribute_names,
+            &None, // BatchGetItem has no ExpressionAttributeValues
+            helpers::ReadExpressions {
+                projection: keys_and_attrs.projection_expression.as_deref(),
+                ..Default::default()
+            },
+        )? {
+            projections.insert(table_name, parsed);
         }
 
         // Duplicate AttributesToGet check (must come before duplicate keys check)
@@ -256,28 +273,20 @@ pub async fn execute<S: StorageBackend>(
         let key_schema = helpers::parse_key_schema(&meta)?;
         let vector_defs = crate::actions::vector_index::parse_vector_defs(&meta)?;
 
-        // Parse projection if present; also handle legacy AttributesToGet
-        let projection = if let Some(ref expr) = keys_and_attrs.projection_expression {
-            Some(expressions::projection::parse(expr).map_err(DynoxideError::ValidationException)?)
-        } else {
+        // The projection checked before the lookups, or the legacy
+        // AttributesToGet.
+        let projection = projections.remove(table_name).or_else(|| {
             keys_and_attrs
                 .attributes_to_get
                 .as_ref()
                 .map(|attrs| crate::actions::helpers::attributes_to_get_to_projection(attrs))
-        };
+        });
 
-        let tracker = crate::expressions::TrackedExpressionAttributes::new(
+        // Resolves the projection's names; they were checked before the lookups.
+        let tracker = crate::expressions::TrackedExpressionAttributes::without_tracking(
             &keys_and_attrs.expression_attribute_names,
             &None, // BatchGetItem has no ExpressionAttributeValues
         );
-
-        // Pre-register projection expression references
-        if let Some(ref proj) = projection {
-            tracker.track_projection_expr(proj);
-            // Reject undefined names and overlapping paths before reading.
-            expressions::projection::validate(proj, &tracker)
-                .map_err(DynoxideError::ValidationException)?;
-        }
 
         // BatchGetItem does NOT automatically include key attributes in projections.
         let key_attrs = Vec::new();
@@ -332,9 +341,6 @@ pub async fn execute<S: StorageBackend>(
                 per_table_rcu += crate::types::read_capacity_units_with_consistency(0, consistent);
             }
         }
-
-        // Check for unused expression attribute names
-        tracker.check_unused()?;
 
         table_rcu.insert(table_name.clone(), per_table_rcu);
         responses.insert(table_name.clone(), table_items);

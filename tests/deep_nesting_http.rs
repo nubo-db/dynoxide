@@ -1327,10 +1327,13 @@ async fn older_member_errors_win_over_deep_values() {
     let rv = "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]";
     let xor = "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]";
     // Shallower requests keep the newer wording, so the rewording must not
-    // reach them: the generic ReturnValues set at 40 levels, [ALL, OR] at 33
-    // and 40.
+    // reach them: the generic ReturnValues set at 40 levels, and the newer
+    // operator message at 33 and 40. That message changed after these
+    // captures (captured eu-west-2 and us-east-1, 2026-11-11, for shallow
+    // requests only); that it reaches requests 33 and 40 levels deep is
+    // inferred.
     let generic_rv = "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
-    let newer_xor = "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]";
+    let newer_xor = "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]";
     for depth in [33, 40, 63, 100] {
         let v = deep_map(depth);
         let (rv, xor) = if depth < 63 {
@@ -1855,10 +1858,13 @@ async fn missing_update_key_joins_older_member_errors() {
         let (status, body) = send(&url, "UpdateItem", body.into()).await;
         assert_validation(status, &body, expected);
     }
+    // The operator is reported alone beside an unknown Select, in the wording
+    // DynamoDB moved to after the capture above (captured eu-west-2 and
+    // us-east-1, 2026-11-11).
     let (status, body) = send(&url, "Query", r#"{"TableName":"Deep","Select":"BOGUS","ConditionalOperator":"XOR","QueryFilter":{"a":{"ComparisonOperator":"NULL"},"b":{"ComparisonOperator":"NULL"}}}"#.into()).await;
     assert_validation(
         status,
         &body,
-        "Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]",
+        "Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]",
     );
 }

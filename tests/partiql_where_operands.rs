@@ -695,10 +695,9 @@ fn an_in_list_names_its_own_path_before_its_operand_count() {
 /// Which refusal DynamoDB reports when a WHERE clause holds two. A function
 /// it doesn't recognise, a number it can't store and `MISSING` compared
 /// without IS outrank the rest, the first written of them winning. Below them,
-/// an operand that isn't distinct and an IN with too many operands are
-/// reported in the order written, and either one written first wins over an
-/// operand of the wrong type (captured eu-west-2 and us-east-1, 2026-10-10;
-/// the regions agree on every row).
+/// an operand that isn't distinct, an IN with too many operands and an
+/// operand of the wrong type are reported in the order written (captured
+/// eu-west-2 and us-east-1, 2026-10-10; the regions agree on every row).
 #[test]
 fn refusals_rank_as_dynamodb_ranks_them() {
     let db = db();
@@ -716,6 +715,8 @@ fn refusals_rank_as_dynamodb_ranks_them() {
              or function; operator: {operator}, first operand: [s]"
         )
     };
+    let ordered_bool = "Incorrect operand type for operator or function; operator or function: <, \
+                        operand type: BOOL";
     let missing = "MISSING must be compared using IS operator";
     let overflow = "Number overflow. Attempting to store a number with magnitude larger than \
                     supported range under root";
@@ -725,6 +726,14 @@ fn refusals_rank_as_dynamodb_ranks_them() {
         (format!("s = s AND {long_in}"), distinct("=")),
         (format!("{long_in} AND s = s"), in_count.to_string()),
         ("s IN [s] AND size(s) < true".to_string(), distinct("IN")),
+        (
+            "size(s) < true AND s IN [s]".to_string(),
+            ordered_bool.to_string(),
+        ),
+        (
+            format!("size(s) < true AND {long_in}"),
+            ordered_bool.to_string(),
+        ),
         (
             format!("s BETWEEN s AND 1 AND {long_in}"),
             distinct("BETWEEN"),

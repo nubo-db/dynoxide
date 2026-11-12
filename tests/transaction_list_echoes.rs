@@ -1,13 +1,14 @@
-//! A transaction's action or statement list longer than DynamoDB allows is
-//! echoed in its constraint message as the Java model's `toString`: every
-//! field of every action named, every attribute value with all sixteen of its
-//! fields, and a map's entries in the order of a Java hash map. An empty list
-//! is echoed as `[]`. Each expected head and tail below is DynamoDB's own text
-//! for the same request (captured us-east-1, eu-west-1 and us-west-2,
-//! 2026-10-10; eu-west-2 echoes no list for TransactWriteItems and
-//! TransactGetItems, and some hosts print a value as an object hash, so the
-//! form most regions give is the one followed). The requests use the capture's
-//! own table name, so the whole message can be compared by length too.
+//! A statement or get list longer than a transaction allows, and a
+//! BatchWriteItem request, is echoed in its constraint message as the Java
+//! model's `toString`: every field of every entry named, every attribute value
+//! with all sixteen of its fields, and a map's entries in the order of a Java
+//! hash map. An empty list is echoed as `[]`. Each expected head and tail below
+//! is DynamoDB's own text for the same request (captured us-east-1, eu-west-1
+//! and us-west-2, 2026-10-10; eu-west-2 echoes no list for TransactGetItems,
+//! and some hosts print a value as an object hash, so the form most regions
+//! give is the one followed). The requests use the capture's own table name,
+//! so the whole message can be compared by length too. TransactWriteItems
+//! echoes no list (captured eu-west-2 and us-east-1, 2026-11-11).
 
 use dynoxide::Database;
 use dynoxide::actions::execute_transaction::ExecuteTransactionRequest;
@@ -93,8 +94,11 @@ fn a_statement_list_over_100_is_echoed_in_the_java_form() {
     );
 }
 
+/// TransactWriteItems is the exception: it refuses more than 100 actions in
+/// the older form, with no list echoed (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
 #[test]
-fn an_action_list_over_100_is_echoed_in_the_java_form() {
+fn an_action_list_over_100_is_not_echoed() {
     let db = Database::memory().unwrap();
     let key = json!({"pk": {"S": "k"}});
     let full = |mut action: Value| {
@@ -129,87 +133,10 @@ fn an_action_list_over_100_is_echoed_in_the_java_form() {
                 .unwrap(),
         )
         .unwrap_err();
-    assert_echo(
-        &err.to_string(),
-        concat!(
-            "1 validation error detected: Value '[TransactWriteItem(conditionCheck=ConditionCheck(key={pk=AttributeValue(s=k",
-            ", n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null",
-            ", bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null",
-            ", nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none",
-            ", conditionExpression=#n = :v, expressionAttributeNames={#n=a}",
-            ", expressionAttributeValues={:v=AttributeValue(s=null, n=1, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", returnValuesOnConditionCheckFailure=ALL_OLD, workloadProfileName=null)",
-            ", put=null, delete=null, update=null), TransactWriteItem(conditionCheck=null",
-            ", put=null, delete=Delete(key={pk=AttributeValue(s=k, n=null, b=null",
-            ", iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null",
-            ", iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null",
-            ", bOOL=null)}, tableName=_capture_20261010_mcii_none",
-            ", conditionExpression=#n = :v, expressionAttributeNames={#n=a}",
-            ", expressionAttributeValues={:v=AttributeValue(s=null, n=1, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", returnValuesOnConditionCheckFailure=ALL_OLD, workloadProfileName=null)",
-            ", update=null), TransactWriteItem(conditionCheck=null, put=null, delete=null",
-            ", update=Update(key={pk=AttributeValue(s=k, n=null, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", updateExpression=SET #n = :v, tableName=_capture_20261010_mcii_none",
-            ", conditionExpression=#n = :v, expressionAttributeNames={#n=a}",
-            ", expressionAttributeValues={:v=AttributeValue(s=null, n=1, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", returnValuesOnConditionCheckFailure=ALL_OLD, workloadProfileName=null))",
-            ", TransactWriteItem(conditionCheck=null",
-            ", put=Put(item={ss=AttributeValue(s=null, n=null, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=[a], nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)",
-            ", b=AttributeValue(s=null, n=null, b=null, iNT=null, dECIMAL=null",
-            ", dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null",
-            ", dOUBLESET=null, m=null, l=null, nULL=null, bOOL=true)",
-            ", nul=AttributeValue(s=null, n=null, b=null, iNT=null, dECIMAL=null",
-            ", dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null",
-            ", dOUBLESET=null, m=null, l=null, nULL=true, bOOL=null)",
-            ", bin=AttributeValue(s=null, n=null",
-            ", b=java.nio.HeapByteBuffer[pos=0 lim=3 cap=3], iNT=null, dECIMAL=null",
-            ", dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null",
-            ", dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)",
-            ", pk=AttributeValue(s=p, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null",
-            ", sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null",
-            ", m=null, l=null, nULL=null, bOOL=null), l=AttributeValue(s=null, n=null",
-            ", b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null",
-            ", iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null",
-            ", l=[AttributeValue(s=null, n=1, b=null, iNT=null, dECIMAL=null, dOUBLE=null",
-            ", sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null",
-            ", m=null, l=null, nULL=null, bOOL=null)], nULL=null, bOOL=null)",
-            ", m=AttributeValue(s=null, n=null, b=null, iNT=null, dECIMAL=null",
-            ", dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null",
-            ", dOUBLESET=null, m={x=AttributeValue(s=y, n=null, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", l=null, nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none",
-            ", conditionExpression=#n = :v, expressionAttributeNames={#n=a}",
-            ", expressionAttributeValues={:v=AttributeValue(s=null, n=1, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", returnValuesOnConditionCheckFailure=ALL_OLD, workloadProfileName=null)",
-            ", delete=null, update=null), TransactWriteItem(conditionCheck=null",
-            ", put=Put(item={pk=AttributeValue(s=t0, n=null, b=null, iNT=null",
-            ", dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null",
-            ", dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", tableName=_capture_20261010_mcii_none, conditionExpression=null",
-            ", expressionAttributeNames=null, expressionAttributeValues=null",
-            ", returnValuesOnConditionCheckFailure=null, workloadProfileName=null)",
-            ", delete=null, update=null), ",
-        ),
-        concat!(
-            "1010_mcii_none, conditionExpression=null, expressionAttributeNames=null",
-            ", expressionAttributeValues=null, returnValuesOnConditionCheckFailure=null",
-            ", workloadProfileName=null), delete=null",
-            ", update=null)]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
-        ),
-        49744,
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
     );
 }
 
@@ -410,32 +337,9 @@ fn an_echoed_map_is_sized_to_its_entries() {
             "batch, {} names",
             sent.len()
         );
-
-        let mut actions = vec![json!({"Put": {"TableName": "t", "Item": item}})];
-        actions.extend(
-            (0..100).map(
-                |i| json!({"Put": {"TableName": "t", "Item": {"pk": {"S": format!("s{i}")}}}}),
-            ),
-        );
-        let message = db
-            .transact_write_items(
-                serde_json::from_value::<TransactWriteItemsRequest>(
-                    json!({"TransactItems": actions}),
-                )
-                .unwrap(),
-            )
-            .unwrap_err()
-            .to_string();
-        let start = message.find("item={").unwrap() + "item={".len();
-        assert_eq!(
-            echoed_names(&message, start),
-            listed,
-            "transaction, {} names",
-            sent.len()
-        );
     }
 
-    // A nested map, and ExpressionAttributeNames, are sized the same way.
+    // A nested map is sized the same way.
     let sent = ["bsol", "byko", "bvrn", "btgp", "pk"];
     let nested: serde_json::Map<String, Value> = sent
         .iter()
@@ -456,28 +360,28 @@ fn an_echoed_map_is_sized_to_its_entries() {
         ["bsol", "pk", "btgp", "byko", "bvrn"]
     );
 
+    // So is ExpressionAttributeNames, echoed here in a get list.
     let names: serde_json::Map<String, Value> = sent
         .iter()
         .map(|name| (format!("#{name}"), json!(name)))
         .collect();
-    let condition = sent
+    let projection = sent
         .iter()
-        .map(|name| format!("attribute_not_exists(#{name})"))
+        .map(|name| format!("#{name}"))
         .collect::<Vec<_>>()
-        .join(" AND ");
-    let mut actions = vec![json!({"Put": {
+        .join(", ");
+    let mut gets = vec![json!({"Get": {
         "TableName": "t",
-        "Item": {"pk": {"S": "n"}},
-        "ConditionExpression": condition,
+        "Key": {"pk": {"S": "n"}},
+        "ProjectionExpression": projection,
         "ExpressionAttributeNames": names
     }})];
-    actions.extend(
-        (0..100)
-            .map(|i| json!({"Put": {"TableName": "t", "Item": {"pk": {"S": format!("s{i}")}}}})),
+    gets.extend(
+        (0..100).map(|i| json!({"Get": {"TableName": "t", "Key": {"pk": {"S": format!("g{i}")}}}})),
     );
     let message = db
-        .transact_write_items(
-            serde_json::from_value::<TransactWriteItemsRequest>(json!({"TransactItems": actions}))
+        .transact_get_items(
+            serde_json::from_value::<TransactGetItemsRequest>(json!({"TransactItems": gets}))
                 .unwrap(),
         )
         .unwrap_err()

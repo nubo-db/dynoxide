@@ -584,7 +584,8 @@ async fn search_vectors_member_errors() {
 }
 
 const KEY_NULL: &str = "Value null at 'key' failed to satisfy constraint: Member must not be null";
-const ALL_OR: &str = "Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]";
+const XOR_ENUM: &str = "Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: \
+                        Member must satisfy enum value set: [AND, OR]";
 
 fn two_expected() -> serde_json::Value {
     serde_json::json!({"Expected": {"a": {"Exists": false}, "b": {"Exists": false}}})
@@ -665,11 +666,12 @@ async fn query_reports_an_empty_name_and_a_zero_limit_together() {
 }
 
 /// A `ConditionalOperator` that does join two or more legacy conditions but
-/// isn't `AND` or `OR` gets the newer layer's generic enum message, with
-/// DynamoDB's own `[ALL, OR]` list: enveloped on PutItem, UpdateItem and
-/// DeleteItem (five of seven regions), bare on Query (six of seven) and, since
-/// Scan moved to the newer layer, on Scan. Captured 2026-10-09 and, for Scan,
-/// 2026-10-20.
+/// isn't `AND` or `OR` gets the newer layer's enum message, naming the value
+/// and the member and listing `[AND, OR]`: enveloped on PutItem, UpdateItem
+/// and DeleteItem, bare on Query and Scan (captured eu-west-2 and us-east-1,
+/// 2026-11-11). On 2026-10-09 and 2026-10-20 the message named neither and
+/// listed `[ALL, OR]`; which requests get it, and in which envelope, has not
+/// moved.
 #[tokio::test]
 async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
     let url = start_server().await;
@@ -684,7 +686,7 @@ async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
                 ),
                 xor.clone(),
             ),
-            one(ALL_OR),
+            one(XOR_ENUM),
         ),
         (
             "DeleteItem",
@@ -695,7 +697,7 @@ async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
                 ),
                 xor.clone(),
             ),
-            one(ALL_OR),
+            one(XOR_ENUM),
         ),
         (
             "UpdateItem",
@@ -707,7 +709,7 @@ async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
                 ),
                 xor.clone(),
             ),
-            one(ALL_OR),
+            one(XOR_ENUM),
         ),
         (
             "Query",
@@ -717,7 +719,7 @@ async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
                     "QueryFilter": {"b": {"ComparisonOperator": "NULL"}, "c": {"ComparisonOperator": "NULL"}}}),
                 xor.clone(),
             ),
-            ALL_OR.to_string(),
+            XOR_ENUM.to_string(),
         ),
         (
             "Scan",
@@ -726,7 +728,7 @@ async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
                     "ScanFilter": {"b": {"ComparisonOperator": "NULL"}, "c": {"ComparisonOperator": "NULL"}}}),
                 xor.clone(),
             ),
-            ALL_OR.to_string(),
+            XOR_ENUM.to_string(),
         ),
         (
             "PutItem",

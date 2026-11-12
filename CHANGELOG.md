@@ -52,6 +52,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `ConditionalOperator` other than `AND` or `OR` is refused in the words
+  DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
+  constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has
+  changed this message since October, when it named neither the value nor
+  the member and listed `[ALL, OR]`, and the Parity Suite's Query ordering
+  test caught the difference. Lower case and the empty string are refused the
+  same way on Query, Scan, PutItem, UpdateItem and DeleteItem. With no table
+  name, a Query now lists the operator beside the missing name, as Scan
+  already did, and so does a PutItem; a DeleteItem with no key lists it ahead
+  of the key, as UpdateItem does. `KeyConditions` now conflicts only with
+  `KeyConditionExpression`, so a Query that pairs it with a `FilterExpression`
+  or a `ProjectionExpression` runs, where it used to be refused, and the
+  mixing message no longer names it beside a `FilterExpression`. The
+  placeholders Dynoxide names the key conditions through internally never
+  take the place of the caller's own, so a caller's `:kc_v0` or `#kc_0` means
+  what the caller defined. Query, Scan, GetItem and BatchGetItem now check
+  their expressions through before the table is looked up, as DynamoDB does:
+  syntax, a name or value nobody defined, overlapping projection paths, and
+  then a name or value no expression uses. A filter value nobody defined used
+  to go unnoticed when no item was read. A key condition value nobody defined
+  is named as the key condition's, and a projection syntax error, such as
+  `#a,,` or `a[-1]`, names the offending token and where it sits, in
+  DynamoDB's usual form. A BatchGetItem reports a fault in a table's
+  projection ahead of a repeated key. `ExpressionAttributeValues` on a Query or Scan
+  with only a `ProjectionExpression` is now refused, and on Query and Scan the
+  refusal no longer ends with `: FilterExpression is null`
+  ([#319](https://github.com/nubo-db/dynoxide/issues/319)).
 - A `B` value, or a `BS` member, is read the way DynamoDB reads base64.
   The refusals now carry DynamoDB's `SerializationException` messages
   (`Buffer is too short for base64 encoding` for one character, `Base64
@@ -137,6 +164,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It holds over HTTP and in the wasm engine. Captured against eu-west-2 and
   us-east-1 on 9 October 2026, and the map order against eu-west-2 on
   9 November 2026 ([#261](https://github.com/nubo-db/dynoxide/issues/261)).
+- A PartiQL UPDATE that sets or removes a path into a key attribute, such as
+  `SET pk.x = 1` or `REMOVE sk[0]`, is refused as an update of that key:
+  `Cannot update attribute pk. This attribute is part of the key`. It used to
+  say the document path was invalid, or fail its condition when the item was
+  missing. With both keys named, the sort key is the one reported, whichever
+  comes first. `SET m.pk = 2` still runs. Captured against eu-west-2 and
+  us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- ExecuteStatement and a BatchExecuteStatement member read a `ConsistentRead`
+  written as a string, such as `"true"` or `"no"`, as GetItem does, where they
+  used to refuse it with a `SerializationException`. A list there is refused
+  with no message, as DynamoDB refuses it. Captured against eu-west-2 and
+  us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- The refusal of an ORDER BY term that isn't a key prints a quoted name
+  without its quotes, so `ORDER BY "a.b"` names `a.b`. Captured against
+  eu-west-2 and us-east-1 on 11 November 2026 ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- In a PartiQL WHERE clause, a call to `attribute_exists`,
+  `attribute_not_exists` or `attribute_type` can be a BETWEEN bound or
+  subject, the operand of `size` or `attribute_type`, or the argument of
+  `attribute_exists`, and it answers as a boolean written there would.
+  `attribute_type(attribute_exists(n), 'BOOL')` is true, and `n BETWEEN
+  attribute_exists(n) AND 5` is refused for its boolean bound. These used to
+  fail to parse. `size` now refuses a number, a boolean or a null operand, as
+  a literal, a parameter, a call or another `size`, where it used to match
+  nothing. Captured against eu-west-2 and us-east-1 on 11 November 2026
+  ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
+- A PartiQL WHERE clause is checked in one pass, in the order it's written,
+  and the first fault met is the one reported. Inside a condition each
+  operand comes before its operator, and an operand's own operands before it,
+  so `size(true) < attribute_exists(n)` is refused for size's boolean and
+  `attribute_exists(size(s, s))` for size's operand count. A wrong operand
+  count, a type a call or operator can't take, an operand that isn't
+  distinct, an IN with more than 100 operands and a parameter of the wrong
+  type all count as faults in the same pass. Before, some of these were
+  reported ahead of others wherever they were written. A `size` given two
+  operands and standing on its own, as in `WHERE size(s, s) AND n = 1`, is
+  refused for its count, where it used to be called a malformed statement.
+- That pass is the statement's own validation. A write naming an index is
+  refused first, then a read of an index keyed on more than one attribute
+  outside a transaction, then the parameter count, then the pass, and only
+  after that are the table, the key, ORDER BY and RETURNING looked at. A
+  refused `set_add` or `set_delete` comes after the pass. In
+  BatchExecuteStatement a fault is that member's own error, and the other
+  members run; the member is no longer counted for the duplicate, mixed read
+  and write, or missing key checks. In ExecuteTransaction it is
+  `Validation failed in TransactStatements[i]`, ahead of the same-item check
+  and never a cancellation reason. A `COUNT(*)` read of a multi-attribute
+  index in a batch is refused for the index, as ExecuteStatement refuses it.
+- Arithmetic that starts the left side of a condition is refused for its
+  first `+` or `-` ahead of anything wrong with its operands, on a size, a
+  value or a path, and inside brackets: `size(true) + 1 > size(s)`,
+  `1 + size(s) > 0`, `(size(s) + 1) > 0` and `n + 1 > 0` all name the `+`.
+  All but the first used to be called malformed statements. Arithmetic on
+  the right of a comparison, in a BETWEEN bound or in an IN list is still
+  called malformed. IS on any `size` is refused for the IS, even one given
+  two operands.
+- A PartiQL UPDATE, DELETE or INSERT sent with a `NextToken` runs as it
+  would without one, where it used to be refused. An empty `NextToken` is
+  refused as a member error on any statement. This and the three entries
+  above were captured against eu-west-2 on 11 November 2026, in rounds five
+  to thirteen of the capture; rounds one to four went to us-east-1 as well,
+  and the regions agreed ([#230](https://github.com/nubo-db/dynoxide/issues/230)).
 - The MCP tools read `consistent_read` (`get_item`, and `ConsistentRead`
   inside `batch_get_item`'s `request_items`) and `scan_index_forward`
   (`query`) as the HTTP API does: the strings DynamoDB reads as booleans,
@@ -172,7 +260,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an empty statement) ahead of a parameter refused for its value, and
   `parameters` that isn't a list as a `SerializationException` rather than a
   protocol error, as ExecuteStatement does over HTTP. `consistent_read` goes
-  to ExecuteStatement as given, so a string gets ExecuteStatement's answer
+  to ExecuteStatement as given, so a string gets ExecuteStatement's answer:
+  one DynamoDB reads as a boolean runs, and any other is refused
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
 - An empty `ClientRequestToken` is refused on TransactWriteItems and
   ExecuteTransaction. Before, it was accepted and the request went on to look

@@ -78,13 +78,17 @@ for (const version of ["1.7.0", "1.7.0-rc.1", "1.8.0", "2.0.0"]) {
   });
 }
 
+function escapeRegExp(text) {
+  return text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
 for (const version of ["1.6.0", "1.6.9-rc.1", "0.9.0"]) {
   test(`version ${version} is refused`, async () => {
     await assert.rejects(
       checkVersion(FAKE, { command: viaNode, env: { FAKE_VERSION: version } }),
       {
         code: "DYNOXIDE_TOO_OLD",
-        message: new RegExp(`found ${version.replace(/\./g, "\\.")}, and start\\(\\) needs 1\\.7\\.0 or later`),
+        message: new RegExp(`found ${escapeRegExp(version)}, and start\\(\\) needs 1\\.7\\.0 or later`),
       }
     );
   });

@@ -119,6 +119,7 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             // array by position.
             refuse_array(obj, "StreamSpecification")?;
             refuse_array(obj, "SSESpecification")?;
+            refuse_array(obj, "OnDemandThroughput")?;
             refuse_array_elements(obj, "Tags")?;
 
             // Check nested fields inside KeySchema elements
@@ -200,6 +201,14 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             check_list_elements_are_structs(obj, "GlobalSecondaryIndexUpdates")?;
             check_field_is_struct(obj, "ProvisionedThroughput")?;
             check_nested_pt_fields(obj)?;
+            // Structures the request decoder would otherwise read from an
+            // array by position, and two it doesn't read whose array DynamoDB
+            // refuses all the same.
+            refuse_array(obj, "StreamSpecification")?;
+            refuse_array(obj, "SSESpecification")?;
+            refuse_array(obj, "OnDemandThroughput")?;
+            refuse_array_elements(obj, "AttributeDefinitions")?;
+            refuse_array_elements(obj, "ReplicaUpdates")?;
             // Check inside GlobalSecondaryIndexUpdates
             if let Some(serde_json::Value::Array(arr)) = obj.get("GlobalSecondaryIndexUpdates") {
                 for item in arr {

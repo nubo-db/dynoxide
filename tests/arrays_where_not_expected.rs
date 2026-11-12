@@ -13,7 +13,8 @@
 //! 12 November 2026 and the answers DynamoDB gave. They are data captured from
 //! DynamoDB, not written by hand. Where the regions differ both answers are
 //! kept and the row names the one Dynoxide gives: BatchWriteItem reads its body
-//! as `[RequestItems]` or `[RequestItems, ReturnConsumedCapacity]`, a
+//! as `[RequestItems]`, `[RequestItems, ReturnConsumedCapacity]` or
+//! `[RequestItems, ReturnConsumedCapacity, ReturnItemCollectionMetrics]`, a
 //! `PutRequest` as `[Item]` and a `DeleteRequest` as `[Key]` in eu-west-2 and
 //! refuses them in us-east-1, and Dynoxide reads them as eu-west-2 does. The
 //! one other row where the regions differ is an operator outside the enum,
@@ -89,11 +90,17 @@ const LEFT_OUT: &[(&str, usize, &str, &str)] = &[
          RequestItems map naming a table called RequestItems, whose entry has no Keys",
     ),
     (
-        "second round",
-        8,
-        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The requestItems parameter is required for BatchWriteItem"}"#,
-        "read by position as an empty RequestItems, which Dynoxide refuses in the words \
-         most regions use for the object form; eu-west-2 words it differently",
+        "seventh round",
+        21,
+        r#"{"__type":"com.amazon.coral.service#UnknownOperationException"}"#,
+        "UpdateContinuousBackups is not implemented",
+    ),
+    (
+        "seventh round",
+        27,
+        r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        "a PutRequest given as [Item, \"x\"] is read with the second element ignored; one \
+         row is not enough to know the rule for elements past the first",
     ),
 ];
 
@@ -247,6 +254,12 @@ async fn the_fifth_round_answers_as_dynamodb_did() {
 async fn the_sixth_round_answers_as_dynamodb_did() {
     let url = start_server().await;
     assert_eq!(assert_rows(&url, "sixth round", SIXTH_ROUND).await, 12);
+}
+
+#[tokio::test]
+async fn the_seventh_round_answers_as_dynamodb_did() {
+    let url = start_server().await;
+    assert_eq!(assert_rows(&url, "seventh round", SEVENTH_ROUND).await, 31);
 }
 
 /// SearchVectors is not in the captures and keeps its own reader, which
@@ -1373,5 +1386,207 @@ const SIXTH_ROUND: &[Row] = &[
         "BatchGetItem",
         r#"[null,"TOTAL"]"#,
         Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+];
+const SEVENTH_ROUND: &[Row] = &[
+    (
+        1,
+        "TransactGetItems",
+        r#"{"TransactItems":[[]]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        2,
+        "TransactGetItems",
+        r#"{"TransactItems":[{"Get":[]}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        3,
+        "TransactGetItems",
+        r#"{"TransactItems":[[],{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}}}}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        4,
+        "TransactWriteItems",
+        r#"{"TransactItems":[[]]}"#,
+        Same(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '' at 'transactItems' failed to satisfy constraint: TransactWriteRequest should contain Delete or Put or Update or ConditionCheck"}"#,
+        ),
+    ),
+    (
+        5,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","StreamSpecification":[true,"NEW_IMAGE"]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        6,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","SSESpecification":[true]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        7,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","SSESpecification":[true,"KMS","k"]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        8,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","AttributeDefinitions":[["pk","S"]]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        9,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","GlobalSecondaryIndexUpdates":[{"Create":["g",[{"AttributeName":"pk","KeyType":"HASH"}],{"ProjectionType":"ALL"}]}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        10,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","GlobalSecondaryIndexUpdates":[{"Delete":["g"]}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        11,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","GlobalSecondaryIndexUpdates":[{"Update":["g",{"ReadCapacityUnits":1,"WriteCapacityUnits":1}]}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        12,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","OnDemandThroughput":[1,1]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        13,
+        "UpdateTable",
+        r#"{"TableName":"_capture_20261111_317_none","ReplicaUpdates":[[{"RegionName":"eu-west-1"}]]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        14,
+        "CreateTable",
+        r#"{"TableName":"_capture_20261111_317_nonex","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"Projection":["ALL"]}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        15,
+        "CreateTable",
+        r#"{"TableName":"_capture_20261111_317_nonex","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","GlobalSecondaryIndexes":[{"IndexName":"g","KeySchema":[["pk","HASH"]],"Projection":{"ProjectionType":"ALL"}}]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        16,
+        "CreateTable",
+        r#"{"TableName":"_capture_20261111_317_nonex","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","LocalSecondaryIndexes":[["l",[{"AttributeName":"pk","KeyType":"HASH"}],{"ProjectionType":"ALL"}]]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        17,
+        "CreateTable",
+        r#"{"TableName":"_capture_20261111_317_nonex","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","OnDemandThroughput":[1,1]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        18,
+        "CreateTable",
+        r#"{"TableName":"_capture_20261111_317_nonex","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","StreamSpecification":[true]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        19,
+        "CreateTable",
+        r#"{"TableName":"_capture_20261111_317_nonex","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST","SSESpecification":[true,"KMS","k"]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        20,
+        "TagResource",
+        r#"{"ResourceArn":"arn:aws:dynamodb:eu-west-2:000000000000:table/_capture_20261111_317_none","Tags":[["k","v"]]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        21,
+        "UpdateContinuousBackups",
+        r#"{"TableName":"_capture_20261111_317_none","PointInTimeRecoverySpecification":[true]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        22,
+        "ExecuteStatement",
+        r#"{"Statement":"SELECT * FROM \"_capture_20261111_317_none\" WHERE pk = ?","Parameters":[["a"]]}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        23,
+        "BatchWriteItem",
+        r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL","SIZE"]"#,
+        Same(
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+    ),
+    (
+        24,
+        "BatchWriteItem",
+        r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL","SIZE","x"]"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        25,
+        "BatchWriteItem",
+        r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL","BOGUS"]"#,
+        Same(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BOGUS' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"}"#,
+        ),
+    ),
+    (
+        26,
+        "BatchWriteItem",
+        r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"BOGUS"]"#,
+        Same(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+        ),
+    ),
+    (
+        27,
+        "BatchWriteItem",
+        r#"{"RequestItems":{"_capture_20261111_317_none":[{"PutRequest":[{"pk":{"S":"a"}},"x"]}]}}"#,
+        Same(
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+    ),
+    (
+        28,
+        "BatchWriteItem",
+        r#"{"RequestItems":{"_capture_20261111_317_none":[{"PutRequest":[]}]}}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        29,
+        "BatchWriteItem",
+        r#"{"RequestItems":{"_capture_20261111_317_none":[{"DeleteRequest":[null]}]}}"#,
+        Same(r#"{"__type":"com.amazon.coral.service#SerializationException"}"#),
+    ),
+    (
+        30,
+        "BatchWriteItem",
+        r#"{"RequestItems":{}}"#,
+        Same(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+    ),
+    (
+        31,
+        "BatchGetItem",
+        r#"{"RequestItems":{}}"#,
+        Same(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
     ),
 ];

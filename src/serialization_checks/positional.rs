@@ -5,8 +5,10 @@
 //! exceptions it reads by position (captured eu-west-2 and us-east-1, 11 and 12
 //! November 2026):
 //!
-//! - a BatchGetItem or BatchWriteItem body of `[RequestItems]` or
-//!   `[RequestItems, ReturnConsumedCapacity]`;
+//! - a BatchGetItem body of `[RequestItems]` or
+//!   `[RequestItems, ReturnConsumedCapacity]`, and a BatchWriteItem body of
+//!   those or `[RequestItems, ReturnConsumedCapacity,
+//!   ReturnItemCollectionMetrics]`;
 //! - in BatchWriteItem, a `PutRequest` given as `[Item]` and a
 //!   `DeleteRequest` given as `[Key]`;
 //! - on Query and Scan, a `Condition` in `KeyConditions`, `QueryFilter` or
@@ -25,8 +27,12 @@ pub(super) fn rewrite(operation: &str, body: &str) -> Option<String> {
     let bytes = body.as_bytes();
     let start = skip_ws(bytes, 0);
     match operation {
-        "BatchGetItem" => batch_body(body, start),
-        "BatchWriteItem" => match batch_body(body, start) {
+        "BatchGetItem" => batch_body(body, start, &["ReturnConsumedCapacity"]),
+        "BatchWriteItem" => match batch_body(
+            body,
+            start,
+            &["ReturnConsumedCapacity", "ReturnItemCollectionMetrics"],
+        ) {
             Some(rewritten) => {
                 let start = skip_ws(rewritten.as_bytes(), 0);
                 Some(write_requests(&rewritten, start).unwrap_or(rewritten))
@@ -39,30 +45,28 @@ pub(super) fn rewrite(operation: &str, body: &str) -> Option<String> {
     }
 }
 
-/// A BatchGetItem or BatchWriteItem body of one or two elements, the first an
-/// object and the second a string or `null` (which leaves
-/// `ReturnConsumedCapacity` unset), as the object form it stands for. Only
-/// those two positions were captured, so a third element leaves the body to be
-/// refused as an array.
-fn batch_body(body: &str, start: usize) -> Option<String> {
+/// A batch body read by position, as the object form it stands for: the
+/// first element an object (`RequestItems`), then one string member for each
+/// of `members` in order (`ReturnConsumedCapacity`, and on BatchWriteItem
+/// `ReturnItemCollectionMetrics`). A `null` there leaves the member unset. More
+/// elements than that, or one of another type, leaves the body to be refused
+/// as an array: BatchGetItem's third element and BatchWriteItem's fourth are
+/// refused.
+fn batch_body(body: &str, start: usize, members: &[&str]) -> Option<String> {
     let elements = elements(body, start)?;
-    let (first, second) = match elements.as_slice() {
-        [first] => (*first, None),
-        [first, second] => (*first, Some(*second)),
-        _ => return None,
-    };
-    if !starts_with(body, first, b'{') {
+    let (&first, rest) = elements.split_first()?;
+    if rest.len() > members.len() || !starts_with(body, first, b'{') {
         return None;
     }
     let mut out = format!("{{\"RequestItems\":{}", &body[first.0..first.1]);
-    match second {
-        None => {}
-        Some(second) if is_null(body, second) => {}
-        Some(second) if starts_with(body, second, b'"') => {
-            out.push_str(",\"ReturnConsumedCapacity\":");
-            out.push_str(&body[second.0..second.1]);
+    for (&element, member) in rest.iter().zip(members) {
+        if is_null(body, element) {
+            continue;
         }
-        Some(_) => return None,
+        if !starts_with(body, element, b'"') {
+            return None;
+        }
+        out.push_str(&format!(",\"{member}\":{}", &body[element.0..element.1]));
     }
     out.push('}');
     Some(out)
@@ -306,7 +310,8 @@ mod tests {
             ("Scan", r#"{"QueryFilter":{"pk":[[],"EQ"]}}"#),
             ("PutItem", r#"["t", {"pk": {"S": "a"}}]"#),
             ("BatchWriteItem", r#"[]"#),
-            ("BatchWriteItem", r#"[{}, "TOTAL", "x"]"#),
+            ("BatchWriteItem", r#"[{}, "TOTAL", "SIZE", "x"]"#),
+            ("BatchWriteItem", r#"[{}, "TOTAL", 5]"#),
             (
                 "BatchWriteItem",
                 r#"{"RequestItems":{"t":[[{"Item":{}}]]}}"#,
@@ -361,6 +366,10 @@ mod tests {
             Some(
                 r#"{"RequestItems":{"t":[{"PutRequest":{"Item":{"pk":{"S":"b"}}}},{"DeleteRequest":{"Key":{"pk":{"S":"a"}}}}]},"ReturnConsumedCapacity":"TOTAL"}"#
             )
+        );
+        assert_eq!(
+            rewrite("BatchWriteItem", r#"[{}, null, "SIZE"]"#).as_deref(),
+            Some(r#"{"RequestItems":{},"ReturnItemCollectionMetrics":"SIZE"}"#)
         );
         assert_eq!(
             rewrite("BatchWriteItem", r#"[{}]"#).as_deref(),

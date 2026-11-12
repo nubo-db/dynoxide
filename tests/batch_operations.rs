@@ -730,10 +730,12 @@ fn batch_get_allows_uniform_projection_across_tables() {
 }
 
 #[test]
-fn test_batch_write_empty_request_items_keeps_bespoke_message() {
-    // BatchWriteItem has not followed BatchGetItem onto the validation
-    // envelope, so this sentence is the answer nearly every region gives.
-    // Pinned to stop the two being aligned for consistency's sake.
+fn test_batch_write_empty_request_items_is_a_length_error() {
+    // An empty RequestItems is the length error in the validation envelope,
+    // as BatchGetItem answers it and as eu-west-2 answers it for
+    // BatchWriteItem (captured 11 and 12 November 2026). us-east-1 and most
+    // other regions still give `The requestItems parameter is required for
+    // BatchWriteItem`; where the regions differ, Dynoxide follows eu-west-2.
     let db = setup_db();
 
     let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
@@ -744,7 +746,10 @@ fn test_batch_write_empty_request_items_keeps_bespoke_message() {
     let err = db.batch_write_item(req).unwrap_err();
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("The requestItems parameter is required for BatchWriteItem"),
+        msg.contains(
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1"
+        ),
         "Got: {msg}"
     );
 }

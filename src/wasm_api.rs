@@ -1913,6 +1913,41 @@ mod tests {
             r#"[null,"TOTAL"]"#,
             r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
         ),
+        (
+            "second",
+            8,
+            "BatchWriteItem",
+            r#"[{}]"#,
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+        (
+            "seventh",
+            23,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL","SIZE"]"#,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        ),
+        (
+            "seventh",
+            24,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL","SIZE","x"]"#,
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        ),
+        (
+            "seventh",
+            25,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TOTAL","BOGUS"]"#,
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BOGUS' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"}"#,
+        ),
+        (
+            "seventh",
+            26,
+            "BatchWriteItem",
+            r#"[{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"BOGUS"]"#,
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"}"#,
+        ),
     ];
 
     /// The wasm entry points give the HTTP server's answers to a body that
@@ -1958,7 +1993,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((over_http, over_rpc), (51, 45));
+        assert_eq!((over_http, over_rpc), (56, 50));
         assert!(
             wrong.is_empty(),
             "{} answers differ:\n{}",

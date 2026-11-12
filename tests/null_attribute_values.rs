@@ -107,6 +107,12 @@ const NOT_FOLLOWED_YET: &[Excepted] = &[
         "no TableName beside a null",
         r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The supplied Item contains a null AttributeValue: pk is null"}"#,
     ),
+    (
+        "ninth",
+        26,
+        "a bad ReturnValues beside a null set member",
+        r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"#,
+    ),
 ];
 
 /// Rows where a member name is written twice somewhere other than an item, a
@@ -402,6 +408,17 @@ async fn seventh_set_answers_as_dynamodb_did() {
 async fn eighth_set_answers_as_dynamodb_did() {
     assert_eq!(EIGHTH.len(), 13);
     assert_choices("eighth", EIGHTH).await;
+}
+
+/// The ninth set: where a null or empty name ranks on each operation, with
+/// and without an expression, and where a null set member ranks against the
+/// other faults in its value, its item and the request's members (captured
+/// from DynamoDB on 12 November 2026; eu-west-2 and us-east-1 agree on every
+/// row).
+#[tokio::test]
+async fn ninth_set_answers_as_dynamodb_did() {
+    assert_eq!(NINTH.len(), 30);
+    assert_rows("ninth", NINTH).await;
 }
 
 /// TransactWriteItems with no null in the request: an action's item or key
@@ -2118,5 +2135,188 @@ const EIGHTH: &[Choices] = &[
         &[
             r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: xyz"}"##,
         ],
+    ),
+];
+
+const NINTH: &[Row] = &[
+    (
+        1,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":""},"ExpressionAttributeValues":{":a":{"BOOL":"true"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        2,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":""},"ExpressionAttributeValues":{":a":{"BOOL":"true"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames can only be specified when using expressions"}"##,
+    ),
+    (
+        3,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":""}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        4,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":""},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        5,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":null}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":""},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"}"##,
+    ),
+    (
+        6,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":null}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"}"##,
+    ),
+    (
+        7,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: The parameter cannot be converted to a numeric value: xyz for key :a"}"##,
+    ),
+    (
+        8,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        9,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        10,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"#n = :a","ExpressionAttributeNames":{"#n":""},"ExpressionAttributeValues":{":a":{"S":"x"}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        11,
+        "TransactGetItems",
+        r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ProjectionExpression":"#n","ExpressionAttributeNames":{"#n":null}}}]}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        12,
+        "TransactGetItems",
+        r##"{"TransactItems":[{"Get":{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ExpressionAttributeNames":{"#n":null}}}]}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        13,
+        "GetItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ProjectionExpression":"#n","ExpressionAttributeNames":{"#n":null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        14,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET #n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        15,
+        "DeleteItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"ConditionExpression":"attribute_exists(#n)","ExpressionAttributeNames":{"#n":null}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        16,
+        "Scan",
+        r##"{"TableName":"_capture_20261111_317_none","FilterExpression":"#n = :a","ExpressionAttributeNames":{"#n":null},"ExpressionAttributeValues":{":a":{"S":"x"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        17,
+        "BatchGetItem",
+        r##"{"RequestItems":{"_capture_20261111_317_none":{"Keys":[{"pk":{"S":"a"}}],"ProjectionExpression":"#n","ExpressionAttributeNames":{"#n":null}}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeNames contains invalid value: Empty attribute name for key #n"}"##,
+    ),
+    (
+        18,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"a":{"N":"abc"},"s":{"SS":[null]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        19,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null]},"z":{"N":"abc"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        20,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null,"a","a"]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        21,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":["a","a",null]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        22,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null,""]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        23,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"NS":[null,"abc"]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: Numeric sets may not contain null"}"##,
+    ),
+    (
+        24,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"NS":["abc",null]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: abc"}"##,
+    ),
+    (
+        25,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null]}},"ConditionExpression":"a = :a","ExpressionAttributeValues":{":a":{"N":"xyz"}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        26,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null]}},"ReturnValues":"BOGUS"}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"}"##,
+    ),
+    (
+        27,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"L":[{"SS":[null]}]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        28,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"s":{"SS":[null,5]}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"##,
+    ),
+    (
+        29,
+        "BatchWriteItem",
+        r##"{"RequestItems":{"_capture_20261111_317_none":[{"PutRequest":{"Item":{"pk":{"S":"a"},"s":{"SS":[null]}}}}]}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"One or more parameter values were invalid: An string set may not have a null string as a member"}"##,
+    ),
+    (
+        30,
+        "UpdateItem",
+        r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":{"S":"a"}},"UpdateExpression":"SET s = :a","ExpressionAttributeValues":{":a":{"NS":[null]}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"ExpressionAttributeValues contains invalid value: One or more parameter values were invalid: Numeric sets may not contain null for key :a"}"##,
     ),
 ];

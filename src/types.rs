@@ -313,6 +313,12 @@ impl<'de> Deserialize<'de> for AttributeValue {
                         for item in arr {
                             if let Some(n) = item.as_str() {
                                 validate_number_in_deser(n, layer).map_err(de::Error::custom)?;
+                            } else if present.len() == 1 {
+                                // A set's members are checked in order, so
+                                // a null ahead of a bad number is the one
+                                // refused, and one after it is not (captured
+                                // eu-west-2 and us-east-1, 2026-11-12).
+                                return Err(set_member_refusal("NS", item));
                             }
                         }
                     }
@@ -1055,10 +1061,11 @@ const TYPE_MEMBERS: [&str; 10] = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS
 /// item, an `L`, the expression values and an `Expected` value list), and so
 /// does a null type member, as in `{"S": null}`, whatever the attribute
 /// holding it is called (captured eu-west-2 and us-east-1, 2026-11-11, beside
-/// a bad number). So does a null name in `ExpressionAttributeNames`, which
-/// PutItem then refuses bare and Query checks after its expression members
-/// (captured eu-west-2 and us-east-1, 2026-11-12; see
-/// `empty_names::names_checked_early`). A null legacy `Value` and a null
+/// a bad number). So does a null member of a set, though it is refused as a
+/// fault of the set rather than as a null value, and a null name in
+/// `ExpressionAttributeNames`, which PutItem then refuses bare and Query
+/// checks after its expression members (captured eu-west-2 and us-east-1,
+/// 2026-11-12; see `empty_names::names_checked_early`). A null legacy `Value` and a null
 /// request member don't, whatever the attribute they belong to is called: a
 /// legacy condition's keys are attribute names, not type members (captured
 /// eu-west-2 and us-east-1, 2026-11-12, for an attribute named `M`).
@@ -1176,7 +1183,8 @@ fn walk_null(value: &serde_json::Value, shape: Shape) -> bool {
 
 /// Whether an object holds a JSON null where an attribute value belongs: in a
 /// map of attributes it names, in a list of values, or as a value's type
-/// member; or a null name in its `ExpressionAttributeNames`. A legacy condition map never reaches here: its keys are attribute
+/// member; or a null member of a set, or a null name in its
+/// `ExpressionAttributeNames`. A legacy condition map never reaches here: its keys are attribute
 /// names, so an attribute called `M` or `S` is not a type member.
 fn holds_null_value(map: &serde_json::Map<String, serde_json::Value>) -> bool {
     map.iter()
@@ -1190,6 +1198,12 @@ fn holds_null_value(map: &serde_json::Map<String, serde_json::Value>) -> bool {
                 .is_some_and(|values| values.values().any(serde_json::Value::is_null)),
             ("L" | "AttributeValueList", serde_json::Value::Array(values)) => {
                 values.iter().any(serde_json::Value::is_null)
+            }
+            // A null set member is a value fault, not a null value, but it
+            // puts the request on the older layer as one does (captured
+            // eu-west-2 and us-east-1, 2026-11-12).
+            ("SS" | "NS" | "BS", serde_json::Value::Array(members)) => {
+                members.iter().any(serde_json::Value::is_null)
             }
             ("Keys", serde_json::Value::Array(keys)) => keys.iter().any(|key| {
                 key.as_object()
@@ -3792,7 +3806,7 @@ mod tests {
         // A null `Value`, or a null condition, for an attribute named like a
         // type member is not a null attribute value, in any legacy member.
         for member in LEGACY_CONDITIONS {
-            for name in ["M", "L", "S", "Item", "X"] {
+            for name in ["M", "L", "S", "SS", "NS", "Item", "X"] {
                 for condition in [serde_json::json!({"Value": null}), serde_json::Value::Null] {
                     let request = serde_json::json!({ member: { name: condition } });
                     assert!(!holds_null(&request), "{request}");
@@ -3809,6 +3823,7 @@ mod tests {
                     serde_json::json!({"Value": {"M": {"x": null}}}),
                     serde_json::json!({"AttributeValueList": [null]}),
                     serde_json::json!({"AttributeValueList": [{"L": [null]}]}),
+                    serde_json::json!({"Value": {"NS": [null]}}),
                 ] {
                     let request = serde_json::json!({ member: { name: condition } });
                     assert!(holds_null(&request), "{request}");
@@ -3828,6 +3843,7 @@ mod tests {
             serde_json::json!({"pk": null}),
             serde_json::json!({"pk": {"S": null}}),
             serde_json::json!({"pk": {"S": "a"}, "sk": {"M": {"x": null}}}),
+            serde_json::json!({"pk": {"S": "a"}, "s": {"SS": ["a", null]}}),
         ] {
             assert!(attribute_map_holds_null(&key), "{key}");
             assert!(

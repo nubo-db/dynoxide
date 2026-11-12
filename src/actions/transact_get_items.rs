@@ -24,7 +24,38 @@ struct TransactGetItemsRequestRaw {
 #[derive(Deserialize)]
 struct TransactGetItemRaw {
     #[serde(rename = "Get", default)]
-    get: Option<TransactGet>,
+    get: Option<TransactGetRaw>,
+}
+
+/// A `Get` as it arrives, its names as written (see
+/// [`crate::empty_names::action_names`]).
+#[derive(Deserialize)]
+struct TransactGetRaw {
+    #[serde(rename = "TableName")]
+    table_name: String,
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
+    key: HashMap<String, AttributeValue>,
+    #[serde(rename = "ProjectionExpression", default)]
+    projection_expression: Option<String>,
+    #[serde(rename = "ExpressionAttributeNames", default)]
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
+}
+
+impl From<TransactGetRaw> for TransactGet {
+    fn from(raw: TransactGetRaw) -> Self {
+        TransactGet {
+            expression_attribute_names: crate::empty_names::action_names(
+                raw.expression_attribute_names,
+                raw.projection_expression.is_some(),
+            ),
+            table_name: raw.table_name,
+            key: raw.key,
+            projection_expression: raw.projection_expression,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for TransactGetItemsRequest {
@@ -67,7 +98,7 @@ impl<'de> Deserialize<'de> for TransactGetItemsRequest {
                 .transact_items
                 .into_iter()
                 .filter_map(|item| item.get)
-                .map(|get| TransactGetItem { get })
+                .map(|get| TransactGetItem { get: get.into() })
                 .collect(),
             return_consumed_capacity: raw.return_consumed_capacity,
         })

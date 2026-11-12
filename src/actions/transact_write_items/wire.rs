@@ -48,12 +48,8 @@ struct Put {
     item: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(
-        rename = "ExpressionAttributeNames",
-        default,
-        deserialize_with = "crate::empty_names::deserialize_names"
-    )]
-    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeNames", default)]
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -70,12 +66,8 @@ struct Update {
     update_expression: Option<String>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(
-        rename = "ExpressionAttributeNames",
-        default,
-        deserialize_with = "crate::empty_names::deserialize_names"
-    )]
-    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeNames", default)]
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -90,12 +82,8 @@ struct Delete {
     key: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(
-        rename = "ExpressionAttributeNames",
-        default,
-        deserialize_with = "crate::empty_names::deserialize_names"
-    )]
-    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeNames", default)]
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -110,12 +98,8 @@ struct ConditionCheck {
     key: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(
-        rename = "ExpressionAttributeNames",
-        default,
-        deserialize_with = "crate::empty_names::deserialize_names"
-    )]
-    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeNames", default)]
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
@@ -489,8 +473,11 @@ impl Item {
                 TransactPut {
                     table_name: put.table_name.unwrap_or_default(),
                     item,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        put.expression_attribute_names,
+                        put.condition_expression.is_some(),
+                    ),
                     condition_expression: put.condition_expression,
-                    expression_attribute_names: put.expression_attribute_names,
                     expression_attribute_values: values,
                     return_values_on_condition_check_failure: put
                         .return_values_on_condition_check_failure,
@@ -501,9 +488,12 @@ impl Item {
                 TransactUpdate {
                     table_name: update.table_name.unwrap_or_default(),
                     key,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        update.expression_attribute_names,
+                        update.update_expression.is_some() || update.condition_expression.is_some(),
+                    ),
                     update_expression: update.update_expression.unwrap_or_default(),
                     condition_expression: update.condition_expression,
-                    expression_attribute_names: update.expression_attribute_names,
                     expression_attribute_values: values,
                     return_values_on_condition_check_failure: update
                         .return_values_on_condition_check_failure,
@@ -514,8 +504,11 @@ impl Item {
                 TransactDelete {
                     table_name: delete.table_name.unwrap_or_default(),
                     key,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        delete.expression_attribute_names,
+                        delete.condition_expression.is_some(),
+                    ),
                     condition_expression: delete.condition_expression,
-                    expression_attribute_names: delete.expression_attribute_names,
                     expression_attribute_values: values,
                     return_values_on_condition_check_failure: delete
                         .return_values_on_condition_check_failure,
@@ -526,8 +519,11 @@ impl Item {
                 TransactConditionCheck {
                     table_name: check.table_name.unwrap_or_default(),
                     key,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        check.expression_attribute_names,
+                        check.condition_expression.is_some(),
+                    ),
                     condition_expression: check.condition_expression.unwrap_or_default(),
-                    expression_attribute_names: check.expression_attribute_names,
                     expression_attribute_values: values,
                     return_values_on_condition_check_failure: check
                         .return_values_on_condition_check_failure,

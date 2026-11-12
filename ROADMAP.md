@@ -19,13 +19,14 @@ process code.
 - **A PHP package.** `nubo-db/dynoxide` on Packagist downloads and verifies the
   binary, starts it, and comes with a PHPUnit extension (Pest and ParaTest
   included).
+- **A Laravel package.** `nubo-db/dynoxide-laravel` starts Dynoxide in tests,
+  points the app's DynamoDB cache, rate limiter, sessions and failed jobs at
+  it, creates the tables its config names, and adds
+  `php artisan dynoxide:serve` for local development.
 
 ## Next
 
 - **A Python launcher** on PyPI, built on the same contract.
-- **Laravel support**, on top of the PHP package. A
-  [recipe](docs/laravel.md) covers the cache, locks, sessions and failed jobs
-  today.
 - **Guides for Symfony and Bref**, and for Architect's sandbox.
 - **Closing the remaining differences from DynamoDB.** The open
   [bug issues](https://github.com/nubo-db/dynoxide/issues?q=is%3Aopen+label%3Abug)

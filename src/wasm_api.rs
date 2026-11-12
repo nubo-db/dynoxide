@@ -1644,7 +1644,12 @@ mod tests {
             }
         }
         println!("{rows} captured rows: {over_http} sent over HTTP, {over_rpc} over RPC");
-        assert!(over_http > 0 && over_rpc > 0);
+        // Every row in the fixture is read. 18 name an operation the engine
+        // doesn't serve (TransactWriteItems, UpdateTimeToLive, TagResource,
+        // UpdateContinuousBackups and a made-up one) and go over neither
+        // entry point. 3 more have a body that isn't JSON (empty, or cut
+        // short), which the RPC entry point can't be given.
+        assert_eq!((rows, over_http, over_rpc), (288, 270, 267));
         assert!(
             wrong.is_empty(),
             "{} answers differ:\n{}",

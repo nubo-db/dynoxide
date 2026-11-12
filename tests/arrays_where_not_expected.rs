@@ -225,7 +225,11 @@ async fn assert_round(round: &str) -> usize {
             ));
         }
     }
-    assert!(compared > 0, "the {round} has no rows");
+    assert_eq!(
+        compared,
+        rows.len(),
+        "every row of the {round} in the fixture must be sent"
+    );
     assert_eq!(
         left_out,
         fixture.left_out.iter().filter(|l| l.round == round).count(),
@@ -253,9 +257,10 @@ fn every_round_in_the_fixture_is_tested() {
     assert_eq!(names, ROUNDS);
     let rows: usize = fixture().rounds.iter().map(|(_, _, rows)| rows.len()).sum();
     println!("{} rounds, {rows} rows", names.len());
+    assert_eq!(rows, 288, "rows added to or removed from the fixture");
 }
 
-const ROUNDS: [&str; 9] = [
+const ROUNDS: [&str; 10] = [
     "first round",
     "second round",
     "third round",
@@ -265,6 +270,7 @@ const ROUNDS: [&str; 9] = [
     "seventh round",
     "eighth round",
     "ninth round",
+    "tenth round",
 ];
 
 #[tokio::test]
@@ -313,6 +319,15 @@ async fn the_eighth_round_answers_as_dynamodb_did() {
 #[tokio::test]
 async fn the_ninth_round_answers_as_dynamodb_did() {
     assert_round(ROUNDS[8]).await;
+}
+
+/// A list nested 45 to 135 deep in a BatchGetItem body given by position, a
+/// `Condition` given by position and the BatchGetItem object form: the
+/// positional forms are refused with no message from 61 and 62 levels, the
+/// object form gets the nesting error at every depth.
+#[tokio::test]
+async fn the_tenth_round_answers_as_dynamodb_did() {
+    assert_round(ROUNDS[9]).await;
 }
 
 /// SearchVectors is not in the captures and keeps its own reader, which

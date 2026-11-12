@@ -73,11 +73,16 @@ pub(crate) fn is_depth_failure(err: &serde_json::Error) -> bool {
 /// Decide what a body that serde refused on depth should get.
 pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     // A body that is an array is never an object form: it is refused, or it
-    // is a batch body DynamoDB reads by position, and DynamoDB answers either
-    // with no message when it is too deep for its parser, where the object
-    // form gets the nesting error (captured eu-west-2 and us-east-1,
-    // 12 November 2026). A form read by position deeper inside the body holds
-    // no value the scan below finds, so it ends up unreadable too.
+    // is a batch body DynamoDB reads by position. DynamoDB answers a form read
+    // by position with no message from the depth at which its own parser
+    // stops following the body, where the object form gets the nesting error
+    // at every depth. That depth coincides with this parser's limit: a list
+    // nested 61 levels in a BatchGetItem body given by position, or 62 in a
+    // `Condition` given by position, is the first answered with no message,
+    // and the BatchGetItem object form gets the nesting error from 45 levels
+    // to 135 (captured eu-west-2 and us-east-1, 12 November 2026). A form
+    // read by position inside the body holds no value the scan below finds,
+    // so it ends up unreadable too.
     if body
         .trim_start_matches([' ', '\t', '\n', '\r'])
         .starts_with('[')

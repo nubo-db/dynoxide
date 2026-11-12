@@ -231,8 +231,10 @@ fn a_transaction_write_over_100_actions_is_not_listed() {
     );
 }
 
-/// TransactGetItems lists its gets when it holds more than 100, in the same
-/// form.
+/// TransactGetItems refuses more than 100 gets without listing them unless
+/// the request holds a null name, and then lists them in the same form
+/// (captured eu-west-2 and us-east-1, 2026-11-12). Asked for over HTTP, where
+/// a null name can be sent, the listing is bounded.
 #[test]
 fn a_transaction_get_listing_is_bounded() {
     let db = Database::memory().unwrap();
@@ -251,7 +253,44 @@ fn a_transaction_get_listing_is_bounded() {
             ..Default::default()
         })
         .unwrap_err();
-    let message = message(err);
+    assert_eq!(
+        message(err),
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
+    );
+
+    let gets: Vec<serde_json::Value> = (0..101)
+        .map(|i| {
+            let mut get = serde_json::json!({"TableName": "T", "Key": long_key(i)});
+            if i == 0 {
+                get["ExpressionAttributeNames"] = serde_json::json!({"#x": null});
+            }
+            serde_json::json!({"Get": get})
+        })
+        .collect();
+    let message = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(dynoxide::server::serve_on(listener, db));
+        let body: serde_json::Value = reqwest::Client::new()
+            .post(url)
+            .header("x-amz-target", "DynamoDB_20120810.TransactGetItems")
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                 SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+            )
+            .header("x-amz-date", "20260101T000000Z")
+            .body(serde_json::json!({"TransactItems": gets}).to_string())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["message"].as_str().unwrap().to_string()
+    });
     assert!(
         message.starts_with("1 validation error detected: Value '[TransactGetItem("),
         "unexpected message start: {}",

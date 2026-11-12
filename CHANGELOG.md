@@ -91,7 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ProjectionExpression` beside `AttributesToGet` ahead of an empty name in
   `ExpressionAttributeNames`, and a TransactGetItems `Get` with no
   `ProjectionExpression` no longer refuses an empty or unused name, going on
-  to the table lookup as DynamoDB does
+  to the table lookup as DynamoDB does. More than 100 Gets in TransactGetItems
+  are now refused without listing them, as DynamoDB now does, unless the
+  request holds a null name, when the listing shows that name as `null`
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

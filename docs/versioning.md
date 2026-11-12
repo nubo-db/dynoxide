@@ -15,7 +15,7 @@ lives in `Cargo.toml`.
 They were one number until 1.1.0. The split happened because a change to a
 public Rust type forced a major on every artefact whose users never touch the
 Rust API, and stranding everyone on `^1.x` and `dynoxide:1` to report a change
-they cannot observe is a poor trade. The current mapping is product **1.6.0**,
+they cannot observe is a poor trade. The current mapping is product **1.7.0**,
 crate **3.3.0**.
 
 This page says what each number promises. It is not a claim that conformance is

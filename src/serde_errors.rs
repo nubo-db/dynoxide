@@ -586,7 +586,11 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
 
     // "invalid length N, expected struct X ...": a structure given as an
     // array, which DynamoDB refuses with no message (captured eu-west-2 and
-    // us-east-1, 11 and 12 November 2026).
+    // us-east-1, 11 and 12 November 2026). The type checks run before the
+    // decoder (`serialization_checks`) are what refuse an array at a
+    // structure; one of the right length would be read by position here, so
+    // they must. This only catches an array of the wrong length at a
+    // structure those checks have no position for.
     if msg.contains("expected struct") && msg.starts_with("invalid length ") {
         return String::new();
     }
@@ -628,9 +632,10 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
         return "Unexpected field type".to_string();
     }
 
-    // An array where a scalar, a map or a structure belongs: DynamoDB refuses
-    // it with no message (captured eu-west-2 and us-east-1, 11 and 12
-    // November 2026).
+    // An array where a scalar or a map belongs: DynamoDB refuses it with no
+    // message (captured eu-west-2 and us-east-1, 11 and 12 November 2026).
+    // An array at a structure is refused by the type checks run before the
+    // decoder.
     if is_sequence {
         return String::new();
     }
@@ -933,5 +938,25 @@ mod tests {
         assert_eq!(strip_position("msg at line 1 column 2"), "msg");
         assert_eq!(strip_position("msg"), "msg");
         assert_eq!(strip_position("look at line 9"), "look at line 9");
+    }
+
+    /// An array the decoder meets where a structure, a scalar or a map
+    /// belongs is a `SerializationException` with no message.
+    #[test]
+    fn an_array_the_decoder_meets_is_refused_with_no_message() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Pair {
+            a: Option<String>,
+            b: Option<std::collections::HashMap<String, String>>,
+        }
+        for body in [r#"["x"]"#, r#"[]"#, r#"{"a":["x"]}"#, r#"{"b":["x"]}"#] {
+            match deserialize::<Pair>(body) {
+                Err(crate::DynoxideError::SerializationException(message)) => {
+                    assert_eq!(message, "", "{body}")
+                }
+                other => panic!("{body}: {other:?}"),
+            }
+        }
     }
 }

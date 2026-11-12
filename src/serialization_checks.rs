@@ -114,13 +114,7 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             // Check struct fields and their inner scalar types
             check_field_is_struct(obj, "ProvisionedThroughput")?;
             check_nested_pt_fields(obj)?;
-
-            // Structures the request decoder would otherwise read from an
-            // array by position.
-            refuse_array(obj, "StreamSpecification")?;
-            refuse_array(obj, "SSESpecification")?;
-            refuse_array(obj, "OnDemandThroughput")?;
-            refuse_array_elements(obj, "Tags")?;
+            refuse_arrays(operation, obj)?;
 
             // Check nested fields inside KeySchema elements
             check_nested_list_structs(obj, "KeySchema")?;
@@ -201,14 +195,7 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             check_list_elements_are_structs(obj, "GlobalSecondaryIndexUpdates")?;
             check_field_is_struct(obj, "ProvisionedThroughput")?;
             check_nested_pt_fields(obj)?;
-            // Structures the request decoder would otherwise read from an
-            // array by position, and two it doesn't read whose array DynamoDB
-            // refuses all the same.
-            refuse_array(obj, "StreamSpecification")?;
-            refuse_array(obj, "SSESpecification")?;
-            refuse_array(obj, "OnDemandThroughput")?;
-            refuse_array_elements(obj, "AttributeDefinitions")?;
-            refuse_array_elements(obj, "ReplicaUpdates")?;
+            refuse_arrays(operation, obj)?;
             // Check inside GlobalSecondaryIndexUpdates
             if let Some(serde_json::Value::Array(arr)) = obj.get("GlobalSecondaryIndexUpdates") {
                 for item in arr {
@@ -323,6 +310,9 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                                 }
                                 if let Some(key_map) = key.as_object() {
                                     for (_k, v) in key_map {
+                                        if v.is_array() {
+                                            return Err(array_not_expected());
+                                        }
                                         if !v.is_object() && !v.is_null() {
                                             return Err(
                                                 crate::DynoxideError::SerializationException(
@@ -387,16 +377,10 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             check_field_is_list(obj, "Tags")?;
             check_list_elements_are_structs(obj, "Tags")?;
         }
-        // The structures below are read by derived decoders, which would take
-        // an array by position, so an array is refused here first.
-        "UpdateTimeToLive" => refuse_array(obj, "TimeToLiveSpecification")?,
-        "BatchExecuteStatement" => refuse_array_elements(obj, "Statements")?,
-        "ExecuteTransaction" => refuse_array_elements(obj, "TransactStatements")?,
-        // TransactWriteItems has its own reader for its items and their
-        // actions (`actions::transact_write_items::wire`), which already
-        // refuses an array there, apart from an empty one given as an item,
-        // which DynamoDB reads as an item naming no action.
-        "TransactGetItems" => refuse_transact_item_arrays(obj, &["Get"])?,
+        "UpdateTimeToLive"
+        | "BatchExecuteStatement"
+        | "ExecuteTransaction"
+        | "TransactGetItems" => refuse_arrays(operation, obj)?,
         _ => {}
     }
 
@@ -707,45 +691,75 @@ fn check_field_is_map(
     ))
 }
 
-/// Refuse a structure member given as an array. A value of any other type is
-/// left for the request decoder, which answers it as it does today.
-fn refuse_array(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> crate::Result<()> {
-    if obj.get(field).is_some_and(serde_json::Value::is_array) {
-        return Err(array_not_expected());
-    }
-    Ok(())
-}
+/// The structures, outside those the checks above type one by one, where an
+/// array is refused with no message, by operation and path: a member name
+/// for a structure member, `[]` after it for each element of a list of
+/// structures, and `.` between steps. The request decoders are derived, and a
+/// derived decoder reads a structure from an array of the right length by
+/// position, so these checks, not the decoder, are what refuse it.
+/// `ReplicaUpdates` and UpdateTable's `AttributeDefinitions` are not read at
+/// all; DynamoDB refuses an array there all the same. TransactWriteItems is
+/// absent: its own reader (`actions::transact_write_items::wire`) refuses an
+/// array in its items, apart from an empty one given as an item, which
+/// DynamoDB reads as an item naming no action.
+const ARRAYS_REFUSED: &[(&str, &str)] = &[
+    ("CreateTable", "StreamSpecification"),
+    ("CreateTable", "SSESpecification"),
+    ("CreateTable", "OnDemandThroughput"),
+    ("CreateTable", "Tags[]"),
+    ("UpdateTable", "StreamSpecification"),
+    ("UpdateTable", "SSESpecification"),
+    ("UpdateTable", "OnDemandThroughput"),
+    ("UpdateTable", "AttributeDefinitions[]"),
+    ("UpdateTable", "ReplicaUpdates[]"),
+    ("UpdateTimeToLive", "TimeToLiveSpecification"),
+    ("BatchExecuteStatement", "Statements[]"),
+    ("ExecuteTransaction", "TransactStatements[]"),
+    ("TransactGetItems", "TransactItems[]"),
+    ("TransactGetItems", "TransactItems[].Get"),
+];
 
-/// Refuse an element of a list of structures given as an array. An element of
-/// any other type is left for the request decoder.
-fn refuse_array_elements(
+/// Refuse an array at any of `operation`'s paths in [`ARRAYS_REFUSED`]. A
+/// value of any other type is left for the checks above and the decoder.
+fn refuse_arrays(
+    operation: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
 ) -> crate::Result<()> {
-    if let Some(serde_json::Value::Array(items)) = obj.get(field)
-        && items.iter().any(serde_json::Value::is_array)
-    {
-        return Err(array_not_expected());
-    }
-    Ok(())
-}
-
-/// Refuse a TransactGetItems item given as an array, or one of its `actions`
-/// given as an array.
-fn refuse_transact_item_arrays(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    actions: &[&str],
-) -> crate::Result<()> {
-    refuse_array_elements(obj, "TransactItems")?;
-    if let Some(serde_json::Value::Array(items)) = obj.get("TransactItems") {
-        for item in items.iter().filter_map(serde_json::Value::as_object) {
-            for action in actions {
-                refuse_array(item, action)?;
+    let holds_array = |path: &str| {
+        let mut values: Vec<&serde_json::Value> = Vec::new();
+        for (i, step) in path.split('.').enumerate() {
+            let (member, each) = match step.strip_suffix("[]") {
+                Some(member) => (member, true),
+                None => (step, false),
+            };
+            let found: Vec<&serde_json::Value> = if i == 0 {
+                obj.get(member).into_iter().collect()
+            } else {
+                values
+                    .iter()
+                    .filter_map(|value| value.get(member))
+                    .collect()
+            };
+            values = if each {
+                found
+                    .into_iter()
+                    .filter_map(serde_json::Value::as_array)
+                    .flatten()
+                    .collect()
+            } else {
+                found
+            };
+            if values.iter().any(|value| value.is_array()) {
+                return true;
             }
         }
+        false
+    };
+    let refused = ARRAYS_REFUSED
+        .iter()
+        .any(|&(op, path)| op == operation && holds_array(path));
+    if refused {
+        return Err(array_not_expected());
     }
     Ok(())
 }

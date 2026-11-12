@@ -732,10 +732,8 @@ fn batch_get_allows_uniform_projection_across_tables() {
 #[test]
 fn test_batch_write_empty_request_items_is_a_length_error() {
     // An empty RequestItems is the length error in the validation envelope,
-    // as BatchGetItem answers it and as eu-west-2 answers it for
-    // BatchWriteItem (captured 11 and 12 November 2026). us-east-1 and most
-    // other regions still give `The requestItems parameter is required for
-    // BatchWriteItem`; where the regions differ, Dynoxide follows eu-west-2.
+    // as BatchGetItem answers it. DynamoDB's regions differed on this when
+    // captured (11 and 12 November 2026), and Dynoxide follows eu-west-2.
     let db = setup_db();
 
     let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({

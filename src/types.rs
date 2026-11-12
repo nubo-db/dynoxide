@@ -216,6 +216,12 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // Deserialize as raw JSON Value first so we can inspect all keys
         let raw = serde_json::Value::deserialize(deserializer)?;
 
+        // A value given as an array is malformed, refused with no message
+        // wherever it appears (captured eu-west-2 and us-east-1, 12 November
+        // 2026), not read as a value with no members.
+        if raw.is_array() {
+            return Err(de::Error::custom(crate::serde_errors::SERIALIZATION_MARKER));
+        }
         let obj = raw
             .as_object()
             .ok_or_else(|| de::Error::custom("empty AttributeValue object"))?;

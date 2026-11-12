@@ -1,9 +1,9 @@
 //! The forms DynamoDB reads by position, rewritten to the object form they
 //! stand for before any other check reads the request.
 //!
-//! DynamoDB refuses a JSON array wherever it expects an object, with two
-//! exceptions it reads by position (captured eu-west-2 and us-east-1, 11 and 12
-//! November 2026):
+//! DynamoDB refuses a JSON array wherever it expects an object, except in
+//! these places, where it reads one by position (captured eu-west-2 and
+//! us-east-1, 11 and 12 November 2026):
 //!
 //! - a BatchGetItem body of `[RequestItems]` or
 //!   `[RequestItems, ReturnConsumedCapacity]`, and a BatchWriteItem body of
@@ -14,12 +14,15 @@
 //! - on Query and Scan, a `Condition` in `KeyConditions`, `QueryFilter` or
 //!   `ScanFilter` given as `[AttributeValueList, ComparisonOperator]`.
 //!
-//! BatchWriteItem's forms are read this way in eu-west-2 and refused in
-//! us-east-1; Dynoxide follows eu-west-2. Each is rewritten here so the object form's checks and wording apply to it.
-//! Any other array in those places, or an element of the wrong JSON type, is
-//! left alone for the type checks to refuse with no message. The rewrite
-//! splices the request's own text: a parsed value is never written back out,
-//! since that would reorder members and change how numbers are written.
+//! DynamoDB's regions differed on BatchWriteItem's forms when captured, and
+//! Dynoxide follows eu-west-2, which reads them. Each form is rewritten here
+//! so the object form's checks and wording apply to it. Any other array in
+//! those places, or an element of the wrong JSON type, is left alone for the
+//! type checks to refuse with no message. The rewrite splices the request's
+//! own text: a parsed value is never written back out, since that would
+//! reorder members and change how numbers are written.
+
+use crate::json_text::{Span, string_end};
 
 /// `body` with each positional form rewritten to its object form, or `None`
 /// when it holds none and is read as it is. `body` is valid JSON.
@@ -147,24 +150,12 @@ fn conditions(body: &str, start: usize, members: &[&str]) -> Option<String> {
 }
 
 /// `body` with each span replaced by its text, or `None` when there are none.
-/// The spans are in order and do not overlap.
 fn splice(body: &str, replacements: Vec<(Span, String)>) -> Option<String> {
     if replacements.is_empty() {
         return None;
     }
-    let mut out = String::with_capacity(body.len() + 64 * replacements.len());
-    let mut copied = 0;
-    for ((from, to), text) in replacements {
-        out.push_str(&body[copied..from]);
-        out.push_str(&text);
-        copied = to;
-    }
-    out.push_str(&body[copied..]);
-    Some(out)
+    Some(crate::json_text::splice(body, replacements))
 }
-
-/// A value's span in the body: its first byte and the byte after its last.
-type Span = (usize, usize);
 
 fn starts_with(body: &str, span: Span, byte: u8) -> bool {
     body.as_bytes().get(span.0) == Some(&byte)
@@ -179,19 +170,6 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
         i += 1;
     }
     i
-}
-
-/// The end of the string whose opening quote is at `i`.
-fn string_end(bytes: &[u8], mut i: usize) -> Option<usize> {
-    i += 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i + 1),
-            _ => i += 1,
-        }
-    }
-    None
 }
 
 /// The end of the value starting at `i`.
@@ -386,5 +364,103 @@ mod tests {
                 r#"{"TableName":"t","KeyConditions":{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}},"QueryFilter":{"x":{"AttributeValueList":[{"N":1e400}],"ComparisonOperator":"EQ"},"y\"]":{"AttributeValueList":null,"ComparisonOperator":"NULL"}},"Limit":1}"#
             )
         );
+    }
+
+    #[test]
+    fn strings_holding_json_punctuation_are_copied_whole() {
+        assert_eq!(
+            rewrite(
+                "BatchGetItem",
+                r#"[{"t":{"Keys":[{"pk":{"S":"a],[\"}{,\\"}}]}},"TOTAL"]"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"RequestItems":{"t":{"Keys":[{"pk":{"S":"a],[\"}{,\\"}}]}},"ReturnConsumedCapacity":"TOTAL"}"#
+            )
+        );
+        assert_eq!(
+            rewrite(
+                "Scan",
+                r#"{"TableName":"t\\","ScanFilter":{"x\\":[[{"S":"]\\"}],"EQ"]}}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"TableName":"t\\","ScanFilter":{"x\\":{"AttributeValueList":[{"S":"]\\"}],"ComparisonOperator":"EQ"}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn member_names_are_read_as_decoded() {
+        assert_eq!(
+            rewrite(
+                "BatchWriteItem",
+                r#"{"RequestItems":{"t":[{"PutRequest":[{"pk":{"S":"a"}}]}]}}"#
+            )
+            .as_deref(),
+            Some(r#"{"RequestItems":{"t":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#)
+        );
+        assert_eq!(
+            rewrite("Query", r#"{"KeyConditions":{"pk":[[],"EQ"]}}"#).as_deref(),
+            Some(r#"{"KeyConditions":{"pk":{"AttributeValueList":[],"ComparisonOperator":"EQ"}}}"#)
+        );
+    }
+
+    #[test]
+    fn whitespace_around_colons_and_commas_is_kept() {
+        assert_eq!(
+            rewrite(
+                "Query",
+                "{ \"KeyConditions\" :\n { \"pk\" : [ [ ] ,\t\"EQ\" ] } }"
+            )
+            .as_deref(),
+            Some(
+                "{ \"KeyConditions\" :\n { \"pk\" : {\"AttributeValueList\":[ ],\"ComparisonOperator\":\"EQ\"} } }"
+            )
+        );
+    }
+
+    #[test]
+    fn a_duplicated_member_is_rewritten_wherever_it_appears() {
+        assert_eq!(
+            rewrite(
+                "Scan",
+                r#"{"ScanFilter":{"x":[[],"EQ"]},"ScanFilter":{"x":[null,"NULL"]}}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"ScanFilter":{"x":{"AttributeValueList":[],"ComparisonOperator":"EQ"}},"ScanFilter":{"x":{"AttributeValueList":null,"ComparisonOperator":"NULL"}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn numbers_beside_a_rewritten_form_keep_how_they_were_written() {
+        assert_eq!(
+            rewrite(
+                "Scan",
+                r#"{"Limit":-0,"Segment":1e400,"ScanFilter":{"x":[[{"N":"1"}],"EQ"]},"TotalSegments":123456789012345678901234567890}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"Limit":-0,"Segment":1e400,"ScanFilter":{"x":{"AttributeValueList":[{"N":"1"}],"ComparisonOperator":"EQ"}},"TotalSegments":123456789012345678901234567890}"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_request_in_its_object_form_is_left_as_written() {
+        for (operation, body) in [
+            (
+                "BatchWriteItem",
+                r#" { "RequestItems" : {"t":[{"PutRequest":{"Item":{"pk":{"N":"1.50"}}}},{"DeleteRequest":{"Key":{"pk":{"S":"[a]"}}}}]}, "ReturnConsumedCapacity":"TOTAL" } "#,
+            ),
+            (
+                "Scan",
+                r#"{"TableName":"t","ScanFilter":{"x":{"AttributeValueList":[{"N":1e400}],"ComparisonOperator":"EQ"}},"Limit":-0}"#,
+            ),
+        ] {
+            assert_eq!(rewrite(operation, body), None, "{operation} {body}");
+        }
     }
 }

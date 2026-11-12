@@ -75,11 +75,8 @@ fn accumulate_index_units(
 /// so a member error there is still reported ahead of the nesting error.
 pub(crate) fn check_request(request: &BatchWriteItemRequest) -> Result<()> {
     // An empty RequestItems is a length error in the standard envelope, as
-    // BatchGetItem answers it. The regions differ here: eu-west-2 answers
-    // this way (captured 11 and 12 November 2026), while us-east-1 and, as of
-    // the 2026-09-02 sweep, most other regions still answer `The
-    // requestItems parameter is required for BatchWriteItem`. Where the
-    // regions differ, Dynoxide follows eu-west-2.
+    // BatchGetItem answers it. DynamoDB's regions differed on this when
+    // captured (11 and 12 November 2026), and Dynoxide follows eu-west-2.
     if request.request_items.is_empty() {
         return Err(DynoxideError::ValidationException(
             "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: \

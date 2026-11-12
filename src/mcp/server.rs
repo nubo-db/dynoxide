@@ -3120,6 +3120,40 @@ fn find_attribute_type(
 mod tests {
     use super::*;
 
+    /// A tool decodes the request the wire checks return, so a write request
+    /// BatchWriteItem reads by position decodes as its object form, as it does
+    /// over HTTP, and one it refuses is refused with no message.
+    #[test]
+    fn a_write_request_given_by_position_decodes_as_its_object_form() {
+        let decode = |items: serde_json::Value| {
+            decode_wire_request::<crate::actions::batch_write_item::BatchWriteItemRequest>(
+                "BatchWriteItem",
+                vec![("RequestItems", Some(items))],
+            )
+        };
+        let request = decode(serde_json::json!({"tab": [
+            {"PutRequest": [{"pk": {"S": "b"}}]},
+            {"DeleteRequest": [{"pk": {"S": "a"}}]},
+        ]}))
+        .unwrap();
+        let [put, delete] = &request.request_items["tab"][..] else {
+            panic!("{request:?}");
+        };
+        assert_eq!(
+            put.put_request.as_ref().unwrap().item["pk"],
+            crate::types::AttributeValue::S("b".into())
+        );
+        assert_eq!(
+            delete.delete_request.as_ref().unwrap().key["pk"],
+            crate::types::AttributeValue::S("a".into())
+        );
+        let refused = decode(serde_json::json!({"tab": [{"PutRequest": [{}, {}]}]})).unwrap_err();
+        assert_eq!(
+            refused,
+            to_tool_error(crate::DynoxideError::SerializationException(String::new()))
+        );
+    }
+
     fn report(exposures: usize, cautions: usize, accepted: bool) -> ImportReport {
         let mut notices = Vec::new();
         for i in 0..exposures {

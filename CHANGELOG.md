@@ -67,15 +67,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[RequestItems, ReturnConsumedCapacity, ReturnItemCollectionMetrics]`, a
   BatchWriteItem `PutRequest` given as `[Item]` and `DeleteRequest` as
   `[Key]`, and on Query and Scan a condition given as
-  `[AttributeValueList, ComparisonOperator]`. BatchGetItem no longer accepts
-  a table's keys given as an array.
+  `[AttributeValueList, ComparisonOperator]`. DynamoDB's regions differed on
+  BatchWriteItem's forms when captured, and Dynoxide reads them as eu-west-2
+  does. One of these forms holding a value nested too deep for DynamoDB's
+  parser is refused with no message, where the object form gets the nesting
+  error.
+
+- An attribute value given as an array is a `SerializationException` with no
+  message wherever it appears. In a transaction, a batch of PartiQL
+  statements, a legacy `Expected` or `AttributeUpdates` value and a
+  BatchGetItem key, Dynoxide answered `Supplied AttributeValue is empty` or
+  `Unexpected value type in payload`.
 
 - BatchWriteItem with an empty `RequestItems` is refused as BatchGetItem
   refuses it, `1 validation error detected: Value at 'RequestItems' failed to
-  satisfy constraint: Member must have length greater than or equal to 1`,
-  as eu-west-2 answers it. It used to say `The requestItems parameter is
-  required for BatchWriteItem`, which us-east-1 and most other regions still
-  say.
+  satisfy constraint: Member must have length greater than or equal to 1`.
+  It used to say `The requestItems parameter is required for BatchWriteItem`.
+  DynamoDB's regions differed on this when captured, and Dynoxide follows
+  eu-west-2.
 
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

@@ -91,6 +91,7 @@ pub struct ScanRequest {
 /// Scan, as it does in 20 of the 33 observed regions.
 pub(crate) struct ScanMembers<'a> {
     pub table_name: Option<&'a str>,
+    pub index_name: Option<&'a str>,
     pub select: Option<&'a str>,
     pub return_consumed_capacity: Option<&'a str>,
     pub conditional_operator: Option<&'a str>,
@@ -122,8 +123,8 @@ impl ScanMembers<'_> {
     /// 2. `Limit` below 1, `Segment` outside 0 to 999999, `TotalSegments`
     ///    outside 1 to 1000000 and an empty table name, in the newer wording:
     ///    the member's name capitalised and the value not echoed.
-    /// 3. The first table-name error beside a `ReturnConsumedCapacity` outside
-    ///    its enum.
+    /// 3. The first table-name error, then the first `IndexName` error, beside
+    ///    a `ReturnConsumedCapacity` outside its enum.
     ///
     /// Everything else about the request waits for `execute`. The wire path
     /// asks here as the body is read and `execute` asks again, so a request
@@ -132,8 +133,8 @@ impl ScanMembers<'_> {
     pub(crate) fn rejection(&self) -> Option<String> {
         use crate::validation::{
             EMPTY_TABLE_NAME_REJECTION, TableNameContext, conditional_operator_rejection,
-            first_table_name_error, format_validation_errors, return_consumed_capacity_rejection,
-            table_name_constraint_errors,
+            first_index_name_error, first_table_name_error, format_validation_errors,
+            return_consumed_capacity_rejection, table_name_constraint_errors,
         };
 
         let missing_operators =
@@ -232,6 +233,7 @@ impl ScanMembers<'_> {
 
         let mut errors = Vec::new();
         errors.extend(self.table_name.and_then(first_table_name_error));
+        errors.extend(self.index_name.and_then(first_index_name_error));
         errors.extend(return_consumed_capacity_rejection(
             self.return_consumed_capacity,
         ));
@@ -255,6 +257,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         // the stages `ScanMembers::rejection` describes.
         if let Some(msg) = (ScanMembers {
             table_name: raw.table_name.as_deref(),
+            index_name: raw.index_name.as_deref(),
             select: raw.select.as_deref(),
             return_consumed_capacity: raw.return_consumed_capacity.as_deref(),
             conditional_operator: raw.conditional_operator.as_deref(),
@@ -323,6 +326,7 @@ pub async fn execute<S: StorageBackend>(
     // body: a request built in code gets the same answer.
     if let Some(msg) = (ScanMembers {
         table_name: Some(&request.table_name),
+        index_name: request.index_name.as_deref(),
         select: request.select.as_deref(),
         return_consumed_capacity: request.return_consumed_capacity.as_deref(),
         conditional_operator: request.conditional_operator.as_deref(),

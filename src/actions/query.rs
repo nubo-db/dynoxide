@@ -196,6 +196,13 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         }
 
         let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
+        // The first fault in IndexName joins the table name's, ahead of the
+        // table lookup.
+        errors.extend(
+            raw.index_name
+                .as_deref()
+                .and_then(crate::validation::first_index_name_error),
+        );
         let table_name = raw.table_name.unwrap_or_default();
 
         // ReturnConsumedCapacity enum
@@ -282,7 +289,16 @@ pub async fn execute<S: StorageBackend>(
     if let Some(msg) = crate::validation::format_validation_errors(&first_pass) {
         return Err(DynoxideError::ValidationException(msg));
     }
-    crate::validation::validate_item_table_name(&request.table_name)?;
+    let mut name_errors = crate::validation::item_table_name_errors(Some(&request.table_name));
+    name_errors.extend(
+        request
+            .index_name
+            .as_deref()
+            .and_then(crate::validation::first_index_name_error),
+    );
+    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
 
     // A Limit past what a 32-bit integer holds is read as the largest one.
     request.limit = request.limit.map(|l| l.min(i32::MAX as usize));

@@ -1176,8 +1176,8 @@ fn reconcile_attribute_definitions(
     attr_defs.retain(|d| used.contains(d.attribute_name.as_str()));
 }
 
-/// Request-model constraint errors for `GlobalSecondaryIndexUpdates` Update
-/// actions, shared between the operation-layer validation and the raw parse
+/// Request-model constraint errors for `GlobalSecondaryIndexUpdates` actions,
+/// shared between the operation-layer validation and the raw parse
 /// path's cross-family envelope.
 fn collect_gsi_update_errors(updates: &[GlobalSecondaryIndexUpdate], errors: &mut Vec<String>) {
     for (i, update) in updates.iter().enumerate() {
@@ -1214,6 +1214,25 @@ fn collect_gsi_update_errors(updates: &[GlobalSecondaryIndexUpdate], errors: &mu
                 }
             } else {
                 errors.push(format!("Value null at 'globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput' failed to satisfy constraint: Member must not be null", i + 1));
+            }
+        }
+        // A Create or Delete action's index name: the length in characters,
+        // then the pattern, ahead of the table lookup (captured eu-west-2 and
+        // us-east-1, 12 November 2026).
+        let actions = [
+            ("create", update.create.as_ref().map(|c| &c.index_name)),
+            ("delete", update.delete.as_ref().map(|d| &d.index_name)),
+        ];
+        for (action, name) in actions {
+            if let Some(name) = name {
+                errors.extend(crate::validation::name_errors_length_first(
+                    name,
+                    &format!(
+                        "globalSecondaryIndexUpdates.{}.member.{action}.indexName",
+                        i + 1
+                    ),
+                    crate::validation::length_in_characters(name),
+                ));
             }
         }
     }

@@ -497,34 +497,37 @@ fn table_name_pattern_holds(name: &str) -> bool {
 /// [`TableNameContext::ReadWrite`]); the batch and transaction operations carry
 /// their table names inside the body and apply the full constraint.
 pub(crate) fn member_table_name_is_valid(name: &str) -> bool {
-    (3..=255).contains(&name.len()) && table_name_pattern_holds(name)
+    (3..=255).contains(&length_in_characters(name)) && table_name_pattern_holds(name)
 }
 
 /// The constraint errors for a table name carried at `path` inside a
-/// transaction, such as `transactItems.2.member.update.tableName`: the length
-/// first, then the pattern, which is the order DynamoDB lists them in when a
-/// name breaks both (captured us-east-1 and three more regions, 2026-10-09;
-/// eu-west-2 lists the pattern first).
+/// transaction, such as `transactItems.2.member.update.tableName`: the pattern
+/// first, then the length in characters, which is the order and unit
+/// eu-west-2 gives when a name breaks both (captured eu-west-2 and us-east-1,
+/// 12 November 2026; us-east-1 listed the length first on 9 October 2026).
 pub(crate) fn member_table_name_errors(name: &str, path: &str) -> Vec<String> {
-    let mut errors = Vec::new();
-    if name.len() < 3 {
-        errors.push(format!(
-            "Value '{name}' at '{path}' failed to satisfy constraint: \
-             Member must have length greater than or equal to 3"
-        ));
-    } else if name.len() > 255 {
-        errors.push(format!(
-            "Value '{name}' at '{path}' failed to satisfy constraint: \
-             Member must have length less than or equal to 255"
-        ));
-    }
-    if !table_name_pattern_holds(name) {
-        errors.push(format!(
-            "Value '{name}' at '{path}' failed to satisfy constraint: \
-             Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
-        ));
-    }
-    errors
+    name_pattern_error(name, path)
+        .into_iter()
+        .chain(name_length_error(name, path, length_in_characters(name)))
+        .collect()
+}
+
+/// The first fault in a Query or Scan `IndexName`, ahead of the table lookup:
+/// the length in characters, with no value echo and the member spelled
+/// `IndexName`, or else the pattern, echoing the value at `indexName`
+/// (captured eu-west-2 and us-east-1, 12 November 2026).
+pub(crate) fn first_index_name_error(name: &str) -> Option<String> {
+    let length = length_in_characters(name);
+    let constraint = if length < 3 {
+        "Member must have length greater than or equal to 3"
+    } else if length > 255 {
+        "Member must have length less than or equal to 255"
+    } else {
+        return name_pattern_error(name, "indexName");
+    };
+    Some(format!(
+        "Value at 'IndexName' failed to satisfy constraint: {constraint}"
+    ))
 }
 
 /// The constraint a batch request's `RequestItems` map puts on its keys, the
@@ -954,7 +957,7 @@ pub fn validate_gsi(
     request_definitions: &[AttributeDefinition],
 ) -> Result<()> {
     // Validate index name length
-    if gsi.index_name.len() < 3 || gsi.index_name.len() > 255 {
+    if !(3..=255).contains(&length_in_characters(&gsi.index_name)) {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at 'globalSecondaryIndexes.1.member.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",
@@ -1009,14 +1012,14 @@ pub fn validate_vector_index(
     member_path: &str,
 ) -> Result<()> {
     // Index name length (request-model constraint; minimum length 3)
-    if vix.index_name.len() < 3 {
+    if length_in_characters(&vix.index_name) < 3 {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",
             vix.index_name
         )));
     }
-    if vix.index_name.len() > 255 {
+    if length_in_characters(&vix.index_name) > 255 {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must have length less than or equal to 255",
@@ -1712,7 +1715,7 @@ pub fn validate_lsi(
     all_definitions: &[AttributeDefinition],
 ) -> Result<()> {
     // Validate index name length
-    if lsi.index_name.len() < 3 || lsi.index_name.len() > 255 {
+    if !(3..=255).contains(&length_in_characters(&lsi.index_name)) {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at 'localSecondaryIndexes.1.member.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",

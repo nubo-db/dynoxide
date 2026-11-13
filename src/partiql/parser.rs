@@ -2682,10 +2682,6 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
     }
 }
 
-/// Parse conditions supporting both AND and OR.
-///
-/// Returns a list of OR-groups, where each group is a list of AND-joined
-/// conditions.
 #[cfg(test)]
 thread_local! {
     /// How many WHERE clauses this thread has flattened, for tests that a
@@ -2693,6 +2689,10 @@ thread_local! {
     static CLAUSES_FLATTENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Parse conditions supporting both AND and OR.
+///
+/// Returns a list of OR-groups, where each group is a list of AND-joined
+/// conditions.
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
     t.reading_where = true;
     let expr = parse_or_expr(t, 0);

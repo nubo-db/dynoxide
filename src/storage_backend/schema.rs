@@ -17,8 +17,14 @@ pub const MULTI_ATTRIBUTE_KEYS: u32 = 10;
 /// for those items, and they are recomputed on open.
 pub const VECTOR_BILLED_SIZES: u32 = 11;
 
+/// The version that first holds a hash prefix for every item. A native
+/// database recorded below it may hold items written before schema version 6
+/// with an empty `hash_prefix`, which no parallel scan segment returns, and
+/// those prefixes are filled in on open.
+pub const HASH_PREFIXES: u32 = 12;
+
 // The version this build writes is the version its last migration records.
-const _: () = assert!(SCHEMA_VERSION == VECTOR_BILLED_SIZES);
+const _: () = assert!(SCHEMA_VERSION == HASH_PREFIXES);
 
 /// What opening a database at a recorded schema version needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +33,8 @@ pub struct OpenMigrations {
     pub rebuild_multi_attribute_gsis: bool,
     /// Recompute the stored item sizes of every table with a vector index.
     pub recompute_vector_sizes: bool,
+    /// Fill in the empty `hash_prefix` of every item that has one.
+    pub fill_hash_prefixes: bool,
     /// The version a newer build than this one recorded, when one did.
     /// Nothing is migrated, and the open refuses the file.
     pub newer_than_this_build: Option<u32>,
@@ -35,19 +43,21 @@ pub struct OpenMigrations {
 /// The open-time migrations a database recorded at `recorded` needs.
 ///
 /// `None` is a database with no recorded version: one the wasm backend wrote
-/// before it began recording a version, or one this open is creating. Both
-/// migrations run for it; on a new database there is nothing for either to
-/// do.
+/// before it began recording a version, or one this open is creating. Every
+/// migration runs for it; on a new database there is nothing for any of them
+/// to do.
 pub fn open_migrations(recorded: Option<u32>) -> OpenMigrations {
     match recorded {
         None => OpenMigrations {
             rebuild_multi_attribute_gsis: true,
             recompute_vector_sizes: true,
+            fill_hash_prefixes: true,
             newer_than_this_build: None,
         },
         Some(version) => OpenMigrations {
             rebuild_multi_attribute_gsis: version < MULTI_ATTRIBUTE_KEYS,
             recompute_vector_sizes: version < VECTOR_BILLED_SIZES,
+            fill_hash_prefixes: version < HASH_PREFIXES,
             newer_than_this_build: (version > SCHEMA_VERSION).then_some(version),
         },
     }
@@ -130,31 +140,46 @@ fn unreadable_version(value: &str) -> String {
 mod tests {
     use super::*;
 
-    const BOTH: OpenMigrations = OpenMigrations {
+    const EVERY: OpenMigrations = OpenMigrations {
         rebuild_multi_attribute_gsis: true,
         recompute_vector_sizes: true,
+        fill_hash_prefixes: true,
         newer_than_this_build: None,
     };
 
     #[test]
     fn an_unversioned_database_runs_every_migration() {
-        assert_eq!(open_migrations(None), BOTH);
+        assert_eq!(open_migrations(None), EVERY);
     }
 
     #[test]
-    fn a_database_before_multi_attribute_keys_runs_both() {
+    fn a_database_before_multi_attribute_keys_runs_every_migration() {
         for version in 1..MULTI_ATTRIBUTE_KEYS {
-            assert_eq!(open_migrations(Some(version)), BOTH, "version {version}");
+            assert_eq!(open_migrations(Some(version)), EVERY, "version {version}");
         }
     }
 
     #[test]
-    fn a_database_at_multi_attribute_keys_only_recomputes_sizes() {
+    fn a_database_at_multi_attribute_keys_recomputes_sizes_and_fills_prefixes() {
         assert_eq!(
             open_migrations(Some(MULTI_ATTRIBUTE_KEYS)),
             OpenMigrations {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: true,
+                fill_hash_prefixes: true,
+                newer_than_this_build: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_database_at_vector_billed_sizes_only_fills_prefixes() {
+        assert_eq!(
+            open_migrations(Some(VECTOR_BILLED_SIZES)),
+            OpenMigrations {
+                rebuild_multi_attribute_gsis: false,
+                recompute_vector_sizes: false,
+                fill_hash_prefixes: true,
                 newer_than_this_build: None,
             }
         );
@@ -167,6 +192,7 @@ mod tests {
             OpenMigrations {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
+                fill_hash_prefixes: false,
                 newer_than_this_build: None,
             }
         );
@@ -179,6 +205,7 @@ mod tests {
             OpenMigrations {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
+                fill_hash_prefixes: false,
                 newer_than_this_build: Some(SCHEMA_VERSION + 1),
             }
         );

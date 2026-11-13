@@ -1268,6 +1268,28 @@ impl StorageBackend for WasmBridgeBackend {
         Ok(())
     }
 
+    async fn fill_hash_prefixes(
+        &self,
+        table_name: &str,
+        prefixes: &[(String, String, String)],
+    ) -> Result<(), BackendError> {
+        if prefixes.is_empty() {
+            return Ok(());
+        }
+        let rows = prefixes
+            .iter()
+            .map(|(pk, sk, prefix)| {
+                vec![
+                    SqlParam::text(prefix.as_str()),
+                    SqlParam::text(pk.as_str()),
+                    SqlParam::text(sk.as_str()),
+                ]
+            })
+            .collect();
+        self.exec_batch(&sql_builders::fill_hash_prefix(table_name), rows)
+            .await
+    }
+
     // --- Introspection ---------------------------------------------------
 
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {

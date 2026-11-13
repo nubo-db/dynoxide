@@ -106,7 +106,7 @@ pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribu
 /// open and runs the migrations it calls for (see
 /// `storage_backend::schema::open_migrations`), then records this one. Every
 /// place that stamps or compares the current version uses this constant.
-pub const SCHEMA_VERSION: u32 = super::schema::VECTOR_BILLED_SIZES;
+pub const SCHEMA_VERSION: u32 = super::schema::HASH_PREFIXES;
 
 /// Add the `vector_index_definitions` column to `_tables`.
 ///
@@ -547,6 +547,16 @@ pub fn set_item_size<'a>(
             SqlParam::text(sk),
             SqlParam::Integer(item_size as i64),
         ],
+    )
+}
+
+/// Set one stored item's `hash_prefix` where it is empty, leaving the row
+/// otherwise as it is, and leaving a row that already has a prefix alone.
+/// Binds the prefix as `?1`, then the item's `pk` and `sk`.
+pub(crate) fn fill_hash_prefix(table_name: &str) -> String {
+    format!(
+        "UPDATE \"{}\" SET hash_prefix = ?1 WHERE pk = ?2 AND sk = ?3 AND hash_prefix = ''",
+        escape_table_name(table_name)
     )
 }
 

@@ -809,6 +809,15 @@ pub trait StorageBackend: private::Sealed {
         sizes: &[(String, String, usize)],
     ) -> Result<(), BackendError>;
 
+    /// Set the stored `hash_prefix` of the given rows, each a
+    /// `(pk, sk, hash_prefix)`, where it is empty. A row that already has a
+    /// prefix, and every other column, is left unchanged.
+    async fn fill_hash_prefixes(
+        &self,
+        table_name: &str,
+        prefixes: &[(String, String, String)],
+    ) -> Result<(), BackendError>;
+
     // -----------------------------------------------------------------------
     // Introspection
     // -----------------------------------------------------------------------

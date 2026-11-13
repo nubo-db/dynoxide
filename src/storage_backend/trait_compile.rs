@@ -466,6 +466,14 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn fill_hash_prefixes(
+        &self,
+        _table_name: &str,
+        _prefixes: &[(String, String, String)],
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
         unimplemented!()
     }

@@ -509,7 +509,7 @@ impl Storage {
         // a file a newer build wrote is refused as it was found.
         refuse_newer_schema(&self.conn)?;
         // Enable WAL mode for better concurrency
-        self.conn.pragma_update(None, "journal_mode", "WAL")?;
+        self.switch_to_wal()?;
         Self::register_functions(&self.conn)?;
         self.migrate_to_current()?;
         #[cfg(test)]
@@ -519,6 +519,42 @@ impl Storage {
             |r| r.get(0),
         )?));
         Ok(())
+    }
+
+    /// Switch the database to WAL mode, unless it is in WAL mode already.
+    ///
+    /// The switch needs the file's exclusive lock. When two connections open
+    /// a file that is not yet in WAL mode at once, both can hold a shared lock
+    /// and want that lock, and SQLite then fails one of them at once with
+    /// `SQLITE_BUSY` without calling the busy handler, so the busy timeout
+    /// does not cover it. The switch is tried again until the connection's
+    /// busy timeout has run out, and the last error is returned after that.
+    /// Everything else the open writes takes its lock with `BEGIN IMMEDIATE`,
+    /// which waits under the busy handler.
+    fn switch_to_wal(&self) -> Result<()> {
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            return Ok(());
+        }
+        let timeout_ms: u32 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.into());
+        loop {
+            match self.conn.pragma_update(None, "journal_mode", "WAL") {
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                result => return Ok(result?),
+            }
+        }
     }
 
     /// Register the SQL functions every statement this layer runs may call.
@@ -2900,6 +2936,164 @@ mod tests {
             .unwrap()
             .pragma_update(None, "journal_mode", "WAL")
             .unwrap();
+    }
+
+    /// Open one file from two threads released together, `runs` times, each
+    /// time at a new path that `prepare` is given first. Returns how many runs
+    /// had an open fail, and the first error seen. Each open that succeeds
+    /// must leave the file in WAL mode at this build's version.
+    fn racing_opens(
+        runs: usize,
+        prepare: impl Fn(&str),
+        open: fn(&str) -> Result<Storage>,
+    ) -> (usize, Option<String>) {
+        let mut failed = 0;
+        let mut first = None;
+        for _ in 0..runs {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db").to_str().unwrap().to_string();
+            prepare(&path);
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let opens: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, start) = (path.clone(), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let storage = open(&path).map_err(|e| e.to_string())?;
+                        let mode: String = storage
+                            .conn
+                            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                            .unwrap();
+                        assert_eq!(mode, "wal");
+                        assert_eq!(
+                            storage.recorded_schema_version().unwrap(),
+                            Some(SCHEMA_VERSION)
+                        );
+                        Ok::<(), String>(())
+                    })
+                })
+                .collect();
+            let errors: Vec<String> = opens
+                .into_iter()
+                .filter_map(|open| open.join().unwrap().err())
+                .collect();
+            if !errors.is_empty() {
+                failed += 1;
+                first.get_or_insert_with(|| errors[0].clone());
+            }
+        }
+        (failed, first)
+    }
+
+    #[test]
+    fn two_opens_of_a_new_file_at_once_both_succeed() {
+        // Both find no file and both switch the new one to WAL, which SQLite
+        // fails at once with SQLITE_BUSY for one of them unless that open
+        // tries again. Unfixed, about one run in eight fails, so 200 runs
+        // that all pass leave the chance of a missed failure below 1 in 10^11.
+        // The metadata tables are created under the same race.
+        let (failed, first) = racing_opens(200, |_| {}, Storage::new);
+        assert_eq!(failed, 0, "{failed} of 200 runs failed, first: {first:?}");
+    }
+
+    #[test]
+    fn two_opens_at_once_of_an_old_file_not_in_wal_mode_both_succeed() {
+        // A version 1 file in the default rollback journal mode, so both opens
+        // switch it to WAL and then race through every migration step.
+        // Unfixed, about one run in four fails.
+        let (failed, first) = racing_opens(100, |path| version_1_database(path, &[]), Storage::new);
+        assert_eq!(failed, 0, "{failed} of 100 runs failed, first: {first:?}");
+    }
+
+    #[cfg(feature = "_has-encryption")]
+    #[test]
+    fn two_encrypted_opens_of_a_new_file_at_once_both_succeed() {
+        const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let (failed, first) = racing_opens(200, |_| {}, |path| Storage::new_encrypted(path, KEY));
+        assert_eq!(failed, 0, "{failed} of 200 runs failed, first: {first:?}");
+    }
+
+    /// Set for a copy of this test binary run by
+    /// `two_processes_opening_one_file_at_once_both_succeed`: the file to open.
+    const CHILD_OPEN_PATH: &str = "DYNOXIDE_TEST_CHILD_OPEN_PATH";
+    /// And the time to open it at, in milliseconds since the Unix epoch.
+    const CHILD_OPEN_AT_MS: &str = "DYNOXIDE_TEST_CHILD_OPEN_AT_MS";
+
+    fn unix_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    }
+
+    /// The open each child process makes. Does nothing in a normal run.
+    #[test]
+    fn open_at_the_given_time_in_a_child_process() {
+        let (Ok(path), Ok(at)) = (
+            std::env::var(CHILD_OPEN_PATH),
+            std::env::var(CHILD_OPEN_AT_MS),
+        ) else {
+            return;
+        };
+        let at: u128 = at.parse().unwrap();
+        while unix_ms() < at {
+            std::hint::spin_loop();
+        }
+        Storage::new(&path).unwrap();
+    }
+
+    #[test]
+    fn two_processes_opening_one_file_at_once_both_succeed() {
+        // Each run starts two copies of this test binary that each open the
+        // file at the same moment, about 50 ms ahead, alternating a new file
+        // and an old one not in WAL mode. Unfixed, about half the runs fail.
+        let exe = std::env::current_exe().unwrap();
+        let runs = 50;
+        let mut failed = Vec::new();
+        for run in 0..runs {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db").to_str().unwrap().to_string();
+            if run % 2 == 1 {
+                version_1_database(&path, &[]);
+            }
+            let at = (unix_ms() + 50).to_string();
+            let children: Vec<_> = (0..2)
+                .map(|_| {
+                    std::process::Command::new(&exe)
+                        .args([
+                            "--exact",
+                            "storage::tests::open_at_the_given_time_in_a_child_process",
+                        ])
+                        .env(CHILD_OPEN_PATH, &path)
+                        .env(CHILD_OPEN_AT_MS, &at)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            let mut opened = 0;
+            for child in children {
+                let output = child.wait_with_output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // A child whose filter matched nothing would pass too.
+                assert!(stdout.contains("running 1 test"), "{stdout}");
+                if output.status.success() {
+                    opened += 1;
+                } else {
+                    failed.push(format!("run {run}: {stdout}"));
+                }
+            }
+            if opened > 0 {
+                assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "{} opens failed in {runs} runs, first: {}",
+            failed.len(),
+            failed[0]
+        );
     }
 
     #[test]

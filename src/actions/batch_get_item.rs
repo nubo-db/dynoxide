@@ -7,11 +7,190 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(try_from = "BatchGetItemWire")]
 pub struct BatchGetItemRequest {
     #[serde(rename = "RequestItems")]
     pub request_items: HashMap<String, KeysAndAttributes>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     pub return_consumed_capacity: Option<String>,
+}
+
+/// The request as it is read, with every member DynamoDB tells apart when it
+/// is missing or null held as an `Option`: `RequestItems`, each table's entry,
+/// its `Keys` and each key. A member of the wrong JSON type still fails the
+/// read, wherever it is written, ahead of the checks on missing and null
+/// members (captured eu-west-2 and us-east-1, 11 and 12 November 2026).
+#[derive(Deserialize)]
+struct BatchGetItemWire {
+    #[serde(rename = "RequestItems", default)]
+    request_items: Option<helpers::WrittenTables<Option<KeysAndAttributesWire>>>,
+    #[serde(rename = "ReturnConsumedCapacity", default)]
+    return_consumed_capacity: Option<String>,
+}
+
+/// A table's entry as it is read: [`KeysAndAttributes`] with `Keys` and each
+/// key optional.
+#[derive(Deserialize)]
+struct KeysAndAttributesWire {
+    #[serde(rename = "Keys", default)]
+    keys: Option<Vec<Option<crate::types::AttributeMap>>>,
+    #[serde(rename = "ProjectionExpression", default)]
+    projection_expression: Option<String>,
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
+    consistent_read: Option<bool>,
+    #[serde(rename = "AttributesToGet", default)]
+    attributes_to_get: Option<Vec<String>>,
+}
+
+impl TryFrom<BatchGetItemWire> for BatchGetItemRequest {
+    type Error = String;
+
+    /// The checks DynamoDB makes on a missing or null member, in its words
+    /// (captured eu-west-2 and us-east-1, 11, 12 and 13 November 2026):
+    ///
+    /// - A missing or null `RequestItems` is refused alone, ahead of anything
+    ///   else.
+    /// - A table with no `Keys` is a null member. Its fault is listed with the
+    ///   request's other member constraints in the older words, a `Keys` that
+    ///   is empty or holds more than 100 keys and a `ReturnConsumedCapacity`
+    ///   outside its enum, tables in the order DynamoDB walks the map. A table
+    ///   name that breaks its constraints is not listed.
+    /// - A null table entry or a null key is refused alone, after a
+    ///   `ReturnConsumedCapacity` outside its enum.
+    ///
+    /// Every other check is made where it is made for a request that passes
+    /// these. The refusal keeps its text whole, since a table name may hold
+    /// anything.
+    fn try_from(wire: BatchGetItemWire) -> std::result::Result<Self, String> {
+        let refuse = |message: &str| {
+            format!(
+                "{}{message}",
+                crate::serde_errors::VALIDATION_AS_READ_MARKER
+            )
+        };
+        let Some(entries) = wire.request_items else {
+            return Err(refuse(
+                "The requestItems parameter is required for BatchGetItem",
+            ));
+        };
+        let tables = entries.walk_order();
+        let rcc_rejection = crate::validation::return_consumed_capacity_rejection(
+            wire.return_consumed_capacity.as_deref(),
+        );
+
+        if tables
+            .iter()
+            .any(|(_, entry)| entry.as_ref().is_some_and(|ka| ka.keys.is_none()))
+        {
+            let mut member_errors: Vec<String> = tables
+                .iter()
+                .filter_map(|(table_name, entry)| {
+                    let keys = match entry.as_ref()?.keys.as_ref() {
+                        None => {
+                            return Some(format!(
+                                "Value null at 'requestItems.{table_name}.member.keys' failed \
+                                 to satisfy constraint: Member must not be null"
+                            ));
+                        }
+                        Some(keys) => keys,
+                    };
+                    let bound = if keys.is_empty() {
+                        "greater than or equal to 1"
+                    } else if keys.len() > 100 {
+                        "less than or equal to 100"
+                    } else {
+                        return None;
+                    };
+                    Some(format!(
+                        "Value '{}' at 'requestItems.{table_name}.member.keys' failed to \
+                         satisfy constraint: Member must have length {bound}",
+                        keys_echo(keys)
+                    ))
+                })
+                .chain(rcc_rejection.clone())
+                .collect();
+            // DynamoDB lists ten member faults at most.
+            member_errors.truncate(10);
+            if let Some(message) = crate::validation::format_validation_errors(&member_errors) {
+                return Err(refuse(&message));
+            }
+        }
+
+        for (table_name, entry) in &tables {
+            let refusal = match entry {
+                None => format!(
+                    "The list of keys in RequestItems for BatchGetItem is required: \
+                     {table_name} has empty list"
+                ),
+                Some(ka) if ka.keys.iter().flatten().any(Option::is_none) => format!(
+                    "The list of keys in RequestItems for BatchGetItem may not contain null or \
+                     empty values: {table_name} has one or more empty keys"
+                ),
+                Some(_) => continue,
+            };
+            return Err(refuse(&match rcc_rejection {
+                Some(rejection) => crate::validation::envelope_message(&rejection),
+                None => refusal,
+            }));
+        }
+
+        // Every entry and key is present by now.
+        let request_items = entries
+            .0
+            .into_iter()
+            .filter_map(|(table_name, entry)| {
+                let ka = entry?;
+                let keys = ka.keys?.into_iter().flatten().map(|key| key.0).collect();
+                Some((
+                    table_name,
+                    KeysAndAttributes {
+                        keys,
+                        projection_expression: ka.projection_expression,
+                        expression_attribute_names: ka.expression_attribute_names,
+                        consistent_read: ka.consistent_read,
+                        attributes_to_get: ka.attributes_to_get,
+                    },
+                ))
+            })
+            .collect();
+        Ok(BatchGetItemRequest {
+            request_items,
+            return_consumed_capacity: wire.return_consumed_capacity,
+        })
+    }
+}
+
+/// A table's `Keys` as the Java model prints them in a constraint message:
+/// each key's attribute map, a null key as `null` (two tables, one with 101
+/// keys, captured us-east-1, 13 November 2026). Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+fn keys_echo(keys: &[Option<crate::types::AttributeMap>]) -> String {
+    use std::fmt::Write;
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = (|| {
+        out.write_str("[")?;
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            match key {
+                Some(key) => crate::actions::batch_write_item::write_java_item(&mut out, &key.0)?,
+                None => out.write_str("null")?,
+            }
+        }
+        out.write_str("]")
+    })();
+    out.finish()
 }
 
 #[derive(Debug, Default, Deserialize)]

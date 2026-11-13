@@ -2872,6 +2872,67 @@ pub(crate) fn select_projection_rejection(
     Some(crate::validation::envelope_message(&msg))
 }
 
+/// A batch request's `RequestItems` as read: each table's entry in the order
+/// it was written. A table written twice keeps its first place and its last
+/// entry, the entry a decoded map would hold.
+pub(crate) struct WrittenTables<V>(pub(crate) Vec<(String, V)>);
+
+impl<V> WrittenTables<V> {
+    /// The table names in the order DynamoDB walks the map: a Java hash map
+    /// sized to its entries, names sharing a bucket in written order (two and
+    /// three tables with no `Keys` captured eu-west-2 and us-east-1, 11 and 13
+    /// November 2026).
+    pub(crate) fn walk_order(&self) -> Vec<(&str, &V)> {
+        let names: Vec<&str> = self.0.iter().map(|(name, _)| name.as_str()).collect();
+        let entries: HashMap<&str, &V> = self
+            .0
+            .iter()
+            .map(|(name, entry)| (name.as_str(), entry))
+            .collect();
+        crate::validation::java_hash_order(&names, true)
+            .into_iter()
+            .map(|name| (name, entries[name]))
+            .collect()
+    }
+}
+
+impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for WrittenTables<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Tables<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: serde::Deserialize<'de>> serde::de::Visitor<'de> for Tables<V> {
+            type Value = WrittenTables<V>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                // The wording a `HashMap` gives, which `serde_errors` maps.
+                f.write_str("a map")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<WrittenTables<V>, A::Error> {
+                let mut tables: Vec<(String, V)> = Vec::new();
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                while let Some((name, entry)) = map.next_entry::<String, V>()? {
+                    match seen.get(&name) {
+                        Some(&at) => tables[at].1 = entry,
+                        None => {
+                            seen.insert(name.clone(), tables.len());
+                            tables.push((name, entry));
+                        }
+                    }
+                }
+                Ok(WrittenTables(tables))
+            }
+        }
+
+        deserializer.deserialize_map(Tables(std::marker::PhantomData))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

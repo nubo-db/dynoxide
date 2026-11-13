@@ -9,12 +9,10 @@ use std::borrow::Cow;
 
 mod positional;
 
-/// Java ClassCastException message that DynamoDB leaks for certain type mismatches.
-const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl cannot be cast to class java.lang.Class (sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl and java.lang.Class are in module java.base of loader 'bootstrap')";
-
 /// The refusal for a JSON array where DynamoDB expects a scalar, a map or a
-/// structure: a `SerializationException` with no message (captured eu-west-2
-/// and us-east-1, 11 and 12 November 2026).
+/// structure, and for a string or a number given as a BatchGetItem key or as
+/// a table's BatchWriteItem requests: a `SerializationException` with no
+/// message (captured eu-west-2 and us-east-1, 11 and 12 November 2026).
 fn array_not_expected() -> crate::DynoxideError {
     crate::DynoxideError::SerializationException(String::new())
 }
@@ -297,16 +295,13 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                         // Check Keys array elements are maps, and their values are AV structs
                         if let Some(serde_json::Value::Array(keys)) = inner.get("Keys") {
                             for key in keys {
-                                // A key given as an array is refused with no
-                                // message; any other non-object leaks a Java
-                                // class-cast message.
-                                if key.is_array() {
-                                    return Err(array_not_expected());
-                                }
+                                // A key given as anything but a map is refused
+                                // with no message, a string and a number as an
+                                // array is (captured eu-west-2 and us-east-1,
+                                // 11 and 12 November 2026). A null key is
+                                // refused once the request is read.
                                 if !key.is_object() && !key.is_null() {
-                                    return Err(crate::DynoxideError::SerializationException(
-                                        PARAMETERIZED_TYPE_CAST_ERROR.to_string(),
-                                    ));
+                                    return Err(array_not_expected());
                                 }
                                 if let Some(key_map) = key.as_object() {
                                     for (_k, v) in key_map {
@@ -333,11 +328,18 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
             // Check nested fields inside RequestItems
             if let Some(serde_json::Value::Object(ri)) = obj.get("RequestItems") {
                 for (_table, val) in ri {
-                    // Each value must be an array of WriteRequests
-                    if !val.is_array() && !val.is_null() {
+                    // Each value must be an array of WriteRequests. A map
+                    // there is a structure where none is expected, and a
+                    // string or a number is refused with no message (captured
+                    // eu-west-2 and us-east-1, 11 and 12 November 2026). A
+                    // null is refused once the request is read.
+                    if val.is_object() {
                         return Err(crate::DynoxideError::SerializationException(
-                            PARAMETERIZED_TYPE_CAST_ERROR.to_string(),
+                            "Start of structure or map found where not expected".to_string(),
                         ));
+                    }
+                    if !val.is_array() && !val.is_null() {
+                        return Err(array_not_expected());
                     }
                     if let Some(items) = val.as_array() {
                         // Check array elements are structs (WriteRequest)

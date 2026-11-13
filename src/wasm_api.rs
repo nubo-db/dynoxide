@@ -1242,10 +1242,9 @@ mod tests {
 
     #[test]
     fn missing_field_classifies_as_validation_like_http() {
-        // BatchGetItem without RequestItems is a plain serde "missing field"
-        // failure. The shared decoder classifies it as a ValidationException,
-        // matching the HTTP surface (previously a SerializationException on
-        // this surface).
+        // BatchGetItem without RequestItems is refused by the shared decoder
+        // as a ValidationException, matching the HTTP surface (previously a
+        // SerializationException on this surface).
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "BatchGetItem", "{}").unwrap_err();
         let v: serde_json::Value = serde_json::from_str(&err).unwrap();

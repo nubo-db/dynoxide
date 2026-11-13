@@ -188,6 +188,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's regions differed on this when captured, and Dynoxide follows
   eu-west-2.
 
+- BatchGetItem and BatchWriteItem refuse a missing or null part of
+  `RequestItems` in DynamoDB's words, where Dynoxide answered with its JSON
+  decoder's own text, such as ``missing field `Keys` at line 1 column 50``.
+  A table with no `Keys`, a `PutRequest` with no `Item` and a
+  `DeleteRequest` with no `Key` are each `Value null at
+  'requestItems.<table>.member.keys' failed to satisfy constraint: Member
+  must not be null` (or `...member.1.member.putRequest.item`), listed with
+  the request's other member faults. A missing or null `RequestItems` is
+  `The requestItems parameter is required for BatchGetItem` (or
+  `BatchWriteItem`), and a null table entry or a null key or write request
+  has its own message too. A key given as a string or number, and a table's
+  write requests given as a string, number or map, are a
+  `SerializationException` as DynamoDB words it, where Dynoxide printed a
+  Java class-cast message. A write request holding both a `PutRequest` and
+  a `DeleteRequest` is refused as one holding neither is; it used to run.
+
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
   constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has

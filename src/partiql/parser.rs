@@ -2686,6 +2686,13 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 ///
 /// Returns a list of OR-groups, where each group is a list of AND-joined
 /// conditions.
+#[cfg(test)]
+thread_local! {
+    /// How many WHERE clauses this thread has flattened, for tests that a
+    /// clause refused as it was read is never flattened.
+    static CLAUSES_FLATTENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
     t.reading_where = true;
     let expr = parse_or_expr(t, 0);
@@ -2719,6 +2726,8 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
             ..refused()
         });
     }
+    #[cfg(test)]
+    CLAUSES_FLATTENED.set(CLAUSES_FLATTENED.get() + 1);
     let flattened = push_not_down(expr, false).and_then(|expr| {
         let tree = ConditionTree::of(expr);
         if tree.bytes() > MAX_CLAUSE_BYTES {
@@ -6094,10 +6103,22 @@ mod tests {
             .map(|i| format!("a='v{i}'"))
             .collect::<Vec<_>>()
             .join(" OR ");
+        let flattened = CLAUSES_FLATTENED.get();
         let start = std::time::Instant::now();
         let err = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap_err();
         assert!(err.to_string().contains("too many operators"), "got {err}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            CLAUSES_FLATTENED.get(),
+            flattened,
+            "the clause was flattened"
+        );
+        // Reading it takes well under a second in a debug build. The bound
+        // is far above that, so it trips only on work that grows faster than
+        // the clause, never on a slow or busy machine.
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
+        // A clause that is not refused is flattened, and counted.
+        parse(r#"SELECT * FROM "t" WHERE a='v'"#).unwrap();
+        assert_eq!(CLAUSES_FLATTENED.get(), flattened + 1);
     }
 
     /// A condition leaf for the flattening tests.

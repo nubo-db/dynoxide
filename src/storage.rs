@@ -529,30 +529,54 @@ impl Storage {
     /// `SQLITE_BUSY` without calling the busy handler, so the busy timeout
     /// does not cover it. The switch is tried again until the connection's
     /// busy timeout has run out, and the last error is returned after that.
-    /// Everything else the open writes takes its lock with `BEGIN IMMEDIATE`,
-    /// which waits under the busy handler.
+    /// Each try waits under the busy handler only for the time left, so the
+    /// whole switch, the check of the current mode included, gives up within
+    /// one busy timeout. Everything else the open writes takes its lock with
+    /// `BEGIN IMMEDIATE`, which waits under the busy handler.
     fn switch_to_wal(&self) -> Result<()> {
-        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+        let timeout_ms: u32 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        let timeout = std::time::Duration::from_millis(timeout_ms.into());
+        let deadline = std::time::Instant::now() + timeout;
         let mode: String = self
             .conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         if mode.eq_ignore_ascii_case("wal") {
             return Ok(());
         }
-        let timeout_ms: u32 = self
-            .conn
-            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.into());
+        if timeout.is_zero() {
+            // No busy timeout to wait within, so one try, as SQLite would.
+            self.conn.pragma_update(None, "journal_mode", "WAL")?;
+            return Ok(());
+        }
+        let switched = self.switch_to_wal_by(deadline);
+        // Put the connection's own busy timeout back however the switch ended.
+        let restored = self.conn.busy_timeout(timeout);
+        switched?;
+        restored?;
+        Ok(())
+    }
+
+    /// Try the switch to WAL until it succeeds, fails with anything but
+    /// `SQLITE_BUSY`, or `deadline` passes. Each try's busy timeout is the
+    /// time left, so no try waits past `deadline`.
+    fn switch_to_wal_by(&self, deadline: std::time::Instant) -> rusqlite::Result<()> {
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
         loop {
+            self.conn
+                .busy_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?;
             match self.conn.pragma_update(None, "journal_mode", "WAL") {
                 Err(rusqlite::Error::SqliteFailure(e, _))
                     if e.code == rusqlite::ErrorCode::DatabaseBusy
                         && std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(RETRY_INTERVAL);
+                    std::thread::sleep(
+                        RETRY_INTERVAL
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
                 }
-                result => return Ok(result?),
+                result => return result,
             }
         }
     }
@@ -3013,68 +3037,222 @@ mod tests {
         assert_eq!(failed, 0, "{failed} of 200 runs failed, first: {first:?}");
     }
 
+    /// A connection to `path` with the given busy timeout, not yet initialised.
+    fn unopened_storage(path: &str, busy_timeout: std::time::Duration) -> Storage {
+        let conn = Connection::open(path).unwrap();
+        conn.busy_timeout(busy_timeout).unwrap();
+        Storage {
+            conn,
+            metadata_cache: RefCell::new(HashMap::new()),
+            gsi_insert_fault: RefCell::new(None),
+            item_size_fault: RefCell::new(None),
+            schema_change_fault: RefCell::new(None),
+            open_hook: RefCell::new(None),
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// A file in the rollback journal mode with one table, `t`.
+    fn rollback_mode_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db").to_str().unwrap().to_string();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (v)")
+            .unwrap();
+        (dir, path)
+    }
+
+    fn is_busy(err: &DynoxideError) -> bool {
+        matches!(err, DynoxideError::SqliteError(e)
+            if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
+    }
+
+    const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+    /// How far past its busy timeout a switch to WAL may give up.
+    const SWITCH_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+    #[test]
+    fn a_switch_to_wal_gives_up_within_its_timeout_when_the_lock_changes_hands() {
+        // Another connection holds the write lock, which fails each try at
+        // once, then most of the way through the timeout takes the exclusive
+        // lock and keeps it, so the next try waits in the busy handler. That
+        // wait must end at the switch's deadline, not a whole timeout later.
+        let (_dir, path) = rollback_mode_file();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (exclusive_tx, exclusive_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let other = path.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(&other).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // Keep every lock taken until the connection closes.
+            conn.execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE; BEGIN IMMEDIATE; INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(SWITCH_TIMEOUT * 7 / 10);
+            conn.execute_batch("COMMIT").unwrap();
+            exclusive_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        ready_rx.recv().unwrap();
+        let storage = unopened_storage(&path, SWITCH_TIMEOUT);
+        let started = std::time::Instant::now();
+        let result = storage.switch_to_wal();
+        let took = started.elapsed();
+        let lock_changed_hands = exclusive_rx.try_recv().is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let err = result.expect_err("switched");
+        assert!(is_busy(&err), "{err:?}");
+        assert!(lock_changed_hands);
+        assert!(
+            took < SWITCH_TIMEOUT + SWITCH_MARGIN,
+            "gave up after {took:?}"
+        );
+        assert_eq!(busy_timeout_ms(&storage.conn), 1000);
+    }
+
+    #[test]
+    fn a_switch_to_wal_against_a_lock_held_throughout_gives_up_at_its_deadline() {
+        let (_dir, path) = rollback_mode_file();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let other = path.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(&other).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1);")
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        ready_rx.recv().unwrap();
+        let storage = unopened_storage(&path, SWITCH_TIMEOUT);
+        let started = std::time::Instant::now();
+        let result = storage.switch_to_wal();
+        let took = started.elapsed();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let err = result.expect_err("switched");
+        assert!(is_busy(&err), "{err:?}");
+        assert!(took >= SWITCH_TIMEOUT, "gave up after {took:?}");
+        assert!(
+            took < SWITCH_TIMEOUT + SWITCH_MARGIN,
+            "gave up after {took:?}"
+        );
+        assert_eq!(busy_timeout_ms(&storage.conn), 1000);
+    }
+
     /// Set for a copy of this test binary run by
     /// `two_processes_opening_one_file_at_once_both_succeed`: the file to open.
     const CHILD_OPEN_PATH: &str = "DYNOXIDE_TEST_CHILD_OPEN_PATH";
-    /// And the time to open it at, in milliseconds since the Unix epoch.
-    const CHILD_OPEN_AT_MS: &str = "DYNOXIDE_TEST_CHILD_OPEN_AT_MS";
-
-    fn unix_ms() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    }
+    /// The file the child creates once it is ready to open.
+    const CHILD_READY_PATH: &str = "DYNOXIDE_TEST_CHILD_READY_PATH";
+    /// The file whose creation releases the child to open.
+    const CHILD_RELEASE_PATH: &str = "DYNOXIDE_TEST_CHILD_RELEASE_PATH";
 
     /// The open each child process makes. Does nothing in a normal run.
     #[test]
-    fn open_at_the_given_time_in_a_child_process() {
-        let (Ok(path), Ok(at)) = (
+    fn open_on_release_in_a_child_process() {
+        let (Ok(path), Ok(ready), Ok(release)) = (
             std::env::var(CHILD_OPEN_PATH),
-            std::env::var(CHILD_OPEN_AT_MS),
+            std::env::var(CHILD_READY_PATH),
+            std::env::var(CHILD_RELEASE_PATH),
         ) else {
             return;
         };
-        let at: u128 = at.parse().unwrap();
-        while unix_ms() < at {
+        let release = std::path::Path::new(&release);
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        std::fs::write(ready, "").unwrap();
+        while !release.exists() {
+            assert!(std::time::Instant::now() < give_up, "never released");
             std::hint::spin_loop();
         }
         Storage::new(&path).unwrap();
     }
 
+    /// Child processes that are killed and reaped if the test panics before
+    /// it has waited for them.
+    struct Children(Vec<std::process::Child>);
+
+    impl Drop for Children {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     #[test]
     fn two_processes_opening_one_file_at_once_both_succeed() {
-        // Each run starts two copies of this test binary that each open the
-        // file at the same moment, about 50 ms ahead, alternating a new file
-        // and an old one not in WAL mode. Unfixed, about half the runs fail.
+        // Each run starts two copies of this test binary. Each says when it is
+        // ready, and once both are, both are released to open the file
+        // together, alternating a new file and an old one not in WAL mode.
+        // Unfixed, 187 of 500 runs failed, and never fewer than 31 in 100, so
+        // 50 runs that all pass leave the chance of a missed failure below 1
+        // in 10^8.
         let exe = std::env::current_exe().unwrap();
         let runs = 50;
         let mut failed = Vec::new();
+        let mut failed_runs = 0;
         for run in 0..runs {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("db").to_str().unwrap().to_string();
             if run % 2 == 1 {
                 version_1_database(&path, &[]);
             }
-            let at = (unix_ms() + 50).to_string();
-            let children: Vec<_> = (0..2)
-                .map(|_| {
-                    std::process::Command::new(&exe)
-                        .args([
-                            "--exact",
-                            "storage::tests::open_at_the_given_time_in_a_child_process",
-                        ])
-                        .env(CHILD_OPEN_PATH, &path)
-                        .env(CHILD_OPEN_AT_MS, &at)
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .unwrap()
-                })
+            let release = dir.path().join("release");
+            let ready: Vec<_> = (0..2)
+                .map(|i| dir.path().join(format!("ready-{i}")))
+                .collect();
+            let mut children = Children(
+                ready
+                    .iter()
+                    .map(|ready| {
+                        std::process::Command::new(&exe)
+                            .args([
+                                "--exact",
+                                "storage::tests::open_on_release_in_a_child_process",
+                            ])
+                            .env(CHILD_OPEN_PATH, &path)
+                            .env(CHILD_READY_PATH, ready)
+                            .env(CHILD_RELEASE_PATH, &release)
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .spawn()
+                            .unwrap()
+                    })
+                    .collect(),
+            );
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !ready.iter().all(|ready| ready.exists()) {
+                // A child that exits before it is ready was filtered out or
+                // failed to start.
+                for child in &mut children.0 {
+                    assert!(child.try_wait().unwrap().is_none(), "a child exited early");
+                }
+                assert!(
+                    std::time::Instant::now() < give_up,
+                    "a child never got ready"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::fs::write(&release, "").unwrap();
+            // Wait for both before looking at either.
+            let outputs: Vec<_> = children
+                .0
+                .drain(..)
+                .map(|child| child.wait_with_output())
                 .collect();
             let mut opened = 0;
-            for child in children {
-                let output = child.wait_with_output().unwrap();
+            for output in outputs {
+                let output = output.unwrap();
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 // A child whose filter matched nothing would pass too.
                 assert!(stdout.contains("running 1 test"), "{stdout}");
@@ -3084,13 +3262,16 @@ mod tests {
                     failed.push(format!("run {run}: {stdout}"));
                 }
             }
+            if opened < 2 {
+                failed_runs += 1;
+            }
             if opened > 0 {
                 assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
             }
         }
         assert!(
             failed.is_empty(),
-            "{} opens failed in {runs} runs, first: {}",
+            "{failed_runs} of {runs} runs failed ({} opens), first: {}",
             failed.len(),
             failed[0]
         );

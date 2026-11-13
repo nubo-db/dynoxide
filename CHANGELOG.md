@@ -71,8 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Two opens of one database file at the same moment, from two threads or two
   processes, no longer fail with `database is locked` when the file is new or
   not yet in WAL mode. The open that loses the race to switch the file to WAL
-  now waits for the other, within the usual open timeout. Encrypted databases
-  get the same fix
+  now waits for the other, for no longer than the usual open timeout.
+  Encrypted databases get the same fix
   ([#306](https://github.com/nubo-db/dynoxide/issues/306)).
 - **TransactGetItems no longer refuses an empty or unused name in a `Get`
   with no `ProjectionExpression`.** It goes on to the table lookup as

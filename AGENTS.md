@@ -92,15 +92,23 @@ they do not carry equal weight:
   between runs because of noisy neighbours. A red Criterion row on
   your PR is not by itself a blocker; re-run the workflow if the
   result looks noisy.
-- **iai-callgrind (instruction-count benchmarks).** Deterministic, but
-  informational. The PR job reports instruction counts without a
-  stored baseline to compare against, so it never fails on a
-  regression by itself, and CI keeps no counts from `main` to compare
-  with. When you need to know whether a change does more work, run
-  `cargo bench --bench iai_core --features iai-callgrind` in
-  `benchmarks/` on `main` and on your branch, on the same Linux
-  machine or container; a difference there means the code path really
-  does more.
+- **iai-callgrind (instruction-count benchmarks).** Nearly
+  deterministic, and the layer that can go red. The PR job benchmarks
+  the base branch first, then your merged change against it on the
+  same runner, and fails if any benchmark runs more than 4% more
+  instructions than the base, or if a benchmark the base has ended up
+  with nothing to compare against. A benchmark your PR adds is
+  reported as new and does not fail. The one case with no comparison
+  is a PR that changes the locked iai-callgrind version: counts from
+  two versions are not comparable, so the job warns and runs only your
+  benchmarks. The job is advisory, not a required check, but a red
+  result here usually means the code path really does more. To
+  reproduce it, run
+  `cargo bench --bench iai_core --features iai-callgrind -- --save-baseline=base`
+  in `benchmarks/` on `main`, then
+  `cargo bench --bench iai_core --features iai-callgrind -- --baseline=base --regression='ir=4.0'`
+  on your branch, on the same Linux machine or container and with the
+  same target directory.
 
 In short: trust iai-callgrind's numbers, treat Criterion as a smoke
 signal.

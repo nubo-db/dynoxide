@@ -220,7 +220,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RequestItems` with a `SerializationException`, `Duplicate key found in
   payload`, once the whole map is read, as DynamoDB does. A value of the
   wrong type anywhere in the map, either copy included, or in a member
-  written ahead of it, is reported instead. Dynoxide used the last copy. Tables with empty `Keys` are listed one fault per table, ten at
+  written ahead of it, is reported instead; a value that breaks a
+  constraint, such as one with two data types, is not, wherever it is
+  written. Dynoxide used the last copy. Tables with empty `Keys` are listed one fault per table, ten at
   most, as BatchWriteItem's empty or overlong lists are; BatchGetItem used to
   report only one of them.
 

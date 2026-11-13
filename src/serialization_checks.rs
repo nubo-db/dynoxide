@@ -58,12 +58,8 @@ pub(crate) fn pre_check_and_read_layer<'a>(
         }
         None => (Cow::Borrowed(body), json),
     };
-    match repeated_table_views(operation, &body) {
-        Some(views) => {
-            for view in &views {
-                check_types(operation, view)?;
-            }
-        }
+    match check_repeated_tables(operation, &body) {
+        Some(checked) => checked?,
         None => check_types(operation, &json)?,
     }
     let layer = if crate::types::reads_on_older_layer(&json) {
@@ -74,73 +70,178 @@ pub(crate) fn pre_check_and_read_layer<'a>(
     Ok((body, layer))
 }
 
-/// An object's members as written, repeats included, each value unread.
-struct WrittenMembers<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
+/// One walk over a batch body for [`check_repeated_tables`]: the names in
+/// `RequestItems`, each entry's JSON types, or each entry read as the request
+/// reads it.
+#[derive(Clone, Copy, PartialEq)]
+enum Pass {
+    Names,
+    Types,
+    Reads,
+}
 
-impl<'de> serde::Deserialize<'de> for WrittenMembers<'de> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Members;
-        impl<'de> serde::de::Visitor<'de> for Members {
-            type Value = WrittenMembers<'de>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut members = Vec::new();
-                while let Some(member) = map.next_entry()? {
-                    members.push(member);
-                }
-                Ok(WrittenMembers(members))
-            }
-        }
-        deserializer.deserialize_map(Members)
+/// A walk over a batch body, borrowing from it and keeping nothing of an
+/// entry once it has been looked at.
+#[derive(Clone, Copy)]
+struct Walk<'o> {
+    operation: &'o str,
+    entry_fault: fn(&str) -> Option<crate::DynoxideError>,
+    pass: Pass,
+}
+
+/// What a walk found: whether `RequestItems` names a table twice (on the
+/// names walk), the members written ahead of it (on the types walk), and the
+/// first fault in its entries.
+struct Walked<'de> {
+    repeated: bool,
+    ahead: Vec<(String, &'de serde_json::value::RawValue)>,
+    fault: Option<crate::DynoxideError>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Walk<'_> {
+    type Value = Walked<'de>;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
     }
 }
 
-/// For a BatchGetItem or BatchWriteItem body whose `RequestItems` names a
-/// table more than once, the requests DynamoDB type-checks before it refuses
-/// the repeat: one for each table entry as written, both copies of a repeated
-/// table included, each beside the members written ahead of `RequestItems`.
-/// DynamoDB reads the whole map first, so a type fault in any entry is
-/// reported in place of the repeat, as is one in a member written before the
-/// map, while one written after it is never reached (captured eu-west-2 and
-/// us-east-1, 13 November 2026). `None` when no table is repeated, and the
+impl<'de> serde::de::Visitor<'de> for Walk<'_> {
+    type Value = Walked<'de>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an object")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut walked = Walked {
+            repeated: false,
+            ahead: Vec::new(),
+            fault: None,
+        };
+        let mut past_the_map = false;
+        while let Some(name) = map.next_key::<String>()? {
+            if past_the_map {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            } else if name == "RequestItems" {
+                (walked.repeated, walked.fault) = map.next_value_seed(Entries(self))?;
+                past_the_map = true;
+            } else if self.pass == Pass::Types {
+                walked.ahead.push((name, map.next_value()?));
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(walked)
+    }
+}
+
+/// The `RequestItems` map on a [`Walk`].
+struct Entries<'o>(Walk<'o>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for Entries<'_> {
+    type Value = (bool, Option<crate::DynoxideError>);
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Entries<'_> {
+    type Value = (bool, Option<crate::DynoxideError>);
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a map")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let walk = self.0;
+        let mut seen = std::collections::HashSet::new();
+        let mut repeated = false;
+        let mut fault = None;
+        while let Some(name) = map.next_key::<String>()? {
+            if walk.pass == Pass::Names {
+                repeated |= !seen.insert(name);
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
+            let entry: &serde_json::value::RawValue = map.next_value()?;
+            if fault.is_some() {
+                continue;
+            }
+            fault = match walk.pass {
+                Pass::Types => {
+                    let value = crate::serde_errors::body_value(entry.get())
+                        .map_err(serde::de::Error::custom)?;
+                    let mut table = serde_json::Map::with_capacity(1);
+                    table.insert(name, value);
+                    let mut view = serde_json::Map::with_capacity(1);
+                    view.insert("RequestItems".to_string(), serde_json::Value::Object(table));
+                    check_types(walk.operation, &serde_json::Value::Object(view)).err()
+                }
+                _ => (walk.entry_fault)(entry.get()),
+            };
+        }
+        Ok((repeated, fault))
+    }
+}
+
+/// The answer to a BatchGetItem or BatchWriteItem body whose `RequestItems`
+/// names a table more than once, decided here, where every entry can be read
+/// on its own. DynamoDB reads the whole map before it refuses the repeat, so
+/// a fault in the JSON types of any entry, both copies of a repeated table
+/// included, is reported in its place, as is one in a member written ahead
+/// of the map, while one written after the map is never reached. Every fault
+/// of a value's constraints, wherever it is written, loses to the repeat
+/// (captured eu-west-2 and us-east-1, 13 November 2026).
+///
+/// The body is walked once for the names in the map, keeping only those that
+/// differ. With a repeat it is walked again to check each entry as the
+/// body's parsed value would be checked, as each is reached, then the members
+/// ahead of the map once, and a third time to read each entry as the request
+/// reads it. The first fault found is the answer, and the refusal of the
+/// repeat otherwise. Nothing of an entry is kept once it has been looked at.
+/// `None` when no table is repeated, or the body can't be walked, and the
 /// body's parsed value is checked as it stands.
-fn repeated_table_views(operation: &str, body: &str) -> Option<Vec<serde_json::Value>> {
-    if operation != "BatchGetItem" && operation != "BatchWriteItem" {
+fn check_repeated_tables(operation: &str, body: &str) -> Option<crate::Result<()>> {
+    use serde::de::DeserializeSeed;
+    let entry_fault = match operation {
+        "BatchGetItem" => crate::actions::batch_get_item::entry_serialization_fault,
+        "BatchWriteItem" => crate::actions::batch_write_item::entry_serialization_fault,
+        _ => return None,
+    };
+    let walk = |pass| {
+        let mut deserializer = serde_json::Deserializer::from_str(body);
+        let walked = Walk {
+            operation,
+            entry_fault,
+            pass,
+        }
+        .deserialize(&mut deserializer)
+        .ok()?;
+        deserializer.end().ok()?;
+        Some(walked)
+    };
+    if !walk(Pass::Names)?.repeated {
         return None;
     }
-    let top: WrittenMembers = serde_json::from_str(body).ok()?;
-    let at = top.0.iter().position(|(name, _)| name == "RequestItems")?;
-    let tables: WrittenMembers = serde_json::from_str(top.0[at].1.get()).ok()?;
-    let mut seen = std::collections::HashSet::new();
-    if tables.0.iter().all(|(name, _)| seen.insert(name.as_str())) {
-        return None;
+    let types = walk(Pass::Types)?;
+    if let Some(fault) = types.fault {
+        return Some(Err(fault));
     }
-    let mut before = serde_json::Map::new();
-    for (name, value) in &top.0[..at] {
-        before.insert(
-            name.clone(),
-            crate::serde_errors::body_value(value.get()).ok()?,
-        );
+    let mut ahead = serde_json::Map::with_capacity(types.ahead.len());
+    for (name, value) in types.ahead {
+        ahead.insert(name, crate::serde_errors::body_value(value.get()).ok()?);
     }
-    tables
-        .0
-        .iter()
-        .map(|(name, entry)| {
-            let mut view = before.clone();
-            let mut table = serde_json::Map::new();
-            table.insert(
-                name.clone(),
-                crate::serde_errors::body_value(entry.get()).ok()?,
-            );
-            view.insert("RequestItems".to_string(), serde_json::Value::Object(table));
-            Some(serde_json::Value::Object(view))
-        })
-        .collect()
+    if let Err(fault) = check_types(operation, &serde_json::Value::Object(ahead)) {
+        return Some(Err(fault));
+    }
+    if let Some(fault) = walk(Pass::Reads)?.fault {
+        return Some(Err(fault));
+    }
+    Some(Err(crate::DynoxideError::SerializationException(
+        crate::types::DUPLICATE_MEMBER.to_string(),
+    )))
 }
 
 fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {

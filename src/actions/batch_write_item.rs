@@ -57,6 +57,22 @@ struct DeleteRequestWire {
     key: Option<types::AttributeMap>,
 }
 
+/// The serialisation fault one table's entry in `RequestItems` raises when it
+/// is read on its own, written as `entry`; `None` when it reads, or fails only
+/// a constraint. See `serialization_checks` for the request it decides.
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
+pub(crate) fn entry_serialization_fault(entry: &str) -> Option<DynoxideError> {
+    match crate::serde_errors::deserialize::<Option<Vec<Option<WriteRequestWire>>>>(entry) {
+        Err(fault @ DynoxideError::SerializationException(_)) => Some(fault),
+        _ => None,
+    }
+}
+
 impl TryFrom<BatchWriteItemWire> for BatchWriteItemRequest {
     type Error = String;
 

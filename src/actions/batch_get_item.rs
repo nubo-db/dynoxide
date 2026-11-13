@@ -52,6 +52,22 @@ struct KeysAndAttributesWire {
     attributes_to_get: Option<Vec<String>>,
 }
 
+/// The serialisation fault one table's entry in `RequestItems` raises when it
+/// is read on its own, written as `entry`; `None` when it reads, or fails only
+/// a constraint. See `serialization_checks` for the request it decides.
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
+pub(crate) fn entry_serialization_fault(entry: &str) -> Option<DynoxideError> {
+    match crate::serde_errors::deserialize::<Option<KeysAndAttributesWire>>(entry) {
+        Err(fault @ DynoxideError::SerializationException(_)) => Some(fault),
+        _ => None,
+    }
+}
+
 impl TryFrom<BatchGetItemWire> for BatchGetItemRequest {
     type Error = String;
 

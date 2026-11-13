@@ -615,14 +615,23 @@ const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
 /// marker.
 ///
 /// The faults are met in the order the value meets them when no name is
-/// written twice, so a repeat elsewhere never changes which of two is
-/// reported. For a member of an item, a key or the expression values, which
-/// is read as it stands: its own JSON type; its `BOOL` and then its `NULL`
-/// member, where [`read_lenient_bool`] refuses them as the request is parsed;
-/// then every other member at any depth in key order, as
+/// written twice, so a repeat elsewhere leaves unchanged which of two faults
+/// as JSON is reported. For a member of an item, a key or the expression
+/// values, which is read as it stands: its own JSON type; its `BOOL` and then
+/// its `NULL` member, where [`read_lenient_bool`] refuses them as the request
+/// is parsed; then every other member at any depth in key order, as
 /// [`unreadable_member_in`] walks them; and only then a nested `BOOL` or
 /// `NULL`, as each nested value is read (an `L` in order, an `M` in written
-/// order). Copies of one name are taken in written order among themselves.
+/// order), and only inside a value with exactly one type member. Copies of
+/// one name are taken in written order among themselves.
+///
+/// One exception: without a repeat, an `L` item refused for a validation
+/// fault (a number that doesn't read, an empty value, a null, a `NULL` of
+/// false, more than one type member) stops the items after it from being
+/// read, so a later item's `BOOL` or `NULL` fault is not reported, while with
+/// a repeat elsewhere it is: `{"L":[{"N":"bad"},{"BOOL":"maybe"}]}` is refused
+/// for the number alone and for the `BOOL` beside a repeat. No capture says
+/// which DynamoDB gives.
 fn malformed_value(value: &Written) -> Option<Cow<'static, str>> {
     written_slot_refusal(JsonSlot::Value, value)
         .or_else(|| malformed_flag(value))
@@ -710,20 +719,43 @@ fn malformed_member(type_key: &str, member: &Written) -> Option<Cow<'static, str
     }
 }
 
-/// The faults met only as each nested value is read: the members of an `L`
-/// in order and of an `M` in written order, each as [`malformed_value`]
-/// meets them.
+/// The faults met only as each nested value is read: a `BOOL` or `NULL` that
+/// [`read_lenient_bool`] refuses, in the members of an `L` in order and of an
+/// `M` in written order, at any depth. Every other fault below the value was
+/// looked for by [`malformed_member_in`] first, so only these are left. A
+/// value without exactly one type member is refused before what it holds is
+/// read, so nothing inside it is looked at.
 fn malformed_nested_value(value: &Written) -> Option<Cow<'static, str>> {
     let Written::Object(members) = value else {
         return None;
     };
+    if !reads_one_type_member(members) {
+        return None;
+    }
+    let nested = |item: &Written| malformed_flag(item).or_else(|| malformed_nested_value(item));
     in_key_order(members)
         .into_iter()
         .find_map(|(type_key, member)| match (type_key.as_str(), member) {
-            ("L", Written::Array(list)) => list.iter().find_map(malformed_value),
-            ("M", Written::Object(map)) => map.iter().find_map(|(_, item)| malformed_value(item)),
+            ("L", Written::Array(list)) => list.iter().find_map(nested),
+            ("M", Written::Object(map)) => map.iter().find_map(|(_, item)| nested(item)),
             _ => None,
         })
+}
+
+/// Whether a value as read has exactly one type member that isn't null, the
+/// last copy of a name written twice being the one read.
+fn reads_one_type_member(members: &[(String, Written)]) -> bool {
+    let mut seen: Vec<&str> = Vec::with_capacity(TYPE_MEMBERS.len());
+    let mut present = 0;
+    for (name, member) in members.iter().rev() {
+        if TYPE_MEMBERS.contains(&name.as_str()) && !seen.contains(&name.as_str()) {
+            seen.push(name);
+            if !member.is_null() {
+                present += 1;
+            }
+        }
+    }
+    present == 1
 }
 
 /// [`JsonSlot::refusal`] for a value as written, without copying it.

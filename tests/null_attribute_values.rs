@@ -619,6 +619,33 @@ async fn names_written_twice_are_read_in_one_pass() {
     }
 }
 
+/// A name written twice whose earlier copy is an `M` nested 30 deep, with
+/// 40,000 members at the bottom, is looked through once, not once for each
+/// level above the bottom.
+#[tokio::test]
+async fn a_deep_copy_is_looked_through_once() {
+    let url = start_server().await;
+    let bottom = (0..40_000)
+        .map(|i| format!(r#""n{i}":{{"S":"a"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut chain = format!(r#"{{"M":{{{bottom}}}}}"#);
+    for _ in 0..30 {
+        chain = format!(r#"{{"M":{{"c":{chain}}}}}"#);
+    }
+    let body = format!(
+        r#"{{"TableName":"_capture_20261111_317_none","Item":{{"pk":{{"S":"a"}},"m":{{"M":{{"x":{chain},"x":{{"S":"2"}}}}}}}}}}"#
+    );
+    let started = std::time::Instant::now();
+    let (status, answer) = send(&url, "PutItem", &body).await;
+    let took = started.elapsed();
+    assert_eq!(
+        answer["__type"], "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+        "{status} {answer}"
+    );
+    assert!(took < std::time::Duration::from_secs(20), "took {took:?}");
+}
+
 /// A fault as JSON in any written copy of a name written twice, at any depth,
 /// is the answer, and so is a `BOOL` or `NULL` member that can't be read as a
 /// boolean; a well-formed earlier copy is not read.
@@ -698,6 +725,15 @@ async fn a_malformed_copy_at_any_depth_is_the_answer() {
 /// and for 300 generated ones (from a fixed seed), each read as a member of
 /// an item beside a repeated `pk`, and as the earlier copy of a repeated
 /// name in an `M`.
+///
+/// A value with more than one type member, at its top or nested in an `L` or
+/// `M`, is refused for that before what it holds is read, so a `BOOL` or
+/// `NULL` inside it that can't be read is never the answer, with a repeat or
+/// without. Checked for 101 more values, 100 of them generated: beside a
+/// repeated `pk` the answer is the one a well-formed value gets there; beside
+/// a repeated name in an `M` it is the value's answer alone; and as the
+/// earlier copy of a repeated name in an `M`, one with more than one type
+/// member at its top is refused as a name written twice.
 #[tokio::test]
 async fn a_repeat_elsewhere_leaves_a_values_fault_unchanged() {
     /// A deterministic generator, so a failure names the same values again.
@@ -769,6 +805,51 @@ async fn a_repeat_elsewhere_leaves_a_values_fault_unchanged() {
         )
     }
 
+    /// A value holding a `BOOL` or `NULL` that can't be read, somewhere
+    /// inside an `L` or `M`, with a well-formed member before it.
+    fn holder(rng: &mut Seeded, depth: usize) -> (String, String) {
+        const FLAGS: [&str; 4] = [
+            r#"{"BOOL":"maybe"}"#,
+            r#"{"NULL":5}"#,
+            r#"{"BOOL":[]}"#,
+            r#"{"NULL":{}}"#,
+        ];
+        let inner = match (depth < 2).then(|| rng.below(3)) {
+            Some(0) => {
+                let (key, member) = holder(rng, depth + 1);
+                format!(r#"{{"{key}":{member}}}"#)
+            }
+            _ => FLAGS[rng.below(FLAGS.len())].to_string(),
+        };
+        if rng.below(2) == 0 {
+            ("L".to_string(), format!(r#"[{{"S":"x"}},{inner}]"#))
+        } else {
+            (
+                "M".to_string(),
+                format!(r#"{{"b":{{"S":"x"}},"a":{inner}}}"#),
+            )
+        }
+    }
+    /// A value with a well-formed type member beside a [`holder`], in either
+    /// written order.
+    fn several(rng: &mut Seeded) -> String {
+        const OTHERS: [&str; 6] = [
+            r#""S":"a""#,
+            r#""N":"1""#,
+            r#""B":"AQ==""#,
+            r#""SS":["a"]"#,
+            r#""BOOL":true"#,
+            r#""NULL":true"#,
+        ];
+        let other = OTHERS[rng.below(OTHERS.len())];
+        let (key, member) = holder(rng, 0);
+        if rng.below(2) == 0 {
+            format!(r#"{{{other},"{key}":{member}}}"#)
+        } else {
+            format!(r#"{{"{key}":{member},{other}}}"#)
+        }
+    }
+
     let mut values: Vec<String> = vec![
         r#"{"S":5,"B":"!!!!"}"#.to_string(),
         r#"{"M":{"f194":{"M":[]},"f0":{"S":true}}}"#.to_string(),
@@ -782,6 +863,18 @@ async fn a_repeat_elsewhere_leaves_a_values_fault_unchanged() {
             format!("{{\"M\":{{{}}}}}", members(&mut rng, 1))
         };
         values.push(generated);
+    }
+    // Values with more than one type member, at their top or one level in,
+    // the first of them found by hand.
+    let mut layered: Vec<(String, bool)> =
+        vec![(r#"{"S":"a","L":[{"BOOL":"x"}]}"#.to_string(), true)];
+    while layered.len() < 101 {
+        let value = several(&mut rng);
+        layered.push(match rng.below(3) {
+            0 => (format!(r#"{{"L":[{{"S":"y"}},{value}]}}"#), false),
+            1 => (format!(r#"{{"M":{{"q":{value}}}}}"#), false),
+            _ => (value, true),
+        });
     }
 
     let url = start_server().await;
@@ -810,11 +903,48 @@ async fn a_repeat_elsewhere_leaves_a_values_fault_unchanged() {
             }
         }
     }
+    for (value, several_at_top) in &layered {
+        let pairs = [
+            (
+                format!(r#"{{"pk":{{"S":"a"}},"m":{value},"pk":{{"S":"b"}}}}"#),
+                r#"{"pk":{"S":"a"},"m":{"S":"ok"},"pk":{"S":"b"}}"#.to_string(),
+            ),
+            (
+                format!(
+                    r#"{{"pk":{{"S":"a"}},"m":{{"M":{{"x":{value},"y":{{"S":"1"}},"y":{{"S":"2"}}}}}}}}"#
+                ),
+                format!(r#"{{"pk":{{"S":"a"}},"m":{{"M":{{"x":{value}}}}}}}"#),
+            ),
+        ];
+        for (repeated, expected) in pairs {
+            let got = send(&url, "PutItem", &put(repeated.clone())).await;
+            let wanted = send(&url, "PutItem", &put(expected)).await;
+            assert_eq!(wanted.0, 400, "{value} is refused");
+            if got != wanted {
+                wrong.push(format!(
+                    "{repeated}\n  got      {got:?}\n  expected {wanted:?}"
+                ));
+            }
+        }
+        if *several_at_top {
+            let copy =
+                format!(r#"{{"pk":{{"S":"a"}},"m":{{"M":{{"x":{value},"x":{{"S":"2"}}}}}}}}"#);
+            let answer = send(&url, "PutItem", &put(copy.clone())).await;
+            let duplicate = serde_json::json!({
+                "__type": "com.amazon.coral.service#SerializationException",
+                "Message": "Duplicate key found in payload"
+            });
+            if answer != (400, duplicate) {
+                wrong.push(format!("{copy}\n  as a copy {answer:?}"));
+            }
+        }
+    }
+    let copies = layered.iter().filter(|(_, top)| *top).count();
     assert!(
         wrong.is_empty(),
         "{} of {} differ:\n{}",
         wrong.len(),
-        values.len() * 2,
+        values.len() * 2 + layered.len() * 2 + copies,
         wrong.join("\n")
     );
 }

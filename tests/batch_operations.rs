@@ -295,7 +295,8 @@ fn test_batch_write_exceeds_25_items() {
         msg.contains("Member must have length less than or equal to 25"),
         "Got: {msg}"
     );
-    assert!(msg.contains("at 'requestItems'"), "Got: {msg}");
+    // One fault for the table, with no echo (captured eu-west-2, 2026-11-13).
+    assert!(msg.contains("at 'RequestItems.Tbl.member'"), "Got: {msg}");
 }
 
 #[test]

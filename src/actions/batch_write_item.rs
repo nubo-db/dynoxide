@@ -67,10 +67,13 @@ impl TryFrom<BatchWriteItemWire> for BatchWriteItemRequest {
     ///   else.
     /// - A put with no `Item` or a delete with no `Key` is a null member. Its
     ///   fault is listed with the request's other member constraints in the
-    ///   older words: the request lists' lengths, with the request echoed, then
-    ///   the null members, tables in the order DynamoDB walks the map, then
-    ///   `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics` outside
-    ///   their enums. A table name that breaks its constraints is not listed.
+    ///   older words: the request lists' lengths, with the request echoed in
+    ///   its Java model's `toString` (both regions still answer this way here,
+    ///   though eu-west-2 words a list's length differently on its own, see
+    ///   [`check_request`]), then the null members, tables in the order
+    ///   DynamoDB walks the map, then `ReturnConsumedCapacity` and
+    ///   `ReturnItemCollectionMetrics` outside their enums. A table name that
+    ///   breaks its constraints is not listed.
     /// - A null list for a table or a null write request is refused alone,
     ///   after those enum faults.
     ///
@@ -250,11 +253,10 @@ fn accumulate_index_units(
     }
 }
 
-/// The request-level checks, in the order DynamoDB reports them: an empty
-/// `RequestItems`; then the member constraints together (a table's request list
-/// that is empty or pushes the request past 25, ReturnConsumedCapacity and
-/// ReturnItemCollectionMetrics); then a table name that breaks its constraints,
-/// alone.
+/// The request-level checks, in the order eu-west-2 reports them: an empty
+/// `RequestItems`; then each table's request list that is empty or holds more
+/// than 25, alone; then a table name that breaks its constraints together with
+/// ReturnConsumedCapacity and ReturnItemCollectionMetrics outside their enums.
 ///
 /// Also run on the request-parsing path for a body nested too deep to decode,
 /// so a member error there is still reported ahead of the nesting error.
@@ -270,51 +272,119 @@ pub(crate) fn check_request(request: &BatchWriteItemRequest) -> Result<()> {
         ));
     }
 
-    // The request's member constraints, reported together before anything is
-    // read or written: a table's request list that is empty or pushes the
-    // request past 25, then ReturnConsumedCapacity and
-    // ReturnItemCollectionMetrics outside their enums (captured us-east-1,
-    // eu-west-2 and ten more regions, 2026-10-08 and 2026-10-09).
-    let mut member_errors = Vec::new();
-    let total_requests: usize = request.request_items.values().map(|v| v.len()).sum();
-    if total_requests > 25 || request.request_items.values().any(|wrs| wrs.is_empty()) {
-        member_errors.push(format!(
+    let enum_faults = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    )
+    .into_iter()
+    .chain(crate::validation::return_item_collection_metrics_rejection(
+        request.return_item_collection_metrics.as_deref(),
+    ));
+
+    // A table's request list that is empty or holds more than 25 is a fault
+    // of its own, one for each such table, with no echo, reported ahead of and
+    // without the enum faults or a table name that breaks its constraints
+    // (captured eu-west-2, 13 November 2026). Two tables came back in the
+    // reverse of the order DynamoDB walks the map. us-east-1 still gave the
+    // older form, one fault for the whole map with the request echoed in its
+    // Java model's `toString`, listed with the enum faults.
+    let mut names: Vec<&str> = request.request_items.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let length_faults: Vec<String> = crate::validation::java_hash_order(&names, true)
+        .into_iter()
+        .rev()
+        .filter_map(|table_name| {
+            let requests = request.request_items[table_name].len();
+            let bound = if requests == 0 {
+                "greater than or equal to 1"
+            } else if requests > 25 {
+                "less than or equal to 25"
+            } else {
+                return None;
+            };
+            Some(format!(
+                "Value at 'RequestItems.{table_name}.member' failed to satisfy constraint: \
+                 Member must have length {bound}"
+            ))
+        })
+        .collect();
+    if let Some(msg) = crate::validation::format_validation_errors(&length_faults) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // More than 25 requests across tables that each hold 25 or fewer has not
+    // been captured since eu-west-2 changed its words, so it keeps the older
+    // form, listed with the enum faults.
+    let total_requests: usize = request.request_items.values().map(Vec::len).sum();
+    if total_requests > 25 {
+        let member_errors: Vec<String> = std::iter::once(format!(
             "Value '{}' at 'requestItems' failed to satisfy constraint: {MAP_VALUE_CONSTRAINT}",
             request_items_echo(&request.request_items)
+        ))
+        .chain(enum_faults)
+        .collect();
+        return Err(DynoxideError::ValidationException(
+            crate::validation::format_validation_errors(&member_errors).unwrap_or_default(),
         ));
     }
-    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ) {
-        member_errors.push(msg);
-    }
-    if let Some(msg) = crate::validation::return_item_collection_metrics_rejection(
-        request.return_item_collection_metrics.as_deref(),
-    ) {
-        member_errors.push(msg);
-    }
+
+    // A table name that breaks its constraints is a constraint on the
+    // RequestItems map's keys, reported once for the map with the request
+    // echoed as JSON, ahead of the enum faults and listed with them (captured
+    // eu-west-2, 12 and 13 November 2026).
+    let all_names_valid = request
+        .request_items
+        .keys()
+        .all(|name| crate::validation::member_table_name_is_valid(name));
+    let member_errors: Vec<String> = (!all_names_valid)
+        .then(|| {
+            format!(
+                "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
+                request_items_json_echo(&request.request_items),
+                crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
+            )
+        })
+        .into_iter()
+        .chain(enum_faults)
+        .collect();
     if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
         return Err(DynoxideError::ValidationException(msg));
     }
 
-    // A table name that breaks its constraints comes after those, and alone:
-    // it is a constraint on the RequestItems map's keys, reported once for the
-    // map with the map echoed.
-    if !request
-        .request_items
-        .keys()
-        .all(|name| crate::validation::member_table_name_is_valid(name))
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&format!(
-                "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
-                request_items_echo(&request.request_items),
-                crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
-            )),
-        ));
-    }
-
     Ok(())
+}
+
+/// The `RequestItems` map echoed as JSON, as eu-west-2 echoes it for a table
+/// name that breaks its constraints (captured 12 and 13 November 2026): each
+/// write request as it is written on the wire, with tables and every map's
+/// members in order of name, as BatchGetItem's echo is. Bounded by
+/// [`ECHO_LIMIT`].
+fn request_items_json_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
+    let echo: serde_json::Map<String, serde_json::Value> = request_items
+        .iter()
+        .map(|(table_name, requests)| {
+            let requests = requests
+                .iter()
+                .map(|request| {
+                    let mut members = serde_json::Map::new();
+                    if let Some(ref put) = request.put_request {
+                        members.insert(
+                            "PutRequest".to_string(),
+                            serde_json::json!({ "Item": put.item }),
+                        );
+                    }
+                    if let Some(ref delete) = request.delete_request {
+                        members.insert(
+                            "DeleteRequest".to_string(),
+                            serde_json::json!({ "Key": delete.key }),
+                        );
+                    }
+                    serde_json::Value::Object(members)
+                })
+                .collect();
+            (table_name.clone(), serde_json::Value::Array(requests))
+        })
+        .collect();
+    bound_echo(crate::sorted_json(serde_json::Value::Object(echo)).to_string())
 }
 
 pub async fn execute<S: StorageBackend>(
@@ -805,13 +875,17 @@ pub(crate) fn bound_echo(echo: String) -> String {
     out.finish()
 }
 
-/// The `RequestItems` map as DynamoDB echoes it in a constraint message: the
-/// request object's Java `toString`, which names every field of every value.
-/// Eleven of twelve regions printed it this way on 2026-10-09; the other, and
-/// eu-west-2 on other days, print each attribute value as an object hash, so no
-/// echo matches every region byte for byte. Tables are in order of name, where
-/// DynamoDB's own order is its map's; attributes follow the Java map's order.
-/// Bounded by [`ECHO_LIMIT`].
+/// The `RequestItems` map in the older echo, the request object's Java
+/// `toString`, which names every field of every value. Eleven of twelve regions
+/// printed it this way on 2026-10-09 for a request list that was empty or too
+/// long and for a table name that broke its constraints. On 13 November 2026
+/// eu-west-2 no longer echoed the map for a list's length and echoed it as JSON
+/// for a table name (see [`check_request`]), and us-east-1 still gave this
+/// echo for both. Both regions still give it for a list too long beside a put
+/// with no `Item`, sometimes with each attribute value as an object hash
+/// instead, so no echo matches every answer byte for byte. Tables are in order
+/// of name, where DynamoDB's own order is its map's; attributes follow the Java
+/// map's order. Bounded by [`ECHO_LIMIT`].
 fn request_items_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
     let mut out = BoundedEcho::new();
     let _ = write_request_items(&mut out, request_items);

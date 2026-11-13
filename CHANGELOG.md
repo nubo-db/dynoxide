@@ -203,6 +203,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SerializationException` as DynamoDB words it, where Dynoxide printed a
   Java class-cast message. A write request holding both a `PutRequest` and
   a `DeleteRequest` is refused as one holding neither is; it used to run.
+  BatchWriteItem's length and table-name faults now follow eu-west-2's
+  wording. A table's request list that is empty or holds more than 25 is
+  `Value at 'RequestItems.<table>.member' failed to satisfy constraint:
+  Member must have length greater than or equal to 1` (or `less than or
+  equal to 25`), one fault for each such table, with no echo of the request
+  and ahead of a bad `ReturnConsumedCapacity` or
+  `ReturnItemCollectionMetrics`, which are no longer listed beside it. A
+  table name that breaks its constraints echoes the request as JSON and is
+  listed ahead of those enum faults, where it used to follow them. us-east-1
+  still gave the older answers when captured.
 
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

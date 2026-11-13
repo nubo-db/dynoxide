@@ -98,9 +98,12 @@ they do not carry equal weight:
   same runner, and fails if any benchmark runs more than 4% more
   instructions than the base, or if a benchmark the base has ended up
   with nothing to compare against. A benchmark your PR adds is
-  reported as new and does not fail. The job is advisory, not a
-  required check, but a red result here usually means the code path
-  really does more. To reproduce it, run
+  reported as new and does not fail. The one case with no comparison
+  is a PR that changes the locked iai-callgrind version: counts from
+  two versions are not comparable, so the job warns and runs only your
+  benchmarks. The job is advisory, not a required check, but a red
+  result here usually means the code path really does more. To
+  reproduce it, run
   `cargo bench --bench iai_core --features iai-callgrind -- --save-baseline=base`
   in `benchmarks/` on `main`, then
   `cargo bench --bench iai_core --features iai-callgrind -- --baseline=base --regression='ir=4.0'`

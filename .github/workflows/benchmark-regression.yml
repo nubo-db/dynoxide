@@ -182,6 +182,28 @@ jobs:
           ")
           cargo install iai-callgrind-runner --version "${IAI_VERSION}"
 
+      - name: Compare the iai-callgrind version with the base
+        # The runner refuses a library of any other version, and it is
+        # installed from the PR's requirement, so when a PR changes the locked
+        # iai-callgrind the base cannot be benchmarked with it. Counts from two
+        # versions are not comparable either. That is the one case with no
+        # comparison: say so and run the PR's benchmarks on their own.
+        id: version
+        shell: bash
+        run: |
+          locked() {
+            git show "$1:benchmarks/Cargo.lock" 2>/dev/null \
+              | sed -n '/^name = "iai-callgrind"$/{n;s/^version = "\(.*\)"$/\1/p;}'
+          }
+          base_version=$(locked HEAD^1)
+          head_version=$(locked HEAD)
+          if [ -n "$head_version" ] && [ "$base_version" = "$head_version" ]; then
+            echo "compare=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "compare=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::iai-callgrind changes from ${base_version:-none} to ${head_version:-none} in this PR, so its instruction counts cannot be compared with the base branch. The benchmarks run without a comparison."
+          fi
+
       - name: Benchmark the base branch
         # Runs in place, in the same benchmarks/target the PR's run uses next,
         # because iai-callgrind looks for the baseline beside its own output. A
@@ -195,6 +217,7 @@ jobs:
         # `record` lists what the base produced, for the check further down,
         # and runs from the PR's checkout because the base may not have it.
         id: base
+        if: steps.version.outputs.compare == 'true'
         shell: bash
         run: |
           rm -rf benchmarks/target/iai
@@ -209,34 +232,45 @@ jobs:
       - name: Benchmark the PR against the base
         # The limit is 4% more instructions than the base, per benchmark. The
         # counts are not exactly repeatable from one process to the next (std's
-        # HashMap, for one, seeds itself per process): across 16 runs of
-        # unchanged code, get_item moved by up to 2.7% and every other
-        # benchmark by 1.1% or less. 4% stays clear of that and still catches
-        # a regression like the 5.9% one this job once missed. iai-callgrind exits non-zero when a benchmark breaches it,
+        # HashMap, for one, seeds itself per process). Across 16 runs of
+        # unchanged code in an arm64 Linux container, get_item moved by up to
+        # 2.7% and every other benchmark by 1.1% or less; the x86 runner's
+        # spread is still to be confirmed by the first runs here. 4% stays
+        # clear of that and still catches a regression like the 5.9% one this
+        # job once missed. iai-callgrind exits 3 when a benchmark breaches it,
         # and lists the breaches under "Regressions" at the end of the log.
         #
+        # Without a base run (see the version step) the benchmarks run on
+        # their own, so the numbers are still in the log.
+        #
         # pipefail (from shell: bash) keeps cargo's exit status rather than
-        # tee's. The grep only picks the annotation.
+        # tee's.
         shell: bash
+        env:
+          COMPARE: ${{ steps.version.outputs.compare }}
         run: |
+          args=()
+          if [ "$COMPARE" = "true" ]; then
+            args=(--baseline=base --regression='ir=4.0' --save-summary=json)
+          fi
           set +e
-          (cd benchmarks && cargo bench --bench iai_core --features iai-callgrind -- --baseline=base --regression='ir=4.0' --save-summary=json 2>&1 | tee iai_output.txt)
+          (cd benchmarks && cargo bench --bench iai_core --features iai-callgrind -- "${args[@]}" 2>&1 | tee iai_output.txt)
           status=$?
           set -e
-          if [ "$status" -ne 0 ]; then
-            if grep -q "Performance has regressed" benchmarks/iai_output.txt; then
-              echo "::error::Instruction count rose more than 4% over the base branch; see Regressions in the log"
-            else
-              echo "::error::iai-callgrind run failed (exit $status)"
-            fi
-            exit "$status"
+          if [ "$status" -eq 3 ]; then
+            echo "::error::Instruction count rose more than 4% over the base branch; see Regressions in the log"
+          elif [ "$status" -ne 0 ]; then
+            echo "::error::iai-callgrind run failed (exit $status)"
           fi
+          exit "$status"
 
       - name: Check every benchmark had a baseline
         # iai-callgrind prints N/A and carries on when it finds no baseline,
         # which reads as a pass. Fail instead when a benchmark the base ran has
-        # no old count. One only the PR has is reported as new and allowed.
-        # Runs after a regression too, so both problems show in one go.
+        # no old count. One only the PR has is reported as new and allowed,
+        # and one only the base has is reported as removed.
+        # Runs after a regression too, so both problems show in one go, and
+        # is skipped with the base run when there is nothing to compare.
         if: ${{ !cancelled() && steps.base.outcome == 'success' }}
         run: |
           python3 benchmarks/scripts/check_iai_baselines.py check \

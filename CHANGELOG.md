@@ -84,7 +84,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExpressionAttributeValues` and `AttributeUpdates`, and a starting key
   before Query's. In a TransactWriteItems action the item or key comes first
   too, unless the request holds a null, when the values do; a member of the
-  wrong JSON type anywhere in the action comes ahead of both
+  wrong JSON type anywhere in the action comes ahead of both. Nulls inside an
+  `M` are met in the order they were written when their names share a bucket
+  of that map, an array given for a value is refused with no message even
+  beside the same name written twice, and the MCP write tools refuse a
+  malformed `expression_attribute_values` before a fault in the item or key
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - A `null` name in `ExpressionAttributeNames` is now read as an empty name,
   puts the request on the older layer and is checked with the expressions. A

@@ -572,6 +572,18 @@ async fn fourteenth_set_answers_as_dynamodb_did() {
     assert_choices("fourteenth", FOURTEENTH).await;
 }
 
+/// The fifteenth set: a name written twice inside an `M` (in an item, an
+/// expression value, an `L` and a transaction), where a malformed copy is the
+/// answer, a null, empty or many-membered copy is a name written twice, and
+/// otherwise the last copy is read and the earlier one is not; and a name
+/// written twice at the top of an item beside a malformed copy (captured from
+/// DynamoDB on 13 November 2026; eu-west-2 and us-east-1 agree on every row).
+#[tokio::test]
+async fn fifteenth_set_answers_as_dynamodb_did() {
+    assert_eq!(FIFTEENTH.len(), 21);
+    assert_rows("fifteenth", FIFTEENTH).await;
+}
+
 /// TransactWriteItems with no null in the request: an action's item or key
 /// is reported ahead of its expression values, whichever is written first,
 /// and a bad number in the values is reported bare, as is the first action's
@@ -2880,5 +2892,134 @@ const FOURTEENTH: &[Choices] = &[
         "DeleteItem",
         r##"{"TableName":"_capture_20261111_317_none","Key":{"pk":null},"ExpressionAttributeValues":{":a":[]},"ConditionExpression":"a = :a"}"##,
         &[r##"{"__type":"com.amazon.coral.service#SerializationException"}"##],
+    ),
+];
+
+const FIFTEENTH: &[Row] = &[
+    (
+        1,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":null,"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        2,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"2"},"x":null}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        3,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"N":"bad"},"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        4,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"2"},"x":{"N":"bad"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: The parameter cannot be converted to a numeric value: bad"}"##,
+    ),
+    (
+        5,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{},"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        6,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"2"},"x":{}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        7,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":[],"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        8,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"2"},"x":[]}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        9,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":5},"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"##,
+    ),
+    (
+        10,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"2"},"x":{"S":5}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"##,
+    ),
+    (
+        11,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"1"},"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        12,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"SS":[]},"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
+    ),
+    (
+        13,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":{"S":"a","N":"1"},"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        14,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"}},"ConditionExpression":"a = :a","ExpressionAttributeValues":{":a":{"M":{"x":null,"x":{"S":"2"}}}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        15,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"l":{"L":[{"M":{"x":null,"x":{"S":"2"}}}]}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        16,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"L":[[]]},"pk":{"S":"a"}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        17,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":5},"pk":{"S":"a"}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"##,
+    ),
+    (
+        18,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"pk":{"S":5}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"##,
+    ),
+    (
+        19,
+        "PutItem",
+        r##"{"TableName":"_capture_20261111_317_none","Item":{"pk":null,"pk":{"S":"a"}}}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
+    ),
+    (
+        20,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":[],"pk":{"S":"a"}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException"}"##,
+    ),
+    (
+        21,
+        "TransactWriteItems",
+        r##"{"TransactItems":[{"Put":{"TableName":"_capture_20261111_317_none","Item":{"pk":{"S":"a"},"m":{"M":{"x":null,"x":{"S":"2"}}}}}}]}"##,
+        r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
     ),
 ];

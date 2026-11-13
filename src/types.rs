@@ -455,6 +455,12 @@ impl AttributeValue {
                 let Some(Written::Object(members)) = written.into_member("M") else {
                     unreachable!("a member of the wrong JSON type is refused above")
                 };
+                let members = collapse_repeated_members(members).map_err(|refusal| {
+                    de::Error::custom(format!(
+                        "{}{refusal}",
+                        crate::serde_errors::SERIALIZATION_MARKER
+                    ))
+                })?;
                 read_attribute_map(members)
                     .map(AttributeValue::M)
                     .map_err(de::Error::custom)
@@ -602,6 +608,59 @@ fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'s
 
 /// DynamoDB's refusal of a map that names a member twice.
 const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
+
+/// DynamoDB's refusal of an attribute value that is malformed as JSON: not an
+/// object, or a member of the wrong JSON type at any depth (see
+/// [`unreadable_member_in`]); `None` when it reads as JSON, and for JSON null.
+fn malformed_value(value: &Written) -> Option<Cow<'static, str>> {
+    let value = value.to_value();
+    JsonSlot::Value
+        .refusal(&value)
+        .or_else(|| value.as_object().and_then(unreadable_member_in))
+}
+
+/// The members of an `M` with a name written twice collapsed, as DynamoDB
+/// reads them (captured eu-west-2 and us-east-1, 2026-11-12). A member
+/// malformed as JSON in any copy, or anywhere earlier, is the refusal.
+/// Otherwise a copy that is null, empty or has more than one type member is
+/// refused as a name written twice. Otherwise the last copy is the member's
+/// value, in the place the name was first written, and the earlier copies are
+/// not read at all. The refusal is the message, without its marker.
+fn collapse_repeated_members(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<Vec<(String, Written)>, Cow<'static, str>> {
+    let one_type_member = |value: &Written| match value {
+        Written::Object(members) => {
+            members
+                .iter()
+                .filter(|(name, member)| TYPE_MEMBERS.contains(&name.as_str()) && !member.is_null())
+                .count()
+                == 1
+        }
+        _ => false,
+    };
+    let mut collapsed: Vec<(String, Written)> = Vec::with_capacity(members.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (at, (name, value)) in members.iter().enumerate() {
+        let Some(&first) = seen.get(name) else {
+            seen.insert(name.clone(), collapsed.len());
+            collapsed.push((name.clone(), value.clone()));
+            continue;
+        };
+        if let Some(malformed) = members[..=at]
+            .iter()
+            .map(|(_, member)| member)
+            .find_map(malformed_value)
+        {
+            return Err(malformed);
+        }
+        if !one_type_member(&collapsed[first].1) || !one_type_member(value) {
+            return Err(Cow::Borrowed(DUPLICATE_MEMBER));
+        }
+        collapsed[first].1 = value.clone();
+    }
+    Ok(collapsed)
+}
 
 /// A JSON value as written: an object's members are kept in the order they
 /// were written, which `serde_json::Value` doesn't keep. DynamoDB meets the
@@ -783,17 +842,16 @@ impl<'de> Deserialize<'de> for WrittenMembers {
                 while let Some((name, value)) = map.next_entry::<String, Written>()? {
                     // A name written twice is refused as the request is
                     // parsed (captured eu-west-2 and us-east-1, 2026-11-11),
-                    // unless either copy is an array, which is refused with no
-                    // message whichever is written first (captured eu-west-2
-                    // and us-east-1, 2026-11-12).
-                    if let Some(&at) = seen.get(&name) {
-                        let copies: [&Written; 2] = [&members[at].1, &value];
-                        let refusal = if copies.iter().any(|copy| matches!(copy, Written::Array(_)))
-                        {
-                            ""
-                        } else {
-                            DUPLICATE_MEMBER
-                        };
+                    // unless a member read so far, either copy included, is
+                    // malformed, at any depth: that fault is the answer
+                    // (captured eu-west-2 and us-east-1, 2026-11-12).
+                    if seen.contains_key(&name) {
+                        let refusal = members
+                            .iter()
+                            .map(|(_, member)| member)
+                            .chain([&value])
+                            .find_map(malformed_value)
+                            .unwrap_or(Cow::Borrowed(DUPLICATE_MEMBER));
                         return Err(de::Error::custom(format!(
                             "{}{refusal}",
                             crate::serde_errors::SERIALIZATION_MARKER

@@ -133,6 +133,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and refuse expression values that aren't a map as the HTTP API does, where
   `delete_item` used to ignore them
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A table or index name's length is counted the way DynamoDB counts it, and
+  never in UTF-8 bytes. `TableName` on CreateTable, DescribeTable,
+  DeleteTable, UpdateTable, UpdateTimeToLive and DescribeTimeToLive counts
+  UTF-16 units, so `😀😀` is long enough there. An index name on CreateTable
+  and UpdateTable, ListTables' `ExclusiveStartTableName`, a table name inside
+  a transaction and a Query or Scan `IndexName` count characters, so `😀😀` is
+  too short. A name like this always breaks the name pattern as well, so it
+  is still refused; what changes is which faults the refusal lists, and in
+  what order. Some answers change for an ASCII name too. DescribeTable,
+  DeleteTable, UpdateTable and DescribeTimeToLive refuse a name under 3 or
+  over 255 in the validation envelope (`Value 'ab' at 'tableName' failed to
+  satisfy constraint: Member must have length greater than or equal to 3`)
+  where they gave a bare sentence; an empty name still gets the sentence.
+  UpdateTimeToLive refuses a name under 3, where it looked the table up. An
+  UpdateTable `Create` or `Delete` index name, and a Query or Scan
+  `IndexName`, are checked before the table is looked up, so a bad one is no
+  longer answered with `ResourceNotFoundException`. CreateTable, UpdateTable
+  and ListTables list the length fault before the pattern fault, and a
+  transaction lists the pattern fault first, as eu-west-2 does
+  ([#290](https://github.com/nubo-db/dynoxide/issues/290)).
 
 - A JSON array where DynamoDB doesn't expect one is refused as DynamoDB
   refuses it. A request body that is an array is a `SerializationException`

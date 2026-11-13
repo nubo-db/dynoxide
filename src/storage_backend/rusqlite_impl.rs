@@ -508,19 +508,37 @@ impl StorageBackend for Storage {
     async fn fill_hash_prefixes(
         &self,
         table_name: &str,
-        prefixes: &[(String, String, String)],
-    ) -> Result<(), BackendError> {
+        fill: &[(String, String, String)],
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, BackendError> {
+        use crate::storage_backend::sql_builders;
+        if !fill.is_empty() {
+            let mut stmt = self
+                .conn()
+                .prepare_cached(&sql_builders::fill_hash_prefix(table_name))
+                .map_err(error::from_rusqlite)?;
+            for (pk, sk, prefix) in fill {
+                stmt.execute(rusqlite::params![prefix, pk, sk])
+                    .map_err(error::from_rusqlite)?;
+            }
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = sql_builders::keys_without_hash_prefix(table_name, after.is_some(), limit);
         let mut stmt = self
             .conn()
-            .prepare_cached(&crate::storage_backend::sql_builders::fill_hash_prefix(
-                table_name,
-            ))
+            .prepare_cached(&sql)
             .map_err(error::from_rusqlite)?;
-        for (pk, sk, prefix) in prefixes {
-            stmt.execute(rusqlite::params![prefix, pk, sk])
-                .map_err(error::from_rusqlite)?;
-        }
-        Ok(())
+        let params: Vec<&str> = after.map(|(pk, sk)| vec![pk, sk]).unwrap_or_default();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(error::from_rusqlite)?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(error::from_rusqlite)
     }
 
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {

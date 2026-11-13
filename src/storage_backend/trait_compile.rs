@@ -469,8 +469,10 @@ impl StorageBackend for TestBackend {
     async fn fill_hash_prefixes(
         &self,
         _table_name: &str,
-        _prefixes: &[(String, String, String)],
-    ) -> Result<(), BackendError> {
+        _fill: &[(String, String, String)],
+        _after: Option<(&str, &str)>,
+        _limit: usize,
+    ) -> Result<Vec<(String, String)>, BackendError> {
         unimplemented!()
     }
 

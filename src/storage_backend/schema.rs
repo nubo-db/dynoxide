@@ -35,6 +35,11 @@ pub struct OpenMigrations {
     pub recompute_vector_sizes: bool,
     /// Fill in the empty `hash_prefix` of every item that has one.
     pub fill_hash_prefixes: bool,
+    /// The file is open read-only. Only the hash prefix fill looks at this:
+    /// with nothing to fill, it is skipped and the recorded version left as
+    /// it is, so a file that needs no change still opens; with rows to fill,
+    /// the open is refused. The steps before it are unaffected.
+    pub read_only: bool,
     /// The version a newer build than this one recorded, when one did.
     /// Nothing is migrated, and the open refuses the file.
     pub newer_than_this_build: Option<u32>,
@@ -52,12 +57,14 @@ pub fn open_migrations(recorded: Option<u32>) -> OpenMigrations {
             rebuild_multi_attribute_gsis: true,
             recompute_vector_sizes: true,
             fill_hash_prefixes: true,
+            read_only: false,
             newer_than_this_build: None,
         },
         Some(version) => OpenMigrations {
             rebuild_multi_attribute_gsis: version < MULTI_ATTRIBUTE_KEYS,
             recompute_vector_sizes: version < VECTOR_BILLED_SIZES,
             fill_hash_prefixes: version < HASH_PREFIXES,
+            read_only: false,
             newer_than_this_build: (version > SCHEMA_VERSION).then_some(version),
         },
     }
@@ -88,6 +95,17 @@ pub fn refuse_newer_mid_migration(recorded: Option<u32>) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+/// What an open says of a database open read-only that holds items without a
+/// hash prefix: filling them in is a write.
+pub fn read_only_needs_hash_prefixes() -> String {
+    format!(
+        "this database holds items written before Dynoxide 0.9.5 that need their \
+         hash prefix filled in before a parallel scan can return them, and it is \
+         open read-only. Open it writable once so this build can bring it up to \
+         schema version {HASH_PREFIXES}. The file has not been changed."
+    )
 }
 
 /// Read a recorded schema version as [`parse_recorded`] does and refuse one a
@@ -144,6 +162,7 @@ mod tests {
         rebuild_multi_attribute_gsis: true,
         recompute_vector_sizes: true,
         fill_hash_prefixes: true,
+        read_only: false,
         newer_than_this_build: None,
     };
 
@@ -167,6 +186,7 @@ mod tests {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: true,
                 fill_hash_prefixes: true,
+                read_only: false,
                 newer_than_this_build: None,
             }
         );
@@ -180,6 +200,7 @@ mod tests {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
                 fill_hash_prefixes: true,
+                read_only: false,
                 newer_than_this_build: None,
             }
         );
@@ -193,6 +214,7 @@ mod tests {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
                 fill_hash_prefixes: false,
+                read_only: false,
                 newer_than_this_build: None,
             }
         );
@@ -206,6 +228,7 @@ mod tests {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
                 fill_hash_prefixes: false,
+                read_only: false,
                 newer_than_this_build: Some(SCHEMA_VERSION + 1),
             }
         );

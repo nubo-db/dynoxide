@@ -44,63 +44,87 @@ pub(crate) async fn run_open_migrations<S: StorageBackend>(
         .await?;
     }
     if plan.fill_hash_prefixes {
-        migrate_step(storage, schema::HASH_PREFIXES, || async {
-            fill_hash_prefixes(storage).await
-        })
-        .await?;
+        if plan.read_only {
+            // Recording the version is a write, so a read-only open with
+            // nothing to fill leaves the file as it is; a later writable open
+            // records it. One with rows to fill is refused, as the earlier
+            // steps refuse a read-only file.
+            if fill_hash_prefixes(storage, false).await? > 0 {
+                return Err(DynoxideError::InternalServerError(
+                    schema::read_only_needs_hash_prefixes(),
+                ));
+            }
+        } else {
+            migrate_step(storage, schema::HASH_PREFIXES, || async {
+                fill_hash_prefixes(storage, true).await.map(|_| ())
+            })
+            .await?;
+        }
     }
     Ok(())
 }
 
 /// Give every item without a stored hash prefix the prefix a write of its key
-/// stores now.
+/// stores now, or, when `write` is false, only look for one that needs it.
+/// Returns how many items were given a prefix; without `write`, 1 when any
+/// item needs one and 0 when none does.
 ///
 /// Items written before schema version 6 were left with an empty
 /// `hash_prefix`. A parallel scan picks each segment's items by that prefix,
 /// and an empty one falls below every segment, so a parallel scan over the
-/// whole table missed them. Only data tables carry the column; index tables
-/// are left alone. A row whose stored `pk` does not read back as a key keeps
-/// its empty prefix rather than failing the open, and no other column of any
-/// row is touched.
-async fn fill_hash_prefixes<S: StorageBackend>(storage: &S) -> Result<()> {
+/// whole table missed them. Only the rows with an empty prefix are read, and
+/// only their keys, so a table with none costs one query. Only data tables
+/// carry the column; index tables are left alone. A row whose stored `pk` does
+/// not read back as a key keeps its empty prefix rather than failing the open,
+/// and no other column of any row is touched.
+async fn fill_hash_prefixes<S: StorageBackend>(storage: &S, write: bool) -> Result<usize> {
     const BATCH_SIZE: usize = 1000;
+    let mut filled = 0;
     for table_name in storage.list_table_names().await? {
         // A listed table without its data table, as an interrupted CreateTable
         // or DeleteTable can leave, has no items to fill in.
         if !storage.data_table_exists(&table_name).await? {
             continue;
         }
-        let mut last: Option<(String, String)> = None;
+        // Each call writes the prefixes worked out from the last page, then
+        // reads the next page of keys past it. The page is ordered by key, so
+        // a row filled behind the cursor can't move it, and a row whose key
+        // doesn't read back is passed over rather than read again.
+        let mut fill: Vec<(String, String, String)> = Vec::new();
+        let mut after: Option<(String, String)> = None;
         loop {
-            let items = storage
-                .scan_items(
+            let keys = storage
+                .fill_hash_prefixes(
                     &table_name,
-                    &crate::storage::ScanParams {
-                        limit: Some(BATCH_SIZE),
-                        exclusive_start_pk: last.as_ref().map(|(pk, _)| pk.as_str()),
-                        exclusive_start_sk: last.as_ref().map(|(_, sk)| sk.as_str()),
-                        ..Default::default()
-                    },
+                    &fill,
+                    after.as_ref().map(|(pk, sk)| (pk.as_str(), sk.as_str())),
+                    BATCH_SIZE,
                 )
                 .await?;
-            let prefixes: Vec<(String, String, String)> = items
+            fill = keys
                 .iter()
-                .filter_map(|(pk, sk, _)| {
+                .filter_map(|(pk, sk)| {
                     let key = crate::types::key_value_from_key_string(pk)?;
                     let prefix = crate::storage::compute_hash_prefix(&key);
                     Some((pk.clone(), sk.clone(), prefix))
                 })
                 .collect();
-            storage.fill_hash_prefixes(&table_name, &prefixes).await?;
-            match items.last() {
-                Some((pk, sk, _)) if items.len() == BATCH_SIZE => {
-                    last = Some((pk.clone(), sk.clone()));
-                }
+            if !write && !fill.is_empty() {
+                return Ok(1);
+            }
+            filled += fill.len();
+            match keys.last() {
+                Some(last) if keys.len() == BATCH_SIZE => after = Some(last.clone()),
                 _ => break,
             }
         }
+        if !fill.is_empty() {
+            storage
+                .fill_hash_prefixes(&table_name, &fill, None, 0)
+                .await?;
+        }
     }
-    Ok(())
+    Ok(filled)
 }
 
 /// Run `step` and record `version`, in one write transaction.
@@ -134,6 +158,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::Database;
+    use crate::storage_backend::schema;
     use crate::storage_backend::sql_builders::SCHEMA_VERSION;
     use crate::types::Item;
     use rusqlite::Connection;
@@ -141,11 +166,17 @@ mod tests {
     use serde_json::json;
 
     /// The data tables the fixture creates: string, number and binary
-    /// partition keys, and a table with a sort key and a GSI.
-    const TABLES: [&str; 4] = ["Str", "Num", "Bin", "Sorted"];
+    /// partition keys, a table with a sort key and a GSI, and a table holding
+    /// one number partition key written in several forms.
+    const TABLES: [&str; 5] = ["Str", "Num", "Bin", "Sorted", "NumForms"];
 
     /// The segment counts each table is scanned with.
     const TOTALS: [u32; 4] = [1, 3, 4, 16];
+
+    /// The recorded versions an aged fixture is opened from: none, as the
+    /// browser build wrote from Dynoxide 0.10 to 0.13, then one from each
+    /// stretch of native and shared steps.
+    const STARTING_VERSIONS: [Option<u32>; 5] = [None, Some(5), Some(9), Some(10), Some(11)];
 
     /// Every item of every parallel scan of every table, by table, then total,
     /// then segment, in the order the scan returned them.
@@ -191,6 +222,19 @@ mod tests {
             }]
         })))
         .unwrap();
+        db.create_table(request(json!({
+            "TableName": "NumForms",
+            "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "N"},
+                {"AttributeName": "sk", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ]
+        })))
+        .unwrap();
 
         let mut items = Vec::new();
         for i in 0..24 {
@@ -206,6 +250,23 @@ mod tests {
                 json!({"pk": {"B": base64_encode(&bytes)}, "l": {"L": [{"BOOL": true}]}}),
             ));
         }
+        // Characters that mean something to SQL, to LIKE, or to the stored
+        // key string, which starts with the key's type and a colon.
+        for key in [
+            "it's",
+            "say \"hi\"",
+            "100%",
+            "a_b",
+            "a:b",
+            "S:x",
+            "N:1",
+            "B:AA==",
+            "nul\u{0}inside",
+            "back\\slash",
+            "é ü 😀",
+        ] {
+            items.push(("Str", json!({"pk": {"S": key}})));
+        }
         for p in 0..6 {
             for s in 0..4 {
                 items.push((
@@ -218,6 +279,22 @@ mod tests {
                     }),
                 ));
             }
+        }
+        // One number written in several forms is one partition key: each item
+        // stores the key as its own form gave it.
+        for form in [
+            "1",
+            "1.0",
+            "1e0",
+            "10E-1",
+            "0.1e1",
+            "1.00",
+            "-0.50",
+            "-5e-1",
+            "123.4560",
+            "1.23456E2",
+        ] {
+            items.push(("NumForms", json!({"pk": {"N": form}, "sk": {"S": form}})));
         }
         for (table, item) in items {
             db.put_item(request(json!({"TableName": table, "Item": item})))
@@ -292,13 +369,19 @@ mod tests {
 
     /// Put the file back the way a build before schema version 6 left its
     /// items, with no hash prefix, and record `version`.
-    fn age(path: &str, version: u32) {
+    fn age(path: &str, version: Option<u32>) {
         let conn = Connection::open(path).unwrap();
         for table in TABLES {
             conn.execute(&format!("UPDATE \"{table}\" SET hash_prefix = ''"), [])
                 .unwrap();
         }
-        set_version(&conn, version);
+        match version {
+            Some(version) => set_version(&conn, version),
+            None => {
+                conn.execute("DELETE FROM _config WHERE key = 'schema_version'", [])
+                    .unwrap();
+            }
+        }
     }
 
     fn set_version(conn: &Connection, version: u32) {
@@ -309,19 +392,25 @@ mod tests {
         .unwrap();
     }
 
-    fn empty_prefixes(path: &str) -> usize {
+    /// How many items the fixture tables hold, and how many of them have an
+    /// empty hash prefix.
+    fn items_and_empty_prefixes(path: &str) -> (usize, usize) {
         let conn = Connection::open(path).unwrap();
-        TABLES
-            .iter()
-            .map(|table| {
-                conn.query_row(
-                    &format!("SELECT COUNT(*) FROM \"{table}\" WHERE hash_prefix = ''"),
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap() as usize
-            })
-            .sum()
+        let count =
+            |sql: String| conn.query_row(&sql, [], |r| r.get::<_, i64>(0)).unwrap() as usize;
+        TABLES.iter().fold((0, 0), |(items, empty), table| {
+            (
+                items + count(format!("SELECT COUNT(*) FROM \"{table}\"")),
+                empty
+                    + count(format!(
+                        "SELECT COUNT(*) FROM \"{table}\" WHERE hash_prefix = ''"
+                    )),
+            )
+        })
+    }
+
+    fn empty_prefixes(path: &str) -> usize {
+        items_and_empty_prefixes(path).1
     }
 
     /// The stored hash prefix of the `Str` item whose `pk` column is `pk`.
@@ -334,7 +423,7 @@ mod tests {
             .unwrap()
     }
 
-    fn recorded(path: &str) -> String {
+    fn recorded(path: &str) -> Option<String> {
         Connection::open(path)
             .unwrap()
             .query_row(
@@ -342,7 +431,11 @@ mod tests {
                 [],
                 |r| r.get(0),
             )
-            .unwrap()
+            .ok()
+    }
+
+    fn current() -> Option<String> {
+        Some(SCHEMA_VERSION.to_string())
     }
 
     fn fresh_fixture() -> (tempfile::NamedTempFile, String, Segments, Rows) {
@@ -354,18 +447,35 @@ mod tests {
         (tmp, path, fresh, rows)
     }
 
+    #[cfg(unix)]
+    fn set_mode(path: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Make the file writable again and remove the `-wal` and `-shm` files a
+    /// read-only connection leaves beside it.
+    #[cfg(unix)]
+    fn tidy_read_only(path: &str) {
+        set_mode(path, 0o644);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
     #[test]
     fn old_items_scan_in_the_segments_a_fresh_write_gets() {
-        for version in [9, 11] {
+        for version in STARTING_VERSIONS {
             let (_tmp, path, fresh, _) = fresh_fixture();
             age(&path, version);
-            assert_eq!(empty_prefixes(&path), 24 * 4, "the fixture is aged");
+            let (items, empty) = items_and_empty_prefixes(&path);
+            assert_eq!(empty, items, "the fixture is aged");
 
             let db = Database::new(&path).unwrap();
             let opened = segments(&db);
             for (t, table) in TABLES.iter().enumerate() {
                 let count = db.scan(request(json!({"TableName": table}))).unwrap().count;
-                assert_eq!(count, 24, "{table}");
+                assert!(count > 0, "{table}");
                 let mut at = 0;
                 for &total in &TOTALS {
                     let all: usize = opened[t][at..at + total as usize]
@@ -374,35 +484,36 @@ mod tests {
                         .sum();
                     assert_eq!(
                         all, count,
-                        "{table}: {total} segments return every item, from version {version}"
+                        "{table}: {total} segments return every item, from {version:?}"
                     );
                     at += total as usize;
                 }
                 assert_eq!(
                     opened[t], fresh[t],
-                    "{table}: each segment, in order, from version {version}"
+                    "{table}: each segment, in order, from {version:?}"
                 );
             }
             assert_eq!(empty_prefixes(&path), 0);
-            assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+            assert_eq!(recorded(&path), current());
         }
     }
 
     #[test]
     fn filling_prefixes_loses_no_row_and_changes_no_other_column() {
-        let (_tmp, path, _, fresh) = fresh_fixture();
-        age(&path, 11);
-        let aged = rows(&path);
-        assert_ne!(aged, fresh, "the fixture is aged");
+        for version in STARTING_VERSIONS {
+            let (_tmp, path, _, fresh) = fresh_fixture();
+            age(&path, version);
+            assert_ne!(rows(&path), fresh, "the fixture is aged");
 
-        drop(Database::new(&path).unwrap());
-        assert_eq!(rows(&path), fresh);
+            drop(Database::new(&path).unwrap());
+            assert_eq!(rows(&path), fresh, "from {version:?}");
+        }
     }
 
     #[test]
     fn a_stored_prefix_is_kept_and_a_second_run_changes_nothing() {
         let (_tmp, path, _, fresh) = fresh_fixture();
-        age(&path, 11);
+        age(&path, Some(11));
         Connection::open(&path)
             .unwrap()
             .execute(
@@ -426,13 +537,13 @@ mod tests {
         set_version(&Connection::open(&path).unwrap(), 11);
         drop(Database::new(&path).unwrap());
         assert_eq!(rows(&path), once);
-        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+        assert_eq!(recorded(&path), current());
     }
 
     #[test]
     fn a_key_that_does_not_read_back_keeps_its_empty_prefix() {
         let (_tmp, path, _, _) = fresh_fixture();
-        age(&path, 11);
+        age(&path, Some(11));
         Connection::open(&path)
             .unwrap()
             .execute(
@@ -444,7 +555,7 @@ mod tests {
         drop(Database::new(&path).unwrap());
         assert_eq!(prefix_of(&path, "X:unreadable"), "");
         assert_eq!(empty_prefixes(&path), 1);
-        assert_eq!(recorded(&path), SCHEMA_VERSION.to_string());
+        assert_eq!(recorded(&path), current());
     }
 
     #[test]
@@ -472,10 +583,130 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute("UPDATE \"Str\" SET hash_prefix = ''", [])
             .unwrap();
+        // Rows whose key doesn't read back, spread through the table and
+        // across the batch boundaries, keep their empty prefix and must not
+        // stop the pages after them being filled.
+        conn.execute(
+            "INSERT INTO \"Str\" (pk, sk, item_json, item_size)
+                SELECT 'S:' || substr(pk, 3) || '!', sk, item_json, item_size
+                FROM \"Str\" WHERE pk LIKE 'S:k__0__'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE \"Str\" SET pk = 'X:' || pk WHERE pk LIKE '%!'", [])
+            .unwrap();
         set_version(&conn, 11);
         drop(conn);
 
         drop(Database::new(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM \"Str\" WHERE pk LIKE 'X:%'", [])
+            .unwrap();
+        drop(conn);
         assert_eq!(rows(&path), fresh);
+    }
+
+    #[test]
+    fn a_current_file_with_nothing_to_fill_is_not_rewritten() {
+        let (_tmp, path, _, fresh) = fresh_fixture();
+        let conn = Connection::open(&path).unwrap();
+        set_version(&conn, 11);
+        // Count every row update, including one that writes a row's values
+        // back unchanged.
+        conn.execute_batch("CREATE TABLE probe (n INTEGER)")
+            .unwrap();
+        for table in TABLES {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER \"probe {table}\" AFTER UPDATE ON \"{table}\"
+                    BEGIN INSERT INTO probe VALUES (1); END"
+            ))
+            .unwrap();
+        }
+        drop(conn);
+
+        drop(Database::new(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        let updates: i64 = conn
+            .query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(updates, 0);
+        conn.execute_batch("DROP TABLE probe").unwrap();
+        drop(conn);
+        assert_eq!(rows(&path), fresh);
+        assert_eq!(recorded(&path), current(), "the version is still recorded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_with_nothing_to_fill_opens_as_it_is() {
+        let (_tmp, path, fresh, _) = fresh_fixture();
+        set_version(&Connection::open(&path).unwrap(), 11);
+        set_mode(&path, 0o444);
+        let before = std::fs::read(&path).unwrap();
+
+        {
+            let db = Database::new(&path).unwrap();
+            assert_eq!(segments(&db), fresh);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(recorded(&path), Some("11".to_string()));
+
+        // The first writable open records the version. It opens a copy: this
+        // process's SQLite may still hold the read-only file handle for the
+        // original, which a later process would not.
+        tidy_read_only(&path);
+        let copy = tempfile::NamedTempFile::new().unwrap();
+        let copy = copy.path().to_str().unwrap().to_string();
+        std::fs::copy(&path, &copy).unwrap();
+        drop(Database::new(&copy).unwrap());
+        assert_eq!(recorded(&copy), current());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_with_items_to_fill_is_refused_as_it_is() {
+        let (_tmp, path, _, _) = fresh_fixture();
+        age(&path, Some(11));
+        set_mode(&path, 0o444);
+        let before = std::fs::read(&path).unwrap();
+
+        let message = match Database::new(&path) {
+            Ok(_) => panic!("a read-only file with items to fill opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains(&schema::read_only_needs_hash_prefixes()),
+            "{message}"
+        );
+        assert!(message.contains("Open it writable once"), "{message}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(recorded(&path), Some("11".to_string()));
+        let (items, empty) = items_and_empty_prefixes(&path);
+        assert_eq!(empty, items);
+        tidy_read_only(&path);
+    }
+
+    /// The steps before this one record their version even when they have
+    /// nothing to change, so a read-only file below version 11 is refused, as
+    /// it was before the hash prefix fill.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_before_vector_billed_sizes_is_refused_as_before() {
+        let (_tmp, path, _, _) = fresh_fixture();
+        set_version(&Connection::open(&path).unwrap(), 10);
+        set_mode(&path, 0o444);
+        let before = std::fs::read(&path).unwrap();
+
+        let message = match Database::new(&path) {
+            Ok(_) => panic!("a read-only file at version 10 opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("attempt to write a readonly database"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(recorded(&path), Some("10".to_string()));
+        tidy_read_only(&path);
     }
 }

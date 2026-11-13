@@ -560,6 +560,20 @@ pub(crate) fn fill_hash_prefix(table_name: &str) -> String {
     )
 }
 
+/// The keys `(pk, sk)` of up to `limit` rows whose `hash_prefix` is empty, in
+/// key order. With `after`, only rows past the key bound as `?1` and `?2`.
+pub(crate) fn keys_without_hash_prefix(table_name: &str, after: bool, limit: usize) -> String {
+    format!(
+        "SELECT pk, sk FROM \"{}\" WHERE hash_prefix = ''{} ORDER BY pk, sk LIMIT {limit}",
+        escape_table_name(table_name),
+        if after {
+            " AND (pk, sk) > (?1, ?2)"
+        } else {
+            ""
+        }
+    )
+}
+
 // --- Secondary index tables (GSI/LSI) -----------------------------------
 
 /// Create a GSI table plus its base-key index (a two-statement batch).

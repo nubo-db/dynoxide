@@ -33,8 +33,9 @@ async fn start_server() -> String {
     url
 }
 
-/// The HTTP status and the message of the answer to a request.
-async fn answer(url: &str, operation: &str, body: serde_json::Value) -> (u16, String) {
+/// The HTTP status, the error type after its `#` and the message of the
+/// answer to a request.
+async fn answer(url: &str, operation: &str, body: serde_json::Value) -> (u16, String, String) {
     let response = reqwest::Client::new()
         .post(url)
         .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
@@ -51,11 +52,16 @@ async fn answer(url: &str, operation: &str, body: serde_json::Value) -> (u16, St
         .unwrap();
     let status = response.status().as_u16();
     let body: serde_json::Value = response.json().await.unwrap();
+    let kind = body["__type"].as_str().unwrap_or_default();
     (
         status,
+        kind.rsplit('#').next().unwrap().to_string(),
         body["message"].as_str().unwrap_or_default().to_string(),
     )
 }
+
+/// The error type of a refused request's validation.
+const VALIDATION: &str = "ValidationException";
 
 fn short_index_name(path: &str) -> String {
     format!(
@@ -148,7 +154,7 @@ async fn an_empty_index_name_gets_the_length_fault_alone() {
     let mut wrong = Vec::new();
     for (operation, body, path) in cases {
         let got = answer(&url, operation, body).await;
-        if got != (400, short_index_name(path)) {
+        if got != (400, VALIDATION.to_string(), short_index_name(path)) {
             wrong.push(format!("{path}: {got:?}"));
         }
     }
@@ -194,11 +200,15 @@ fn update_table_built_in_code_checks_the_table_name() {
     let err = validation(db.update_table(update_table("ab")));
     assert_eq!(err, too_short("ab"));
     let long = "a".repeat(256);
-    let err = db
-        .update_table(update_table(&long))
-        .unwrap_err()
-        .to_string();
+    let err = validation(db.update_table(update_table(&long)));
     assert_eq!(err, too_long(&long));
+    // The table name comes ahead of the request's other checks: a BillingMode
+    // outside its enum is not reached.
+    let request = UpdateTableRequest {
+        billing_mode: Some("BOGUS".to_string()),
+        ..update_table("ab")
+    };
+    assert_eq!(validation(db.update_table(request)), too_short("ab"));
 }
 
 /// The other table operations built in code refuse a two-character name as a
@@ -240,7 +250,13 @@ async fn a_bad_index_name_comes_ahead_of_a_bad_select() {
         "KeyConditionExpression": "pk = :a",
         "ExpressionAttributeValues": {":a": {"S": "a"}}
     });
-    assert_eq!(answer(&url, "Query", query).await, (400, short.clone()));
+    assert_eq!(
+        answer(&url, "Query", query).await,
+        (400, VALIDATION.to_string(), short.clone())
+    );
     let scan = json!({"TableName": "Existing", "IndexName": "ab", "Select": "BOGUS"});
-    assert_eq!(answer(&url, "Scan", scan).await, (400, short));
+    assert_eq!(
+        answer(&url, "Scan", scan).await,
+        (400, VALIDATION.to_string(), short)
+    );
 }

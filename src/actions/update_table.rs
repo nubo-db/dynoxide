@@ -291,7 +291,8 @@ pub async fn execute<S: StorageBackend>(
     mut request: UpdateTableRequest,
     lifecycle: &VectorIndexLifecycle,
 ) -> Result<UpdateTableResponse> {
-    // Table name validation is handled in the Deserialize impl
+    // A table name read from a request body is checked as it is read; one in
+    // a request built in code is checked below, before anything else.
 
     // An OnDemandThroughput object with no members carries no change, so
     // treat it as absent: it neither satisfies the at-least-one-change

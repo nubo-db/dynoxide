@@ -52,6 +52,9 @@ struct ByShape {
 /// rows of the same set.
 const HASHED_ECHO: &str = "eu-west-2 echoed each attribute value as an object hash";
 
+/// Why a row with two faults is left out.
+const TWO_FAULTS_ORDER: &str = "reported in a different order when two faults are present";
+
 async fn start_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -262,11 +265,30 @@ async fn a_repeated_table_outranks_constraint_faults_as_dynamodb_did() {
     assert_eq!(replay(FIFTH_ROWS, &[], &[]).await, (13, 13, 0, 0));
 }
 
+/// The sixth set, captured on 13 November 2026: a member of the wrong JSON
+/// type written ahead of `RequestItems` or after it, beside a type fault in
+/// the map, with a table written twice and without.
+#[tokio::test]
+async fn members_ahead_of_the_map_are_read_first_as_dynamodb_did() {
+    assert_eq!(replay(SIXTH_ROWS, &[], &[]).await, (12, 12, 0, 0));
+}
+
+/// The seventh set, captured on 13 November 2026: two faults of different
+/// kinds in one request, and a member the operation doesn't have.
+#[tokio::test]
+async fn two_faults_and_a_stray_member_answer_as_dynamodb_did() {
+    assert_eq!(
+        replay(SEVENTH_ROWS, SEVENTH_LEFT_OUT, &[]).await,
+        (13, 5, 0, 8)
+    );
+}
+
 #[test]
 fn every_row_left_out_is_sent() {
     assert_left_out_rows_are_sent(ROWS, LEFT_OUT);
     assert_left_out_rows_are_sent(SECOND_ROWS, SECOND_LEFT_OUT);
     assert_left_out_rows_are_sent(THIRD_ROWS, THIRD_LEFT_OUT);
+    assert_left_out_rows_are_sent(SEVENTH_ROWS, SEVENTH_LEFT_OUT);
     for b in THIRD_BY_SHAPE {
         assert!(
             THIRD_ROWS
@@ -1162,5 +1184,220 @@ const FIFTH_ROWS: &[Row] = &[
         body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a","N":"1"}}}}]}}"#,
         answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"}"#,
         us_east_1: None,
+    },
+];
+
+const SIXTH_ROWS: &[Row] = &[
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":"x"}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":"x"}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":"x"}]},"ReturnConsumedCapacity":[1]}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected field type"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"ReturnConsumedCapacity":[1]}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":"x"}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":"x"}]},"ReturnConsumedCapacity":[1]}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected field type"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"ReturnItemCollectionMetrics":{"a":1},"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":"x"}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Start of structure or map found where not expected"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":"x"}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":"x"},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}},"ReturnConsumedCapacity":[1]}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected field type"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"ReturnConsumedCapacity":[1],"RequestItems":{"_capture_20261113_sweep_none":{"Keys":"x"}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+];
+
+const SEVENTH_ROWS: &[Row] = &[
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":"a","N":"1"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"N":"bad"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":"a"},"l":{"L":[{"N":"bad"},{"BOOL":"maybe"}]}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected token received from parser"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_other":{"Keys":[{"pk":{"S":"a","N":"1"}}],"ProjectionExpression":5}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_other":{"Keys":[{"pk":{"N":"bad"}}],"ProjectionExpression":5}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a","N":"1"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"N":"bad"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"zz__capture_20261113_sweep_none":"x","aa__capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":5}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"aa__capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":5}}}],"zz__capture_20261113_sweep_none":"x"}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected value type in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"zz__capture_20261113_sweep_none":"x","aa__capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":5}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"TableName":5,"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"TableName":5}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"TableName":5,"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+];
+
+const SEVENTH_LEFT_OUT: &[LeftOut] = &[
+    // repeat; other table: request 1 two datatypes, request 2 S as a number
+    LeftOut {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":"a","N":"1"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"Message":"Duplicate key found in payload","__type":"com.amazon.coral.service#SerializationException"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // repeat; other table: request 1 bad number, request 2 S as a number
+    LeftOut {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"N":"bad"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"Message":"Duplicate key found in payload","__type":"com.amazon.coral.service#SerializationException"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // repeat; other table: a list holding a bad number then BOOL as a string
+    LeftOut {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":"a"},"l":{"L":[{"N":"bad"},{"BOOL":"maybe"}]}}}}]}}"#,
+        answer: r#"{"Message":"Duplicate key found in payload","__type":"com.amazon.coral.service#SerializationException"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // repeat; other table: key with two datatypes, ProjectionExpression as a number
+    LeftOut {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_other":{"Keys":[{"pk":{"S":"a","N":"1"}}],"ProjectionExpression":5}}}"#,
+        answer: r#"{"Message":"Duplicate key found in payload","__type":"com.amazon.coral.service#SerializationException"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // repeat; other table: key with a bad number, ProjectionExpression as a number
+    LeftOut {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_other":{"Keys":[{"pk":{"N":"bad"}}],"ProjectionExpression":5}}}"#,
+        answer: r#"{"Message":"Duplicate key found in payload","__type":"com.amazon.coral.service#SerializationException"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // NO repeat: request 1 two datatypes, request 2 S as a number (control)
+    LeftOut {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a","N":"1"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // NO repeat: request 1 bad number, request 2 S as a number (control)
+    LeftOut {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"N":"bad"}}}},{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The parameter cannot be converted to a numeric value: bad"}"#,
+        reason: TWO_FAULTS_ORDER,
+    },
+    // NO repeat: table zz a string, then table aa an item value as a number
+    LeftOut {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"zz__capture_20261113_sweep_none":"x","aa__capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":5}}}]}}"#,
+        answer: r#"{"Message":"Unexpected value type in payload","__type":"com.amazon.coral.service#SerializationException"}"#,
+        reason: TWO_FAULTS_ORDER,
     },
 ];

@@ -6,7 +6,9 @@
 //!
 //! This test is a binary of its own because it counts every allocation the
 //! process makes, and refuses any that would take the process past a cap, so
-//! a regression fails here instead of exhausting the machine.
+//! a regression fails here instead of exhausting the machine. The counters
+//! are shared by the whole process, so this file must hold one test: another
+//! running beside it would add its allocations to the ones measured here.
 
 #![cfg(feature = "http-server")]
 

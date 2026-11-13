@@ -58,10 +58,20 @@ pub(crate) fn pre_check_and_read_layer<'a>(
         }
         None => (Cow::Borrowed(body), json),
     };
-    match check_repeated_tables(operation, &body) {
-        Some(checked) => checked?,
-        None => check_types(operation, &json)?,
+    if let Some(batch) = walk_batch(operation, &body) {
+        // A member written ahead of `RequestItems` is read before it, so its
+        // type fault is reported ahead of any in the map, with a repeated
+        // table or without (captured eu-west-2 and us-east-1, 13 November
+        // 2026). One written after the map is checked below, after it.
+        check_types(operation, &batch.ahead_value()?)?;
+        if batch.walked.repeated {
+            // The answer is a refusal either way, so the parsed body is not
+            // kept while the map is walked again.
+            drop(json);
+            return Err(batch.repeated_table_answer(&body));
+        }
     }
+    check_types(operation, &json)?;
     let layer = if crate::types::reads_on_older_layer(&json) {
         crate::validation::ValueLayer::Older
     } else {
@@ -70,7 +80,7 @@ pub(crate) fn pre_check_and_read_layer<'a>(
     Ok((body, layer))
 }
 
-/// One walk over a batch body for [`check_repeated_tables`]: the names in
+/// One walk over a batch body for [`walk_batch`]: the names in
 /// `RequestItems`, each entry's JSON types, or each entry read as the request
 /// reads it.
 #[derive(Clone, Copy, PartialEq)]
@@ -89,9 +99,9 @@ struct Walk<'o> {
     pass: Pass,
 }
 
-/// What a walk found: whether `RequestItems` names a table twice (on the
-/// names walk), the members written ahead of it (on the types walk), and the
-/// first fault in its entries.
+/// What a walk found: whether `RequestItems` names a table twice and the
+/// members written ahead of it (on the names walk), and the first fault in
+/// its entries (on the others).
 struct Walked<'de> {
     repeated: bool,
     ahead: Vec<(String, &'de serde_json::value::RawValue)>,
@@ -126,7 +136,7 @@ impl<'de> serde::de::Visitor<'de> for Walk<'_> {
             } else if name == "RequestItems" {
                 (walked.repeated, walked.fault) = map.next_value_seed(Entries(self))?;
                 past_the_map = true;
-            } else if self.pass == Pass::Types {
+            } else if self.pass == Pass::Names {
                 walked.ahead.push((name, map.next_value()?));
             } else {
                 map.next_value::<serde::de::IgnoredAny>()?;
@@ -186,62 +196,87 @@ impl<'de> serde::de::Visitor<'de> for Entries<'_> {
     }
 }
 
-/// The answer to a BatchGetItem or BatchWriteItem body whose `RequestItems`
-/// names a table more than once, decided here, where every entry can be read
-/// on its own. DynamoDB reads the whole map before it refuses the repeat, so
-/// a fault in the JSON types of any entry, both copies of a repeated table
-/// included, is reported in its place, as is one in a member written ahead
-/// of the map, while one written after the map is never reached. Every fault
-/// of a value's constraints, wherever it is written, loses to the repeat
-/// (captured eu-west-2 and us-east-1, 13 November 2026).
-///
-/// The body is walked once for the names in the map, keeping only those that
-/// differ. With a repeat it is walked again to check each entry as the
-/// body's parsed value would be checked, as each is reached, then the members
-/// ahead of the map once, and a third time to read each entry as the request
-/// reads it. The first fault found is the answer, and the refusal of the
-/// repeat otherwise. Nothing of an entry is kept once it has been looked at.
-/// `None` when no table is repeated, or the body can't be walked, and the
-/// body's parsed value is checked as it stands.
-fn check_repeated_tables(operation: &str, body: &str) -> Option<crate::Result<()>> {
-    use serde::de::DeserializeSeed;
+/// A BatchGetItem or BatchWriteItem body walked once for the names in
+/// `RequestItems` and the members written ahead of it.
+struct Batch<'a> {
+    operation: &'a str,
+    entry_fault: fn(&str) -> Option<crate::DynoxideError>,
+    walked: Walked<'a>,
+}
+
+/// Walk a BatchGetItem or BatchWriteItem body once, keeping only the table
+/// names that differ and the members ahead of `RequestItems`, borrowed.
+/// `None` for any other operation, or a body that can't be walked, which is
+/// checked as its parsed value stands.
+fn walk_batch<'a>(operation: &'a str, body: &'a str) -> Option<Batch<'a>> {
     let entry_fault = match operation {
         "BatchGetItem" => crate::actions::batch_get_item::entry_serialization_fault,
         "BatchWriteItem" => crate::actions::batch_write_item::entry_serialization_fault,
         _ => return None,
     };
-    let walk = |pass| {
+    let batch = Batch {
+        operation,
+        entry_fault,
+        walked: Walked {
+            repeated: false,
+            ahead: Vec::new(),
+            fault: None,
+        },
+    };
+    let walked = batch.walk(Pass::Names, body)?;
+    Some(Batch { walked, ..batch })
+}
+
+impl<'a> Batch<'a> {
+    fn walk(&self, pass: Pass, body: &'a str) -> Option<Walked<'a>> {
+        use serde::de::DeserializeSeed;
         let mut deserializer = serde_json::Deserializer::from_str(body);
         let walked = Walk {
-            operation,
-            entry_fault,
+            operation: self.operation,
+            entry_fault: self.entry_fault,
             pass,
         }
         .deserialize(&mut deserializer)
         .ok()?;
         deserializer.end().ok()?;
         Some(walked)
-    };
-    if !walk(Pass::Names)?.repeated {
-        return None;
     }
-    let types = walk(Pass::Types)?;
-    if let Some(fault) = types.fault {
-        return Some(Err(fault));
+
+    /// The members written ahead of `RequestItems`, as an object.
+    fn ahead_value(&self) -> crate::Result<serde_json::Value> {
+        let mut ahead = serde_json::Map::with_capacity(self.walked.ahead.len());
+        for (name, value) in &self.walked.ahead {
+            let value = crate::serde_errors::body_value(value.get())
+                .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
+            ahead.insert(name.clone(), value);
+        }
+        Ok(serde_json::Value::Object(ahead))
     }
-    let mut ahead = serde_json::Map::with_capacity(types.ahead.len());
-    for (name, value) in types.ahead {
-        ahead.insert(name, crate::serde_errors::body_value(value.get()).ok()?);
+
+    /// The answer to a body whose `RequestItems` names a table more than
+    /// once, once the members ahead of it have passed. DynamoDB reads the
+    /// whole map before it refuses the repeat. A fault in the JSON types of
+    /// an entry, either copy of a repeated table included, is reported in its
+    /// place; a fault of a value's constraints loses to it, as does any fault
+    /// in a member written after the map (captured eu-west-2 and us-east-1,
+    /// 13 November 2026). Where an entry's constraint fault is written ahead
+    /// of a type fault in the same entry, the reading stops at the first and
+    /// the repeat is reported instead.
+    ///
+    /// The map is walked again to check each entry as the body's parsed value
+    /// would be checked, then a third time to read each entry as the request
+    /// reads it, keeping nothing of an entry once it has been looked at. The
+    /// first fault found is the answer, and the refusal of the repeat
+    /// otherwise.
+    fn repeated_table_answer(&self, body: &'a str) -> crate::DynoxideError {
+        let fault = self
+            .walk(Pass::Types, body)
+            .and_then(|walked| walked.fault)
+            .or_else(|| self.walk(Pass::Reads, body).and_then(|walked| walked.fault));
+        fault.unwrap_or_else(|| {
+            crate::DynoxideError::SerializationException(crate::types::DUPLICATE_MEMBER.to_string())
+        })
     }
-    if let Err(fault) = check_types(operation, &serde_json::Value::Object(ahead)) {
-        return Some(Err(fault));
-    }
-    if let Some(fault) = walk(Pass::Reads)?.fault {
-        return Some(Err(fault));
-    }
-    Some(Err(crate::DynoxideError::SerializationException(
-        crate::types::DUPLICATE_MEMBER.to_string(),
-    )))
 }
 
 fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
@@ -499,6 +534,12 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                     }
                 }
             }
+            // A batch operation has no other members, and DynamoDB doesn't
+            // check the JSON type of a member an operation doesn't have, so
+            // the checks below for other operations' members are skipped
+            // (captured eu-west-2 and us-east-1, 13 November 2026).
+            check_field_is_string(obj, "ReturnConsumedCapacity")?;
+            return Ok(());
         }
         "BatchWriteItem" => {
             check_field_is_map(obj, "RequestItems")?;
@@ -551,6 +592,13 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                     }
                 }
             }
+            // A batch operation has no other members, and DynamoDB doesn't
+            // check the JSON type of a member an operation doesn't have, so
+            // the checks below for other operations' members are skipped
+            // (captured eu-west-2 and us-east-1, 13 November 2026).
+            check_field_is_string(obj, "ReturnConsumedCapacity")?;
+            check_field_is_string(obj, "ReturnItemCollectionMetrics")?;
+            return Ok(());
         }
         "TagResource" => {
             check_field_is_list(obj, "Tags")?;

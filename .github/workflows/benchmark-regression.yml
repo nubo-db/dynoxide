@@ -148,6 +148,13 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v5
+        with:
+          # A pull_request run checks out the merge commit. Depth 2 brings its
+          # first parent too, the tip of the branch the PR merges into, which
+          # is the baseline: it holds everything the merge commit has except
+          # this PR's change. The merge base would not do, since it would
+          # blame the PR for whatever reached the base branch after it forked.
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -175,19 +182,63 @@ jobs:
           ")
           cargo install iai-callgrind-runner --version "${IAI_VERSION}"
 
-      - name: Run iai-callgrind benchmarks
-        # Same reason as the criterion step: without pipefail the step takes
-        # tee's exit status, so a bench that fails to build or run still
-        # passes, and the check below reads its truncated output as clean.
+      - name: Benchmark the base branch
+        # Runs in place, in the same benchmarks/target the PR's run uses next,
+        # because iai-callgrind looks for the baseline beside its own output. A
+        # second checkout with its own target directory would leave the PR's
+        # run with nothing to compare against.
+        #
+        # The rm is for the same reason as the criterion job's: a cache hit
+        # brings back target/iai from an unrelated PR, and its files would
+        # otherwise sit in as a baseline wherever this run fails to write one.
+        #
+        # `record` lists what the base produced, for the check further down,
+        # and runs from the PR's checkout because the base may not have it.
+        id: base
         shell: bash
-        run: cd benchmarks && cargo bench --bench iai_core --features iai-callgrind 2>&1 | tee iai_output.txt
-
-      - name: Check for instruction-count regressions
         run: |
-          if grep -q "Performance has regressed" benchmarks/iai_output.txt; then
-            echo "::error::Instruction-count regression detected in iai-callgrind benchmarks"
-            grep "Performance has regressed" benchmarks/iai_output.txt
-            exit 1
-          else
-            echo "No iai-callgrind regressions detected"
+          rm -rf benchmarks/target/iai
+          head_sha=$(git rev-parse HEAD)
+          git checkout --quiet --detach HEAD^1
+          (cd benchmarks && cargo bench --bench iai_core --features iai-callgrind -- --save-baseline=base --save-summary=json)
+          git checkout --quiet --detach "$head_sha"
+          python3 benchmarks/scripts/check_iai_baselines.py record \
+            --iai-dir benchmarks/target/iai \
+            --output benchmarks/iai_base_benchmarks.txt
+
+      - name: Benchmark the PR against the base
+        # The limit is 4% more instructions than the base, per benchmark. The
+        # counts are not exactly repeatable from one process to the next (std's
+        # HashMap, for one, seeds itself per process): across 16 runs of
+        # unchanged code, get_item moved by up to 2.7% and every other
+        # benchmark by 1.1% or less. 4% stays clear of that and still catches
+        # a regression like the 5.9% one this job once missed. iai-callgrind exits non-zero when a benchmark breaches it,
+        # and lists the breaches under "Regressions" at the end of the log.
+        #
+        # pipefail (from shell: bash) keeps cargo's exit status rather than
+        # tee's. The grep only picks the annotation.
+        shell: bash
+        run: |
+          set +e
+          (cd benchmarks && cargo bench --bench iai_core --features iai-callgrind -- --baseline=base --regression='ir=4.0' --save-summary=json 2>&1 | tee iai_output.txt)
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            if grep -q "Performance has regressed" benchmarks/iai_output.txt; then
+              echo "::error::Instruction count rose more than 4% over the base branch; see Regressions in the log"
+            else
+              echo "::error::iai-callgrind run failed (exit $status)"
+            fi
+            exit "$status"
           fi
+
+      - name: Check every benchmark had a baseline
+        # iai-callgrind prints N/A and carries on when it finds no baseline,
+        # which reads as a pass. Fail instead when a benchmark the base ran has
+        # no old count. One only the PR has is reported as new and allowed.
+        # Runs after a regression too, so both problems show in one go.
+        if: ${{ !cancelled() && steps.base.outcome == 'success' }}
+        run: |
+          python3 benchmarks/scripts/check_iai_baselines.py check \
+            --iai-dir benchmarks/target/iai \
+            --base-list benchmarks/iai_base_benchmarks.txt

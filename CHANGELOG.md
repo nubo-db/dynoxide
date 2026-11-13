@@ -38,6 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
   serves without an `initialize` step. Clients on earlier versions see no
   change.
+- **A bare name on the right of a PartiQL SET is an attribute, not a
+  string.** `SET z = s` copies the attribute `s`, and is refused when the
+  item has none, where it used to write the string `s`, as DynamoDB does.
+- **A path set against a key attribute is refused on a PartiQL read by
+  key.** With the partition key given, by `=` or by `IN` with one value or
+  several, `begins_with(sk, s)`, `begins_with(s, sk)`, `sk = t`, `sk > t`,
+  `sk BETWEEN t AND 'z'` and `pk = s` are refused as a filter on the key,
+  even beside an equality on the sort key, as DynamoDB refuses them. These
+  used to run as filters. A clause that gives the partition key only under a
+  NOT, or puts another condition on it (`pk <> 'z'`, a second `IN`), is a
+  scan, and still runs. Overlapping key conditions are refused first, and
+  `pk = 'a' AND (sk = t OR n = 5)` is refused as overlapping, where
+  `pk = 'a' AND (sk <> t OR n = 5)` runs. The overlap check and ORDER BY take
+  the same view of a read by key, so `NOT NOT pk = 'a' AND (sk = t OR n = 5)`
+  runs, and `pk = 'a' AND pk <> 'z' ORDER BY sk` is refused for having no
+  partition key condition.
 
 ### Changed
 
@@ -370,6 +386,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-string `ProjectionExpression`, malformed `ExpressionAttributeNames` or
   a bad `AttributesToGet`, which the tool also ignored, are now refused
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- PartiQL reads `begins_with` and `contains` as calls, as it already read
+  `attribute_exists` and `attribute_type`. Either operand can be a literal, a
+  parameter, a path or another call, so `begins_with('abc', 'a')`,
+  `begins_with(?, ?)` and `contains([1, 2], 1)` match where they used to
+  match nothing or fail to parse. The call is a boolean wherever an operand
+  can stand, IS refuses it as its left side, and a wrong number of operands,
+  the same path twice, `MISSING`, or a fixed operand of `begins_with` that
+  isn't a string or a binary is refused as DynamoDB refuses it. `contains`
+  now finds a binary inside a binary and a member of a binary set.
+- Arithmetic in a PartiQL WHERE clause is refused naming its operator (`+`,
+  `-`, `*` or `/`) on either side of a comparison, in a BETWEEN bound and in
+  an IN list, where it used to be a malformed statement; `n IN [6 - 1]` is no
+  longer read as two members. A bracketed value, `n = (5)`, is the value.
+- A PartiQL SET sum takes paths, numbers and parameters in any mix, chained
+  and bracketed, so `SET z = 1 + n` and `SET z = (1 + 1)` run.
+  `if_not_exists(path, value)` and `list_append` are terms, so
+  `SET n = if_not_exists(n, 0) + 1` runs. A type fault names the operator
+  written beside it, and a sum is held to the operator limit. A function such
+  as `size` is refused as not allowed in an update expression, one DynamoDB
+  doesn't know (`abs(n)`) as unrecognised, `*` and `/` as unsupported
+  operators, and `-n` for its operand count. An operand of `if_not_exists` or
+  `list_append` is read the same way, so `if_not_exists(q, n + 1)` runs and
+  `if_not_exists(q, size(s))` is refused naming `size`. `if_not_exists`
+  resolves and checks its value even when the attribute is there, so
+  `if_not_exists(n, nope)` is refused when the item has no `nope`. A literal
+  of the wrong type in a sum or a `list_append` operand is refused ahead of an
+  attribute the item lacks, even when the attribute is read by an earlier SET.
+  A sum needing more than 38 significant digits is refused as a number
+  overflow once every attribute has been read, and each running total of a
+  sum is checked in the order written.
 
 ## [1.6.0] - 2026-11-07
 

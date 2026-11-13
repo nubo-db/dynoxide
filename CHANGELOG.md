@@ -102,6 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A name written twice in an item, a key, `ExpressionAttributeValues` or
   `AttributeUpdates` is refused with `Duplicate key found in payload`
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice inside an `M` keeps its last copy, as before, but is
+  now refused with `Duplicate key found in payload` when either copy is a
+  null, an empty value or has more than one type member. A copy that is
+  malformed as JSON, such as an array, is refused for that fault
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
 - GetItem and BatchGetItem now report `ProjectionExpression` beside
   `AttributesToGet` ahead of an empty name in `ExpressionAttributeNames`
   ([#317](https://github.com/nubo-db/dynoxide/issues/317)).

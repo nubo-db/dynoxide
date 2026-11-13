@@ -68,13 +68,17 @@ or behaviour note that motivates the change. Cleaner ergonomics or
 The PR benchmark check has two layers, and neither blocks a merge.
 Criterion wall-clock numbers run on shared CI runners and are
 advisory; they can swing by up to roughly 3x on a noisy neighbour.
-iai-callgrind runs on the same PR and is deterministic, but it reports
-instruction counts without a stored baseline, so it does not fail on a
-regression by itself, and CI keeps no counts from `main`. If Criterion
-looks red, run `cargo bench --bench iai_core --features iai-callgrind`
-in `benchmarks/` on `main` and on your branch, on the same Linux
-machine or container; if the counts match, re-run the workflow before
-worrying. `AGENTS.md` has the short version of this.
+iai-callgrind runs on the same PR and counts instructions, which barely
+move between runs. It benchmarks the base branch and then your merged
+change on the same runner, and fails if any benchmark rises more than
+4% over the base, or if one the base has finds no baseline to compare
+with (a benchmark your PR adds is reported as new and passes). A PR
+that changes the locked iai-callgrind version gets a warning and no
+comparison, the one case where none is possible. It is
+advisory, not a required check, but take a red iai-callgrind result
+seriously. If Criterion looks red and iai-callgrind does not, re-run
+the workflow before worrying. `AGENTS.md` has the short version of
+this, and the commands to reproduce the comparison locally.
 
 ## Commit style
 

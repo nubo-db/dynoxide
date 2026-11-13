@@ -3068,9 +3068,11 @@ mod tests {
             if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
     }
 
-    const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
-    /// How far past its busy timeout a switch to WAL may give up.
-    const SWITCH_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+    const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    /// How far past its busy timeout a switch to WAL may give up: a share of
+    /// the timeout, so the room on either side of the bound grows with it.
+    const SWITCH_MARGIN: std::time::Duration =
+        SWITCH_TIMEOUT.saturating_mul(7).checked_div(20).unwrap();
 
     #[test]
     fn a_switch_to_wal_gives_up_within_its_timeout_when_the_lock_changes_hands() {
@@ -3078,6 +3080,8 @@ mod tests {
         // once, then most of the way through the timeout takes the exclusive
         // lock and keeps it, so the next try waits in the busy handler. That
         // wait must end at the switch's deadline, not a whole timeout later.
+        // Here it gave up after 2.04 to 2.07 s; with each try free to wait a
+        // whole timeout, after 3.49 to 3.54 s. The bound is 2.7 s.
         let (_dir, path) = rollback_mode_file();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (exclusive_tx, exclusive_rx) = std::sync::mpsc::channel();
@@ -3114,11 +3118,13 @@ mod tests {
             took < SWITCH_TIMEOUT + SWITCH_MARGIN,
             "gave up after {took:?}"
         );
-        assert_eq!(busy_timeout_ms(&storage.conn), 1000);
+        assert_eq!(busy_timeout_ms(&storage.conn), 2000);
     }
 
     #[test]
     fn a_switch_to_wal_against_a_lock_held_throughout_gives_up_at_its_deadline() {
+        // Every try fails at once, so the switch keeps trying until its
+        // deadline. Here it gave up after 2.00 s.
         let (_dir, path) = rollback_mode_file();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -3145,7 +3151,51 @@ mod tests {
             took < SWITCH_TIMEOUT + SWITCH_MARGIN,
             "gave up after {took:?}"
         );
-        assert_eq!(busy_timeout_ms(&storage.conn), 1000);
+        assert_eq!(busy_timeout_ms(&storage.conn), 2000);
+    }
+
+    #[test]
+    fn a_switch_to_wal_that_succeeds_after_retrying_restores_the_busy_timeout() {
+        // Another connection holds the write lock for a while and then lets
+        // it go, so the switch is tried again until it succeeds.
+        let (_dir, path) = rollback_mode_file();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let other = path.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(&other).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1);")
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            released_tx.send(()).unwrap();
+            conn.execute_batch("ROLLBACK").unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let storage = unopened_storage(&path, SWITCH_TIMEOUT);
+        storage.switch_to_wal().unwrap();
+        let waited_for_the_lock = released_rx.try_recv().is_ok();
+        holder.join().unwrap();
+
+        assert!(waited_for_the_lock);
+        let mode: String = storage
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(busy_timeout_ms(&storage.conn), 2000);
+    }
+
+    #[test]
+    fn a_switch_to_wal_that_fails_for_another_reason_restores_the_busy_timeout() {
+        // SQLite refuses the switch inside a transaction, with an error that
+        // is not a busy one, so it is returned at once.
+        let (_dir, path) = rollback_mode_file();
+        let storage = unopened_storage(&path, SWITCH_TIMEOUT);
+        storage.conn.execute_batch("BEGIN").unwrap();
+        let err = storage.switch_to_wal().expect_err("switched");
+        assert!(!is_busy(&err), "{err:?}");
+        assert_eq!(busy_timeout_ms(&storage.conn), 2000);
     }
 
     /// Set for a copy of this test binary run by
@@ -3211,25 +3261,25 @@ mod tests {
             let ready: Vec<_> = (0..2)
                 .map(|i| dir.path().join(format!("ready-{i}")))
                 .collect();
-            let mut children = Children(
-                ready
-                    .iter()
-                    .map(|ready| {
-                        std::process::Command::new(&exe)
-                            .args([
-                                "--exact",
-                                "storage::tests::open_on_release_in_a_child_process",
-                            ])
-                            .env(CHILD_OPEN_PATH, &path)
-                            .env(CHILD_READY_PATH, ready)
-                            .env(CHILD_RELEASE_PATH, &release)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .spawn()
-                            .unwrap()
-                    })
-                    .collect(),
-            );
+            // The guard owns each child as soon as it is spawned, so one that
+            // fails to spawn leaves none behind.
+            let mut children = Children(Vec::new());
+            for ready in &ready {
+                children.0.push(
+                    std::process::Command::new(&exe)
+                        .args([
+                            "--exact",
+                            "storage::tests::open_on_release_in_a_child_process",
+                        ])
+                        .env(CHILD_OPEN_PATH, &path)
+                        .env(CHILD_READY_PATH, ready)
+                        .env(CHILD_RELEASE_PATH, &release)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                );
+            }
             let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !ready.iter().all(|ready| ready.exists()) {
                 // A child that exits before it is ready was filtered out or

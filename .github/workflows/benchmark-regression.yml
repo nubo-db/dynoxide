@@ -182,26 +182,45 @@ jobs:
           ")
           cargo install iai-callgrind-runner --version "${IAI_VERSION}"
 
+      - name: Discard any cached iai-callgrind state
+        # Same reason as the criterion job's: a cache hit brings back
+        # target/iai from an unrelated PR. Its files would sit in as a baseline
+        # wherever the base run fails to write one, and a run without a
+        # comparison would compare against them silently. So this runs every
+        # time, before anything is benchmarked.
+        run: rm -rf benchmarks/target/iai
+
       - name: Compare the iai-callgrind version with the base
         # The runner refuses a library of any other version, and it is
         # installed from the PR's requirement, so when a PR changes the locked
         # iai-callgrind the base cannot be benchmarked with it. Counts from two
         # versions are not comparable either. That is the one case with no
         # comparison: say so and run the PR's benchmarks on their own.
+        #
+        # Only a version read from both sides, and different, skips the
+        # comparison. One that cannot be read fails the job, so a lock file
+        # this step cannot parse never turns the check off.
         id: version
         shell: bash
         run: |
           locked() {
-            git show "$1:benchmarks/Cargo.lock" 2>/dev/null \
+            git show "$1:benchmarks/Cargo.lock" \
               | sed -n '/^name = "iai-callgrind"$/{n;s/^version = "\(.*\)"$/\1/p;}'
           }
-          base_version=$(locked HEAD^1)
-          head_version=$(locked HEAD)
-          if [ -n "$head_version" ] && [ "$base_version" = "$head_version" ]; then
+          base_version=$(locked HEAD^1) || base_version=
+          head_version=$(locked HEAD) || head_version=
+          for side in base head; do
+            version_var="${side}_version"
+            if [ -z "${!version_var}" ]; then
+              echo "::error::Could not read the locked iai-callgrind version from the ${side} commit's benchmarks/Cargo.lock"
+              exit 1
+            fi
+          done
+          if [ "$base_version" = "$head_version" ]; then
             echo "compare=true" >> "$GITHUB_OUTPUT"
           else
             echo "compare=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::iai-callgrind changes from ${base_version:-none} to ${head_version:-none} in this PR, so its instruction counts cannot be compared with the base branch. The benchmarks run without a comparison."
+            echo "::warning::iai-callgrind changes from ${base_version} to ${head_version} in this PR, so its instruction counts cannot be compared with the base branch. The benchmarks run without a comparison."
           fi
 
       - name: Benchmark the base branch
@@ -210,17 +229,12 @@ jobs:
         # second checkout with its own target directory would leave the PR's
         # run with nothing to compare against.
         #
-        # The rm is for the same reason as the criterion job's: a cache hit
-        # brings back target/iai from an unrelated PR, and its files would
-        # otherwise sit in as a baseline wherever this run fails to write one.
-        #
         # `record` lists what the base produced, for the check further down,
         # and runs from the PR's checkout because the base may not have it.
         id: base
         if: steps.version.outputs.compare == 'true'
         shell: bash
         run: |
-          rm -rf benchmarks/target/iai
           head_sha=$(git rev-parse HEAD)
           git checkout --quiet --detach HEAD^1
           (cd benchmarks && cargo bench --bench iai_core --features iai-callgrind -- --save-baseline=base --save-summary=json)

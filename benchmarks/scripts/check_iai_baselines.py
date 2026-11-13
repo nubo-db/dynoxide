@@ -17,12 +17,13 @@ benchmark's output under target/iai. Two subcommands:
     check   after the head run: every benchmark must show an old instruction
             count, unless the base never had it. A benchmark only the head has
             is new, reported, and allowed: a PR that adds or renames a
-            benchmark must be able to pass.
+            benchmark must be able to pass. One only the base has is
+            reported as removed, and also allowed.
 
 Exit codes, which the workflow relies on:
 
     0  every benchmark compared, or is new in the head
-    1  could not check (no summaries at all, unreadable file)
+    1  could not check (no summaries at all, unreadable or malformed file)
     4  a benchmark the base produced has no baseline in the head run
 
 Usage:
@@ -61,6 +62,10 @@ def benchmark_name(summary):
     return name
 
 
+class MalformedSummary(Exception):
+    """A summary.json that is not in the shape iai-callgrind 0.14.2 writes."""
+
+
 def old_instructions(summary):
     """The baseline's instruction count, or None when there was nothing to compare with.
 
@@ -75,7 +80,10 @@ def old_instructions(summary):
         return None
     metrics = ir.get("metrics") or {}
     if "Both" in metrics:
-        return metrics["Both"][1]
+        both = metrics["Both"]
+        if not isinstance(both, list) or len(both) != 2:
+            raise MalformedSummary(f"Ir 'Both' should hold [new, old], got {both!r}")
+        return both[1]
     if "Right" in metrics:
         return metrics["Right"]
     return None
@@ -83,7 +91,10 @@ def old_instructions(summary):
 
 def load(path):
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        summary = json.load(f)
+    if not isinstance(summary, dict) or "module_path" not in summary:
+        raise MalformedSummary("not a benchmark summary")
+    return summary
 
 
 def record(iai_dir, output):
@@ -91,7 +102,11 @@ def record(iai_dir, output):
     if not paths:
         print(f"error: the base run left no {SUMMARY_FILE} under {iai_dir}", file=sys.stderr)
         return EXIT_ERROR
-    names = sorted({benchmark_name(load(p)) for p in paths})
+    try:
+        names = sorted({benchmark_name(load(p)) for p in paths})
+    except MalformedSummary as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_ERROR
     with open(output, "w", encoding="utf-8") as f:
         f.write("\n".join(names) + "\n")
     for p in paths:
@@ -117,10 +132,16 @@ def check(iai_dir, base_list):
         return EXIT_ERROR
 
     compared, new, missing = [], [], []
+    seen = set()
     for p in paths:
-        summary = load(p)
-        name = benchmark_name(summary)
-        old = old_instructions(summary)
+        try:
+            summary = load(p)
+            name = benchmark_name(summary)
+            old = old_instructions(summary)
+        except MalformedSummary as e:
+            print(f"error: {p}: {e}", file=sys.stderr)
+            return EXIT_ERROR
+        seen.add(name)
         if old is not None:
             compared.append((name, old))
         elif name in base:
@@ -132,11 +153,14 @@ def check(iai_dir, base_list):
         print(f"compared  {name} (base: {old} instructions)")
     for name in new:
         print(f"new       {name} (not in the base, nothing to compare with)")
+    removed = sorted(base - seen)
+    for name in removed:
+        print(f"removed   {name} (in the base, not run by the head)")
     for name in missing:
         print(f"MISSING   {name} (in the base, but no baseline was found)")
     print(
         f"{len(paths)} benchmarks checked: {len(compared)} compared, "
-        f"{len(new)} new, {len(missing)} without a baseline"
+        f"{len(new)} new, {len(removed)} removed, {len(missing)} without a baseline"
     )
     return EXIT_MISSING_BASELINE if missing else EXIT_OK
 
@@ -158,7 +182,7 @@ def main(argv=None):
         if args.command == "record":
             return record(args.iai_dir, args.output)
         return check(args.iai_dir, args.base_list)
-    except (OSError, ValueError, KeyError) as e:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_ERROR
 

@@ -646,9 +646,10 @@ impl Storage {
         // The steps from version 10 on are shared with the wasm backend and run
         // each in its own write transaction. The native futures never suspend,
         // so `block_on` returns as soon as they do.
+        let mut plan = crate::storage_backend::schema::open_migrations(Some(version));
+        plan.read_only = self.conn.is_readonly(rusqlite::MAIN_DB)?;
         pollster::block_on(crate::actions::schema_migrations::run_open_migrations(
-            self,
-            crate::storage_backend::schema::open_migrations(Some(version)),
+            self, plan,
         ))
     }
 

@@ -1,7 +1,10 @@
 // Iai-Callgrind instruction-count benchmarks for deterministic regression detection.
 //
-// These measure CPU instruction counts (not wall-clock time), giving <1% variance
-// regardless of CI runner load. They require Valgrind (Linux only).
+// These measure CPU instruction counts (not wall-clock time), so CI runner load
+// does not move them. They are not exactly repeatable from one process to the
+// next (std's HashMap, for one, seeds itself per process), and some benchmarks
+// move by up to about 3% between runs of unchanged code. They require Valgrind
+// (Linux only).
 //
 // Run with: cargo bench --bench iai_core --features iai-callgrind
 // Requires: cargo install iai-callgrind-runner --version 0.14.2
@@ -248,7 +251,8 @@ fn bench_delete_item((db, request): (Database, DeleteItemRequest)) {
 /// A 25-statement PartiQL batch.
 ///
 /// The PartiQL surfaces had no instruction-count coverage at all, so a change
-/// to their hot path could not be measured by the gate that blocks a merge.
+/// to their hot path could not be measured by the PR check that compares
+/// instruction counts against the base branch.
 /// This one walks its statement list more than once before executing anything,
 /// which is precisely the kind of cost the wall-clock suite is too noisy to
 /// resolve.

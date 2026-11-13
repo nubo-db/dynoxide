@@ -611,35 +611,81 @@ const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
 
 /// DynamoDB's refusal of an attribute value that is malformed as JSON, read
 /// from it as written, so every copy of a name written twice is seen, at any
-/// depth: not an object, a type member of the wrong JSON type (see
-/// [`unreadable_member`]), or a `BOOL` or `NULL` member that
-/// [`read_lenient_bool`] refuses as the request is parsed. `None` when it
-/// reads as JSON, and for JSON null. The refusal has no marker.
+/// depth; `None` when it reads as JSON, and for JSON null. The refusal has no
+/// marker.
+///
+/// The faults are met in the order the value meets them when no name is
+/// written twice, so a repeat elsewhere never changes which of two is
+/// reported. For a member of an item, a key or the expression values, which
+/// is read as it stands: its own JSON type; its `BOOL` and then its `NULL`
+/// member, where [`read_lenient_bool`] refuses them as the request is parsed;
+/// then every other member at any depth in key order, as
+/// [`unreadable_member_in`] walks them; and only then a nested `BOOL` or
+/// `NULL`, as each nested value is read (an `L` in order, an `M` in written
+/// order). Copies of one name are taken in written order among themselves.
 fn malformed_value(value: &Written) -> Option<Cow<'static, str>> {
-    written_slot_refusal(JsonSlot::Value, value).or_else(|| match value {
-        Written::Object(members) => members
+    written_slot_refusal(JsonSlot::Value, value)
+        .or_else(|| malformed_flag(value))
+        .or_else(|| malformed_member_in(value))
+        .or_else(|| malformed_nested_value(value))
+}
+
+/// [`malformed_value`] for a member of an `M`, whose type members other than
+/// `BOOL` and `NULL` are walked with the rest of the value holding the `M`,
+/// in key order, before the member itself is read and its own `BOOL` and
+/// `NULL` with it.
+fn malformed_map_member(value: &Written) -> Option<Cow<'static, str>> {
+    written_slot_refusal(JsonSlot::Value, value)
+        .or_else(|| malformed_member_in(value))
+        .or_else(|| malformed_flag(value))
+        .or_else(|| malformed_nested_value(value))
+}
+
+/// The value's own `BOOL` member, then its `NULL` member, where
+/// [`read_lenient_bool`] refuses it as the request is parsed.
+fn malformed_flag(value: &Written) -> Option<Cow<'static, str>> {
+    let Written::Object(members) = value else {
+        return None;
+    };
+    ["BOOL", "NULL"].into_iter().find_map(|flag| {
+        members
             .iter()
-            .find_map(|(type_key, member)| malformed_member(type_key, member)),
-        _ => None,
+            .filter(|(name, member)| name == flag && !member.is_null())
+            .find_map(|(_, member)| {
+                // A string is read for its text; anything else for its JSON type.
+                let read = match member {
+                    Written::String(text) => serde_json::Value::String(text.clone()),
+                    other => other.shallow_value(),
+                };
+                read_lenient_bool(&read)
+                    .err()?
+                    .strip_prefix(crate::serde_errors::SERIALIZATION_MARKER)
+                    .map(|refusal| Cow::Owned(refusal.to_string()))
+            })
     })
 }
 
-/// [`malformed_value`] for an attribute value's `type_key` member.
+/// An object's members in key order, the copies of a name written twice in
+/// written order among themselves.
+fn in_key_order(members: &[(String, Written)]) -> Vec<&(String, Written)> {
+    let mut ordered: Vec<&(String, Written)> = members.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    ordered
+}
+
+/// [`unreadable_member_in`] for a value as written: each type member other
+/// than `BOOL` and `NULL`, in key order, and what it holds, at any depth.
+fn malformed_member_in(value: &Written) -> Option<Cow<'static, str>> {
+    let Written::Object(members) = value else {
+        return None;
+    };
+    in_key_order(members)
+        .into_iter()
+        .find_map(|(type_key, member)| malformed_member(type_key, member))
+}
+
+/// [`unreadable_member`] for a type member as written.
 fn malformed_member(type_key: &str, member: &Written) -> Option<Cow<'static, str>> {
-    if matches!(type_key, "BOOL" | "NULL") {
-        if member.is_null() {
-            return None;
-        }
-        // A string is read for its text; anything else for its JSON type.
-        let flag = match member {
-            Written::String(text) => serde_json::Value::String(text.clone()),
-            other => other.shallow_value(),
-        };
-        let marked = read_lenient_bool(&flag).err()?;
-        return marked
-            .strip_prefix(crate::serde_errors::SERIALIZATION_MARKER)
-            .map(|refusal| Cow::Owned(refusal.to_string()));
-    }
     let (slot, items) = match type_key {
         "S" | "N" => (JsonSlot::Text, None),
         "B" => (JsonSlot::Bytes, None),
@@ -653,15 +699,31 @@ fn malformed_member(type_key: &str, member: &Written) -> Option<Cow<'static, str
         return Some(refusal);
     }
     let items = items?;
-    let item_refusal = |item: &Written| match items {
-        JsonSlot::Value => malformed_value(item),
-        slot => written_slot_refusal(slot, item),
-    };
+    let item_refusal =
+        |item: &Written| written_slot_refusal(items, item).or_else(|| malformed_member_in(item));
     match member {
         Written::Array(list) => list.iter().find_map(item_refusal),
-        Written::Object(map) => map.iter().map(|(_, item)| item).find_map(item_refusal),
+        Written::Object(map) => in_key_order(map)
+            .into_iter()
+            .find_map(|(_, item)| item_refusal(item)),
         _ => None,
     }
+}
+
+/// The faults met only as each nested value is read: the members of an `L`
+/// in order and of an `M` in written order, each as [`malformed_value`]
+/// meets them.
+fn malformed_nested_value(value: &Written) -> Option<Cow<'static, str>> {
+    let Written::Object(members) = value else {
+        return None;
+    };
+    in_key_order(members)
+        .into_iter()
+        .find_map(|(type_key, member)| match (type_key.as_str(), member) {
+            ("L", Written::Array(list)) => list.iter().find_map(malformed_value),
+            ("M", Written::Object(map)) => map.iter().find_map(|(_, item)| malformed_value(item)),
+            _ => None,
+        })
 }
 
 /// [`JsonSlot::refusal`] for a value as written, without copying it.
@@ -713,7 +775,7 @@ fn collapse_repeated_members(
             };
             if let Some(malformed) = members[looked_at..=at]
                 .iter()
-                .find_map(|(_, member)| malformed_value(member))
+                .find_map(|(_, member)| malformed_map_member(member))
             {
                 return Err(malformed);
             }

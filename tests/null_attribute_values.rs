@@ -692,6 +692,133 @@ async fn a_malformed_copy_at_any_depth_is_the_answer() {
     );
 }
 
+/// A value with two faults as JSON gets the same answer whether or not a name
+/// is written twice elsewhere: the repeat is judged on the fault the value
+/// would be refused for without it. Checked for three values found by hand
+/// and for 300 generated ones (from a fixed seed), each read as a member of
+/// an item beside a repeated `pk`, and as the earlier copy of a repeated
+/// name in an `M`.
+#[tokio::test]
+async fn a_repeat_elsewhere_leaves_a_values_fault_unchanged() {
+    /// A deterministic generator, so a failure names the same values again.
+    struct Seeded(u64);
+    impl Seeded {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+    }
+    /// A type member that is malformed as JSON, written as text.
+    fn fault(rng: &mut Seeded, depth: usize) -> (String, String) {
+        const FLAT: [(&str, &str); 14] = [
+            ("S", "5"),
+            ("S", "true"),
+            ("S", "1.5"),
+            ("N", "[]"),
+            ("B", r#""!!!!""#),
+            ("SS", "[1]"),
+            ("NS", r#""x""#),
+            ("BS", r#"["!!"]"#),
+            ("L", "{}"),
+            ("M", "[]"),
+            ("BOOL", "[]"),
+            ("NULL", "5"),
+            ("BOOL", r#""maybe""#),
+            ("NULL", "{}"),
+        ];
+        match (depth < 2).then(|| rng.below(5)) {
+            Some(0) => ("M".to_string(), format!("{{{}}}", members(rng, depth + 1))),
+            Some(1) => ("L".to_string(), format!("[{}]", value(rng, depth + 1, 1))),
+            _ => {
+                let (key, member) = FLAT[rng.below(FLAT.len())];
+                (key.to_string(), member.to_string())
+            }
+        }
+    }
+    /// An attribute value holding `faults` malformed type members, each
+    /// under its own name, in a random written order.
+    fn value(rng: &mut Seeded, depth: usize, faults: usize) -> String {
+        let mut chosen: Vec<(String, String)> = Vec::new();
+        while chosen.len() < faults {
+            let (key, member) = fault(rng, depth);
+            if chosen.iter().all(|(k, _)| *k != key) {
+                chosen.push((key, member));
+            }
+        }
+        let written: Vec<String> = chosen
+            .iter()
+            .map(|(key, member)| format!(r#""{key}":{member}"#))
+            .collect();
+        format!("{{{}}}", written.join(","))
+    }
+    /// Two members of an `M`, each with one fault, under names that sort
+    /// apart from the order they are written in.
+    fn members(rng: &mut Seeded, depth: usize) -> String {
+        const NAMES: [&str; 6] = ["b", "a", "q", "f194", "f0", "zz"];
+        let first = rng.below(NAMES.len());
+        let second = (first + 1 + rng.below(NAMES.len() - 1)) % NAMES.len();
+        format!(
+            r#""{}":{},"{}":{}"#,
+            NAMES[first],
+            value(rng, depth, 1),
+            NAMES[second],
+            value(rng, depth, 1)
+        )
+    }
+
+    let mut values: Vec<String> = vec![
+        r#"{"S":5,"B":"!!!!"}"#.to_string(),
+        r#"{"M":{"f194":{"M":[]},"f0":{"S":true}}}"#.to_string(),
+        r#"{"M":{"b":{"S":5},"a":{"S":true}}}"#.to_string(),
+    ];
+    let mut rng = Seeded(317);
+    while values.len() < 303 {
+        let generated = if rng.below(2) == 0 {
+            value(&mut rng, 0, 2)
+        } else {
+            format!("{{\"M\":{{{}}}}}", members(&mut rng, 1))
+        };
+        values.push(generated);
+    }
+
+    let url = start_server().await;
+    let put =
+        |item: String| format!(r#"{{"TableName":"_capture_20261111_317_none","Item":{item}}}"#);
+    let mut wrong = Vec::new();
+    for value in &values {
+        let pairs = [
+            (
+                format!(r#"{{"pk":{{"S":"a"}},"m":{value},"pk":{{"S":"b"}}}}"#),
+                format!(r#"{{"pk":{{"S":"a"}},"m":{value}}}"#),
+            ),
+            (
+                format!(r#"{{"pk":{{"S":"a"}},"m":{{"M":{{"x":{value},"x":{{"S":"2"}}}}}}}}"#),
+                format!(r#"{{"pk":{{"S":"a"}},"m":{{"M":{{"x":{value}}}}}}}"#),
+            ),
+        ];
+        for (repeated, alone) in pairs {
+            let with_repeat = send(&url, "PutItem", &put(repeated.clone())).await;
+            let without = send(&url, "PutItem", &put(alone)).await;
+            assert_eq!(without.0, 400, "{value} is refused without a repeat");
+            if with_repeat != without {
+                wrong.push(format!(
+                    "{repeated}\n  with the repeat {with_repeat:?}\n  without         {without:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} differ:\n{}",
+        wrong.len(),
+        values.len() * 2,
+        wrong.join("\n")
+    );
+}
+
 /// TransactWriteItems with no null in the request: an action's item or key
 /// is reported ahead of its expression values, whichever is written first,
 /// and a bad number in the values is reported bare, as is the first action's

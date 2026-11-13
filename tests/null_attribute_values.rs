@@ -2405,7 +2405,7 @@ const SEVENTH: &[Choices] = &[
             r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
         ],
     ),
-    // A name written twice outside an item, key or expression values is a separate change.
+    // A table written twice in RequestItems, refused once the map is read.
     (
         15,
         "BatchGetItem",

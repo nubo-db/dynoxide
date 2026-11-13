@@ -2874,8 +2874,8 @@ pub(crate) fn select_projection_rejection(
 
 /// A batch request's `RequestItems` as read: each table's entry in the order
 /// it was written. A table written twice fails the read as a malformed
-/// request, whatever either copy holds (captured eu-west-2 and us-east-1,
-/// 13 November 2026).
+/// request once the whole map has been read, unless an entry is itself
+/// malformed (captured eu-west-2 and us-east-1, 13 November 2026).
 pub(crate) struct WrittenTables<V>(pub(crate) Vec<(String, V)>);
 
 impl<V> WrittenTables<V> {
@@ -2944,17 +2944,26 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for WrittenTables<
                 self,
                 mut map: A,
             ) -> std::result::Result<WrittenTables<V>, A::Error> {
+                // DynamoDB reads the whole map before it refuses a repeated
+                // name, so a fault in any entry read after the repeat, either
+                // copy included, is reported in its place (captured
+                // eu-west-2 and us-east-1, 13 November 2026).
                 let mut tables: Vec<(String, V)> = Vec::new();
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut repeated = false;
                 while let Some((name, entry)) = map.next_entry::<String, V>()? {
-                    if !seen.insert(name.clone()) {
-                        return Err(serde::de::Error::custom(format!(
-                            "{}{}",
-                            crate::serde_errors::SERIALIZATION_MARKER,
-                            crate::types::DUPLICATE_MEMBER
-                        )));
+                    if seen.insert(name.clone()) {
+                        tables.push((name, entry));
+                    } else {
+                        repeated = true;
                     }
-                    tables.push((name, entry));
+                }
+                if repeated {
+                    return Err(serde::de::Error::custom(format!(
+                        "{}{}",
+                        crate::serde_errors::SERIALIZATION_MARKER,
+                        crate::types::DUPLICATE_MEMBER
+                    )));
                 }
                 Ok(WrittenTables(tables))
             }

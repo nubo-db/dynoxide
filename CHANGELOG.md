@@ -218,8 +218,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - BatchGetItem and BatchWriteItem refuse a table written twice in
   `RequestItems` with a `SerializationException`, `Duplicate key found in
-  payload`, as DynamoDB does whatever either copy holds. Dynoxide used the
-  last copy. Tables with empty `Keys` are listed one fault per table, ten at
+  payload`, once the whole map is read, as DynamoDB does. A value of the
+  wrong type anywhere in the map, either copy included, or in a member
+  written ahead of it, is reported instead. Dynoxide used the last copy. Tables with empty `Keys` are listed one fault per table, ten at
   most, as BatchWriteItem's empty or overlong lists are; BatchGetItem used to
   report only one of them.
 

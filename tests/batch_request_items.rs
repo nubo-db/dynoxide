@@ -247,6 +247,13 @@ async fn limits_repeats_and_orders_answer_as_dynamodb_did() {
     );
 }
 
+/// The fourth set, captured on 13 November 2026: a table written twice beside
+/// a malformed value elsewhere in the request, before or after the repeat.
+#[tokio::test]
+async fn a_repeated_table_answers_after_the_whole_map_as_dynamodb_did() {
+    assert_eq!(replay(FOURTH_ROWS, &[], &[]).await, (12, 12, 0, 0));
+}
+
 #[test]
 fn every_row_left_out_is_sent() {
     assert_left_out_rows_are_sent(ROWS, LEFT_OUT);
@@ -993,3 +1000,78 @@ const THIRD_LEFT_OUT: &[LeftOut] = &[LeftOut {
     answer: r#"{"Message":"duplicate field `RequestItems` at line 1 column 91","__type":"com.amazon.coral.service#SerializationException"}"#,
     reason: "RequestItems written twice is a repeated member name, a separate change",
 }];
+
+const FOURTH_ROWS: &[Row] = &[
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":5}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":"x","_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":"x"}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":5}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":5}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"ReturnConsumedCapacity":5}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"ReturnConsumedCapacity":5,"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":[]}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_other":{"Keys":"x"}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Unexpected field type"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":5}}]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"NUMBER_VALUE cannot be converted to String"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"ReturnConsumedCapacity":"BOGUS"}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+];

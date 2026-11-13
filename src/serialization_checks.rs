@@ -58,13 +58,89 @@ pub(crate) fn pre_check_and_read_layer<'a>(
         }
         None => (Cow::Borrowed(body), json),
     };
-    check_types(operation, &json)?;
+    match repeated_table_views(operation, &body) {
+        Some(views) => {
+            for view in &views {
+                check_types(operation, view)?;
+            }
+        }
+        None => check_types(operation, &json)?,
+    }
     let layer = if crate::types::reads_on_older_layer(&json) {
         crate::validation::ValueLayer::Older
     } else {
         crate::validation::ValueLayer::for_operation(operation)
     };
     Ok((body, layer))
+}
+
+/// An object's members as written, repeats included, each value unread.
+struct WrittenMembers<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
+
+impl<'de> serde::Deserialize<'de> for WrittenMembers<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Members;
+        impl<'de> serde::de::Visitor<'de> for Members {
+            type Value = WrittenMembers<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(WrittenMembers(members))
+            }
+        }
+        deserializer.deserialize_map(Members)
+    }
+}
+
+/// For a BatchGetItem or BatchWriteItem body whose `RequestItems` names a
+/// table more than once, the requests DynamoDB type-checks before it refuses
+/// the repeat: one for each table entry as written, both copies of a repeated
+/// table included, each beside the members written ahead of `RequestItems`.
+/// DynamoDB reads the whole map first, so a type fault in any entry is
+/// reported in place of the repeat, as is one in a member written before the
+/// map, while one written after it is never reached (captured eu-west-2 and
+/// us-east-1, 13 November 2026). `None` when no table is repeated, and the
+/// body's parsed value is checked as it stands.
+fn repeated_table_views(operation: &str, body: &str) -> Option<Vec<serde_json::Value>> {
+    if operation != "BatchGetItem" && operation != "BatchWriteItem" {
+        return None;
+    }
+    let top: WrittenMembers = serde_json::from_str(body).ok()?;
+    let at = top.0.iter().position(|(name, _)| name == "RequestItems")?;
+    let tables: WrittenMembers = serde_json::from_str(top.0[at].1.get()).ok()?;
+    let mut seen = std::collections::HashSet::new();
+    if tables.0.iter().all(|(name, _)| seen.insert(name.as_str())) {
+        return None;
+    }
+    let mut before = serde_json::Map::new();
+    for (name, value) in &top.0[..at] {
+        before.insert(
+            name.clone(),
+            crate::serde_errors::body_value(value.get()).ok()?,
+        );
+    }
+    tables
+        .0
+        .iter()
+        .map(|(name, entry)| {
+            let mut view = before.clone();
+            let mut table = serde_json::Map::new();
+            table.insert(
+                name.clone(),
+                crate::serde_errors::body_value(entry.get()).ok()?,
+            );
+            view.insert("RequestItems".to_string(), serde_json::Value::Object(table));
+            Some(serde_json::Value::Object(view))
+        })
+        .collect()
 }
 
 fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {

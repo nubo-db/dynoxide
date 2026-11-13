@@ -25,13 +25,19 @@ pub struct WriteRequest {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PutRequest {
-    #[serde(rename = "Item")]
+    #[serde(
+        rename = "Item",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub item: Item,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DeleteRequest {
-    #[serde(rename = "Key")]
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub key: HashMap<String, AttributeValue>,
 }
 
@@ -706,10 +712,11 @@ pub(crate) fn write_java_item(
     out.write_str("}")
 }
 
-/// `ExpressionAttributeNames` as the Java model prints it, `{#n=a}`, or `null`.
-pub(crate) fn write_java_names(
+/// Expression attribute names as written, a null name printed `null` as the
+/// Java model prints it (captured eu-west-2 and us-east-1, 2026-11-12).
+pub(crate) fn write_java_written_names(
     out: &mut dyn std::fmt::Write,
-    names: Option<&HashMap<String, String>>,
+    names: Option<&crate::empty_names::WrittenNames>,
 ) -> std::fmt::Result {
     let Some(names) = names else {
         return out.write_str("null");
@@ -719,7 +726,7 @@ pub(crate) fn write_java_names(
         if i > 0 {
             out.write_str(", ")?;
         }
-        write!(out, "{name}={}", names[name])?;
+        write!(out, "{name}={}", names[name].as_deref().unwrap_or("null"))?;
     }
     out.write_str("}")
 }

@@ -8,7 +8,10 @@
 //! and some hosts print a value as an object hash, so the form most regions
 //! give is the one followed). The requests use the capture's own table name,
 //! so the whole message can be compared by length too. TransactWriteItems
-//! echoes no list (captured eu-west-2 and us-east-1, 2026-11-11).
+//! echoes no list (captured eu-west-2 and us-east-1, 2026-11-11), and nor
+//! does TransactGetItems unless the request holds a null name (captured
+//! eu-west-2 and us-east-1, 2026-11-12), so its echoes are asked for over
+//! HTTP with a null name in a Get the assertions don't read.
 
 use dynoxide::Database;
 use dynoxide::actions::execute_transaction::ExecuteTransactionRequest;
@@ -17,6 +20,37 @@ use dynoxide::actions::transact_write_items::TransactWriteItemsRequest;
 use serde_json::{Value, json};
 
 const TABLE: &str = "_capture_20261010_mcii_none";
+
+/// The message TransactGetItems answers these Gets with over HTTP, where a
+/// null name can be sent.
+fn transact_get_message(gets: Vec<Value>) -> String {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(dynoxide::server::serve_on(
+            listener,
+            Database::memory().unwrap(),
+        ));
+        let body: Value = reqwest::Client::new()
+            .post(url)
+            .header("x-amz-target", "DynamoDB_20120810.TransactGetItems")
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                 SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+            )
+            .header("x-amz-date", "20260101T000000Z")
+            .body(json!({"TransactItems": gets}).to_string())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["message"].as_str().unwrap().to_string()
+    })
+}
 
 fn assert_echo(message: &str, head: &str, tail: &str, len: usize) {
     assert!(
@@ -140,9 +174,10 @@ fn an_action_list_over_100_is_not_echoed() {
     );
 }
 
+/// The Gets are echoed when the request holds a null name, here in the
+/// Get for `g50`; without one, nothing is echoed.
 #[test]
 fn a_get_list_over_100_is_echoed_in_the_java_form() {
-    let db = Database::memory().unwrap();
     let mut items = vec![json!({"Get": {
         "TableName": TABLE,
         "Key": {"pk": {"S": "k"}},
@@ -153,14 +188,30 @@ fn a_get_list_over_100_is_echoed_in_the_java_form() {
         (0..100)
             .map(|i| json!({"Get": {"TableName": TABLE, "Key": {"pk": {"S": format!("g{i}")}}}})),
     );
-    let err = db
+    let short = Database::memory()
+        .unwrap()
         .transact_get_items(
-            serde_json::from_value::<TransactGetItemsRequest>(json!({"TransactItems": items}))
-                .unwrap(),
+            serde_json::from_value::<TransactGetItemsRequest>(
+                json!({"TransactItems": items.clone()}),
+            )
+            .unwrap(),
         )
         .unwrap_err();
+    assert_eq!(
+        short.to_string(),
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
+    );
+    items[51]["Get"]["ExpressionAttributeNames"] = json!({"#x": null});
+    let message = transact_get_message(items);
+    assert!(message.contains(
+        "{pk=AttributeValue(s=g50, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, \
+         sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, \
+         l=null, nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none, \
+         projectionExpression=null, expressionAttributeNames={#x=null}"
+    ));
     assert_echo(
-        &err.to_string(),
+        &message,
         concat!(
             "1 validation error detected: Value '[TransactGetItem(get=Get(key={pk=AttributeValue(s=k",
             ", n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null",
@@ -181,7 +232,7 @@ fn a_get_list_over_100_is_echoed_in_the_java_form() {
             ", expressionAttributeNames=null",
             ", workloadProfileName=null))]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
         ),
-        34969,
+        34974,
     );
 }
 
@@ -379,13 +430,8 @@ fn an_echoed_map_is_sized_to_its_entries() {
     gets.extend(
         (0..100).map(|i| json!({"Get": {"TableName": "t", "Key": {"pk": {"S": format!("g{i}")}}}})),
     );
-    let message = db
-        .transact_get_items(
-            serde_json::from_value::<TransactGetItemsRequest>(json!({"TransactItems": gets}))
-                .unwrap(),
-        )
-        .unwrap_err()
-        .to_string();
+    gets[1]["Get"]["ExpressionAttributeNames"] = json!({"#x": null});
+    let message = transact_get_message(gets);
     let start =
         message.find("expressionAttributeNames={").unwrap() + "expressionAttributeNames={".len();
     assert_eq!(

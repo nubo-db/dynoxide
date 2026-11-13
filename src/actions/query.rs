@@ -20,14 +20,14 @@ struct QueryRequestRaw {
     filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(
-        rename = "ExpressionAttributeValues",
+        rename = "ExpressionAttributeNames",
         default,
-        deserialize_with = "crate::types::deserialize_named_empty_and_null_refusals"
+        deserialize_with = "crate::empty_names::deserialize_names"
     )]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<crate::types::HeldValues>,
     #[serde(
         rename = "ScanIndexForward",
         default,
@@ -115,6 +115,16 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = QueryRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
+        let expression_attribute_values = helpers::read_values_after_start_key(
+            raw.expression_attribute_values,
+            crate::types::read_query_values,
+            raw.exclusive_start_key.as_ref(),
+            |key| {
+                helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current)
+                    .map_err(start_key_value_error)
+            },
+        )
+        .map_err(serde::de::Error::custom)?;
 
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
@@ -144,7 +154,12 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         // value as read, and an empty name in the older wording (captured
         // eu-west-2, eu-central-1 and us-east-1, 2026-10-20).
         let limit = raw.limit.map(|n| n.value);
-        let coerced = raw.limit.is_some_and(|n| n.coerced);
+        //
+        // A null in the ExclusiveStartKey hands the request to the older layer
+        // too: beside a Limit of 0 it answers `Value '0' at 'limit'` (captured
+        // eu-west-2 and us-east-1, 2026-11-11).
+        let coerced = raw.limit.is_some_and(|n| n.coerced)
+            || helpers::start_key_holds_null(raw.exclusive_start_key.as_ref());
         let limit_too_small = limit.filter(|l| *l < 1);
         if raw.table_name.is_none() || coerced {
             let mut errors = Vec::new();
@@ -233,7 +248,7 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             filter_expression: raw.filter_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             // Left out or null, a Query reads forward (captured eu-west-2 and
             // us-east-1, 2026-10-10).
             scan_index_forward: raw.scan_index_forward.unwrap_or(true),
@@ -320,7 +335,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
     if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
         .is_some()
     {

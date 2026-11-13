@@ -86,9 +86,77 @@ pub(crate) fn empty_placeholder(names: Option<&HashMap<String, String>>) -> Opti
     empty.first().copied()
 }
 
+/// Read a request's `ExpressionAttributeNames`, taking a name given as JSON
+/// `null` for an empty one, as DynamoDB reads it: `ExpressionAttributeNames
+/// contains invalid value: Empty attribute name for key #n` beside an
+/// expression, and `ExpressionAttributeNames can only be specified when using
+/// expressions` without one (captured eu-west-2 and us-east-1, 2026-11-12). A
+/// null in place of the whole map is still no map.
+pub(crate) fn deserialize_names<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names: Option<HashMap<String, Option<String>>> =
+        serde::Deserialize::deserialize(deserializer)?;
+    Ok(names.map(|names| {
+        names
+            .into_iter()
+            .map(|(placeholder, name)| (placeholder, name.unwrap_or_default()))
+            .collect()
+    }))
+}
+
 /// The message for an empty ExpressionAttributeNames value.
 pub(crate) fn placeholder_message(placeholder: &str) -> String {
     format!("ExpressionAttributeNames contains invalid value: {MESSAGE} for key {placeholder}")
+}
+
+/// Whether the expression names are checked for an empty name ahead of
+/// everything else, as the current layer checks them. The older layer, which a
+/// null name puts the request on, checks them with the expressions instead,
+/// after `ExpressionAttributeNames can only be specified when using
+/// expressions` (captured eu-west-2 and us-east-1, 2026-11-12; see
+/// `helpers::validate_expression_params`).
+pub(crate) fn names_checked_early() -> bool {
+    crate::types::current_value_layer() != crate::validation::ValueLayer::Older
+}
+
+/// [`check_names`] for an operation that checks its expression names again
+/// with its expressions: only where [`names_checked_early`].
+pub(crate) fn check_names_early(names: Option<&HashMap<String, String>>) -> Result<()> {
+    if names_checked_early() {
+        check_names(names)
+    } else {
+        Ok(())
+    }
+}
+
+/// A transaction action's `ExpressionAttributeNames` as written, a name
+/// given as JSON `null` kept apart from an empty one.
+pub(crate) type WrittenNames = HashMap<String, Option<String>>;
+
+/// The names a transaction action is read with. A null name is read as an
+/// empty one when the action has an expression, and refused as such. When it
+/// has none, names holding a null are not checked at all, and DynamoDB goes
+/// on to the table lookup, whatever the other names are (captured eu-west-2
+/// and us-east-1, 2026-11-12, for a TransactWriteItems `Put`). Names without
+/// a null are read as written either way.
+pub(crate) fn action_names(
+    names: Option<WrittenNames>,
+    has_expression: bool,
+) -> Option<HashMap<String, String>> {
+    let names = names?;
+    if !has_expression && names.values().any(Option::is_none) {
+        return None;
+    }
+    Some(
+        names
+            .into_iter()
+            .map(|(placeholder, name)| (placeholder, name.unwrap_or_default()))
+            .collect(),
+    )
 }
 
 /// Refuse an ExpressionAttributeNames entry whose name is empty, bare, with
@@ -208,7 +276,7 @@ pub(crate) fn check_single_item_write(
     if map_has_empty_name(attributes) || updates_empty || expected_has_empty_name(expected) {
         return Err(enveloped());
     }
-    if let Some(placeholder) = empty_placeholder(names) {
+    if let Some(placeholder) = empty_placeholder(names).filter(|_| names_checked_early()) {
         return Err(DynoxideError::ValidationException(
             crate::validation::envelope_message(&placeholder_message(placeholder)),
         ));

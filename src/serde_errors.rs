@@ -236,9 +236,67 @@ pub(crate) fn marked_serialization_error(msg: &str) -> Option<crate::DynoxideErr
     })
 }
 
+/// The raw serde message, marker and all, that [`deserialize`] answers with
+/// `error`, for a request decoder that raises an error found by a check made
+/// outside serde; `None` for an error no marker carries.
+pub(crate) fn marked_message(error: &crate::DynoxideError) -> Option<String> {
+    match error {
+        crate::DynoxideError::ValidationException(message) => {
+            Some(format!("{VALIDATION_MARKER}{message}"))
+        }
+        crate::DynoxideError::EnvelopedValidation(message) => {
+            Some(format!("{REQUEST_VALIDATION_MARKER}{message}"))
+        }
+        crate::DynoxideError::SerializationException(message) => {
+            Some(format!("{SERIALIZATION_MARKER}{message}"))
+        }
+        _ => None,
+    }
+}
+
 /// DynamoDB's refusal of a NULL that isn't true.
 pub(crate) const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value types must have the value \
      of true";
+
+/// DynamoDB's refusal of a JSON null where an attribute value belongs. A
+/// member of a map of attributes is named after it by
+/// [`null_member_refusal`]; a list member, a PartiQL parameter and a legacy
+/// `AttributeValueList` member are not (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
+pub(crate) const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
+
+/// DynamoDB's refusal of a JSON null given for the attribute `name` of an
+/// item, a key or a nested `M`.
+pub(crate) fn null_member_refusal(name: &str) -> String {
+    format!("{NULL_VALUE}: {name} is null")
+}
+
+/// DynamoDB's refusal of a JSON null among the members of a set of
+/// `type_key`'s type: a value fault, refused bare, and named by key in the
+/// expression values as a null value is (captured eu-west-2 and us-east-1,
+/// 2026-11-12).
+pub(crate) fn null_set_member_refusal(type_key: &str) -> Option<&'static str> {
+    NULL_SET_MEMBER
+        .iter()
+        .find(|(set, _)| *set == type_key)
+        .map(|(_, refusal)| *refusal)
+}
+
+/// The refusals [`null_set_member_refusal`] gives, by set type.
+const NULL_SET_MEMBER: [(&str, &str); 3] = [
+    (
+        "SS",
+        "One or more parameter values were invalid: An string set may not have a null string as a member",
+    ),
+    (
+        "NS",
+        "One or more parameter values were invalid: Numeric sets may not contain null",
+    ),
+    (
+        "BS",
+        "One or more parameter values were invalid: Binary sets may not contain null or empty values",
+    ),
+];
 
 /// DynamoDB's refusal of a value with no type set.
 pub(crate) const EMPTY_VALUE: &str =
@@ -253,6 +311,9 @@ pub(crate) const MORE_THAN_ONE_TYPE: &str = "Supplied AttributeValue has more th
 /// `ExpressionAttributeValues` tell the cases apart to decide which name the
 /// value's key.
 pub(crate) enum ValueRefusal<'a> {
+    /// A JSON null, named after its attribute when it was a map's member, or
+    /// a member of a set.
+    Null(&'a str),
     /// No type set, or not an object.
     Empty,
     /// More than one type set.
@@ -273,7 +334,11 @@ pub(crate) enum ValueRefusal<'a> {
 /// Which refusal a raw serde message from reading one value is.
 pub(crate) fn value_refusal(msg: &str) -> ValueRefusal<'_> {
     let inner = clean_serde_message(msg);
-    if inner.contains("empty AttributeValue") || inner.contains("Supplied AttributeValue is empty")
+    if inner.starts_with(NULL_VALUE) || NULL_SET_MEMBER.iter().any(|(_, refusal)| inner == *refusal)
+    {
+        ValueRefusal::Null(inner)
+    } else if inner.contains("empty AttributeValue")
+        || inner.contains("Supplied AttributeValue is empty")
     {
         ValueRefusal::Empty
     } else if inner.contains("more than one datatypes") {

@@ -23,19 +23,19 @@ struct UpdateItemRequestRaw {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
     #[serde(rename = "Key", default)]
-    key: Option<HashMap<String, AttributeValue>>,
+    key: Option<types::HeldAttributeMap>,
     #[serde(rename = "UpdateExpression", default)]
     update_expression: Option<String>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(
-        rename = "ExpressionAttributeValues",
+        rename = "ExpressionAttributeNames",
         default,
-        deserialize_with = "crate::types::deserialize_named_null_refusals"
+        deserialize_with = "crate::empty_names::deserialize_names"
     )]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<types::HeldValues>,
     #[serde(rename = "ReturnValues", default)]
     return_values: Option<String>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
@@ -44,8 +44,12 @@ struct UpdateItemRequestRaw {
     return_values_on_condition_check_failure: Option<String>,
     #[serde(rename = "ReturnItemCollectionMetrics", default)]
     return_item_collection_metrics: Option<String>,
-    #[serde(rename = "AttributeUpdates", default)]
-    attribute_updates: Option<HashMap<String, AttributeValueUpdate>>,
+    #[serde(
+        rename = "AttributeUpdates",
+        default,
+        deserialize_with = "deserialize_attribute_updates"
+    )]
+    attribute_updates: Option<HeldUpdates>,
     #[serde(rename = "Expected", default)]
     expected: Option<serde_json::Value>,
     #[serde(rename = "ConditionalOperator", default)]
@@ -113,6 +117,26 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         let raw = UpdateItemRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
+        // The key's values are checked ahead of the expression values,
+        // whichever is written first (captured eu-west-2 and us-east-1,
+        // 2026-11-11).
+        let key = raw
+            .key
+            .map(|key| key.0)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        // So are they ahead of the values in AttributeUpdates, whichever is
+        // written first (captured eu-west-2 and us-east-1, 2026-11-11).
+        let attribute_updates = raw
+            .attribute_updates
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let expression_attribute_values = raw
+            .expression_attribute_values
+            .map(|values| values.read(types::read_update_item_values))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
         // request malformed, ahead of everything else.
@@ -122,7 +146,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
 
         // A missing key hands the request to the older member-validation
         // layer, including an empty table name and ConditionalOperator (#262).
-        if raw.key.is_none() {
+        if key.is_none() {
             let mut errors: Vec<String> = Vec::new();
             if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
                 raw.return_consumed_capacity.as_deref(),
@@ -189,7 +213,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         let mut errors = Vec::new();
 
         // Key constraint
-        if raw.key.is_none() {
+        if key.is_none() {
             errors.push(
                 "Value null at 'key' failed to satisfy constraint: \
                  Member must not be null"
@@ -220,16 +244,16 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
 
         Ok(UpdateItemRequest {
             table_name,
-            key: raw.key.unwrap_or_default(),
+            key: key.unwrap_or_default(),
             update_expression: raw.update_expression,
             condition_expression: raw.condition_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             return_values: raw.return_values,
             return_consumed_capacity: raw.return_consumed_capacity,
             return_values_on_condition_check_failure: raw.return_values_on_condition_check_failure,
             return_item_collection_metrics: raw.return_item_collection_metrics,
-            attribute_updates: raw.attribute_updates,
+            attribute_updates,
             expected: raw.expected,
             conditional_operator: raw.conditional_operator,
         })
@@ -243,6 +267,50 @@ pub struct AttributeValueUpdate {
     pub action: String,
     #[serde(rename = "Value", default)]
     pub value: Option<AttributeValue>,
+}
+
+/// `AttributeUpdates` as read, or the refusal held for it as the raw serde
+/// message.
+type HeldUpdates = std::result::Result<HashMap<String, AttributeValueUpdate>, String>;
+
+/// Deserialise `AttributeUpdates`, refusing an entry given as null in
+/// DynamoDB's words for it, which name the attribute (captured eu-west-2 and
+/// us-east-1, 2026-11-11). Entries are read in written order. A value of the
+/// wrong JSON type fails the request as it is parsed; any other refusal is
+/// held, so the key's can be reported first.
+fn deserialize_attribute_updates<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HeldUpdates>, D::Error> {
+    let Some(types::WrittenMembers(members)) =
+        Option::<types::WrittenMembers>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut updates = HashMap::with_capacity(members.len());
+    let mut held = None;
+    for (name, update) in members {
+        if update.is_null() {
+            held = held.or(Some(format!(
+                "{}Supplied AttributeValueUpdate is empty, must contain one of the \
+                 supported actions: {name} is null",
+                crate::serde_errors::VALIDATION_MARKER
+            )));
+            continue;
+        }
+        match serde_json::from_value::<AttributeValueUpdate>(update.to_value()) {
+            Ok(update) => {
+                updates.insert(name, update);
+            }
+            Err(e) => {
+                let refusal = e.to_string();
+                if !crate::serde_errors::is_validation_refusal(&refusal) {
+                    return Err(serde::de::Error::custom(refusal));
+                }
+                held = held.or(Some(refusal));
+            }
+        }
+    }
+    Ok(Some(held.map_or(Ok(updates), Err)))
 }
 
 /// DynamoDB's refusal of an `AttributeUpdates` action other than `ADD`,
@@ -442,8 +510,10 @@ async fn execute_inner<S: StorageBackend>(
         }
         for update in updates.values() {
             let action = update.action.as_str();
+            // Refused inside the envelope (captured eu-west-2 and us-east-1,
+            // 2026-11-11).
             if update.value.is_none() && action != "DELETE" {
-                return Err(DynoxideError::ValidationException(
+                return Err(DynoxideError::EnvelopedValidation(
                     "One or more parameter values were invalid: \
                          Only DELETE action is allowed when no attribute value is specified"
                         .to_string(),

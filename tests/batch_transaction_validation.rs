@@ -484,11 +484,12 @@ fn a_malformed_table_name_in_a_transaction_is_a_top_level_error_naming_the_actio
             "ConditionExpression": "attribute_exists(pk)"}}])
         ),
         format!(
-            "2 validation errors detected: Value 'a!' at 'transactItems.1.member.conditionCheck.tableName' \
-             failed to satisfy constraint: Member must have length greater than or equal to 3; {}",
+            "2 validation errors detected: {}; Value 'a!' at \
+             'transactItems.1.member.conditionCheck.tableName' failed to satisfy constraint: \
+             Member must have length greater than or equal to 3",
             bad_name_message("a!", "transactItems.1.member.conditionCheck.tableName")
         ),
-        "a name too short and malformed"
+        "a name too short and malformed, the pattern first as eu-west-2 lists them"
     );
     assert_eq!(
         write(serde_json::json!([

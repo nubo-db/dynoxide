@@ -38,6 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
   serves without an `initialize` step. Clients on earlier versions see no
   change.
+- **A bare name on the right of a PartiQL SET is an attribute, not a
+  string.** `SET z = s` copies the attribute `s`, and is refused when the
+  item has none, where it used to write the string `s`, as DynamoDB does.
+- **A path set against a key attribute is refused on a PartiQL read by
+  key.** With the partition key given, by `=` or by `IN` with one value or
+  several, `begins_with(sk, s)`, `begins_with(s, sk)`, `sk = t`, `sk > t`,
+  `sk BETWEEN t AND 'z'` and `pk = s` are refused as a filter on the key,
+  even beside an equality on the sort key, as DynamoDB refuses them. These
+  used to run as filters. A clause that gives the partition key only under a
+  NOT, or puts another condition on it (`pk <> 'z'`, a second `IN`), is a
+  scan, and still runs. Overlapping key conditions are refused first, and
+  `pk = 'a' AND (sk = t OR n = 5)` is refused as overlapping, where
+  `pk = 'a' AND (sk <> t OR n = 5)` runs. The overlap check and ORDER BY take
+  the same view of a read by key, so `NOT NOT pk = 'a' AND (sk = t OR n = 5)`
+  runs, and `pk = 'a' AND pk <> 'z' ORDER BY sk` is refused for having no
+  partition key condition.
 
 ### Changed
 
@@ -51,6 +67,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crate release is `dynoxide-rs` 4.0.0.
 
 ### Fixed
+
+- **TransactGetItems no longer refuses an empty or unused name in a `Get`
+  with no `ProjectionExpression`.** It goes on to the table lookup as
+  DynamoDB does, so a request Dynoxide used to refuse now reads the item.
+  More than 100 Gets in TransactGetItems are now refused without listing
+  them, as DynamoDB now does, unless the request holds a null name, when the
+  listing shows that name as `null`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A JSON `null` where an attribute value belongs is refused in DynamoDB's
+  words, `The supplied Item contains a null AttributeValue`, where before it
+  was taken for an empty value. A null member of an item, a key or an `M` is
+  named (`: pk is null`); one in an `L`, a PartiQL parameter or an
+  `AttributeValueList` is not. `ExpressionAttributeValues` and
+  `ExclusiveStartKey` wrap it as they wrap their other faults, and a null
+  given for a whole `Expected`, `AttributeUpdates`, `KeyConditions`,
+  `QueryFilter` or `ScanFilter` entry gets the message DynamoDB has for each.
+  In BatchExecuteStatement it fails only its own statement
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A null, including one given as a type member such as `{"S": null}`, puts
+  the request on the older validation layer, so a bad number beside one in
+  an item comes back without the `1 validation error detected:` envelope,
+  and one in the expression values is named by its key. A null in a starting
+  key puts a Query's or Scan's `Limit` error, and its other numbers, in that
+  layer's words. Without a null, a bad number in a transaction's expression
+  values is no longer named by key, as DynamoDB now answers
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- The faults in an item or key are now met in the order DynamoDB walks them
+  (its Java `HashMap` order, with a value of the wrong JSON type ahead of the
+  rest), as are those in PutItem's expression values and in any request's
+  expression values once a null is present. An item or key is checked before
+  `ExpressionAttributeValues` and `AttributeUpdates`, and a starting key
+  before Query's. In a TransactWriteItems action the item or key comes first
+  too, unless the request holds a null, when the values do; a member of the
+  wrong JSON type anywhere in the action comes ahead of both. Nulls inside an
+  `M` are met in the order they were written when their names share a bucket
+  of that map, an array given for a value is refused with no message even
+  beside the same name written twice, and the MCP write tools refuse a
+  malformed `expression_attribute_values` before a fault in the item or key
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A `null` name in `ExpressionAttributeNames` is now read as an empty name,
+  puts the request on the older layer and is checked with the expressions. A
+  transaction action with no expression doesn't check names that hold one
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A `null` member of an `SS`, `NS` or `BS` puts the request on the older
+  layer, as a null value does, and is refused in DynamoDB's words, in its
+  place among the set's members, where it used to be a
+  `SerializationException`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice in an item, a key, `ExpressionAttributeValues` or
+  `AttributeUpdates` is refused with `Duplicate key found in payload`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice inside an `M` keeps its last copy, as before, but is
+  now refused with `Duplicate key found in payload` when either copy is a
+  null, an empty value or has more than one type member. A copy that is
+  malformed as JSON, such as an array, is refused for that fault
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- GetItem and BatchGetItem now report `ProjectionExpression` beside
+  `AttributesToGet` ahead of an empty name in `ExpressionAttributeNames`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- An `AttributeUpdates` entry with no value and an action other than
+  `DELETE` is now refused inside the `1 validation error detected:` envelope
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- The MCP tools give the same answers as the HTTP API for these requests,
+  and refuse expression values that aren't a map as the HTTP API does, where
+  `delete_item` used to ignore them
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A table or index name's length is counted the way DynamoDB counts it, and
+  never in UTF-8 bytes. `TableName` on CreateTable, DescribeTable,
+  DeleteTable, UpdateTable, UpdateTimeToLive and DescribeTimeToLive counts
+  UTF-16 units, so `😀😀` is long enough there. An index name on CreateTable
+  and UpdateTable, ListTables' `ExclusiveStartTableName`, a table name inside
+  a transaction and a Query or Scan `IndexName` count characters, so `😀😀` is
+  too short. A name like this always breaks the name pattern as well, so it
+  is still refused; what changes is which faults the refusal lists, and in
+  what order. Some answers change for an ASCII name too. DescribeTable,
+  DeleteTable, UpdateTable and DescribeTimeToLive refuse a name under 3 or
+  over 255 in the validation envelope (`Value 'ab' at 'tableName' failed to
+  satisfy constraint: Member must have length greater than or equal to 3`)
+  where they gave a bare sentence; an empty name still gets the sentence.
+  UpdateTimeToLive refuses a name under 3, where it looked the table up. An
+  UpdateTable `Create` or `Delete` index name, and a Query or Scan
+  `IndexName`, are checked before the table is looked up, so a bad one is no
+  longer answered with `ResourceNotFoundException`. CreateTable, UpdateTable
+  and ListTables list the length fault before the pattern fault, and a
+  transaction lists the pattern fault first, as eu-west-2 does
+  ([#290](https://github.com/nubo-db/dynoxide/issues/290)).
 
 - A JSON array where DynamoDB doesn't expect one is refused as DynamoDB
   refuses it. A request body that is an array is a `SerializationException`
@@ -370,6 +472,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-string `ProjectionExpression`, malformed `ExpressionAttributeNames` or
   a bad `AttributesToGet`, which the tool also ignored, are now refused
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- PartiQL reads `begins_with` and `contains` as calls, as it already read
+  `attribute_exists` and `attribute_type`. Either operand can be a literal, a
+  parameter, a path or another call, so `begins_with('abc', 'a')`,
+  `begins_with(?, ?)` and `contains([1, 2], 1)` match where they used to
+  match nothing or fail to parse. The call is a boolean wherever an operand
+  can stand, IS refuses it as its left side, and a wrong number of operands,
+  the same path twice, `MISSING`, or a fixed operand of `begins_with` that
+  isn't a string or a binary is refused as DynamoDB refuses it. `contains`
+  now finds a binary inside a binary and a member of a binary set.
+- Arithmetic in a PartiQL WHERE clause is refused naming its operator (`+`,
+  `-`, `*` or `/`) on either side of a comparison, in a BETWEEN bound and in
+  an IN list, where it used to be a malformed statement; `n IN [6 - 1]` is no
+  longer read as two members. A bracketed value, `n = (5)`, is the value.
+- A PartiQL SET sum takes paths, numbers and parameters in any mix, chained
+  and bracketed, so `SET z = 1 + n` and `SET z = (1 + 1)` run.
+  `if_not_exists(path, value)` and `list_append` are terms, so
+  `SET n = if_not_exists(n, 0) + 1` runs. A type fault names the operator
+  written beside it, and a sum is held to the operator limit. A function such
+  as `size` is refused as not allowed in an update expression, one DynamoDB
+  doesn't know (`abs(n)`) as unrecognised, `*` and `/` as unsupported
+  operators, and `-n` for its operand count. An operand of `if_not_exists` or
+  `list_append` is read the same way, so `if_not_exists(q, n + 1)` runs and
+  `if_not_exists(q, size(s))` is refused naming `size`. `if_not_exists`
+  resolves and checks its value even when the attribute is there, so
+  `if_not_exists(n, nope)` is refused when the item has no `nope`. A literal
+  of the wrong type in a sum or a `list_append` operand is refused ahead of an
+  attribute the item lacks, even when the attribute is read by an earlier SET.
+  A sum needing more than 38 significant digits is refused as a number
+  overflow once every attribute has been read, and each running total of a
+  sum is checked in the order written.
 
 ## [1.6.0] - 2026-11-07
 

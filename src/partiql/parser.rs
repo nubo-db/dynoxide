@@ -300,27 +300,51 @@ pub struct SetClause {
     pub value: SetValue,
 }
 
-/// One operand of a SET assignment's arithmetic or `list_append`: an attribute
-/// of the item, written bare, or a value. A quoted string is a value, never an
-/// attribute's name.
+/// A term of a SET assignment's right-hand side: an attribute of the item,
+/// written bare, a value, or a call to `list_append` or `if_not_exists`. A
+/// quoted string is a value, never an attribute's name.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetTerm {
     Path(String),
     Value(PartiqlValue),
+    /// `list_append(a, b)`: the two lists joined, `a` first.
+    ListAppend(Box<SetTerm>, Box<SetTerm>),
+    /// `if_not_exists(path, value)`: the attribute at `path` when the item
+    /// has it, and `value` when it doesn't.
+    IfNotExists(String, Box<SetTerm>),
+    /// Terms added and subtracted, as an operand of `list_append` or
+    /// `if_not_exists`: `if_not_exists(q, n + 1)`.
+    Sum(Vec<SumTerm>),
+}
+
+/// Whether a term of a SET assignment's arithmetic is added or subtracted, or
+/// which of `+` and `-` was written beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetSign {
+    Plus,
+    Minus,
+}
+
+/// One term of a SET sum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SumTerm {
+    /// Whether the term is added or subtracted once any brackets are opened.
+    pub sign: SetSign,
+    /// The operator a type fault in the term names: the one written beside
+    /// it, which brackets don't flip.
+    pub named: SetSign,
+    pub term: SetTerm,
 }
 
 /// A value on the right-hand side of a SET assignment.
-/// Supports simple values and binary arithmetic expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetValue {
-    /// A simple value (literal or parameter).
-    Simple(PartiqlValue),
-    /// `path + term`: add the term to the attribute at path.
-    Add(String, SetTerm),
-    /// `path - term`: subtract the term from the attribute at path.
-    Sub(String, SetTerm),
-    /// `list_append(a, b)`, each a list literal, a parameter or an attribute.
-    ListAppend(SetTerm, SetTerm),
+    /// One term: a literal, a parameter, an attribute of the item, which is
+    /// copied, or a call.
+    Simple(SetTerm),
+    /// Terms added and subtracted in turn, `n + 1`, `1 + 1 + 1`, `n - (1 +
+    /// m)`, `if_not_exists(n, 0) + 1`.
+    Sum(Vec<SumTerm>),
     /// `set_add(path, set)` or `set_delete(path, set)`: the set at `path`,
     /// which the call assigns back to, with the members added or removed.
     /// `refusal_at` is where DynamoDB points when the members turn out not to
@@ -565,6 +589,11 @@ pub enum WhereCondition {
     /// `attribute_type(operand, type)`: the operand's DynamoDB type is `type`.
     /// A type that isn't a value is refused before the statement runs.
     AttributeType(Operand, Operand),
+    /// `begins_with(a, b)` or `contains(a, b)` on operands other than a path
+    /// and a value, which keep the `BeginsWith` and `Contains` forms the key
+    /// pushdown reads: `begins_with('hello', s)`, `contains(?, ?)`,
+    /// `begins_with(s, attribute_exists(n))`.
+    Search(Search, Operand, Operand),
     /// A negated condition with no negated form of its own.
     Not(Box<WhereCondition>),
     /// A condition DynamoDB refuses for itself, once its operands are checked:
@@ -572,6 +601,23 @@ pub enum WhereCondition {
     /// distinct, an IN with too many. Never evaluated: the statement is
     /// refused before it runs.
     Refused(Box<Refused>),
+}
+
+/// The two condition functions that search one operand for another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Search {
+    BeginsWith,
+    Contains,
+}
+
+impl Search {
+    /// The function's name, as DynamoDB writes it in a refusal.
+    pub fn name(self) -> &'static str {
+        match self {
+            Search::BeginsWith => "begins_with",
+            Search::Contains => "contains",
+        }
+    }
 }
 
 /// What DynamoDB refuses a call or an operator for, with the operands it was
@@ -2091,9 +2137,8 @@ fn parse_from_first(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     })
 }
 
-/// Parse the right-hand side of a SET assignment to `target`: `value`,
-/// `path + value`, `path - value`, `list_append(a, b)`, or `set_add` and
-/// `set_delete`.
+/// Parse the right-hand side of a SET assignment to `target`: a term, terms
+/// added and subtracted, or `set_add` and `set_delete`.
 fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> {
     t.clause = LiteralClause::Set;
     if let Some(tok) = t.peek_token()?
@@ -2102,78 +2147,255 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
     {
         return parse_set_call(t, target, delete);
     }
-    // Check for list_append function
-    if let Some(ref tok) = t.peek_token()?
-        && tok.eq_ignore_ascii_case("list_append")
-    {
-        t.next_token()?; // consume list_append
-        expect_char(t, "(")?;
-        let first = parse_set_term(t)?;
-        let comma = t.next_token()?.ok_or("Expected ',' in list_append")?;
-        if comma != "," {
-            return Err(format!("Expected ',' but got '{comma}'"));
-        }
-        let second = parse_set_term(t)?;
-        expect_char(t, ")")?;
-        return Ok(SetValue::ListAppend(first, second));
+    Ok(match read_set_operands(t, 0)? {
+        SetTerm::Sum(terms) => SetValue::Sum(terms),
+        term => SetValue::Simple(term),
+    })
+}
+
+/// A SET right-hand side, or an operand of `list_append` or `if_not_exists`,
+/// read the same way at every depth: one term, or terms added and subtracted.
+/// A call in it is classified by [`read_set_operand`] wherever it stands, so
+/// `if_not_exists(q, size(s))` refuses `size` as `SET z = size(s)` does, and
+/// `if_not_exists(q, n + 1)` computes (captured eu-west-2, 12 November 2026).
+fn read_set_operands(t: &mut Tokenizer, depth: usize) -> Result<SetTerm, String> {
+    let mut terms = Vec::new();
+    read_set_sum(t, SetSign::Plus, SetSign::Plus, &mut terms, depth)?;
+    Ok(match terms.as_slice() {
+        [
+            SumTerm {
+                sign: SetSign::Plus,
+                term,
+                ..
+            },
+        ] => term.clone(),
+        // Only a refused operand holds no term, and it is never evaluated.
+        [] => refused_set_term(),
+        _ => SetTerm::Sum(terms),
+    })
+}
+
+/// What stands for a SET term that is refused. It is never evaluated.
+fn refused_set_term() -> SetTerm {
+    SetTerm::Value(PartiqlValue::Literal(AttributeValue::NULL(true)))
+}
+
+/// How DynamoDB refuses an operator SET doesn't compute.
+const SET_OPERATOR_REFUSAL: &str = "Unsupported operator in Update Expression. Operator: ";
+
+/// The terms of a SET right-hand side, or of a bracket in one, added and
+/// subtracted in any mix and chained: `n + 1`, `1 + n`, `n + n`, `3 - 1`,
+/// `1 + 1 + 1` and `(1 + 1)` all compute (captured eu-west-2, 12 November
+/// 2026). `sign` is the sign the first term takes. A bracket of several terms
+/// is pushed as one term, a group read with its own signs; a bracket of one
+/// term is that term, with the sign written before the bracket. `written` is
+/// the operator written before the bracket, which its first term is named by
+/// if the bracket holds nothing else.
+///
+/// A type fault names the operator written beside the faulty operand, not its
+/// sign once the brackets are opened: the one before it, or the one after it
+/// for the first term of a run (captured eu-west-2, 12 November 2026:
+/// `5 - (2 - 'a')` names `-` and `1 - ('a' + 1)` names `+`). `*` and `/` are
+/// refused naming them. Each `+`, `-`, `*` and `/` counts towards the
+/// expression's operator limit, as a WHERE clause's operators do.
+fn read_set_sum(
+    t: &mut Tokenizer,
+    sign: SetSign,
+    written: SetSign,
+    terms: &mut Vec<SumTerm>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
     }
-
-    let first = parse_value(t, 0)?;
-
-    // Peek for + or -
-    match t.peek_token()? {
-        Some(ref s) if s == "+" => {
-            t.next_token()?; // consume +
-            let second = parse_set_term(t)?;
-            // The first value should be a path reference (attribute name).
-            // In PartiQL, `SET x = x + 1` means add 1 to the current value of x.
-            let attr_path = match &first {
-                PartiqlValue::Literal(AttributeValue::S(s)) => s.clone(),
-                // If first is an unquoted identifier that was mistakenly parsed as something
-                // else, we need to handle it. But identifiers in SET RHS would have been
-                // consumed as unknown tokens and errored. We'll handle the common case
-                // where parse_value can't parse an identifier: see below.
-                _ => {
-                    return Err(
-                        "Expected attribute path on left side of '+' expression".to_string()
-                    );
-                }
-            };
-            Ok(SetValue::Add(attr_path, second))
+    let first = terms.len();
+    read_set_operand(t, sign, written, terms, depth)?;
+    // The run's first operand, when it is a single term, is named by the
+    // operator after it.
+    let mut unnamed = (terms.len() == first + 1).then_some(first);
+    while let Some(op) = t.peek_token()? {
+        let (next, operator) = match op.as_str() {
+            "+" => (sign, SetSign::Plus),
+            "-" => (flipped(sign), SetSign::Minus),
+            "*" | "/" => {
+                t.note_set_refusal(format!("{SET_OPERATOR_REFUSAL}{op}"));
+                (sign, SetSign::Plus)
+            }
+            _ => break,
+        };
+        t.count_set_operator();
+        if let Some(index) = unnamed.take() {
+            terms[index].named = operator;
         }
-        Some(ref s) if s == "-" => {
-            t.next_token()?; // consume -
-            let second = parse_set_term(t)?;
-            let attr_path = match &first {
-                PartiqlValue::Literal(AttributeValue::S(s)) => s.clone(),
-                _ => {
-                    return Err(
-                        "Expected attribute path on left side of '-' expression".to_string()
-                    );
-                }
-            };
-            Ok(SetValue::Sub(attr_path, second))
-        }
-        _ => Ok(SetValue::Simple(first)),
+        t.next_token()?;
+        read_set_operand(t, next, operator, terms, depth)?;
+    }
+    Ok(())
+}
+
+/// The other sign.
+fn flipped(sign: SetSign) -> SetSign {
+    match sign {
+        SetSign::Plus => SetSign::Minus,
+        SetSign::Minus => SetSign::Plus,
     }
 }
 
-/// An operand of SET arithmetic or `list_append`. A bare name starts an
-/// attribute; anything else is a value, so `'abc'` is a string and not the
-/// attribute `abc`.
-fn parse_set_term(t: &mut Tokenizer) -> Result<SetTerm, String> {
-    let names_attribute = t.peek_token()?.is_some_and(|tok| {
-        tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && !["TRUE", "FALSE", "NULL"]
-                .iter()
-                .any(|word| tok.eq_ignore_ascii_case(word))
-    });
-    match parse_value(t, 0)? {
-        PartiqlValue::Literal(AttributeValue::S(path)) if names_attribute => {
-            Ok(SetTerm::Path(path))
-        }
-        value => Ok(SetTerm::Value(value)),
+/// One operand of a SET right-hand side, pushed with `sign` and named by
+/// `written`, the operator written before it: a term, or a bracket of terms.
+///
+/// A call to a condition function, or to `size`, is refused naming the
+/// function whatever its operands, ahead of anything wrong with them, and read
+/// past (captured eu-west-2, 12 November 2026: `size(true)`, `size(nope)` and
+/// `size(s) + 1` all report it). A call to a function DynamoDB doesn't know,
+/// `foo(1)` or `abs(n)`, is unrecognised, naming the function and where it
+/// stands (captured eu-west-2, 12 November 2026).
+///
+/// A `-` before anything but a number is an operator with one operand, which
+/// DynamoDB refuses (`- - n` and `-(n)`); before a number it is the number's
+/// sign (`- 5`, `n - -1`). A run of them is read in a loop, so its length
+/// costs no stack.
+fn read_set_operand(
+    t: &mut Tokenizer,
+    sign: SetSign,
+    written: SetSign,
+    terms: &mut Vec<SumTerm>,
+    depth: usize,
+) -> Result<(), String> {
+    let mut tok = t.peek_token()?.ok_or(UNEXPECTED_TERM)?;
+    while tok == "-"
+        && !t
+            .peek_token_at(1)?
+            .is_some_and(|next| is_number_token(&next))
+    {
+        t.note_set_refusal(operand_count_refusal("-", 1));
+        t.next_token()?;
+        tok = t.peek_token()?.ok_or(UNEXPECTED_TERM)?;
     }
+    if tok == "(" {
+        t.next_token()?;
+        // A bracket of several terms is one term of the run it stands in, its
+        // sign applied to the group's total, so the group is worked out on its
+        // own first. Each term in it is named as it would be in the run, and a
+        // bracket holding one term is that term.
+        let mut group = Vec::new();
+        read_set_sum(t, SetSign::Plus, written, &mut group, depth + 1)?;
+        expect_char(t, ")")?;
+        match <[SumTerm; 1]>::try_from(group) {
+            Ok([only]) => terms.push(SumTerm {
+                sign: if only.sign == SetSign::Plus {
+                    sign
+                } else {
+                    flipped(sign)
+                },
+                ..only
+            }),
+            Err(group) if group.is_empty() => {}
+            Err(group) => terms.push(SumTerm {
+                sign,
+                named: written,
+                term: SetTerm::Sum(group),
+            }),
+        }
+        return Ok(());
+    }
+    let calls = t.peek_token_at(1)?.as_deref() == Some("(");
+    if calls && is_any(&tok, WHERE_FUNCTIONS) {
+        t.note_set_refusal(format!(
+            "The function is not allowed in an update expression; function: {}",
+            tok.to_lowercase()
+        ));
+        return skip_call_operands(t);
+    }
+    if calls && set_term_function(&tok).is_none() && is_name(&tok) && !tok.starts_with('"') {
+        t.note_unrecognized_function(t.pos);
+        return skip_call_operands(t);
+    }
+    terms.push(SumTerm {
+        sign,
+        named: written,
+        term: parse_set_term(t, depth)?,
+    });
+    Ok(())
+}
+
+/// The functions a SET term can call: `list_append` and `if_not_exists`.
+fn set_term_function(tok: &str) -> Option<&'static str> {
+    ["list_append", "if_not_exists"]
+        .into_iter()
+        .find(|name| is_keyword(tok, name))
+}
+
+/// A term of a SET right-hand side, or an operand of `list_append` or
+/// `if_not_exists`. A call to either function is a term, so it can be
+/// bracketed and added to (captured eu-west-2, 12 November 2026:
+/// `if_not_exists(n, 0) + 1` and `(list_append(l, [3]))` run). A name, bare
+/// or quoted, starts an attribute's path, dotted or indexed, so `SET z = s`
+/// copies `s` and `SET z = l[0]` its first element (captured eu-west-2, 12
+/// November 2026); anything else is a value, so `'abc'` is a string and not
+/// the attribute `abc`.
+fn parse_set_term(t: &mut Tokenizer, depth: usize) -> Result<SetTerm, String> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
+    if let Some(tok) = t.peek_token()?
+        && let Some(name) = set_term_function(&tok)
+        && t.peek_token_at(1)?.as_deref() == Some("(")
+    {
+        return parse_set_term_call(t, name, depth);
+    }
+    let names_attribute = t.peek_token()?.is_some_and(|tok| {
+        tok.starts_with('"')
+            || (tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && !is_any(&tok, &["TRUE", "FALSE", "NULL"])
+                && !is_any(&tok, CLAUSE_KEYWORDS)
+                && !is_any(&tok, OPERATOR_WORDS))
+    });
+    if names_attribute {
+        let tok = t.next_token()?.unwrap_or_default();
+        return Ok(SetTerm::Path(parse_dotted_path_from_token(&tok, t)?));
+    }
+    Ok(SetTerm::Value(parse_value(t, 0)?))
+}
+
+/// `list_append(a, b)` or `if_not_exists(path, value)`, with its name next.
+/// Anything but two operands is refused for its count, and an
+/// `if_not_exists` whose first operand isn't a path as needing one (captured
+/// eu-west-2, 12 November 2026).
+fn parse_set_term_call(t: &mut Tokenizer, name: &str, depth: usize) -> Result<SetTerm, String> {
+    t.next_token()?; // the name
+    t.next_token()?; // (
+    let mut operands = Vec::new();
+    if t.peek_token()?.as_deref() == Some(")") {
+        t.next_token()?;
+    } else {
+        loop {
+            operands.push(read_set_operands(t, depth + 1)?);
+            match t.next_token()?.as_deref() {
+                Some(",") => continue,
+                Some(")") => break,
+                Some(other) => return Err(format!("Expected ')' but got '{other}'")),
+                None => return Err("Expected ')'".to_string()),
+            }
+        }
+    }
+    let [first, second] = match <[SetTerm; 2]>::try_from(operands) {
+        Ok(pair) => pair,
+        Err(operands) => {
+            t.note_set_refusal(operand_count_refusal(name, operands.len()));
+            return Ok(refused_set_term());
+        }
+    };
+    Ok(match (name, first) {
+        ("if_not_exists", SetTerm::Path(path)) => SetTerm::IfNotExists(path, Box::new(second)),
+        ("if_not_exists", _) => {
+            t.note_set_refusal(format!(
+                "Operator or function requires a document path; operator or function: {name}"
+            ));
+            refused_set_term()
+        }
+        (_, first) => SetTerm::ListAppend(Box::new(first), Box::new(second)),
+    })
 }
 
 /// Whether a name calls `set_add` (false) or `set_delete` (true).
@@ -2228,9 +2450,7 @@ fn parse_set_call(t: &mut Tokenizer, target: &str, delete: bool) -> Result<SetVa
         t.note_unrecognized_function(call);
         t.next_token()?;
         parse_value(t, 0)?;
-        return Ok(SetValue::Simple(PartiqlValue::Literal(
-            AttributeValue::NULL(true),
-        )));
+        return Ok(SetValue::Simple(refused_set_term()));
     }
     let call_at = t.position(t.span_at(call));
     let first_at = args
@@ -2621,15 +2841,10 @@ fn require_right_hand_side(t: &mut Tokenizer) -> Result<(), String> {
 /// Only reached from `parse_and_expr`, under a `parse_or_expr` that has
 /// already checked `depth`.
 fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
-    // `NOT BEGINS_WITH(x, y)` is a single condition with its own variant, so it
-    // belongs to parse_single_condition and is left to it. A `NOT` in front of
-    // anything else is the boolean operator.
+    // A `NOT` in front of a condition is the boolean operator, a call to
+    // `begins_with` or `contains` included.
     let mut nots = 0usize;
     while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("NOT")) {
-        let next = t.peek_token_at(1)?.unwrap_or_default();
-        if next.eq_ignore_ascii_case("BEGINS_WITH") {
-            break;
-        }
         t.next_token()?;
         nots += 1;
     }
@@ -2732,8 +2947,9 @@ fn mirrored(op: CompOp) -> CompOp {
     }
 }
 
-/// A function that is a condition: `attribute_exists`, `attribute_not_exists`
-/// or `attribute_type`, as the condition it is when it holds.
+/// A function that is a condition: `attribute_exists`, `attribute_not_exists`,
+/// `attribute_type`, `begins_with` or `contains`, as the condition it is when
+/// it holds.
 struct ConditionFunction {
     holds: WhereCondition,
 }
@@ -2797,7 +3013,16 @@ fn condition_function_name(tok: &str) -> Option<&'static str> {
 
 /// Whether a name calls a function that is itself a condition.
 fn is_condition_function(tok: &str) -> bool {
-    condition_function_name(tok).is_some() || is_keyword(tok, "attribute_type")
+    condition_function_name(tok).is_some()
+        || search_function(tok).is_some()
+        || is_keyword(tok, "attribute_type")
+}
+
+/// Which search a name calls, `begins_with` or `contains`.
+fn search_function(tok: &str) -> Option<Search> {
+    [Search::BeginsWith, Search::Contains]
+        .into_iter()
+        .find(|search| is_keyword(tok, search.name()))
 }
 
 /// Whether a token starts a term that is a value rather than a path: a
@@ -2919,8 +3144,13 @@ fn condition_function_tail(
     };
     if is_comparison_operator(&next) {
         t.next_token()?;
-        let right = parse_operand(t, depth)?;
+        let right = parse_term(t, depth)?;
         return function.compared(&next, right, true);
+    }
+    // IS refuses any condition function as its left side, as it does a size
+    // (captured eu-west-2, 2026-11-12).
+    if is_keyword(&next, "IS") {
+        return Ok(BoolExpr::Leaf(WhereCondition::Refused(refuse_is(t)?)));
     }
     // `NOT BETWEEN` takes BETWEEN's refusal and `NOT IN` is the negation of
     // IN (captured eu-west-2 and us-east-1, 2026-10-10).
@@ -2937,9 +3167,9 @@ fn condition_function_tail(
     // checked (captured eu-west-2, 2026-11-11).
     if is_keyword(&next, "BETWEEN") {
         t.next_token()?;
-        let low = parse_operand(t, depth)?;
+        let low = parse_term(t, depth)?;
         expect_between_and(t)?;
-        let high = parse_operand(t, depth)?;
+        let high = parse_term(t, depth)?;
         let between = BoolExpr::Leaf(WhereCondition::CompareBetween(
             function.operand(),
             low,
@@ -2955,7 +3185,7 @@ fn condition_function_tail(
     // a string (captured eu-west-2 and us-east-1, 2026-10-10).
     if is_keyword(&next, "IN") {
         t.next_token()?;
-        let members = parse_in_list(t, depth, parse_operand)?;
+        let members = parse_in_list(t, depth, parse_term)?;
         let listed = match in_limit_refusal(members.len()) {
             Some(message) => {
                 let operands = std::iter::once(function.operand()).chain(members).collect();
@@ -2972,15 +3202,21 @@ fn condition_function_tail(
     function.condition(true)
 }
 
-/// Read `attribute_exists(...)`, `attribute_not_exists(...)` or
-/// `attribute_type(...)`. A call DynamoDB refuses for its operands holds a
-/// [`WhereCondition::Refused`] with the operands it was given.
+/// Read `attribute_exists(...)`, `attribute_not_exists(...)`,
+/// `attribute_type(...)`, `begins_with(...)` or `contains(...)`. A call
+/// DynamoDB refuses for its operands holds a [`WhereCondition::Refused`] with
+/// the operands it was given.
 fn parse_condition_function(t: &mut Tokenizer, depth: usize) -> Result<ConditionFunction, String> {
     if t.peek_token()?
         .is_some_and(|tok| is_keyword(&tok, "attribute_type"))
     {
         return Ok(ConditionFunction {
             holds: parse_attribute_type(t, depth)?,
+        });
+    }
+    if let Some(search) = t.peek_token()?.as_deref().and_then(search_function) {
+        return Ok(ConditionFunction {
+            holds: parse_search(t, depth, search)?,
         });
     }
     let name_tok = t.next_token()?.unwrap_or_default();
@@ -3090,6 +3326,39 @@ fn parse_attribute_type(t: &mut Tokenizer, depth: usize) -> Result<WhereConditio
     Ok(WhereCondition::AttributeType(operand, kind))
 }
 
+/// Read `begins_with(a, b)` or `contains(a, b)`. Either operand can be a
+/// literal, a parameter, a path or a call (captured eu-west-2, 2026-11-12).
+/// A wrong number of operands, or the same path in both places, is held as a
+/// [`WhereCondition::Refused`]. A path and a value keep the form the key
+/// pushdown reads; anything else is a [`WhereCondition::Search`], whose
+/// operand types are checked with the statement's other operands.
+fn parse_search(t: &mut Tokenizer, depth: usize, search: Search) -> Result<WhereCondition, String> {
+    let [first, second] = match <[Operand; 2]>::try_from(call_operands(t, depth + 1)?) {
+        Ok(pair) => pair,
+        Err(operands) => {
+            let message = operand_count_refusal(search.name(), operands.len());
+            return Ok(WhereCondition::Refused(t.refused(operands, message)));
+        }
+    };
+    if let Operand::Path(path) = &first
+        && first == second
+    {
+        let message = not_distinct(search.name(), path);
+        return Ok(WhereCondition::Refused(
+            t.refused(vec![first, second], message),
+        ));
+    }
+    Ok(match (search, first, second) {
+        (Search::BeginsWith, Operand::Path(path), Operand::Value(value)) => {
+            WhereCondition::BeginsWith(path, value)
+        }
+        (Search::Contains, Operand::Path(path), Operand::Value(value)) => {
+            WhereCondition::Contains(path, value)
+        }
+        (search, first, second) => WhereCondition::Search(search, first, second),
+    })
+}
+
 /// DynamoDB's refusal of a type `attribute_type` doesn't know, if it doesn't.
 pub(crate) fn attribute_type_name_refusal(name: &str) -> Option<String> {
     (!ATTRIBUTE_TYPES.contains(&name)).then(|| {
@@ -3126,6 +3395,9 @@ fn starts_operand_call(t: &Tokenizer) -> Result<bool, String> {
 /// the attribute `n` rather than the string `'n'` (captured eu-west-2 and
 /// us-east-1, 2026-10-09). `MISSING` is refused here as it is anywhere else
 /// an operand can stand.
+///
+/// Arithmetic after the operand is not read here: [`parse_term`] reads it
+/// where an operand can be followed by it, and refuses it for its operator.
 fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
     // `size(` and `attribute_type(` come back here for their arguments, so a
     // run of nested calls is held to the same depth as nested brackets.
@@ -3143,6 +3415,14 @@ fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
         return Ok(Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(
             true,
         ))));
+    }
+    // A bracketed operand is the operand: `n = (5)` (captured eu-west-2,
+    // 2026-11-12).
+    if tok == "(" {
+        t.next_token()?;
+        let inner = parse_term(t, depth + 1)?;
+        expect_char(t, ")")?;
+        return Ok(inner);
     }
     let call = starts_operand_call(t)?;
     if call && is_condition_function(&tok) {
@@ -3246,9 +3526,9 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
     finish_operator(t, depth, left)
 }
 
-/// `+` or `-` between two operands.
+/// `+`, `-`, `*` or `/` between two operands.
 fn is_arithmetic_operator(tok: &str) -> bool {
-    tok == "+" || tok == "-"
+    matches!(tok, "+" | "-" | "*" | "/")
 }
 
 /// How DynamoDB refuses arithmetic in a condition.
@@ -3263,6 +3543,17 @@ const ARITHMETIC_REFUSAL: &str = "Unsupported operator in Condition Expression. 
 /// a loop, so a long run of `+ 1` reads in constant stack, and the comparison
 /// that follows, if one does, is read and has no say.
 fn arithmetic(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<WhereCondition, String> {
+    let refused = arithmetic_terms(t, depth)?;
+    if starts_operator_tail(t)? {
+        finish_operator(t, depth, left)?;
+    }
+    Ok(WhereCondition::Refused(refused))
+}
+
+/// The refusal of the arithmetic operator about to be read, once it and the
+/// terms after it are read past. `-`, `*` and `/` are refused as `+` is,
+/// naming the operator (captured eu-west-2, 2026-11-12).
+fn arithmetic_terms(t: &mut Tokenizer, depth: usize) -> Result<Box<Refused>, String> {
     let op = t.peek_token()?.unwrap_or_default();
     let refused = t.refused(Vec::new(), format!("{ARITHMETIC_REFUSAL}{op}"));
     while t
@@ -3272,10 +3563,23 @@ fn arithmetic(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<WhereCon
         t.next_token()?;
         parse_operand(t, depth)?;
     }
-    if starts_operator_tail(t)? {
-        finish_operator(t, depth, left)?;
+    Ok(refused)
+}
+
+/// An operand that may be followed by arithmetic: the right-hand side of a
+/// comparison, a BETWEEN bound or an IN member. Arithmetic there is refused
+/// for its operator, as it is on the left, and stands as a refused operand
+/// so it is reported where it was written (captured eu-west-2, 2026-11-12:
+/// `n = 1 + 1`, `0 < n + 1`, `n BETWEEN 1 + 1 AND 9` and `n IN [6 - 1]`, the
+/// last no longer two members).
+fn parse_term(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
+    let operand = parse_operand(t, depth)?;
+    if t.peek_token()?
+        .is_some_and(|op| is_arithmetic_operator(&op))
+    {
+        return Ok(Operand::Refused(arithmetic_terms(t, depth)?));
     }
-    Ok(WhereCondition::Refused(refused))
+    Ok(operand)
 }
 
 /// Whether what comes next compares the operand before it: a comparison
@@ -3318,7 +3622,7 @@ fn finish_operator(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<Boo
             // first: `? = attribute_exists(a)` and `size(s) =
             // attribute_exists(a)` run (captured eu-west-2 and us-east-1,
             // 2026-10-10).
-            match parse_operand(t, depth)? {
+            match parse_term(t, depth)? {
                 Operand::Condition(holds) => {
                     ConditionFunction { holds: *holds }.compared(&op_tok, left, false)
                 }
@@ -3327,16 +3631,16 @@ fn finish_operator(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<Boo
         }
         Some(tok) if is_keyword(tok, "BETWEEN") => {
             t.next_token()?;
-            let low = parse_operand(t, depth)?;
+            let low = parse_term(t, depth)?;
             expect_between_and(t)?;
-            let high = parse_operand(t, depth)?;
+            let high = parse_term(t, depth)?;
             Ok(BoolExpr::Leaf(WhereCondition::CompareBetween(
                 left, low, high,
             )))
         }
         Some(tok) if is_keyword(tok, "IN") => {
             t.next_token()?;
-            let members = parse_in_list(t, depth, parse_operand)?;
+            let members = parse_in_list(t, depth, parse_term)?;
             Ok(BoolExpr::Leaf(match in_limit_refusal(members.len()) {
                 Some(message) => {
                     let operands = std::iter::once(left).chain(members).collect();
@@ -3350,18 +3654,7 @@ fn finish_operator(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<Boo
         Some(tok)
             if is_keyword(tok, "IS") && matches!(left, Operand::Size(_) | Operand::Refused(_)) =>
         {
-            let refused = t.refused(
-                Vec::new(),
-                "The left hand side argument to IS must be a Variable Reference, Literal, or \
-                 Path"
-                    .to_string(),
-            );
-            t.next_token()?;
-            if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
-                t.next_token()?;
-            }
-            read_type_name(t)?;
-            Ok(BoolExpr::Leaf(WhereCondition::Refused(refused)))
+            Ok(BoolExpr::Leaf(WhereCondition::Refused(refuse_is(t)?)))
         }
         // A size refused for its operand count stands as a size does, and the
         // walk reports its count first.
@@ -3370,6 +3663,23 @@ fn finish_operator(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<Boo
         }
         _ => Err("Expected operator after attribute path".to_string()),
     }
+}
+
+/// IS, about to be read, after a left side it can't take: a call. It is
+/// refused ahead of anything wrong with the call, its operand count included,
+/// and the type after it is read past.
+fn refuse_is(t: &mut Tokenizer) -> Result<Box<Refused>, String> {
+    let refused = t.refused(
+        Vec::new(),
+        "The left hand side argument to IS must be a Variable Reference, Literal, or Path"
+            .to_string(),
+    );
+    t.next_token()?;
+    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
+        t.next_token()?;
+    }
+    read_type_name(t)?;
+    Ok(refused)
 }
 
 /// A comparison of two operands, in the form the executor and the key
@@ -3420,18 +3730,24 @@ fn subquery_select(t: &Tokenizer) -> Option<usize> {
 
 /// Read past a call whose refusal is noted, and any comparison it is part of.
 fn skip_call(t: &mut Tokenizer, depth: usize) -> Result<(), String> {
+    skip_call_operands(t)?;
+    skip_comparison(t, depth)
+}
+
+/// Read past a call whose refusal is noted: its name, and its operands to the
+/// bracket that closes them.
+fn skip_call_operands(t: &mut Tokenizer) -> Result<(), String> {
     t.next_token()?;
     let mut open = 0usize;
     loop {
         match t.next_token()?.as_deref() {
             Some("(") => open += 1,
-            Some(")") if open == 1 => break,
+            Some(")") if open == 1 => return Ok(()),
             Some(")") => open -= 1,
             Some(_) => {}
             None => return Err("Expected ')'".to_string()),
         }
     }
-    skip_comparison(t, depth)
 }
 
 /// Read past a comparison after a term whose refusal is noted.
@@ -3535,7 +3851,8 @@ fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
         other @ (W::Compare(..)
         | W::CompareBetween(..)
         | W::CompareIn(..)
-        | W::AttributeType(..)) => W::Not(Box::new(other)).into(),
+        | W::AttributeType(..)
+        | W::Search(..)) => W::Not(Box::new(other)).into(),
     })
 }
 
@@ -3645,7 +3962,7 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
         W::Compare(left, _, right) => operand(left) + operand(right),
         W::CompareBetween(o, low, high) => operand(o) + operand(low) + operand(high),
         W::CompareIn(o, values) => operand(o) + values.iter().map(operand).sum::<usize>(),
-        W::AttributeType(o, kind) => operand(o) + operand(kind),
+        W::AttributeType(o, kind) | W::Search(_, o, kind) => operand(o) + operand(kind),
         W::Not(inner) => condition_bytes(inner),
         W::Refused(refused) => refused.operands.iter().map(operand).sum(),
     }
@@ -3755,15 +4072,14 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
     // Where a condition should start, DynamoDB reports the end of the
     // statement as an unexpected term, an operator as an unexpected operator
     // and a clause keyword as an unexpected keyword (captured eu-west-2,
-    // us-east-1, eu-west-1 and us-west-2, 2026-10-09). `NOT` reaches here only
-    // as part of `NOT EXISTS(...)` or `NOT BEGINS_WITH(...)`.
+    // us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     let path_start = t.pos;
     let tok = match t.next_token()? {
         None => return Err(UNEXPECTED_TERM.to_string()),
         Some(tok) if tok == ";" => return Err(UNEXPECTED_TERM.to_string()),
         Some(tok) => tok,
     };
-    if !is_keyword(&tok, "NOT") && is_any(&tok, OPERATOR_WORDS) {
+    if is_any(&tok, OPERATOR_WORDS) {
         return Err(UNEXPECTED_OPERATOR.to_string());
     }
     if is_any(&tok, CLAUSE_KEYWORDS) {
@@ -3777,46 +4093,6 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
             let path = parse_function_path(t)?;
             expect_char(t, ")")?;
             Ok(WhereCondition::Exists(path))
-        }
-        "BEGINS_WITH" => {
-            expect_char(t, "(")?;
-            let path = parse_function_path(t)?;
-            let comma = t.next_token()?.ok_or("Expected ',' in BEGINS_WITH")?;
-            if comma != "," {
-                return Err(format!("Expected ',' but got '{comma}'"));
-            }
-            let value = parse_value(t, depth)?;
-            expect_char(t, ")")?;
-            Ok(WhereCondition::BeginsWith(path, value))
-        }
-        "CONTAINS" => {
-            expect_char(t, "(")?;
-            let path = parse_function_path(t)?;
-            let comma = t.next_token()?.ok_or("Expected ',' in CONTAINS")?;
-            if comma != "," {
-                return Err(format!("Expected ',' but got '{comma}'"));
-            }
-            let value = parse_value(t, depth)?;
-            expect_char(t, ")")?;
-            Ok(WhereCondition::Contains(path, value))
-        }
-        "NOT" => {
-            // The NOT in front of BEGINS_WITH is an operator like any other,
-            // counted as it was read.
-            let func = t.next_token()?.ok_or("Expected function name after NOT")?;
-            if func.eq_ignore_ascii_case("BEGINS_WITH") {
-                expect_char(t, "(")?;
-                let path = parse_function_path(t)?;
-                let comma = t.next_token()?.ok_or("Expected ',' in NOT BEGINS_WITH")?;
-                if comma != "," {
-                    return Err(format!("Expected ',' but got '{comma}'"));
-                }
-                let value = parse_value(t, depth)?;
-                expect_char(t, ")")?;
-                Ok(WhereCondition::NotBeginsWith(path, value))
-            } else {
-                Err(format!("Unsupported NOT function: {func}"))
-            }
         }
         _ => {
             // Regular comparison or BETWEEN / IN / IS MISSING
@@ -3839,7 +4115,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 }
                 "IN" => {
                     t.next_token()?; // consume IN
-                    let members = parse_in_list(t, depth, parse_operand)?;
+                    let members = parse_in_list(t, depth, parse_term)?;
                     Ok(path_in(t, path, members))
                 }
                 // `x NOT IN [...]` and `x NOT BETWEEN lo AND hi` read as
@@ -3856,7 +4132,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                     if is_keyword(&after, "IN") {
                         t.next_token()?; // consume NOT
                         t.next_token()?; // consume IN
-                        let members = parse_in_list(t, depth, parse_operand)?;
+                        let members = parse_in_list(t, depth, parse_term)?;
                         Ok(WhereCondition::Not(Box::new(path_in(t, path, members))))
                     } else if is_keyword(&after, "BETWEEN") {
                         t.next_token()?; // consume NOT
@@ -3902,7 +4178,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                     // Standard comparison: path op operand
                     let op_tok = t.next_token()?.ok_or("Expected comparison operator")?;
                     let op = comparison_operator(&op_tok)?;
-                    let right = parse_operand(t, depth)?;
+                    let right = parse_term(t, depth)?;
                     Ok(comparison(t, Operand::Path(path), op, &op_tok, right))
                 }
             }
@@ -3915,9 +4191,9 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
 /// makes it a comparison of operands, read item by item. The path itself as a
 /// bound is refused.
 fn path_between(t: &mut Tokenizer, depth: usize, path: String) -> Result<WhereCondition, String> {
-    let low = parse_operand(t, depth)?;
+    let low = parse_term(t, depth)?;
     expect_between_and(t)?;
-    let high = parse_operand(t, depth)?;
+    let high = parse_term(t, depth)?;
     if names_path(&[&low, &high], &path) {
         let message = not_distinct("BETWEEN", &path);
         return Ok(WhereCondition::Refused(
@@ -4951,6 +5227,8 @@ struct Tokenizer {
     depth: usize,
     /// How many operators the WHERE clause has held so far.
     operators: usize,
+    /// How many operators the SET right-hand sides have held so far.
+    set_operators: usize,
     /// Whether a WHERE clause's conditions are being read, so its comparison
     /// operators and function calls count against `MAX_OPERATORS` as they
     /// are consumed.
@@ -4998,6 +5276,7 @@ impl Tokenizer {
             set_refusal: None,
             depth: 0,
             operators: 0,
+            set_operators: 0,
             reading_where: false,
             reading_literal: 0,
         })
@@ -5052,6 +5331,20 @@ impl Tokenizer {
             self.note_term(format!(
                 "The expression contains too many operators; operator count: {}",
                 self.operators
+            ));
+        }
+    }
+
+    /// Count an operator in a SET right-hand side, refusing the one past
+    /// [`MAX_OPERATORS`] in the words a WHERE clause's are refused in. The
+    /// update expression is counted on its own, as DynamoDB holds an update
+    /// expression and a condition expression to the limit separately.
+    fn count_set_operator(&mut self) {
+        self.set_operators += 1;
+        if self.set_operators == MAX_OPERATORS + 1 {
+            self.note_term(format!(
+                "The expression contains too many operators; operator count: {}",
+                self.set_operators
             ));
         }
     }
@@ -5348,7 +5641,8 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
         // Single-char tokens
         match chars[i] {
             '.' if leading_point => {}
-            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '*' | '?' | '+' | '-' | '.' | ';' => {
+            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '*' | '/' | '?' | '+' | '-' | '.'
+            | ';' => {
                 // Check for multi-char - or +  as start of number? No, treat as separate.
                 let tok = chars[i].to_string();
                 i += 1;
@@ -5584,6 +5878,91 @@ mod tests {
             .expect("the parser ran out of stack");
         let err = outcome.expect_err("past the operator limit");
         assert!(err.contains("too many operators"), "got {err}");
+    }
+
+    /// A run of `-` on the right of SET is read in a loop, so however long it
+    /// is it costs no stack: on a 2 MB stack, 100,000 of them before a path
+    /// is the one-operand refusal of `-`, not an overflow. Read by recursion,
+    /// a run of this length overflows that stack.
+    #[test]
+    fn a_long_run_of_minuses_in_set_is_refused_without_overflowing() {
+        let statement = format!(
+            r#"UPDATE "t" SET z = {}n WHERE pk = 'a'"#,
+            "- ".repeat(100_000)
+        );
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse(&statement).map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap()
+            .join()
+            .expect("the parser ran out of stack");
+        let err = outcome.expect_err("a lone minus is refused");
+        assert!(
+            err.contains("operator or function: -, number of operands: 1"),
+            "got {err}"
+        );
+    }
+
+    /// Calls to `if_not_exists` nest to the expression depth limit on a 2 MB
+    /// stack: 64 parse, and a 65th is refused as too deep, not an overflow.
+    #[test]
+    fn nested_if_not_exists_calls_parse_to_the_depth_limit() {
+        let nested = |calls: usize| {
+            format!(
+                r#"UPDATE "t" SET z = {}1{} WHERE pk = 'a'"#,
+                "if_not_exists(q, ".repeat(calls),
+                ")".repeat(calls)
+            )
+        };
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let parsed = |calls| parse(&nested(calls)).map(|_| ()).map_err(|e| e.to_string());
+                (parsed(MAX_EXPR_DEPTH), parsed(MAX_EXPR_DEPTH + 1))
+            })
+            .unwrap()
+            .join()
+            .expect("the parser ran out of stack");
+        assert_eq!(outcome.0, Ok(()));
+        let err = outcome.1.expect_err("one more call is too deep");
+        assert!(err.contains(TOO_DEEP), "got {err}");
+    }
+
+    /// The `+` and `-` of a SET sum count towards the operator limit, as a
+    /// WHERE clause's operators do: 300 run and the 301st is refused.
+    #[test]
+    fn a_set_sum_is_held_to_the_operator_limit() {
+        let sum = |operators: usize| {
+            format!(
+                r#"UPDATE "t" SET z = 1{} WHERE pk = 'a'"#,
+                " + 1".repeat(operators)
+            )
+        };
+        assert!(parse(&sum(MAX_OPERATORS)).is_ok());
+        match parse(&sum(MAX_OPERATORS + 1)) {
+            Err(ParseError::Validation(message)) => assert_eq!(
+                message,
+                "The expression contains too many operators; operator count: 301"
+            ),
+            other => panic!("expected the operator limit, got {other:?}"),
+        }
+    }
+
+    /// A `begins_with` or `contains` on operands other than a path and a
+    /// value holds its literals' bytes against the clause's byte budget, as
+    /// the other conditions do.
+    #[test]
+    fn a_search_on_operands_counts_against_the_byte_budget() {
+        // `s` is one byte of path; the literal is the rest.
+        let search = |bytes: usize| {
+            format!(
+                r#"SELECT * FROM "t" WHERE begins_with('{}', s)"#,
+                "x".repeat(bytes)
+            )
+        };
+        assert!(parse(&search(MAX_CLAUSE_BYTES - 1)).is_ok());
+        let err = parse(&search(MAX_CLAUSE_BYTES)).unwrap_err();
+        assert!(err.to_string().contains("too complex"), "got {err}");
     }
 
     /// The operators a WHERE clause is charged, read the way a statement's
@@ -6325,18 +6704,23 @@ mod tests {
         match stmt {
             Statement::Update { set_clauses, .. } => {
                 assert_eq!(set_clauses.len(), 1);
-                match &set_clauses[0].value {
-                    SetValue::Add(attr, val) => {
-                        assert_eq!(attr, "count");
-                        assert_eq!(
-                            val,
-                            &SetTerm::Value(PartiqlValue::Literal(AttributeValue::N(
+                assert_eq!(
+                    set_clauses[0].value,
+                    SetValue::Sum(vec![
+                        SumTerm {
+                            sign: SetSign::Plus,
+                            named: SetSign::Plus,
+                            term: SetTerm::Path("count".to_string()),
+                        },
+                        SumTerm {
+                            sign: SetSign::Plus,
+                            named: SetSign::Plus,
+                            term: SetTerm::Value(PartiqlValue::Literal(AttributeValue::N(
                                 "1".to_string()
-                            )))
-                        );
-                    }
-                    other => panic!("Expected Add, got {other:?}"),
-                }
+                            ))),
+                        },
+                    ])
+                );
             }
             _ => panic!("Expected UPDATE"),
         }

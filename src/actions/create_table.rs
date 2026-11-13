@@ -425,7 +425,9 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
             "The parameter 'TableName' is required but was not present in the request".to_string(),
         ));
     }
-    if request.table_name.len() < 3 || request.table_name.len() > 255 {
+    if !(3..=255).contains(&crate::validation::length_in_utf16_units(
+        &request.table_name,
+    )) {
         return Err(DynoxideError::ValidationException(
             "TableName must be at least 3 characters long and at most 255 characters long"
                 .to_string(),
@@ -1319,19 +1321,14 @@ fn collect_idx_name_errors(name: &str, prefix: &str, idx: usize, errors: &mut Ve
 
 /// As [`collect_idx_name_errors`], but taking the full member path directly,
 /// for callers whose path does not follow the `<list>.<idx>.member` shape.
+/// The length is in characters and its fault is listed before the pattern's
+/// (captured eu-west-2 and us-east-1, 12 November 2026, for global and local
+/// secondary index names; vector index names are checked the same way).
 fn collect_idx_name_errors_at(name: &str, path: &str, errors: &mut Vec<String>) {
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", name, path));
-    }
-    if name.len() < 3 {
-        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must have length greater than or equal to 3", name, path));
-    }
-    if name.len() > 255 {
-        errors.push(format!("Value '{}' at '{}.indexName' failed to satisfy constraint: Member must have length less than or equal to 255", name, path));
-    }
+    errors.extend(crate::validation::index_name_errors(
+        name,
+        &format!("{path}.indexName"),
+    ));
 }
 
 /// `prefix` is the owning index object's full member path (for example

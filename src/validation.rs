@@ -64,31 +64,7 @@ pub fn table_name_constraint_errors(
         }
         Some(name) => match context {
             TableNameContext::CreateTable => {
-                if name.is_empty()
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-                {
-                    errors.push(format!(
-                        "Value '{}' at 'tableName' failed to satisfy constraint: \
-                         Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-                        name
-                    ));
-                }
-                if name.len() < 3 {
-                    errors.push(format!(
-                        "Value '{}' at 'tableName' failed to satisfy constraint: \
-                         Member must have length greater than or equal to 3",
-                        name
-                    ));
-                }
-                if name.len() > 255 {
-                    errors.push(format!(
-                        "Value '{}' at 'tableName' failed to satisfy constraint: \
-                         Member must have length less than or equal to 255",
-                        name
-                    ));
-                }
+                errors.extend(control_table_name_errors(name));
             }
             TableNameContext::ReadWrite => {
                 if name.is_empty() {
@@ -154,7 +130,7 @@ fn table_name_pattern_error(name: &str) -> String {
 /// SearchVectors). The length is in characters: `😀😀` is too short and 128
 /// of them aren't too long (captured eu-west-2 and us-east-1, 2026-11-05).
 pub(crate) fn first_table_name_error(name: &str) -> Option<String> {
-    let length = name.chars().count();
+    let length = length_in_characters(name);
     if length < 3 {
         Some(short_table_name_error(name))
     } else if length > 255 {
@@ -183,20 +159,106 @@ pub(crate) fn older_empty_table_name_rejection() -> String {
 /// deep requests are read.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) fn older_table_name_errors(name: &str) -> Vec<String> {
-    let mut errors = Vec::new();
     if name.is_empty() {
-        return errors;
+        return Vec::new();
     }
-    let length = name.encode_utf16().count();
-    if length < 3 {
-        errors.push(short_table_name_error(name));
+    control_table_name_errors(name)
+}
+
+/// A name's length in characters, the unit DynamoDB counts an index name in,
+/// a table name inside a transaction, ListTables' `ExclusiveStartTableName`
+/// and the table name the newer layer checks on a single-item operation
+/// (captured eu-west-2 and us-east-1, 12 November 2026).
+pub(crate) fn length_in_characters(name: &str) -> usize {
+    name.chars().count()
+}
+
+/// A name's length in UTF-16 units, the unit DynamoDB counts `TableName` in
+/// on CreateTable, DescribeTable, DeleteTable, UpdateTable, UpdateTimeToLive
+/// and DescribeTimeToLive: `😀` is two of them (captured eu-west-2 and
+/// us-east-1, 12 November 2026).
+pub(crate) fn length_in_utf16_units(name: &str) -> usize {
+    name.encode_utf16().count()
+}
+
+/// The length fault for a name `length` long at `path`, if it is outside 3
+/// to 255. The caller counts `length` in the unit DynamoDB uses there.
+pub(crate) fn name_length_error(name: &str, path: &str, length: usize) -> Option<String> {
+    let constraint = if length < 3 {
+        "Member must have length greater than or equal to 3"
     } else if length > 255 {
-        errors.push(long_table_name_error(name));
+        "Member must have length less than or equal to 255"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "Value '{name}' at '{path}' failed to satisfy constraint: {constraint}"
+    ))
+}
+
+/// The pattern fault for a name at `path`, if it breaks `[a-zA-Z0-9_.-]+`.
+pub(crate) fn name_pattern_error(name: &str, path: &str) -> Option<String> {
+    (!table_name_pattern_holds(name)).then(|| {
+        format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        )
+    })
+}
+
+/// Both faults a name `length` long at `path` can break, the length first.
+pub(crate) fn name_errors_length_first(name: &str, path: &str, length: usize) -> Vec<String> {
+    name_length_error(name, path, length)
+        .into_iter()
+        .chain(name_pattern_error(name, path))
+        .collect()
+}
+
+/// The faults in an index name at `path` on CreateTable or UpdateTable: the
+/// length in characters, then the pattern. An empty name gets the length fault
+/// alone, the answer CreateTable and UpdateTable's vector create have always
+/// given one; DynamoDB's answer for one is uncaptured.
+pub(crate) fn index_name_errors(name: &str, path: &str) -> Vec<String> {
+    if name.is_empty() {
+        return name_length_error(name, path, 0).into_iter().collect();
     }
-    if !table_name_pattern_holds(name) {
-        errors.push(table_name_pattern_error(name));
+    name_errors_length_first(name, path, length_in_characters(name))
+}
+
+/// The faults in a `TableName` on CreateTable, DescribeTable, DeleteTable,
+/// UpdateTable, UpdateTimeToLive and DescribeTimeToLive: the length in UTF-16
+/// units, then the pattern, both listed when both are broken (captured
+/// eu-west-2 and us-east-1, 12 November 2026).
+pub(crate) fn control_table_name_errors(name: &str) -> Vec<String> {
+    name_errors_length_first(name, "tableName", length_in_utf16_units(name))
+}
+
+/// The bare refusal DescribeTable, DeleteTable, UpdateTable and
+/// DescribeTimeToLive give an empty `TableName`.
+pub(crate) const EMPTY_CONTROL_TABLE_NAME_REJECTION: &str =
+    "TableName must be at least 3 characters long and at most 255 characters long";
+
+/// The refusal for a `TableName` on DescribeTable, DeleteTable, UpdateTable
+/// and DescribeTimeToLive as their bodies are read: the bare sentence for an
+/// empty name, and otherwise [`control_table_name_errors`] in the envelope.
+pub(crate) fn control_table_name_rejection(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some(EMPTY_CONTROL_TABLE_NAME_REJECTION.to_string());
     }
-    errors
+    format_validation_errors(&control_table_name_errors(name))
+}
+
+/// [`control_table_name_errors`] for a request built in code, which these
+/// operations and UpdateTimeToLive check in `execute`. An empty name gets the
+/// answer [`validate_table_name`] gives it.
+pub(crate) fn validate_control_table_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return validate_table_name(name);
+    }
+    match format_validation_errors(&control_table_name_errors(name)) {
+        Some(msg) => Err(DynoxideError::ValidationException(msg)),
+        None => Ok(()),
+    }
 }
 
 /// The table-name errors for PutItem, DeleteItem, GetItem and Query: a missing
@@ -360,17 +422,6 @@ pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<S
     ))
 }
 
-/// [`return_consumed_capacity_rejection`] as an error, in the single-error
-/// envelope a wire client gets. For callers that check the mode outside a
-/// deserialiser, where there is no errors vec to push onto: the MCP tools.
-#[cfg(feature = "mcp-server")]
-pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
-    match return_consumed_capacity_rejection(mode) {
-        Some(msg) => Err(DynoxideError::ValidationException(envelope_message(&msg))),
-        None => Ok(()),
-    }
-}
-
 /// The values `ReturnValues` accepts on a write.
 pub(crate) const RETURN_VALUES: [&str; 5] =
     ["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
@@ -446,34 +497,37 @@ fn table_name_pattern_holds(name: &str) -> bool {
 /// [`TableNameContext::ReadWrite`]); the batch and transaction operations carry
 /// their table names inside the body and apply the full constraint.
 pub(crate) fn member_table_name_is_valid(name: &str) -> bool {
-    (3..=255).contains(&name.len()) && table_name_pattern_holds(name)
+    (3..=255).contains(&length_in_characters(name)) && table_name_pattern_holds(name)
 }
 
 /// The constraint errors for a table name carried at `path` inside a
-/// transaction, such as `transactItems.2.member.update.tableName`: the length
-/// first, then the pattern, which is the order DynamoDB lists them in when a
-/// name breaks both (captured us-east-1 and three more regions, 2026-10-09;
-/// eu-west-2 lists the pattern first).
+/// transaction, such as `transactItems.2.member.update.tableName`: the pattern
+/// first, then the length in characters, which is the order and unit
+/// eu-west-2 gives when a name breaks both (captured eu-west-2 and us-east-1,
+/// 12 November 2026; us-east-1 listed the length first on 9 October 2026).
 pub(crate) fn member_table_name_errors(name: &str, path: &str) -> Vec<String> {
-    let mut errors = Vec::new();
-    if name.len() < 3 {
-        errors.push(format!(
-            "Value '{name}' at '{path}' failed to satisfy constraint: \
-             Member must have length greater than or equal to 3"
-        ));
-    } else if name.len() > 255 {
-        errors.push(format!(
-            "Value '{name}' at '{path}' failed to satisfy constraint: \
-             Member must have length less than or equal to 255"
-        ));
-    }
-    if !table_name_pattern_holds(name) {
-        errors.push(format!(
-            "Value '{name}' at '{path}' failed to satisfy constraint: \
-             Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
-        ));
-    }
-    errors
+    name_pattern_error(name, path)
+        .into_iter()
+        .chain(name_length_error(name, path, length_in_characters(name)))
+        .collect()
+}
+
+/// The first fault in a Query or Scan `IndexName`, ahead of the table lookup:
+/// the length in characters, with no value echo and the member spelled
+/// `IndexName`, or else the pattern, echoing the value at `indexName`
+/// (captured eu-west-2 and us-east-1, 12 November 2026).
+pub(crate) fn first_index_name_error(name: &str) -> Option<String> {
+    let length = length_in_characters(name);
+    let constraint = if length < 3 {
+        "Member must have length greater than or equal to 3"
+    } else if length > 255 {
+        "Member must have length less than or equal to 255"
+    } else {
+        return name_pattern_error(name, "indexName");
+    };
+    Some(format!(
+        "Value at 'IndexName' failed to satisfy constraint: {constraint}"
+    ))
 }
 
 /// The constraint a batch request's `RequestItems` map puts on its keys, the
@@ -503,7 +557,7 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
 /// legacy `Expected` would put it there, and the current layer otherwise.
 pub(crate) fn single_write_layer(expected: Option<&serde_json::Value>) -> ValueLayer {
     if crate::types::current_value_layer() == ValueLayer::Older
-        || expected.is_some_and(crate::types::reads_on_older_layer)
+        || expected.is_some_and(crate::types::conditions_read_on_older_layer)
     {
         ValueLayer::Older
     } else {
@@ -753,6 +807,62 @@ pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Ve
     ordered.into_iter().map(|(_, _, name)| name).collect()
 }
 
+/// Each name's place in the order a Java `HashMap` iterates them, given in
+/// written order: the map is made for that many entries (a table of
+/// `tableSizeFor(n)` buckets, doubled whenever it is more than three quarters
+/// full) and filled in written order, so names sharing a bucket keep written
+/// order. `None` when a bucket would turn into a tree, whose order this does
+/// not follow. DynamoDB walks a map's members in this order, a PartiQL
+/// parameter's (captured eu-west-2, 2026-11-09) and an item's or key's
+/// (captured eu-west-2 and us-east-1, 2026-11-11) alike.
+pub(crate) fn java_hash_map_order(names: &[&str]) -> Option<Vec<usize>> {
+    let hashes: Vec<u32> = names
+        .iter()
+        .map(|name| {
+            let h = name.encode_utf16().fold(0u32, |h, unit| {
+                h.wrapping_mul(31).wrapping_add(u32::from(unit))
+            });
+            h ^ (h >> 16)
+        })
+        .collect();
+    // Java's own table: `tableSizeFor(n)` buckets, filled one at a time.
+    let mut buckets = names.len().max(1).next_power_of_two();
+    let mut sizes = vec![0usize; buckets];
+    for (count, hash) in hashes.iter().enumerate() {
+        let bucket = *hash as usize & (buckets - 1);
+        let already = sizes[bucket];
+        sizes[bucket] += 1;
+        let mut grow = false;
+        // Added as the ninth or later in its bucket, the bucket turns into a
+        // tree once there are 64 buckets; until then the table doubles.
+        if already >= 8 {
+            if buckets >= 64 {
+                return None;
+            }
+            grow = true;
+        }
+        let mut grown = buckets * if grow { 2 } else { 1 };
+        // More than three quarters full, it doubles again.
+        if (count + 1) * 4 > grown * 3 {
+            grown *= 2;
+        }
+        if grown != buckets {
+            buckets = grown;
+            sizes = vec![0; buckets];
+            for h in &hashes[..=count] {
+                sizes[*h as usize & (buckets - 1)] += 1;
+            }
+        }
+    }
+    let mut by_order: Vec<usize> = (0..names.len()).collect();
+    by_order.sort_by_key(|&n| (hashes[n] as usize & (buckets - 1), n));
+    let mut ranks = vec![0; names.len()];
+    for (rank, n) in by_order.into_iter().enumerate() {
+        ranks[n] = rank;
+    }
+    Some(ranks)
+}
+
 /// How many buckets a Java hash table that starts with `initial` (a power of
 /// two) holds once `len` names are in it: it doubles whenever it is more than
 /// three quarters full.
@@ -903,7 +1013,7 @@ pub fn validate_gsi(
     request_definitions: &[AttributeDefinition],
 ) -> Result<()> {
     // Validate index name length
-    if gsi.index_name.len() < 3 || gsi.index_name.len() > 255 {
+    if !(3..=255).contains(&length_in_characters(&gsi.index_name)) {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at 'globalSecondaryIndexes.1.member.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",
@@ -958,14 +1068,14 @@ pub fn validate_vector_index(
     member_path: &str,
 ) -> Result<()> {
     // Index name length (request-model constraint; minimum length 3)
-    if vix.index_name.len() < 3 {
+    if length_in_characters(&vix.index_name) < 3 {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",
             vix.index_name
         )));
     }
-    if vix.index_name.len() > 255 {
+    if length_in_characters(&vix.index_name) > 255 {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at '{member_path}.indexName' \
              failed to satisfy constraint: Member must have length less than or equal to 255",
@@ -1661,7 +1771,7 @@ pub fn validate_lsi(
     all_definitions: &[AttributeDefinition],
 ) -> Result<()> {
     // Validate index name length
-    if lsi.index_name.len() < 3 || lsi.index_name.len() > 255 {
+    if !(3..=255).contains(&length_in_characters(&lsi.index_name)) {
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '{}' at 'localSecondaryIndexes.1.member.indexName' \
              failed to satisfy constraint: Member must have length greater than or equal to 3",

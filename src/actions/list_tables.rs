@@ -34,33 +34,15 @@ impl<'de> serde::Deserialize<'de> for ListTablesRequest {
 
         let mut errors = Vec::new();
 
-        // Validate ExclusiveStartTableName if present
+        // Validate ExclusiveStartTableName if present: the length in
+        // characters, then the pattern (captured eu-west-2 and us-east-1,
+        // 12 November 2026).
         if let Some(ref name) = raw.exclusive_start_table_name {
-            if name.is_empty()
-                || !name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-            {
-                errors.push(format!(
-                    "Value '{}' at 'exclusiveStartTableName' failed to satisfy constraint: \
-                     Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-                    name
-                ));
-            }
-            if name.len() < 3 {
-                errors.push(format!(
-                    "Value '{}' at 'exclusiveStartTableName' failed to satisfy constraint: \
-                     Member must have length greater than or equal to 3",
-                    name
-                ));
-            }
-            if name.len() > 255 {
-                errors.push(format!(
-                    "Value '{}' at 'exclusiveStartTableName' failed to satisfy constraint: \
-                     Member must have length less than or equal to 255",
-                    name
-                ));
-            }
+            errors.extend(crate::validation::name_errors_length_first(
+                name,
+                "exclusiveStartTableName",
+                crate::validation::length_in_characters(name),
+            ));
         }
 
         // Validate Limit

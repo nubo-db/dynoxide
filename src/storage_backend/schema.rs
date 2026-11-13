@@ -99,12 +99,21 @@ pub fn refuse_newer_mid_migration(recorded: Option<u32>) -> Result<(), String> {
 
 /// What an open says of a database open read-only that holds items without a
 /// hash prefix: filling them in is a write.
+///
+/// The `-wal` and `-shm` files beside the database must be writable too. A
+/// read-only open in a writable directory creates them when they are missing,
+/// and SQLite gives one it creates, or one it finds empty, the database file's
+/// permissions, so they are read-only too once this open is refused. A
+/// writable open then can't write through them.
 pub fn read_only_needs_hash_prefixes() -> String {
     format!(
         "this database holds items written before Dynoxide 0.9.5 that need their \
          hash prefix filled in before a parallel scan can return them, and it is \
-         open read-only. Open it writable once so this build can bring it up to \
-         schema version {HASH_PREFIXES}. The file has not been changed."
+         open read-only. Make the database file writable, and its -wal and -shm \
+         files beside it as well: a read-only open gives them the database file's \
+         permissions when it creates them or finds them empty. Then open it once \
+         so this build can bring it up to schema version {HASH_PREFIXES}. The \
+         database has not been changed."
     )
 }
 

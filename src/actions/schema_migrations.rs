@@ -113,9 +113,9 @@ async fn fill_hash_prefixes<S: StorageBackend>(storage: &S, write: bool) -> Resu
                 return Ok(1);
             }
             filled += fill.len();
-            match keys.last() {
-                Some(last) if keys.len() == BATCH_SIZE => after = Some(last.clone()),
-                _ => break,
+            match next_page_after(&table_name, after.as_ref(), &keys, BATCH_SIZE)? {
+                Some(next) => after = Some(next),
+                None => break,
             }
         }
         if !fill.is_empty() {
@@ -125,6 +125,33 @@ async fn fill_hash_prefixes<S: StorageBackend>(storage: &S, write: bool) -> Resu
         }
     }
     Ok(filled)
+}
+
+/// The key the page after `keys` starts past, or `None` when `keys` is the
+/// last page: one shorter than `batch_size`.
+///
+/// A full page whose last key is not past `after` is refused rather than
+/// read again. Each backend returns keys in order past `after`, so this can
+/// only happen when a backend reads a key back as something other than what
+/// is stored, such as a key column that isn't text coming back empty; the
+/// next page would then repeat this one, and the open would never finish.
+fn next_page_after(
+    table_name: &str,
+    after: Option<&(String, String)>,
+    keys: &[(String, String)],
+    batch_size: usize,
+) -> Result<Option<(String, String)>> {
+    let Some(last) = keys.last().filter(|_| keys.len() == batch_size) else {
+        return Ok(None);
+    };
+    if let Some(after) = after.filter(|after| last <= *after) {
+        return Err(DynoxideError::InternalServerError(format!(
+            "filling in the hash prefixes of table {table_name}: a page of keys \
+             did not move past {after:?}, so the same rows would be read again. \
+             The table has a key this build can't read back as stored."
+        )));
+    }
+    Ok(Some(last.clone()))
 }
 
 /// Run `step` and record `version`, in one write transaction.
@@ -453,6 +480,21 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Make the database file writable, and with `sidecars` its `-wal` and
+    /// `-shm` files too, where they exist.
+    #[cfg(unix)]
+    fn make_writable(path: &str, sidecars: bool) {
+        set_mode(path, 0o644);
+        if sidecars {
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = format!("{path}{suffix}");
+                if std::path::Path::new(&sidecar).exists() {
+                    set_mode(&sidecar, 0o644);
+                }
+            }
+        }
+    }
+
     /// Make the file writable again and remove the `-wal` and `-shm` files a
     /// read-only connection leaves beside it.
     #[cfg(unix)]
@@ -648,18 +690,17 @@ mod tests {
             let db = Database::new(&path).unwrap();
             assert_eq!(segments(&db), fresh);
         }
+        assert_eq!(open_in_child(&path), Ok(()));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(recorded(&path), Some("11".to_string()));
 
-        // The first writable open records the version. It opens a copy: this
-        // process's SQLite may still hold the read-only file handle for the
-        // original, which a later process would not.
+        // A later writable open records the version, once the database and
+        // the -wal and -shm files the read-only opens left read-only are
+        // writable again.
+        make_writable(&path, true);
+        assert_eq!(open_in_child(&path), Ok(()));
+        assert_eq!(recorded(&path), current());
         tidy_read_only(&path);
-        let copy = tempfile::NamedTempFile::new().unwrap();
-        let copy = copy.path().to_str().unwrap().to_string();
-        std::fs::copy(&path, &copy).unwrap();
-        drop(Database::new(&copy).unwrap());
-        assert_eq!(recorded(&copy), current());
     }
 
     #[cfg(unix)]
@@ -678,7 +719,7 @@ mod tests {
             message.contains(&schema::read_only_needs_hash_prefixes()),
             "{message}"
         );
-        assert!(message.contains("Open it writable once"), "{message}");
+        assert!(message.contains("-wal and -shm"), "{message}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(recorded(&path), Some("11".to_string()));
         let (items, empty) = items_and_empty_prefixes(&path);
@@ -708,5 +749,120 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(recorded(&path), Some("10".to_string()));
         tidy_read_only(&path);
+    }
+
+    /// A read-only file with items to fill is refused, and doing what the
+    /// refusal says, each open in a process of its own as a user's would be,
+    /// brings it up to date.
+    #[cfg(unix)]
+    #[test]
+    fn following_the_read_only_refusal_brings_the_file_up_to_date() {
+        let (_tmp, path, _, fresh) = fresh_fixture();
+        age(&path, Some(11));
+        set_mode(&path, 0o444);
+
+        let message = open_in_child(&path).unwrap_err();
+        assert!(
+            message.contains(&schema::read_only_needs_hash_prefixes()),
+            "{message}"
+        );
+        // Make writable what the message names, and nothing else.
+        make_writable(&path, message.contains("-wal and -shm"));
+        assert_eq!(open_in_child(&path), Ok(()));
+        assert_eq!(recorded(&path), current());
+        assert_eq!(empty_prefixes(&path), 0);
+        assert_eq!(rows(&path), fresh);
+        tidy_read_only(&path);
+    }
+
+    /// Open the database named by `DYNOXIDE_TEST_CHILD_OPEN` and say what
+    /// happened, for [`open_in_child`]. Without that variable it does nothing.
+    #[test]
+    fn child_open() {
+        let Ok(path) = std::env::var("DYNOXIDE_TEST_CHILD_OPEN") else {
+            return;
+        };
+        match Database::new(&path) {
+            Ok(_) => println!("\nCHILD-OPENED"),
+            Err(e) => println!("\nCHILD-REFUSED: {e}"),
+        }
+    }
+
+    /// Open the database at `path` in a new process running this test binary,
+    /// as a later run would, so nothing this process's SQLite still holds for
+    /// the file can affect it.
+    fn open_in_child(path: &str) -> Result<(), String> {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "actions::schema_migrations::tests::child_open",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("DYNOXIDE_TEST_CHILD_OPEN", path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.lines().any(|line| line == "CHILD-OPENED") {
+            return Ok(());
+        }
+        match stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("CHILD-REFUSED: "))
+        {
+            Some(message) => Err(message.to_string()),
+            None => panic!(
+                "the child open said neither: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    fn keys(range: std::ops::Range<u32>) -> Vec<(String, String)> {
+        range
+            .map(|i| (format!("S:k{i:03}"), String::new()))
+            .collect()
+    }
+
+    #[test]
+    fn a_page_shorter_than_a_batch_is_the_last() {
+        let after = ("S:k000".to_string(), String::new());
+        assert_eq!(
+            super::next_page_after("T", Some(&after), &keys(1..4), 4).unwrap(),
+            None
+        );
+        assert_eq!(super::next_page_after("T", None, &[], 4).unwrap(), None);
+    }
+
+    #[test]
+    fn a_full_page_moves_the_cursor_to_its_last_key() {
+        assert_eq!(
+            super::next_page_after("T", None, &keys(0..4), 4).unwrap(),
+            Some(("S:k003".to_string(), String::new()))
+        );
+        let after = ("S:k003".to_string(), String::new());
+        assert_eq!(
+            super::next_page_after("T", Some(&after), &keys(4..8), 4).unwrap(),
+            Some(("S:k007".to_string(), String::new()))
+        );
+    }
+
+    /// A backend that read every key of a full page back as empty would hand
+    /// the same page back for ever; the walk stops instead.
+    #[test]
+    fn a_full_page_that_does_not_move_the_cursor_is_refused() {
+        let empty = vec![(String::new(), String::new()); 4];
+        let after = super::next_page_after("T", None, &empty, 4)
+            .unwrap()
+            .unwrap();
+        let message = super::next_page_after("T", Some(&after), &empty, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("a page of keys did not move past (\"\", \"\")"),
+            "{message}"
+        );
+        let later = ("S:k009".to_string(), String::new());
+        assert!(super::next_page_after("T", Some(&later), &keys(4..8), 4).is_err());
     }
 }

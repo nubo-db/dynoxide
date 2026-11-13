@@ -2846,6 +2846,27 @@ fn test_execute_partiql() {
     let content = tool_content(&resp);
     assert_eq!(content["Count"], 2);
 
+    // `begins_with` takes a literal as its first operand through the tool as
+    // it does through the API: true for a prefix, false otherwise.
+    for (id, prefix, count) in [(6, "a", 1), (7, "b", 0)] {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "execute_partiql",
+            json!({
+                "statement":
+                    format!("SELECT * FROM PQL WHERE pk = 'x' AND begins_with('abc', '{prefix}')")
+            }),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+        let content = tool_content(&resp);
+        assert_eq!(
+            content["Items"].as_array().unwrap().len(),
+            count,
+            "{prefix}"
+        );
+    }
+
     drop(child.stdin.take());
     let _ = child.wait();
 }

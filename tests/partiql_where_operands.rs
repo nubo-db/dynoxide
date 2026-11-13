@@ -995,3 +995,78 @@ fn between_bounds_and_in_members_can_be_operands() {
         ["it1", "it2"]
     );
 }
+
+/// A value written before the sort key means what it says: `'bcd' >= sk` is
+/// the items whose sort key sorts at or before `bcd`, and `begins_with('bcd',
+/// sk)` the items whose sort key is a prefix of `bcd`, on a read of one
+/// partition and on a scan alike.
+#[test]
+fn a_value_before_the_sort_key_means_what_it_says() {
+    let db = Database::memory().unwrap();
+    db.create_table(CreateTableRequest {
+        table_name: "Sorted".to_string(),
+        key_schema: vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::HASH,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::RANGE,
+            },
+        ],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+    for sk in ["b", "bc", "bcd", "bcdef", "x"] {
+        db.put_item(PutItemRequest {
+            table_name: "Sorted".to_string(),
+            item: HashMap::from([("pk".to_string(), s("a")), ("sk".to_string(), s(sk))]),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let sort_keys = |condition: &str| -> Vec<String> {
+        let statement = format!(r#"SELECT sk FROM "Sorted" WHERE {condition}"#);
+        let response = run(&db, &statement, None)
+            .unwrap_or_else(|e| panic!("{statement}: expected rows, got {e:?}"));
+        let mut out: Vec<String> = response
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| match item.get("sk") {
+                Some(AttributeValue::S(sk)) => sk.clone(),
+                other => panic!("{statement}: no sort key in {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    for clause in ["pk = 'a' AND ", ""] {
+        assert_eq!(
+            sort_keys(&format!("{clause}'bcd' >= sk")),
+            ["b", "bc", "bcd"],
+            "{clause}'bcd' >= sk"
+        );
+        assert_eq!(
+            sort_keys(&format!("{clause}begins_with('bcd', sk)")),
+            ["b", "bc", "bcd"],
+            "{clause}begins_with('bcd', sk)"
+        );
+        assert_eq!(
+            sort_keys(&format!("{clause}'bcd' < sk")),
+            ["bcdef", "x"],
+            "{clause}'bcd' < sk"
+        );
+    }
+}

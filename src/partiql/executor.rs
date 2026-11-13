@@ -10,7 +10,8 @@ use crate::expressions::key_condition::{
 };
 use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, ParseError, ParseFailure, PartiqlValue, Refused,
-    ReturningVariant, SetTerm, SetValue, Statement, WhereClause, WhereCondition, WrittenClause,
+    ReturningVariant, Search, SetSign, SetTerm, SetValue, Statement, SumTerm, WhereClause,
+    WhereCondition, WrittenClause,
 };
 use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
@@ -307,13 +308,11 @@ fn reject_negated_key_filters(
     let Some(wc) = where_clause else {
         return Ok(());
     };
-    if !wc
-        .top_level_equalities
-        .iter()
-        .any(|c| names_attribute(&c.path, read_pk))
-    {
+    if !partition_key_given(wc, read_pk) {
         return Ok(());
     }
+    // A filter on any part of a key attribute, `sk.x` too, is a filter on
+    // the key, so the root attribute is what is compared.
     let key_named = |cond: &WhereCondition| {
         condition_paths(cond)
             .into_iter()
@@ -387,10 +386,169 @@ fn reject_negated_key_filters(
             .filter(|(_, negated)| *negated)
             .find_map(|(cond, _)| key_named(cond))
         {
-            return Err(DynoxideError::ValidationException(format!(
-                "Filter Expression can only contain non-primary key attributes: \
-                 Primary key attribute: {key}"
-            )));
+            return Err(key_filter_refusal(&key));
+        }
+    }
+    Ok(())
+}
+
+/// DynamoDB's refusal of a filter on a key attribute of the read target.
+fn key_filter_refusal(key: &str) -> DynoxideError {
+    DynoxideError::ValidationException(format!(
+        "Filter Expression can only contain non-primary key attributes: Primary key \
+         attribute: {key}"
+    ))
+}
+
+/// Whether a SELECT is read by key: the clause gives the read target's
+/// partition key by an equality, in either order (`pk = 'a'`, `'a' = pk`),
+/// joined to the rest of the clause by AND alone. A key condition names the
+/// key attribute itself, so the path is compared exactly here; the filter
+/// checks compare a condition's root attribute instead, since a filter on
+/// `sk.x` is a filter on the key.
+fn partition_key_given(wc: &WhereClause, read_pk: &str) -> bool {
+    wc.top_level_equalities
+        .iter()
+        .any(|c| names_attribute(&c.path, read_pk))
+}
+
+/// The conditions joined to the rest of a clause as written by AND alone,
+/// outside any OR or NOT. Brackets leave no node, so they don't matter.
+fn top_level_conditions(written: &WrittenClause) -> Vec<&Arc<WhereCondition>> {
+    match written {
+        WrittenClause::Leaf(condition) => vec![condition],
+        WrittenClause::And(terms) => terms.iter().flat_map(top_level_conditions).collect(),
+        WrittenClause::Or(_) | WrittenClause::Not(_) | WrittenClause::Operand(_) => Vec::new(),
+    }
+}
+
+/// Whether a read is planned on the partition key as the clause is written:
+/// the conditions joined to the rest by AND alone name the partition key only
+/// by `=` or `IN`, and those name one key condition between them, as
+/// [`key_conditions`] counts them. `pk = 'a'`, `pk IN ['a']`, `pk IN ['a',
+/// 'z']` and `pk = 'a' AND pk IN ['a']` are read by key. Two different key
+/// conditions (`pk IN ['a'] AND pk IN ['z']`), any other condition on the
+/// partition key (`pk <> 'z'`), or a key condition under a NOT, even two
+/// (`NOT NOT pk = 'a'`), leave the read a scan with the clause as its filter
+/// (captured eu-west-2, 12 November 2026). An equality with a path on the
+/// other side names no key condition and leaves the plan as it is.
+fn partition_key_read(wc: &WhereClause, read_pk: &str, parameters: &[AttributeValue]) -> bool {
+    let mut keyed = Vec::new();
+    for condition in top_level_conditions(&wc.written) {
+        match &**condition {
+            WhereCondition::Comparison(c) if names_attribute(&c.path, read_pk) => {
+                if c.op != CompOp::Eq {
+                    return false;
+                }
+                keyed.push(Arc::clone(condition));
+            }
+            WhereCondition::In(path, _) if names_attribute(path, read_pk) => {
+                keyed.push(Arc::clone(condition));
+            }
+            WhereCondition::Compare(left, CompOp::Eq, right)
+                if matches!((left, right), (Operand::Path(_), Operand::Path(_))) => {}
+            other => {
+                if condition_paths(other)
+                    .into_iter()
+                    .any(|path| names_attribute(path, read_pk))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    key_conditions(&keyed, read_pk, false, parameters).is_some_and(|found| found.len() == 1)
+}
+
+/// Whether a read is planned on the partition key for the overlap check and
+/// ORDER BY: as [`partition_key_read`] decides it when a condition joined to
+/// the rest by AND alone names the partition key, and otherwise when an OR
+/// outside any NOT names it, so `pk = 'a' OR pk = 'b'` is still read by key,
+/// branch by branch. A partition key named only under a NOT leaves the read a
+/// scan (captured eu-west-2, 12 November 2026: `NOT NOT pk = 'a' AND (sk = t
+/// OR n = 5)` runs, and `NOT NOT pk = 'a' ORDER BY sk` is refused for having no
+/// partition key condition).
+fn read_planned_by_key(wc: &WhereClause, read_pk: &str, parameters: &[AttributeValue]) -> bool {
+    fn names_key(written: &WrittenClause, read_pk: &str, in_or: bool) -> bool {
+        match written {
+            WrittenClause::Leaf(condition) => {
+                in_or
+                    && condition_paths(condition)
+                        .into_iter()
+                        .any(|path| names_attribute(path, read_pk))
+            }
+            WrittenClause::And(terms) => terms.iter().any(|t| names_key(t, read_pk, in_or)),
+            WrittenClause::Or(terms) => terms.iter().any(|t| names_key(t, read_pk, true)),
+            WrittenClause::Not(_) | WrittenClause::Operand(_) => false,
+        }
+    }
+    let at_top = top_level_conditions(&wc.written)
+        .into_iter()
+        .any(|condition| {
+            condition_paths(condition)
+                .into_iter()
+                .any(|path| names_attribute(path, read_pk))
+        });
+    if at_top {
+        partition_key_read(wc, read_pk, parameters)
+    } else {
+        names_key(&wc.written, read_pk, false)
+    }
+}
+
+/// Refuse a path set against a key attribute, on a read by key, in a
+/// condition DynamoDB would otherwise take as a key condition. A read is by
+/// key as [`partition_key_read`] decides it. On the sort
+/// key that is `begins_with` with the key either side, an ordering comparison
+/// or `=`, or `BETWEEN` with a path for a bound; on the partition key, `=`. A
+/// path can't be a key condition's value, so the condition is left a filter on
+/// the key, which DynamoDB refuses, even when an equality also pins the sort
+/// key, naming the sort key when the condition names both. Under NOT or OR, in
+/// an IN list, and for `contains`, the statement runs (captured eu-west-2, 12
+/// November 2026). On an index the keys are the index's.
+fn reject_key_path_operand(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    if !partition_key_read(wc, read_pk, parameters) {
+        return Ok(());
+    }
+    let key = |operand: &Operand, key: Option<&str>| matches!((operand, key), (Operand::Path(p), Some(key)) if names_attribute(p, key));
+    let path = |operand: &Operand| matches!(operand, Operand::Path(_));
+    let against = |left: &Operand, right: &Operand, name: Option<&str>| {
+        (key(left, name) && path(right)) || (path(left) && key(right, name))
+    };
+    for condition in top_level_conditions(&wc.written) {
+        let refused = match &**condition {
+            WhereCondition::Search(Search::BeginsWith, left, right)
+            | WhereCondition::Compare(
+                left,
+                CompOp::Lt | CompOp::Le | CompOp::Gt | CompOp::Ge,
+                right,
+            ) if against(left, right, read_sk) => read_sk,
+            WhereCondition::Compare(left, CompOp::Eq, right) => {
+                if against(left, right, read_sk) {
+                    read_sk
+                } else if against(left, right, Some(read_pk)) {
+                    Some(read_pk)
+                } else {
+                    None
+                }
+            }
+            WhereCondition::CompareBetween(operand, low, high)
+                if key(operand, read_sk) && (path(low) || path(high)) =>
+            {
+                read_sk
+            }
+            _ => None,
+        };
+        if let Some(name) = refused {
+            return Err(key_filter_refusal(name));
         }
     }
     Ok(())
@@ -704,6 +862,11 @@ fn reject_overlapping_key_conditions(
     let Some(wc) = where_clause else {
         return Ok(());
     };
+    // A read that isn't planned on the partition key has no key condition to
+    // overlap.
+    if !read_planned_by_key(wc, read_pk, parameters) {
+        return Ok(());
+    }
     let key = |value: &PartiqlValue| {
         resolve_value(value, parameters)
             .ok()
@@ -811,6 +974,21 @@ fn reject_overlapping_key_conditions(
                 {
                     return Ok(());
                 }
+                // A path set against the sort key is a condition on it with no
+                // range of its own: `<>` stops the check as a literal `<>`
+                // does, and any other operator narrows nothing and doesn't
+                // count as a second condition on the sort key, so
+                // `pk = 'a' AND (sk <> t OR n = 5)` runs and `pk = 'a' AND sk >
+                // 'b' AND (sk = t OR n = 5)` is refused, where `sk = 'bc'` in
+                // its place runs (captured eu-west-2, 12 November 2026).
+                WhereCondition::Compare(left, CompOp::Ne, right)
+                    if [left, right].into_iter().any(|operand| {
+                        matches!(operand, Operand::Path(path)
+                            if read_sk.is_some_and(|sk| names_attribute(path, sk)))
+                    }) =>
+                {
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -855,17 +1033,26 @@ fn key_groups(
     // runs, on a table or an index (captured eu-west-2 and us-east-1,
     // 6 November 2026). `IS <type>` is read as `attribute_type`, which runs
     // there too.
-    let is_key = |cond: &WhereCondition| {
-        !matches!(
-            cond,
-            WhereCondition::Exists(_)
-                | WhereCondition::NotExists(_)
-                | WhereCondition::IsMissing(_)
-                | WhereCondition::IsType(..)
-        ) && condition_path(cond).is_some_and(|path| {
-            let root = root_attribute(path);
-            root == read_pk || read_sk == Some(&*root)
-        })
+    // A path set against a key by a comparison names the key too, so
+    // `pk = 'a' AND (sk = t OR n = 5)` is two ranges that meet (captured
+    // eu-west-2, 12 November 2026).
+    let keyed = |path: &str| {
+        let root = root_attribute(path);
+        root == read_pk || read_sk == Some(&*root)
+    };
+    let is_key = |cond: &WhereCondition| match cond {
+        WhereCondition::Compare(Operand::Path(left), _, Operand::Path(right)) => {
+            keyed(left) || keyed(right)
+        }
+        _ => {
+            !matches!(
+                cond,
+                WhereCondition::Exists(_)
+                    | WhereCondition::NotExists(_)
+                    | WhereCondition::IsMissing(_)
+                    | WhereCondition::IsType(..)
+            ) && condition_path(cond).is_some_and(keyed)
+        }
     };
     fn mentions_key(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> bool {
         match tree {
@@ -1084,6 +1271,20 @@ fn plan_order(
             "Must have WHERE clause in the statement when using ORDER BY clause.".to_string(),
         ));
     };
+    let no_partition = || {
+        reject(
+            "Must have at least one non-optional hash key condition in WHERE clause \
+             when using ORDER BY clause."
+                .to_string(),
+        )
+    };
+    // The read must be planned on the partition key, so a partition key under
+    // a NOT, or beside another condition on it, has none (captured eu-west-2,
+    // 12 November 2026: `pk = 'a' AND pk <> 'z' ORDER BY sk` and `NOT NOT pk =
+    // 'a' ORDER BY sk`).
+    if !read_planned_by_key(wc, read_pk, parameters) {
+        return Err(no_partition());
+    }
     let mut partition_values = Vec::new();
     for group in &wc.groups {
         let pinned: Vec<Vec<&PartiqlValue>> = group
@@ -1101,11 +1302,7 @@ fn plan_order(
             })
             .collect();
         let [values] = pinned.as_slice() else {
-            return Err(reject(
-                "Must have at least one non-optional hash key condition in WHERE clause \
-                 when using ORDER BY clause."
-                    .to_string(),
-            ));
+            return Err(no_partition());
         };
         partition_values.extend(values.iter().copied());
     }
@@ -1514,6 +1711,29 @@ fn validate_operand_types(
                 let value = resolve_value(prefix, parameters)?;
                 if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
                     return Err(reject("begins_with", &value));
+                }
+            }
+            // Each operand's own operands come first. Then `begins_with`
+            // refuses an operand whose value is fixed unless it is a string
+            // or a binary, the first operand before the second, a size being
+            // a number and a call a boolean; a path is only read with the
+            // item. `contains` refuses nothing by type (captured eu-west-2,
+            // 2026-11-11 and 2026-11-12).
+            WhereCondition::Search(search, first, second) => {
+                check_operand(first, parameters)?;
+                check_operand(second, parameters)?;
+                if *search == Search::BeginsWith {
+                    for operand in [first, second] {
+                        let fixed = match operand {
+                            Operand::Size(_) => Some(AttributeValue::N("0".to_string())),
+                            other => fixed_value(other, parameters)?,
+                        };
+                        if let Some(value) = fixed
+                            && !matches!(value, AttributeValue::S(_) | AttributeValue::B(_))
+                        {
+                            return Err(reject("begins_with", &value));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1964,7 +2184,10 @@ async fn execute_select<S: StorageBackend>(
     // eu-west-2 and us-east-1, 6 November 2026).
     check_read_key_types(where_clause, parameters, read_pk, read_sk, &declared)?;
     reject_negated_key_filters(where_clause, read_pk, read_sk)?;
+    // Overlapping key conditions are refused ahead of a path set against a
+    // key (captured eu-west-2, 12 November 2026: `pk IN ['a', 'a'] AND sk = t`).
     reject_overlapping_key_conditions(where_clause, parameters, read_pk, read_sk)?;
+    reject_key_path_operand(where_clause, parameters, read_pk, read_sk)?;
     let order = if order_by.is_empty() {
         None
     } else {
@@ -2609,7 +2832,15 @@ fn condition_path(condition: &WhereCondition) -> Option<&str> {
         | WhereCondition::IsNotMissing(p)
         | WhereCondition::IsType(p, _)
         | WhereCondition::IsNotType(p, _) => Some(p.as_str()),
-        _ => None,
+        // Conditions on operands can name several paths, or none; see
+        // `condition_paths`.
+        WhereCondition::Compare(..)
+        | WhereCondition::CompareBetween(..)
+        | WhereCondition::CompareIn(..)
+        | WhereCondition::AttributeType(..)
+        | WhereCondition::Search(..)
+        | WhereCondition::Not(_)
+        | WhereCondition::Refused(_) => None,
     }
 }
 
@@ -2636,6 +2867,10 @@ fn condition_paths(condition: &WhereCondition) -> Vec<&str> {
             .flat_map(operand_paths)
             .collect(),
         WhereCondition::AttributeType(operand, _) => operand_paths(operand),
+        WhereCondition::Search(_, first, second) => [first, second]
+            .into_iter()
+            .flat_map(operand_paths)
+            .collect(),
         WhereCondition::Not(inner) => condition_paths(inner),
         other => condition_path(other).into_iter().collect(),
     }
@@ -3146,6 +3381,15 @@ fn translate_sk_conditions(
             // the sort key. A negated comparison in particular must never drive
             // the read: it keeps rows that have no sort key value to compare,
             // and a range read cannot express that.
+            // A search on other operands that names the sort key is a filter,
+            // and drives nothing either.
+            WhereCondition::Search(..)
+                if condition_paths(cond)
+                    .into_iter()
+                    .any(|path| names_attribute(path, sk_name)) =>
+            {
+                return None;
+            }
             WhereCondition::NotComparison(crate::partiql::parser::Condition { path, .. })
             | WhereCondition::NotBeginsWith(path, _)
             | WhereCondition::In(path, _)
@@ -3698,13 +3942,27 @@ async fn execute_update<S: StorageBackend>(
     // past the end of a list append in the order of their indexes (eu-west-2
     // and us-east-1, 20 October 2026). A SET that removes its path is taken out
     // with the REMOVEs.
+    //
+    // A literal or parameter of the wrong type in any SET is refused first,
+    // then every attribute the SETs read is resolved, and only then is a sum
+    // past what a number holds refused (captured eu-west-2, 12 November 2026:
+    // `SET a = nope, z = 'a' + 1` names `+`, and `SET a =
+    // 99999999999999999999999999999999999999 + 9, z = nope` is the missing
+    // attribute).
+    for clause in set_clauses {
+        check_fixed_value(&clause.value, parameters)?;
+    }
+    let mut overflow = None;
     let mut writes = Vec::with_capacity(set_clauses.len());
     for clause in set_clauses {
         writes.push((
             element_path(&clause.path),
             &clause.path,
-            resolve_set_value(&clause.value, &before_item, parameters)?,
+            resolve_set_value(&clause.value, &before_item, parameters, &mut overflow)?,
         ));
+    }
+    if let Some(overflow) = overflow {
+        return Err(overflow);
     }
     writes.sort_by(|(a, _, _), (b, _, _)| crate::expressions::update::compare_paths(a, b));
     let mut removals = Vec::with_capacity(remove_paths.len());
@@ -4195,6 +4453,7 @@ fn resolve_set_value(
     val: &SetValue,
     item: &Item,
     parameters: &[AttributeValue],
+    overflow: &mut Option<DynoxideError>,
 ) -> Result<Option<AttributeValue>> {
     if let SetValue::SetCall {
         delete,
@@ -4205,7 +4464,7 @@ fn resolve_set_value(
     {
         return resolve_set_call(*delete, path, members, refusal_at, item, parameters);
     }
-    resolve_set_operand(val, item, parameters).map(Some)
+    resolve_set_operand(val, item, parameters, overflow).map(Some)
 }
 
 /// `set_add` or `set_delete` against the set stored at `path`.
@@ -4294,32 +4553,119 @@ fn combine_set_members<T: Clone, K: Eq + std::hash::Hash>(
 }
 
 /// Resolve a SetValue other than a set call to a concrete AttributeValue,
-/// potentially using the current item.
+/// potentially using the current item. The first sum past what a number holds
+/// is kept in `overflow`, to be refused once every SET has been resolved.
 fn resolve_set_operand(
     val: &SetValue,
     item: &Item,
     parameters: &[AttributeValue],
+    overflow: &mut Option<DynoxideError>,
 ) -> Result<AttributeValue> {
     match val {
         SetValue::SetCall { .. } => unreachable!("resolve_set_value handles a set call"),
-        SetValue::Simple(pv) => resolve_value(pv, parameters),
-        SetValue::Add(attr, term) => arithmetic(attr, term, item, parameters, "+"),
-        SetValue::Sub(attr, term) => arithmetic(attr, term, item, parameters, "-"),
-        SetValue::ListAppend(first, second) => {
-            // A literal or parameter of the wrong type is refused before the
-            // item is read, ahead of an attribute that is missing or mistyped.
-            let static_first = literal_of(first, parameters, "list_append", is_list)?;
-            let static_second = literal_of(second, parameters, "list_append", is_list)?;
-            let list_a = static_first.map_or_else(|| attribute_of(first, item, is_list), Ok)?;
-            let list_b = static_second.map_or_else(|| attribute_of(second, item, is_list), Ok)?;
-            match (list_a, list_b) {
-                (AttributeValue::L(mut la), AttributeValue::L(lb)) => {
-                    la.extend(lb);
-                    Ok(AttributeValue::L(la))
-                }
-                _ => unreachable!("both operands were checked to be lists"),
-            }
+        SetValue::Simple(term) => term_value(term, item, parameters, overflow),
+        SetValue::Sum(terms) => arithmetic(terms, item, parameters, overflow),
+    }
+}
+
+/// [`check_fixed_terms`] for the right-hand side of one SET. A set call
+/// checks its own operands as it is resolved.
+fn check_fixed_value(val: &SetValue, parameters: &[AttributeValue]) -> Result<()> {
+    match val {
+        SetValue::SetCall { .. } => Ok(()),
+        SetValue::Simple(term) => check_fixed_terms(term, parameters),
+        SetValue::Sum(terms) => check_fixed_sum(terms, parameters),
+    }
+}
+
+/// Refuse a literal or parameter of the wrong type anywhere in a SET term,
+/// before any attribute is read: a fault nested in `if_not_exists` or a
+/// bracket comes ahead of a missing attribute beside it (captured eu-west-2,
+/// 12 November 2026: `nope + if_not_exists(q, 'a' + 1)` names `+` and `S`).
+/// The terms are checked in the order written, each before what it holds.
+fn check_fixed_terms(term: &SetTerm, parameters: &[AttributeValue]) -> Result<()> {
+    match term {
+        SetTerm::Path(_) | SetTerm::Value(_) => Ok(()),
+        SetTerm::ListAppend(first, second) => {
+            fixed_of(first, parameters, "list_append", is_list)?;
+            fixed_of(second, parameters, "list_append", is_list)?;
+            check_fixed_terms(first, parameters)?;
+            check_fixed_terms(second, parameters)
         }
+        SetTerm::IfNotExists(_, value) => check_fixed_terms(value, parameters),
+        SetTerm::Sum(terms) => check_fixed_sum(terms, parameters),
+    }
+}
+
+/// [`check_fixed_terms`] for the terms of a sum, each held to a number and
+/// named by the operator written beside it.
+fn check_fixed_sum(terms: &[SumTerm], parameters: &[AttributeValue]) -> Result<()> {
+    for term in terms {
+        fixed_of(&term.term, parameters, sign_operator(term.named), is_number)?;
+        check_fixed_terms(&term.term, parameters)?;
+    }
+    Ok(())
+}
+
+/// The operator a sign was written as.
+fn sign_operator(sign: SetSign) -> &'static str {
+    match sign {
+        SetSign::Plus => "+",
+        SetSign::Minus => "-",
+    }
+}
+
+/// The value of a SET term. A path copies the attribute, and one the item
+/// lacks is refused (captured eu-west-2, 12 November 2026).
+fn term_value(
+    term: &SetTerm,
+    item: &Item,
+    parameters: &[AttributeValue],
+    overflow: &mut Option<DynoxideError>,
+) -> Result<AttributeValue> {
+    match term {
+        SetTerm::Value(value) => resolve_value(value, parameters),
+        SetTerm::Path(_) => attribute_of(term, item, |_| true),
+        SetTerm::ListAppend(first, second) => {
+            list_append(first, second, item, parameters, overflow)
+        }
+        // The value is resolved even when the attribute is there, so one that
+        // reads an attribute the item lacks is refused either way (captured
+        // eu-west-2, 12 November 2026: `if_not_exists(n, nope)` with `n` held).
+        SetTerm::IfNotExists(path, value) => {
+            let value = term_value(value, item, parameters, overflow)?;
+            Ok(resolve_nested_path(item, path).cloned().unwrap_or(value))
+        }
+        SetTerm::Sum(terms) => arithmetic(terms, item, parameters, overflow),
+    }
+}
+
+/// `list_append(first, second)`. A literal or parameter of the wrong type is
+/// refused before the item is read, ahead of an attribute that is missing or
+/// mistyped.
+fn list_append(
+    first: &SetTerm,
+    second: &SetTerm,
+    item: &Item,
+    parameters: &[AttributeValue],
+    overflow: &mut Option<DynoxideError>,
+) -> Result<AttributeValue> {
+    let static_first = fixed_of(first, parameters, "list_append", is_list)?;
+    let static_second = fixed_of(second, parameters, "list_append", is_list)?;
+    let list_a = match static_first {
+        Some(list) => list,
+        None => read_of(first, item, parameters, is_list, overflow)?,
+    };
+    let list_b = match static_second {
+        Some(list) => list,
+        None => read_of(second, item, parameters, is_list, overflow)?,
+    };
+    match (list_a, list_b) {
+        (AttributeValue::L(mut la), AttributeValue::L(lb)) => {
+            la.extend(lb);
+            Ok(AttributeValue::L(la))
+        }
+        _ => unreachable!("both operands were checked to be lists"),
     }
 }
 
@@ -4331,19 +4677,29 @@ fn is_number(value: &AttributeValue) -> bool {
     matches!(value, AttributeValue::N(_))
 }
 
-/// The value of a literal or parameter operand, `None` for an attribute. A
-/// value that `fits` is returned; one that does not is refused as DynamoDB
-/// refuses it, naming the operator and the operand's type.
-fn literal_of(
+/// The value of a term whose type is known before the item is read: a literal
+/// or a parameter, returned if it `fits`, or a `list_append`, whose type is a
+/// list and which is evaluated later if a list fits. A term that does not fit
+/// is refused as DynamoDB refuses it, naming the operator and the type
+/// (captured eu-west-2, 12 November 2026: `1 + list_append(l, [1])` names `+`
+/// and `L`). `None` for a term the item decides.
+fn fixed_of(
     term: &SetTerm,
     parameters: &[AttributeValue],
     operator: &str,
     fits: fn(&AttributeValue) -> bool,
 ) -> Result<Option<AttributeValue>> {
-    let SetTerm::Value(value) = term else {
-        return Ok(None);
+    let value = match term {
+        SetTerm::Value(value) => resolve_value(value, parameters)?,
+        SetTerm::ListAppend(..) => {
+            let list = AttributeValue::L(Vec::new());
+            if fits(&list) {
+                return Ok(None);
+            }
+            list
+        }
+        SetTerm::Path(_) | SetTerm::IfNotExists(..) | SetTerm::Sum(_) => return Ok(None),
     };
-    let value = resolve_value(value, parameters)?;
     if fits(&value) {
         return Ok(Some(value));
     }
@@ -4354,6 +4710,29 @@ fn literal_of(
     )))
 }
 
+/// The value of a term the item decides, an attribute or a call: refused when
+/// the item lacks an attribute it reads, and when it is not of the type the
+/// operator takes.
+fn read_of(
+    term: &SetTerm,
+    item: &Item,
+    parameters: &[AttributeValue],
+    fits: fn(&AttributeValue) -> bool,
+    overflow: &mut Option<DynoxideError>,
+) -> Result<AttributeValue> {
+    let value = match term {
+        SetTerm::Path(_) => return attribute_of(term, item, fits),
+        _ => term_value(term, item, parameters, overflow)?,
+    };
+    if fits(&value) {
+        Ok(value)
+    } else {
+        Err(DynoxideError::ValidationException(
+            crate::expressions::OPERAND_TYPE.to_string(),
+        ))
+    }
+}
+
 /// The value of an attribute operand: refused when the item lacks it, and when
 /// it is not of the type the operator takes.
 fn attribute_of(
@@ -4362,7 +4741,7 @@ fn attribute_of(
     fits: fn(&AttributeValue) -> bool,
 ) -> Result<AttributeValue> {
     let SetTerm::Path(path) = term else {
-        unreachable!("a value is read by literal_of");
+        unreachable!("only a path is read from the item here");
     };
     match resolve_nested_path(item, path) {
         None => Err(DynoxideError::ValidationException(
@@ -4375,33 +4754,78 @@ fn attribute_of(
     }
 }
 
-/// `attr + term` or `attr - term`, on numbers only.
+/// Terms added and subtracted, on numbers only. A term whose type is known
+/// before the item is read and isn't a number is refused first, naming the
+/// operator written beside it, and then each term the item decides is read
+/// in turn (captured eu-west-2, 12 November 2026: `'abc' + 1` is refused
+/// naming `+` and its type, `n + nope + 'a'` for the string ahead of the
+/// missing attribute, and `n + nope` as an attribute the item lacks).
+///
+/// Each running total is held to what a number can hold, in the order
+/// written, so `99999999999999999999999999999999999999 + 9 - 9` overflows
+/// though its result would fit (captured eu-west-2, 12 November 2026). The
+/// first overflow is kept in `overflow` rather than returned, so an attribute
+/// any SET reads is resolved first; the sum is carried on exactly meanwhile,
+/// and is never written.
 fn arithmetic(
-    attr: &str,
-    term: &SetTerm,
+    terms: &[SumTerm],
     item: &Item,
     parameters: &[AttributeValue],
-    operator: &str,
+    overflow: &mut Option<DynoxideError>,
 ) -> Result<AttributeValue> {
     use bigdecimal::BigDecimal;
     use std::str::FromStr;
-    let literal = literal_of(term, parameters, operator, is_number)?;
-    let left = attribute_of(&SetTerm::Path(attr.to_string()), item, is_number)?;
-    let right = literal.map_or_else(|| attribute_of(term, item, is_number), Ok)?;
-    let (AttributeValue::N(left), AttributeValue::N(right)) = (left, right) else {
-        unreachable!("both operands were checked to be numbers");
-    };
+    let mut fixed = Vec::with_capacity(terms.len());
+    for term in terms {
+        fixed.push(fixed_of(
+            &term.term,
+            parameters,
+            sign_operator(term.named),
+            is_number,
+        )?);
+    }
     let number = |n: &str| {
         BigDecimal::from_str(n)
             .map_err(|e| DynoxideError::ValidationException(format!("Invalid number: {e}")))
     };
-    let (left, right) = (number(&left)?, number(&right)?);
-    let result = if operator == "+" {
-        left + right
-    } else {
-        left - right
-    };
-    Ok(AttributeValue::N(format_bigdecimal(&result)))
+    let mut total = BigDecimal::from(0);
+    for (term, value) in terms.iter().zip(fixed) {
+        let value = match value {
+            Some(value) => value,
+            None => read_of(&term.term, item, parameters, is_number, overflow)?,
+        };
+        let AttributeValue::N(n) = value else {
+            unreachable!("each operand was checked to be a number");
+        };
+        let n = number(&n)?;
+        total = match term.sign {
+            SetSign::Plus => total + n,
+            SetSign::Minus => total - n,
+        };
+        if overflow.is_none()
+            && let Err(fault) = sum_in_range(&total)
+        {
+            *overflow = Some(fault);
+        }
+    }
+    Ok(AttributeValue::N(format_bigdecimal(&total)))
+}
+
+/// Refuse a sum DynamoDB can't hold, at whatever depth it is computed: past
+/// the number range, or needing more than 38 significant digits, is an
+/// overflow (captured eu-west-2, 12 November 2026: `9.99E+125 + 1E+125` at
+/// the top of a SET, `99999999999999999999999999999999999999 + 9` inside
+/// `if_not_exists`, whether or not its value is used, and `1E+37 + 0.1`). A
+/// sum whose digits fit is held: `99999999999999999999999999999999999999 + 1`
+/// is `1E+38`.
+fn sum_in_range(total: &bigdecimal::BigDecimal) -> Result<()> {
+    const OVERFLOW: &str =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    let (digits, _) = total.normalized().as_bigint_and_exponent();
+    if digits.magnitude().to_string().len() > 38 {
+        return Err(DynoxideError::ValidationException(OVERFLOW.to_string()));
+    }
+    crate::types::validate_dynamo_number(&format_bigdecimal(total))
 }
 
 /// A statement's path as the elements an UpdateItem path is made of, for the
@@ -4640,7 +5064,9 @@ fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
         WhereCondition::CompareIn(o, list) => {
             operand(o, bound) || list.iter().any(|m| operand(m, bound))
         }
-        WhereCondition::AttributeType(o, kind) => operand(o, bound) || operand(kind, bound),
+        WhereCondition::AttributeType(o, kind) | WhereCondition::Search(_, o, kind) => {
+            operand(o, bound) || operand(kind, bound)
+        }
         WhereCondition::Not(inner) => has_unbound_parameter(inner, bound),
         WhereCondition::Refused(refused) => refused.operands.iter().any(|o| operand(o, bound)),
     }
@@ -4842,7 +5268,37 @@ fn operand_condition_holds(
             (Some(v), Some(AttributeValue::S(kind))) => v.type_name() == kind,
             _ => false,
         },
-        _ => false,
+        // A missing value, or one of a type the search can't read, is no
+        // match (captured eu-west-2, 2026-11-12).
+        WhereCondition::Search(search, first, second) => match (value(first), value(second)) {
+            (Some(first), Some(second)) => match search {
+                Search::BeginsWith => begins_with(&first, &second),
+                Search::Contains => holds_value(&first, &second),
+            },
+            _ => false,
+        },
+        // A condition on a path and a value is read by `matches_conditions`
+        // before it gets here, and `Not` is unwrapped there too.
+        WhereCondition::Comparison(_)
+        | WhereCondition::NotComparison(_)
+        | WhereCondition::Exists(_)
+        | WhereCondition::NotExists(_)
+        | WhereCondition::BeginsWith(..)
+        | WhereCondition::NotBeginsWith(..)
+        | WhereCondition::Between(..)
+        | WhereCondition::NotBetween(..)
+        | WhereCondition::In(..)
+        | WhereCondition::Contains(..)
+        | WhereCondition::NotContains(..)
+        | WhereCondition::IsMissing(_)
+        | WhereCondition::IsNotMissing(_)
+        | WhereCondition::IsType(..)
+        | WhereCondition::IsNotType(..)
+        | WhereCondition::Not(_) => false,
+        WhereCondition::Refused(_) => {
+            debug_assert!(false, "a refused condition reached evaluation");
+            false
+        }
     }
 }
 
@@ -4883,8 +5339,8 @@ fn operand_value(
     }
 }
 
-/// Whether `path` holds a value containing `substr_val`: a substring of a
-/// string, a member of a set, or an element of a list.
+/// Whether `path` holds a value containing `substr_val`, as [`holds_value`]
+/// decides it.
 ///
 /// Shared by `CONTAINS` and `NOT CONTAINS` so the two cannot answer different
 /// questions. A path that does not resolve, or a value that cannot be compared
@@ -4901,10 +5357,22 @@ fn contains_value(
     let Ok(substr) = resolve_value(substr_val, parameters) else {
         return false;
     };
-    match (item_val, &substr) {
+    holds_value(item_val, &substr)
+}
+
+/// Whether `value` holds `target`: a substring of a string, a run of bytes in
+/// a binary, a member of a set, or an element of a list, which holds a value
+/// and not a list of it. Values of other types hold nothing (captured
+/// eu-west-2, 2026-11-12, for a binary, a binary set and a number set).
+fn holds_value(value: &AttributeValue, target: &AttributeValue) -> bool {
+    match (value, target) {
         (AttributeValue::S(s), AttributeValue::S(sub)) => s.contains(sub.as_str()),
+        (AttributeValue::B(b), AttributeValue::B(sub)) => {
+            sub.is_empty() || b.windows(sub.len()).any(|window| window == sub.as_slice())
+        }
         (AttributeValue::SS(set), AttributeValue::S(val)) => set.contains(val),
         (AttributeValue::NS(set), AttributeValue::N(val)) => set.contains(val),
+        (AttributeValue::BS(set), AttributeValue::B(val)) => set.contains(val),
         (AttributeValue::L(list), target) => list.contains(target),
         _ => false,
     }
@@ -5095,6 +5563,14 @@ mod tests {
                 "Condition operand in an IN list under NOT",
                 "NOT attribute_exists(flag) IN [?, true]",
             ),
+            (
+                "begins_with on a parameter and a path, under NOT",
+                "NOT begins_with(?, tag)",
+            ),
+            (
+                "contains on a parameter and a path, under NOT",
+                "NOT contains(?, tag)",
+            ),
         ]
         .into_iter()
         .filter(|(_, clause)| {
@@ -5126,6 +5602,8 @@ mod tests {
             "NOT attribute_exists(flag) = ?",
             "attribute_exists(flag) IN [?, false]",
             "NOT attribute_exists(flag) IN [?, true]",
+            "NOT begins_with(?, tag)",
+            "NOT contains(?, tag)",
         ] {
             let wc = where_of(&format!(r#"SELECT * FROM "t" WHERE {clause}"#));
             assert!(

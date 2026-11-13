@@ -513,7 +513,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fresh write of its key would get, and changes nothing else, so it comes
   back in the same segment and the same place as a fresh write. That open
   moves the file to schema version 12, and the upgrade is one way: Dynoxide
-  1.3.0 to 1.6.0 read up to version 11 and will refuse the file afterwards
+  1.3.0 to 1.6.0 read up to version 11 and will refuse the file afterwards.
+  Recording version 12 is a write, so the first open by this release writes
+  to the file. A database kept read-only that has items to fill is refused
+  until it has been opened writable once; one with nothing to fill still
+  opens read-only, and is left at version 11
   ([#296](https://github.com/nubo-db/dynoxide/issues/296)).
 
 ## [1.6.0] - 2026-11-07

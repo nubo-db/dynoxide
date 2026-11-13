@@ -304,6 +304,10 @@ pub async fn execute<S: StorageBackend>(
         request.on_demand_throughput = None;
     }
 
+    // The table name, as the body is checked when it is read, for a request
+    // built in code.
+    crate::validation::validate_control_table_name(&request.table_name)?;
+
     // Phase 1: Validate request parameters BEFORE table existence check
     // (DynamoDB validates these first and returns ValidationException,
     // not ResourceNotFoundException)
@@ -1225,13 +1229,12 @@ fn collect_gsi_update_errors(updates: &[GlobalSecondaryIndexUpdate], errors: &mu
         ];
         for (action, name) in actions {
             if let Some(name) = name {
-                errors.extend(crate::validation::name_errors_length_first(
+                errors.extend(crate::validation::index_name_errors(
                     name,
                     &format!(
                         "globalSecondaryIndexUpdates.{}.member.{action}.indexName",
                         i + 1
                     ),
-                    crate::validation::length_in_characters(name),
                 ));
             }
         }

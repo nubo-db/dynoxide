@@ -214,6 +214,16 @@ pub(crate) fn name_errors_length_first(name: &str, path: &str, length: usize) ->
         .collect()
 }
 
+/// The faults in an index name at `path` on CreateTable or UpdateTable: the
+/// length in characters, then the pattern. An empty name gets the length fault
+/// alone, as it always has here; DynamoDB's answer for one is uncaptured.
+pub(crate) fn index_name_errors(name: &str, path: &str) -> Vec<String> {
+    if name.is_empty() {
+        return name_length_error(name, path, 0).into_iter().collect();
+    }
+    name_errors_length_first(name, path, length_in_characters(name))
+}
+
 /// The faults in a `TableName` on CreateTable, DescribeTable, DeleteTable,
 /// UpdateTable, UpdateTimeToLive and DescribeTimeToLive: the length in UTF-16
 /// units, then the pattern, both listed when both are broken (captured

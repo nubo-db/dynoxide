@@ -1325,10 +1325,9 @@ fn collect_idx_name_errors(name: &str, prefix: &str, idx: usize, errors: &mut Ve
 /// (captured eu-west-2 and us-east-1, 12 November 2026, for global and local
 /// secondary index names; vector index names are checked the same way).
 fn collect_idx_name_errors_at(name: &str, path: &str, errors: &mut Vec<String>) {
-    errors.extend(crate::validation::name_errors_length_first(
+    errors.extend(crate::validation::index_name_errors(
         name,
         &format!("{path}.indexName"),
-        crate::validation::length_in_characters(name),
     ));
 }
 

@@ -609,14 +609,72 @@ fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'s
 /// DynamoDB's refusal of a map that names a member twice.
 const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
 
-/// DynamoDB's refusal of an attribute value that is malformed as JSON: not an
-/// object, or a member of the wrong JSON type at any depth (see
-/// [`unreadable_member_in`]); `None` when it reads as JSON, and for JSON null.
+/// DynamoDB's refusal of an attribute value that is malformed as JSON, read
+/// from it as written, so every copy of a name written twice is seen, at any
+/// depth: not an object, a type member of the wrong JSON type (see
+/// [`unreadable_member`]), or a `BOOL` or `NULL` member that
+/// [`read_lenient_bool`] refuses as the request is parsed. `None` when it
+/// reads as JSON, and for JSON null. The refusal has no marker.
 fn malformed_value(value: &Written) -> Option<Cow<'static, str>> {
-    let value = value.to_value();
-    JsonSlot::Value
-        .refusal(&value)
-        .or_else(|| value.as_object().and_then(unreadable_member_in))
+    written_slot_refusal(JsonSlot::Value, value).or_else(|| match value {
+        Written::Object(members) => members
+            .iter()
+            .find_map(|(type_key, member)| malformed_member(type_key, member)),
+        _ => None,
+    })
+}
+
+/// [`malformed_value`] for an attribute value's `type_key` member.
+fn malformed_member(type_key: &str, member: &Written) -> Option<Cow<'static, str>> {
+    if matches!(type_key, "BOOL" | "NULL") {
+        if member.is_null() {
+            return None;
+        }
+        // A string is read for its text; anything else for its JSON type.
+        let flag = match member {
+            Written::String(text) => serde_json::Value::String(text.clone()),
+            other => other.shallow_value(),
+        };
+        let marked = read_lenient_bool(&flag).err()?;
+        return marked
+            .strip_prefix(crate::serde_errors::SERIALIZATION_MARKER)
+            .map(|refusal| Cow::Owned(refusal.to_string()));
+    }
+    let (slot, items) = match type_key {
+        "S" | "N" => (JsonSlot::Text, None),
+        "B" => (JsonSlot::Bytes, None),
+        "SS" | "NS" => (JsonSlot::List, Some(JsonSlot::Text)),
+        "BS" => (JsonSlot::List, Some(JsonSlot::Bytes)),
+        "L" => (JsonSlot::List, Some(JsonSlot::Value)),
+        "M" => (JsonSlot::Map, Some(JsonSlot::Value)),
+        _ => return None,
+    };
+    if let Some(refusal) = written_slot_refusal(slot, member) {
+        return Some(refusal);
+    }
+    let items = items?;
+    let item_refusal = |item: &Written| match items {
+        JsonSlot::Value => malformed_value(item),
+        slot => written_slot_refusal(slot, item),
+    };
+    match member {
+        Written::Array(list) => list.iter().find_map(item_refusal),
+        Written::Object(map) => map.iter().map(|(_, item)| item).find_map(item_refusal),
+        _ => None,
+    }
+}
+
+/// [`JsonSlot::refusal`] for a value as written, without copying it.
+fn written_slot_refusal(slot: JsonSlot, value: &Written) -> Option<Cow<'static, str>> {
+    if let Some(refusal) = slot.json_type_refusal(&value.shallow_value()) {
+        return Some(Cow::Borrowed(refusal));
+    }
+    match (slot, value) {
+        (JsonSlot::Bytes, Written::String(text)) => {
+            crate::wire_base64::check(text).err().map(|r| r.message())
+        }
+        _ => None,
+    }
 }
 
 /// The members of an `M` with a name written twice collapsed, as DynamoDB
@@ -626,6 +684,9 @@ fn malformed_value(value: &Written) -> Option<Cow<'static, str>> {
 /// refused as a name written twice. Otherwise the last copy is the member's
 /// value, in the place the name was first written, and the earlier copies are
 /// not read at all. The refusal is the message, without its marker.
+///
+/// One pass: a member is looked at for a fault as JSON only once a repeat
+/// needs it, and never again, and nothing is copied.
 fn collapse_repeated_members(
     members: Vec<(String, Written)>,
 ) -> std::result::Result<Vec<(String, Written)>, Cow<'static, str>> {
@@ -639,27 +700,38 @@ fn collapse_repeated_members(
         }
         _ => false,
     };
-    let mut collapsed: Vec<(String, Written)> = Vec::with_capacity(members.len());
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for (at, (name, value)) in members.iter().enumerate() {
-        let Some(&first) = seen.get(name) else {
-            seen.insert(name.clone(), collapsed.len());
-            collapsed.push((name.clone(), value.clone()));
-            continue;
-        };
-        if let Some(malformed) = members[..=at]
-            .iter()
-            .map(|(_, member)| member)
-            .find_map(malformed_value)
-        {
-            return Err(malformed);
+    // For each name, in the order first written, the member read for it.
+    let mut chosen: Vec<usize> = Vec::with_capacity(members.len());
+    {
+        let mut slot_of: HashMap<&str, usize> = HashMap::with_capacity(members.len());
+        let mut looked_at = 0;
+        for (at, (name, value)) in members.iter().enumerate() {
+            let Some(&slot) = slot_of.get(name.as_str()) else {
+                slot_of.insert(name, chosen.len());
+                chosen.push(at);
+                continue;
+            };
+            if let Some(malformed) = members[looked_at..=at]
+                .iter()
+                .find_map(|(_, member)| malformed_value(member))
+            {
+                return Err(malformed);
+            }
+            looked_at = at + 1;
+            if !one_type_member(&members[chosen[slot]].1) || !one_type_member(value) {
+                return Err(Cow::Borrowed(DUPLICATE_MEMBER));
+            }
+            chosen[slot] = at;
         }
-        if !one_type_member(&collapsed[first].1) || !one_type_member(value) {
-            return Err(Cow::Borrowed(DUPLICATE_MEMBER));
-        }
-        collapsed[first].1 = value.clone();
     }
-    Ok(collapsed)
+    if chosen.len() == members.len() {
+        return Ok(members);
+    }
+    let mut members: Vec<Option<(String, Written)>> = members.into_iter().map(Some).collect();
+    Ok(chosen
+        .into_iter()
+        .map(|at| members[at].take().expect("each member is chosen once"))
+        .collect())
 }
 
 /// A JSON value as written: an object's members are kept in the order they
@@ -698,6 +770,19 @@ impl Written {
                     .map(|(name, member)| (name.clone(), member.to_value()))
                     .collect(),
             ),
+        }
+    }
+
+    /// The value's JSON type as `serde_json::Value`, without what it holds:
+    /// a string, array or object is empty. Enough to check its JSON type.
+    fn shallow_value(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(*b),
+            Self::Number(n) => serde_json::Value::Number(n.clone()),
+            Self::String(_) => serde_json::Value::String(String::new()),
+            Self::Array(_) => serde_json::Value::Array(Vec::new()),
+            Self::Object(_) => serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 

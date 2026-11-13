@@ -584,6 +584,114 @@ async fn fifteenth_set_answers_as_dynamodb_did() {
     assert_rows("fifteenth", FIFTEENTH).await;
 }
 
+/// A name written twice is read in one pass: an `M` of 10,000 names each
+/// written twice, and an `L` of 50,000 strings followed by 2,000 names
+/// written twice, are answered well within a few seconds, not minutes.
+#[tokio::test]
+async fn names_written_twice_are_read_in_one_pass() {
+    let url = start_server().await;
+    let twice = |prefix: &str, count: usize| {
+        (0..count)
+            .map(|i| format!(r#""{prefix}{i}":{{"S":"a"}},"{prefix}{i}":{{"S":"b"}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let strings = vec![r#"{"S":"x"}"#; 50_000].join(",");
+    let bodies = [
+        format!(
+            r#"{{"TableName":"_capture_20261111_317_none","Item":{{"pk":{{"S":"a"}},"m":{{"M":{{{}}}}}}}}}"#,
+            twice("n", 10_000)
+        ),
+        format!(
+            r#"{{"TableName":"_capture_20261111_317_none","Item":{{"pk":{{"S":"a"}},"m":{{"M":{{"l":{{"L":[{strings}]}},{}}}}}}}}}"#,
+            twice("r", 2_000)
+        ),
+    ];
+    for body in &bodies {
+        let started = std::time::Instant::now();
+        let (status, answer) = send(&url, "PutItem", body).await;
+        let took = started.elapsed();
+        assert_eq!(
+            answer["__type"], "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+            "{status} {answer}"
+        );
+        assert!(took < std::time::Duration::from_secs(8), "took {took:?}");
+    }
+}
+
+/// A fault as JSON in any written copy of a name written twice, at any depth,
+/// is the answer, and so is a `BOOL` or `NULL` member that can't be read as a
+/// boolean; a well-formed earlier copy is not read.
+#[tokio::test]
+async fn a_malformed_copy_at_any_depth_is_the_answer() {
+    const NUMBER: &str = "NUMBER_VALUE cannot be converted to String";
+    let url = start_server().await;
+    let item =
+        |item: &str| format!(r#"{{"TableName":"_capture_20261111_317_none","Item":{item}}}"#);
+    let refused = |message: &str| {
+        let mut answer =
+            serde_json::json!({"__type": "com.amazon.coral.service#SerializationException"});
+        if !message.is_empty() {
+            answer["Message"] = message.into();
+        }
+        answer
+    };
+    let not_found = serde_json::json!({
+        "__type": "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+        "message": "Requested resource not found"
+    });
+    let cases = [
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"M":{"y":{"S":5},"y":{"S":"1"}}},"x":{"S":"2"}}}}"#,
+            refused(NUMBER),
+        ),
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"M":{"y":{"S":5},"y":{"S":"1"}}},"z":{"S":"1"},"z":null}}}"#,
+            refused(NUMBER),
+        ),
+        (
+            r#"{"y":{"M":{"q":{"S":5},"q":{"S":"1"}}},"pk":{"S":"a"},"pk":{"S":"b"}}"#,
+            refused(NUMBER),
+        ),
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"BOOL":[]},"x":{"S":"2"}}}}"#,
+            refused(""),
+        ),
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"NULL":5},"x":{"S":"2"}}}}"#,
+            refused("NUMBER_VALUE cannot be converted to Boolean"),
+        ),
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"BOOL":"maybe"},"x":{"S":"2"}}}}"#,
+            refused("Unexpected token received from parser"),
+        ),
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"BOOL":"true"},"x":{"S":"2"}}}}"#,
+            not_found.clone(),
+        ),
+        (
+            r#"{"pk":{"S":"a"},"m":{"M":{"x":{"NULL":false},"x":{"S":"2"}}}}"#,
+            not_found.clone(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (written, expected) in &cases {
+        let got = send(&url, "PutItem", &item(written)).await;
+        if got != (status_of(expected), expected.clone()) {
+            wrong.push(format!(
+                "{written}\n  expected {expected}\n  got      {got:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} differ:\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n")
+    );
+}
+
 /// TransactWriteItems with no null in the request: an action's item or key
 /// is reported ahead of its expression values, whichever is written first,
 /// and a bad number in the values is reported bare, as is the first action's

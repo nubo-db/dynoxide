@@ -739,6 +739,23 @@ fn reject_non_ascii_placeholder(
     )))
 }
 
+/// DynamoDB's refusal of a request that holds both expression and
+/// non-expression parameters, naming each.
+pub(crate) fn mixed_parameters_refusal(
+    non_expression_params: &[&str],
+    expression_params: &[&str],
+) -> Option<String> {
+    if non_expression_params.is_empty() || expression_params.is_empty() {
+        return None;
+    }
+    let non_expr = non_expression_params.join(", ");
+    let expr = expression_params.join(", ");
+    Some(format!(
+        "Can not use both expression and non-expression parameters in the same request: \
+         Non-expression parameters: {{{non_expr}}} Expression parameters: {{{expr}}}"
+    ))
+}
+
 /// Validate expression vs non-expression parameter conflicts and basic
 /// ExpressionAttributeNames/Values key format.
 ///
@@ -759,20 +776,16 @@ pub fn validate_expression_params(
     ctx: &ExpressionParamContext<'_>,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, ClassifiedValidationError> {
     let has_expressions = !ctx.expression_params.is_empty();
-    let has_non_expressions = !ctx.non_expression_params.is_empty();
     let has_names = ctx.expression_attribute_names.is_some();
     // EAV is present if either parsed or raw is Some
     let has_values =
         ctx.expression_attribute_values.is_some() || ctx.expression_attribute_values_raw.is_some();
 
     // Check expression/non-expression conflict
-    if has_expressions && has_non_expressions {
-        let non_expr = ctx.non_expression_params.join(", ");
-        let expr = ctx.expression_params.join(", ");
-        return Err(ClassifiedValidationError::enveloped(format!(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {{{non_expr}}} Expression parameters: {{{expr}}}"
-        )));
+    if let Some(message) =
+        mixed_parameters_refusal(&ctx.non_expression_params, &ctx.expression_params)
+    {
+        return Err(ClassifiedValidationError::enveloped(message));
     }
 
     // ExpressionAttributeNames without any expression
@@ -813,6 +826,14 @@ pub fn validate_expression_params(
                 )));
             }
             reject_non_ascii_placeholder("ExpressionAttributeNames", key)?;
+        }
+        // An empty name, or one given as null, is refused here on the older
+        // layer, which doesn't check it ahead of everything else (see
+        // `empty_names::names_checked_early`).
+        if let Some(placeholder) = crate::empty_names::empty_placeholder(Some(names)) {
+            return Err(ClassifiedValidationError::enveloped(
+                crate::empty_names::placeholder_message(placeholder),
+            ));
         }
     }
 
@@ -1052,6 +1073,11 @@ pub fn parse_expression_attribute_values_raw(
                     return Err(error);
                 }
                 return Err(match value_refusal(&msg) {
+                    // A JSON null is named by key on every operation (captured
+                    // eu-west-2 and us-east-1, 2026-11-11).
+                    ValueRefusal::Null(inner) => {
+                        DynoxideError::ValidationException(named_value_refusal(inner, key))
+                    }
                     ValueRefusal::Empty => {
                         DynoxideError::ValidationException(named_value_refusal(EMPTY_VALUE, key))
                     }
@@ -1110,6 +1136,18 @@ pub fn parse_expression_attribute_values_raw(
 pub(crate) fn read_expected(
     expected: &serde_json::Value,
 ) -> Result<Option<HashMap<String, ExpectedCondition>>> {
+    // A null given for a whole condition is refused in words of its own
+    // (captured eu-west-2 and us-east-1, 2026-11-11).
+    if let Some(name) = expected.as_object().and_then(|conditions| {
+        conditions
+            .iter()
+            .find_map(|(name, condition)| condition.is_null().then_some(name))
+    }) {
+        return Err(DynoxideError::ValidationException(format!(
+            "One or more parameter values were invalid: \
+             ExpectedAttributeValue must not be null for Attribute: {name}"
+        )));
+    }
     match serde_json::from_value::<HashMap<String, ExpectedCondition>>(expected.clone()) {
         Ok(map) => {
             // Each value is checked as an item's would be: empty and duplicated
@@ -2067,6 +2105,45 @@ pub fn extract_key_strings(
     Ok((pk, sk))
 }
 
+/// Read a Query's or Scan's `ExpressionAttributeValues` with `read`, after
+/// its starting key. DynamoDB checks `ExclusiveStartKey` ahead of the
+/// expression values, whichever is written first (captured eu-west-2 and
+/// us-east-1, 2026-11-11, on Query; Scan is taken to read them the same way),
+/// so when a value is refused, the starting key's own fault, read as
+/// `read_start_key` reads it, is answered instead. Otherwise the starting key
+/// is read later, after the request's other checks. The error is a raw serde
+/// message, marker and all.
+pub(crate) fn read_values_after_start_key(
+    values: Option<crate::types::HeldValues>,
+    read: impl FnOnce(
+        Vec<(String, crate::types::Written)>,
+    ) -> std::result::Result<HashMap<String, AttributeValue>, String>,
+    start_key: Option<&serde_json::Value>,
+    read_start_key: impl FnOnce(&serde_json::Value) -> Result<HashMap<String, AttributeValue>>,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, String> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    match values.read(read) {
+        Ok(values) => Ok(Some(values)),
+        Err(refusal) => match start_key.map(read_start_key) {
+            Some(Err(error)) => Err(crate::serde_errors::marked_message(&error).unwrap_or(refusal)),
+            _ => Err(refusal),
+        },
+    }
+}
+
+/// Whether a Query's or Scan's `ExclusiveStartKey` holds a JSON null where a
+/// value belongs, which hands the request to the older validation layer:
+/// beside a `Limit` of 0 it answers `Value '0' at 'limit'`, where a starting
+/// key without one, or with a bad number, answers `Value at 'Limit'`
+/// (captured eu-west-2 and us-east-1, 2026-11-11). A null type member, as in
+/// `{"S": null}`, is such a null too, as it is wherever the request's layer
+/// is decided (captured eu-west-2 and us-east-1, 2026-11-12).
+pub(crate) fn start_key_holds_null(start_key: Option<&serde_json::Value>) -> bool {
+    start_key.is_some_and(crate::types::attribute_map_holds_null)
+}
+
 /// Parse an `ExclusiveStartKey` from a raw `serde_json::Value`.
 ///
 /// Validation errors are formatted to match DynamoDB's exact error messages:
@@ -2078,11 +2155,19 @@ pub fn parse_exclusive_start_key(
     value: &serde_json::Value,
     layer: crate::validation::ValueLayer,
 ) -> Result<HashMap<String, AttributeValue>> {
+    // A null among the key's values puts the request on the older layer, so
+    // the key's other values are read by that layer's rules, as an item's
+    // are beside a null.
+    let layer = if start_key_holds_null(Some(value)) {
+        crate::validation::ValueLayer::Older
+    } else {
+        layer
+    };
     // First, try to deserialise: this catches multi-type and number errors
     let parsed = match crate::types::with_value_layer(layer, || {
-        serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone())
+        serde_json::from_value::<crate::types::AttributeMap>(value.clone())
     }) {
-        Ok(map) => map,
+        Ok(map) => map.0,
         Err(e) => {
             let msg = e.to_string();
             // A malformed value fails the request as it is read, as it does
@@ -2093,7 +2178,13 @@ pub fn parse_exclusive_start_key(
             // Strip the serde position suffix and any internal marker
             let inner = crate::serde_errors::clean_serde_message(&msg);
 
-            if inner.contains("empty AttributeValue")
+            if inner.starts_with(crate::serde_errors::NULL_VALUE) {
+                // A null member is named, inside the starting-key prefix
+                // (captured eu-west-2 and us-east-1, 2026-11-11).
+                return Err(DynoxideError::ValidationException(format!(
+                    "The provided starting key is invalid: {inner}"
+                )));
+            } else if inner.contains("empty AttributeValue")
                 || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
             {
                 return Err(DynoxideError::ValidationException(
@@ -2550,6 +2641,17 @@ pub fn validate_filter_conditions_raw(
     };
 
     let obj = val.as_object().unwrap();
+    // A KeyConditions, QueryFilter or ScanFilter entry given as null is
+    // refused before the table is looked up (captured eu-west-2 and
+    // us-east-1, 2026-11-11).
+    if let Some(name) = obj
+        .iter()
+        .find_map(|(name, condition)| condition.is_null().then_some(name))
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "The filter condition for an attribute cannot be null: {name}"
+        )));
+    }
     for (_attr_name, cond_val) in obj {
         let cond_obj = match cond_val.as_object() {
             Some(o) => o,
@@ -2600,7 +2702,8 @@ fn legacy_value_refusal(
     match value_refusal(msg) {
         ValueRefusal::Empty => refusal(EMPTY_VALUE),
         ValueRefusal::MoreThanOneType => refusal(MORE_THAN_ONE_TYPE),
-        ValueRefusal::EmptySet(inner)
+        ValueRefusal::Null(inner)
+        | ValueRefusal::EmptySet(inner)
         | ValueRefusal::Number(inner)
         | ValueRefusal::ParsedNull(inner)
         | ValueRefusal::RequestNull(inner) => refusal(inner),

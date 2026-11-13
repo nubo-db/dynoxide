@@ -360,17 +360,6 @@ pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<S
     ))
 }
 
-/// [`return_consumed_capacity_rejection`] as an error, in the single-error
-/// envelope a wire client gets. For callers that check the mode outside a
-/// deserialiser, where there is no errors vec to push onto: the MCP tools.
-#[cfg(feature = "mcp-server")]
-pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
-    match return_consumed_capacity_rejection(mode) {
-        Some(msg) => Err(DynoxideError::ValidationException(envelope_message(&msg))),
-        None => Ok(()),
-    }
-}
-
 /// The values `ReturnValues` accepts on a write.
 pub(crate) const RETURN_VALUES: [&str; 5] =
     ["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
@@ -503,7 +492,7 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
 /// legacy `Expected` would put it there, and the current layer otherwise.
 pub(crate) fn single_write_layer(expected: Option<&serde_json::Value>) -> ValueLayer {
     if crate::types::current_value_layer() == ValueLayer::Older
-        || expected.is_some_and(crate::types::reads_on_older_layer)
+        || expected.is_some_and(crate::types::conditions_read_on_older_layer)
     {
         ValueLayer::Older
     } else {
@@ -751,6 +740,62 @@ pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Ve
         .collect();
     ordered.sort_unstable();
     ordered.into_iter().map(|(_, _, name)| name).collect()
+}
+
+/// Each name's place in the order a Java `HashMap` iterates them, given in
+/// written order: the map is made for that many entries (a table of
+/// `tableSizeFor(n)` buckets, doubled whenever it is more than three quarters
+/// full) and filled in written order, so names sharing a bucket keep written
+/// order. `None` when a bucket would turn into a tree, whose order this does
+/// not follow. DynamoDB walks a map's members in this order, a PartiQL
+/// parameter's (captured eu-west-2, 2026-11-09) and an item's or key's
+/// (captured eu-west-2 and us-east-1, 2026-11-11) alike.
+pub(crate) fn java_hash_map_order(names: &[&str]) -> Option<Vec<usize>> {
+    let hashes: Vec<u32> = names
+        .iter()
+        .map(|name| {
+            let h = name.encode_utf16().fold(0u32, |h, unit| {
+                h.wrapping_mul(31).wrapping_add(u32::from(unit))
+            });
+            h ^ (h >> 16)
+        })
+        .collect();
+    // Java's own table: `tableSizeFor(n)` buckets, filled one at a time.
+    let mut buckets = names.len().max(1).next_power_of_two();
+    let mut sizes = vec![0usize; buckets];
+    for (count, hash) in hashes.iter().enumerate() {
+        let bucket = *hash as usize & (buckets - 1);
+        let already = sizes[bucket];
+        sizes[bucket] += 1;
+        let mut grow = false;
+        // Added as the ninth or later in its bucket, the bucket turns into a
+        // tree once there are 64 buckets; until then the table doubles.
+        if already >= 8 {
+            if buckets >= 64 {
+                return None;
+            }
+            grow = true;
+        }
+        let mut grown = buckets * if grow { 2 } else { 1 };
+        // More than three quarters full, it doubles again.
+        if (count + 1) * 4 > grown * 3 {
+            grown *= 2;
+        }
+        if grown != buckets {
+            buckets = grown;
+            sizes = vec![0; buckets];
+            for h in &hashes[..=count] {
+                sizes[*h as usize & (buckets - 1)] += 1;
+            }
+        }
+    }
+    let mut by_order: Vec<usize> = (0..names.len()).collect();
+    by_order.sort_by_key(|&n| (hashes[n] as usize & (buckets - 1), n));
+    let mut ranks = vec![0; names.len()];
+    for (rank, n) in by_order.into_iter().enumerate() {
+        ranks[n] = rank;
+    }
+    Some(ranks)
 }
 
 /// How many buckets a Java hash table that starts with `initial` (a power of

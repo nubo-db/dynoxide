@@ -284,6 +284,7 @@ pub struct PutItemParams {
     #[schemars(
         description = "Substitution tokens for expression attribute names, e.g. {\"#n\": \"name\"}"
     )]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -319,6 +320,7 @@ pub struct GetItemParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     /// Passed to GetItem's own decoder as given, so a string reads as the
@@ -359,6 +361,7 @@ pub struct UpdateItemParams {
     pub condition_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -412,6 +415,7 @@ pub struct SearchVectorsParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Optional expression attribute name substitutions")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<std::collections::HashMap<String, String>>,
 
     #[schemars(description = "Optional expression attribute values as DynamoDB-typed JSON")]
@@ -442,6 +446,7 @@ pub struct QueryParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -497,6 +502,7 @@ pub struct ScanParams {
     pub projection_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -561,6 +567,7 @@ pub struct DeleteItemParams {
     pub condition_expression: Option<String>,
 
     #[schemars(description = "Substitution tokens for expression attribute names")]
+    #[serde(default, deserialize_with = "crate::empty_names::deserialize_names")]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 
     #[schemars(
@@ -929,14 +936,17 @@ fn decode_dynamo_json<T: serde::de::DeserializeOwned>(
     val: serde_json::Value,
     field_name: &str,
 ) -> Result<T, crate::errors::DynoxideError> {
-    serde_json::from_value(val).map_err(|e| {
-        let msg = e.to_string();
-        crate::serde_errors::classify_marked_serde_error(&msg).unwrap_or_else(|| {
-            crate::errors::DynoxideError::ValidationException(format!(
-                "Invalid DynamoDB JSON in '{field_name}': {}",
-                crate::serde_errors::clean_serde_message(&msg)
-            ))
-        })
+    serde_json::from_value(val).map_err(|e| classify_decode_error(&e.to_string(), field_name))
+}
+
+/// Classify a raw serde message from decoding `field_name`, as
+/// [`decode_dynamo_json`] does.
+fn classify_decode_error(msg: &str, field_name: &str) -> crate::errors::DynoxideError {
+    crate::serde_errors::classify_marked_serde_error(msg).unwrap_or_else(|| {
+        crate::errors::DynoxideError::ValidationException(format!(
+            "Invalid DynamoDB JSON in '{field_name}': {}",
+            crate::serde_errors::clean_serde_message(msg)
+        ))
     })
 }
 
@@ -950,7 +960,9 @@ fn parse_dynamo_map(
     field_name: &str,
     resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
 ) -> Result<HashMap<String, AttributeValue>, CallToolResult> {
-    decode_dynamo_json(val, field_name).map_err(|e| to_tool_error(resolve(e)))
+    decode_dynamo_json::<crate::types::AttributeMap>(val, field_name)
+        .map(|map| map.0)
+        .map_err(|e| to_tool_error(resolve(e)))
 }
 
 /// Resolve the request-validation tag for PutItem, UpdateItem or DeleteItem
@@ -965,23 +977,84 @@ fn resolve_single_write(err: crate::DynoxideError) -> crate::DynoxideError {
     )
 }
 
-/// Decode update_item's `expression_attribute_values` with the reader
-/// UpdateItem's wire request uses, which names the key of a value refused on
-/// the older layer; a plain map never names it.
-fn parse_update_expression_values(
-    val: Option<serde_json::Value>,
-) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
-    #[derive(Deserialize)]
-    struct Named(
-        #[serde(deserialize_with = "crate::types::deserialize_named_null_refusals")]
-        Option<HashMap<String, AttributeValue>>,
-    );
-    let Some(val) = val else {
-        return Ok(None);
+/// The refusal for `expression_attribute_values` that is malformed rather
+/// than refused for what it holds: not a map of attribute value structs (see
+/// [`values_shape_refusal`]), or a value refused as it is parsed, such as one
+/// holding an array. The HTTP API refuses these as the request is parsed,
+/// ahead of a null or a bad number in the item or key and of an empty value
+/// or a bad number in another expression value (captured eu-west-2 and
+/// us-east-1, 2026-11-12), so the tools ask here before reading the item or
+/// key.
+fn malformed_values_refusal(
+    val: Option<&serde_json::Value>,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
+) -> Option<CallToolResult> {
+    if let Some(refusal) = values_shape_refusal(val) {
+        return Some(refusal);
+    }
+    let serde_json::Value::Object(values) = val? else {
+        return None;
     };
-    decode_dynamo_json::<Named>(val, "expression_attribute_values")
-        .map(|named| named.0)
-        .map_err(|e| to_tool_error(resolve_single_write(e)))
+    values.values().find_map(|value| {
+        let msg = AttributeValue::read_written::<serde_json::Error>(value.clone().into())
+            .err()?
+            .to_string();
+        (!crate::serde_errors::is_validation_refusal(&msg)).then(|| {
+            to_tool_error(resolve(classify_decode_error(
+                &msg,
+                "expression_attribute_values",
+            )))
+        })
+    })
+}
+
+/// Decode a tool's `expression_attribute_values` with the reader its
+/// operation's wire request uses (`types::read_put_item_values` and its
+/// siblings), which names the key of a value refused as that operation names
+/// it; a plain map never names it.
+fn parse_expression_values(
+    val: Option<serde_json::Value>,
+    read: crate::types::ValuesReader,
+    resolve: fn(crate::DynoxideError) -> crate::DynoxideError,
+) -> Result<Option<HashMap<String, AttributeValue>>, CallToolResult> {
+    const FIELD: &str = "expression_attribute_values";
+    if let Some(refusal) = values_shape_refusal(val.as_ref()) {
+        return Err(refusal);
+    }
+    match val {
+        None => Ok(None),
+        Some(serde_json::Value::Object(values)) => read(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, crate::types::Written::from(value)))
+                .collect(),
+        )
+        .map(Some)
+        .map_err(|msg| to_tool_error(resolve(classify_decode_error(&msg, FIELD)))),
+        Some(other) => parse_optional_dynamo_map(Some(other), FIELD, resolve),
+    }
+}
+
+/// The refusal for `expression_attribute_values` that isn't a map of
+/// attribute value structs, in the HTTP API's words for the same body: a
+/// SerializationException such as `Unexpected field type`, or with no message
+/// for an array, whether for the map or for a value in it.
+fn values_shape_refusal(val: Option<&serde_json::Value>) -> Option<CallToolResult> {
+    let message = match val? {
+        serde_json::Value::Null => return None,
+        serde_json::Value::Object(values) => match values
+            .values()
+            .find(|value| !value.is_object() && !value.is_null())?
+        {
+            serde_json::Value::Array(_) => String::new(),
+            _ => "Unexpected value type in payload".to_string(),
+        },
+        serde_json::Value::Array(_) => String::new(),
+        _ => "Unexpected field type".to_string(),
+    };
+    Some(to_tool_error(
+        crate::errors::DynoxideError::SerializationException(message),
+    ))
 }
 
 /// Optional-map variant of [`parse_dynamo_map`].
@@ -1101,16 +1174,6 @@ fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
     )])
 }
 
-/// Refuse a `return_consumed_capacity` outside DynamoDB's enum with the error a
-/// wire client gets, before the tool reads or writes anything. Most tools build
-/// their action request directly, which skips the check the wire path makes
-/// while deserialising, so those tools ask here instead.
-fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
-    crate::validation::reject_bad_capacity_mode(mode)
-        .err()
-        .map(to_tool_error)
-}
-
 /// Decode a tool's arguments as `operation`'s request, from the JSON body the
 /// HTTP API would be sent for the same call (`members` names each member as
 /// the wire does; an absent one is left out), through the HTTP seam's own type
@@ -1123,7 +1186,10 @@ fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
 /// One known difference remains: the arguments arrive already parsed, so a
 /// number written as `-0`, or as an integer past 64 bits, is read as the
 /// value it parsed to rather than as written. For a boolean member that is a
-/// `DECIMAL_VALUE` refusal where the HTTP API says `NUMBER_VALUE`.
+/// `DECIMAL_VALUE` refusal where the HTTP API says `NUMBER_VALUE`. For the
+/// same reason the order members were written in, and a name written twice,
+/// are gone, so where two faults tie on written order the tool may report
+/// the other one.
 fn decode_wire_request<T: serde::de::DeserializeOwned>(
     operation: &str,
     members: Vec<(&str, Option<serde_json::Value>)>,
@@ -1535,12 +1601,18 @@ impl McpServer {
         // an argument that isn't DynamoDB JSON at all. The request is then
         // decoded as PutItem's wire request, which checks its members in
         // PutItem's order and words, after the values, as over HTTP.
+        if let Some(err) = malformed_values_refusal(
+            params.expression_attribute_values.as_ref(),
+            resolve_single_write,
+        ) {
+            return Ok(err);
+        }
         if let Err(err) = parse_dynamo_map(params.item.clone(), "item", resolve_single_write) {
             return Ok(err);
         }
-        if let Err(err) = parse_optional_dynamo_map(
+        if let Err(err) = parse_expression_values(
             params.expression_attribute_values.clone(),
-            "expression_attribute_values",
+            crate::types::read_put_item_values,
             resolve_single_write,
         ) {
             return Ok(err);
@@ -1639,11 +1711,20 @@ impl McpServer {
         // The values are read first, as on `put_item`, then the request as
         // UpdateItem's wire request, which reports the first enum member it
         // refuses in UpdateItem's own words.
+        if let Some(err) = malformed_values_refusal(
+            params.expression_attribute_values.as_ref(),
+            resolve_single_write,
+        ) {
+            return Ok(err);
+        }
         if let Err(err) = parse_dynamo_map(params.key.clone(), "key", resolve_single_write) {
             return Ok(err);
         }
-        if let Err(err) = parse_update_expression_values(params.expression_attribute_values.clone())
-        {
+        if let Err(err) = parse_expression_values(
+            params.expression_attribute_values.clone(),
+            crate::types::read_update_item_values,
+            resolve_single_write,
+        ) {
             return Ok(err);
         }
         let request: crate::actions::update_item::UpdateItemRequest = match decode_wire_request(
@@ -1861,6 +1942,12 @@ impl McpServer {
         // DeleteItem's wire request. DeleteItem reads its expression values
         // after the member checks, naming a refused one by its key, so they
         // are passed on as given.
+        if let Some(err) = malformed_values_refusal(
+            params.expression_attribute_values.as_ref(),
+            resolve_single_write,
+        ) {
+            return Ok(err);
+        }
         if let Err(err) = parse_dynamo_map(params.key.clone(), "key", resolve_single_write) {
             return Ok(err);
         }
@@ -2359,17 +2446,19 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<TransactGetItemsParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
+        // Read through the HTTP API's reader, so a Get left out, more than
+        // 100 Gets with a null name among them and the capacity mode are
+        // answered in the order and wording a wire client gets, the names as
+        // written.
+        let mut wire = serde_json::json!({ "TransactItems": params.transact_items });
+        if let Some(mode) = params.return_consumed_capacity {
+            wire["ReturnConsumedCapacity"] = mode.into();
         }
-        let transact_items = match parse_json_param(params.transact_items, "transact_items") {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        let request = crate::actions::transact_get_items::TransactGetItemsRequest {
-            transact_items,
-            return_consumed_capacity: params.return_consumed_capacity,
-        };
+        let request: crate::actions::transact_get_items::TransactGetItemsRequest =
+            match parse_json_param(wire, "transact_items") {
+                Ok(r) => r,
+                Err(err) => return Ok(err),
+            };
         match self.db.transact_get_items(request) {
             Ok(resp) => json_result(&resp),
             Err(err) => Ok(to_tool_error(err)),
@@ -2762,13 +2851,25 @@ fn tool_operation(tool: &str) -> Option<&'static str> {
 
 /// The layer a tool call's values are read on, decided as the HTTP API
 /// decides it for the same request: the older layer when the arguments hold a
-/// `BOOL` or `NULL` written as a string, or a value with more than one member,
-/// and otherwise the operation's own.
+/// `BOOL` or `NULL` written as a string, a value with more than one member, or
+/// a JSON null for a value in the item, the key or the expression values or
+/// for an expression name, and otherwise the operation's own.
 fn tool_value_layer(
     tool: &str,
     arguments: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> crate::validation::ValueLayer {
-    let older = arguments.is_some_and(|args| args.values().any(crate::types::reads_on_older_layer));
+    let older = arguments.is_some_and(|args| {
+        args.values().any(crate::types::part_reads_on_older_layer)
+            || [
+                "item",
+                "key",
+                "expression_attribute_values",
+                "expression_attribute_names",
+            ]
+            .iter()
+            .filter_map(|name| args.get(*name)?.as_object())
+            .any(|values| values.values().any(serde_json::Value::is_null))
+    });
     if older {
         crate::validation::ValueLayer::Older
     } else {

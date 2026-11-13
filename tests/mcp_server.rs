@@ -6585,6 +6585,656 @@ fn execute_partiql_reads_consistent_read_as_execute_statement_does() {
     let _ = child.wait();
 }
 
+/// A JSON null where an attribute value belongs gets the HTTP API's answer
+/// through the tools too: named after its attribute in an item or a key,
+/// named by key in the expression values, and wrapped as the starting key's
+/// fault in an `exclusive_start_key` (captured eu-west-2 and us-east-1,
+/// 2026-11-11, and pinned over HTTP in tests/null_attribute_values.rs).
+#[test]
+fn a_null_value_is_refused_through_the_tools_as_over_http() {
+    const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
+    let mut child = mcp_with_table("Nulls");
+    let member = validation_error(&format!("{NULL_VALUE}: pk is null"));
+    let cases: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": null}}),
+            member.clone(),
+        ),
+        (
+            "get_item",
+            json!({"table_name": "Nulls", "key": {"pk": null}}),
+            member.clone(),
+        ),
+        (
+            "delete_item",
+            json!({"table_name": "Nulls", "key": {"pk": null}}),
+            member.clone(),
+        ),
+        (
+            "update_item",
+            json!({"table_name": "Nulls", "key": {"pk": null}, "update_expression": "SET a = :v",
+                "expression_attribute_values": {":v": {"S": "x"}}}),
+            member.clone(),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": {"S": "a"}},
+                "condition_expression": "a = :v", "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "update_item",
+            json!({"table_name": "Nulls", "key": {"pk": {"S": "a"}}, "update_expression": "SET a = :v",
+                "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "delete_item",
+            json!({"table_name": "Nulls", "key": {"pk": {"S": "a"}},
+                "condition_expression": "a = :v", "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "query",
+            json!({"table_name": "Nulls", "key_condition_expression": "pk = :v",
+                "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "scan",
+            json!({"table_name": "Nulls", "filter_expression": "a = :v",
+                "expression_attribute_values": {":v": null}}),
+            named(NULL_VALUE, ":v"),
+        ),
+        (
+            "scan",
+            json!({"table_name": "Nulls", "exclusive_start_key": {"pk": null}}),
+            validation_error(&format!(
+                "The provided starting key is invalid: {NULL_VALUE}: pk is null"
+            )),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": {"S": "a"}},
+                "condition_expression": "x = :a AND y = :b",
+                "expression_attribute_values": {":b": null, ":a": {"N": "abc"}}}),
+            named(NULL_VALUE, ":b"),
+        ),
+        // A null puts the call on the older layer: a bad number beside one in
+        // the item is bare, and one in the expression values is named.
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": null, "x": {"N": "abc"}}}),
+            validation_error(ABC_NUMBER),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "Nulls", "item": {"pk": {"S": "a"}},
+                "condition_expression": "x = :a AND y = :b",
+                "expression_attribute_values": {":a": null, ":b": {"N": "abc"}}}),
+            named(ABC_NUMBER, ":b"),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (tool, args, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A null name in `expression_attribute_names` is read as an empty one, and a
+/// null member of a set is a value fault, through the tools as over HTTP
+/// (captured from DynamoDB on 12 November 2026, and pinned over HTTP in
+/// tests/null_attribute_values.rs).
+#[test]
+fn a_null_name_or_set_member_is_refused_through_the_tools_as_over_http() {
+    const EMPTY_NAME: &str = "ExpressionAttributeNames contains invalid value: \
+                              Empty attribute name for key #n";
+    const NAMES_WITHOUT_EXPRESSIONS: &str =
+        "ExpressionAttributeNames can only be specified when using expressions";
+    const NULL_STRING: &str = "One or more parameter values were invalid: \
+                               An string set may not have a null string as a member";
+    let mut child = mcp_with_table("NullNames");
+    let cases: Vec<(&str, Value, (String, String))> = vec![
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"}},
+                "condition_expression": "#n = :a", "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"}},
+                "expression_attribute_names": {"#n": null}}),
+            validation_error(NAMES_WITHOUT_EXPRESSIONS),
+        ),
+        (
+            "get_item",
+            json!({"table_name": "NullNames", "key": {"pk": {"S": "a"}},
+                "projection_expression": "#n", "expression_attribute_names": {"#n": null}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "update_item",
+            json!({"table_name": "NullNames", "key": {"pk": {"S": "a"}},
+                "update_expression": "SET #n = :a", "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "delete_item",
+            json!({"table_name": "NullNames", "key": {"pk": {"S": "a"}},
+                "condition_expression": "#n = :a", "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "query",
+            json!({"table_name": "NullNames", "key_condition_expression": "#n = :a",
+                "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "scan",
+            json!({"table_name": "NullNames", "filter_expression": "#n = :a",
+                "expression_attribute_names": {"#n": null},
+                "expression_attribute_values": {":a": {"S": "x"}}}),
+            validation_error(EMPTY_NAME),
+        ),
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"}, "s": {"SS": [null]}}}),
+            validation_error(NULL_STRING),
+        ),
+        (
+            "query",
+            json!({"table_name": "NullNames", "key_condition_expression": "pk = :a",
+                "expression_attribute_values": {":a": {"SS": [null]}}}),
+            named(NULL_STRING, ":a"),
+        ),
+        (
+            "transact_get_items",
+            json!({"transact_items": [{"Get": {"TableName": "NullNames", "Key": {"pk": {"S": "a"}},
+                "ProjectionExpression": "#n", "ExpressionAttributeNames": {"#n": null}}}]}),
+            validation_error(EMPTY_NAME),
+        ),
+        // An item attribute named like a legacy request member is an
+        // ordinary attribute: a boolean written as a string in it puts the
+        // call on the older layer, so a bad number beside it is bare.
+        (
+            "put_item",
+            json!({"table_name": "NullNames", "item": {"pk": {"S": "a"},
+                "Expected": {"BOOL": "true"}, "n": {"N": "abc"}}}),
+            validation_error("The parameter cannot be converted to a numeric value: abc"),
+        ),
+    ];
+    let checked = cases.len();
+    let mut mismatches = Vec::new();
+    for (id, (tool, args, refusal)) in (10..).zip(cases) {
+        let resp = call_tool(&mut child, id, tool, args.clone());
+        let answer = tool_error(&resp);
+        if answer != refusal {
+            mismatches.push(format!("{tool} {args}: {answer:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {checked} answers differ: {mismatches:#?}",
+        mismatches.len()
+    );
+
+    // A `Get` with no expression whose names hold a null goes on to the
+    // table, as over HTTP, whatever its other names.
+    let resp = call_tool(
+        &mut child,
+        99,
+        "transact_get_items",
+        json!({"transact_items": [{"Get": {"TableName": "NullNames", "Key": {"pk": {"S": "a"}},
+            "ExpressionAttributeNames": {"#n": null, "#m": "x"}}}]}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// More than 100 Gets are answered by the tool as by the HTTP API: listed
+/// when a name is null, the null name printed `null`, and in the short form
+/// without one, a capacity mode outside the enum included (captured from
+/// DynamoDB on 12 November 2026, and pinned over HTTP in
+/// tests/null_attribute_values.rs).
+#[test]
+fn over_100_gets_are_answered_through_the_tool_as_over_http() {
+    let gets = |first: Value| {
+        let mut gets = vec![json!({"Get": first})];
+        gets.extend(
+            (0..100)
+                .map(|i| json!({"Get": {"TableName": "T", "Key": {"pk": {"S": format!("g{i}")}}}})),
+        );
+        gets
+    };
+    let key = json!({"pk": {"S": "a"}});
+    let cases = [
+        (
+            json!({"TableName": "T", "Key": key, "ExpressionAttributeNames": {"#n": null}}),
+            None,
+        ),
+        (
+            json!({"TableName": "T", "Key": key, "ProjectionExpression": "#n",
+                "ExpressionAttributeNames": {"#n": null, "#m": "x"}}),
+            None,
+        ),
+        (
+            json!({"TableName": "T", "Key": key, "ExpressionAttributeNames": {"#n": "x"}}),
+            None,
+        ),
+        (json!({"TableName": "T", "Key": key}), None),
+        (json!({"TableName": "T", "Key": key}), Some("EVERYTHING")),
+        (
+            json!({"TableName": "T", "Key": key, "ExpressionAttributeNames": {"#n": null}}),
+            Some("EVERYTHING"),
+        ),
+    ];
+
+    let over_http: Vec<String> = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(dynoxide::server::serve_on(
+            listener,
+            dynoxide::Database::memory().unwrap(),
+        ));
+        let mut messages = Vec::new();
+        for (first, mode) in &cases {
+            let mut body = json!({"TransactItems": gets(first.clone())});
+            if let Some(mode) = mode {
+                body["ReturnConsumedCapacity"] = json!(mode);
+            }
+            let answer: Value = reqwest::Client::new()
+                .post(&url)
+                .header("x-amz-target", "DynamoDB_20120810.TransactGetItems")
+                .header("content-type", "application/x-amz-json-1.0")
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                     SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+                )
+                .header("x-amz-date", "20260101T000000Z")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            messages.push(answer["message"].as_str().unwrap().to_string());
+        }
+        messages
+    });
+    assert!(over_http[0].contains("expressionAttributeNames={#n=null}"));
+    assert!(over_http[1].contains("expressionAttributeNames={#m=x, #n=null}"));
+    assert_eq!(
+        over_http[2],
+        "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
+         Member must have length less than or equal to 100"
+    );
+
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let mut mismatches = Vec::new();
+    for ((id, (first, mode)), http) in (10..).zip(&cases).zip(&over_http) {
+        let mut args = json!({"transact_items": gets(first.clone())});
+        if let Some(mode) = mode {
+            args["return_consumed_capacity"] = json!(mode);
+        }
+        let answer = tool_error(&call_tool(&mut child, id, "transact_get_items", args));
+        if answer != validation_error(http) {
+            mismatches.push(format!(
+                "{first} {mode:?}:\n  tool {}\n  http {}",
+                &answer.1[..answer.1.len().min(300)],
+                &http[..http.len().min(300)]
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} answers differ: {mismatches:#?}",
+        mismatches.len(),
+        cases.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A malformed expression value (an array for the map, for a value or inside
+/// one) is refused by the write tools ahead of a null or a bad number in the
+/// item or key, and ahead of an empty value or a bad number in another
+/// value, with the message the HTTP API gives for the same request (captured
+/// from DynamoDB on 12 November 2026, and pinned over HTTP in
+/// tests/null_attribute_values.rs).
+#[test]
+fn a_malformed_expression_value_is_refused_first_through_the_tools_as_over_http() {
+    let cases: [(&str, &str, Value, Value); 6] = [
+        (
+            "put_item",
+            "PutItem",
+            json!({"table_name": "T", "item": {"pk": null},
+                "expression_attribute_values": {":a": [], ":b": {"S": "y"}},
+                "condition_expression": "a = :a AND b = :b"}),
+            json!({"TableName": "T", "Item": {"pk": null},
+                "ExpressionAttributeValues": {":a": [], ":b": {"S": "y"}},
+                "ConditionExpression": "a = :a AND b = :b"}),
+        ),
+        (
+            "put_item",
+            "PutItem",
+            json!({"table_name": "T", "item": {"pk": {"N": "abc"}},
+                "expression_attribute_values": [], "condition_expression": "a = :a"}),
+            json!({"TableName": "T", "Item": {"pk": {"N": "abc"}},
+                "ExpressionAttributeValues": [], "ConditionExpression": "a = :a"}),
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            json!({"table_name": "T", "key": {"pk": {"S": "a"}},
+                "update_expression": "SET a = :a, b = :b",
+                "expression_attribute_values": {":a": {}, ":b": {"L": [[]]}}}),
+            json!({"TableName": "T", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET a = :a, b = :b",
+                "ExpressionAttributeValues": {":a": {}, ":b": {"L": [[]]}}}),
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            json!({"table_name": "T", "key": {"pk": {"S": "a"}},
+                "update_expression": "SET a = :a, b = :b",
+                "expression_attribute_values": {":a": {"N": "abc"}, ":b": {"L": [[]]}}}),
+            json!({"TableName": "T", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET a = :a, b = :b",
+                "ExpressionAttributeValues": {":a": {"N": "abc"}, ":b": {"L": [[]]}}}),
+        ),
+        (
+            "update_item",
+            "UpdateItem",
+            json!({"table_name": "T", "key": {"pk": null},
+                "update_expression": "SET a = :a",
+                "expression_attribute_values": {":a": {"L": [[]]}}}),
+            json!({"TableName": "T", "Key": {"pk": null},
+                "UpdateExpression": "SET a = :a",
+                "ExpressionAttributeValues": {":a": {"L": [[]]}}}),
+        ),
+        (
+            "delete_item",
+            "DeleteItem",
+            json!({"table_name": "T", "key": {"pk": null},
+                "expression_attribute_values": {":a": []}, "condition_expression": "a = :a"}),
+            json!({"TableName": "T", "Key": {"pk": null},
+                "ExpressionAttributeValues": {":a": []}, "ConditionExpression": "a = :a"}),
+        ),
+    ];
+
+    let over_http: Vec<(String, String)> =
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(dynoxide::server::serve_on(
+                listener,
+                dynoxide::Database::memory().unwrap(),
+            ));
+            let mut answers = Vec::new();
+            for (_, operation, _, body) in &cases {
+                let answer: Value = reqwest::Client::new()
+                .post(&url)
+                .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+                .header("content-type", "application/x-amz-json-1.0")
+                .header(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, \
+                     SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+                )
+                .header("x-amz-date", "20260101T000000Z")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+                let kind = answer["__type"].as_str().unwrap();
+                answers.push((
+                    kind.rsplit('#').next().unwrap().to_string(),
+                    answer
+                        .get("message")
+                        .or_else(|| answer.get("Message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+            }
+            answers
+        });
+    assert!(
+        over_http
+            .iter()
+            .all(|answer| answer == &serialization_error("")),
+        "{over_http:?}"
+    );
+
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let mut mismatches = Vec::new();
+    for ((id, (tool, _, args, _)), http) in (10..).zip(&cases).zip(&over_http) {
+        let answer = tool_error(&call_tool(&mut child, id, tool, args.clone()));
+        if &answer != http {
+            mismatches.push(format!(
+                "{tool} {args}:\n  tool {answer:?}\n  http {http:?}"
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} answers differ: {mismatches:#?}",
+        mismatches.len(),
+        cases.len()
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// Expression values that aren't a map of values are refused as the HTTP API
+/// refuses the same body, and `delete_item` deletes nothing.
+#[test]
+fn malformed_expression_values_are_refused_and_delete_nothing() {
+    let mut child = mcp_with_table("Shapes");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Shapes", "item": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let cases = [
+        (json!("x"), "Unexpected field type"),
+        (json!(5), "Unexpected field type"),
+        (json!([]), ""),
+        (json!({":v": "x"}), "Unexpected value type in payload"),
+        (json!({":v": []}), ""),
+    ];
+    let mut id = 10;
+    for (values, message) in cases {
+        for tool in ["delete_item", "put_item"] {
+            id += 1;
+            let mut args = json!({
+                "table_name": "Shapes", "condition_expression": "attribute_exists(pk)",
+                "expression_attribute_values": values
+            });
+            let target = if tool == "delete_item" { "key" } else { "item" };
+            args[target] = json!({"pk": {"S": "a"}});
+            let resp = call_tool(&mut child, id, tool, args);
+            assert_eq!(
+                tool_error(&resp),
+                serialization_error(message),
+                "{tool} {values}"
+            );
+        }
+    }
+    let resp = call_tool(
+        &mut child,
+        50,
+        "get_item",
+        json!({"table_name": "Shapes", "key": {"pk": {"S": "a"}}}),
+    );
+    assert_eq!(tool_content(&resp)["Item"], json!({"pk": {"S": "a"}}));
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A valid expression value reaches the condition or filter it is used in:
+/// a condition on it decides whether `put_item` and `delete_item` write, and
+/// a filter on it decides what `scan` returns.
+#[test]
+fn expression_values_decide_conditions_and_filters() {
+    let mut child = mcp_with_table("Decided");
+    let mut id = 1;
+    let mut call = |child: &mut std::process::Child, tool: &str, args: Value| {
+        id += 1;
+        call_tool(child, id, tool, args)
+    };
+    for (pk, v) in [("a", "1"), ("b", "2")] {
+        let resp = call(
+            &mut child,
+            "put_item",
+            json!({"table_name": "Decided", "item": {"pk": {"S": pk}, "v": {"N": v}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+    let conditional = |tool: &str, v: &str| {
+        let mut args = json!({
+            "table_name": "Decided", "condition_expression": "v = :v",
+            "expression_attribute_values": {":v": {"N": v}}
+        });
+        if tool == "put_item" {
+            args["item"] = json!({"pk": {"S": "a"}, "v": {"N": "1"}, "w": {"S": "put"}});
+        } else {
+            args["key"] = json!({"pk": {"S": "a"}});
+        }
+        args
+    };
+    for tool in ["put_item", "delete_item"] {
+        let resp = call(&mut child, tool, conditional(tool, "9"));
+        assert_eq!(
+            tool_content(&resp)["error_type"],
+            "ConditionalCheckFailedException",
+            "{tool}: {resp}"
+        );
+        let resp = call(&mut child, tool, conditional(tool, "1"));
+        assert!(!is_tool_error(&resp), "{tool}: {resp}");
+    }
+    let resp = call(
+        &mut child,
+        "get_item",
+        json!({"table_name": "Decided", "key": {"pk": {"S": "a"}}}),
+    );
+    assert!(tool_content(&resp).get("Item").is_none(), "{resp}");
+    let resp = call(
+        &mut child,
+        "scan",
+        json!({"table_name": "Decided", "filter_expression": "v = :v",
+            "expression_attribute_values": {":v": {"N": "2"}}}),
+    );
+    assert_eq!(
+        tool_content(&resp)["Items"],
+        json!([{"pk": {"S": "b"}, "v": {"N": "2"}}])
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `query` and `scan` page with an `exclusive_start_key` taken from the last
+/// page's `LastEvaluatedKey`, and every item comes back once.
+#[test]
+fn query_and_scan_page_from_the_last_evaluated_key() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Pages",
+            "billing_mode": "PAY_PER_REQUEST",
+            "key_schema": [
+                {"attribute_name": "pk", "key_type": "HASH"},
+                {"attribute_name": "sk", "key_type": "RANGE"}
+            ],
+            "attribute_definitions": [
+                {"attribute_name": "pk", "attribute_type": "S"},
+                {"attribute_name": "sk", "attribute_type": "N"}
+            ]
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let mut id = 1;
+    for sk in 1..=5 {
+        id += 1;
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Pages", "item": {"pk": {"S": "p"}, "sk": {"N": sk.to_string()}}}),
+        );
+        assert!(!is_tool_error(&resp), "{resp}");
+    }
+    for tool in ["query", "scan"] {
+        let mut seen = Vec::new();
+        let mut start = Value::Null;
+        loop {
+            let mut args = json!({"table_name": "Pages", "limit": 2});
+            if tool == "query" {
+                args["key_condition_expression"] = json!("pk = :p");
+                args["expression_attribute_values"] = json!({":p": {"S": "p"}});
+            }
+            if !start.is_null() {
+                args["exclusive_start_key"] = start.clone();
+            }
+            id += 1;
+            let resp = call_tool(&mut child, id, tool, args);
+            assert!(!is_tool_error(&resp), "{tool}: {resp}");
+            let page = tool_content(&resp);
+            for item in page["Items"].as_array().unwrap() {
+                seen.push(item["sk"]["N"].as_str().unwrap().to_string());
+            }
+            start = page["LastEvaluatedKey"].clone();
+            if start.is_null() {
+                break;
+            }
+            assert!(seen.len() <= 5, "{tool} pages past the end: {seen:?}");
+        }
+        assert_eq!(seen, ["1", "2", "3", "4", "5"], "{tool}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 // ---------------------------------------------------------------------------
 // The same request over MCP and over the HTTP API
 // ---------------------------------------------------------------------------

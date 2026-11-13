@@ -18,10 +18,14 @@ struct ScanRequestRaw {
     filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<crate::types::HeldValues>,
     #[serde(
         rename = "Limit",
         default,
@@ -99,7 +103,8 @@ pub(crate) struct ScanMembers<'a> {
     pub segment: Option<i64>,
     pub total_segments: Option<i64>,
     /// Whether `Limit`, `Segment` or `TotalSegments` saturated or lost a
-    /// fraction as it was read.
+    /// fraction as it was read, or the `ExclusiveStartKey` holds a null
+    /// value. Either hands the request to the older layer.
     pub coerced: bool,
 }
 
@@ -113,9 +118,10 @@ impl ScanMembers<'_> {
     ///
     /// 1. A missing table name, a legacy condition with no
     ///    `ComparisonOperator`, or a `Limit`, `Segment` or `TotalSegments` that
-    ///    saturated or lost a fraction as it was read hands the request to the
-    ///    older layer, which reports every member error it finds, in its
-    ///    wording and in this order: `Select`, `TotalSegments` (outside 1 to
+    ///    saturated or lost a fraction as it was read, or a null in the
+    ///    `ExclusiveStartKey`, hands the request to the older layer, which
+    ///    reports every member error it finds, in its wording and in this
+    ///    order: `Select`, `TotalSegments` (outside 1 to
     ///    1000000), `ReturnConsumedCapacity`, the table name (missing or
     ///    empty), `ConditionalOperator`, the missing operators, `Segment`
     ///    (outside 0 to 999999), `Limit` below 1.
@@ -244,6 +250,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
+        let expression_attribute_values = helpers::read_values_after_start_key(
+            raw.expression_attribute_values,
+            crate::types::read_scan_values,
+            raw.exclusive_start_key.as_ref(),
+            |key| helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current),
+        )
+        .map_err(serde::de::Error::custom)?;
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
         // request malformed, ahead of everything else.
@@ -265,7 +278,8 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             coerced: [raw.limit, raw.segment, raw.total_segments]
                 .iter()
                 .flatten()
-                .any(|n| n.coerced),
+                .any(|n| n.coerced)
+                || helpers::start_key_holds_null(raw.exclusive_start_key.as_ref()),
         })
         .rejection()
         {
@@ -278,7 +292,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             filter_expression: raw.filter_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             limit: raw.limit.map(|n| n.value as usize),
             exclusive_start_key: None,
             select: raw.select,
@@ -330,7 +344,7 @@ pub async fn execute<S: StorageBackend>(
         limit: request.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)),
         segment: request.segment.map(i64::from),
         total_segments: request.total_segments.map(i64::from),
-        coerced: false,
+        coerced: helpers::start_key_holds_null(request.exclusive_start_key_raw.as_ref()),
     })
     .rejection()
     {
@@ -358,7 +372,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
     if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
         .is_some()
     {

@@ -68,6 +68,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TransactGetItems no longer refuses an empty or unused name in a `Get`
+  with no `ProjectionExpression`.** It goes on to the table lookup as
+  DynamoDB does, so a request Dynoxide used to refuse now reads the item.
+  More than 100 Gets in TransactGetItems are now refused without listing
+  them, as DynamoDB now does, unless the request holds a null name, when the
+  listing shows that name as `null`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A JSON `null` where an attribute value belongs is refused in DynamoDB's
+  words, `The supplied Item contains a null AttributeValue`, where before it
+  was taken for an empty value. A null member of an item, a key or an `M` is
+  named (`: pk is null`); one in an `L`, a PartiQL parameter or an
+  `AttributeValueList` is not. `ExpressionAttributeValues` and
+  `ExclusiveStartKey` wrap it as they wrap their other faults, and a null
+  given for a whole `Expected`, `AttributeUpdates`, `KeyConditions`,
+  `QueryFilter` or `ScanFilter` entry gets the message DynamoDB has for each.
+  In BatchExecuteStatement it fails only its own statement
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A null, including one given as a type member such as `{"S": null}`, puts
+  the request on the older validation layer, so a bad number beside one in
+  an item comes back without the `1 validation error detected:` envelope,
+  and one in the expression values is named by its key. A null in a starting
+  key puts a Query's or Scan's `Limit` error, and its other numbers, in that
+  layer's words. Without a null, a bad number in a transaction's expression
+  values is no longer named by key, as DynamoDB now answers
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- The faults in an item or key are now met in the order DynamoDB walks them
+  (its Java `HashMap` order, with a value of the wrong JSON type ahead of the
+  rest), as are those in PutItem's expression values and in any request's
+  expression values once a null is present. An item or key is checked before
+  `ExpressionAttributeValues` and `AttributeUpdates`, and a starting key
+  before Query's. In a TransactWriteItems action the item or key comes first
+  too, unless the request holds a null, when the values do; a member of the
+  wrong JSON type anywhere in the action comes ahead of both. Nulls inside an
+  `M` are met in the order they were written when their names share a bucket
+  of that map, an array given for a value is refused with no message even
+  beside the same name written twice, and the MCP write tools refuse a
+  malformed `expression_attribute_values` before a fault in the item or key
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A `null` name in `ExpressionAttributeNames` is now read as an empty name,
+  puts the request on the older layer and is checked with the expressions. A
+  transaction action with no expression doesn't check names that hold one
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A `null` member of an `SS`, `NS` or `BS` puts the request on the older
+  layer, as a null value does, and is refused in DynamoDB's words, in its
+  place among the set's members, where it used to be a
+  `SerializationException`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice in an item, a key, `ExpressionAttributeValues` or
+  `AttributeUpdates` is refused with `Duplicate key found in payload`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice inside an `M` keeps its last copy, as before, but is
+  now refused with `Duplicate key found in payload` when either copy is a
+  null, an empty value or has more than one type member. A copy that is
+  malformed as JSON, such as an array, is refused for that fault
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- GetItem and BatchGetItem now report `ProjectionExpression` beside
+  `AttributesToGet` ahead of an empty name in `ExpressionAttributeNames`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- An `AttributeUpdates` entry with no value and an action other than
+  `DELETE` is now refused inside the `1 validation error detected:` envelope
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- The MCP tools give the same answers as the HTTP API for these requests,
+  and refuse expression values that aren't a map as the HTTP API does, where
+  `delete_item` used to ignore them
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+
 - A JSON array where DynamoDB doesn't expect one is refused as DynamoDB
   refuses it. A request body that is an array is a `SerializationException`
   with no message on every operation, where Dynoxide used to read it by

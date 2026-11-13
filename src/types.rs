@@ -213,8 +213,30 @@ impl<'de> Deserialize<'de> for AttributeValue {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize as raw JSON Value first so we can inspect all keys
-        let raw = serde_json::Value::deserialize(deserializer)?;
+        Self::read_written(Written::deserialize(deserializer)?)
+    }
+}
+
+impl AttributeValue {
+    /// Read a value from its JSON as written. The members of an `M` are read
+    /// in the order they were written, at any depth, as an item's are (see
+    /// [`read_attribute_map`]).
+    pub(crate) fn read_written<E: de::Error>(written: Written) -> Result<Self, E> {
+        // Inspect all keys as JSON first.
+        let raw = written.to_value();
+
+        // A JSON null where a value belongs has a refusal of its own, which a
+        // reader of a map of attributes names after its attribute
+        // (`read_attribute_map`). It is a validation fault, met in DynamoDB's
+        // walk over the request like an empty value (captured eu-west-2 and
+        // us-east-1, 2026-11-11).
+        if raw.is_null() {
+            return Err(de::Error::custom(format!(
+                "{}{}",
+                crate::serde_errors::VALIDATION_MARKER,
+                crate::serde_errors::NULL_VALUE
+            )));
+        }
 
         // A value given as an array is malformed, refused with no message
         // wherever it appears (captured eu-west-2 and us-east-1, 12 November
@@ -222,6 +244,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
         if raw.is_array() {
             return Err(de::Error::custom(crate::serde_errors::SERIALIZATION_MARKER));
         }
+
         let obj = raw
             .as_object()
             .ok_or_else(|| de::Error::custom("empty AttributeValue object"))?;
@@ -306,6 +329,12 @@ impl<'de> Deserialize<'de> for AttributeValue {
                         for item in arr {
                             if let Some(n) = item.as_str() {
                                 validate_number_in_deser(n, layer).map_err(de::Error::custom)?;
+                            } else if present.len() == 1 {
+                                // A set's members are checked in order, so
+                                // a null ahead of a bad number is the one
+                                // refused, and one after it is not (captured
+                                // eu-west-2 and us-east-1, 2026-11-12).
+                                return Err(set_member_refusal("NS", item));
                             }
                         }
                     }
@@ -379,7 +408,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     .map(|v| {
                         v.as_str()
                             .map(|s| s.to_string())
-                            .ok_or_else(|| de::Error::custom("expected string in SS"))
+                            .ok_or_else(|| set_member_refusal("SS", v))
                     })
                     .collect();
                 Ok(AttributeValue::SS(ss?))
@@ -393,7 +422,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     .map(|v| {
                         v.as_str()
                             .map(|s| s.to_string())
-                            .ok_or_else(|| de::Error::custom("expected string in NS"))
+                            .ok_or_else(|| set_member_refusal("NS", v))
                     })
                     .collect();
                 Ok(AttributeValue::NS(ns?))
@@ -406,35 +435,52 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 for item in arr {
                     let encoded = item
                         .as_str()
-                        .ok_or_else(|| de::Error::custom("expected string in BS"))?;
+                        .ok_or_else(|| set_member_refusal("BS", item))?;
                     decoded.push(decode_base64(encoded)?);
                 }
                 Ok(AttributeValue::BS(decoded))
             }
             "L" => {
-                let arr = val
-                    .as_array()
-                    .expect("a member of the wrong JSON type is refused above");
-                let list: Result<Vec<AttributeValue>, _> = arr
-                    .iter()
-                    .map(|v| serde_json::from_value(v.clone()).map_err(de::Error::custom))
-                    .collect();
+                let Some(Written::Array(items)) = written.into_member("L") else {
+                    unreachable!("a member of the wrong JSON type is refused above")
+                };
+                let list: Result<Vec<AttributeValue>, E> =
+                    items.into_iter().map(Self::read_written).collect();
                 Ok(AttributeValue::L(list?))
             }
             "M" => {
-                let map_val = val
-                    .as_object()
-                    .expect("a member of the wrong JSON type is refused above");
-                let mut result = std::collections::HashMap::new();
-                for (k, v) in map_val {
-                    let av: AttributeValue =
-                        serde_json::from_value(v.clone()).map_err(de::Error::custom)?;
-                    result.insert(k.clone(), av);
-                }
-                Ok(AttributeValue::M(result))
+                // The members in the order they were written, so those that
+                // share a bucket of DynamoDB's map are met as written (captured
+                // eu-west-2 and us-east-1, 2026-11-12).
+                let Some(Written::Object(members)) = written.into_member("M") else {
+                    unreachable!("a member of the wrong JSON type is refused above")
+                };
+                let members = collapse_repeated_members(members).map_err(|refusal| {
+                    de::Error::custom(format!(
+                        "{}{refusal}",
+                        crate::serde_errors::SERIALIZATION_MARKER
+                    ))
+                })?;
+                read_attribute_map(members)
+                    .map(AttributeValue::M)
+                    .map_err(de::Error::custom)
             }
             _ => unreachable!(),
         }
+    }
+}
+
+/// The refusal of a member of a `type_key` set that isn't a string. A member
+/// of the wrong JSON type is refused before this runs, so it is a JSON null:
+/// a value fault in DynamoDB's words (see
+/// [`crate::serde_errors::null_set_member_refusal`]).
+fn set_member_refusal<E: de::Error>(type_key: &str, member: &serde_json::Value) -> E {
+    match crate::serde_errors::null_set_member_refusal(type_key).filter(|_| member.is_null()) {
+        Some(refusal) => E::custom(format!(
+            "{}{refusal}",
+            crate::serde_errors::VALIDATION_MARKER
+        )),
+        None => E::custom(format!("expected string in {type_key}")),
     }
 }
 
@@ -557,6 +603,592 @@ fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'s
         serde_json::Value::Array(items) => items.iter().find_map(member_refusal),
         serde_json::Value::Object(map) => map.values().find_map(member_refusal),
         _ => None,
+    }
+}
+
+/// DynamoDB's refusal of a map that names a member twice.
+const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
+
+/// DynamoDB's refusal of an attribute value that is malformed as JSON, read
+/// from it as written, so every copy of a name written twice is seen, at any
+/// depth; `None` when it reads as JSON, and for JSON null. The refusal has no
+/// marker.
+///
+/// The faults are met in the order the value meets them when no name is
+/// written twice, so a repeat elsewhere leaves unchanged which of two faults
+/// as JSON is reported. For a member of an item, a key or the expression
+/// values, which is read as it stands: its own JSON type; its `BOOL` and then
+/// its `NULL` member, where [`read_lenient_bool`] refuses them as the request
+/// is parsed; then every other member at any depth in key order, as
+/// [`unreadable_member_in`] walks them; and only then a nested `BOOL` or
+/// `NULL`, as each nested value is read (an `L` in order, an `M` in written
+/// order). Copies of one name are taken in written order among themselves.
+///
+/// Two exceptions, where a nested `BOOL` or `NULL` fault is reported beside a
+/// repeat but not without one. First, an `L` item refused for a validation
+/// fault (a number that doesn't read, an empty value, a null, a `NULL` of
+/// false, more than one type member) stops the items after it from being
+/// read without a repeat: `{"L":[{"N":"bad"},{"BOOL":"maybe"}]}` is refused
+/// for the number alone and for the `BOOL` beside a repeat. Second, a value
+/// with more than one type member is refused alone for having more than one
+/// datatype, without its members being read: `{"S":"a","L":[{"BOOL":"x"}]}`
+/// is refused for its datatypes alone and for the `BOOL` beside a repeat. No
+/// capture says which DynamoDB gives in either case.
+fn malformed_value(value: &Written) -> Option<Cow<'static, str>> {
+    written_slot_refusal(JsonSlot::Value, value)
+        .or_else(|| malformed_flag(value))
+        .or_else(|| malformed_member_in(value))
+        .or_else(|| malformed_nested_value(value))
+}
+
+/// [`malformed_value`] for a member of an `M`, whose type members other than
+/// `BOOL` and `NULL` are walked with the rest of the value holding the `M`,
+/// in key order, before the member itself is read and its own `BOOL` and
+/// `NULL` with it.
+fn malformed_map_member(value: &Written) -> Option<Cow<'static, str>> {
+    written_slot_refusal(JsonSlot::Value, value)
+        .or_else(|| malformed_member_in(value))
+        .or_else(|| malformed_flag(value))
+        .or_else(|| malformed_nested_value(value))
+}
+
+/// The value's own `BOOL` member, then its `NULL` member, where
+/// [`read_lenient_bool`] refuses it as the request is parsed.
+fn malformed_flag(value: &Written) -> Option<Cow<'static, str>> {
+    let Written::Object(members) = value else {
+        return None;
+    };
+    ["BOOL", "NULL"].into_iter().find_map(|flag| {
+        members
+            .iter()
+            .filter(|(name, member)| name == flag && !member.is_null())
+            .find_map(|(_, member)| {
+                // A string is read for its text; anything else for its JSON type.
+                let read = match member {
+                    Written::String(text) => serde_json::Value::String(text.clone()),
+                    other => other.shallow_value(),
+                };
+                read_lenient_bool(&read)
+                    .err()?
+                    .strip_prefix(crate::serde_errors::SERIALIZATION_MARKER)
+                    .map(|refusal| Cow::Owned(refusal.to_string()))
+            })
+    })
+}
+
+/// An object's members in key order, the copies of a name written twice in
+/// written order among themselves.
+fn in_key_order(members: &[(String, Written)]) -> Vec<&(String, Written)> {
+    let mut ordered: Vec<&(String, Written)> = members.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    ordered
+}
+
+/// [`unreadable_member_in`] for a value as written: each type member other
+/// than `BOOL` and `NULL`, in key order, and what it holds, at any depth.
+fn malformed_member_in(value: &Written) -> Option<Cow<'static, str>> {
+    let Written::Object(members) = value else {
+        return None;
+    };
+    in_key_order(members)
+        .into_iter()
+        .find_map(|(type_key, member)| malformed_member(type_key, member))
+}
+
+/// [`unreadable_member`] for a type member as written.
+fn malformed_member(type_key: &str, member: &Written) -> Option<Cow<'static, str>> {
+    let (slot, items) = match type_key {
+        "S" | "N" => (JsonSlot::Text, None),
+        "B" => (JsonSlot::Bytes, None),
+        "SS" | "NS" => (JsonSlot::List, Some(JsonSlot::Text)),
+        "BS" => (JsonSlot::List, Some(JsonSlot::Bytes)),
+        "L" => (JsonSlot::List, Some(JsonSlot::Value)),
+        "M" => (JsonSlot::Map, Some(JsonSlot::Value)),
+        _ => return None,
+    };
+    if let Some(refusal) = written_slot_refusal(slot, member) {
+        return Some(refusal);
+    }
+    let items = items?;
+    let item_refusal =
+        |item: &Written| written_slot_refusal(items, item).or_else(|| malformed_member_in(item));
+    match member {
+        Written::Array(list) => list.iter().find_map(item_refusal),
+        Written::Object(map) => in_key_order(map)
+            .into_iter()
+            .find_map(|(_, item)| item_refusal(item)),
+        _ => None,
+    }
+}
+
+/// The faults met only as each nested value is read: a `BOOL` or `NULL` that
+/// [`read_lenient_bool`] refuses, in the members of an `L` in order and of an
+/// `M` in written order, at any depth. Every other fault below the value was
+/// looked for by [`malformed_member_in`] first, so only these are left.
+fn malformed_nested_value(value: &Written) -> Option<Cow<'static, str>> {
+    let Written::Object(members) = value else {
+        return None;
+    };
+    let nested = |item: &Written| malformed_flag(item).or_else(|| malformed_nested_value(item));
+    in_key_order(members)
+        .into_iter()
+        .find_map(|(type_key, member)| match (type_key.as_str(), member) {
+            ("L", Written::Array(list)) => list.iter().find_map(nested),
+            ("M", Written::Object(map)) => map.iter().find_map(|(_, item)| nested(item)),
+            _ => None,
+        })
+}
+
+/// [`JsonSlot::refusal`] for a value as written, without copying it.
+fn written_slot_refusal(slot: JsonSlot, value: &Written) -> Option<Cow<'static, str>> {
+    if let Some(refusal) = slot.json_type_refusal(&value.shallow_value()) {
+        return Some(Cow::Borrowed(refusal));
+    }
+    match (slot, value) {
+        (JsonSlot::Bytes, Written::String(text)) => {
+            crate::wire_base64::check(text).err().map(|r| r.message())
+        }
+        _ => None,
+    }
+}
+
+/// The members of an `M` with a name written twice collapsed, as DynamoDB
+/// reads them (captured eu-west-2 and us-east-1, 2026-11-12). A member
+/// malformed as JSON in any copy, or anywhere earlier, is the refusal.
+/// Otherwise a copy that is null, empty or has more than one type member is
+/// refused as a name written twice. Otherwise the last copy is the member's
+/// value, in the place the name was first written, and the earlier copies are
+/// not read at all. The refusal is the message, without its marker.
+///
+/// One pass: a member is looked at for a fault as JSON only once a repeat
+/// needs it, and never again, and nothing is copied.
+fn collapse_repeated_members(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<Vec<(String, Written)>, Cow<'static, str>> {
+    let one_type_member = |value: &Written| match value {
+        Written::Object(members) => {
+            members
+                .iter()
+                .filter(|(name, member)| TYPE_MEMBERS.contains(&name.as_str()) && !member.is_null())
+                .count()
+                == 1
+        }
+        _ => false,
+    };
+    // For each name, in the order first written, the member read for it.
+    let mut chosen: Vec<usize> = Vec::with_capacity(members.len());
+    {
+        let mut slot_of: HashMap<&str, usize> = HashMap::with_capacity(members.len());
+        let mut looked_at = 0;
+        for (at, (name, value)) in members.iter().enumerate() {
+            let Some(&slot) = slot_of.get(name.as_str()) else {
+                slot_of.insert(name, chosen.len());
+                chosen.push(at);
+                continue;
+            };
+            if let Some(malformed) = members[looked_at..=at]
+                .iter()
+                .find_map(|(_, member)| malformed_map_member(member))
+            {
+                return Err(malformed);
+            }
+            looked_at = at + 1;
+            if !one_type_member(&members[chosen[slot]].1) || !one_type_member(value) {
+                return Err(Cow::Borrowed(DUPLICATE_MEMBER));
+            }
+            chosen[slot] = at;
+        }
+    }
+    if chosen.len() == members.len() {
+        return Ok(members);
+    }
+    let mut members: Vec<Option<(String, Written)>> = members.into_iter().map(Some).collect();
+    Ok(chosen
+        .into_iter()
+        .map(|at| members[at].take().expect("each member is chosen once"))
+        .collect())
+}
+
+/// A JSON value as written: an object's members are kept in the order they
+/// were written, which `serde_json::Value` doesn't keep. DynamoDB meets the
+/// members of a map that share a bucket of its hash map in written order, at
+/// any depth.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Written {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<Written>),
+    Object(Vec<(String, Written)>),
+}
+
+impl Written {
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// The value as `serde_json::Value`, a name written twice in an object
+    /// keeping its last value, as serde_json keeps it.
+    pub(crate) fn to_value(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(*b),
+            Self::Number(n) => serde_json::Value::Number(n.clone()),
+            Self::String(s) => serde_json::Value::String(s.clone()),
+            Self::Array(items) => {
+                serde_json::Value::Array(items.iter().map(Self::to_value).collect())
+            }
+            Self::Object(members) => serde_json::Value::Object(
+                members
+                    .iter()
+                    .map(|(name, member)| (name.clone(), member.to_value()))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The value's JSON type as `serde_json::Value`, without what it holds:
+    /// a string, array or object is empty. Enough to check its JSON type.
+    fn shallow_value(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(*b),
+            Self::Number(n) => serde_json::Value::Number(n.clone()),
+            Self::String(_) => serde_json::Value::String(String::new()),
+            Self::Array(_) => serde_json::Value::Array(Vec::new()),
+            Self::Object(_) => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    /// An object's member `name`, its last value if written twice.
+    fn into_member(self, name: &str) -> Option<Written> {
+        match self {
+            Self::Object(members) => members
+                .into_iter()
+                .rev()
+                .find_map(|(n, member)| (n == name).then_some(member)),
+            _ => None,
+        }
+    }
+}
+
+impl From<serde_json::Value> for Written {
+    /// A value already parsed, an object's members in key order.
+    fn from(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(b),
+            serde_json::Value::Number(n) => Self::Number(n),
+            serde_json::Value::String(s) => Self::String(s),
+            serde_json::Value::Array(items) => {
+                Self::Array(items.into_iter().map(Self::from).collect())
+            }
+            serde_json::Value::Object(members) => Self::Object(
+                members
+                    .into_iter()
+                    .map(|(name, member)| (name, Self::from(member)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Written {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Json;
+
+        impl<'de> de::Visitor<'de> for Json {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any valid JSON value")
+            }
+
+            fn visit_bool<E: de::Error>(self, b: bool) -> std::result::Result<Written, E> {
+                Ok(Written::Bool(b))
+            }
+
+            fn visit_i64<E: de::Error>(self, n: i64) -> std::result::Result<Written, E> {
+                Ok(Written::Number(n.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, n: u64) -> std::result::Result<Written, E> {
+                Ok(Written::Number(n.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, n: f64) -> std::result::Result<Written, E> {
+                // As serde_json reads it: a float JSON can't hold is null.
+                Ok(serde_json::Number::from_f64(n).map_or(Written::Null, Written::Number))
+            }
+
+            fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Written, E> {
+                Ok(Written::String(s.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(self, s: String) -> std::result::Result<Written, E> {
+                Ok(Written::String(s))
+            }
+
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Written, E> {
+                Ok(Written::Null)
+            }
+
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Written, E> {
+                Ok(Written::Null)
+            }
+
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> std::result::Result<Written, D::Error> {
+                Written::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Written, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(256));
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Written::Array(items))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Written, A::Error> {
+                let mut members = Vec::with_capacity(map.size_hint().unwrap_or(0).min(256));
+                while let Some(member) = map.next_entry::<String, Written>()? {
+                    members.push(member);
+                }
+                Ok(Written::Object(members))
+            }
+        }
+
+        deserializer.deserialize_any(Json)
+    }
+}
+
+/// A map's members in the order they were written, each read as JSON and no
+/// further. A name written twice is refused as a malformed request. A request's item or key is read this way so its values can be
+/// walked in the order DynamoDB walks them ([`read_attribute_map`]), and its
+/// expression values so they can wait until the item or key has been read
+/// ([`HeldValues`]).
+#[derive(Debug, Default)]
+pub(crate) struct WrittenMembers(pub(crate) Vec<(String, Written)>);
+
+impl<'de> Deserialize<'de> for WrittenMembers {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Members;
+
+        impl<'de> de::Visitor<'de> for Members {
+            type Value = WrittenMembers;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                // The wording a `HashMap` gives, which `serde_errors` maps.
+                f.write_str("a map")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<WrittenMembers, A::Error> {
+                let mut members: Vec<(String, Written)> =
+                    Vec::with_capacity(map.size_hint().unwrap_or(0).min(256));
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                while let Some((name, value)) = map.next_entry::<String, Written>()? {
+                    // A name written twice is refused as the request is
+                    // parsed (captured eu-west-2 and us-east-1, 2026-11-11),
+                    // unless a member read so far, either copy included, is
+                    // malformed, at any depth: that fault is the answer
+                    // (captured eu-west-2 and us-east-1, 2026-11-12).
+                    if seen.contains_key(&name) {
+                        let refusal = members
+                            .iter()
+                            .map(|(_, member)| member)
+                            .chain([&value])
+                            .find_map(malformed_value)
+                            .unwrap_or(Cow::Borrowed(DUPLICATE_MEMBER));
+                        return Err(de::Error::custom(format!(
+                            "{}{refusal}",
+                            crate::serde_errors::SERIALIZATION_MARKER
+                        )));
+                    }
+                    seen.insert(name.clone(), members.len());
+                    members.push((name, value));
+                }
+                Ok(WrittenMembers(members))
+            }
+        }
+
+        deserializer.deserialize_map(Members)
+    }
+}
+
+/// Read a map of attributes (an item, a key, the members of an `M`) from its
+/// members as written, refusing it for the fault DynamoDB meets first.
+///
+/// A value of the wrong JSON type fails the request as it is parsed, ahead of
+/// everything else. Every other fault is met as DynamoDB walks the map, in the
+/// order a Java `HashMap` iterates its members: `{"b": null, "q": null}` names
+/// `q` whichever is written first, and a bad number in `x` is reported ahead
+/// of a null in `pk` (captured eu-west-2 and us-east-1, 2026-11-11). A null
+/// member is named after its attribute. The error is the raw serde message,
+/// marker and all.
+pub(crate) fn read_attribute_map(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    let read: Vec<(String, std::result::Result<AttributeValue, String>)> = members
+        .into_iter()
+        .map(|(name, value)| {
+            let value = if value.is_null() {
+                Err(format!(
+                    "{}{}",
+                    crate::serde_errors::VALIDATION_MARKER,
+                    crate::serde_errors::null_member_refusal(&name)
+                ))
+            } else {
+                AttributeValue::read_written::<serde_json::Error>(value).map_err(|e| e.to_string())
+            };
+            (name, value)
+        })
+        .collect();
+    refuse_in_map_order(read)
+}
+
+/// The members of a map of attributes, each read or refused, given in written
+/// order: the map they make, or the refusal DynamoDB reports for it. A value
+/// of the wrong JSON type is reported first, in written order; otherwise the
+/// fault met first in a Java `HashMap`'s order.
+fn refuse_in_map_order(
+    read: Vec<(String, std::result::Result<AttributeValue, String>)>,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    let mut refusals = read
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (_, value))| value.as_ref().err().map(|refusal| (at, refusal)));
+    let Some(first) = refusals.next() else {
+        return Ok(read
+            .into_iter()
+            .map(|(name, value)| (name, value.expect("every member read")))
+            .collect());
+    };
+    let refusals: Vec<(usize, &String)> = std::iter::once(first).chain(refusals).collect();
+    if let Some(&(_, malformed)) = refusals
+        .iter()
+        .find(|(_, refusal)| !crate::serde_errors::is_validation_refusal(refusal))
+    {
+        return Err(malformed.clone());
+    }
+    let names: Vec<&str> = read.iter().map(|(name, _)| name.as_str()).collect();
+    // Past the point where the map's buckets turn into trees, whose order
+    // isn't followed, the members are taken as written.
+    let ranks = crate::validation::java_hash_map_order(&names)
+        .unwrap_or_else(|| (0..names.len()).collect());
+    let &(_, refusal) = refusals
+        .iter()
+        .min_by_key(|(at, _)| ranks[*at])
+        .expect("at least one refusal");
+    Err(refusal.clone())
+}
+
+/// A map of attributes read by [`read_attribute_map`].
+pub(crate) struct AttributeMap(pub(crate) HashMap<String, AttributeValue>);
+
+impl<'de> Deserialize<'de> for AttributeMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let WrittenMembers(members) = WrittenMembers::deserialize(deserializer)?;
+        read_attribute_map(members)
+            .map(AttributeMap)
+            .map_err(de::Error::custom)
+    }
+}
+
+/// Deserialise a request's item or key as [`read_attribute_map`] reads it.
+pub(crate) fn deserialize_attribute_map<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    Ok(Option::<AttributeMap>::deserialize(deserializer)?.map(|map| map.0))
+}
+
+/// Deserialise a required item or key as [`read_attribute_map`] reads it.
+pub(crate) fn deserialize_required_attribute_map<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, AttributeValue>, D::Error> {
+    Ok(AttributeMap::deserialize(deserializer)?.0)
+}
+
+/// Deserialise a list of keys, each as [`read_attribute_map`] reads it, in
+/// written order.
+pub(crate) fn deserialize_attribute_maps<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<HashMap<String, AttributeValue>>, D::Error> {
+    Ok(Vec::<AttributeMap>::deserialize(deserializer)?
+        .into_iter()
+        .map(|map| map.0)
+        .collect())
+}
+
+/// A request's item or key, read as the request is parsed. A value of the
+/// wrong JSON type fails the request there, in written order among the
+/// request's members, as DynamoDB fails it while parsing. Any other fault is
+/// held, so the request decoder can report it ahead of a fault in the
+/// request's expression values, whichever is written first (captured eu-west-2
+/// and us-east-1, 2026-11-11). The held refusal is the raw serde message.
+#[derive(Debug)]
+pub(crate) struct HeldAttributeMap(
+    pub(crate) std::result::Result<HashMap<String, AttributeValue>, String>,
+);
+
+impl<'de> Deserialize<'de> for HeldAttributeMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let WrittenMembers(members) = WrittenMembers::deserialize(deserializer)?;
+        match read_attribute_map(members) {
+            Err(refusal) if !crate::serde_errors::is_validation_refusal(&refusal) => {
+                Err(de::Error::custom(refusal))
+            }
+            read => Ok(HeldAttributeMap(read)),
+        }
+    }
+}
+
+/// A request's `ExpressionAttributeValues`, or a TransactWriteItems action's
+/// item or key, read as the request is parsed but not yet as values: a value
+/// of the wrong JSON type fails the request there, as for
+/// [`HeldAttributeMap`], and the operation's own reader reads them all once
+/// the item or key has been read, or for a transaction once the whole request
+/// has been.
+#[derive(Debug)]
+pub(crate) struct HeldValues(pub(crate) WrittenMembers);
+
+impl<'de> Deserialize<'de> for HeldValues {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let members = WrittenMembers::deserialize(deserializer)?;
+        for (_, value) in &members.0 {
+            if let Err(e) = AttributeValue::read_written::<serde_json::Error>(value.clone()) {
+                let refusal = e.to_string();
+                if !crate::serde_errors::is_validation_refusal(&refusal) {
+                    return Err(de::Error::custom(refusal));
+                }
+            }
+        }
+        Ok(HeldValues(members))
+    }
+}
+
+impl HeldValues {
+    /// The values read by `read`, one of the `ExpressionAttributeValues`
+    /// readers, in written order. The error is the raw serde message.
+    pub(crate) fn read(
+        self,
+        read: impl FnOnce(
+            Vec<(String, Written)>,
+        ) -> std::result::Result<HashMap<String, AttributeValue>, String>,
+    ) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+        read(self.0.0)
     }
 }
 
@@ -791,9 +1423,86 @@ const TYPE_MEMBERS: [&str; 10] = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS
 ///
 /// A map whose members are all maps is an item or an attribute map, not a
 /// value, so an attribute named `S` beside one named `N` doesn't count.
+///
+/// A JSON null where a value belongs counts too: a member of an item, a key,
+/// `ExpressionAttributeValues`, an `M`, an `L` or a legacy
+/// `AttributeValueList` (captured eu-west-2 and us-east-1, 2026-11-11, for an
+/// item, an `L`, the expression values and an `Expected` value list), and so
+/// does a null type member, as in `{"S": null}`, whatever the attribute
+/// holding it is called (captured eu-west-2 and us-east-1, 2026-11-11, beside
+/// a bad number). So does a null member of a set, though it is refused as a
+/// fault of the set rather than as a null value, and a null name in
+/// `ExpressionAttributeNames`, which PutItem then refuses bare and Query
+/// checks after its expression members (captured eu-west-2 and us-east-1,
+/// 2026-11-12; see `empty_names::names_checked_early`). A null legacy `Value` and a null
+/// request member don't, whatever the attribute they belong to is called: a
+/// legacy condition's keys are attribute names, not type members (captured
+/// eu-west-2 and us-east-1, 2026-11-12, for an attribute named `M`).
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
 pub(crate) fn reads_on_older_layer(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
+    walk_older_layer(value, Shape::Request)
+}
+
+/// [`reads_on_older_layer`] for a part of a request that is not its root
+/// object, such as an MCP tool's item or key: no key in it is a request
+/// member, so none is read as a legacy condition map.
+#[cfg(feature = "mcp-server")]
+pub(crate) fn part_reads_on_older_layer(value: &serde_json::Value) -> bool {
+    walk_older_layer(value, Shape::Part)
+}
+
+/// [`reads_on_older_layer`] for a request's legacy `Expected`,
+/// `AttributeUpdates`, `KeyConditions`, `QueryFilter` or `ScanFilter` alone,
+/// whose keys are attribute names.
+pub(crate) fn conditions_read_on_older_layer(conditions: &serde_json::Value) -> bool {
+    walk_older_layer(conditions, Shape::Conditions)
+}
+
+/// What the object being walked holds, so a name is read for what it is.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A request's root object: its keys are the request's members, so the
+    /// legacy ones hold condition maps. Only a wire seam reads a whole
+    /// request (see [`reads_on_older_layer`]).
+    #[cfg_attr(
+        not(any(
+            feature = "http-server",
+            feature = "wasm-sqlite",
+            feature = "mcp-server",
+            test
+        )),
+        expect(dead_code, reason = "only a wire seam reads a whole request")
+    )]
+    Request,
+    /// Anything below the root (an item, a key, a value, a transaction
+    /// action, an MCP tool's argument): its keys are type members, attribute
+    /// names or an action's members, and an attribute may be called
+    /// `Expected` or `ScanFilter` like any other, so none is read as a
+    /// condition map (captured eu-west-2 and us-east-1, 2026-11-12).
+    Part,
+    /// A legacy condition map: its keys are attribute names and its values
+    /// conditions or updates.
+    Conditions,
+}
+
+/// The request members whose keys are attribute names and whose values are
+/// legacy conditions or updates.
+const LEGACY_CONDITIONS: [&str; 5] = [
+    "Expected",
+    "AttributeUpdates",
+    "KeyConditions",
+    "QueryFilter",
+    "ScanFilter",
+];
+
+fn walk_older_layer(value: &serde_json::Value, shape: Shape) -> bool {
+    match (value, shape) {
+        (serde_json::Value::Object(map), Shape::Request | Shape::Part) => {
             let string_flag = ["BOOL", "NULL", "Exists"]
                 .iter()
                 .any(|member| map.get(*member).is_some_and(serde_json::Value::is_string));
@@ -804,11 +1513,98 @@ pub(crate) fn reads_on_older_layer(value: &serde_json::Value) -> bool {
                 .collect();
             string_flag
                 || (members.len() > 1 && members.iter().any(|member| !member.is_object()))
-                || map.values().any(reads_on_older_layer)
+                || holds_null_value(map)
+                || map
+                    .iter()
+                    .any(|(name, member)| walk_older_layer(member, member_shape(name, shape)))
         }
-        serde_json::Value::Array(items) => items.iter().any(reads_on_older_layer),
+        // Each condition is walked as a part of the request; the attribute
+        // names it is keyed by are not.
+        (serde_json::Value::Object(conditions), Shape::Conditions) => conditions
+            .values()
+            .any(|condition| walk_older_layer(condition, Shape::Part)),
+        (serde_json::Value::Array(items), _) => {
+            items.iter().any(|item| walk_older_layer(item, Shape::Part))
+        }
         _ => false,
     }
+}
+
+/// The shape of the value under `name` in an object of shape `parent`: a
+/// legacy condition map only for the root's own legacy members.
+fn member_shape(name: &str, parent: Shape) -> Shape {
+    match parent {
+        Shape::Request if LEGACY_CONDITIONS.contains(&name) => Shape::Conditions,
+        _ => Shape::Part,
+    }
+}
+
+/// Whether a part of a request (a value, an item, a key), holds a JSON null
+/// where an attribute value belongs, at any depth (see [`holds_null_value`]).
+pub(crate) fn holds_null(value: &serde_json::Value) -> bool {
+    walk_null(value, Shape::Part)
+}
+
+/// Whether an attribute map, such as an item, a key or an `ExclusiveStartKey`,
+/// holds a JSON null where an attribute value belongs: as one of its own
+/// values or anywhere within one.
+pub(crate) fn attribute_map_holds_null(map: &serde_json::Value) -> bool {
+    map.as_object().is_some_and(|values| {
+        values
+            .values()
+            .any(|value| value.is_null() || holds_null(value))
+    })
+}
+
+fn walk_null(value: &serde_json::Value, shape: Shape) -> bool {
+    match (value, shape) {
+        (serde_json::Value::Object(map), Shape::Request | Shape::Part) => {
+            holds_null_value(map)
+                || map
+                    .iter()
+                    .any(|(name, member)| walk_null(member, member_shape(name, shape)))
+        }
+        (serde_json::Value::Object(conditions), Shape::Conditions) => conditions
+            .values()
+            .any(|condition| walk_null(condition, Shape::Part)),
+        (serde_json::Value::Array(items), _) => {
+            items.iter().any(|item| walk_null(item, Shape::Part))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an object holds a JSON null where an attribute value belongs: in a
+/// map of attributes it names, in a list of values, or as a value's type
+/// member; or a null member of a set, or a null name in its
+/// `ExpressionAttributeNames`. A legacy condition map never reaches here: its
+/// keys are attribute names, so an attribute called `M` or `S` is not a type
+/// member.
+fn holds_null_value(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.iter()
+        .any(|(name, member)| match (name.as_str(), member) {
+            (name, serde_json::Value::Null) if TYPE_MEMBERS.contains(&name) => true,
+            (
+                "Item" | "Key" | "ExpressionAttributeValues" | "ExpressionAttributeNames" | "M",
+                value,
+            ) => value
+                .as_object()
+                .is_some_and(|values| values.values().any(serde_json::Value::is_null)),
+            ("L" | "AttributeValueList", serde_json::Value::Array(values)) => {
+                values.iter().any(serde_json::Value::is_null)
+            }
+            // A null set member is a value fault, not a null value, but it
+            // puts the request on the older layer as one does (captured
+            // eu-west-2 and us-east-1, 2026-11-12).
+            ("SS" | "NS" | "BS", serde_json::Value::Array(members)) => {
+                members.iter().any(serde_json::Value::is_null)
+            }
+            ("Keys", serde_json::Value::Array(keys)) => keys.iter().any(|key| {
+                key.as_object()
+                    .is_some_and(|values| values.values().any(serde_json::Value::is_null))
+            }),
+            _ => false,
+        })
 }
 
 /// The validation layer values are being read under on this thread: the one
@@ -879,84 +1675,183 @@ pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
     with_value_layer(crate::validation::ValueLayer::Older, read)
 }
 
-/// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
-/// NULL refused as it was parsed (a string that reads as false, or false
-/// beside another member) the way DynamoDB does: `ExpressionAttributeValues
-/// contains invalid value: ... for key :v` (captured eu-west-2 and us-east-1,
-/// 2026-10-10). Every other value error passes through as it is.
-pub(crate) fn deserialize_named_null_refusals<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    deserialize_named_refusals(deserializer, false, true)
+/// How an operation's `ExpressionAttributeValues` reader words and orders the
+/// values it refuses. Every reader names the key of a JSON null, and on the
+/// older layer of a number it can't store too: `ExpressionAttributeValues
+/// contains invalid value: The parameter cannot be converted to a numeric
+/// value: abc for key :b` (captured eu-west-2 and us-east-1, 2026-11-11).
+#[derive(Clone, Copy)]
+struct ValueNaming {
+    /// Names a NULL refused as it was parsed (a string that reads as false,
+    /// or false beside another member).
+    parsed_null: bool,
+    /// Names an empty value.
+    empty: bool,
+    /// Names a value with more than one member and an empty set beside
+    /// another member.
+    update: bool,
+    /// Reports the fault met first in a Java `HashMap`'s order on the current
+    /// layer as well as on the older one.
+    map_order: bool,
+    /// Whether a number refused is named: `None` for on the older layer only.
+    numbers: Option<bool>,
 }
 
-/// Deserialise Query's `ExpressionAttributeValues`, naming the key of an empty
-/// value as well as of a NULL refused as it was parsed (captured eu-west-2 and
-/// us-east-1, 2026-10-10: `{":v": {"S": null}}` and `{":v": {"NULL": "no"}}`).
-pub(crate) fn deserialize_named_empty_and_null_refusals<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    deserialize_named_refusals(deserializer, true, false)
+/// An `ExpressionAttributeValues` reader: the values in written order, read
+/// into a map or refused with the raw serde message.
+#[cfg(feature = "mcp-server")]
+pub(crate) type ValuesReader =
+    fn(Vec<(String, Written)>) -> std::result::Result<HashMap<String, AttributeValue>, String>;
+
+/// Read PutItem's `ExpressionAttributeValues`, in written order.
+pub(crate) fn read_put_item_values(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    read_named_values(
+        members,
+        ValueNaming {
+            parsed_null: false,
+            empty: false,
+            update: false,
+            map_order: true,
+            numbers: None,
+        },
+    )
 }
 
-/// Read `ExpressionAttributeValues`, naming the key of a NULL refused as it was
-/// parsed, of an empty value when `name_empty`, and, when `name_older` and the
-/// request is read on the older layer, of every other value refusal.
-fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-    name_empty: bool,
-    name_older: bool,
-) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    let Some(raw) =
-        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
-    else {
-        return Ok(None);
+/// Read UpdateItem's `ExpressionAttributeValues`, in written order, naming
+/// the key of a NULL refused as it was parsed, and of a value with more than
+/// one member or an empty set beside another member (captured eu-west-2 and
+/// us-east-1, 2026-10-10).
+pub(crate) fn read_update_item_values(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    read_named_values(
+        members,
+        ValueNaming {
+            parsed_null: true,
+            empty: false,
+            update: true,
+            map_order: false,
+            numbers: None,
+        },
+    )
+}
+
+/// Read Query's `ExpressionAttributeValues`, in written order, naming the key
+/// of an empty value as well as of a NULL refused as it was parsed (captured
+/// eu-west-2 and us-east-1, 2026-10-10: `{":v": {"S": null}}` and `{":v":
+/// {"NULL": "no"}}`).
+pub(crate) fn read_query_values(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    read_named_values(
+        members,
+        ValueNaming {
+            parsed_null: true,
+            empty: true,
+            update: false,
+            map_order: false,
+            numbers: None,
+        },
+    )
+}
+
+/// Read a TransactWriteItems action's `ExpressionAttributeValues`, in written
+/// order, naming the key of a null and, when `name_numbers`, of a number that
+/// can't be stored. DynamoDB names that number only when the request holds a
+/// null too, and reports it bare otherwise (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
+pub(crate) fn read_transaction_values(
+    members: Vec<(String, Written)>,
+    name_numbers: bool,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    read_named_values(
+        members,
+        ValueNaming {
+            parsed_null: false,
+            empty: false,
+            update: false,
+            map_order: true,
+            numbers: Some(name_numbers),
+        },
+    )
+}
+
+/// Read Scan's `ExpressionAttributeValues`, in written order.
+pub(crate) fn read_scan_values(
+    members: Vec<(String, Written)>,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    read_named_values(
+        members,
+        ValueNaming {
+            parsed_null: false,
+            empty: false,
+            update: false,
+            map_order: false,
+            numbers: None,
+        },
+    )
+}
+
+/// Read `ExpressionAttributeValues`, given in written order, worded as
+/// `naming` says. When more than one value is refused, the fault reported on
+/// the older layer is the one met first in a Java `HashMap`'s order, as for an
+/// item: `{":a": null, ":b": {"N": "abc"}}` names `:b` whichever is written
+/// first, and `{":q": null, ":b": null}` names `:b` (captured eu-west-2 and
+/// us-east-1, 2026-11-11). PutItem reports it in that order on the current
+/// layer too; the other readers report the first in key order there, though
+/// which of two faulty values DynamoDB reports on the current layer varies
+/// between its hosts. The error is the raw serde message, marker and all.
+fn read_named_values(
+    members: Vec<(String, Written)>,
+    naming: ValueNaming,
+) -> std::result::Result<HashMap<String, AttributeValue>, String> {
+    use crate::serde_errors::{
+        EMPTY_VALUE, MORE_THAN_ONE_TYPE, VALIDATION_MARKER, ValueRefusal, named_value_refusal,
+        value_refusal,
     };
-    let mut values = HashMap::with_capacity(raw.len());
-    for (key, value) in raw {
-        match serde_json::from_value::<AttributeValue>(value) {
-            Ok(av) => {
-                values.insert(key, av);
-            }
-            Err(e) => {
-                use crate::serde_errors::{
-                    EMPTY_VALUE, MORE_THAN_ONE_TYPE, VALIDATION_MARKER, ValueRefusal,
-                    named_value_refusal, value_refusal,
-                };
+    let older = current_value_layer() == crate::validation::ValueLayer::Older;
+    let read: Vec<(String, std::result::Result<AttributeValue, String>)> = members
+        .into_iter()
+        .map(|(key, value)| {
+            let read = AttributeValue::read_written::<serde_json::Error>(value).map_err(|e| {
                 let msg = e.to_string();
-                // UpdateItem, read on the older layer, names the key of every
-                // value refusal: a number, a value with more than one member
-                // (which puts the request on that layer), an empty set beside
-                // another member (captured eu-west-2 and us-east-1,
-                // 2026-10-10).
-                let older =
-                    name_older && current_value_layer() == crate::validation::ValueLayer::Older;
-                return Err(de::Error::custom(match value_refusal(&msg) {
-                    ValueRefusal::ParsedNull(inner) => {
-                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
-                    }
-                    ValueRefusal::Empty if name_empty => {
-                        format!(
-                            "{VALIDATION_MARKER}{}",
-                            named_value_refusal(EMPTY_VALUE, &key)
-                        )
-                    }
-                    ValueRefusal::MoreThanOneType if name_older => format!(
-                        "{VALIDATION_MARKER}{}",
-                        named_value_refusal(MORE_THAN_ONE_TYPE, &key)
-                    ),
-                    ValueRefusal::EmptySet(inner) if name_older => {
-                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
-                    }
-                    ValueRefusal::Number(inner) if older => {
-                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
-                    }
+                let named = |inner: &str| {
+                    format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
+                };
+                match value_refusal(&msg) {
+                    ValueRefusal::Null(inner) => named(inner),
+                    ValueRefusal::ParsedNull(inner) if naming.parsed_null => named(inner),
+                    ValueRefusal::Empty if naming.empty => named(EMPTY_VALUE),
+                    ValueRefusal::MoreThanOneType if naming.update => named(MORE_THAN_ONE_TYPE),
+                    ValueRefusal::EmptySet(inner) if naming.update => named(inner),
+                    ValueRefusal::Number(inner) if naming.numbers.unwrap_or(older) => named(inner),
                     _ => msg,
-                }));
-            }
-        }
+                }
+            });
+            (key, read)
+        })
+        .collect();
+    if older || naming.map_order {
+        return refuse_in_map_order(read);
     }
-    Ok(Some(values))
+    // A value refused as it is parsed comes first, in written order, as for
+    // an item (captured eu-west-2 and us-east-1, 2026-11-12).
+    if let Some((_, Err(malformed))) = read.iter().find(|(_, value)| {
+        value
+            .as_ref()
+            .is_err_and(|refusal| !crate::serde_errors::is_validation_refusal(refusal))
+    }) {
+        return Err(malformed.clone());
+    }
+    // A key written twice keeps its last value, as in a map.
+    let by_key: std::collections::BTreeMap<_, _> = read.into_iter().collect();
+    let mut values = HashMap::with_capacity(by_key.len());
+    for (key, value) in by_key {
+        values.insert(key, value?);
+    }
+    Ok(values)
 }
 
 /// Deserialise a statement's `Parameters`, reading their numbers as PartiQL
@@ -1056,108 +1951,6 @@ pub(crate) fn deserialize_held_parameters<'de, D: serde::Deserializer<'de>>(
     }
 
     deserializer.deserialize_option(List)
-}
-
-/// A map of attribute values read off the wire, such as a transaction
-/// action's `Item`, `Key` or `ExpressionAttributeValues`, with the first value
-/// DynamoDB refuses held back, as [`HeldParameters`] holds a parameter. A
-/// value of the wrong JSON type still fails the read there and then, wherever
-/// it sits in the map, as DynamoDB fails the request ahead of its member
-/// checks. The request decoder raises the refusal once those checks pass.
-#[derive(Debug, Default)]
-pub(crate) struct HeldValues {
-    /// The values read, each refused one left out. `None` when the map was
-    /// left out or given as null.
-    pub(crate) values: Option<HashMap<String, AttributeValue>>,
-    /// The first refusal, as the reader raised it, marker and all.
-    pub(crate) refusal: Option<String>,
-}
-
-impl HeldValues {
-    /// Whether the map was left out or given as null.
-    pub(crate) fn is_null(&self) -> bool {
-        self.values.is_none() && self.refusal.is_none()
-    }
-
-    /// The values, this map's refusal kept in `refusal` if none is yet.
-    pub(crate) fn take(
-        self,
-        refusal: &mut Option<String>,
-    ) -> Option<HashMap<String, AttributeValue>> {
-        if let Some(held) = self.refusal {
-            refusal.get_or_insert(held);
-        }
-        self.values
-    }
-}
-
-/// Sort the message one value's read failed with: a refusal DynamoDB raises
-/// once the request's members pass is returned to be held, and anything else,
-/// a value of the wrong JSON type, fails the read.
-fn hold<E: de::Error>(message: String) -> std::result::Result<String, E> {
-    if crate::serde_errors::is_validation_refusal(&message) {
-        Ok(message)
-    } else {
-        Err(E::custom(message))
-    }
-}
-
-/// Deserialise an `Item`, a `Key` or `ExpressionAttributeValues` into
-/// [`HeldValues`], one value at a time in the order written. Every value is
-/// read through the one `from_value` call below, with its attribute's name or
-/// placeholder in hand, so that is where a refusal that names it belongs.
-pub(crate) fn deserialize_held_attributes<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<HeldValues, D::Error> {
-    struct Attributes;
-
-    impl<'de> de::Visitor<'de> for Attributes {
-        type Value = HeldValues;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a map")
-        }
-
-        fn visit_none<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
-            Ok(HeldValues::default())
-        }
-
-        fn visit_unit<E: de::Error>(self) -> std::result::Result<HeldValues, E> {
-            Ok(HeldValues::default())
-        }
-
-        fn visit_some<D: Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> std::result::Result<HeldValues, D::Error> {
-            deserializer.deserialize_map(self)
-        }
-
-        fn visit_map<A: de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> std::result::Result<HeldValues, A::Error> {
-            let mut values = HashMap::with_capacity(map.size_hint().unwrap_or(0).min(256));
-            let mut refusal = None;
-            while let Some((name, value)) = map.next_entry::<String, serde_json::Value>()? {
-                match serde_json::from_value::<AttributeValue>(value) {
-                    Ok(value) => {
-                        values.insert(name, value);
-                    }
-                    Err(e) => {
-                        let held = hold::<A::Error>(e.to_string())?;
-                        refusal.get_or_insert(held);
-                    }
-                }
-            }
-            Ok(HeldValues {
-                values: Some(values),
-                refusal,
-            })
-        }
-    }
-
-    deserializer.deserialize_option(Attributes)
 }
 
 /// Validate a PartiQL parameter's number. DynamoDB reads it as Java's
@@ -3408,5 +4201,95 @@ mod tests {
         assert_eq!(AttributeValue::BS(vec![]).type_name(), "BS");
         assert_eq!(AttributeValue::L(vec![]).type_name(), "L");
         assert_eq!(AttributeValue::M(HashMap::new()).type_name(), "M");
+    }
+
+    #[test]
+    fn a_legacy_condition_is_keyed_by_attribute_names_not_type_members() {
+        // A null `Value`, or a null condition, for an attribute named like a
+        // type member is not a null attribute value, in any legacy member.
+        for member in LEGACY_CONDITIONS {
+            for name in ["M", "L", "S", "SS", "NS", "Item", "X"] {
+                for condition in [serde_json::json!({"Value": null}), serde_json::Value::Null] {
+                    let request = serde_json::json!({ member: { name: condition } });
+                    assert!(!walk_null(&request, Shape::Request), "{request}");
+                    assert!(!reads_on_older_layer(&request), "{request}");
+                    assert!(
+                        !conditions_read_on_older_layer(&request[member]),
+                        "{request}"
+                    );
+                }
+                // A null inside the condition's value, or among its value
+                // list, still is one.
+                for condition in [
+                    serde_json::json!({"Value": {"S": null}}),
+                    serde_json::json!({"Value": {"M": {"x": null}}}),
+                    serde_json::json!({"AttributeValueList": [null]}),
+                    serde_json::json!({"AttributeValueList": [{"L": [null]}]}),
+                    serde_json::json!({"Value": {"NS": [null]}}),
+                ] {
+                    let request = serde_json::json!({ member: { name: condition } });
+                    assert!(walk_null(&request, Shape::Request), "{request}");
+                    assert!(reads_on_older_layer(&request), "{request}");
+                    assert!(
+                        conditions_read_on_older_layer(&request[member]),
+                        "{request}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_attribute_named_like_a_legacy_member_is_an_ordinary_attribute() {
+        // Below the request's root, a key called `Expected` or `ScanFilter`
+        // is an attribute or placeholder like any other: its value is walked
+        // as a value, wherever it sits.
+        for name in LEGACY_CONDITIONS {
+            for value in [
+                serde_json::json!({"BOOL": "true"}),
+                serde_json::json!({"M": {"a": null}}),
+                serde_json::json!({"S": null}),
+                serde_json::json!({"SS": [null]}),
+            ] {
+                let attributes = serde_json::json!({ "pk": {"S": "a"}, name: value });
+                for (member, map) in [
+                    ("Item", attributes.clone()),
+                    ("Key", attributes.clone()),
+                    (
+                        "ExpressionAttributeValues",
+                        serde_json::json!({ ":a": {"S": "a"}, name: value }),
+                    ),
+                ] {
+                    let request = serde_json::json!({ "TableName": "t", member: map });
+                    assert!(reads_on_older_layer(&request), "{request}");
+                    let action = serde_json::json!({"TransactItems": [{"Put": { member: map }}]});
+                    assert!(reads_on_older_layer(&action), "{action}");
+                    if value.get("BOOL").is_none() {
+                        assert!(walk_null(&request, Shape::Request), "{request}");
+                        assert!(walk_null(&action, Shape::Request), "{action}");
+                        assert!(holds_null(&map), "{map}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_starting_key_holds_a_null_type_member_as_an_item_does() {
+        for key in [
+            serde_json::json!({"pk": null}),
+            serde_json::json!({"pk": {"S": null}}),
+            serde_json::json!({"pk": {"S": "a"}, "sk": {"M": {"x": null}}}),
+            serde_json::json!({"pk": {"S": "a"}, "s": {"SS": ["a", null]}}),
+        ] {
+            assert!(attribute_map_holds_null(&key), "{key}");
+            assert!(
+                holds_null(&serde_json::json!({ "Item": key.clone() })),
+                "{key}"
+            );
+        }
+        assert!(!attribute_map_holds_null(
+            &serde_json::json!({"pk": {"S": "a"}})
+        ));
     }
 }

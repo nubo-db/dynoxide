@@ -16,11 +16,18 @@ pub struct BatchGetItemRequest {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct KeysAndAttributes {
-    #[serde(rename = "Keys")]
+    #[serde(
+        rename = "Keys",
+        deserialize_with = "crate::types::deserialize_attribute_maps"
+    )]
     pub keys: Vec<HashMap<String, AttributeValue>>,
     #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(
         rename = "ConsistentRead",
@@ -126,24 +133,25 @@ pub async fn execute<S: StorageBackend>(
     // DynamoDB validates expression attributes, key values, projections, and duplicates
     // BEFORE checking table existence. Perform these checks first.
 
-    // An empty attribute name in a key, AttributesToGet or the expression names
-    // is refused bare, before anything else here (captured in ten regions).
+    // An empty attribute name in a key or AttributesToGet is refused bare,
+    // before anything else here (captured in ten regions).
     let mut tables: Vec<&String> = request.request_items.keys().collect();
     tables.sort_unstable();
-    for table in tables {
-        let ka = &request.request_items[table];
+    for table in &tables {
+        let ka = &request.request_items[*table];
         if ka.keys.iter().any(crate::empty_names::map_has_empty_name)
             || crate::empty_names::names_include_empty(ka.attributes_to_get.as_ref())
         {
             return Err(crate::empty_names::bare());
         }
-        crate::empty_names::check_names(ka.expression_attribute_names.as_ref())?;
     }
 
     // Reject a request that pairs an expression projection with a non-expression
     // AttributesToGet, whether in the same block or across blocks. AWS rejects the
     // request as a whole even when each block is internally consistent.
-    // Order-independent over the request map.
+    // Order-independent over the request map. It comes ahead of an empty
+    // expression name, as on GetItem (captured eu-west-2 and us-east-1,
+    // 2026-11-12).
     let any_projection = request
         .request_items
         .values()
@@ -152,10 +160,28 @@ pub async fn execute<S: StorageBackend>(
         .request_items
         .values()
         .any(|ka| ka.attributes_to_get.is_some());
-    if any_projection && any_attributes_to_get {
-        return Err(DynoxideError::ValidationException(
-            "Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}".to_string(),
-        ));
+    if let Some(message) = helpers::mixed_parameters_refusal(
+        if any_attributes_to_get {
+            &["AttributesToGet"]
+        } else {
+            &[]
+        },
+        if any_projection {
+            &["ProjectionExpression"]
+        } else {
+            &[]
+        },
+    ) {
+        return Err(DynoxideError::ValidationException(message));
+    }
+
+    // An empty expression name, refused bare (captured in ten regions).
+    for table in tables {
+        crate::empty_names::check_names_early(
+            request.request_items[table]
+                .expression_attribute_names
+                .as_ref(),
+        )?;
     }
 
     // Each table's ProjectionExpression, checked through before any table is
@@ -187,6 +213,9 @@ pub async fn execute<S: StorageBackend>(
                     )));
                 }
             }
+            // An empty name left to here, on the older layer (see
+            // `empty_names::names_checked_early`).
+            crate::empty_names::check_names(Some(ean))?;
         }
 
         // Empty ProjectionExpression

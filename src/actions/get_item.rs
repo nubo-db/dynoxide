@@ -10,7 +10,11 @@ use std::collections::HashMap;
 struct GetItemRequestRaw {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
-    #[serde(rename = "Key", default)]
+    #[serde(
+        rename = "Key",
+        default,
+        deserialize_with = "crate::types::deserialize_attribute_map"
+    )]
     key: Option<HashMap<String, AttributeValue>>,
     #[serde(
         rename = "ConsistentRead",
@@ -20,7 +24,11 @@ struct GetItemRequestRaw {
     consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
@@ -130,9 +138,10 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
 
-    // Validate expression/non-expression parameter conflicts
+    // Validate expression/non-expression parameter conflicts. The conflict
+    // comes ahead of an empty expression name, on either layer (captured
+    // eu-west-2 and us-east-1, 2026-11-12).
     {
         let mut non_expr = Vec::new();
         let mut expr_params = Vec::new();
@@ -142,6 +151,10 @@ pub async fn execute<S: StorageBackend>(
         if request.projection_expression.is_some() {
             expr_params.push("ProjectionExpression");
         }
+        if let Some(message) = helpers::mixed_parameters_refusal(&non_expr, &expr_params) {
+            return Err(DynoxideError::ValidationException(message));
+        }
+        crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr_params,

@@ -24,7 +24,49 @@ struct TransactGetItemsRequestRaw {
 #[derive(Deserialize)]
 struct TransactGetItemRaw {
     #[serde(rename = "Get", default)]
-    get: Option<TransactGet>,
+    get: Option<TransactGetRaw>,
+}
+
+/// A `Get` as it arrives, its names as written (see
+/// [`crate::empty_names::action_names`]). Every reader of a `Get`, the MCP
+/// tool's included, goes through it.
+#[derive(Deserialize)]
+struct TransactGetRaw {
+    #[serde(rename = "TableName")]
+    table_name: String,
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
+    key: HashMap<String, AttributeValue>,
+    #[serde(rename = "ProjectionExpression", default)]
+    projection_expression: Option<String>,
+    #[serde(rename = "ExpressionAttributeNames", default)]
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
+}
+
+impl TransactGetRaw {
+    fn holds_null_name(&self) -> bool {
+        self.expression_attribute_names
+            .as_ref()
+            .is_some_and(|names| names.values().any(Option::is_none))
+    }
+}
+
+impl From<TransactGetRaw> for TransactGet {
+    /// A null name is read as an empty one. Without a `ProjectionExpression`
+    /// the names are not checked at all, so a null needs no case of its own.
+    fn from(raw: TransactGetRaw) -> Self {
+        TransactGet {
+            expression_attribute_names: crate::empty_names::action_names(
+                raw.expression_attribute_names,
+                true,
+            ),
+            table_name: raw.table_name,
+            key: raw.key,
+            projection_expression: raw.projection_expression,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for TransactGetItemsRequest {
@@ -62,12 +104,27 @@ impl<'de> Deserialize<'de> for TransactGetItemsRequest {
             }
         }
 
+        let gets: Vec<TransactGetRaw> = raw
+            .transact_items
+            .into_iter()
+            .filter_map(|item| item.get)
+            .collect();
+
+        // More than 100 Gets with a null name among them are refused in the
+        // older form, every Get echoed as sent and the null name printed
+        // `null`. Without a null the short form is given, from `execute`
+        // (captured eu-west-2 and us-east-1, 2026-11-12).
+        if gets.len() > 100 && gets.iter().any(TransactGetRaw::holds_null_name) {
+            return Err(serde::de::Error::custom(format!(
+                "VALIDATION:1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+                gets_echo(&gets)
+            )));
+        }
+
         Ok(TransactGetItemsRequest {
-            transact_items: raw
-                .transact_items
+            transact_items: gets
                 .into_iter()
-                .filter_map(|item| item.get)
-                .map(|get| TransactGetItem { get })
+                .map(|get| TransactGetItem { get: get.into() })
                 .collect(),
             return_consumed_capacity: raw.return_consumed_capacity,
         })
@@ -81,14 +138,11 @@ pub struct TransactGetItem {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(from = "TransactGetRaw")]
 pub struct TransactGet {
-    #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Key")]
     pub key: HashMap<String, AttributeValue>,
-    #[serde(rename = "ProjectionExpression", default)]
     pub projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
 }
 
@@ -112,32 +166,31 @@ pub struct TransactGetResponse {
     pub item: Option<Item>,
 }
 
-/// The action list as DynamoDB echoes it in a constraint message: each
-/// action's Java `toString`, every field named, in the form us-east-1,
-/// eu-west-1 and us-west-2 gave on 2026-10-10. eu-west-2 echoes no list
-/// (`Value at 'TransactItems'`), and some hosts print each attribute value as
-/// an object hash; the form most regions give is the one followed. Bounded by
+/// The Gets as DynamoDB echoes them in a constraint message: each Get's Java
+/// `toString`, every field named, its names as written, in the form
+/// us-east-1, eu-west-1 and us-west-2 gave on 2026-10-10. Bounded by
 /// [`crate::actions::batch_write_item::ECHO_LIMIT`].
-fn items_echo(items: &[TransactGetItem]) -> String {
+fn gets_echo(gets: &[TransactGetRaw]) -> String {
     let mut out = crate::actions::batch_write_item::BoundedEcho::new();
-    let _ = write_items(&mut out, items);
+    let _ = write_gets(&mut out, gets);
     out.finish()
 }
 
-fn write_items(out: &mut dyn std::fmt::Write, items: &[TransactGetItem]) -> std::fmt::Result {
-    use crate::actions::batch_write_item::{write_java_item, write_java_names, write_java_text};
+fn write_gets(out: &mut dyn std::fmt::Write, gets: &[TransactGetRaw]) -> std::fmt::Result {
+    use crate::actions::batch_write_item::{
+        write_java_item, write_java_text, write_java_written_names,
+    };
     out.write_str("[")?;
-    for (i, item) in items.iter().enumerate() {
+    for (i, get) in gets.iter().enumerate() {
         if i > 0 {
             out.write_str(", ")?;
         }
-        let get = &item.get;
         out.write_str("TransactGetItem(get=Get(key=")?;
         write_java_item(out, &get.key)?;
         write!(out, ", tableName={}, projectionExpression=", get.table_name)?;
         write_java_text(out, get.projection_expression.as_deref())?;
         out.write_str(", expressionAttributeNames=")?;
-        write_java_names(out, get.expression_attribute_names.as_ref())?;
+        write_java_written_names(out, get.expression_attribute_names.as_ref())?;
         out.write_str(", workloadProfileName=null))")?;
     }
     out.write_str("]")
@@ -154,12 +207,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate: up to 100 actions, echoing the list as DynamoDB does.
+    // Up to 100 Gets. A request with no null name is refused in the short
+    // form, with nothing echoed (captured eu-west-2 and us-east-1,
+    // 2026-11-12); one with a null name never reaches here (see the request's
+    // `Deserialize`).
     if request.transact_items.len() > 100 {
-        return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
-            items_echo(&request.transact_items)
-        )));
+        return Err(DynoxideError::ValidationException(
+            "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: Member must have length less than or equal to 100".to_string(),
+        ));
     }
 
     // ReturnConsumedCapacity outside the enum: refused with the message the
@@ -191,13 +246,17 @@ pub async fn execute<S: StorageBackend>(
 
     // An empty attribute name in a key or the expression names is a top-level
     // rejection, not a cancellation reason, ahead of the table lookups
-    // (captured in ten regions).
+    // (captured in ten regions). A `Get` with no `ProjectionExpression` has
+    // its names ignored, empty or unused alike, and goes on to the table
+    // lookup (captured eu-west-2 and us-east-1, 2026-11-12).
     for transact_item in &request.transact_items {
         let get = &transact_item.get;
         if crate::empty_names::map_has_empty_name(&get.key) {
             return Err(crate::empty_names::bare());
         }
-        crate::empty_names::check_names(get.expression_attribute_names.as_ref())?;
+        if get.projection_expression.is_some() {
+            crate::empty_names::check_names(get.expression_attribute_names.as_ref())?;
+        }
     }
 
     // A key nested too deep fails the whole request at the top level, before
@@ -246,8 +305,8 @@ pub async fn execute<S: StorageBackend>(
             tracker.track_projection_expr(&projection);
             expressions::projection::validate(&projection, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
+            tracker.check_unused()?;
         }
-        tracker.check_unused()?;
     }
 
     // Per-action validation pass.

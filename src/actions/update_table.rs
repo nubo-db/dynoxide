@@ -72,40 +72,16 @@ impl<'de> serde::Deserialize<'de> for UpdateTableRequest {
         }
 
         // Phase 1: Check TableName missing
-        if raw.table_name.is_none() || raw.table_name.as_deref() == Some("") {
-            let msg = if raw.table_name.is_none() {
-                "The parameter 'TableName' is required but was not present in the request"
-            } else {
-                "TableName must be at least 3 characters long and at most 255 characters long"
-            };
-            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
-        }
-
-        let table_name = raw.table_name.unwrap_or_default();
-
-        // Phase 2: Check TableName length
-        if table_name.len() < 3 || table_name.len() > 255 {
+        let Some(table_name) = raw.table_name.take() else {
             return Err(serde::de::Error::custom(
-                "VALIDATION:TableName must be at least 3 characters long and at most 255 characters long",
+                "VALIDATION:The parameter 'TableName' is required but was not present in the request",
             ));
-        }
+        };
 
-        // Phase 3: Multi-field constraint validation
-        let mut errors = Vec::new();
-
-        if !table_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
-            errors.push(format!(
-                "Value '{}' at 'tableName' failed to satisfy constraint: \
-                 Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-                table_name
-            ));
-        }
-
-        if let Some(msg) = crate::validation::format_validation_errors(&errors) {
-            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        // Phase 2: the table name's length in UTF-16 units, then its pattern,
+        // both listed in the envelope; an empty name gets a bare sentence.
+        if let Some(msg) = crate::validation::control_table_name_rejection(&table_name) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
 
         // Request-model constraint errors for the raw vector create actions,

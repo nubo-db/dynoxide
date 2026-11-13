@@ -425,7 +425,9 @@ fn validate_typed_request(request: &CreateTableRequest) -> Result<()> {
             "The parameter 'TableName' is required but was not present in the request".to_string(),
         ));
     }
-    if request.table_name.len() < 3 || request.table_name.len() > 255 {
+    if !(3..=255).contains(&crate::validation::length_in_utf16_units(
+        &request.table_name,
+    )) {
         return Err(DynoxideError::ValidationException(
             "TableName must be at least 3 characters long and at most 255 characters long"
                 .to_string(),

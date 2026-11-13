@@ -36,6 +36,16 @@ struct LeftOut {
     reason: &'static str,
 }
 
+/// A row compared by the shape of its answer only: the same status, error
+/// type and number of faults, each fault the same apart from the table it
+/// names, and each named table a different one from the request. DynamoDB
+/// lists ten faults of eleven or twelve here, and which ten, and their order,
+/// differed between the regions in a way no rule reproduces.
+struct ByShape {
+    operation: &'static str,
+    body: &'static str,
+}
+
 /// Why a row whose answer echoes attribute values is left out: eu-west-2
 /// printed each one as an object hash in that answer, and Dynoxide prints the
 /// Java model's fields, as us-east-1 did. The regions swapped forms between
@@ -82,13 +92,37 @@ fn status_of(answer: &Value) -> u16 {
     }
 }
 
+/// The faults of a validation answer with the table each one names taken
+/// out, in order of text, and the tables named, in the order listed.
+fn fault_shapes(answer: &Value) -> (Vec<String>, Vec<String>) {
+    let message = answer["message"].as_str().unwrap_or_default();
+    let faults = message.split_once("detected: ").map_or(message, |(_, f)| f);
+    let mut shapes = Vec::new();
+    let mut tables = Vec::new();
+    for fault in faults.split("; ") {
+        let Some(at) = fault.find("equestItems.") else {
+            shapes.push(fault.to_string());
+            continue;
+        };
+        let start = at + "equestItems.".len();
+        let end = start + fault[start..].find(".member").unwrap_or(0);
+        tables.push(fault[start..end].to_string());
+        shapes.push(format!("{}<table>{}", &fault[..start], &fault[end..]));
+    }
+    shapes.sort();
+    (shapes, tables)
+}
+
+/// How many rows were sent, compared in full, compared by shape and left out.
+type Counts = (usize, usize, usize, usize);
+
 /// Send every row, in order, to one server, and list each answer that differs
 /// from eu-west-2's. A row left out by name must keep the answer recorded for
-/// it. Returns how many rows were sent, compared and left out.
-async fn replay(rows: &[Row], left_out_rows: &[LeftOut]) -> (usize, usize, usize) {
+/// it, and a row compared by shape must match eu-west-2's answer in shape.
+async fn replay(rows: &[Row], left_out_rows: &[LeftOut], by_shape_rows: &[ByShape]) -> Counts {
     let url = start_server().await;
     let mut wrong = Vec::new();
-    let (mut sent, mut compared, mut left_out) = (0, 0, 0);
+    let (mut sent, mut compared, mut by_shape, mut left_out) = (0, 0, 0, 0);
     for row in rows {
         let expected: Value = serde_json::from_str(row.answer).unwrap();
         let other: Option<Value> = row.us_east_1.map(|a| serde_json::from_str(a).unwrap());
@@ -119,6 +153,32 @@ async fn replay(rows: &[Row], left_out_rows: &[LeftOut]) -> (usize, usize, usize
             }
             continue;
         }
+        if by_shape_rows
+            .iter()
+            .any(|b| b.operation == row.operation && b.body == row.body)
+        {
+            by_shape += 1;
+            let (want, _) = fault_shapes(&expected);
+            let (shapes, tables) = fault_shapes(&got);
+            let body: Value = serde_json::from_str(row.body).unwrap();
+            let mut distinct = tables.clone();
+            distinct.sort();
+            distinct.dedup();
+            if status != status_of(&expected)
+                || got["__type"] != expected["__type"]
+                || shapes != want
+                || distinct.len() != tables.len()
+                || tables.iter().any(|t| body["RequestItems"].get(t).is_none())
+            {
+                wrong.push(format!(
+                    "{} {} (compared by shape)\n  expected {} {expected}\n  got      {status} {got}",
+                    row.operation,
+                    row.body,
+                    status_of(&expected)
+                ));
+            }
+            continue;
+        }
         compared += 1;
         if status != status_of(&expected) || got != expected {
             let region = match &other {
@@ -133,14 +193,16 @@ async fn replay(rows: &[Row], left_out_rows: &[LeftOut]) -> (usize, usize, usize
             ));
         }
     }
-    println!("sent {sent} rows, compared {compared}, left out {left_out}");
+    println!(
+        "sent {sent} rows, compared {compared}, compared by shape {by_shape}, left out {left_out}"
+    );
     assert!(
         wrong.is_empty(),
         "{} of {sent} rows differ:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
-    (sent, compared, left_out)
+    (sent, compared, by_shape, left_out)
 }
 
 /// Each row left out names a row that is sent.
@@ -160,7 +222,7 @@ fn assert_left_out_rows_are_sent(rows: &[Row], left_out_rows: &[LeftOut]) {
 /// on its own, or beside one other fault.
 #[tokio::test]
 async fn malformed_request_items_answer_as_dynamodb_did() {
-    assert_eq!(replay(ROWS, LEFT_OUT).await, (50, 50, 0));
+    assert_eq!(replay(ROWS, LEFT_OUT, &[]).await, (50, 50, 0, 0));
 }
 
 /// The second set, captured on 13 November 2026: how those faults sit beside
@@ -168,13 +230,38 @@ async fn malformed_request_items_answer_as_dynamodb_did() {
 /// an empty or overlong list and each other.
 #[tokio::test]
 async fn faults_beside_other_faults_answer_as_dynamodb_did() {
-    assert_eq!(replay(SECOND_ROWS, SECOND_LEFT_OUT).await, (31, 30, 1));
+    assert_eq!(
+        replay(SECOND_ROWS, SECOND_LEFT_OUT, &[]).await,
+        (31, 30, 0, 1)
+    );
+}
+
+/// The third set, captured on 13 November 2026: ten faults at most, a table
+/// written twice, names of the same hash in both written orders, null slots
+/// beside null members, and more than 25 requests across tables.
+#[tokio::test]
+async fn limits_repeats_and_orders_answer_as_dynamodb_did() {
+    assert_eq!(
+        replay(THIRD_ROWS, THIRD_LEFT_OUT, THIRD_BY_SHAPE).await,
+        (28, 24, 3, 1)
+    );
 }
 
 #[test]
 fn every_row_left_out_is_sent() {
     assert_left_out_rows_are_sent(ROWS, LEFT_OUT);
     assert_left_out_rows_are_sent(SECOND_ROWS, SECOND_LEFT_OUT);
+    assert_left_out_rows_are_sent(THIRD_ROWS, THIRD_LEFT_OUT);
+    for b in THIRD_BY_SHAPE {
+        assert!(
+            THIRD_ROWS
+                .iter()
+                .any(|row| row.operation == b.operation && row.body == b.body),
+            "{} {} is compared by shape but not sent",
+            b.operation,
+            b.body
+        );
+    }
 }
 
 const ROWS: &[Row] = &[
@@ -702,4 +789,207 @@ const SECOND_LEFT_OUT: &[LeftOut] = &[LeftOut {
     body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{},"_capture_20261113_sweep_other":{"Keys":[{"pk":{"S":"k0"}},{"pk":{"S":"k1"}},{"pk":{"S":"k2"}},{"pk":{"S":"k3"}},{"pk":{"S":"k4"}},{"pk":{"S":"k5"}},{"pk":{"S":"k6"}},{"pk":{"S":"k7"}},{"pk":{"S":"k8"}},{"pk":{"S":"k9"}},{"pk":{"S":"k10"}},{"pk":{"S":"k11"}},{"pk":{"S":"k12"}},{"pk":{"S":"k13"}},{"pk":{"S":"k14"}},{"pk":{"S":"k15"}},{"pk":{"S":"k16"}},{"pk":{"S":"k17"}},{"pk":{"S":"k18"}},{"pk":{"S":"k19"}},{"pk":{"S":"k20"}},{"pk":{"S":"k21"}},{"pk":{"S":"k22"}},{"pk":{"S":"k23"}},{"pk":{"S":"k24"}},{"pk":{"S":"k25"}},{"pk":{"S":"k26"}},{"pk":{"S":"k27"}},{"pk":{"S":"k28"}},{"pk":{"S":"k29"}},{"pk":{"S":"k30"}},{"pk":{"S":"k31"}},{"pk":{"S":"k32"}},{"pk":{"S":"k33"}},{"pk":{"S":"k34"}},{"pk":{"S":"k35"}},{"pk":{"S":"k36"}},{"pk":{"S":"k37"}},{"pk":{"S":"k38"}},{"pk":{"S":"k39"}},{"pk":{"S":"k40"}},{"pk":{"S":"k41"}},{"pk":{"S":"k42"}},{"pk":{"S":"k43"}},{"pk":{"S":"k44"}},{"pk":{"S":"k45"}},{"pk":{"S":"k46"}},{"pk":{"S":"k47"}},{"pk":{"S":"k48"}},{"pk":{"S":"k49"}},{"pk":{"S":"k50"}},{"pk":{"S":"k51"}},{"pk":{"S":"k52"}},{"pk":{"S":"k53"}},{"pk":{"S":"k54"}},{"pk":{"S":"k55"}},{"pk":{"S":"k56"}},{"pk":{"S":"k57"}},{"pk":{"S":"k58"}},{"pk":{"S":"k59"}},{"pk":{"S":"k60"}},{"pk":{"S":"k61"}},{"pk":{"S":"k62"}},{"pk":{"S":"k63"}},{"pk":{"S":"k64"}},{"pk":{"S":"k65"}},{"pk":{"S":"k66"}},{"pk":{"S":"k67"}},{"pk":{"S":"k68"}},{"pk":{"S":"k69"}},{"pk":{"S":"k70"}},{"pk":{"S":"k71"}},{"pk":{"S":"k72"}},{"pk":{"S":"k73"}},{"pk":{"S":"k74"}},{"pk":{"S":"k75"}},{"pk":{"S":"k76"}},{"pk":{"S":"k77"}},{"pk":{"S":"k78"}},{"pk":{"S":"k79"}},{"pk":{"S":"k80"}},{"pk":{"S":"k81"}},{"pk":{"S":"k82"}},{"pk":{"S":"k83"}},{"pk":{"S":"k84"}},{"pk":{"S":"k85"}},{"pk":{"S":"k86"}},{"pk":{"S":"k87"}},{"pk":{"S":"k88"}},{"pk":{"S":"k89"}},{"pk":{"S":"k90"}},{"pk":{"S":"k91"}},{"pk":{"S":"k92"}},{"pk":{"S":"k93"}},{"pk":{"S":"k94"}},{"pk":{"S":"k95"}},{"pk":{"S":"k96"}},{"pk":{"S":"k97"}},{"pk":{"S":"k98"}},{"pk":{"S":"k99"}},{"pk":{"S":"k100"}}]}}}"#,
     answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value null at 'requestItems._capture_20261113_sweep_none.member.keys' failed to satisfy constraint: Member must not be null; Value '[{pk=AttributeValue(s=k0, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k1, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k2, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k3, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k4, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k5, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k6, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k7, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k8, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k9, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k10, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k11, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k12, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k13, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k14, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k15, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k16, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k17, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k18, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k19, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k20, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k21, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k22, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k23, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k24, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k25, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k26, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k27, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k28, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k29, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k30, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k31, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k32, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k33, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k34, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k35, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k36, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k37, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k38, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k39, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k40, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k41, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k42, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k43, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k44, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k45, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k46, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k47, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k48, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k49, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k50, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k51, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k52, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k53, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k54, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k55, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k56, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k57, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k58, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k59, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k60, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k61, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k62, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k63, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k64, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k65, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k66, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k67, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k68, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k69, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k70, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k71, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k72, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k73, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k74, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k75, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k76, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k77, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k78, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k79, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k80, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k81, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k82, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k83, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k84, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k85, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k86, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k87, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k88, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k89, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k90, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k91, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k92, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k93, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k94, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k95, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k96, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k97, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k98, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k99, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, {pk=AttributeValue(s=k100, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}]' at 'requestItems._capture_20261113_sweep_other.member.keys' failed to satisfy constraint: Member must have length less than or equal to 100"}"#,
     reason: HASHED_ECHO,
+}];
+
+const THIRD_ROWS: &[Row] = &[
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"t00":[],"t01":[],"t02":[],"t03":[],"t04":[],"t05":[],"t06":[],"t07":[],"t08":[],"t09":[],"t10":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value at 'RequestItems.t05.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t02.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t07.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t00.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t10.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t01.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t03.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t04.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t09.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t06.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: Some(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value at 'RequestItems.t09.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t01.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t03.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t05.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t02.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t08.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t10.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t07.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t00.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t04.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"t00":[],"t01":[],"t02":[],"t03":[],"t04":[],"t05":[],"t06":[],"t07":[],"t08":[],"t09":[],"t10":[],"t11":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value at 'RequestItems.t00.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t04.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t07.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t08.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t06.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t02.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t03.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t09.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t10.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t11.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: Some(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value at 'RequestItems.t09.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t00.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t06.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t07.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t08.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t10.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t03.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t02.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t01.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t04.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"t00":{},"t01":{},"t02":{},"t03":{},"t04":{},"t05":{},"t06":{},"t07":{},"t08":{},"t09":{},"t10":{}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value null at 'requestItems.t10.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t01.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t00.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t03.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t02.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t05.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t04.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t07.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t06.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.t09.member.keys' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"t00":{"Keys":[]},"t01":{"Keys":[]},"t02":{"Keys":[]},"t03":{"Keys":[]},"t04":{"Keys":[]},"t05":{"Keys":[]},"t06":{"Keys":[]},"t07":{"Keys":[]},"t08":{"Keys":[]},"t09":{"Keys":[]},"t10":{"Keys":[]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value at 'RequestItems.t01.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t04.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t05.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t02.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t00.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t03.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t06.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t07.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t08.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t09.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: Some(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"10 validation errors detected: Value at 'RequestItems.t01.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t05.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t10.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t03.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t06.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t00.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t07.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t04.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t02.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.t08.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":null,"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":null}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{}}],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[null],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[],"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}],"_capture_20261113_sweep_none":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{},"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":null,"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}},"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"AaAa":[],"BBBB":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value at 'RequestItems.AaAa.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.BBBB.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"BBBB":[],"AaAa":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value at 'RequestItems.AaAa.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.BBBB.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: Some(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value at 'RequestItems.BBBB.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems.AaAa.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"AaAa":{},"BBBB":{}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value null at 'requestItems.AaAa.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.BBBB.member.keys' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"BBBB":{},"AaAa":{}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value null at 'requestItems.BBBB.member.keys' failed to satisfy constraint: Member must not be null; Value null at 'requestItems.AaAa.member.keys' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_z":[],"_capture_20261113_sweep_m":[],"_capture_20261113_sweep_a":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"3 validation errors detected: Value at 'RequestItems._capture_20261113_sweep_m.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems._capture_20261113_sweep_a.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems._capture_20261113_sweep_z.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: Some(
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"3 validation errors detected: Value at 'RequestItems._capture_20261113_sweep_a.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems._capture_20261113_sweep_z.member' failed to satisfy constraint: Member must have length greater than or equal to 1; Value at 'RequestItems._capture_20261113_sweep_m.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        ),
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":null,"_capture_20261113_sweep_other":[{"PutRequest":{}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'requestItems._capture_20261113_sweep_other.member.1.member.putRequest.item' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_other":[{"PutRequest":{}}],"_capture_20261113_sweep_none":null}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'requestItems._capture_20261113_sweep_other.member.1.member.putRequest.item' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[null],"_capture_20261113_sweep_other":[{"PutRequest":{}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'requestItems._capture_20261113_sweep_other.member.1.member.putRequest.item' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":null,"_capture_20261113_sweep_other":{}}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'requestItems._capture_20261113_sweep_other.member.keys' failed to satisfy constraint: Member must not be null"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":null,"_capture_20261113_sweep_other":null}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"The list of keys in RequestItems for BatchGetItem is required: _capture_20261113_sweep_none has empty list"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a0"}}}},{"PutRequest":{"Item":{"pk":{"S":"a1"}}}},{"PutRequest":{"Item":{"pk":{"S":"a2"}}}},{"PutRequest":{"Item":{"pk":{"S":"a3"}}}},{"PutRequest":{"Item":{"pk":{"S":"a4"}}}},{"PutRequest":{"Item":{"pk":{"S":"a5"}}}},{"PutRequest":{"Item":{"pk":{"S":"a6"}}}},{"PutRequest":{"Item":{"pk":{"S":"a7"}}}},{"PutRequest":{"Item":{"pk":{"S":"a8"}}}},{"PutRequest":{"Item":{"pk":{"S":"a9"}}}},{"PutRequest":{"Item":{"pk":{"S":"a10"}}}},{"PutRequest":{"Item":{"pk":{"S":"a11"}}}},{"PutRequest":{"Item":{"pk":{"S":"a12"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":"b0"}}}},{"PutRequest":{"Item":{"pk":{"S":"b1"}}}},{"PutRequest":{"Item":{"pk":{"S":"b2"}}}},{"PutRequest":{"Item":{"pk":{"S":"b3"}}}},{"PutRequest":{"Item":{"pk":{"S":"b4"}}}},{"PutRequest":{"Item":{"pk":{"S":"b5"}}}},{"PutRequest":{"Item":{"pk":{"S":"b6"}}}},{"PutRequest":{"Item":{"pk":{"S":"b7"}}}},{"PutRequest":{"Item":{"pk":{"S":"b8"}}}},{"PutRequest":{"Item":{"pk":{"S":"b9"}}}},{"PutRequest":{"Item":{"pk":{"S":"b10"}}}},{"PutRequest":{"Item":{"pk":{"S":"b11"}}}},{"PutRequest":{"Item":{"pk":{"S":"b12"}}}}]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"Too many items requested for the BatchWriteItem call"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"_capture_20261113_sweep_none":[{"PutRequest":{"Item":{"pk":{"S":"a0"}}}},{"PutRequest":{"Item":{"pk":{"S":"a1"}}}},{"PutRequest":{"Item":{"pk":{"S":"a2"}}}},{"PutRequest":{"Item":{"pk":{"S":"a3"}}}},{"PutRequest":{"Item":{"pk":{"S":"a4"}}}},{"PutRequest":{"Item":{"pk":{"S":"a5"}}}},{"PutRequest":{"Item":{"pk":{"S":"a6"}}}},{"PutRequest":{"Item":{"pk":{"S":"a7"}}}},{"PutRequest":{"Item":{"pk":{"S":"a8"}}}},{"PutRequest":{"Item":{"pk":{"S":"a9"}}}},{"PutRequest":{"Item":{"pk":{"S":"a10"}}}},{"PutRequest":{"Item":{"pk":{"S":"a11"}}}},{"PutRequest":{"Item":{"pk":{"S":"a12"}}}}],"_capture_20261113_sweep_other":[{"PutRequest":{"Item":{"pk":{"S":"b0"}}}},{"PutRequest":{"Item":{"pk":{"S":"b1"}}}},{"PutRequest":{"Item":{"pk":{"S":"b2"}}}},{"PutRequest":{"Item":{"pk":{"S":"b3"}}}},{"PutRequest":{"Item":{"pk":{"S":"b4"}}}},{"PutRequest":{"Item":{"pk":{"S":"b5"}}}},{"PutRequest":{"Item":{"pk":{"S":"b6"}}}},{"PutRequest":{"Item":{"pk":{"S":"b7"}}}},{"PutRequest":{"Item":{"pk":{"S":"b8"}}}},{"PutRequest":{"Item":{"pk":{"S":"b9"}}}},{"PutRequest":{"Item":{"pk":{"S":"b10"}}}},{"PutRequest":{"Item":{"pk":{"S":"b11"}}}},{"PutRequest":{"Item":{"pk":{"S":"b12"}}}}],"_capture_20261113_sweep_z":[]}}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value at 'RequestItems._capture_20261113_sweep_z.member' failed to satisfy constraint: Member must have length greater than or equal to 1"}"#,
+        us_east_1: None,
+    },
+    Row {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"bad!name":[{"PutRequest":{"Item":{"pk":{"S":"a"}}}}]},"ReturnItemCollectionMetrics":"BOGUS"}"#,
+        answer: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"2 validation errors detected: Value '{\"bad!name\":[{\"PutRequest\":{\"Item\":{\"pk\":{\"S\":\"a\"}}}}]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]; Value 'BOGUS' at 'returnItemCollectionMetrics' failed to satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"}"#,
+        us_east_1: None,
+    },
+];
+
+const THIRD_BY_SHAPE: &[ByShape] = &[
+    ByShape {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"t00":[],"t01":[],"t02":[],"t03":[],"t04":[],"t05":[],"t06":[],"t07":[],"t08":[],"t09":[],"t10":[]}}"#,
+    },
+    ByShape {
+        operation: "BatchWriteItem",
+        body: r#"{"RequestItems":{"t00":[],"t01":[],"t02":[],"t03":[],"t04":[],"t05":[],"t06":[],"t07":[],"t08":[],"t09":[],"t10":[],"t11":[]}}"#,
+    },
+    ByShape {
+        operation: "BatchGetItem",
+        body: r#"{"RequestItems":{"t00":{"Keys":[]},"t01":{"Keys":[]},"t02":{"Keys":[]},"t03":{"Keys":[]},"t04":{"Keys":[]},"t05":{"Keys":[]},"t06":{"Keys":[]},"t07":{"Keys":[]},"t08":{"Keys":[]},"t09":{"Keys":[]},"t10":{"Keys":[]}}}"#,
+    },
+];
+
+const THIRD_LEFT_OUT: &[LeftOut] = &[LeftOut {
+    operation: "BatchGetItem",
+    body: r#"{"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}},"RequestItems":{"_capture_20261113_sweep_none":{"Keys":[{"pk":{"S":"a"}}]}}}"#,
+    answer: r#"{"Message":"duplicate field `RequestItems` at line 1 column 91","__type":"com.amazon.coral.service#SerializationException"}"#,
+    reason: "RequestItems written twice is a repeated member name, a separate change",
 }];

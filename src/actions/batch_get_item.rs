@@ -247,15 +247,27 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate each table entry has at least one key. Checked ahead of the table
-    // names and reported alone, even beside an unknown capacity mode (captured
-    // in twelve regions, 2026-10-09).
-    for (table_name, ka) in &request.request_items {
-        if ka.keys.is_empty() {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            )));
-        }
+    // A table entry with no keys is a fault of its own, one for each such
+    // table up to ten, checked ahead of the table names and reported alone,
+    // even beside an unknown capacity mode (captured in twelve regions,
+    // 2026-10-09, and eleven tables in eu-west-2 and us-east-1, 2026-11-13).
+    // The order is BatchWriteItem's for its lists' lengths: eleven tables
+    // came back in no order that could be reproduced.
+    let mut empty_keys: Vec<String> =
+        helpers::length_fault_order(request.request_items.keys().map(String::as_str))
+            .into_iter()
+            .filter(|table_name| request.request_items[*table_name].keys.is_empty())
+            .map(|table_name| {
+                format!(
+                    "Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy \
+                     constraint: Member must have length greater than or equal to 1"
+                )
+            })
+            .collect();
+    // DynamoDB lists ten member faults at most.
+    empty_keys.truncate(10);
+    if let Some(message) = crate::validation::format_validation_errors(&empty_keys) {
+        return Err(DynoxideError::ValidationException(message));
     }
 
     // Validate total key count.

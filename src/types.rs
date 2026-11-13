@@ -607,7 +607,7 @@ fn unreadable_member(type_key: &str, value: &serde_json::Value) -> Option<Cow<'s
 }
 
 /// DynamoDB's refusal of a map that names a member twice.
-const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
+pub(crate) const DUPLICATE_MEMBER: &str = "Duplicate key found in payload";
 
 /// DynamoDB's refusal of an attribute value that is malformed as JSON, read
 /// from it as written, so every copy of a name written twice is seen, at any

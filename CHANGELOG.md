@@ -209,10 +209,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Member must have length greater than or equal to 1` (or `less than or
   equal to 25`), one fault for each such table, with no echo of the request
   and ahead of a bad `ReturnConsumedCapacity` or
-  `ReturnItemCollectionMetrics`, which are no longer listed beside it. A
-  table name that breaks its constraints echoes the request as JSON and is
-  listed ahead of those enum faults, where it used to follow them. us-east-1
-  still gave the older answers when captured.
+  `ReturnItemCollectionMetrics`, which are no longer listed beside it. More
+  than 25 requests across tables that each hold 25 or fewer is `Too many
+  items requested for the BatchWriteItem call`. A table name that breaks its
+  constraints echoes the request as JSON and is listed ahead of those enum
+  faults, where it used to follow them. us-east-1 still gave the older
+  answers when captured.
+
+- BatchGetItem and BatchWriteItem refuse a table written twice in
+  `RequestItems` with a `SerializationException`, `Duplicate key found in
+  payload`, as DynamoDB does whatever either copy holds. Dynoxide used the
+  last copy. Tables with empty `Keys` are listed one fault per table, ten at
+  most, as BatchWriteItem's empty or overlong lists are; BatchGetItem used to
+  report only one of them.
 
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

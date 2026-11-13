@@ -2873,15 +2873,17 @@ pub(crate) fn select_projection_rejection(
 }
 
 /// A batch request's `RequestItems` as read: each table's entry in the order
-/// it was written. A table written twice keeps its first place and its last
-/// entry, the entry a decoded map would hold.
+/// it was written. A table written twice fails the read as a malformed
+/// request, whatever either copy holds (captured eu-west-2 and us-east-1,
+/// 13 November 2026).
 pub(crate) struct WrittenTables<V>(pub(crate) Vec<(String, V)>);
 
 impl<V> WrittenTables<V> {
-    /// The table names in the order DynamoDB walks the map: a Java hash map
-    /// sized to its entries, names sharing a bucket in written order (two and
-    /// three tables with no `Keys` captured eu-west-2 and us-east-1, 11 and 13
-    /// November 2026).
+    /// The table names in the order DynamoDB walks the map for its null
+    /// members: a Java hash map sized to its entries, names sharing a bucket
+    /// in written order (two, three and eleven tables with no `Keys`, two of
+    /// them with names of the same hash written in both orders, captured
+    /// eu-west-2 and us-east-1, 11 and 13 November 2026).
     pub(crate) fn walk_order(&self) -> Vec<(&str, &V)> {
         let names: Vec<&str> = self.0.iter().map(|(name, _)| name.as_str()).collect();
         let entries: HashMap<&str, &V> = self
@@ -2894,6 +2896,34 @@ impl<V> WrittenTables<V> {
             .map(|name| (name, entries[name]))
             .collect()
     }
+}
+
+/// Table names in the order eu-west-2 lists a batch request's per-table
+/// length faults: each name's `RequestItems.<name>` path in the buckets of a
+/// default Java hash table (sixteen buckets, doubling once more than three
+/// quarters full), names sharing a bucket in order of name. This fits every
+/// captured request of two and three tables, two with names of the same hash
+/// written in both orders (eu-west-2, 13 November 2026). With eleven and
+/// twelve tables eu-west-2 listed them in no order this or any other rule
+/// found reproduces, and us-east-1 in another, so the order is pinned only
+/// for a few tables.
+pub(crate) fn length_fault_order<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    let paths: Vec<String> = names
+        .iter()
+        .map(|name| format!("RequestItems.{name}"))
+        .collect();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let by_path: HashMap<&str, &str> = path_refs
+        .iter()
+        .copied()
+        .zip(names.iter().copied())
+        .collect();
+    crate::validation::java_hash_order(&path_refs, false)
+        .into_iter()
+        .map(|path| by_path[path])
+        .collect()
 }
 
 impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for WrittenTables<V> {
@@ -2915,15 +2945,16 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for WrittenTables<
                 mut map: A,
             ) -> std::result::Result<WrittenTables<V>, A::Error> {
                 let mut tables: Vec<(String, V)> = Vec::new();
-                let mut seen: HashMap<String, usize> = HashMap::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 while let Some((name, entry)) = map.next_entry::<String, V>()? {
-                    match seen.get(&name) {
-                        Some(&at) => tables[at].1 = entry,
-                        None => {
-                            seen.insert(name.clone(), tables.len());
-                            tables.push((name, entry));
-                        }
+                    if !seen.insert(name.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "{}{}",
+                            crate::serde_errors::SERIALIZATION_MARKER,
+                            crate::types::DUPLICATE_MEMBER
+                        )));
                     }
+                    tables.push((name, entry));
                 }
                 Ok(WrittenTables(tables))
             }

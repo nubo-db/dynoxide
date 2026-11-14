@@ -9,12 +9,10 @@ use std::borrow::Cow;
 
 mod positional;
 
-/// Java ClassCastException message that DynamoDB leaks for certain type mismatches.
-const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl cannot be cast to class java.lang.Class (sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl and java.lang.Class are in module java.base of loader 'bootstrap')";
-
 /// The refusal for a JSON array where DynamoDB expects a scalar, a map or a
-/// structure: a `SerializationException` with no message (captured eu-west-2
-/// and us-east-1, 11 and 12 November 2026).
+/// structure, and for a string or a number given as a BatchGetItem key or as
+/// a table's BatchWriteItem requests: a `SerializationException` with no
+/// message (captured eu-west-2 and us-east-1, 11 and 12 November 2026).
 fn array_not_expected() -> crate::DynoxideError {
     crate::DynoxideError::SerializationException(String::new())
 }
@@ -60,6 +58,21 @@ pub(crate) fn pre_check_and_read_layer<'a>(
         }
         None => (Cow::Borrowed(body), json),
     };
+    if let Some(batch) = walk_batch(operation, &body) {
+        // A member written ahead of `RequestItems` is read before it, so its
+        // type fault is reported ahead of any in the map, with a repeated
+        // table or without (captured eu-west-2 and us-east-1, 13 November
+        // 2026). One written after the map is checked below, after it.
+        if let Some(fault) = batch.ahead_fault() {
+            return Err(fault);
+        }
+        if batch.walked.repeated {
+            // The answer is a refusal either way, so the parsed body is not
+            // kept while the map is walked again.
+            drop(json);
+            return Err(batch.repeated_table_answer(&body));
+        }
+    }
     check_types(operation, &json)?;
     let layer = if crate::types::reads_on_older_layer(&json) {
         crate::validation::ValueLayer::Older
@@ -67,6 +80,237 @@ pub(crate) fn pre_check_and_read_layer<'a>(
         crate::validation::ValueLayer::for_operation(operation)
     };
     Ok((body, layer))
+}
+
+/// One walk over a batch body for [`walk_batch`]: the names in
+/// `RequestItems`, each entry's JSON types, or each entry read as the request
+/// reads it.
+#[derive(Clone, Copy, PartialEq)]
+enum Pass {
+    Names,
+    Types,
+    Reads,
+}
+
+/// A walk over a batch body, borrowing from it and keeping nothing of an
+/// entry once it has been looked at.
+#[derive(Clone, Copy)]
+struct Walk<'o> {
+    operation: &'o str,
+    entry_fault: fn(&str) -> Option<crate::DynoxideError>,
+    pass: Pass,
+}
+
+/// What a walk found: whether `RequestItems` names a table twice and the
+/// members written ahead of it whose type is checked (on the names walk),
+/// and the first fault in its entries (on the others).
+struct Walked<'de> {
+    repeated: bool,
+    ahead: Vec<(String, &'de serde_json::value::RawValue)>,
+    fault: Option<crate::DynoxideError>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Walk<'_> {
+    type Value = Walked<'de>;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Walk<'_> {
+    type Value = Walked<'de>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an object")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut walked = Walked {
+            repeated: false,
+            ahead: Vec::new(),
+            fault: None,
+        };
+        let mut past_the_map = false;
+        while let Some(name) = map.next_key::<String>()? {
+            if past_the_map {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            } else if name == "RequestItems" {
+                (walked.repeated, walked.fault) = map.next_value_seed(Entries(self))?;
+                past_the_map = true;
+            } else if self.pass == Pass::Names
+                && batch_string_members(self.operation).contains(&name.as_str())
+            {
+                walked.ahead.push((name, map.next_value()?));
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(walked)
+    }
+}
+
+/// The `RequestItems` map on a [`Walk`].
+struct Entries<'o>(Walk<'o>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for Entries<'_> {
+    type Value = (bool, Option<crate::DynoxideError>);
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Entries<'_> {
+    type Value = (bool, Option<crate::DynoxideError>);
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a map")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let walk = self.0;
+        let mut seen = std::collections::HashSet::new();
+        let mut repeated = false;
+        let mut fault = None;
+        while let Some(name) = map.next_key::<String>()? {
+            if walk.pass == Pass::Names {
+                repeated |= !seen.insert(name);
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
+            let entry: &serde_json::value::RawValue = map.next_value()?;
+            if fault.is_some() {
+                continue;
+            }
+            fault = match walk.pass {
+                Pass::Types => {
+                    let value = crate::serde_errors::body_value(entry.get())
+                        .map_err(serde::de::Error::custom)?;
+                    let mut table = serde_json::Map::with_capacity(1);
+                    table.insert(name, value);
+                    let mut view = serde_json::Map::with_capacity(1);
+                    view.insert("RequestItems".to_string(), serde_json::Value::Object(table));
+                    check_types(walk.operation, &serde_json::Value::Object(view)).err()
+                }
+                _ => (walk.entry_fault)(entry.get()),
+            };
+        }
+        Ok((repeated, fault))
+    }
+}
+
+/// A BatchGetItem or BatchWriteItem body walked once for the names in
+/// `RequestItems` and the members written ahead of it.
+struct Batch<'a> {
+    operation: &'a str,
+    entry_fault: fn(&str) -> Option<crate::DynoxideError>,
+    walked: Walked<'a>,
+}
+
+/// Walk a BatchGetItem or BatchWriteItem body once, keeping only the table
+/// names that differ and the members ahead of `RequestItems`, borrowed.
+/// `None` for any other operation, or a body that can't be walked, which is
+/// checked as its parsed value stands.
+fn walk_batch<'a>(operation: &'a str, body: &'a str) -> Option<Batch<'a>> {
+    let entry_fault = match operation {
+        "BatchGetItem" => crate::actions::batch_get_item::entry_serialization_fault,
+        "BatchWriteItem" => crate::actions::batch_write_item::entry_serialization_fault,
+        _ => return None,
+    };
+    let batch = Batch {
+        operation,
+        entry_fault,
+        walked: Walked {
+            repeated: false,
+            ahead: Vec::new(),
+            fault: None,
+        },
+    };
+    let walked = batch.walk(Pass::Names, body)?;
+    Some(Batch { walked, ..batch })
+}
+
+impl<'a> Batch<'a> {
+    fn walk(&self, pass: Pass, body: &'a str) -> Option<Walked<'a>> {
+        use serde::de::DeserializeSeed;
+        let mut deserializer = serde_json::Deserializer::from_str(body);
+        let walked = Walk {
+            operation: self.operation,
+            entry_fault: self.entry_fault,
+            pass,
+        }
+        .deserialize(&mut deserializer)
+        .ok()?;
+        deserializer.end().ok()?;
+        Some(walked)
+    }
+
+    /// The type fault of a member written ahead of `RequestItems`, in the
+    /// order [`check_types`] checks them, judged from the text as written so
+    /// that no value is built for it.
+    fn ahead_fault(&self) -> Option<crate::DynoxideError> {
+        batch_string_members(self.operation)
+            .iter()
+            .find_map(|member| {
+                let (_, raw) = self.walked.ahead.iter().find(|(name, _)| name == member)?;
+                string_member_fault(raw.get())
+            })
+    }
+
+    /// The answer to a body whose `RequestItems` names a table more than
+    /// once, once the members ahead of it have passed. DynamoDB reads the
+    /// whole map before it refuses the repeat. A fault in the JSON types of
+    /// an entry, either copy of a repeated table included, is reported in its
+    /// place; a fault of a value's constraints loses to it, as does any fault
+    /// in a member written after the map (captured eu-west-2 and us-east-1,
+    /// 13 November 2026). Where an entry's constraint fault is written ahead
+    /// of a type fault in the same entry, the reading stops at the first and
+    /// the repeat is reported instead.
+    ///
+    /// The map is walked again to check each entry as the body's parsed value
+    /// would be checked, then a third time to read each entry as the request
+    /// reads it, keeping nothing of an entry once it has been looked at. The
+    /// first fault found is the answer, and the refusal of the repeat
+    /// otherwise.
+    fn repeated_table_answer(&self, body: &'a str) -> crate::DynoxideError {
+        let fault = self
+            .walk(Pass::Types, body)
+            .and_then(|walked| walked.fault)
+            .or_else(|| self.walk(Pass::Reads, body).and_then(|walked| walked.fault));
+        fault.unwrap_or_else(|| {
+            crate::DynoxideError::SerializationException(crate::types::DUPLICATE_MEMBER.to_string())
+        })
+    }
+}
+
+/// The members of a batch operation other than `RequestItems`, all strings,
+/// in the order [`check_types`] checks them. No other member written ahead of
+/// the map is kept or read.
+fn batch_string_members(operation: &str) -> &'static [&'static str] {
+    match operation {
+        "BatchWriteItem" => &["ReturnConsumedCapacity", "ReturnItemCollectionMetrics"],
+        _ => &["ReturnConsumedCapacity"],
+    }
+}
+
+/// The refusal [`check_field_is_string`] gives a member written as `raw`,
+/// read from its first character and, for a number, whether it was written
+/// with a point or an exponent, as the body's parsed value would read it.
+fn string_member_fault(raw: &str) -> Option<crate::DynoxideError> {
+    let raw = raw.trim_start();
+    let message = match raw.as_bytes().first()? {
+        b'"' | b'n' => return None,
+        b'[' => return Some(array_not_expected()),
+        b'{' => "Start of structure or map found where not expected",
+        b't' => "TRUE_VALUE cannot be converted to String",
+        b'f' => "FALSE_VALUE cannot be converted to String",
+        _ if raw.contains(['.', 'e', 'E']) => "DECIMAL_VALUE cannot be converted to String",
+        _ => "NUMBER_VALUE cannot be converted to String",
+    };
+    Some(crate::DynoxideError::SerializationException(
+        message.to_string(),
+    ))
 }
 
 fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
@@ -297,16 +541,13 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                         // Check Keys array elements are maps, and their values are AV structs
                         if let Some(serde_json::Value::Array(keys)) = inner.get("Keys") {
                             for key in keys {
-                                // A key given as an array is refused with no
-                                // message; any other non-object leaks a Java
-                                // class-cast message.
-                                if key.is_array() {
-                                    return Err(array_not_expected());
-                                }
+                                // A key given as anything but a map is refused
+                                // with no message, a string and a number as an
+                                // array is (captured eu-west-2 and us-east-1,
+                                // 11 and 12 November 2026). A null key is
+                                // refused once the request is read.
                                 if !key.is_object() && !key.is_null() {
-                                    return Err(crate::DynoxideError::SerializationException(
-                                        PARAMETERIZED_TYPE_CAST_ERROR.to_string(),
-                                    ));
+                                    return Err(array_not_expected());
                                 }
                                 if let Some(key_map) = key.as_object() {
                                     for (_k, v) in key_map {
@@ -327,17 +568,30 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                     }
                 }
             }
+            // A batch operation has no other members, and DynamoDB doesn't
+            // check the JSON type of a member an operation doesn't have, so
+            // the checks below for other operations' members are skipped
+            // (captured eu-west-2 and us-east-1, 13 November 2026).
+            check_field_is_string(obj, "ReturnConsumedCapacity")?;
+            return Ok(());
         }
         "BatchWriteItem" => {
             check_field_is_map(obj, "RequestItems")?;
             // Check nested fields inside RequestItems
             if let Some(serde_json::Value::Object(ri)) = obj.get("RequestItems") {
                 for (_table, val) in ri {
-                    // Each value must be an array of WriteRequests
-                    if !val.is_array() && !val.is_null() {
+                    // Each value must be an array of WriteRequests. A map
+                    // there is a structure where none is expected, and a
+                    // string or a number is refused with no message (captured
+                    // eu-west-2 and us-east-1, 11 and 12 November 2026). A
+                    // null is refused once the request is read.
+                    if val.is_object() {
                         return Err(crate::DynoxideError::SerializationException(
-                            PARAMETERIZED_TYPE_CAST_ERROR.to_string(),
+                            "Start of structure or map found where not expected".to_string(),
                         ));
+                    }
+                    if !val.is_array() && !val.is_null() {
+                        return Err(array_not_expected());
                     }
                     if let Some(items) = val.as_array() {
                         // Check array elements are structs (WriteRequest)
@@ -372,6 +626,13 @@ fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
                     }
                 }
             }
+            // A batch operation has no other members, and DynamoDB doesn't
+            // check the JSON type of a member an operation doesn't have, so
+            // the checks below for other operations' members are skipped
+            // (captured eu-west-2 and us-east-1, 13 November 2026).
+            check_field_is_string(obj, "ReturnConsumedCapacity")?;
+            check_field_is_string(obj, "ReturnItemCollectionMetrics")?;
+            return Ok(());
         }
         "TagResource" => {
             check_field_is_list(obj, "Tags")?;
@@ -864,4 +1125,43 @@ fn check_filter_attribute_value_lists(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A member's refusal judged from its text matches the one judged from
+    /// the body's parsed value, for every kind of JSON value.
+    #[test]
+    fn a_string_member_is_judged_from_its_text_as_from_its_value() {
+        let written = [
+            r#""SIZE""#,
+            "null",
+            "[1]",
+            "[]",
+            r#"{"a":1}"#,
+            "{}",
+            "true",
+            "false",
+            "5",
+            "-5",
+            "0",
+            "1.5",
+            "-1.0",
+            "1e3",
+            "2E-2",
+            "1e400",
+            "123456789012345678901234567890",
+            "-123456789012345678901234567890",
+        ];
+        for raw in written {
+            let body = format!(r#"{{"ReturnConsumedCapacity":{raw}}}"#);
+            let value = crate::serde_errors::body_value(&body).unwrap();
+            let from_value =
+                super::check_field_is_string(value.as_object().unwrap(), "ReturnConsumedCapacity")
+                    .err()
+                    .map(|e| e.to_string());
+            let from_text = super::string_member_fault(raw).map(|e| e.to_string());
+            assert_eq!(from_text, from_value, "{raw}");
+        }
+    }
 }

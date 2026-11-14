@@ -223,83 +223,10 @@ fn the_regions_differ_only_in_fault_order() {
 }
 
 /// Rows sent, rows compared, compared rows holding two orders, rows left out.
-const COUNTS: (usize, usize, usize, usize) = (216, 204, 3, 12);
+const COUNTS: (usize, usize, usize, usize) = (216, 216, 3, 0);
 
 /// The rows left out of the comparison.
-const LEFT_OUT: &[LeftOut] = &[
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "e2",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{éé=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "e200",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<e200>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "e255",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<e255>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "e256",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<e256>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "m2",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{😀😀=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "m127",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<m127>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "m128",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<m128>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "m255",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<m255>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "m256",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<m256>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "ae",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{aé=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "a2",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{ab=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-    LeftOut {
-        position: "BatchWriteItem",
-        name: "a256",
-        reason: "the request items are echoed in another format, a separate change",
-        today: r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value '{<a256>=[WriteRequest(putRequest=PutRequest(item={pk=AttributeValue(s=a, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}, workloadProfileName=null), deleteRequest=null)]}' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"}"#,
-    },
-];
+const LEFT_OUT: &[LeftOut] = &[];
 
 /// Twelve names in eighteen positions, in the order they were sent.
 const ROWS: &[Row] = &[

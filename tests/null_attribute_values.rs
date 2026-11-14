@@ -172,11 +172,6 @@ const DUPLICATE_NAMES_ELSEWHERE: &[(&str, usize, &str)] = &[
     ),
     (
         "seventh",
-        15,
-        r##"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"Requested resource not found"}"##,
-    ),
-    (
-        "seventh",
         16,
         r##"{"Message":"duplicate field `Item` at line 1 column 92","__type":"com.amazon.coral.service#SerializationException"}"##,
     ),
@@ -2410,7 +2405,7 @@ const SEVENTH: &[Choices] = &[
             r##"{"__type":"com.amazon.coral.service#SerializationException","Message":"Duplicate key found in payload"}"##,
         ],
     ),
-    // A name written twice outside an item, key or expression values is a separate change.
+    // A table written twice in RequestItems, refused once the map is read.
     (
         15,
         "BatchGetItem",

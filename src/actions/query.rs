@@ -910,6 +910,17 @@ pub async fn execute<S: StorageBackend>(
     };
 
     let fetch_limit = request.limit;
+    // A read that ends on its last matching row reads one row past its limit,
+    // so it knows whether anything follows. That row is not part of the page.
+    let peek = fetch_limit.is_some()
+        && ends_on_last_row(
+            &bound,
+            key_hash.len(),
+            key_range.len(),
+            request.scan_index_forward,
+            request.filter_expression.is_some(),
+            is_index_query,
+        );
     let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
     // Query either GSI table or base table
@@ -917,12 +928,12 @@ pub async fn execute<S: StorageBackend>(
         sk_condition: sk_condition_sql.as_deref(),
         sk_params: &sk_params_refs,
         forward: request.scan_index_forward,
-        limit: fetch_limit,
+        limit: fetch_limit.map(|limit| if peek { limit.saturating_add(1) } else { limit }),
         exclusive_start_sk: start_sk.as_deref(),
         exclusive_start_base_pk: start_base_pk.as_deref(),
         exclusive_start_base_sk: start_base_sk.as_deref(),
     };
-    let rows = if let Some(ref index_name) = request.index_name {
+    let mut rows = if let Some(ref index_name) = request.index_name {
         if is_lsi {
             storage
                 .query_lsi_items(&request.table_name, index_name, &pk_str, &query_params)
@@ -936,6 +947,15 @@ pub async fn execute<S: StorageBackend>(
         storage
             .query_items(&request.table_name, &pk_str, &query_params)
             .await?
+    };
+    // The row read ahead is taken off before the page is walked, so it counts
+    // toward neither ScannedCount, the charge nor the 1MB budget.
+    let more_rows = match fetch_limit {
+        Some(limit) if peek && rows.len() > limit => {
+            rows.truncate(limit);
+            true
+        }
+        _ => false,
     };
 
     // Parse filter expression if present
@@ -1085,13 +1105,14 @@ pub async fn execute<S: StorageBackend>(
     };
 
     // Determine LastEvaluatedKey
-    // We return LEK if: we hit the Limit, or we hit the 1MB limit. A table
-    // with no sort key never gets one: a partition of such a table holds at
-    // most one item, so the read is already complete (captured on DynamoDB in
-    // eu-west-2 and us-east-1 on 14 November 2026).
+    // We return LEK if: we hit the 1MB limit, or we hit the Limit and, for a
+    // read that looked one row ahead, that row exists. A table with no sort
+    // key never gets one: a partition of such a table holds at most one item,
+    // so the read is already complete (captured on DynamoDB in eu-west-2 and
+    // us-east-1 on 14 November 2026).
     let has_more = !table_without_sort_key
         && (truncated_by_size
-            || (fetch_limit.is_some() && scanned_count >= fetch_limit.unwrap_or(usize::MAX)));
+            || (fetch_limit.is_some_and(|limit| scanned_count >= limit) && (!peek || more_rows)));
 
     // For index queries, include the base table primary key in LastEvaluatedKey
     // alongside the effective (index) keys so the cursor can uniquely identify
@@ -1187,6 +1208,41 @@ pub async fn execute<S: StorageBackend>(
         last_evaluated_key,
         consumed_capacity,
     })
+}
+
+/// Whether DynamoDB hands back no `LastEvaluatedKey` on the page holding the
+/// read's last matching row (#291, captured eu-west-2 and us-east-1, 6 and
+/// 13 November 2026). It does for an ascending read with no filter whose sort
+/// key condition is absent or closed above, on the table and on either kind of
+/// index, and on an index for `>=` too. Descending and filtered reads, and a
+/// table's `>=` and `>`, ended there on some walks and one page later on
+/// others; they, and an index's `>`, keep the trailing empty page every time.
+/// `begins_with` varies on DynamoDB, and so does a read of a multi-attribute
+/// index by its partition attributes alone (14 November 2026); both keep the
+/// trailing page here too. So does an index with no sort key, which has not
+/// been captured.
+fn ends_on_last_row(
+    bound: &expressions::key_condition::BoundKeyCondition,
+    hash_len: usize,
+    range_len: usize,
+    forward: bool,
+    filtered: bool,
+    index: bool,
+) -> bool {
+    use expressions::key_condition::ResolvedSortKeyCondition as Sk;
+    let multi_attribute = hash_len > 1 || range_len > 1;
+    forward
+        && !filtered
+        && match bound.range_last {
+            // An index with no sort key.
+            None if index && range_len == 0 => false,
+            // A multi-attribute index read by its partition attributes alone.
+            None if multi_attribute && bound.range_eq.is_empty() => false,
+            None => true,
+            Some(Sk::Eq(..) | Sk::Lt(..) | Sk::Le(..) | Sk::Between(..)) => true,
+            Some(Sk::Ge(..)) => index,
+            Some(Sk::Gt(..) | Sk::BeginsWith(..)) => false,
+        }
 }
 
 /// The read key's attributes as the item holds them: every partition key and

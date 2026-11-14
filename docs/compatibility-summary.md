@@ -486,9 +486,37 @@ partition both return sort key order.
 Query or Scan fills its `Limit` with the last item there is, AWS sometimes
 returns a `LastEvaluatedKey` and sometimes does not. The same request answered
 one way in eu-west-2 and the other in us-east-1, and two requests that differed
-only in direction or `Select` answered differently in one region. Dynoxide
-always returns one when a page fills its `Limit`, so the next request comes back
-empty, which AWS also does.
+only in direction or `Select` answered differently in one region. Over a
+partition of four items some reads answered the same way on every walk, and
+Dynoxide follows them; for the rest it picks one answer (captured in eu-west-2
+and us-east-1 on 2026-11-06, 2026-11-13 and 2026-11-14):
+
+- **No token on the last item's page.** An ascending Query, or a PartiQL
+  `SELECT` read by partition key, with no filter and a sort key condition that
+  is absent or closed above (`BETWEEN`, `<=`, `<`, `=`), a bound beyond the
+  last item included. This holds on a table, a GSI and an LSI, and on a GSI
+  or an LSI an ascending `>=` ends the same way. On a multi-attribute GSI the
+  sort key needs a condition: an equality on its first attribute ends this
+  way. A Query of a table with no sort key ends on its item's page too. A
+  three-item partition varied between walks; Dynoxide gives the
+  no-token answer there too, the one eu-west-2 gave most often.
+- **A trailing empty page.** A descending read, a filtered read, a `>` on a
+  table or an index, a `>=` on a table, and every Scan (46 items
+  take 47 pages at `Limit: 1` on AWS too). `begins_with`, and a Query of a
+  multi-attribute index by its partition attributes alone, vary on DynamoDB,
+  and Dynoxide keeps the trailing page for them. An index with no sort key
+  has not been captured and pages as it did before, as does a PartiQL read of
+  a table with no sort key, where DynamoDB also hands back a token on the
+  item's page. Dynoxide returns a
+  `LastEvaluatedKey` or `NextToken` whenever one of these fills its `Limit`, so
+  the next request comes back empty, which AWS also does.
+- A PartiQL read with an OR, with two conditions on the sort key, or written
+  with a `NOT` (`NOT NOT pk = 'k'` is a scan on DynamoDB), keeps the rule it
+  had: no `NextToken` when the page ends on the last of a set of sort
+  keys or on a range's closed bound, and an empty page after it otherwise.
+
+A page cut by the 1 MB limit always carries one, since an item is waiting
+behind it.
 
 *What to do:* page until `LastEvaluatedKey` is absent, and treat an empty page
 as the end.

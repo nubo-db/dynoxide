@@ -505,6 +505,42 @@ impl StorageBackend for Storage {
         Storage::set_item_sizes(self, table_name, sizes).map_err(dyno_to_backend)
     }
 
+    async fn fill_hash_prefixes(
+        &self,
+        table_name: &str,
+        fill: &[(String, String, String)],
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, BackendError> {
+        use crate::storage_backend::sql_builders;
+        if !fill.is_empty() {
+            let mut stmt = self
+                .conn()
+                .prepare_cached(&sql_builders::fill_hash_prefix(table_name))
+                .map_err(error::from_rusqlite)?;
+            for (pk, sk, prefix) in fill {
+                stmt.execute(rusqlite::params![prefix, pk, sk])
+                    .map_err(error::from_rusqlite)?;
+            }
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = sql_builders::keys_without_hash_prefix(table_name, after.is_some(), limit);
+        let mut stmt = self
+            .conn()
+            .prepare_cached(&sql)
+            .map_err(error::from_rusqlite)?;
+        let params: Vec<&str> = after.map(|(pk, sk)| vec![pk, sk]).unwrap_or_default();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(error::from_rusqlite)?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(error::from_rusqlite)
+    }
+
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
         Storage::db_size_bytes(self).map_err(dyno_to_backend)
     }

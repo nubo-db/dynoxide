@@ -65,9 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `storage_backend::from_rusqlite` now use `rusqlite` 0.42's types, so code
   that passes them to or from its own `rusqlite` needs 0.42 too. The next
   crate release is `dynoxide-rs` 4.0.0.
+- `StorageBackend` gains `fill_hash_prefixes`, which the open that brings a
+  database up to schema version 12 calls. The trait is sealed, so only
+  Dynoxide's own backends implement it. It arrives with `dynoxide-rs` 4.0.0.
 
 ### Fixed
 
+- Two opens of one database file at the same moment, from two threads or two
+  processes, no longer fail with `database is locked` when the file is new or
+  not yet in WAL mode. The open that loses the race to switch the file to WAL
+  now waits for the other, for no longer than the usual open timeout.
+  Encrypted databases get the same fix
+  ([#306](https://github.com/nubo-db/dynoxide/issues/306)).
 - **TransactGetItems no longer refuses an empty or unused name in a `Get`
   with no `ProjectionExpression`.** It goes on to the table lookup as
   DynamoDB does, so a request Dynoxide used to refuse now reads the item.
@@ -552,6 +561,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A sum needing more than 38 significant digits is refused as a number
   overflow once every attribute has been read, and each running total of a
   sum is checked in the order written.
+- A parallel scan of a table last written before Dynoxide 0.9.5 returned
+  fewer items than the table held. Items written by those builds were stored
+  without the hash prefix that places an item in a segment, so they fell in
+  no segment at all, and a scan over every segment missed them. A plain Scan
+  was not affected. Opening the database now gives each such item the prefix
+  a fresh write of its key would get, and changes nothing else, so it comes
+  back in the same segment and the same place as a fresh write. That open
+  moves the file to schema version 12, and the upgrade is one way: Dynoxide
+  1.3.0 to 1.6.0 read up to version 11 and will refuse the file afterwards.
+  Recording version 12 is a write, so the first open by this release writes
+  to the file. A database kept read-only that has items to fill is refused
+  until it has been opened writable once; one with nothing to fill still
+  opens read-only, and is left at version 11. Before that writable open,
+  make the `-wal` and `-shm` files beside the database writable as well as
+  the database itself: a read-only open creates them when they are missing,
+  and gives them the database file's permissions when it creates them or
+  finds them empty
+  ([#296](https://github.com/nubo-db/dynoxide/issues/296)).
 
 ## [1.6.0] - 2026-11-07
 

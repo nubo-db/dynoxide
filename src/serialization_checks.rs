@@ -63,7 +63,9 @@ pub(crate) fn pre_check_and_read_layer<'a>(
         // type fault is reported ahead of any in the map, with a repeated
         // table or without (captured eu-west-2 and us-east-1, 13 November
         // 2026). One written after the map is checked below, after it.
-        check_types(operation, &batch.ahead_value()?)?;
+        if let Some(fault) = batch.ahead_fault() {
+            return Err(fault);
+        }
         if batch.walked.repeated {
             // The answer is a refusal either way, so the parsed body is not
             // kept while the map is walked again.
@@ -100,8 +102,8 @@ struct Walk<'o> {
 }
 
 /// What a walk found: whether `RequestItems` names a table twice and the
-/// members written ahead of it (on the names walk), and the first fault in
-/// its entries (on the others).
+/// members written ahead of it whose type is checked (on the names walk),
+/// and the first fault in its entries (on the others).
 struct Walked<'de> {
     repeated: bool,
     ahead: Vec<(String, &'de serde_json::value::RawValue)>,
@@ -136,7 +138,9 @@ impl<'de> serde::de::Visitor<'de> for Walk<'_> {
             } else if name == "RequestItems" {
                 (walked.repeated, walked.fault) = map.next_value_seed(Entries(self))?;
                 past_the_map = true;
-            } else if self.pass == Pass::Names {
+            } else if self.pass == Pass::Names
+                && batch_string_members(self.operation).contains(&name.as_str())
+            {
                 walked.ahead.push((name, map.next_value()?));
             } else {
                 map.next_value::<serde::de::IgnoredAny>()?;
@@ -242,15 +246,16 @@ impl<'a> Batch<'a> {
         Some(walked)
     }
 
-    /// The members written ahead of `RequestItems`, as an object.
-    fn ahead_value(&self) -> crate::Result<serde_json::Value> {
-        let mut ahead = serde_json::Map::with_capacity(self.walked.ahead.len());
-        for (name, value) in &self.walked.ahead {
-            let value = crate::serde_errors::body_value(value.get())
-                .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
-            ahead.insert(name.clone(), value);
-        }
-        Ok(serde_json::Value::Object(ahead))
+    /// The type fault of a member written ahead of `RequestItems`, in the
+    /// order [`check_types`] checks them, judged from the text as written so
+    /// that no value is built for it.
+    fn ahead_fault(&self) -> Option<crate::DynoxideError> {
+        batch_string_members(self.operation)
+            .iter()
+            .find_map(|member| {
+                let (_, raw) = self.walked.ahead.iter().find(|(name, _)| name == member)?;
+                string_member_fault(raw.get())
+            })
     }
 
     /// The answer to a body whose `RequestItems` names a table more than
@@ -277,6 +282,35 @@ impl<'a> Batch<'a> {
             crate::DynoxideError::SerializationException(crate::types::DUPLICATE_MEMBER.to_string())
         })
     }
+}
+
+/// The members of a batch operation other than `RequestItems`, all strings,
+/// in the order [`check_types`] checks them. No other member written ahead of
+/// the map is kept or read.
+fn batch_string_members(operation: &str) -> &'static [&'static str] {
+    match operation {
+        "BatchWriteItem" => &["ReturnConsumedCapacity", "ReturnItemCollectionMetrics"],
+        _ => &["ReturnConsumedCapacity"],
+    }
+}
+
+/// The refusal [`check_field_is_string`] gives a member written as `raw`,
+/// read from its first character and, for a number, whether it was written
+/// with a point or an exponent, as the body's parsed value would read it.
+fn string_member_fault(raw: &str) -> Option<crate::DynoxideError> {
+    let raw = raw.trim_start();
+    let message = match raw.as_bytes().first()? {
+        b'"' | b'n' => return None,
+        b'[' => return Some(array_not_expected()),
+        b'{' => "Start of structure or map found where not expected",
+        b't' => "TRUE_VALUE cannot be converted to String",
+        b'f' => "FALSE_VALUE cannot be converted to String",
+        _ if raw.contains(['.', 'e', 'E']) => "DECIMAL_VALUE cannot be converted to String",
+        _ => "NUMBER_VALUE cannot be converted to String",
+    };
+    Some(crate::DynoxideError::SerializationException(
+        message.to_string(),
+    ))
 }
 
 fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
@@ -1091,4 +1125,43 @@ fn check_filter_attribute_value_lists(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A member's refusal judged from its text matches the one judged from
+    /// the body's parsed value, for every kind of JSON value.
+    #[test]
+    fn a_string_member_is_judged_from_its_text_as_from_its_value() {
+        let written = [
+            r#""SIZE""#,
+            "null",
+            "[1]",
+            "[]",
+            r#"{"a":1}"#,
+            "{}",
+            "true",
+            "false",
+            "5",
+            "-5",
+            "0",
+            "1.5",
+            "-1.0",
+            "1e3",
+            "2E-2",
+            "1e400",
+            "123456789012345678901234567890",
+            "-123456789012345678901234567890",
+        ];
+        for raw in written {
+            let body = format!(r#"{{"ReturnConsumedCapacity":{raw}}}"#);
+            let value = crate::serde_errors::body_value(&body).unwrap();
+            let from_value =
+                super::check_field_is_string(value.as_object().unwrap(), "ReturnConsumedCapacity")
+                    .err()
+                    .map(|e| e.to_string());
+            let from_text = super::string_member_fault(raw).map(|e| e.to_string());
+            assert_eq!(from_text, from_value, "{raw}");
+        }
+    }
 }

@@ -221,18 +221,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload`, once the whole map is read, as DynamoDB does. A member of the
   wrong JSON type written ahead of `RequestItems` is reported instead, and
   so is a value of the wrong JSON type in a table's entry, either copy
-  included, unless a value that breaks a constraint is written ahead of it
-  in the same entry. A value that breaks a constraint, such as one with two
-  data types, loses to the repeat wherever it is written. Dynoxide used the
-  last copy. Tables with empty `Keys` are listed one fault per table, ten at
-  most, as BatchWriteItem's empty or overlong lists are; BatchGetItem used to
-  report only one of them.
+  included. A value that breaks a constraint, such as one with two data
+  types, loses to the repeat wherever it is written. Dynoxide used the last
+  copy. Dynoxide still differs from DynamoDB where a value that breaks a
+  constraint is written ahead of a value of the wrong JSON type in the same
+  entry: DynamoDB reports the type fault, and Dynoxide reports the repeat,
+  or with no repeat the constraint fault
+  ([#302](https://github.com/nubo-db/dynoxide/issues/302)). Tables with
+  empty `Keys` are listed one fault per table, ten at most, as
+  BatchWriteItem's empty or overlong lists are; BatchGetItem used to report
+  only one of them.
 
 - BatchGetItem and BatchWriteItem no longer check the JSON type of a member
   they don't have, such as `TableName`, as DynamoDB doesn't; a request
-  carrying one was refused with a `SerializationException`. A member of the
-  wrong JSON type written ahead of `RequestItems` is now reported ahead of
-  one in the map.
+  carrying one of the wrong JSON type was refused with a
+  `SerializationException`. A member of the wrong JSON type written ahead of
+  `RequestItems` is now reported ahead of one in the map.
 
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy

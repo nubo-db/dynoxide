@@ -57,19 +57,9 @@ const RICM: &str = "Value 'BOGUS2' at 'returnItemCollectionMetrics' failed to sa
 const MAP_KEYS: &str = "Map keys must satisfy constraint: [Member must have length less than or \
                         equal to 255, Member must have length greater than or equal to 3, Member \
                         must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]";
-const MAP_VALUE: &str = "Map value must satisfy constraint: [Member must have length less than or \
-                         equal to 25, Member must have length greater than or equal to 1]";
+const EMPTY_LIST: &str = "Value at 'RequestItems.TestTable.member' failed to satisfy constraint: \
+                          Member must have length greater than or equal to 1";
 const NOT_MATCHING_SCHEMA: &str = "The provided key element does not match the schema";
-
-/// How the newer AWS SDKs for Java print an `AttributeValue` holding a string,
-/// which is how DynamoDB echoes a BatchWriteItem request back.
-fn java_string_value(s: &str) -> String {
-    format!(
-        "AttributeValue(s={s}, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, \
-         nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, \
-         nULL=null, bOOL=null)"
-    )
-}
 
 /// An item in TransactItems that names no action.
 const EMPTY_ACTION: &str = "Value '' at 'transactItems' failed to satisfy constraint: \
@@ -154,12 +144,11 @@ fn request_member_errors_are_reported_together() {
             "ReturnItemCollectionMetrics": "BOGUS2"
         })))
         .unwrap_err();
+    // An empty list is reported alone, ahead of the enums (captured eu-west-2,
+    // 2026-11-13, beside each enum).
     assert_eq!(
         validation_message(err),
-        format!(
-            "3 validation errors detected: Value '{{TestTable=[]}}' at 'requestItems' failed to \
-             satisfy constraint: {MAP_VALUE}; {RCC}; {RICM}"
-        ),
+        one(EMPTY_LIST),
         "BatchWriteItem, an empty list and both enums"
     );
 
@@ -217,21 +206,31 @@ fn request_member_errors_are_reported_together() {
     assert!(!stored(&db, "t"));
 }
 
-/// BatchWriteItem and TransactGetItems check a table name after the request's
-/// enums. TransactWriteItems checks it after the token and lists it with a bad
-/// enum.
+/// TransactGetItems checks a table name after the request's enums.
+/// BatchWriteItem lists it with a bad enum, and TransactWriteItems checks it
+/// after the token and lists it with a bad enum.
 #[test]
-fn a_table_name_follows_the_enums_except_in_a_transaction_write_which_lists_them_together() {
+fn a_table_name_follows_the_enums_except_in_a_write_which_lists_them_together() {
     let db = setup();
     let token = "x".repeat(37);
 
+    // BatchWriteItem lists a refused table name with a bad enum, the name
+    // first (captured eu-west-2, 2026-11-13, beside ReturnConsumedCapacity).
     let err = db
         .batch_write_item(request(serde_json::json!({
             "RequestItems": {"bad!name": [{"PutRequest": {"Item": {"pk": {"S": "x"}}}}]},
             "ReturnItemCollectionMetrics": "BOGUS2"
         })))
         .unwrap_err();
-    assert_eq!(validation_message(err), one(RICM), "BatchWriteItem");
+    assert_eq!(
+        validation_message(err),
+        format!(
+            "2 validation errors detected: Value '{{\"bad!name\":[{{\"PutRequest\":{{\"Item\":\
+             {{\"pk\":{{\"S\":\"x\"}}}}}}}}]}}' at 'requestItems' failed to satisfy constraint: \
+             {MAP_KEYS}; {RICM}"
+        ),
+        "BatchWriteItem"
+    );
 
     // A refused table name is listed with a bad enum, the name first: "TW bad
     // name put + RCC" and "TW bad name + RICM" in the 2026-10-09
@@ -286,38 +285,37 @@ fn batch_write_reports_dynamodbs_messages_for_its_request_items() {
         )
     };
 
+    // One fault for the table and no echo, as eu-west-2 answered on
+    // 2026-11-13; us-east-1 still echoed the map.
     assert_eq!(
         write(serde_json::json!({"TestTable": []})),
-        one(&format!(
-            "Value '{{TestTable=[]}}' at 'requestItems' failed to satisfy constraint: {MAP_VALUE}"
-        )),
+        one(EMPTY_LIST),
         "an empty request list"
     );
     assert_eq!(
         write(serde_json::json!({"bad!name": []})),
-        one(&format!(
-            "Value '{{bad!name=[]}}' at 'requestItems' failed to satisfy constraint: {MAP_VALUE}"
-        )),
+        one(
+            "Value at 'RequestItems.bad!name.member' failed to satisfy constraint: Member must \
+             have length greater than or equal to 1"
+        ),
         "an empty request list wins over a malformed table name"
     );
 
     assert_eq!(
         write(serde_json::json!({"bad!name": [{"PutRequest": {"Item": {"pk": {"S": "x"}}}}]})),
+        // The request echoed as JSON, as eu-west-2 answered on 2026-11-13;
+        // us-east-1 still echoed the Java model.
         one(&format!(
-            "Value '{{bad!name=[WriteRequest(putRequest=PutRequest(item={{pk={}}}, \
-             workloadProfileName=null), deleteRequest=null)]}}' at 'requestItems' failed to \
-             satisfy constraint: {MAP_KEYS}",
-            java_string_value("x")
+            "Value '{{\"bad!name\":[{{\"PutRequest\":{{\"Item\":{{\"pk\":{{\"S\":\"x\"}}}}}}}}]}}' \
+             at 'requestItems' failed to satisfy constraint: {MAP_KEYS}"
         )),
         "a malformed table name on a put"
     );
     assert_eq!(
         write(serde_json::json!({"ab": [{"DeleteRequest": {"Key": {"pk": {"S": "x"}}}}]})),
         one(&format!(
-            "Value '{{ab=[WriteRequest(putRequest=null, deleteRequest=DeleteRequest(key={{pk={}}}, \
-             workloadProfileName=null))]}}' at 'requestItems' failed to satisfy constraint: \
-             {MAP_KEYS}",
-            java_string_value("x")
+            "Value '{{\"ab\":[{{\"DeleteRequest\":{{\"Key\":{{\"pk\":{{\"S\":\"x\"}}}}}}}}]}}' \
+             at 'requestItems' failed to satisfy constraint: {MAP_KEYS}"
         )),
         "a table name too short, on a delete"
     );

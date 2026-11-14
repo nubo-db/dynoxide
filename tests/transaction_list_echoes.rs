@@ -14,6 +14,7 @@
 //! HTTP with a null name in a Get the assertions don't read.
 
 use dynoxide::Database;
+use dynoxide::actions::batch_write_item::BatchWriteItemRequest;
 use dynoxide::actions::execute_transaction::ExecuteTransactionRequest;
 use dynoxide::actions::transact_get_items::TransactGetItemsRequest;
 use dynoxide::actions::transact_write_items::TransactWriteItemsRequest;
@@ -265,6 +266,9 @@ fn echoed_names(message: &str, start: usize) -> Vec<String> {
 /// is DynamoDB's echo of it (us-east-1 and eu-west-2, 2026-10-10), except
 /// that names sharing a bucket are listed here in name order: DynamoDB keeps
 /// them in the order they were sent, which a decoded request no longer holds.
+/// BatchWriteItem echoes the request this way for a list holding more than 25
+/// only beside a put with no `Item` now (captured eu-west-2 and us-east-1,
+/// 2026-11-13), so its cases carry one.
 #[test]
 fn an_echoed_map_is_sized_to_its_entries() {
     let cases: [(&[&str], &[&str]); 11] = [
@@ -359,7 +363,6 @@ fn an_echoed_map_is_sized_to_its_entries() {
             ],
         ),
     ];
-    let db = Database::memory().unwrap();
     for (sent, listed) in cases {
         let item: serde_json::Map<String, Value> = sent
             .iter()
@@ -377,10 +380,13 @@ fn an_echoed_map_is_sized_to_its_entries() {
         puts.extend(
             (0..25).map(|i| json!({"PutRequest": {"Item": {"pk": {"S": format!("s{i}")}}}})),
         );
-        let message = db
-            .batch_write_item(serde_json::from_value(json!({"RequestItems": {"t": puts}})).unwrap())
-            .unwrap_err()
-            .to_string();
+        // A put with no item keeps the request echoed beside the list's length.
+        puts.push(json!({"PutRequest": {}}));
+        // The request is refused as it is read.
+        let message =
+            serde_json::from_value::<BatchWriteItemRequest>(json!({"RequestItems": {"t": puts}}))
+                .unwrap_err()
+                .to_string();
         let start = message.find("item={").unwrap() + "item={".len();
         assert_eq!(
             echoed_names(&message, start),
@@ -401,10 +407,11 @@ fn an_echoed_map_is_sized_to_its_entries() {
         "m": {"M": nested}
     }}})];
     puts.extend((0..25).map(|i| json!({"PutRequest": {"Item": {"pk": {"S": format!("s{i}")}}}})));
-    let message = db
-        .batch_write_item(serde_json::from_value(json!({"RequestItems": {"t": puts}})).unwrap())
-        .unwrap_err()
-        .to_string();
+    puts.push(json!({"PutRequest": {}}));
+    let message =
+        serde_json::from_value::<BatchWriteItemRequest>(json!({"RequestItems": {"t": puts}}))
+            .unwrap_err()
+            .to_string();
     let start = message.find(", m={").unwrap() + ", m={".len();
     assert_eq!(
         echoed_names(&message, start),

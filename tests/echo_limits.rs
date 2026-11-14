@@ -59,9 +59,9 @@ fn message(err: DynoxideError) -> String {
     }
 }
 
-/// BatchWriteItem echoes the whole RequestItems map when a table name breaks
-/// its constraints. One item of 200,000 small attributes is about 3 MB of
-/// request and about 40 MB of echo.
+/// BatchWriteItem echoes the whole RequestItems map as JSON when a table name
+/// breaks its constraints. One item of 200,000 small attributes is about 3 MB
+/// of request and as much echo.
 #[test]
 fn a_batch_write_echo_is_bounded() {
     let db = Database::memory().unwrap();
@@ -84,7 +84,9 @@ fn a_batch_write_echo_is_bounded() {
         .unwrap_err();
     let message = message(err);
     assert!(
-        message.starts_with("1 validation error detected: Value '{a!=[WriteRequest(putRequest="),
+        message.starts_with(
+            "1 validation error detected: Value '{\"a!\":[{\"PutRequest\":{\"Item\":{"
+        ),
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );

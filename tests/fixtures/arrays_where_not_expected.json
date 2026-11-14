@@ -2569,9 +2569,9 @@
    "row": 3,
    "answer": {
     "__type": "com.amazon.coral.validate#ValidationException",
-    "message": "missing field `Keys` at line 1 column 90"
+    "message": "1 validation error detected: Value null at 'requestItems.RequestItems.member.keys' failed to satisfy constraint: Member must not be null"
    },
-   "reason": "an array holding an object with a RequestItems member is read by position as a RequestItems map naming a table called RequestItems, whose entry has no Keys; the column in the message counts within the body as rewritten to its object form"
+   "reason": "an array holding an object with a RequestItems member is read by position as a RequestItems map naming a table called RequestItems, whose entry has no Keys, and is refused for the missing Keys"
   },
   {
    "round": "seventh round",

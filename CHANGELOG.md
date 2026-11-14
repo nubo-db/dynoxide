@@ -210,6 +210,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's regions differed on this when captured, and Dynoxide follows
   eu-west-2.
 
+- BatchGetItem and BatchWriteItem refuse a missing or null part of
+  `RequestItems` in DynamoDB's words, where Dynoxide answered with its JSON
+  decoder's own text, such as ``missing field `Keys` at line 1 column 50``.
+  A table with no `Keys`, a `PutRequest` with no `Item` and a
+  `DeleteRequest` with no `Key` are each `Value null at
+  'requestItems.<table>.member.keys' failed to satisfy constraint: Member
+  must not be null` (or `...member.1.member.putRequest.item`), listed with
+  the request's other member faults. A missing or null `RequestItems` is
+  `The requestItems parameter is required for BatchGetItem` (or
+  `BatchWriteItem`), and a null table entry or a null key or write request
+  has its own message too. A key given as a string or number, and a table's
+  write requests given as a string, number or map, are a
+  `SerializationException` as DynamoDB words it, where Dynoxide printed a
+  Java class-cast message. A write request holding both a `PutRequest` and
+  a `DeleteRequest` is refused as one holding neither is; it used to run.
+  BatchWriteItem's length and table-name faults now follow eu-west-2's
+  wording. A table's request list that is empty or holds more than 25 is
+  `Value at 'RequestItems.<table>.member' failed to satisfy constraint:
+  Member must have length greater than or equal to 1` (or `less than or
+  equal to 25`), one fault for each such table, with no echo of the request
+  and ahead of a bad `ReturnConsumedCapacity` or
+  `ReturnItemCollectionMetrics`, which are no longer listed beside it. More
+  than 25 requests across tables that each hold 25 or fewer is `Too many
+  items requested for the BatchWriteItem call`. A table name that breaks its
+  constraints echoes the request as JSON and is listed ahead of those enum
+  faults, where it used to follow them. us-east-1 still gave the older
+  answers when captured.
+
+- BatchGetItem and BatchWriteItem refuse a table written twice in
+  `RequestItems` with a `SerializationException`, `Duplicate key found in
+  payload`, once the whole map is read, as DynamoDB does. A member of the
+  wrong JSON type written ahead of `RequestItems` is reported instead, and
+  so is a value of the wrong JSON type in a table's entry, either copy
+  included. A value that breaks a constraint, such as one with two data
+  types, loses to the repeat wherever it is written. Dynoxide used the last
+  copy. Dynoxide still differs from DynamoDB where a value that breaks a
+  constraint is written ahead of a value of the wrong JSON type in the same
+  entry: DynamoDB reports the type fault, and Dynoxide reports the repeat,
+  or with no repeat the constraint fault
+  ([#302](https://github.com/nubo-db/dynoxide/issues/302)). Tables with
+  empty `Keys` are listed one fault per table, ten at most, as
+  BatchWriteItem's empty or overlong lists are; BatchGetItem used to report
+  only one of them.
+
+- BatchGetItem and BatchWriteItem no longer check the JSON type of a member
+  they don't have, such as `TableName`, as DynamoDB doesn't; a request
+  carrying one of the wrong JSON type was refused with a
+  `SerializationException`. A member of the wrong JSON type written ahead of
+  `RequestItems` is now reported ahead of one in the map.
+
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
   constraint: Member must satisfy enum value set: [AND, OR]`. DynamoDB has

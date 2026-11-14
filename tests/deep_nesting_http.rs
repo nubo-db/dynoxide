@@ -580,7 +580,7 @@ async fn batch_and_transaction_member_errors_are_reported_ahead_of_a_deep_value(
     assert_eq!(status, 400, "expected a 400, got {status}: {body}");
     let message = body["message"].as_str().unwrap_or_default();
     assert!(
-        message.starts_with("1 validation error detected: Value '{bad!name=[WriteRequest(")
+        message.starts_with("1 validation error detected: Value '{\"bad!name\":[{\"PutRequest\":")
             && message.ends_with(
                 "' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"
             ),

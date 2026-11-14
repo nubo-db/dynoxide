@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(try_from = "BatchWriteItemWire")]
 pub struct BatchWriteItemRequest {
     #[serde(rename = "RequestItems")]
     pub request_items: HashMap<String, Vec<WriteRequest>>,
@@ -14,6 +15,203 @@ pub struct BatchWriteItemRequest {
     #[serde(rename = "ReturnItemCollectionMetrics", default)]
     pub return_item_collection_metrics: Option<String>,
 }
+
+/// The request as it is read, with every member DynamoDB tells apart when it
+/// is missing or null held as an `Option`: `RequestItems`, each table's list
+/// of write requests, each write request, and each put's `Item` and delete's
+/// `Key`. A member of the wrong JSON type still fails the read, wherever it is
+/// written, ahead of the checks on missing and null members (captured
+/// eu-west-2 and us-east-1, 11 and 12 November 2026).
+#[derive(Deserialize)]
+struct BatchWriteItemWire {
+    #[serde(rename = "RequestItems", default)]
+    request_items: Option<helpers::WrittenTables<Option<Vec<Option<WriteRequestWire>>>>>,
+    #[serde(rename = "ReturnConsumedCapacity", default)]
+    return_consumed_capacity: Option<String>,
+    #[serde(rename = "ReturnItemCollectionMetrics", default)]
+    return_item_collection_metrics: Option<String>,
+}
+
+/// A write request as it is read. A null `PutRequest` or `DeleteRequest` is
+/// read as absent, as DynamoDB reads it (captured eu-west-2 and us-east-1,
+/// 13 November 2026).
+#[derive(Deserialize)]
+struct WriteRequestWire {
+    #[serde(rename = "PutRequest", default)]
+    put_request: Option<PutRequestWire>,
+    #[serde(rename = "DeleteRequest", default)]
+    delete_request: Option<DeleteRequestWire>,
+}
+
+/// A put as it is read: [`PutRequest`] with its `Item` optional.
+#[derive(Deserialize)]
+struct PutRequestWire {
+    #[serde(rename = "Item", default)]
+    item: Option<types::AttributeMap>,
+}
+
+/// A delete as it is read: [`DeleteRequest`] with its `Key` optional.
+#[derive(Deserialize)]
+struct DeleteRequestWire {
+    #[serde(rename = "Key", default)]
+    key: Option<types::AttributeMap>,
+}
+
+/// The serialisation fault one table's entry in `RequestItems` raises when it
+/// is read on its own, written as `entry`; `None` when it reads, or fails only
+/// a constraint. See `serialization_checks` for the request it decides.
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
+pub(crate) fn entry_serialization_fault(entry: &str) -> Option<DynoxideError> {
+    match crate::serde_errors::deserialize::<Option<Vec<Option<WriteRequestWire>>>>(entry) {
+        Err(fault @ DynoxideError::SerializationException(_)) => Some(fault),
+        _ => None,
+    }
+}
+
+impl TryFrom<BatchWriteItemWire> for BatchWriteItemRequest {
+    type Error = String;
+
+    /// The checks DynamoDB makes on a missing or null member, in its words
+    /// (captured eu-west-2 and us-east-1, 11, 12 and 13 November 2026):
+    ///
+    /// - A missing or null `RequestItems` is refused alone, ahead of anything
+    ///   else.
+    /// - A put with no `Item` or a delete with no `Key` is a null member. Its
+    ///   fault is listed with the request's other member constraints in the
+    ///   older words: the request lists' lengths, with the request echoed in
+    ///   its Java model's `toString` (both regions still answer this way here,
+    ///   though eu-west-2 words a list's length differently on its own, see
+    ///   [`check_request`]), then the null members, tables in the order
+    ///   DynamoDB walks the map, then `ReturnConsumedCapacity` and
+    ///   `ReturnItemCollectionMetrics` outside their enums. A table name that
+    ///   breaks its constraints is not listed.
+    /// - A null list for a table or a null write request is refused alone,
+    ///   after those enum faults.
+    ///
+    /// Every other check is made where it is made for a request that passes
+    /// these. The refusal keeps its text whole, since a table name may hold
+    /// anything.
+    fn try_from(wire: BatchWriteItemWire) -> std::result::Result<Self, String> {
+        let refuse = |message: &str| {
+            format!(
+                "{}{message}",
+                crate::serde_errors::VALIDATION_AS_READ_MARKER
+            )
+        };
+        let Some(entries) = wire.request_items else {
+            return Err(refuse(
+                "The requestItems parameter is required for BatchWriteItem",
+            ));
+        };
+        let tables = entries.walk_order();
+        let enum_faults: Vec<String> = crate::validation::return_consumed_capacity_rejection(
+            wire.return_consumed_capacity.as_deref(),
+        )
+        .into_iter()
+        .chain(crate::validation::return_item_collection_metrics_rejection(
+            wire.return_item_collection_metrics.as_deref(),
+        ))
+        .collect();
+
+        let mut null_members = Vec::new();
+        for (table_name, list) in &tables {
+            let requests = list.iter().flatten().enumerate();
+            for (i, request) in requests.filter_map(|(i, r)| Some((i + 1, r.as_ref()?))) {
+                if request
+                    .put_request
+                    .as_ref()
+                    .is_some_and(|p| p.item.is_none())
+                {
+                    null_members.push(format!(
+                        "Value null at 'requestItems.{table_name}.member.{i}.member.putRequest.item' \
+                         failed to satisfy constraint: Member must not be null"
+                    ));
+                }
+                if request
+                    .delete_request
+                    .as_ref()
+                    .is_some_and(|d| d.key.is_none())
+                {
+                    null_members.push(format!(
+                        "Value null at 'requestItems.{table_name}.member.{i}.member.deleteRequest.key' \
+                         failed to satisfy constraint: Member must not be null"
+                    ));
+                }
+            }
+        }
+        if !null_members.is_empty() {
+            let lists = || tables.iter().filter_map(|(_, list)| list.as_ref());
+            let total_requests: usize = lists().map(Vec::len).sum();
+            let mut member_errors = Vec::new();
+            if total_requests > 25 || lists().any(Vec::is_empty) {
+                member_errors.push(format!(
+                    "Value '{}' at 'requestItems' failed to satisfy constraint: {MAP_VALUE_CONSTRAINT}",
+                    wire_request_items_echo(&entries)
+                ));
+            }
+            member_errors.extend(null_members);
+            member_errors.extend(enum_faults.iter().cloned());
+            // DynamoDB lists ten member faults at most.
+            member_errors.truncate(10);
+            if let Some(message) = crate::validation::format_validation_errors(&member_errors) {
+                return Err(refuse(&message));
+            }
+        }
+
+        for (table_name, list) in &tables {
+            let refusal = match list {
+                None => format!(
+                    "The batch write request list for a table cannot be null or empty: {table_name}"
+                ),
+                Some(requests) if requests.iter().any(Option::is_none) => {
+                    "The batch write request list for a table cannot be null or empty".to_string()
+                }
+                Some(_) => continue,
+            };
+            return Err(refuse(
+                &crate::validation::format_validation_errors(&enum_faults).unwrap_or(refusal),
+            ));
+        }
+
+        // Every list, write request, item and key is present by now.
+        let request_items = entries
+            .0
+            .into_iter()
+            .filter_map(|(table_name, list)| {
+                let requests = list?
+                    .into_iter()
+                    .flatten()
+                    .map(|request| WriteRequest {
+                        put_request: request
+                            .put_request
+                            .and_then(|put| put.item)
+                            .map(|item| PutRequest { item: item.0 }),
+                        delete_request: request
+                            .delete_request
+                            .and_then(|delete| delete.key)
+                            .map(|key| DeleteRequest { key: key.0 }),
+                    })
+                    .collect();
+                Some((table_name, requests))
+            })
+            .collect();
+        Ok(BatchWriteItemRequest {
+            request_items,
+            return_consumed_capacity: wire.return_consumed_capacity,
+            return_item_collection_metrics: wire.return_item_collection_metrics,
+        })
+    }
+}
+
+/// The constraint on each of `RequestItems`' lists, as DynamoDB words it.
+const MAP_VALUE_CONSTRAINT: &str = "Map value must satisfy constraint: \
+     [Member must have length less than or equal to 25, \
+     Member must have length greater than or equal to 1]";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct WriteRequest {
@@ -71,11 +269,11 @@ fn accumulate_index_units(
     }
 }
 
-/// The request-level checks, in the order DynamoDB reports them: an empty
-/// `RequestItems`; then the member constraints together (a table's request list
-/// that is empty or pushes the request past 25, ReturnConsumedCapacity and
-/// ReturnItemCollectionMetrics); then a table name that breaks its constraints,
-/// alone.
+/// The request-level checks, in the order eu-west-2 reports them: an empty
+/// `RequestItems`; then each table's request list that is empty or holds more
+/// than 25, alone; then more than 25 requests in all, alone; then a table name
+/// that breaks its constraints together with ReturnConsumedCapacity and
+/// ReturnItemCollectionMetrics outside their enums.
 ///
 /// Also run on the request-parsing path for a body nested too deep to decode,
 /// so a member error there is still reported ahead of the nesting error.
@@ -91,51 +289,113 @@ pub(crate) fn check_request(request: &BatchWriteItemRequest) -> Result<()> {
         ));
     }
 
-    // The request's member constraints, reported together before anything is
-    // read or written: a table's request list that is empty or pushes the
-    // request past 25, then ReturnConsumedCapacity and
-    // ReturnItemCollectionMetrics outside their enums (captured us-east-1,
-    // eu-west-2 and ten more regions, 2026-10-08 and 2026-10-09).
-    let mut member_errors = Vec::new();
-    let total_requests: usize = request.request_items.values().map(|v| v.len()).sum();
-    if total_requests > 25 || request.request_items.values().any(|wrs| wrs.is_empty()) {
-        member_errors.push(format!(
-            "Value '{}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to 25, Member must have length greater than or equal to 1]",
-            request_items_echo(&request.request_items)
+    let enum_faults = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    )
+    .into_iter()
+    .chain(crate::validation::return_item_collection_metrics_rejection(
+        request.return_item_collection_metrics.as_deref(),
+    ));
+
+    // A table's request list that is empty or holds more than 25 is a fault
+    // of its own, one for each such table up to ten, with no echo, reported
+    // ahead of and without the enum faults or a table name that breaks its
+    // constraints (captured eu-west-2, 13 November 2026), in the order of
+    // `helpers::length_fault_order`. us-east-1 still gave the older form, one
+    // fault for the whole map with the request echoed in its Java model's
+    // `toString`, listed with the enum faults.
+    let mut length_faults: Vec<String> =
+        helpers::length_fault_order(request.request_items.keys().map(String::as_str))
+            .into_iter()
+            .filter_map(|table_name| {
+                let requests = request.request_items[table_name].len();
+                let bound = if requests == 0 {
+                    "greater than or equal to 1"
+                } else if requests > 25 {
+                    "less than or equal to 25"
+                } else {
+                    return None;
+                };
+                Some(format!(
+                    "Value at 'RequestItems.{table_name}.member' failed to satisfy constraint: \
+                     Member must have length {bound}"
+                ))
+            })
+            .collect();
+    // DynamoDB lists ten member faults at most.
+    length_faults.truncate(10);
+    if let Some(msg) = crate::validation::format_validation_errors(&length_faults) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // More than 25 requests across tables that each hold 25 or fewer is
+    // refused alone, with no envelope (captured eu-west-2 and us-east-1,
+    // 13 November 2026).
+    let total_requests: usize = request.request_items.values().map(Vec::len).sum();
+    if total_requests > 25 {
+        return Err(DynoxideError::ValidationException(
+            "Too many items requested for the BatchWriteItem call".to_string(),
         ));
     }
-    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ) {
-        member_errors.push(msg);
-    }
-    if let Some(msg) = crate::validation::return_item_collection_metrics_rejection(
-        request.return_item_collection_metrics.as_deref(),
-    ) {
-        member_errors.push(msg);
-    }
+
+    // A table name that breaks its constraints is a constraint on the
+    // RequestItems map's keys, reported once for the map with the request
+    // echoed as JSON, ahead of the enum faults and listed with them (captured
+    // eu-west-2, 12 and 13 November 2026).
+    let all_names_valid = request
+        .request_items
+        .keys()
+        .all(|name| crate::validation::member_table_name_is_valid(name));
+    let member_errors: Vec<String> = (!all_names_valid)
+        .then(|| {
+            format!(
+                "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
+                request_items_json_echo(&request.request_items),
+                crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
+            )
+        })
+        .into_iter()
+        .chain(enum_faults)
+        .collect();
     if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
         return Err(DynoxideError::ValidationException(msg));
     }
 
-    // A table name that breaks its constraints comes after those, and alone:
-    // it is a constraint on the RequestItems map's keys, reported once for the
-    // map with the map echoed.
-    if !request
-        .request_items
-        .keys()
-        .all(|name| crate::validation::member_table_name_is_valid(name))
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&format!(
-                "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
-                request_items_echo(&request.request_items),
-                crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
-            )),
-        ));
-    }
-
     Ok(())
+}
+
+/// The `RequestItems` map echoed as JSON, as eu-west-2 echoes it for a table
+/// name that breaks its constraints (captured 12 and 13 November 2026): each
+/// write request as it is written on the wire, with tables and every map's
+/// members in order of name, as BatchGetItem's echo is. Bounded by
+/// [`ECHO_LIMIT`].
+fn request_items_json_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
+    let echo: serde_json::Map<String, serde_json::Value> = request_items
+        .iter()
+        .map(|(table_name, requests)| {
+            let requests = requests
+                .iter()
+                .map(|request| {
+                    let mut members = serde_json::Map::new();
+                    if let Some(ref put) = request.put_request {
+                        members.insert(
+                            "PutRequest".to_string(),
+                            serde_json::json!({ "Item": put.item }),
+                        );
+                    }
+                    if let Some(ref delete) = request.delete_request {
+                        members.insert(
+                            "DeleteRequest".to_string(),
+                            serde_json::json!({ "Key": delete.key }),
+                        );
+                    }
+                    serde_json::Value::Object(members)
+                })
+                .collect();
+            (table_name.clone(), serde_json::Value::Array(requests))
+        })
+        .collect();
+    bound_echo(crate::sorted_json(serde_json::Value::Object(echo)).to_string())
 }
 
 pub async fn execute<S: StorageBackend>(
@@ -166,7 +426,10 @@ pub async fn execute<S: StorageBackend>(
     }
     for write_requests in request.request_items.values() {
         for wr in write_requests {
-            if wr.put_request.is_none() && wr.delete_request.is_none() {
+            // A write request holds exactly one of a put and a delete; one
+            // holding both is refused in the same words as one holding
+            // neither (captured eu-west-2 and us-east-1, 11 November 2026).
+            if wr.put_request.is_some() == wr.delete_request.is_some() {
                 return Err(DynoxideError::ValidationException(
                     "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes".to_string(),
                 ));
@@ -623,61 +886,97 @@ pub(crate) fn bound_echo(echo: String) -> String {
     out.finish()
 }
 
-/// The `RequestItems` map as DynamoDB echoes it in a constraint message: the
-/// request object's Java `toString`, which names every field of every value.
-/// Eleven of twelve regions printed it this way on 2026-10-09; the other, and
-/// eu-west-2 on other days, print each attribute value as an object hash, so no
-/// echo matches every region byte for byte. Tables are in order of name, where
-/// DynamoDB's own order is its map's; attributes follow the Java map's order.
-/// Bounded by [`ECHO_LIMIT`].
-fn request_items_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
+/// The `RequestItems` map in the older echo, the request object's Java
+/// `toString`, which names every field of every value, with a null list, write
+/// request, item or key printed `null`. Eleven of twelve regions printed it
+/// this way on 2026-10-09 for a request list that was empty or too long and
+/// for a table name that broke its constraints. On 13 November 2026 eu-west-2
+/// no longer echoed the map for a list's length and echoed it as JSON for a
+/// table name (see [`check_request`]), and us-east-1 still gave this echo for
+/// both. Both regions still give it for a list too long beside a put with no
+/// `Item`, sometimes with each attribute value as an object hash instead, so
+/// no echo matches every answer byte for byte. Tables are in order of name,
+/// where DynamoDB's own order is its map's; attributes follow the Java map's
+/// order. Bounded by [`ECHO_LIMIT`].
+fn wire_request_items_echo(
+    request_items: &helpers::WrittenTables<Option<Vec<Option<WriteRequestWire>>>>,
+) -> String {
     let mut out = BoundedEcho::new();
-    let _ = write_request_items(&mut out, request_items);
+    let _ = write_wire_request_items(&mut out, request_items);
     out.finish()
 }
 
-fn write_request_items(
+fn write_wire_request_items(
     out: &mut dyn std::fmt::Write,
-    request_items: &HashMap<String, Vec<WriteRequest>>,
+    request_items: &helpers::WrittenTables<Option<Vec<Option<WriteRequestWire>>>>,
 ) -> std::fmt::Result {
-    let mut tables: Vec<(&String, &Vec<WriteRequest>)> = request_items.iter().collect();
-    tables.sort_by(|a, b| a.0.cmp(b.0));
+    let mut tables: Vec<&(String, Option<Vec<Option<WriteRequestWire>>>)> =
+        request_items.0.iter().collect();
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
     out.write_str("{")?;
     for (i, (table_name, requests)) in tables.into_iter().enumerate() {
         if i > 0 {
             out.write_str(", ")?;
         }
-        write!(out, "{table_name}=[")?;
+        write!(out, "{table_name}=")?;
+        let Some(requests) = requests else {
+            out.write_str("null")?;
+            continue;
+        };
+        out.write_str("[")?;
         for (j, request) in requests.iter().enumerate() {
             if j > 0 {
                 out.write_str(", ")?;
             }
-            write_write_request(out, request)?;
+            match request {
+                Some(request) => write_write_request(
+                    out,
+                    request
+                        .put_request
+                        .as_ref()
+                        .map(|put| put.item.as_ref().map(|item| &item.0)),
+                    request
+                        .delete_request
+                        .as_ref()
+                        .map(|delete| delete.key.as_ref().map(|key| &key.0)),
+                )?,
+                None => out.write_str("null")?,
+            }
         }
         out.write_str("]")?;
     }
     out.write_str("}")
 }
 
-fn write_write_request(out: &mut dyn std::fmt::Write, request: &WriteRequest) -> std::fmt::Result {
+/// One write request as the Java model prints it: each of its put and delete
+/// absent (`None`), present with no item or key (`Some(None)`), or present
+/// with one.
+fn write_write_request(
+    out: &mut dyn std::fmt::Write,
+    put: Option<Option<&HashMap<String, AttributeValue>>>,
+    delete: Option<Option<&HashMap<String, AttributeValue>>>,
+) -> std::fmt::Result {
+    let held = |out: &mut dyn std::fmt::Write,
+                kind: &str,
+                member: &str,
+                map: Option<Option<&HashMap<String, AttributeValue>>>|
+     -> std::fmt::Result {
+        match map {
+            Some(map) => {
+                write!(out, "{kind}({member}=")?;
+                match map {
+                    Some(map) => write_java_item(out, map)?,
+                    None => out.write_str("null")?,
+                }
+                out.write_str(", workloadProfileName=null)")
+            }
+            None => out.write_str("null"),
+        }
+    };
     out.write_str("WriteRequest(putRequest=")?;
-    match request.put_request {
-        Some(ref put) => {
-            out.write_str("PutRequest(item=")?;
-            write_java_item(out, &put.item)?;
-            out.write_str(", workloadProfileName=null)")?;
-        }
-        None => out.write_str("null")?,
-    }
+    held(out, "PutRequest", "item", put)?;
     out.write_str(", deleteRequest=")?;
-    match request.delete_request {
-        Some(ref delete) => {
-            out.write_str("DeleteRequest(key=")?;
-            write_java_item(out, &delete.key)?;
-            out.write_str(", workloadProfileName=null)")?;
-        }
-        None => out.write_str("null")?,
-    }
+    held(out, "DeleteRequest", "key", delete)?;
     out.write_str(")")
 }
 

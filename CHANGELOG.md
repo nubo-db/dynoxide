@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same view of a read by key, so `NOT NOT pk = 'a' AND (sk = t OR n = 5)`
   runs, and `pk = 'a' AND pk <> 'z' ORDER BY sk` is refused for having no
   partition key condition.
+- **A Query on a table with no sort key refuses an `ExclusiveStartKey`**,
+  as DynamoDB does, with `The provided exclusive start key is invalid`. Such
+  a Query never returns a `LastEvaluatedKey`, so there is no key to pass
+  back; a caller that built one from an item's own key used to get that item
+  again. See the entry under Fixed.
 
 ### Changed
 
@@ -71,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Query on a table with no sort key no longer returns a
+  `LastEvaluatedKey`, as DynamoDB never does for one: a partition of such a
+  table holds at most one item, so the first page is the whole answer. At
+  `Limit: 1` it used to return a key that resumed to the same item, for ever.
+  An `ExclusiveStartKey` on such a Query is now refused with `The provided
+  exclusive start key is invalid`, as DynamoDB refuses it, whether it names
+  the item, a partition with no item or another partition. A malformed key
+  keeps its own message. Indexes of such a table page as before.
 - Two opens of one database file at the same moment, from two threads or two
   processes, no longer fail with `database is locked` when the file is new or
   not yet in WAL mode. The open that loses the race to switch the file to WAL

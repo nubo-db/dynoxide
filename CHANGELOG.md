@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
   serves without an `initialize` step. Clients on earlier versions see no
   change.
+- **A paged read by partition key ends on the page holding its last row.**
+  An ascending Query, or a PartiQL `SELECT` read by partition key, with no
+  filter and a sort key condition that is absent or closed above (`BETWEEN`,
+  `<=`, `<`, `=`), returns no `LastEvaluatedKey` or `NextToken` on that page,
+  where it used to add an empty page after it. This holds on tables and on
+  both kinds of index, and on an index an ascending `>=` ends the same way.
+  The read looks one row ahead to know, and that row is neither counted in
+  `ScannedCount` nor charged. Descending and filtered reads, a `>` or a
+  table's `>=`, and Scan keep the empty page. `begins_with`, and a Query of
+  a multi-attribute index by its partition attributes alone, vary on
+  DynamoDB, so Dynoxide keeps the empty page for them too. An index with no
+  sort key, a PartiQL read of a table with no sort key, and a PartiQL clause
+  written with a `NOT`, such as `NOT NOT pk = 'k'`, page as they did before.
+  A Query of a table with no sort key ends on its item's page
+  ([#291](https://github.com/nubo-db/dynoxide/issues/291)).
 - **A bare name on the right of a PartiQL SET is an attribute, not a
   string.** `SET z = s` copies the attribute `s`, and is refused when the
   item has none, where it used to write the string `s`, as DynamoDB does.

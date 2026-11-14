@@ -2471,7 +2471,19 @@ async fn evaluate_window<S: StorageBackend>(
     let sort_keys = sort_key_plan(where_clause, read_pk, read_sk, parameters);
     let keyed_branches = matches!(pk_key, Some(Some(_))) && !sort_keys.branches.is_empty();
     let mut charge = keyed_branches.then(|| BranchCharge::new(&sort_keys.branches));
-    let peek = limit.is_some() && keyed_branches;
+    // A read that ends on its last matching row peeks the same way, and owes a
+    // continuation only when the peek found a row.
+    let forward = order.is_none_or(|plan| plan.forward);
+    let to_last_row = matches!(pk_key, Some(Some(_)))
+        && ends_on_last_row(
+            where_clause,
+            read_pk,
+            read_sk,
+            parameters,
+            index.is_some(),
+            forward,
+        );
+    let peek = limit.is_some() && (keyed_branches || to_last_row);
     let read_limit = limit.map(|lim| if peek { lim.saturating_add(1) } else { lim });
 
     let mut rows: Vec<(String, String, String)> = if let Some(plan) = order {
@@ -2594,15 +2606,17 @@ async fn evaluate_window<S: StorageBackend>(
     // reads and drops it on some, the same query either way (captured five
     // times in each region, 2026-11-04: `sk < 'row-2' OR sk > 'row-2'` kept it
     // on seven of ten walks), so the read keeps it every time.
-    let forward = order.is_none_or(|plan| plan.forward);
+    // A read that ends on its last matching row (see `ends_on_last_row`) owes
+    // one only when the peek found a row after the page.
     let continues = match (limit, &last_evaluated) {
         (Some(lim), Some(stop)) if evaluated >= lim => {
             !peek
                 || more_rows
-                || sort_keys
-                    .branches
-                    .iter()
-                    .any(|branch| branch.extends_past(&stop.sk, forward))
+                || (!to_last_row
+                    && sort_keys
+                        .branches
+                        .iter()
+                        .any(|branch| branch.extends_past(&stop.sk, forward)))
         }
         _ => false,
     };
@@ -3157,6 +3171,76 @@ fn sort_key_plan(
         sql,
         params,
         branches,
+    }
+}
+
+/// Whether a read by partition key hands back no token on the page holding its
+/// last matching row, as Query's does (#291, captured eu-west-2 and us-east-1,
+/// 6 and 13 November 2026): read ascending, with nothing in the WHERE clause
+/// but the partition key's equality and at most one sort key condition, which
+/// is closed above (`BETWEEN`, `<=`, `<`, `=`), or on an index `>=` too. Two
+/// conditions on the sort key are left out, as are a filter, an OR and a read
+/// in descending order; they keep the trailing empty page. `begins_with` varies
+/// on DynamoDB, so it is left out too and keeps the sort-key branch rule in
+/// `evaluate_window`, which keeps the trailing page for it. A clause written
+/// with a `NOT` anywhere is left out as well: DynamoDB scans `NOT NOT pk = 'k'`
+/// and ends it on an empty page (captured 14 November 2026), though once the
+/// `NOT`s are pushed down it reads as `pk = 'k'`. A table or index with no
+/// sort key is left out too, and pages as it always has.
+fn ends_on_last_row(
+    where_clause: Option<&WhereClause>,
+    read_pk: &str,
+    read_sk: Option<&str>,
+    parameters: &[AttributeValue],
+    index: bool,
+    forward: bool,
+) -> bool {
+    let Some(wc) = where_clause.filter(|wc| wc.fully_expanded && !written_with_not(&wc.written))
+    else {
+        return false;
+    };
+    let [group] = wc.groups.as_slice() else {
+        return false;
+    };
+    let pins = group
+        .iter()
+        .filter(|cond| match &***cond {
+            WhereCondition::Comparison(c) => {
+                names_attribute(&c.path, read_pk) && c.op == CompOp::Eq
+            }
+            WhereCondition::In(path, values) => names_attribute(path, read_pk) && values.len() == 1,
+            _ => false,
+        })
+        .count();
+    let sk_conditions = match read_sk {
+        Some(sk) => match translate_sk_conditions(group, sk, parameters) {
+            Some(conditions) => conditions,
+            None => return false,
+        },
+        // An index with no sort key, which has not been captured.
+        None if index => return false,
+        // A table with no sort key: DynamoDB hands back a token on the page
+        // holding its item (captured 14 November 2026).
+        None => return false,
+    };
+    if !forward || pins != 1 || group.len() != 1 + sk_conditions.len() {
+        return false;
+    }
+    use ResolvedSortKeyCondition as Sk;
+    match sk_conditions.as_slice() {
+        [] => true,
+        [Sk::Eq(..) | Sk::Lt(..) | Sk::Le(..) | Sk::Between(..)] => true,
+        [Sk::Ge(..)] => index,
+        _ => false,
+    }
+}
+
+/// Whether a clause as written holds a `NOT` anywhere.
+fn written_with_not(written: &WrittenClause) -> bool {
+    match written {
+        WrittenClause::Not(_) => true,
+        WrittenClause::And(terms) | WrittenClause::Or(terms) => terms.iter().any(written_with_not),
+        WrittenClause::Leaf(_) | WrittenClause::Operand(_) => false,
     }
 }
 

@@ -4494,13 +4494,10 @@ mod limit_over_the_wire {
     }
 
     /// Walks the select with `Limit` spelt as `limit`, returning the row count
-    /// of each page that carries rows, or the error the first page was refused
-    /// with.
+    /// of each page, or the error the first page was refused with.
     ///
-    /// A trailing empty page is left out. DynamoDB ends this keyed walk on its
-    /// fourth page with `Limit` 1, where Dynoxide still hands back a token
-    /// there and ends on a fifth, empty, page. That is a difference in where a
-    /// walk stops, not in how `Limit` is read, so it is not pinned here.
+    /// The walk ends on the page holding the partition's last row, with no
+    /// token there and no trailing empty page, as DynamoDB ends it.
     async fn walk(url: &str, limit: &str) -> Result<Vec<usize>, String> {
         let mut pages = Vec::new();
         let mut token: Option<String> = None;
@@ -4514,12 +4511,7 @@ mod limit_over_the_wire {
             pages.push(page["Items"].as_array().map_or(0, Vec::len));
             match page["NextToken"].as_str() {
                 Some(t) => token = Some(t.to_string()),
-                None => {
-                    if pages.len() > 1 && pages.last() == Some(&0) {
-                        pages.pop();
-                    }
-                    return Ok(pages);
-                }
+                None => return Ok(pages),
             }
             assert!(pages.len() <= 10, "the walk did not end: {pages:?}");
         }

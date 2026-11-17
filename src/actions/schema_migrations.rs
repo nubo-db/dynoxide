@@ -87,23 +87,21 @@ async fn fill_hash_prefixes<S: StorageBackend>(storage: &S, write: bool) -> Resu
             continue;
         }
         // Each call writes the prefixes worked out from the last page, then
-        // reads the next page of keys past it. The page is ordered by key, so
-        // a row filled behind the cursor can't move it, and a row whose key
-        // doesn't read back is passed over rather than read again.
+        // reads the next page of rows past it, in rowid order: the table's
+        // own, so the walk is one pass over it. Giving a row its prefix
+        // doesn't change its rowid, so a row filled behind the cursor can't
+        // move it. The cursor is the last rowid the page returned, not the
+        // last one filled, so a row whose key doesn't read back is passed
+        // over rather than read again.
         let mut fill: Vec<(String, String, String)> = Vec::new();
-        let mut after: Option<(String, String)> = None;
+        let mut after: Option<i64> = None;
         loop {
             let keys = storage
-                .fill_hash_prefixes(
-                    &table_name,
-                    &fill,
-                    after.as_ref().map(|(pk, sk)| (pk.as_str(), sk.as_str())),
-                    BATCH_SIZE,
-                )
+                .fill_hash_prefixes(&table_name, &fill, after, BATCH_SIZE)
                 .await?;
             fill = keys
                 .iter()
-                .filter_map(|(pk, sk)| {
+                .filter_map(|(_, pk, sk)| {
                     let key = crate::types::key_value_from_key_string(pk)?;
                     let prefix = crate::storage::compute_hash_prefix(&key);
                     Some((pk.clone(), sk.clone(), prefix))
@@ -113,7 +111,7 @@ async fn fill_hash_prefixes<S: StorageBackend>(storage: &S, write: bool) -> Resu
                 return Ok(1);
             }
             filled += fill.len();
-            match next_page_after(&table_name, after.as_ref(), &keys, BATCH_SIZE)? {
+            match next_page_after(&table_name, after, &keys, BATCH_SIZE)? {
                 Some(next) => after = Some(next),
                 None => break,
             }
@@ -127,31 +125,29 @@ async fn fill_hash_prefixes<S: StorageBackend>(storage: &S, write: bool) -> Resu
     Ok(filled)
 }
 
-/// The key the page after `keys` starts past, or `None` when `keys` is the
+/// The rowid the page after `rows` starts past, or `None` when `rows` is the
 /// last page: one shorter than `batch_size`.
 ///
-/// A full page whose last key is not past `after` is refused rather than
-/// read again. Each backend returns keys in order past `after`, so this can
-/// only happen when a backend reads a key back as something other than what
-/// is stored, such as a key column that isn't text coming back empty; the
-/// next page would then repeat this one, and the open would never finish.
+/// A full page whose last rowid is not past `after` is refused rather than
+/// read again. Each backend returns rows in rowid order past `after`, so this
+/// can only happen when a backend reads a rowid back wrongly; the next page
+/// would then repeat this one, and the open would never finish.
 fn next_page_after(
     table_name: &str,
-    after: Option<&(String, String)>,
-    keys: &[(String, String)],
+    after: Option<i64>,
+    rows: &[(i64, String, String)],
     batch_size: usize,
-) -> Result<Option<(String, String)>> {
-    let Some(last) = keys.last().filter(|_| keys.len() == batch_size) else {
+) -> Result<Option<i64>> {
+    let Some(&(last, _, _)) = rows.last().filter(|_| rows.len() == batch_size) else {
         return Ok(None);
     };
-    if let Some(after) = after.filter(|after| last <= *after) {
+    if let Some(after) = after.filter(|&after| last <= after) {
         return Err(DynoxideError::InternalServerError(format!(
-            "filling in the hash prefixes of table {table_name}: a page of keys \
-             did not move past {after:?}, so the same rows would be read again. \
-             The table has a key this build can't read back as stored."
+            "filling in the hash prefixes of table {table_name}: a page of rows \
+             did not move past rowid {after}, so the same rows would be read again"
         )));
     }
-    Ok(Some(last.clone()))
+    Ok(Some(last))
 }
 
 /// Run `step` and record `version`, in one write transaction.
@@ -818,51 +814,114 @@ mod tests {
         }
     }
 
-    fn keys(range: std::ops::Range<u32>) -> Vec<(String, String)> {
-        range
-            .map(|i| (format!("S:k{i:03}"), String::new()))
+    fn page(rowids: std::ops::Range<i64>) -> Vec<(i64, String, String)> {
+        rowids
+            .map(|i| (i, format!("S:k{i:03}"), String::new()))
             .collect()
     }
 
     #[test]
     fn a_page_shorter_than_a_batch_is_the_last() {
-        let after = ("S:k000".to_string(), String::new());
         assert_eq!(
-            super::next_page_after("T", Some(&after), &keys(1..4), 4).unwrap(),
+            super::next_page_after("T", Some(1), &page(2..5), 4).unwrap(),
             None
         );
         assert_eq!(super::next_page_after("T", None, &[], 4).unwrap(), None);
     }
 
     #[test]
-    fn a_full_page_moves_the_cursor_to_its_last_key() {
+    fn a_full_page_moves_the_cursor_to_its_last_rowid() {
         assert_eq!(
-            super::next_page_after("T", None, &keys(0..4), 4).unwrap(),
-            Some(("S:k003".to_string(), String::new()))
+            super::next_page_after("T", None, &page(1..5), 4).unwrap(),
+            Some(4)
         );
-        let after = ("S:k003".to_string(), String::new());
         assert_eq!(
-            super::next_page_after("T", Some(&after), &keys(4..8), 4).unwrap(),
-            Some(("S:k007".to_string(), String::new()))
+            super::next_page_after("T", Some(4), &page(5..9), 4).unwrap(),
+            Some(8)
         );
     }
 
-    /// A backend that read every key of a full page back as empty would hand
+    /// A backend that read every rowid of a full page back wrongly could hand
     /// the same page back for ever; the walk stops instead.
     #[test]
     fn a_full_page_that_does_not_move_the_cursor_is_refused() {
-        let empty = vec![(String::new(), String::new()); 4];
-        let after = super::next_page_after("T", None, &empty, 4)
+        let zeroes = page(0..4)
+            .into_iter()
+            .map(|(_, pk, sk)| (0, pk, sk))
+            .collect::<Vec<_>>();
+        let after = super::next_page_after("T", None, &zeroes, 4)
             .unwrap()
             .unwrap();
-        let message = super::next_page_after("T", Some(&after), &empty, 4)
+        let message = super::next_page_after("T", Some(after), &zeroes, 4)
             .unwrap_err()
             .to_string();
         assert!(
-            message.contains("a page of keys did not move past (\"\", \"\")"),
+            message.contains("a page of rows did not move past rowid 0"),
             "{message}"
         );
-        let later = ("S:k009".to_string(), String::new());
-        assert!(super::next_page_after("T", Some(&later), &keys(4..8), 4).is_err());
+        assert!(super::next_page_after("T", Some(9), &page(5..9), 4).is_err());
+    }
+
+    /// A whole page of rows whose keys don't read back fills nothing, and the
+    /// walk must still move past it, to the rows after it, rather than read it
+    /// again or stop there.
+    #[test]
+    fn a_full_page_of_keys_that_do_not_read_back_is_passed_over() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        {
+            let db = Database::new(&path).unwrap();
+            db.create_table(request(json!({
+                "TableName": "Str",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            })))
+            .unwrap();
+            for i in 0..1500 {
+                db.put_item(request(json!({
+                    "TableName": "Str",
+                    "Item": {"pk": {"S": format!("k{i:05}")}}
+                })))
+                .unwrap();
+            }
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE \"Str\" SET hash_prefix = ''", [])
+            .unwrap();
+        // The first 1000 rows in rowid order, exactly one page, get keys that
+        // don't read back. Changing a row's key in place keeps its rowid.
+        let first_page: Vec<i64> = conn
+            .prepare("SELECT rowid FROM \"Str\" ORDER BY rowid LIMIT 1000")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(first_page.len(), 1000);
+        conn.execute(
+            "UPDATE \"Str\" SET pk = 'X:' || pk WHERE rowid <= ?1",
+            [first_page[999]],
+        )
+        .unwrap();
+        set_version(&conn, 11);
+        drop(conn);
+
+        drop(Database::new(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        let unfilled: Vec<String> = conn
+            .prepare("SELECT pk FROM \"Str\" WHERE hash_prefix = ''")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(unfilled.len(), 1000);
+        assert!(
+            unfilled.iter().all(|pk| pk.starts_with("X:")),
+            "{unfilled:?}"
+        );
+        drop(conn);
+        assert_eq!(recorded(&path), current());
     }
 }

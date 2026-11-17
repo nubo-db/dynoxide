@@ -1272,9 +1272,9 @@ impl StorageBackend for WasmBridgeBackend {
         &self,
         table_name: &str,
         fill: &[(String, String, String)],
-        after: Option<(&str, &str)>,
+        after: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(String, String)>, BackendError> {
+    ) -> Result<Vec<(i64, String, String)>, BackendError> {
         if !fill.is_empty() {
             let rows = fill
                 .iter()
@@ -1294,15 +1294,16 @@ impl StorageBackend for WasmBridgeBackend {
         }
         let sql = sql_builders::keys_without_hash_prefix(table_name, after.is_some(), limit);
         let params = after
-            .map(|(pk, sk)| vec![SqlParam::text(pk), SqlParam::text(sk)])
+            .map(|rowid| vec![SqlParam::Integer(rowid)])
             .unwrap_or_default();
         let rows = self.query(&sql, params).await?;
         let mut keys = Vec::with_capacity(rows.length() as usize);
         for i in 0..rows.length() {
             let row: js_sys::Array = rows.get(i).unchecked_into();
             keys.push((
-                col_text(&row, 0).unwrap_or_default(),
+                col_i64(&row, 0),
                 col_text(&row, 1).unwrap_or_default(),
+                col_text(&row, 2).unwrap_or_default(),
             ));
         }
         Ok(keys)

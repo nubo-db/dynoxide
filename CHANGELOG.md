@@ -642,6 +642,7 @@ Fixed.
   back in the same segment and the same place as a fresh write. That open
   moves the file to schema version 12, and the upgrade is one way: Dynoxide
   1.3.0 to 1.6.0 read up to version 11 and will refuse the file afterwards.
+  Looking for such items reads each table once, in the order it is stored.
   Recording version 12 is a write, so the first open by this release writes
   to the file. A database kept read-only that has items to fill is refused
   until it has been opened writable once; one with nothing to fill still

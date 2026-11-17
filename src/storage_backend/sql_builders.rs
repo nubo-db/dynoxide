@@ -560,17 +560,17 @@ pub(crate) fn fill_hash_prefix(table_name: &str) -> String {
     )
 }
 
-/// The keys `(pk, sk)` of up to `limit` rows whose `hash_prefix` is empty, in
-/// key order. With `after`, only rows past the key bound as `?1` and `?2`.
+/// The `(rowid, pk, sk)` of up to `limit` rows whose `hash_prefix` is empty,
+/// in rowid order. With `after`, only rows past the rowid bound as `?1`.
+///
+/// Rowid order is the table's own, so each page is one range read of it. Key
+/// order would walk the key index and look every row up in the table, which
+/// costs many times more on a large table with nothing to fill.
 pub(crate) fn keys_without_hash_prefix(table_name: &str, after: bool, limit: usize) -> String {
     format!(
-        "SELECT pk, sk FROM \"{}\" WHERE hash_prefix = ''{} ORDER BY pk, sk LIMIT {limit}",
+        "SELECT rowid, pk, sk FROM \"{}\" WHERE hash_prefix = ''{} ORDER BY rowid LIMIT {limit}",
         escape_table_name(table_name),
-        if after {
-            " AND (pk, sk) > (?1, ?2)"
-        } else {
-            ""
-        }
+        if after { " AND rowid > ?1" } else { "" }
     )
 }
 
@@ -1921,6 +1921,43 @@ mod tests {
                 vec![SqlParam::text("S:t1")],
             )
         );
+    }
+
+    /// The schema 12 open runs this query over every row of every table, so
+    /// it must read the table in its own order rather than walk the key index
+    /// and look each row up. Checks parts of the plan, not whole lines, since
+    /// SQLite builds word the plan a little differently.
+    #[test]
+    fn the_hash_prefix_pages_read_the_table_in_rowid_order() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let (create_sql, _) = create_data_table("T");
+        conn.execute_batch(&create_sql).unwrap();
+        for after in [false, true] {
+            let sql = keys_without_hash_prefix("T", after, 1000);
+            let params: Vec<i64> = if after { vec![5] } else { Vec::new() };
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                !plan.iter().any(|d| d.contains("autoindex")),
+                "the page walks the key index: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("INTEGER PRIMARY KEY") || d.starts_with("SCAN")),
+                "the page doesn't read the table in rowid order: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.contains("TEMP B-TREE")),
+                "the page sorts its rows: {plan:?}"
+            );
+        }
     }
 
     #[test]

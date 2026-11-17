@@ -509,9 +509,9 @@ impl StorageBackend for Storage {
         &self,
         table_name: &str,
         fill: &[(String, String, String)],
-        after: Option<(&str, &str)>,
+        after: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(String, String)>, BackendError> {
+    ) -> Result<Vec<(i64, String, String)>, BackendError> {
         use crate::storage_backend::sql_builders;
         if !fill.is_empty() {
             let mut stmt = self
@@ -531,10 +531,9 @@ impl StorageBackend for Storage {
             .conn()
             .prepare_cached(&sql)
             .map_err(error::from_rusqlite)?;
-        let params: Vec<&str> = after.map(|(pk, sk)| vec![pk, sk]).unwrap_or_default();
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params), |r| {
-                Ok((r.get(0)?, r.get(1)?))
+            .query_map(rusqlite::params_from_iter(after), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .map_err(error::from_rusqlite)?;
         rows.collect::<rusqlite::Result<_>>()

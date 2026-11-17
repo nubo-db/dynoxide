@@ -15,7 +15,7 @@ Fixed.
 
 ### Security
 
-- **`rusqlite` moves to 0.42.0, which brings `libsqlite3-sys` 0.40.0 and
+- **`rusqlite` moves to 0.43.0, which brings `libsqlite3-sys` 0.40.0 and
   SQLite 3.54.1,** for RUSTSEC-2026-0459 (CVE-2026-119375). SQLite before
   3.54.0 can return stale memory when it opens a database together with a
   `-wal` file whose page size differs, so a crafted pair of files could leak
@@ -107,7 +107,7 @@ Fixed.
 
 ### Changed
 
-- The declared MSRV is now 1.89, which `rusqlite` 0.42 needs.
+- The declared MSRV is now 1.89, which `rusqlite` 0.43 needs.
 - **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
   emulator verified against AWS**, rather than a drop-in replacement for
   DynamoDB Local.
@@ -115,8 +115,8 @@ Fixed.
 #### Breaking (Rust API)
 
 - `Storage::conn()`, `DynoxideError::SqliteError` and
-  `storage_backend::from_rusqlite` now use `rusqlite` 0.42's types, so code
-  that passes them to or from its own `rusqlite` needs 0.42 too. The next
+  `storage_backend::from_rusqlite` now use `rusqlite` 0.43's types, so code
+  that passes them to or from its own `rusqlite` needs 0.43 too. The next
   crate release is `dynoxide-rs` 4.0.0.
 - `StorageBackend` gains `fill_hash_prefixes`, which the open that brings a
   database up to schema version 12 calls. The trait is sealed, so only

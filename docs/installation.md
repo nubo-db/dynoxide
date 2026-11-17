@@ -82,8 +82,8 @@ leaves a file with nothing to fill at version 11, and refuses one with items to
 fill until it has been opened writable once.
 
 **Depending on the `dynoxide-rs` crate?** It's now 4.0.0. `rusqlite` moves to
-0.42, so code that passes `Storage::conn()` or `DynoxideError::SqliteError` to
-or from its own `rusqlite` needs 0.42 too. The minimum supported Rust version
+0.43, so code that passes `Storage::conn()` or `DynoxideError::SqliteError` to
+or from its own `rusqlite` needs 0.43 too. The minimum supported Rust version
 is now 1.89. The changelog's Breaking (Rust API) section lists each change.
 
 ## Upgrading to 1.3.0

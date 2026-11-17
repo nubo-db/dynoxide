@@ -186,28 +186,41 @@ test("a server that ignores stdin and SIGTERM is killed within the grace periods
   assert.strictEqual(await answers(server.port), false);
 });
 
+// A server that stops being read can block inside a write and stop answering
+// too, so a request that takes too long fails rather than waiting forever.
 function flushed(port) {
   return new Promise((resolve, reject) => {
-    http.get({ host: "127.0.0.1", port, path: "/" }, (res) => {
+    const req = http.get({ host: "127.0.0.1", port, path: "/", timeout: 2000 }, (res) => {
       let text = "";
       res.on("data", (c) => (text += c));
       res.on("end", () => resolve(JSON.parse(text)));
-    }).on("error", reject);
+    });
+    req.on("timeout", () => req.destroy(new Error("the server stopped answering")));
+    req.on("error", reject);
   });
 }
 
-test("a server that floods stdout and stderr keeps being read, and stops", async () => {
+test("a server that floods stdout and stderr keeps being read, and stops", { timeout: 30000 }, async () => {
   const server = await fake("flood");
-  await new Promise((r) => setTimeout(r, 300));
-  const before = await flushed(server.port);
-  await new Promise((r) => setTimeout(r, 300));
-  const after = await flushed(server.port);
-  // A pipe holds about 64 KiB; past that, only a reader keeps the count rising.
-  for (const key of ["out", "err"]) {
-    assert.ok(after[key] > 1024 * 1024, `${key}: only ${after[key]} bytes read`);
-    assert.ok(after[key] > before[key], `${key} stopped being read`);
+  try {
+    // A pipe holds about 64 KiB; past 1 MiB, only a reader keeps the count rising.
+    const enough = (n) => n.out > 1024 * 1024 && n.err > 1024 * 1024;
+    const deadline = Date.now() + 10000;
+    let before = await flushed(server.port);
+    while (!enough(before) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      before = await flushed(server.port);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const after = await flushed(server.port);
+    for (const key of ["out", "err"]) {
+      assert.ok(after[key] > 1024 * 1024, `${key}: only ${after[key]} bytes read`);
+      assert.ok(after[key] > before[key], `${key} stopped being read`);
+    }
+    assert.strictEqual((await server.stop()).code, 0);
+  } finally {
+    await server.stop();
   }
-  assert.strictEqual((await server.stop()).code, 0);
 });
 
 test("DYNOXIDE_ENCRYPTION_KEY reaches neither the version check nor the server", async () => {
@@ -375,8 +388,10 @@ const readmeSkip = !real
   : !sdkInstalled() && !process.env.DYNOXIDE_EXTRA_CHECKS && "the AWS SDK isn't installed in test-fixtures";
 
 test("the README's example is the code the next test runs", () => {
-  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
-  const example = fs.readFileSync(path.join(FIXTURES, "readme-example.mjs"), "utf8").trimEnd();
+  // Git on Windows may check text files out with CRLF line endings.
+  const text = (file) => fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+  const readme = text(path.join(__dirname, "..", "README.md"));
+  const example = text(path.join(FIXTURES, "readme-example.mjs")).trimEnd();
   assert.ok(readme.includes("```js\n" + example + "\n```"), "the README's start() example and test-fixtures/readme-example.mjs differ");
 });
 

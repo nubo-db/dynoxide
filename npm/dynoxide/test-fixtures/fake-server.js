@@ -95,15 +95,19 @@ switch (mode) {
     // In flood mode the server answers with how many bytes of each stream the
     // reader has taken. Writes wait for their callback, so a reader that stops
     // reading stops the count, as it would stop a real server's writes.
+    // Each write waits a turn of the event loop before the next. On Windows,
+    // Node writes stdout and stderr pipes synchronously, so writes chained
+    // straight from their callbacks run on the nextTick queue forever and
+    // the HTTP server never gets to answer.
     const flushed = { out: 0, err: 0 };
     const server = http.createServer((req, res) => res.end(JSON.stringify(flushed)));
     server.listen(0, "127.0.0.1", () => {
       ready(server.address().port);
       if (mode === "flood") {
-        const line = "x".repeat(1024) + "\n";
+        const line = "x".repeat(16 * 1024 - 1) + "\n";
         const pump = (stream, key) => stream.write(line, () => {
           flushed[key] += line.length;
-          pump(stream, key);
+          setImmediate(pump, stream, key);
         });
         pump(process.stdout, "out");
         pump(process.stderr, "err");

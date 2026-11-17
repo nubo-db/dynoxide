@@ -66,11 +66,25 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "3.3", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "4.0", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "3.3", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "4.0", default-features = false, features = ["encryption"] }
 ```
+
+## Upgrading to 1.7.0
+
+**Database files move to schema version 12 when 1.7.0 first opens them
+writable**, and 1.3.0 to 1.6.0 will refuse them afterwards, so copy a file
+first if you might go back. The open gives items written before 0.9.5 the hash
+prefix a fresh write would, so a parallel scan finds them. A read-only open
+leaves a file with nothing to fill at version 11, and refuses one with items to
+fill until it has been opened writable once.
+
+**Depending on the `dynoxide-rs` crate?** It's now 4.0.0. `rusqlite` moves to
+0.42, so code that passes `Storage::conn()` or `DynoxideError::SqliteError` to
+or from its own `rusqlite` needs 0.42 too. The minimum supported Rust version
+is now 1.89. The changelog's Breaking (Rust API) section lists each change.
 
 ## Upgrading to 1.3.0
 

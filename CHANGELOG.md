@@ -131,7 +131,9 @@ Fixed.
   line failed to write and the release build aborted before closing the
   database, leaving its write-ahead log behind. Writes weren't lost, but the
   shutdown wasn't the clean one `--exit-with-parent` promises. Informational
-  lines on the `serve` path now drop a failed write instead.
+  lines on the `serve` path now drop a failed write instead, and so does the
+  log `RUST_LOG` turns on, which otherwise also dropped every request served
+  after the launcher stopped reading.
 
 - A Query on a table with no sort key no longer returns a
   `LastEvaluatedKey`, as DynamoDB never does for one: a partition of such a

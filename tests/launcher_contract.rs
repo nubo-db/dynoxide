@@ -732,6 +732,64 @@ fn a_shutdown_with_no_one_reading_stderr_still_closes_the_database() {
     );
 }
 
+/// With `RUST_LOG` set, requests log to stderr too. A request served after
+/// the launcher stops reading stderr must still be answered, and the server
+/// must still close its database when stdin closes: a failed log write that
+/// panics would drop the request here and abort the release build.
+#[test]
+fn a_request_logged_with_no_one_reading_stderr_is_still_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("data.db");
+    let mut server = KillOnDrop(
+        serve(&[
+            "--port",
+            "0",
+            "--ready-json",
+            "--exit-with-parent",
+            "--db-path",
+            db.to_str().unwrap(),
+        ])
+        .env("RUST_LOG", "debug")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dynoxide"),
+    );
+    let mut stdout = BufReader::new(server.0.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let ready: serde_json::Value = serde_json::from_str(&line).expect("a ready line");
+    let endpoint = ready["endpoint"].as_str().unwrap().to_owned();
+
+    drop(server.0.stderr.take());
+    let create = r#"{"TableName":"Kept","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}"#;
+    // Enough requests to fill the pipe's buffer, so the writes fail.
+    for _ in 0..200 {
+        assert_eq!(list_tables(&endpoint).0, 200);
+    }
+    assert_eq!(dynamo(&endpoint, "CreateTable", create).0, 200);
+
+    drop(stdout);
+    drop(server.0.stdin.take());
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    let status = loop {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server kept running after stdin closed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "exit status {status}");
+    assert!(
+        !dir.path().join("data.db-wal").exists(),
+        "the database wasn't closed"
+    );
+}
+
 #[test]
 fn a_server_started_with_stdin_already_closed_stops_at_once() {
     // Passing the flag with no stdin is a launcher bug, and it shows up as a

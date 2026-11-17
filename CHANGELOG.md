@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The crate moves to `dynoxide-rs` 4.0.0, because the `rusqlite` move changes
 public types: see Breaking (Rust API). Everything else a user installs carries
 1.7.0. The first writable open by this release moves a database to schema
-version 12, which 1.6.0 and earlier refuse: see the parallel scan entry under
+version 12, which 1.3.0 to 1.6.0 refuse: see the parallel scan entry under
 Fixed.
 
 ### Security

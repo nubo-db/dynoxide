@@ -79,7 +79,8 @@ writable**, and 1.3.0 to 1.6.0 will refuse them afterwards, so copy a file
 first if you might go back. The open gives items written before 0.9.5 the hash
 prefix a fresh write would, so a parallel scan finds them. A read-only open
 leaves a file with nothing to fill at version 11, and refuses one with items to
-fill until it has been opened writable once.
+fill until it has been opened writable once. Make the `-wal` and `-shm` files
+beside it writable for that open, as well as the database.
 
 **Depending on the `dynoxide-rs` crate?** It's now 4.0.0. `rusqlite` moves to
 0.43, so code that passes `Storage::conn()` or `DynoxideError::SqliteError` to

@@ -136,11 +136,14 @@ jobs:
       - name: Attest build provenance
         id: attest
         continue-on-error: true
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+          # Storage records need artifact-metadata: write, which these jobs
+          # do not grant; v2 made none.
+          create-storage-record: false
 
       - name: Mirror to Docker Hub
         id: mirror-dockerhub

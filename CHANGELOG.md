@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The crate moves to `dynoxide-rs` 4.0.0, because the `rusqlite` move changes
+public types: see Breaking (Rust API). Everything else a user installs carries
+1.7.0. The first writable open by this release moves a database to schema
+version 12, which 1.3.0 to 1.6.0 refuse: see the parallel scan entry under
+Fixed.
+
 ### Security
 
-- **`rusqlite` moves to 0.42.0, which brings `libsqlite3-sys` 0.40.0 and
+- **`rusqlite` moves to 0.43.0, which brings `libsqlite3-sys` 0.40.0 and
   SQLite 3.54.1,** for RUSTSEC-2026-0459 (CVE-2026-119375). SQLite before
   3.54.0 can return stale memory when it opens a database together with a
   `-wal` file whose page size differs, so a crafted pair of files could leak
@@ -75,21 +81,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back; a caller that built one from an item's own key used to get that item
   again. See the entry under Fixed.
 
+### Added
+
+- **`--ready-json` prints one JSON line to stdout once the server is ready**,
+  so a launcher in another language can read the endpoint, port and process ID
+  without parsing the human startup line. With the flag, stdout carries only
+  that line and log output moves to stderr. It works on `serve` and the
+  no-subcommand form, and `dynoxide mcp` refuses it. The line's fields and how
+  they may change are in `docs/versioning.md`. The library gains
+  `ServerOptions::with_ready_line`.
+- **`--exit-with-parent` shuts the server down gracefully when stdin closes**,
+  so a server started by a test runner stops when the runner exits, even if
+  the runner is killed outright. Closing stdin is also a graceful way to stop
+  the server on Windows, where there is no SIGTERM. Only pass it with stdin on
+  a pipe: with stdin closed, the server stops as soon as it starts. `dynoxide
+  mcp` refuses it, because stdio mode already exits when stdin closes. The
+  library gains `ServerOptions::with_shutdown_trigger`, which stops the HTTP
+  server when a `tokio::sync::watch` channel says so.
+- **`docs/launcher.md` describes how a wrapper for another language finds,
+  verifies, starts and stops Dynoxide**, so wrappers behave alike.
+- **The npm package exports `start()`**, which runs Dynoxide on a free port
+  for a test suite and returns its endpoint, region, credentials and a
+  `stop()`. It follows `docs/launcher.md`. The package gains TypeScript types and an `exports` map that keeps
+  `dynoxide/bin/dynoxide` and `dynoxide/package.json` importable.
+
 ### Changed
 
-- The declared MSRV is now 1.89, which `rusqlite` 0.42 needs.
+- The declared MSRV is now 1.89, which `rusqlite` 0.43 needs.
+- **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
+  emulator verified against AWS**, rather than a drop-in replacement for
+  DynamoDB Local.
 
 #### Breaking (Rust API)
 
 - `Storage::conn()`, `DynoxideError::SqliteError` and
-  `storage_backend::from_rusqlite` now use `rusqlite` 0.42's types, so code
-  that passes them to or from its own `rusqlite` needs 0.42 too. The next
+  `storage_backend::from_rusqlite` now use `rusqlite` 0.43's types, so code
+  that passes them to or from its own `rusqlite` needs 0.43 too. The next
   crate release is `dynoxide-rs` 4.0.0.
 - `StorageBackend` gains `fill_hash_prefixes`, which the open that brings a
   database up to schema version 12 calls. The trait is sealed, so only
   Dynoxide's own backends implement it. It arrives with `dynoxide-rs` 4.0.0.
 
 ### Fixed
+
+- **A server whose launcher was killed now shuts down cleanly.** If the
+  launcher had been reading the server's stderr through a pipe, the shutdown
+  line failed to write and the release build aborted before closing the
+  database, leaving its write-ahead log behind. Writes weren't lost, but the
+  shutdown wasn't the clean one `--exit-with-parent` promises. Informational
+  lines on the `serve` path now drop a failed write instead.
 
 - A Query on a table with no sort key no longer returns a
   `LastEvaluatedKey`, as DynamoDB never does for one: a partition of such a

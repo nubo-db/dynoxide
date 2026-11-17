@@ -80,6 +80,8 @@ Or install it into a project to pin the version, after which `npx dynoxide` uses
 npm install --save-dev dynoxide
 ```
 
+In a Node test suite, the package's `start()` runs a server on a free port and stops it when the tests finish. See [starting a server from your tests](https://github.com/nubo-db/dynoxide/blob/main/npm/dynoxide/README.md#starting-a-server-from-your-tests).
+
 Or run it in Docker, a drop-in for `amazon/dynamodb-local`:
 
 ```sh
@@ -89,7 +91,7 @@ docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
 Or start it in a GitHub Actions job:
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v1.6.0
+- uses: nubo-db/dynoxide/action@v1.7.0
   with:
     port: 8000
 ```
@@ -106,6 +108,7 @@ unchanged.
 - [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker
 - [HTTP server](https://github.com/nubo-db/dynoxide/blob/main/docs/http-server.md) - running the DynamoDB-compatible HTTP API
 - [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
+- [Writing a launcher](https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md) - how a wrapper for another language finds, starts and stops the binary
 - [Laravel](https://github.com/nubo-db/dynoxide/blob/main/docs/laravel.md) - the DynamoDB cache, locks, sessions and failed jobs, run locally
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
@@ -127,6 +130,8 @@ These integrations are built and maintained by people outside the project. There
 - [dynoxide-scala-core](https://github.com/Hapag-Lloyd/dynoxide-scala-core) - the build-tool-agnostic library behind sbt-dynoxide, for wiring Dynoxide into other JVM build tools (Hapag-Lloyd, maintained by [Marcin Szałomski](https://github.com/baldram))
 
 Built something on top of Dynoxide? [Propose it for the list](https://github.com/nubo-db/dynoxide/issues/new?template=community-integration.yml).
+
+Wrapping Dynoxide for another language? [Writing a launcher](https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md) covers finding, starting and stopping the binary the same way every other wrapper does.
 
 ## Supported Operations
 

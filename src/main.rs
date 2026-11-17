@@ -32,7 +32,7 @@ enum LogMode {
 
     name = "dynoxide",
     version = dynoxide::PRODUCT_VERSION,
-    about = "A fast, lightweight drop-in replacement for DynamoDB Local, backed by SQLite",
+    about = "A DynamoDB emulator, verified against AWS, backed by SQLite",
     after_help = after_help_text(),
     args_conflicts_with_subcommands = true,
 )]
@@ -66,10 +66,36 @@ struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     log: Option<LogMode>,
 
+    /// Print one JSON line to stdout once the server is ready, and send log
+    /// output to stderr, for launchers that start Dynoxide. See
+    /// https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md
+    #[arg(long)]
+    ready_json: bool,
+
+    /// Shut down gracefully when stdin closes, so the server stops with the
+    /// process that started it. Don't pass it with stdin closed or at /dev/null
+    #[arg(long)]
+    exit_with_parent: bool,
+
     /// Schema file (JSON with DescribeTable responses): scaffolds empty tables on startup
     #[cfg(feature = "import")]
     #[arg(long, value_name = "PATH")]
     schema: Option<PathBuf>,
+}
+
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+impl Cli {
+    /// Whether this invocation prints the ready line, which reserves stdout
+    /// for it.
+    fn wants_ready_line(&self) -> bool {
+        match &self.command {
+            #[cfg(feature = "http-server")]
+            None => self.ready_json,
+            #[cfg(feature = "http-server")]
+            Some(Commands::Serve(args)) => args.ready_json,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -113,6 +139,17 @@ struct ServeArgs {
     /// Logging mode
     #[arg(long, value_enum, value_name = "MODE")]
     log: Option<LogMode>,
+
+    /// Print one JSON line to stdout once the server is ready, and send log
+    /// output to stderr, for launchers that start Dynoxide. See
+    /// https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md
+    #[arg(long)]
+    ready_json: bool,
+
+    /// Shut down gracefully when stdin closes, so the server stops with the
+    /// process that started it. Don't pass it with stdin closed or at /dev/null
+    #[arg(long)]
+    exit_with_parent: bool,
 
     /// Also start MCP server over Streamable HTTP (for Claude Code integration)
     #[cfg(feature = "mcp-server")]
@@ -201,6 +238,14 @@ struct McpArgs {
     /// Use Streamable HTTP transport instead of stdio
     #[arg(long)]
     http: bool,
+
+    /// Accepted only to refuse it with an explanation (see `run_mcp`)
+    #[arg(long, hide = true)]
+    ready_json: bool,
+
+    /// Accepted only to refuse it with an explanation (see `run_mcp`)
+    #[arg(long, hide = true)]
+    exit_with_parent: bool,
 
     /// Host to bind the HTTP transport to (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1", requires = "http")]
@@ -389,9 +434,12 @@ compile_error!(
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 #[tokio::main]
 async fn main() {
+    // Parsed before the log subscriber is installed, because the command
+    // decides where the log goes: stdout is reserved for the ready line under
+    // `--ready-json`, and for JSON-RPC messages when MCP runs over stdio.
     let cli = Cli::parse();
     let logs = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
-    if speaks_mcp_over_stdio(&cli) {
+    if cli.wants_ready_line() || speaks_mcp_over_stdio(&cli) {
         logs.with_writer(std::io::stderr).init();
     } else {
         logs.init();
@@ -459,6 +507,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 db_path: cli.db_path,
                 encryption_key_file: cli.encryption_key_file,
                 log: cli.log,
+                ready_json: cli.ready_json,
+                exit_with_parent: cli.exit_with_parent,
                 #[cfg(feature = "mcp-server")]
                 mcp: false,
                 #[cfg(feature = "mcp-server")]
@@ -555,11 +605,17 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let n = dynoxide::import::scaffold_from_schema(&db, schema_path)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         if !is_quiet(args.log) {
-            eprintln!("Scaffolded {} table(s) from schema", n);
+            dynoxide::stderr_line(format_args!("Scaffolded {} table(s) from schema", n));
         }
     }
 
-    let server_options = server_options(args.log);
+    let mut server_options = server_options(args.log);
+    if args.ready_json {
+        server_options = server_options.with_ready_line();
+    }
+    if args.exit_with_parent {
+        server_options = server_options.with_shutdown_trigger(watch_stdin_for_eof());
+    }
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {
@@ -585,10 +641,10 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mcp_options = server_options.clone();
 
         if !quiet {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
                 args.host, args.port, args.mcp_host, args.mcp_port
-            );
+            ));
         }
 
         let (http_result, mcp_result) = tokio::join!(
@@ -615,6 +671,38 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
     Ok(())
+}
+
+/// Read stdin until it closes, on a thread of its own, and return a trigger
+/// that fires then.
+///
+/// A plain thread rather than `tokio::io::stdin`: tokio reads stdin with a
+/// blocking read it can't cancel, which can hold up runtime shutdown until
+/// stdin closes, so a SIGTERM would hang while the pipe is still open. The
+/// process doesn't wait for this thread when `main` returns.
+#[cfg(feature = "http-server")]
+fn watch_stdin_for_eof() -> tokio::sync::watch::Receiver<bool> {
+    use std::io::{ErrorKind, Read};
+
+    let (closed, trigger) = tokio::sync::watch::channel(false);
+    std::thread::Builder::new()
+        .name("stdin-watch".into())
+        .spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut discard = [0u8; 1024];
+            loop {
+                match stdin.read(&mut discard) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    // Any other error means nothing more will arrive.
+                    Err(_) => break,
+                }
+            }
+            let _ = closed.send(true);
+        })
+        .expect("failed to start the stdin watcher thread");
+    trigger
 }
 
 /// Whether `--log` asks for quiet mode, for the lines this binary prints
@@ -678,11 +766,11 @@ fn load_data_model(
             let model = dynoxide::schema::onetable::parse_onetable_file(p)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             if !quiet {
-                eprintln!(
+                dynoxide::stderr_line(format_args!(
                     "Loaded data model: {} ({} entities)",
                     model.schema_format,
                     model.entities.len()
-                );
+                ));
             }
             Ok(Some(model))
         }
@@ -901,10 +989,10 @@ fn resolve_mcp_http_options(
 
     match &resolved.mode {
         AuthMode::Disabled => {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "WARNING: MCP auth disabled (--no-auth, loopback only). \
                  Any local process on this machine can call this server."
-            );
+            ));
         }
         AuthMode::Enabled(token) if resolved.first_run => {
             if let Some(path) = &resolved.token_path {
@@ -914,7 +1002,10 @@ fn resolve_mcp_http_options(
                     format!("{host}:{port}")
                 };
                 let url = format!("http://{authority}/mcp");
-                eprintln!("{}", mcp::first_run_message(&url, token, path));
+                dynoxide::stderr_line(format_args!(
+                    "{}",
+                    mcp::first_run_message(&url, token, path)
+                ));
             }
         }
         AuthMode::Enabled(_) => {}
@@ -928,8 +1019,35 @@ fn resolve_mcp_http_options(
     })
 }
 
+/// Why `dynoxide mcp` turns down a launcher flag. The flags belong to the
+/// DynamoDB HTTP server, which `dynoxide mcp` doesn't start.
+#[cfg(feature = "mcp-server")]
+fn refuse_launcher_flag_on_mcp(flag: &str, http: bool) -> String {
+    if http {
+        format!(
+            "`dynoxide mcp --http` does not take {flag}: it applies to the DynamoDB \
+             HTTP server. Use `dynoxide serve --mcp {flag}` to run both."
+        )
+    } else {
+        format!(
+            "`dynoxide mcp` does not take {flag}: in stdio mode, stdin and stdout \
+             carry the MCP protocol, and the server already exits when stdin closes. \
+             Use `dynoxide serve {flag}` for the DynamoDB HTTP server."
+        )
+    }
+}
+
 #[cfg(feature = "mcp-server")]
 async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
+    for (given, flag) in [
+        (args.ready_json, "--ready-json"),
+        (args.exit_with_parent, "--exit-with-parent"),
+    ] {
+        if given {
+            return Err(refuse_launcher_flag_on_mcp(flag, args.http).into());
+        }
+    }
+
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
 
@@ -1113,7 +1231,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         // The import report always prints; this only separates it from the
         // server output that follows, which quiet mode suppresses.
         if !quiet {
-            eprintln!();
+            dynoxide::stderr_line(format_args!(""));
         }
 
         // Both --serve and --mcp: run HTTP + MCP concurrently
@@ -1143,10 +1261,10 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
             let mcp_shutdown_clone = mcp_shutdown.clone();
 
             if !quiet {
-                eprintln!(
+                dynoxide::stderr_line(format_args!(
                     "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
                     args.host, args.port, args.mcp_host, args.mcp_port
-                );
+                ));
             }
 
             let (http_result, mcp_result) = tokio::join!(
@@ -1369,6 +1487,8 @@ mod tests {
                 vec!["dynoxide", "--port", "8893", "serve"],
                 vec!["dynoxide", "--host", "0.0.0.0", "serve"],
                 vec!["dynoxide", "--encryption-key-file", "key.hex", "serve"],
+                vec!["dynoxide", "--ready-json", "serve"],
+                vec!["dynoxide", "--exit-with-parent", "serve"],
             ] {
                 assert!(
                     Cli::try_parse_from(&argv).is_err(),
@@ -1432,6 +1552,20 @@ mod tests {
                 Some(Commands::Serve(args)) => assert_eq!(args.port, 8893),
                 _ => panic!("expected serve subcommand"),
             }
+        }
+
+        #[test]
+        fn help_describes_an_emulator_verified_against_aws() {
+            use clap::CommandFactory;
+            let help = Cli::command().render_help().to_string();
+            assert!(
+                help.contains("DynamoDB emulator, verified against AWS"),
+                "--help should describe Dynoxide as an emulator verified against AWS:\n{help}"
+            );
+            assert!(
+                !help.contains("drop-in"),
+                "--help still calls Dynoxide a drop-in replacement:\n{help}"
+            );
         }
 
         #[test]

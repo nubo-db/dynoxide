@@ -66,11 +66,26 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "3.3", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "4.0", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "3.3", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "4.0", default-features = false, features = ["encryption"] }
 ```
+
+## Upgrading to 1.7.0
+
+**Database files move to schema version 12 when 1.7.0 first opens them
+writable**, and 1.3.0 to 1.6.0 will refuse them afterwards, so copy a file
+first if you might go back. The open gives items written before 0.9.5 the hash
+prefix a fresh write would, so a parallel scan finds them. A read-only open
+leaves a file with nothing to fill at version 11, and refuses one with items to
+fill until it has been opened writable once. Make the `-wal` and `-shm` files
+beside it writable for that open, as well as the database.
+
+**Depending on the `dynoxide-rs` crate?** It's now 4.0.0. `rusqlite` moves to
+0.43, so code that passes `Storage::conn()` or `DynoxideError::SqliteError` to
+or from its own `rusqlite` needs 0.43 too. The minimum supported Rust version
+is now 1.89. The changelog's Breaking (Rust API) section lists each change.
 
 ## Upgrading to 1.3.0
 
@@ -154,7 +169,7 @@ became `#[non_exhaustive]`:
 ## GitHub Actions
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v1.6.0
+- uses: nubo-db/dynoxide/action@v1.7.0
   with:
     snapshot-url: https://example.com/test-data.db.zst  # optional
     port: 8000
@@ -179,7 +194,7 @@ docker run --rm -p 8000:8000 \
   serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
 ```
 
-Image tags follow the version: `dynoxide:1.6.0` is exact, `dynoxide:1.6` floats
+Image tags follow the version: `dynoxide:1.7.0` is exact, `dynoxide:1.7` floats
 across patches, and `dynoxide:1` floats across the whole 1.x line. `:1` receives
 conformance fixes, which change behaviour within a major; `:1.2` does not. See
 `docs/versioning.md`.

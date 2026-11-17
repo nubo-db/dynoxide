@@ -23,18 +23,19 @@ function resolvePackage(packageName) {
   }
 }
 
-function getBinaryPath() {
-  const key = process.platform + "-" + process.arch;
+// Returns the platform package's binary, or throws with the guidance the CLI
+// prints. A library can catch this; nothing here exits the process.
+function findBinary(platform = process.platform, arch = process.arch) {
+  const key = platform + "-" + arch;
   const entry = PLATFORMS[key];
 
   if (!entry) {
     const supported = Object.keys(PLATFORMS).join(", ");
-    console.error(
-      `Dynoxide does not have a prebuilt binary for ${process.platform}-${process.arch}.\n` +
+    throw coded("DYNOXIDE_UNSUPPORTED_PLATFORM",
+      `Dynoxide does not have a prebuilt binary for ${platform}-${arch}.\n` +
         `Supported platforms: ${supported}\n\n` +
         `You can install Dynoxide from source with: cargo install dynoxide-rs`
     );
-    process.exit(1);
   }
 
   const dir = resolvePackage(entry.package);
@@ -43,7 +44,7 @@ function getBinaryPath() {
     if (fs.existsSync(binaryPath)) return binaryPath;
   }
 
-  console.error(
+  throw coded("DYNOXIDE_PACKAGE_MISSING",
     `The platform package ${entry.package} is not installed.\n\n` +
       `This usually means npm was run with --no-optional or --ignore-optional.\n` +
       `Try reinstalling: npm install dynoxide\n\n` +
@@ -51,7 +52,22 @@ function getBinaryPath() {
       `  brew install nubo-db/tap/dynoxide\n` +
       `  cargo install dynoxide-rs`
   );
-  process.exit(1);
 }
 
-module.exports = { getBinaryPath };
+function coded(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+// The CLI's lookup: prints the guidance and exits on failure.
+function getBinaryPath() {
+  try {
+    return findBinary();
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+}
+
+module.exports = { findBinary, getBinaryPath, coded };

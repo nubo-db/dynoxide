@@ -3,6 +3,7 @@
 - [Installation](installation.md) - npm, Homebrew, Cargo, pre-built binaries, GitHub Actions, and Docker
 - [HTTP server](http-server.md) - running the DynamoDB-compatible HTTP API
 - [Testcontainers](testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
+- [Writing a launcher](launcher.md) - how a wrapper for another language finds, starts and stops the binary
 - [Laravel](laravel.md) - the DynamoDB cache, locks, sessions and failed jobs, run locally
 - [MCP server](mcp.md) - the Model Context Protocol server for coding agents
 - [MCP data model](mcp-data-model.md) - the `--data-model` format reference

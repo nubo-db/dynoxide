@@ -3,6 +3,10 @@
 //! Exposes DynamoDB operations as MCP tools, allowing coding agents to
 //! interact with the local DynamoDB emulator through structured tool calls.
 
+// A launcher may have stopped reading stderr by the time anything here
+// writes to it, and `eprintln!` panics on that write. Use `crate::stderr_line`.
+#![deny(clippy::print_stderr)]
+
 mod auth;
 mod errors;
 mod server;
@@ -171,7 +175,9 @@ pub async fn serve_http_with_options(
     let local_addr = listener.local_addr()?;
 
     if !options.suppresses_informational_messages() {
-        eprintln!("MCP HTTP server listening on http://{local_addr}/mcp");
+        crate::stderr_line(format_args!(
+            "MCP HTTP server listening on http://{local_addr}/mcp"
+        ));
     }
 
     // Don't use with_graceful_shutdown for the MCP transport: persistent

@@ -2,15 +2,24 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Advisories are denied by default and nothing is ignored. Keep it that way:
-# an entry here is a hole held open, so prefer a version bump, and record the
-# reason and the condition for removal if one is ever genuinely unavoidable.
+# Advisories are denied by default. Keep the ignore list as short as it can
+# be: an entry here is a hole held open, so prefer a version bump, and record
+# the reason and the condition for removal when one is genuinely unavoidable.
 #
 # RUSTSEC-2026-0009 (`time`, stack exhaustion on a hostile RFC 2822 date) sat
 # here while the fix in 0.3.47 needed Rust 1.88 and the crate declared 1.85.
 # Once the declared MSRV reached 1.88, `time` moved to a fixed version and the
 # ignore went with it.
-ignore = []
+#
+# RUSTSEC-2026-0543 marks `chrono` unmaintained, with no fixed version. It is
+# not a vulnerability. Dynoxide doesn't use `chrono` itself: `rmcp` 3.9 and
+# 3.10 depend on it outright and switch on `schemars`' `chrono04` feature, so
+# no feature choice here removes it. Remove this entry once `rmcp` drops or
+# makes optional its `chrono` dependency
+# (https://github.com/modelcontextprotocol/rust-sdk/issues/1469).
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; reached only through rmcp, which depends on it unconditionally" },
+]
 
 [licenses]
 # Mirrors about.toml's accepted set, plus MPL-2.0 for option-ext (a normal

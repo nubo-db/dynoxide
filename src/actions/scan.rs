@@ -18,10 +18,14 @@ struct ScanRequestRaw {
     filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<crate::types::HeldValues>,
     #[serde(
         rename = "Limit",
         default,
@@ -91,6 +95,7 @@ pub struct ScanRequest {
 /// Scan, as it does in 20 of the 33 observed regions.
 pub(crate) struct ScanMembers<'a> {
     pub table_name: Option<&'a str>,
+    pub index_name: Option<&'a str>,
     pub select: Option<&'a str>,
     pub return_consumed_capacity: Option<&'a str>,
     pub conditional_operator: Option<&'a str>,
@@ -99,7 +104,8 @@ pub(crate) struct ScanMembers<'a> {
     pub segment: Option<i64>,
     pub total_segments: Option<i64>,
     /// Whether `Limit`, `Segment` or `TotalSegments` saturated or lost a
-    /// fraction as it was read.
+    /// fraction as it was read, or the `ExclusiveStartKey` holds a null
+    /// value. Either hands the request to the older layer.
     pub coerced: bool,
 }
 
@@ -113,17 +119,18 @@ impl ScanMembers<'_> {
     ///
     /// 1. A missing table name, a legacy condition with no
     ///    `ComparisonOperator`, or a `Limit`, `Segment` or `TotalSegments` that
-    ///    saturated or lost a fraction as it was read hands the request to the
-    ///    older layer, which reports every member error it finds, in its
-    ///    wording and in this order: `Select`, `TotalSegments` (outside 1 to
+    ///    saturated or lost a fraction as it was read, or a null in the
+    ///    `ExclusiveStartKey`, hands the request to the older layer, which
+    ///    reports every member error it finds, in its wording and in this
+    ///    order: `Select`, `TotalSegments` (outside 1 to
     ///    1000000), `ReturnConsumedCapacity`, the table name (missing or
     ///    empty), `ConditionalOperator`, the missing operators, `Segment`
     ///    (outside 0 to 999999), `Limit` below 1.
     /// 2. `Limit` below 1, `Segment` outside 0 to 999999, `TotalSegments`
     ///    outside 1 to 1000000 and an empty table name, in the newer wording:
     ///    the member's name capitalised and the value not echoed.
-    /// 3. The first table-name error beside a `ReturnConsumedCapacity` outside
-    ///    its enum.
+    /// 3. The first table-name error, then the first `IndexName` error, beside
+    ///    a `ReturnConsumedCapacity` outside its enum.
     ///
     /// Everything else about the request waits for `execute`. The wire path
     /// asks here as the body is read and `execute` asks again, so a request
@@ -132,8 +139,8 @@ impl ScanMembers<'_> {
     pub(crate) fn rejection(&self) -> Option<String> {
         use crate::validation::{
             EMPTY_TABLE_NAME_REJECTION, TableNameContext, conditional_operator_rejection,
-            first_table_name_error, format_validation_errors, return_consumed_capacity_rejection,
-            table_name_constraint_errors,
+            first_index_name_error, first_table_name_error, format_validation_errors,
+            return_consumed_capacity_rejection, table_name_constraint_errors,
         };
 
         let missing_operators =
@@ -232,6 +239,7 @@ impl ScanMembers<'_> {
 
         let mut errors = Vec::new();
         errors.extend(self.table_name.and_then(first_table_name_error));
+        errors.extend(self.index_name.and_then(first_index_name_error));
         errors.extend(return_consumed_capacity_rejection(
             self.return_consumed_capacity,
         ));
@@ -244,6 +252,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
+        let expression_attribute_values = helpers::read_values_after_start_key(
+            raw.expression_attribute_values,
+            crate::types::read_scan_values,
+            raw.exclusive_start_key.as_ref(),
+            |key| helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current),
+        )
+        .map_err(serde::de::Error::custom)?;
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
         // request malformed, ahead of everything else.
@@ -255,6 +270,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         // the stages `ScanMembers::rejection` describes.
         if let Some(msg) = (ScanMembers {
             table_name: raw.table_name.as_deref(),
+            index_name: raw.index_name.as_deref(),
             select: raw.select.as_deref(),
             return_consumed_capacity: raw.return_consumed_capacity.as_deref(),
             conditional_operator: raw.conditional_operator.as_deref(),
@@ -265,7 +281,8 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             coerced: [raw.limit, raw.segment, raw.total_segments]
                 .iter()
                 .flatten()
-                .any(|n| n.coerced),
+                .any(|n| n.coerced)
+                || helpers::start_key_holds_null(raw.exclusive_start_key.as_ref()),
         })
         .rejection()
         {
@@ -278,7 +295,7 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             filter_expression: raw.filter_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             limit: raw.limit.map(|n| n.value as usize),
             exclusive_start_key: None,
             select: raw.select,
@@ -323,6 +340,7 @@ pub async fn execute<S: StorageBackend>(
     // body: a request built in code gets the same answer.
     if let Some(msg) = (ScanMembers {
         table_name: Some(&request.table_name),
+        index_name: request.index_name.as_deref(),
         select: request.select.as_deref(),
         return_consumed_capacity: request.return_consumed_capacity.as_deref(),
         conditional_operator: request.conditional_operator.as_deref(),
@@ -330,7 +348,7 @@ pub async fn execute<S: StorageBackend>(
         limit: request.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)),
         segment: request.segment.map(i64::from),
         total_segments: request.total_segments.map(i64::from),
-        coerced: false,
+        coerced: helpers::start_key_holds_null(request.exclusive_start_key_raw.as_ref()),
     })
     .rejection()
     {
@@ -358,7 +376,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
     if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
         .is_some()
     {

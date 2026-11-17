@@ -34,6 +34,7 @@ mod parameter_order;
 pub(crate) use parameter_order::in_walk_order;
 
 use crate::errors::DynoxideError;
+use crate::json_text::string_end;
 use crate::validation::{NESTING_LIMIT_MESSAGE, RETURN_VALUES_NOT_HONOURED};
 
 /// How far a value may nest inside its attribute: DynamoDB accepts a leaf
@@ -71,6 +72,23 @@ pub(crate) fn is_depth_failure(err: &serde_json::Error) -> bool {
 
 /// Decide what a body that serde refused on depth should get.
 pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
+    // A body that is an array is never an object form: it is refused, or it
+    // is a batch body DynamoDB reads by position. DynamoDB answers a form read
+    // by position with no message from the depth at which its own parser
+    // stops following the body, where the object form gets the nesting error
+    // at every depth. That depth coincides with this parser's limit: a list
+    // nested 61 levels in a BatchGetItem body given by position, or 62 in a
+    // `Condition` given by position, is the first answered with no message,
+    // and the BatchGetItem object form gets the nesting error from 45 levels
+    // to 135 (captured eu-west-2 and us-east-1, 12 November 2026). A form
+    // read by position inside the body holds no value the scan below finds,
+    // so it ends up unreadable too.
+    if body
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('[')
+    {
+        return DeepBody::Unreadable;
+    }
     let Some(values) = scan(body) else {
         return DeepBody::Unreadable;
     };
@@ -100,18 +118,12 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     } else {
         r#"{"NULL":true}"#.to_string()
     };
-    let mut rewritten = String::with_capacity(body.len());
-    let mut copied = 0;
-    for value in &deep {
-        // A value inside one already replaced went with it.
-        if value.start < copied {
-            continue;
-        }
-        rewritten.push_str(&body[copied..value.start]);
-        rewritten.push_str(&stand_in);
-        copied = value.end;
-    }
-    rewritten.push_str(&body[copied..]);
+    // A value inside one already replaced goes with it.
+    let rewritten = crate::json_text::splice(
+        body,
+        deep.iter()
+            .map(|value| ((value.start, value.end), stand_in.as_str())),
+    );
     if serde_json::from_str::<serde_json::Value>(&rewritten).is_err() {
         return DeepBody::Unreadable;
     }
@@ -416,7 +428,8 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
     use crate::actions::*;
     use crate::serde_errors::deserialize;
 
-    crate::serialization_checks::pre_check_serialization_types(operation, body)?;
+    let checked = crate::serialization_checks::pre_check_serialization_types(operation, body)?;
+    let body = checked.as_ref();
     match operation {
         "PutItem" => deserialize::<put_item::PutItemRequest>(body).and_then(|request| {
             check_older_conditional_operator(request.conditional_operator.as_deref())
@@ -690,19 +703,6 @@ fn scan(body: &str) -> Option<Vec<Value>> {
     Some(values)
 }
 
-/// The index just past the closing quote of the string opening at `start`.
-fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = start + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i + 1),
-            _ => i += 1,
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +874,46 @@ mod tests {
             rejected(&xor),
             format!("1 validation error detected: {xor}")
         );
+    }
+
+    /// A request too deep for the parser that also gives a write request by
+    /// position is checked as its object form: a bad member is reported ahead
+    /// of the nesting error in the same words for both. (A deep value inside
+    /// a form given by position is never found, so that body is unreadable, as
+    /// DynamoDB answers it.)
+    #[test]
+    fn a_deep_request_with_a_form_given_by_position_is_checked_as_its_object_form() {
+        let deep = format!(
+            r#"{{"PutRequest":{{"Item":{{"pk":{{"S":"a"}},"v":{}}}}}}}"#,
+            deep_map(70)
+        );
+        let request = |shallow: &str| {
+            format!(
+                r#"{{"RequestItems":{{"tab":[{shallow},{deep}]}},"ReturnConsumedCapacity":"BOGUS"}}"#
+            )
+        };
+        let by_position = request(r#"{"PutRequest":[{"pk":{"S":"b"}}]}"#);
+        let as_object = request(r#"{"PutRequest":{"Item":{"pk":{"S":"b"}}}}"#);
+        let refused = |body: &str| {
+            assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
+            match resolve("BatchWriteItem", body) {
+                DeepBody::Refuse(e) => e.to_string(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(
+            refused(&as_object).contains("BOGUS"),
+            "{}",
+            refused(&as_object)
+        );
+        assert_eq!(refused(&by_position), refused(&as_object));
+        let inside = format!(
+            r#"{{"RequestItems":{{"tab":[{{"PutRequest":[{{"pk":{{"S":"a"}},"v":{}}}]}}]}}}}"#,
+            deep_map(70)
+        );
+        assert!(matches!(
+            resolve("BatchWriteItem", &inside),
+            DeepBody::Unreadable
+        ));
     }
 }

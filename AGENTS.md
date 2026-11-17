@@ -54,13 +54,14 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 - New behaviour ships with tests in `tests/` or inline module tests.
 - Bug fixes ship with a regression test that fails before the fix.
 - `cargo test` on default features is what most contributors run
-  locally. CI goes further and runs a feature matrix across five
+  locally. CI goes further and runs a feature matrix across six
   configurations:
   - default (all default features)
   - `--no-default-features --features native-sqlite --lib`
   - `--no-default-features --features encryption --lib`
-  - `--no-default-features --features encryption,http-server`
+  - `--no-default-features --features encryption,http-server,cli`
   - `--features bench-counters --test repeated_work_counts`
+  - `--no-default-features --features native-sqlite --test expected_library_build`
   A separate feature-guard job checks that deliberately incompatible
   feature combinations fail to compile (for example
   `native-sqlite + encryption`). A `wasm-check` job builds the library
@@ -92,15 +93,23 @@ they do not carry equal weight:
   between runs because of noisy neighbours. A red Criterion row on
   your PR is not by itself a blocker; re-run the workflow if the
   result looks noisy.
-- **iai-callgrind (instruction-count benchmarks).** Deterministic, but
-  informational. The PR job reports instruction counts without a
-  stored baseline to compare against, so it never fails on a
-  regression by itself, and CI keeps no counts from `main` to compare
-  with. When you need to know whether a change does more work, run
-  `cargo bench --bench iai_core --features iai-callgrind` in
-  `benchmarks/` on `main` and on your branch, on the same Linux
-  machine or container; a difference there means the code path really
-  does more.
+- **iai-callgrind (instruction-count benchmarks).** Nearly
+  deterministic, and the layer that can go red. The PR job benchmarks
+  the base branch first, then your merged change against it on the
+  same runner, and fails if any benchmark runs more than 4% more
+  instructions than the base, or if a benchmark the base has ended up
+  with nothing to compare against. A benchmark your PR adds is
+  reported as new and does not fail. The one case with no comparison
+  is a PR that changes the locked iai-callgrind version: counts from
+  two versions are not comparable, so the job warns and runs only your
+  benchmarks. The job is advisory, not a required check, but a red
+  result here usually means the code path really does more. To
+  reproduce it, run
+  `cargo bench --bench iai_core --features iai-callgrind -- --save-baseline=base`
+  in `benchmarks/` on `main`, then
+  `cargo bench --bench iai_core --features iai-callgrind -- --baseline=base --regression='ir=4.0'`
+  on your branch, on the same Linux machine or container and with the
+  same target directory.
 
 In short: trust iai-callgrind's numbers, treat Criterion as a smoke
 signal.
@@ -132,8 +141,8 @@ The action handlers are async and generic over the trait
 with a `NativeDatabase` alias that keeps the historical synchronous public API
 through a `block_on` facade, and a `WasmDatabase` alias whose methods are async
 (the wasm main thread cannot block). The trait is consumed monomorphically (no
-`dyn`). The raw `Storage::conn()` / `conn_mut()` escape hatches are no longer
-used by action handlers. Please open an issue before submitting changes to
+`dyn`). Action handlers don't use the raw `Storage::conn()` / `conn_mut()`
+escape hatches. Please open an issue before submitting changes to
 `src/storage.rs` or `src/storage_backend/`; we can advise whether your change
 fits the current shape.
 

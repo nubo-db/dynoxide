@@ -28,8 +28,9 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: UpdateTimeToLiveRequest,
 ) -> Result<UpdateTimeToLiveResponse> {
-    // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    // Validate table name format before checking existence (DynamoDB validates
+    // input first): the length in UTF-16 units, from 3, then the pattern.
+    crate::validation::validate_control_table_name(&request.table_name)?;
 
     // Validate attribute name is not empty
     if request.time_to_live_specification.attribute_name.is_empty() {

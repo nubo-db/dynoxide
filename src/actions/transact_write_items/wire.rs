@@ -9,7 +9,7 @@ use super::{
     TransactWriteItemsRequest,
 };
 use crate::serde_errors::{SERIALIZATION_MARKER, VALIDATION_MARKER};
-use crate::types::{HeldValues, deserialize_held_attributes};
+use crate::types::{self, AttributeValue, HeldValues};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use std::collections::HashMap;
@@ -44,22 +44,14 @@ struct Item {
 struct Put {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
-    #[serde(
-        rename = "Item",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    item: HeldValues,
+    #[serde(rename = "Item", default)]
+    item: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    expression_attribute_values: HeldValues,
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     return_values_on_condition_check_failure: Option<String>,
 }
@@ -68,24 +60,16 @@ struct Put {
 struct Update {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
-    #[serde(
-        rename = "Key",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    key: HeldValues,
+    #[serde(rename = "Key", default)]
+    key: Option<HeldValues>,
     #[serde(rename = "UpdateExpression", default)]
     update_expression: Option<String>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    expression_attribute_values: HeldValues,
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     return_values_on_condition_check_failure: Option<String>,
 }
@@ -94,22 +78,14 @@ struct Update {
 struct Delete {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
-    #[serde(
-        rename = "Key",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    key: HeldValues,
+    #[serde(rename = "Key", default)]
+    key: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    expression_attribute_values: HeldValues,
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     return_values_on_condition_check_failure: Option<String>,
 }
@@ -118,22 +94,14 @@ struct Delete {
 struct ConditionCheck {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
-    #[serde(
-        rename = "Key",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    key: HeldValues,
+    #[serde(rename = "Key", default)]
+    key: Option<HeldValues>,
     #[serde(rename = "ConditionExpression", default)]
     condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "deserialize_held_attributes"
-    )]
-    expression_attribute_values: HeldValues,
+    expression_attribute_names: Option<crate::empty_names::WrittenNames>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<HeldValues>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     return_values_on_condition_check_failure: Option<String>,
 }
@@ -318,7 +286,9 @@ impl Request {
     /// request is refused with `TransactItems can't be null`. Then come the
     /// stages
     /// [`super::stages_before_values`] runs, and only then a value refused in
-    /// an item (captured eu-west-2 and us-east-1, 2026-11-11).
+    /// an item (captured eu-west-2 and us-east-1, 2026-11-11). The values are
+    /// read once the whole request has been, since a null anywhere in it
+    /// changes how every action's values are read (see [`read_values`]).
     pub(super) fn into_request(self) -> Result<TransactWriteItemsRequest, String> {
         let marked = |msg: String| format!("{VALIDATION_MARKER}{msg}");
 
@@ -353,14 +323,28 @@ impl Request {
             ));
         }
 
-        let mut refusal = None;
-        let transact_items: Vec<TransactWriteItem> = self
+        let items: Vec<Item> = self
             .transact_items
             .unwrap_or_default()
             .into_iter()
             .flat_map(|ListedItem(item)| item)
-            .map(|item| item.into_item(&mut refusal))
             .collect();
+        // A null where a value belongs puts the request's values on the older
+        // layer, so they are read there, wherever the request came from.
+        let null_in_request = items.iter().any(Item::holds_null);
+        let read = || {
+            let mut refusal = None;
+            let items: Vec<TransactWriteItem> = items
+                .into_iter()
+                .map(|item| item.into_item(null_in_request, &mut refusal))
+                .collect();
+            (items, refusal)
+        };
+        let (transact_items, refusal) = if null_in_request {
+            types::with_value_layer(crate::validation::ValueLayer::Older, read)
+        } else {
+            read()
+        };
         let request = TransactWriteItemsRequest {
             transact_items,
             client_request_token: self.client_request_token,
@@ -386,7 +370,7 @@ impl Item {
         let put = self.put.as_ref().map(|a| ActionMembers {
             action: "put",
             members: vec![
-                Member::Required("item", a.item.is_null()),
+                Member::Required("item", a.item.is_none()),
                 Member::Mode(a.return_values_on_condition_check_failure.as_deref()),
                 Member::Required("tableName", a.table_name.is_none()),
             ],
@@ -396,7 +380,7 @@ impl Item {
             members: vec![
                 Member::Mode(a.return_values_on_condition_check_failure.as_deref()),
                 Member::Required("updateExpression", a.update_expression.is_none()),
-                Member::Required("key", a.key.is_null()),
+                Member::Required("key", a.key.is_none()),
                 Member::Required("tableName", a.table_name.is_none()),
             ],
         });
@@ -404,7 +388,7 @@ impl Item {
             action: "delete",
             members: vec![
                 Member::Mode(a.return_values_on_condition_check_failure.as_deref()),
-                Member::Required("key", a.key.is_null()),
+                Member::Required("key", a.key.is_none()),
                 Member::Required("tableName", a.table_name.is_none()),
             ],
         });
@@ -413,7 +397,7 @@ impl Item {
             members: vec![
                 Member::Required("conditionExpression", a.condition_expression.is_none()),
                 Member::Mode(a.return_values_on_condition_check_failure.as_deref()),
-                Member::Required("key", a.key.is_null()),
+                Member::Required("key", a.key.is_none()),
                 Member::Required("tableName", a.table_name.is_none()),
             ],
         });
@@ -447,52 +431,156 @@ impl Item {
         any_null
     }
 
+    /// Whether any action of this item holds a JSON null where an attribute
+    /// value belongs, in its item, key or expression values (see
+    /// [`types::holds_null`]), or a null name in its expression names, which
+    /// puts the request on the older layer as it does a single-item write
+    /// (captured eu-west-2 and us-east-1, 2026-11-12).
+    fn holds_null(&self) -> bool {
+        let held = |values: &Option<HeldValues>| {
+            values.as_ref().is_some_and(|values| {
+                values
+                    .0
+                    .0
+                    .iter()
+                    .any(|(_, value)| value.is_null() || types::holds_null(&value.to_value()))
+            })
+        };
+        let null_name = |names: &Option<crate::empty_names::WrittenNames>| {
+            names
+                .as_ref()
+                .is_some_and(|names| names.values().any(Option::is_none))
+        };
+        self.put.as_ref().is_some_and(|a| {
+            held(&a.item)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        }) || self.update.as_ref().is_some_and(|a| {
+            held(&a.key)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        }) || self.delete.as_ref().is_some_and(|a| {
+            held(&a.key)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        }) || self.condition_check.as_ref().is_some_and(|a| {
+            held(&a.key)
+                || held(&a.expression_attribute_values)
+                || null_name(&a.expression_attribute_names)
+        })
+    }
+
     /// The public item, once no required member is null, with the first value
-    /// refused anywhere in the request kept in `refusal`. An action's item or
-    /// key is taken ahead of its expression values, so a value refused in the
-    /// item or key is the one reported whichever was written first (captured
-    /// eu-west-2 and us-east-1, 2026-11-11).
-    fn into_item(self, refusal: &mut Option<String>) -> TransactWriteItem {
+    /// refused anywhere in the request kept in `refusal` (see [`read_values`]).
+    fn into_item(self, null_in_request: bool, refusal: &mut Option<String>) -> TransactWriteItem {
+        let read = |attributes, values, refusal: &mut Option<String>| {
+            read_values(attributes, values, null_in_request, refusal)
+        };
         TransactWriteItem {
-            put: self.put.map(|put| TransactPut {
-                table_name: put.table_name.unwrap_or_default(),
-                item: put.item.take(refusal).unwrap_or_default(),
-                condition_expression: put.condition_expression,
-                expression_attribute_names: put.expression_attribute_names,
-                expression_attribute_values: put.expression_attribute_values.take(refusal),
-                return_values_on_condition_check_failure: put
-                    .return_values_on_condition_check_failure,
+            put: self.put.map(|put| {
+                let (item, values) = read(put.item, put.expression_attribute_values, refusal);
+                TransactPut {
+                    table_name: put.table_name.unwrap_or_default(),
+                    item,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        put.expression_attribute_names,
+                        put.condition_expression.is_some(),
+                    ),
+                    condition_expression: put.condition_expression,
+                    expression_attribute_values: values,
+                    return_values_on_condition_check_failure: put
+                        .return_values_on_condition_check_failure,
+                }
             }),
-            update: self.update.map(|update| TransactUpdate {
-                table_name: update.table_name.unwrap_or_default(),
-                key: update.key.take(refusal).unwrap_or_default(),
-                update_expression: update.update_expression.unwrap_or_default(),
-                condition_expression: update.condition_expression,
-                expression_attribute_names: update.expression_attribute_names,
-                expression_attribute_values: update.expression_attribute_values.take(refusal),
-                return_values_on_condition_check_failure: update
-                    .return_values_on_condition_check_failure,
+            update: self.update.map(|update| {
+                let (key, values) = read(update.key, update.expression_attribute_values, refusal);
+                TransactUpdate {
+                    table_name: update.table_name.unwrap_or_default(),
+                    key,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        update.expression_attribute_names,
+                        update.update_expression.is_some() || update.condition_expression.is_some(),
+                    ),
+                    update_expression: update.update_expression.unwrap_or_default(),
+                    condition_expression: update.condition_expression,
+                    expression_attribute_values: values,
+                    return_values_on_condition_check_failure: update
+                        .return_values_on_condition_check_failure,
+                }
             }),
-            delete: self.delete.map(|delete| TransactDelete {
-                table_name: delete.table_name.unwrap_or_default(),
-                key: delete.key.take(refusal).unwrap_or_default(),
-                condition_expression: delete.condition_expression,
-                expression_attribute_names: delete.expression_attribute_names,
-                expression_attribute_values: delete.expression_attribute_values.take(refusal),
-                return_values_on_condition_check_failure: delete
-                    .return_values_on_condition_check_failure,
+            delete: self.delete.map(|delete| {
+                let (key, values) = read(delete.key, delete.expression_attribute_values, refusal);
+                TransactDelete {
+                    table_name: delete.table_name.unwrap_or_default(),
+                    key,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        delete.expression_attribute_names,
+                        delete.condition_expression.is_some(),
+                    ),
+                    condition_expression: delete.condition_expression,
+                    expression_attribute_values: values,
+                    return_values_on_condition_check_failure: delete
+                        .return_values_on_condition_check_failure,
+                }
             }),
-            condition_check: self.condition_check.map(|check| TransactConditionCheck {
-                table_name: check.table_name.unwrap_or_default(),
-                key: check.key.take(refusal).unwrap_or_default(),
-                condition_expression: check.condition_expression.unwrap_or_default(),
-                expression_attribute_names: check.expression_attribute_names,
-                expression_attribute_values: check.expression_attribute_values.take(refusal),
-                return_values_on_condition_check_failure: check
-                    .return_values_on_condition_check_failure,
+            condition_check: self.condition_check.map(|check| {
+                let (key, values) = read(check.key, check.expression_attribute_values, refusal);
+                TransactConditionCheck {
+                    table_name: check.table_name.unwrap_or_default(),
+                    key,
+                    expression_attribute_names: crate::empty_names::action_names(
+                        check.expression_attribute_names,
+                        check.condition_expression.is_some(),
+                    ),
+                    condition_expression: check.condition_expression.unwrap_or_default(),
+                    expression_attribute_values: values,
+                    return_values_on_condition_check_failure: check
+                        .return_values_on_condition_check_failure,
+                }
             }),
         }
     }
+}
+
+/// One action's item or key and its expression values, read once the whole
+/// request has been, with the action's refusal kept in `refusal` if none is
+/// yet. The item or key is read as [`types::read_attribute_map`] reads it, a
+/// null member named and its faults met in DynamoDB's map order, and the
+/// values as [`types::read_transaction_values`] reads them.
+///
+/// Which of the two is reported turns on the null, whichever is written first
+/// (captured eu-west-2 and us-east-1, 2026-11-11). Without a null anywhere in
+/// the request, the item or key comes first and a bad number in the values is
+/// reported bare. With one, the values come first and a bad number in them is
+/// named by key, as a null is.
+fn read_values(
+    attributes: Option<HeldValues>,
+    values: Option<HeldValues>,
+    null_in_request: bool,
+    refusal: &mut Option<String>,
+) -> (
+    HashMap<String, AttributeValue>,
+    Option<HashMap<String, AttributeValue>>,
+) {
+    let attributes = attributes.map(|held| held.read(types::read_attribute_map));
+    let values = values
+        .map(|held| held.read(|members| types::read_transaction_values(members, null_in_request)));
+    let attributes_refusal = attributes.as_ref().and_then(|read| read.as_ref().err());
+    let values_refusal = values.as_ref().and_then(|read| read.as_ref().err());
+    let ahead = if null_in_request {
+        values_refusal.or(attributes_refusal)
+    } else {
+        attributes_refusal.or(values_refusal)
+    };
+    if let Some(ahead) = ahead
+        && refusal.is_none()
+    {
+        *refusal = Some(ahead.clone());
+    }
+    (
+        attributes.and_then(Result::ok).unwrap_or_default(),
+        values.and_then(Result::ok),
+    )
 }
 
 #[cfg(test)]

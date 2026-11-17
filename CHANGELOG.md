@@ -38,6 +38,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP clients can also speak protocol version 2026-07-28, which `rmcp` 3
   serves without an `initialize` step. Clients on earlier versions see no
   change.
+- **A paged read by partition key ends on the page holding its last row.**
+  An ascending Query, or a PartiQL `SELECT` read by partition key, with no
+  filter and a sort key condition that is absent or closed above (`BETWEEN`,
+  `<=`, `<`, `=`), returns no `LastEvaluatedKey` or `NextToken` on that page,
+  where it used to add an empty page after it. This holds on tables and on
+  both kinds of index, and on an index an ascending `>=` ends the same way.
+  The read looks one row ahead to know, and that row is neither counted in
+  `ScannedCount` nor charged. Descending and filtered reads, a `>` or a
+  table's `>=`, and Scan keep the empty page. `begins_with`, and a Query of
+  a multi-attribute index by its partition attributes alone, vary on
+  DynamoDB, so Dynoxide keeps the empty page for them too. An index with no
+  sort key, a PartiQL read of a table with no sort key, and a PartiQL clause
+  written with a `NOT`, such as `NOT NOT pk = 'k'`, page as they did before.
+  A Query of a table with no sort key ends on its item's page
+  ([#291](https://github.com/nubo-db/dynoxide/issues/291)).
+- **A bare name on the right of a PartiQL SET is an attribute, not a
+  string.** `SET z = s` copies the attribute `s`, and is refused when the
+  item has none, where it used to write the string `s`, as DynamoDB does.
+- **A path set against a key attribute is refused on a PartiQL read by
+  key.** With the partition key given, by `=` or by `IN` with one value or
+  several, `begins_with(sk, s)`, `begins_with(s, sk)`, `sk = t`, `sk > t`,
+  `sk BETWEEN t AND 'z'` and `pk = s` are refused as a filter on the key,
+  even beside an equality on the sort key, as DynamoDB refuses them. These
+  used to run as filters. A clause that gives the partition key only under a
+  NOT, or puts another condition on it (`pk <> 'z'`, a second `IN`), is a
+  scan, and still runs. Overlapping key conditions are refused first, and
+  `pk = 'a' AND (sk = t OR n = 5)` is refused as overlapping, where
+  `pk = 'a' AND (sk <> t OR n = 5)` runs. The overlap check and ORDER BY take
+  the same view of a read by key, so `NOT NOT pk = 'a' AND (sk = t OR n = 5)`
+  runs, and `pk = 'a' AND pk <> 'z' ORDER BY sk` is refused for having no
+  partition key condition.
+- **A Query on a table with no sort key refuses an `ExclusiveStartKey`**,
+  as DynamoDB does, with `The provided exclusive start key is invalid`. Such
+  a Query never returns a `LastEvaluatedKey`, so there is no key to pass
+  back; a caller that built one from an item's own key used to get that item
+  again. See the entry under Fixed.
 
 ### Added
 
@@ -66,6 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The declared MSRV is now 1.89, which `rusqlite` 0.42 needs.
+- **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
+  emulator verified against AWS**, rather than a drop-in replacement for
+  DynamoDB Local.
 
 #### Breaking (Rust API)
 
@@ -73,9 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `storage_backend::from_rusqlite` now use `rusqlite` 0.42's types, so code
   that passes them to or from its own `rusqlite` needs 0.42 too. The next
   crate release is `dynoxide-rs` 4.0.0.
-- **`--help` and the Homebrew formula describe Dynoxide as a DynamoDB
-  emulator verified against AWS**, rather than a drop-in replacement for
-  DynamoDB Local.
+- `StorageBackend` gains `fill_hash_prefixes`, which the open that brings a
+  database up to schema version 12 calls. The trait is sealed, so only
+  Dynoxide's own backends implement it. It arrives with `dynoxide-rs` 4.0.0.
 
 ### Fixed
 
@@ -85,6 +124,190 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database, leaving its write-ahead log behind. Writes weren't lost, but the
   shutdown wasn't the clean one `--exit-with-parent` promises. Informational
   lines on the `serve` path now drop a failed write instead.
+
+- A Query on a table with no sort key no longer returns a
+  `LastEvaluatedKey`, as DynamoDB never does for one: a partition of such a
+  table holds at most one item, so the first page is the whole answer. At
+  `Limit: 1` it used to return a key that resumed to the same item, for ever.
+  An `ExclusiveStartKey` on such a Query is now refused with `The provided
+  exclusive start key is invalid`, as DynamoDB refuses it, whether it names
+  the item, a partition with no item or another partition. A malformed key
+  keeps its own message. Indexes of such a table page as before.
+- Two opens of one database file at the same moment, from two threads or two
+  processes, no longer fail with `database is locked` when the file is new or
+  not yet in WAL mode. The open that loses the race to switch the file to WAL
+  now waits for the other, for no longer than the usual open timeout.
+  Encrypted databases get the same fix
+  ([#306](https://github.com/nubo-db/dynoxide/issues/306)).
+- **TransactGetItems no longer refuses an empty or unused name in a `Get`
+  with no `ProjectionExpression`.** It goes on to the table lookup as
+  DynamoDB does, so a request Dynoxide used to refuse now reads the item.
+  More than 100 Gets in TransactGetItems are now refused without listing
+  them, as DynamoDB now does, unless the request holds a null name, when the
+  listing shows that name as `null`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A JSON `null` where an attribute value belongs is refused in DynamoDB's
+  words, `The supplied Item contains a null AttributeValue`, where before it
+  was taken for an empty value. A null member of an item, a key or an `M` is
+  named (`: pk is null`); one in an `L`, a PartiQL parameter or an
+  `AttributeValueList` is not. `ExpressionAttributeValues` and
+  `ExclusiveStartKey` wrap it as they wrap their other faults, and a null
+  given for a whole `Expected`, `AttributeUpdates`, `KeyConditions`,
+  `QueryFilter` or `ScanFilter` entry gets the message DynamoDB has for each.
+  In BatchExecuteStatement it fails only its own statement
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A null, including one given as a type member such as `{"S": null}`, puts
+  the request on the older validation layer, so a bad number beside one in
+  an item comes back without the `1 validation error detected:` envelope,
+  and one in the expression values is named by its key. A null in a starting
+  key puts a Query's or Scan's `Limit` error, and its other numbers, in that
+  layer's words. Without a null, a bad number in a transaction's expression
+  values is no longer named by key, as DynamoDB now answers
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- The faults in an item or key are now met in the order DynamoDB walks them
+  (its Java `HashMap` order, with a value of the wrong JSON type ahead of the
+  rest), as are those in PutItem's expression values and in any request's
+  expression values once a null is present. An item or key is checked before
+  `ExpressionAttributeValues` and `AttributeUpdates`, and a starting key
+  before Query's. In a TransactWriteItems action the item or key comes first
+  too, unless the request holds a null, when the values do; a member of the
+  wrong JSON type anywhere in the action comes ahead of both. Nulls inside an
+  `M` are met in the order they were written when their names share a bucket
+  of that map, an array given for a value is refused with no message even
+  beside the same name written twice, and the MCP write tools refuse a
+  malformed `expression_attribute_values` before a fault in the item or key
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A `null` name in `ExpressionAttributeNames` is now read as an empty name,
+  puts the request on the older layer and is checked with the expressions. A
+  transaction action with no expression doesn't check names that hold one
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A `null` member of an `SS`, `NS` or `BS` puts the request on the older
+  layer, as a null value does, and is refused in DynamoDB's words, in its
+  place among the set's members, where it used to be a
+  `SerializationException`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice in an item, a key, `ExpressionAttributeValues` or
+  `AttributeUpdates` is refused with `Duplicate key found in payload`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A name written twice inside an `M` keeps its last copy, as before, but is
+  now refused with `Duplicate key found in payload` when either copy is a
+  null, an empty value or has more than one type member. A copy that is
+  malformed as JSON, such as an array, is refused for that fault
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- GetItem and BatchGetItem now report `ProjectionExpression` beside
+  `AttributesToGet` ahead of an empty name in `ExpressionAttributeNames`
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- An `AttributeUpdates` entry with no value and an action other than
+  `DELETE` is now refused inside the `1 validation error detected:` envelope
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- The MCP tools give the same answers as the HTTP API for these requests,
+  and refuse expression values that aren't a map as the HTTP API does, where
+  `delete_item` used to ignore them
+  ([#317](https://github.com/nubo-db/dynoxide/issues/317)).
+- A table or index name's length is counted the way DynamoDB counts it, and
+  never in UTF-8 bytes. `TableName` on CreateTable, DescribeTable,
+  DeleteTable, UpdateTable, UpdateTimeToLive and DescribeTimeToLive counts
+  UTF-16 units, so `😀😀` is long enough there. An index name on CreateTable
+  and UpdateTable, ListTables' `ExclusiveStartTableName`, a table name inside
+  a transaction and a Query or Scan `IndexName` count characters, so `😀😀` is
+  too short. A name like this always breaks the name pattern as well, so it
+  is still refused; what changes is which faults the refusal lists, and in
+  what order. Some answers change for an ASCII name too. DescribeTable,
+  DeleteTable, UpdateTable and DescribeTimeToLive refuse a name under 3 or
+  over 255 in the validation envelope (`Value 'ab' at 'tableName' failed to
+  satisfy constraint: Member must have length greater than or equal to 3`)
+  where they gave a bare sentence; an empty name still gets the sentence.
+  UpdateTimeToLive refuses a name under 3, where it looked the table up. An
+  UpdateTable `Create` or `Delete` index name, and a Query or Scan
+  `IndexName`, are checked before the table is looked up, so a bad one is no
+  longer answered with `ResourceNotFoundException`. CreateTable, UpdateTable
+  and ListTables list the length fault before the pattern fault, and a
+  transaction lists the pattern fault first, as eu-west-2 does
+  ([#290](https://github.com/nubo-db/dynoxide/issues/290)).
+
+- A JSON array where DynamoDB doesn't expect one is refused as DynamoDB
+  refuses it. A request body that is an array is a `SerializationException`
+  with no message on every operation, where Dynoxide used to read it by
+  position and run it: `["Tab", {"pk": {"S": "a"}}]` sent to PutItem wrote
+  the item. A body that is a string, number or boolean is refused as
+  `Unexpected value type in payload`, and `null` as `Request payload does not
+  contain the input model`. An array given for a string, number, boolean,
+  map or structure inside a request is a `SerializationException` with no
+  message, where Dynoxide printed `Unrecognized collection type ...`, which
+  DynamoDB no longer says. The forms DynamoDB does read by position are read:
+  a BatchGetItem or BatchWriteItem body of `[RequestItems]` or
+  `[RequestItems, ReturnConsumedCapacity]`, a BatchWriteItem body of
+  `[RequestItems, ReturnConsumedCapacity, ReturnItemCollectionMetrics]`, a
+  BatchWriteItem `PutRequest` given as `[Item]` and `DeleteRequest` as
+  `[Key]`, and on Query and Scan a condition given as
+  `[AttributeValueList, ComparisonOperator]`. DynamoDB's regions differed on
+  BatchWriteItem's forms when captured, and Dynoxide reads them as eu-west-2
+  does. One of these forms holding a value nested too deep for DynamoDB's
+  parser is refused with no message, where the object form gets the nesting
+  error.
+
+- An attribute value given as an array is a `SerializationException` with no
+  message wherever it appears. In a transaction, a batch of PartiQL
+  statements, a legacy `Expected` or `AttributeUpdates` value and a
+  BatchGetItem key, Dynoxide answered `Supplied AttributeValue is empty` or
+  `Unexpected value type in payload`.
+
+- BatchWriteItem with an empty `RequestItems` is refused as BatchGetItem
+  refuses it, `1 validation error detected: Value at 'RequestItems' failed to
+  satisfy constraint: Member must have length greater than or equal to 1`.
+  It used to say `The requestItems parameter is required for BatchWriteItem`.
+  DynamoDB's regions differed on this when captured, and Dynoxide follows
+  eu-west-2.
+
+- BatchGetItem and BatchWriteItem refuse a missing or null part of
+  `RequestItems` in DynamoDB's words, where Dynoxide answered with its JSON
+  decoder's own text, such as ``missing field `Keys` at line 1 column 50``.
+  A table with no `Keys`, a `PutRequest` with no `Item` and a
+  `DeleteRequest` with no `Key` are each `Value null at
+  'requestItems.<table>.member.keys' failed to satisfy constraint: Member
+  must not be null` (or `...member.1.member.putRequest.item`), listed with
+  the request's other member faults. A missing or null `RequestItems` is
+  `The requestItems parameter is required for BatchGetItem` (or
+  `BatchWriteItem`), and a null table entry or a null key or write request
+  has its own message too. A key given as a string or number, and a table's
+  write requests given as a string, number or map, are a
+  `SerializationException` as DynamoDB words it, where Dynoxide printed a
+  Java class-cast message. A write request holding both a `PutRequest` and
+  a `DeleteRequest` is refused as one holding neither is; it used to run.
+  BatchWriteItem's length and table-name faults now follow eu-west-2's
+  wording. A table's request list that is empty or holds more than 25 is
+  `Value at 'RequestItems.<table>.member' failed to satisfy constraint:
+  Member must have length greater than or equal to 1` (or `less than or
+  equal to 25`), one fault for each such table, with no echo of the request
+  and ahead of a bad `ReturnConsumedCapacity` or
+  `ReturnItemCollectionMetrics`, which are no longer listed beside it. More
+  than 25 requests across tables that each hold 25 or fewer is `Too many
+  items requested for the BatchWriteItem call`. A table name that breaks its
+  constraints echoes the request as JSON and is listed ahead of those enum
+  faults, where it used to follow them. us-east-1 still gave the older
+  answers when captured.
+
+- BatchGetItem and BatchWriteItem refuse a table written twice in
+  `RequestItems` with a `SerializationException`, `Duplicate key found in
+  payload`, once the whole map is read, as DynamoDB does. A member of the
+  wrong JSON type written ahead of `RequestItems` is reported instead, and
+  so is a value of the wrong JSON type in a table's entry, either copy
+  included. A value that breaks a constraint, such as one with two data
+  types, loses to the repeat wherever it is written. Dynoxide used the last
+  copy. Dynoxide still differs from DynamoDB where a value that breaks a
+  constraint is written ahead of a value of the wrong JSON type in the same
+  entry: DynamoDB reports the type fault, and Dynoxide reports the repeat,
+  or with no repeat the constraint fault
+  ([#302](https://github.com/nubo-db/dynoxide/issues/302)). Tables with
+  empty `Keys` are listed one fault per table, ten at most, as
+  BatchWriteItem's empty or overlong lists are; BatchGetItem used to report
+  only one of them.
+
+- BatchGetItem and BatchWriteItem no longer check the JSON type of a member
+  they don't have, such as `TableName`, as DynamoDB doesn't; a request
+  carrying one of the wrong JSON type was refused with a
+  `SerializationException`. A member of the wrong JSON type written ahead of
+  `RequestItems` is now reported ahead of one in the map.
 
 - A `ConditionalOperator` other than `AND` or `OR` is refused in the words
   DynamoDB uses now, `Value 'XOR' at 'conditionalOperator' failed to satisfy
@@ -370,6 +593,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-string `ProjectionExpression`, malformed `ExpressionAttributeNames` or
   a bad `AttributesToGet`, which the tool also ignored, are now refused
   ([#237](https://github.com/nubo-db/dynoxide/issues/237)).
+- PartiQL reads `begins_with` and `contains` as calls, as it already read
+  `attribute_exists` and `attribute_type`. Either operand can be a literal, a
+  parameter, a path or another call, so `begins_with('abc', 'a')`,
+  `begins_with(?, ?)` and `contains([1, 2], 1)` match where they used to
+  match nothing or fail to parse. The call is a boolean wherever an operand
+  can stand, IS refuses it as its left side, and a wrong number of operands,
+  the same path twice, `MISSING`, or a fixed operand of `begins_with` that
+  isn't a string or a binary is refused as DynamoDB refuses it. `contains`
+  now finds a binary inside a binary and a member of a binary set.
+- Arithmetic in a PartiQL WHERE clause is refused naming its operator (`+`,
+  `-`, `*` or `/`) on either side of a comparison, in a BETWEEN bound and in
+  an IN list, where it used to be a malformed statement; `n IN [6 - 1]` is no
+  longer read as two members. A bracketed value, `n = (5)`, is the value.
+- A PartiQL SET sum takes paths, numbers and parameters in any mix, chained
+  and bracketed, so `SET z = 1 + n` and `SET z = (1 + 1)` run.
+  `if_not_exists(path, value)` and `list_append` are terms, so
+  `SET n = if_not_exists(n, 0) + 1` runs. A type fault names the operator
+  written beside it, and a sum is held to the operator limit. A function such
+  as `size` is refused as not allowed in an update expression, one DynamoDB
+  doesn't know (`abs(n)`) as unrecognised, `*` and `/` as unsupported
+  operators, and `-n` for its operand count. An operand of `if_not_exists` or
+  `list_append` is read the same way, so `if_not_exists(q, n + 1)` runs and
+  `if_not_exists(q, size(s))` is refused naming `size`. `if_not_exists`
+  resolves and checks its value even when the attribute is there, so
+  `if_not_exists(n, nope)` is refused when the item has no `nope`. A literal
+  of the wrong type in a sum or a `list_append` operand is refused ahead of an
+  attribute the item lacks, even when the attribute is read by an earlier SET.
+  A sum needing more than 38 significant digits is refused as a number
+  overflow once every attribute has been read, and each running total of a
+  sum is checked in the order written.
+- A parallel scan of a table last written before Dynoxide 0.9.5 returned
+  fewer items than the table held. Items written by those builds were stored
+  without the hash prefix that places an item in a segment, so they fell in
+  no segment at all, and a scan over every segment missed them. A plain Scan
+  was not affected. Opening the database now gives each such item the prefix
+  a fresh write of its key would get, and changes nothing else, so it comes
+  back in the same segment and the same place as a fresh write. That open
+  moves the file to schema version 12, and the upgrade is one way: Dynoxide
+  1.3.0 to 1.6.0 read up to version 11 and will refuse the file afterwards.
+  Recording version 12 is a write, so the first open by this release writes
+  to the file. A database kept read-only that has items to fill is refused
+  until it has been opened writable once; one with nothing to fill still
+  opens read-only, and is left at version 11. Before that writable open,
+  make the `-wal` and `-shm` files beside the database writable as well as
+  the database itself: a read-only open creates them when they are missing,
+  and gives them the database file's permissions when it creates them or
+  finds them empty
+  ([#296](https://github.com/nubo-db/dynoxide/issues/296)).
 
 ## [1.6.0] - 2026-11-07
 

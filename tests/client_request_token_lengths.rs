@@ -61,52 +61,15 @@ async fn send(url: &str, operation: &str, body: &str) -> (u16, serde_json::Value
     (status, resp.json().await.unwrap())
 }
 
-/// Rows left out because they turn on a different gap: DynamoDB answers a
-/// list given where a string belongs with a `SerializationException` that has
-/// no message, for every member and not only this one. Each is still sent: it
-/// must still differ from DynamoDB's answer, and give the answer recorded
-/// here, which is Dynoxide's answer today.
-const LIST_FOR_A_STRING: &[(&str, usize, &str)] = &[
-    (
-        "first round",
-        9,
-        r#"{"Message":"Unrecognized collection type class java.lang.String","__type":"com.amazon.coral.service#SerializationException"}"#,
-    ),
-    (
-        "first round",
-        20,
-        r#"{"Message":"Unrecognized collection type class java.lang.String","__type":"com.amazon.coral.service#SerializationException"}"#,
-    ),
-];
-
 async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
     let puts: String = format!("[{}]", vec![PUT; 101].join(", "));
     let mut wrong = Vec::new();
     let mut compared = 0;
-    let mut left_out = 0;
     for &(number, operation, body, answer) in rows {
         let body = body.replace("PUTS_101", &puts);
         let expected: serde_json::Value = serde_json::from_str(answer).unwrap();
         let (status, got) = send(url, operation, &body).await;
         compared += 1;
-        if let Some(&(_, _, today)) = LIST_FOR_A_STRING
-            .iter()
-            .find(|&&(r, n, _)| r == round && n == number)
-        {
-            left_out += 1;
-            let today: serde_json::Value = serde_json::from_str(today).unwrap();
-            if got == expected {
-                wrong.push(format!(
-                    "{round} row {number} now answers as DynamoDB did: drop it from \
-                     LIST_FOR_A_STRING"
-                ));
-            } else if status != 400 || got != today {
-                wrong.push(format!(
-                    "{round} row {number}: {operation}\n  expected 400 {today}\n  got      {status} {got}"
-                ));
-            }
-            continue;
-        }
         if status != 400 || got != expected {
             let shown = if body.len() > 300 {
                 &body[..300]
@@ -119,14 +82,6 @@ async fn assert_rows(url: &str, round: &str, rows: &[Row]) {
         }
     }
     assert_eq!(compared, rows.len());
-    assert_eq!(
-        left_out,
-        LIST_FOR_A_STRING
-            .iter()
-            .filter(|&&(r, _, _)| r == round)
-            .count(),
-        "every row left out of {round} must still be sent"
-    );
     assert!(
         wrong.is_empty(),
         "{} of {compared} rows in the {round} differ:\n{}",

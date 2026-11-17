@@ -113,24 +113,6 @@ type Excepted = (
 const ORDER_NOT_FOLLOWED: &[Excepted] = &[
     (
         "round 1",
-        65,
-        "a bad number in an attribute written first",
-        "ValidationException",
-        Some(
-            "1 validation error detected: The parameter cannot be converted to a numeric value: abc",
-        ),
-    ),
-    (
-        "round 1",
-        66,
-        "an empty value in an attribute written first",
-        "ValidationException",
-        Some(
-            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
-        ),
-    ),
-    (
-        "round 1",
         72,
         "a bad BOOL read ahead of the B written first",
         "SerializationException",

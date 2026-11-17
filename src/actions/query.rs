@@ -20,14 +20,14 @@ struct QueryRequestRaw {
     filter_expression: Option<String>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
-    expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(
-        rename = "ExpressionAttributeValues",
+        rename = "ExpressionAttributeNames",
         default,
-        deserialize_with = "crate::types::deserialize_named_empty_and_null_refusals"
+        deserialize_with = "crate::empty_names::deserialize_names"
     )]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(rename = "ExpressionAttributeValues", default)]
+    expression_attribute_values: Option<crate::types::HeldValues>,
     #[serde(
         rename = "ScanIndexForward",
         default,
@@ -115,6 +115,16 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = QueryRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
+        let expression_attribute_values = helpers::read_values_after_start_key(
+            raw.expression_attribute_values,
+            crate::types::read_query_values,
+            raw.exclusive_start_key.as_ref(),
+            |key| {
+                helpers::parse_exclusive_start_key(key, crate::validation::ValueLayer::Current)
+                    .map_err(start_key_value_error)
+            },
+        )
+        .map_err(serde::de::Error::custom)?;
 
         // A legacy condition value that can't be read (a boolean that doesn't
         // read as one, or a member of the wrong JSON type) makes the whole
@@ -144,7 +154,12 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         // value as read, and an empty name in the older wording (captured
         // eu-west-2, eu-central-1 and us-east-1, 2026-10-20).
         let limit = raw.limit.map(|n| n.value);
-        let coerced = raw.limit.is_some_and(|n| n.coerced);
+        //
+        // A null in the ExclusiveStartKey hands the request to the older layer
+        // too: beside a Limit of 0 it answers `Value '0' at 'limit'` (captured
+        // eu-west-2 and us-east-1, 2026-11-11).
+        let coerced = raw.limit.is_some_and(|n| n.coerced)
+            || helpers::start_key_holds_null(raw.exclusive_start_key.as_ref());
         let limit_too_small = limit.filter(|l| *l < 1);
         if raw.table_name.is_none() || coerced {
             let mut errors = Vec::new();
@@ -196,6 +211,13 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         }
 
         let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
+        // The first fault in IndexName joins the table name's, ahead of the
+        // table lookup.
+        errors.extend(
+            raw.index_name
+                .as_deref()
+                .and_then(crate::validation::first_index_name_error),
+        );
         let table_name = raw.table_name.unwrap_or_default();
 
         // ReturnConsumedCapacity enum
@@ -226,7 +248,7 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             filter_expression: raw.filter_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
-            expression_attribute_values: raw.expression_attribute_values,
+            expression_attribute_values,
             // Left out or null, a Query reads forward (captured eu-west-2 and
             // us-east-1, 2026-10-10).
             scan_index_forward: raw.scan_index_forward.unwrap_or(true),
@@ -282,7 +304,16 @@ pub async fn execute<S: StorageBackend>(
     if let Some(msg) = crate::validation::format_validation_errors(&first_pass) {
         return Err(DynoxideError::ValidationException(msg));
     }
-    crate::validation::validate_item_table_name(&request.table_name)?;
+    let mut name_errors = crate::validation::item_table_name_errors(Some(&request.table_name));
+    name_errors.extend(
+        request
+            .index_name
+            .as_deref()
+            .and_then(crate::validation::first_index_name_error),
+    );
+    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
 
     // A Limit past what a 32-bit integer holds is read as the largest one.
     request.limit = request.limit.map(|l| l.min(i32::MAX as usize));
@@ -304,7 +335,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    crate::empty_names::check_names_early(request.expression_attribute_names.as_ref())?;
     if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
         .is_some()
     {
@@ -722,9 +753,10 @@ pub async fn execute<S: StorageBackend>(
     let (sk_condition_sql, sk_param_values) = bound.sort_key_sql(key_range.len());
 
     // A starting key from another partition, or outside the sort key condition,
-    // is refused, on a table and on an index.
+    // is refused, on a table and on an index. On a table with no sort key any
+    // starting key is refused.
+    let table_without_sort_key = request.index_name.is_none() && effective_sk.is_none();
     if let Some(ref esk) = exclusive_start_key {
-        let table_without_sort_key = request.index_name.is_none() && effective_sk.is_none();
         check_start_key_within_condition(esk, &bound, table_without_sort_key)?;
     }
 
@@ -878,6 +910,17 @@ pub async fn execute<S: StorageBackend>(
     };
 
     let fetch_limit = request.limit;
+    // A read that ends on its last matching row reads one row past its limit,
+    // so it knows whether anything follows. That row is not part of the page.
+    let peek = fetch_limit.is_some()
+        && ends_on_last_row(
+            &bound,
+            key_hash.len(),
+            key_range.len(),
+            request.scan_index_forward,
+            request.filter_expression.is_some(),
+            is_index_query,
+        );
     let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
 
     // Query either GSI table or base table
@@ -885,12 +928,12 @@ pub async fn execute<S: StorageBackend>(
         sk_condition: sk_condition_sql.as_deref(),
         sk_params: &sk_params_refs,
         forward: request.scan_index_forward,
-        limit: fetch_limit,
+        limit: fetch_limit.map(|limit| if peek { limit.saturating_add(1) } else { limit }),
         exclusive_start_sk: start_sk.as_deref(),
         exclusive_start_base_pk: start_base_pk.as_deref(),
         exclusive_start_base_sk: start_base_sk.as_deref(),
     };
-    let rows = if let Some(ref index_name) = request.index_name {
+    let mut rows = if let Some(ref index_name) = request.index_name {
         if is_lsi {
             storage
                 .query_lsi_items(&request.table_name, index_name, &pk_str, &query_params)
@@ -904,6 +947,15 @@ pub async fn execute<S: StorageBackend>(
         storage
             .query_items(&request.table_name, &pk_str, &query_params)
             .await?
+    };
+    // The row read ahead is taken off before the page is walked, so it counts
+    // toward neither ScannedCount, the charge nor the 1MB budget.
+    let more_rows = match fetch_limit {
+        Some(limit) if peek && rows.len() > limit => {
+            rows.truncate(limit);
+            true
+        }
+        _ => false,
     };
 
     // Parse filter expression if present
@@ -1053,9 +1105,14 @@ pub async fn execute<S: StorageBackend>(
     };
 
     // Determine LastEvaluatedKey
-    // We return LEK if: we hit the Limit, or we hit the 1MB limit
-    let has_more = truncated_by_size
-        || (fetch_limit.is_some() && scanned_count >= fetch_limit.unwrap_or(usize::MAX));
+    // We return LEK if: we hit the 1MB limit, or we hit the Limit and, for a
+    // read that looked one row ahead, that row exists. A table with no sort
+    // key never gets one: a partition of such a table holds at most one item,
+    // so the read is already complete (captured on DynamoDB in eu-west-2 and
+    // us-east-1 on 14 November 2026).
+    let has_more = !table_without_sort_key
+        && (truncated_by_size
+            || (fetch_limit.is_some_and(|limit| scanned_count >= limit) && (!peek || more_rows)));
 
     // For index queries, include the base table primary key in LastEvaluatedKey
     // alongside the effective (index) keys so the cursor can uniquely identify
@@ -1151,6 +1208,41 @@ pub async fn execute<S: StorageBackend>(
         last_evaluated_key,
         consumed_capacity,
     })
+}
+
+/// Whether DynamoDB hands back no `LastEvaluatedKey` on the page holding the
+/// read's last matching row (#291, captured eu-west-2 and us-east-1, 6 and
+/// 13 November 2026). It does for an ascending read with no filter whose sort
+/// key condition is absent or closed above, on the table and on either kind of
+/// index, and on an index for `>=` too. Descending and filtered reads, and a
+/// table's `>=` and `>`, ended there on some walks and one page later on
+/// others; they, and an index's `>`, keep the trailing empty page every time.
+/// `begins_with` varies on DynamoDB, and so does a read of a multi-attribute
+/// index by its partition attributes alone (14 November 2026); both keep the
+/// trailing page here too. So does an index with no sort key, which has not
+/// been captured.
+fn ends_on_last_row(
+    bound: &expressions::key_condition::BoundKeyCondition,
+    hash_len: usize,
+    range_len: usize,
+    forward: bool,
+    filtered: bool,
+    index: bool,
+) -> bool {
+    use expressions::key_condition::ResolvedSortKeyCondition as Sk;
+    let multi_attribute = hash_len > 1 || range_len > 1;
+    forward
+        && !filtered
+        && match bound.range_last {
+            // An index with no sort key.
+            None if index && range_len == 0 => false,
+            // A multi-attribute index read by its partition attributes alone.
+            None if multi_attribute && bound.range_eq.is_empty() => false,
+            None => true,
+            Some(Sk::Eq(..) | Sk::Lt(..) | Sk::Le(..) | Sk::Between(..)) => true,
+            Some(Sk::Ge(..)) => index,
+            Some(Sk::Gt(..) | Sk::BeginsWith(..)) => false,
+        }
 }
 
 /// The read key's attributes as the item holds them: every partition key and
@@ -1280,11 +1372,17 @@ fn start_key_value_error(err: DynoxideError) -> DynoxideError {
 /// return at most one row and cannot be restarted". Then a sort key condition
 /// the start key breaks: "does not match the range key predicate". Then a
 /// different last partition key attribute: "at most one row" again when a sort
-/// key condition follows it, "The provided exclusive start key is invalid" on a
-/// table with no sort key, and "outside query boundaries based on provided
+/// key condition follows it, and "outside query boundaries based on provided
 /// conditions" otherwise. The same on a table, an LSI, a GSI and a GSI with a
 /// multi-attribute key. Captured in eu-west-2 and us-east-1, 2026-10-09, and
 /// on tables in us-west-2 and eu-central-1 too.
+///
+/// On a table with no sort key, where a Query never returns a starting key,
+/// every well-formed starting key is refused as "The provided exclusive start
+/// key is invalid": the item's own key, a key naming a partition with no item,
+/// and a key naming another partition alike (captured on DynamoDB in eu-west-2
+/// and us-east-1 on 14 November 2026). A malformed key is refused earlier, in
+/// its own words.
 fn check_start_key_within_condition(
     esk: &Item,
     bound: &expressions::key_condition::BoundKeyCondition,
@@ -1294,6 +1392,9 @@ fn check_start_key_within_condition(
 
     const AT_MOST_ONE_ROW: &str = "The query can return at most one row and cannot be restarted";
     let refuse = |message: &str| Err(DynoxideError::ValidationException(message.to_string()));
+    if table_without_sort_key {
+        return refuse("The provided exclusive start key is invalid");
+    }
     let holds = |name: &str, value: &AttributeValue| {
         esk.get(name)
             .is_some_and(|v| compare_values(v, &CompOp::Eq, value))
@@ -1319,9 +1420,6 @@ fn check_start_key_within_condition(
     if !holds(last_name, last_value) {
         if !bound.range_eq.is_empty() || bound.range_last.is_some() {
             return refuse(AT_MOST_ONE_ROW);
-        }
-        if table_without_sort_key {
-            return refuse("The provided exclusive start key is invalid");
         }
         return refuse(
             "The provided starting key is outside query boundaries based on provided conditions",

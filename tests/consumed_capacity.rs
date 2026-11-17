@@ -518,10 +518,12 @@ async fn the_transact_write_action_rejects_an_unknown_return_consumed_capacity()
 }
 
 #[test]
-fn batch_write_checks_return_consumed_capacity_before_table_names() {
-    // BatchWriteItem refuses the capacity mode ahead of a table name that fails
-    // its pattern, while the RequestItems length constraints still come first.
-    // Captured us-east-1 and eu-west-2, 2026-10-09.
+fn batch_write_lists_return_consumed_capacity_after_table_names() {
+    // BatchWriteItem lists a bad capacity mode after a table name that fails
+    // its pattern, while a table's request list that is too long comes first
+    // and alone. Captured eu-west-2, 2026-11-13; on 2026-10-09 both regions
+    // reported the mode ahead of the name, and us-east-1 still listed the
+    // list's length with the mode.
     let db = setup();
     let bad_name = |mode: &str| {
         request::<dynoxide::actions::batch_write_item::BatchWriteItemRequest>(serde_json::json!({
@@ -531,9 +533,11 @@ fn batch_write_checks_return_consumed_capacity_before_table_names() {
             "ReturnConsumedCapacity": mode
         }))
     };
-    assert_eq!(
-        validation_message(db.batch_write_item(bad_name("BOGUS")).unwrap_err()),
-        BOGUS_MODE_MESSAGE
+    let with_mode = validation_message(db.batch_write_item(bad_name("BOGUS")).unwrap_err());
+    assert!(
+        with_mode.starts_with("2 validation errors detected: Value '{\"bad!name\":")
+            && with_mode.ends_with(&BOGUS_MODE_MESSAGE["1 validation error detected: ".len()..]),
+        "expected the table name and then the mode, got {with_mode}"
     );
     let without_mode = validation_message(db.batch_write_item(bad_name("NONE")).unwrap_err());
     assert!(
@@ -552,8 +556,10 @@ fn batch_write_checks_return_consumed_capacity_before_table_names() {
         .unwrap_err();
     let message = validation_message(err);
     assert!(
-        message.contains("at 'requestItems'") && message.contains("less than or equal to 25"),
-        "expected the request count first, got {message}"
+        message
+            == "1 validation error detected: Value at 'RequestItems.TestTable.member' failed to \
+                satisfy constraint: Member must have length less than or equal to 25",
+        "expected the request count alone, got {message}"
     );
 }
 

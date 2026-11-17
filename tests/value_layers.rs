@@ -13,7 +13,10 @@
 //! layer on the transactions), Dynoxide follows the majority. Scan was one of
 //! those until 20 October 2026, when 19 of 33 regions read its values on the
 //! current layer, and TransactWriteItems' numbers until 11 November 2026, when
-//! all four regions read them, and its sets, on the current layer.
+//! all four regions read them, and its sets, on the current layer. A request
+//! that holds a null where a value belongs is read on the older layer, a
+//! transaction's expression values named by key (see
+//! tests/null_attribute_values.rs).
 
 #![cfg(feature = "http-server")]
 

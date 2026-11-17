@@ -319,6 +319,39 @@ fn a_keyed_read_rejects_a_filter_on_an_attribute_the_index_does_not_carry() {
     }
 }
 
+/// The attribute is named inside `begins_with` or `contains` with operands
+/// other than a path and a value, in either place, and under NOT.
+#[test]
+fn a_keyed_read_rejects_an_unprojected_attribute_inside_a_search() {
+    let db = seeded();
+    for (filter, parameters) in [
+        ("begins_with('N1x', nonproj)", vec![]),
+        ("begins_with(nonproj, projattr)", vec![]),
+        ("contains('N1', nonproj)", vec![]),
+        (
+            "NOT contains(?, nonproj)",
+            vec![serde_json::json!({"S": "N1"})],
+        ),
+    ] {
+        let sql = format!("SELECT * FROM \"{TABLE}\".\"gsi-inc\" WHERE gsiPk2='x2' AND {filter}");
+        let mut req = serde_json::json!({ "Statement": sql });
+        if !parameters.is_empty() {
+            req["Parameters"] = serde_json::json!(parameters);
+        }
+        let msg = db
+            .execute_statement(serde_json::from_value(req).unwrap())
+            .expect_err("expected a rejection")
+            .to_string();
+        assert!(
+            msg.contains(
+                "One or more parameter values were invalid: Secondary index gsi-inc does not \
+                 project one or more filter attributes: [nonproj]"
+            ),
+            "for {filter}: got {msg}"
+        );
+    }
+}
+
 #[test]
 fn an_unkeyed_read_accepts_a_filter_the_index_cannot_satisfy() {
     // Q7, Q29, Q35, Q37. Without a condition on the index partition key the

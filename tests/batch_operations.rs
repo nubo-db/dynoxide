@@ -295,7 +295,8 @@ fn test_batch_write_exceeds_25_items() {
         msg.contains("Member must have length less than or equal to 25"),
         "Got: {msg}"
     );
-    assert!(msg.contains("at 'requestItems'"), "Got: {msg}");
+    // One fault for the table, with no echo (captured eu-west-2, 2026-11-13).
+    assert!(msg.contains("at 'RequestItems.Tbl.member'"), "Got: {msg}");
 }
 
 #[test]
@@ -730,10 +731,10 @@ fn batch_get_allows_uniform_projection_across_tables() {
 }
 
 #[test]
-fn test_batch_write_empty_request_items_keeps_bespoke_message() {
-    // BatchWriteItem has not followed BatchGetItem onto the validation
-    // envelope, so this sentence is the answer nearly every region gives.
-    // Pinned to stop the two being aligned for consistency's sake.
+fn test_batch_write_empty_request_items_is_a_length_error() {
+    // An empty RequestItems is the length error in the validation envelope,
+    // as BatchGetItem answers it. DynamoDB's regions differed on this when
+    // captured (11 and 12 November 2026), and Dynoxide follows eu-west-2.
     let db = setup_db();
 
     let req: BatchWriteItemRequest = serde_json::from_value(serde_json::json!({
@@ -744,7 +745,10 @@ fn test_batch_write_empty_request_items_keeps_bespoke_message() {
     let err = db.batch_write_item(req).unwrap_err();
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("The requestItems parameter is required for BatchWriteItem"),
+        msg.contains(
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy \
+             constraint: Member must have length greater than or equal to 1"
+        ),
         "Got: {msg}"
     );
 }

@@ -54,11 +54,18 @@ pub struct TransactWriteItem {
 pub struct TransactPut {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Item")]
+    #[serde(
+        rename = "Item",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub item: Item,
     #[serde(rename = "ConditionExpression", default)]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -70,13 +77,20 @@ pub struct TransactPut {
 pub struct TransactUpdate {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Key")]
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "UpdateExpression")]
     pub update_expression: String,
     #[serde(rename = "ConditionExpression", default)]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -88,11 +102,18 @@ pub struct TransactUpdate {
 pub struct TransactDelete {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Key")]
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "ConditionExpression", default)]
     pub condition_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -104,11 +125,18 @@ pub struct TransactDelete {
 pub struct TransactConditionCheck {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Key")]
+    #[serde(
+        rename = "Key",
+        deserialize_with = "crate::types::deserialize_required_attribute_map"
+    )]
     pub key: HashMap<String, AttributeValue>,
     #[serde(rename = "ConditionExpression")]
     pub condition_expression: String,
-    #[serde(rename = "ExpressionAttributeNames", default)]
+    #[serde(
+        rename = "ExpressionAttributeNames",
+        default,
+        deserialize_with = "crate::empty_names::deserialize_names"
+    )]
     pub expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,

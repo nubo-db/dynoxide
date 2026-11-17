@@ -809,6 +809,20 @@ pub trait StorageBackend: private::Sealed {
         sizes: &[(String, String, usize)],
     ) -> Result<(), BackendError>;
 
+    /// Set the stored `hash_prefix` of the rows in `fill`, each a
+    /// `(pk, sk, hash_prefix)`, where it is empty, then return the keys
+    /// `(pk, sk)` of up to `limit` rows whose `hash_prefix` is empty, in key
+    /// order, past `after` when it is given. A row that already has a prefix,
+    /// and every other column, is left unchanged. Nothing is written when
+    /// `fill` is empty, and nothing is read when `limit` is 0.
+    async fn fill_hash_prefixes(
+        &self,
+        table_name: &str,
+        fill: &[(String, String, String)],
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, BackendError>;
+
     // -----------------------------------------------------------------------
     // Introspection
     // -----------------------------------------------------------------------

@@ -20,21 +20,16 @@ impl<'de> serde::Deserialize<'de> for DescribeTimeToLiveRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = DescribeTimeToLiveRequestRaw::deserialize(deserializer)?;
 
-        if raw.table_name.is_none() || raw.table_name.as_deref() == Some("") {
-            let msg = if raw.table_name.is_none() {
-                "The parameter 'TableName' is required but was not present in the request"
-            } else {
-                "TableName must be at least 3 characters long and at most 255 characters long"
-            };
-            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
-        }
-
-        let table_name = raw.table_name.unwrap_or_default();
-
-        if table_name.len() < 3 || table_name.len() > 255 {
+        let Some(table_name) = raw.table_name else {
             return Err(serde::de::Error::custom(
-                "VALIDATION:TableName must be at least 3 characters long and at most 255 characters long",
+                "VALIDATION:The parameter 'TableName' is required but was not present in the request",
             ));
+        };
+
+        // The length in UTF-16 units, then the pattern, both listed in the
+        // envelope; an empty name gets a bare sentence.
+        if let Some(msg) = crate::validation::control_table_name_rejection(&table_name) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
 
         Ok(DescribeTimeToLiveRequest { table_name })
@@ -59,9 +54,8 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: DescribeTimeToLiveRequest,
 ) -> Result<DescribeTimeToLiveResponse> {
-    // Table name format validation already done in Deserialize impl;
-    // only pattern validation remains
-    crate::validation::validate_table_name(&request.table_name)?;
+    // The checks the body was read with, for a request built in code.
+    crate::validation::validate_control_table_name(&request.table_name)?;
 
     let meta = storage
         .get_table_metadata(&request.table_name)

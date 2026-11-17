@@ -466,6 +466,16 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn fill_hash_prefixes(
+        &self,
+        _table_name: &str,
+        _fill: &[(String, String, String)],
+        _after: Option<(&str, &str)>,
+        _limit: usize,
+    ) -> Result<Vec<(String, String)>, BackendError> {
+        unimplemented!()
+    }
+
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
         unimplemented!()
     }

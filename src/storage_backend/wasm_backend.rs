@@ -1268,6 +1268,46 @@ impl StorageBackend for WasmBridgeBackend {
         Ok(())
     }
 
+    async fn fill_hash_prefixes(
+        &self,
+        table_name: &str,
+        fill: &[(String, String, String)],
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, BackendError> {
+        if !fill.is_empty() {
+            let rows = fill
+                .iter()
+                .map(|(pk, sk, prefix)| {
+                    vec![
+                        SqlParam::text(prefix.as_str()),
+                        SqlParam::text(pk.as_str()),
+                        SqlParam::text(sk.as_str()),
+                    ]
+                })
+                .collect();
+            self.exec_batch(&sql_builders::fill_hash_prefix(table_name), rows)
+                .await?;
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = sql_builders::keys_without_hash_prefix(table_name, after.is_some(), limit);
+        let params = after
+            .map(|(pk, sk)| vec![SqlParam::text(pk), SqlParam::text(sk)])
+            .unwrap_or_default();
+        let rows = self.query(&sql, params).await?;
+        let mut keys = Vec::with_capacity(rows.length() as usize);
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            keys.push((
+                col_text(&row, 0).unwrap_or_default(),
+                col_text(&row, 1).unwrap_or_default(),
+            ));
+        }
+        Ok(keys)
+    }
+
     // --- Introspection ---------------------------------------------------
 
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {

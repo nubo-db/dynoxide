@@ -148,6 +148,59 @@ fn a_keyed_select_is_charged_on_the_rows_its_key_condition_reached() {
     assert_eq!(single, 0.5, "one row of ~3KB is one read unit");
 }
 
+/// `begins_with` on the sort key with a literal or a parameter for its prefix
+/// is a key condition, so the read reaches one row, where `contains` on the
+/// sort key is a filter over the whole partition.
+#[test]
+fn a_sort_key_begins_with_is_charged_as_a_key_condition() {
+    let db = table();
+    let literal = statement(
+        &db,
+        &format!("SELECT * FROM \"{TABLE}\" WHERE pk='p' AND begins_with(sk, 's0000')"),
+    );
+    assert_eq!(literal, 0.5, "one row of ~3KB is one read unit");
+
+    let req = serde_json::json!({
+        "Statement": format!("SELECT * FROM \"{TABLE}\" WHERE pk='p' AND begins_with(sk, ?)"),
+        "Parameters": [{"S": "s0000"}],
+        "ReturnConsumedCapacity": "TOTAL"
+    });
+    let parameter = db
+        .execute_statement(serde_json::from_value(req).unwrap())
+        .unwrap()
+        .consumed_capacity
+        .expect("TOTAL mode reports capacity")
+        .capacity_units;
+    assert_eq!(parameter, 0.5, "a parameter prefix is a key condition too");
+
+    let filter = statement(
+        &db,
+        &format!("SELECT * FROM \"{TABLE}\" WHERE pk='p' AND contains(sk, 's0000')"),
+    );
+    assert_eq!(filter, 1.5, "a filter is charged on the whole partition");
+}
+
+/// A search on the sort key that isn't a key condition, beside one that is,
+/// leaves the read on the whole partition, as `contains` on the sort key
+/// does: a key condition is pushed into the read only when every condition
+/// on the sort key can be one.
+#[test]
+fn a_search_beside_a_sort_key_condition_reads_the_whole_partition() {
+    let db = table();
+    let contains = statement(
+        &db,
+        &format!("SELECT * FROM \"{TABLE}\" WHERE pk='p' AND sk <= 's0000' AND contains(sk, 's')"),
+    );
+    assert_eq!(contains, 1.5);
+    let search = statement(
+        &db,
+        &format!(
+            "SELECT * FROM \"{TABLE}\" WHERE pk='p' AND sk <= 's0000' AND begins_with('s', sk)"
+        ),
+    );
+    assert_eq!(search, 1.5);
+}
+
 #[test]
 fn consistent_read_doubles_the_charge_on_the_evaluated_bytes() {
     let db = table();

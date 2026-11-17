@@ -30,24 +30,10 @@ impl<'de> serde::Deserialize<'de> for DescribeTableRequest {
         }
         let table_name = raw.table_name.unwrap();
 
-        // Length check (before pattern, matching DynamoDB ordering)
-        if table_name.len() < 3 || table_name.len() > 255 {
-            return Err(serde::de::Error::custom(
-                "VALIDATION:TableName must be at least 3 characters long and at most 255 characters long",
-            ));
-        }
-
-        // Pattern check
-        if !table_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
-            return Err(serde::de::Error::custom(format!(
-                "VALIDATION:1 validation error detected: \
-                 Value '{}' at 'tableName' failed to satisfy constraint: \
-                 Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-                table_name
-            )));
+        // The length in UTF-16 units, then the pattern, both listed in the
+        // envelope; an empty name gets a bare sentence.
+        if let Some(msg) = crate::validation::control_table_name_rejection(&table_name) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
 
         Ok(DescribeTableRequest { table_name })
@@ -146,7 +132,7 @@ pub async fn execute<S: StorageBackend>(
     lifecycle: &VectorIndexLifecycle,
 ) -> Result<DescribeTableResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_control_table_name(&request.table_name)?;
 
     let meta = storage
         .get_table_metadata(&request.table_name)

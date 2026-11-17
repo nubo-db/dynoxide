@@ -97,6 +97,15 @@ pub(crate) mod number_tokens;
     test
 ))]
 pub(crate) mod serialization_checks;
+// Walking and rewriting a request body as written, shared by the readers that
+// rewrite part of one before it is decoded.
+#[cfg(any(
+    feature = "http-server",
+    feature = "wasm-sqlite",
+    feature = "mcp-server",
+    test
+))]
+pub(crate) mod json_text;
 // Nesting checks for values outside an item or an expression: keys, start
 // keys, legacy conditions and PartiQL parameters.
 pub(crate) mod value_nesting;

@@ -236,9 +236,67 @@ pub(crate) fn marked_serialization_error(msg: &str) -> Option<crate::DynoxideErr
     })
 }
 
+/// The raw serde message, marker and all, that [`deserialize`] answers with
+/// `error`, for a request decoder that raises an error found by a check made
+/// outside serde; `None` for an error no marker carries.
+pub(crate) fn marked_message(error: &crate::DynoxideError) -> Option<String> {
+    match error {
+        crate::DynoxideError::ValidationException(message) => {
+            Some(format!("{VALIDATION_MARKER}{message}"))
+        }
+        crate::DynoxideError::EnvelopedValidation(message) => {
+            Some(format!("{REQUEST_VALIDATION_MARKER}{message}"))
+        }
+        crate::DynoxideError::SerializationException(message) => {
+            Some(format!("{SERIALIZATION_MARKER}{message}"))
+        }
+        _ => None,
+    }
+}
+
 /// DynamoDB's refusal of a NULL that isn't true.
 pub(crate) const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value types must have the value \
      of true";
+
+/// DynamoDB's refusal of a JSON null where an attribute value belongs. A
+/// member of a map of attributes is named after it by
+/// [`null_member_refusal`]; a list member, a PartiQL parameter and a legacy
+/// `AttributeValueList` member are not (captured eu-west-2 and us-east-1,
+/// 2026-11-11).
+pub(crate) const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
+
+/// DynamoDB's refusal of a JSON null given for the attribute `name` of an
+/// item, a key or a nested `M`.
+pub(crate) fn null_member_refusal(name: &str) -> String {
+    format!("{NULL_VALUE}: {name} is null")
+}
+
+/// DynamoDB's refusal of a JSON null among the members of a set of
+/// `type_key`'s type: a value fault, refused bare, and named by key in the
+/// expression values as a null value is (captured eu-west-2 and us-east-1,
+/// 2026-11-12).
+pub(crate) fn null_set_member_refusal(type_key: &str) -> Option<&'static str> {
+    NULL_SET_MEMBER
+        .iter()
+        .find(|(set, _)| *set == type_key)
+        .map(|(_, refusal)| *refusal)
+}
+
+/// The refusals [`null_set_member_refusal`] gives, by set type.
+const NULL_SET_MEMBER: [(&str, &str); 3] = [
+    (
+        "SS",
+        "One or more parameter values were invalid: An string set may not have a null string as a member",
+    ),
+    (
+        "NS",
+        "One or more parameter values were invalid: Numeric sets may not contain null",
+    ),
+    (
+        "BS",
+        "One or more parameter values were invalid: Binary sets may not contain null or empty values",
+    ),
+];
 
 /// DynamoDB's refusal of a value with no type set.
 pub(crate) const EMPTY_VALUE: &str =
@@ -253,6 +311,9 @@ pub(crate) const MORE_THAN_ONE_TYPE: &str = "Supplied AttributeValue has more th
 /// `ExpressionAttributeValues` tell the cases apart to decide which name the
 /// value's key.
 pub(crate) enum ValueRefusal<'a> {
+    /// A JSON null, named after its attribute when it was a map's member, or
+    /// a member of a set.
+    Null(&'a str),
     /// No type set, or not an object.
     Empty,
     /// More than one type set.
@@ -273,7 +334,11 @@ pub(crate) enum ValueRefusal<'a> {
 /// Which refusal a raw serde message from reading one value is.
 pub(crate) fn value_refusal(msg: &str) -> ValueRefusal<'_> {
     let inner = clean_serde_message(msg);
-    if inner.contains("empty AttributeValue") || inner.contains("Supplied AttributeValue is empty")
+    if inner.starts_with(NULL_VALUE) || NULL_SET_MEMBER.iter().any(|(_, refusal)| inner == *refusal)
+    {
+        ValueRefusal::Null(inner)
+    } else if inner.contains("empty AttributeValue")
+        || inner.contains("Supplied AttributeValue is empty")
     {
         ValueRefusal::Empty
     } else if inner.contains("more than one datatypes") {
@@ -584,16 +649,15 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
         return map_type_mismatch(source_part.trim(), target);
     }
 
-    // "invalid length N, expected struct X ..." → struct-level errors
+    // "invalid length N, expected struct X ...": a structure given as an
+    // array, which DynamoDB refuses with no message (captured eu-west-2 and
+    // us-east-1, 11 and 12 November 2026). The type checks run before the
+    // decoder (`serialization_checks`) are what refuse an array at a
+    // structure; one of the right length would be read by position here, so
+    // they must. This only catches an array of the wrong length at a
+    // structure those checks have no position for.
     if msg.contains("expected struct") && msg.starts_with("invalid length ") {
-        // Extract struct name from "invalid length N, expected struct X with M elements"
-        if let Some(rest) = msg.split("expected struct ").nth(1) {
-            let struct_name = rest.split(' ').next().unwrap_or("Unknown");
-            if let Some(dynamo_class) = map_struct_to_dynamo_class(struct_name) {
-                return format!("Unrecognized collection type class {dynamo_class}");
-            }
-        }
-        return "Start of structure or map found where not expected".to_string();
+        return String::new();
     }
 
     // "expected value at line N column N" → wrong value type at position
@@ -633,6 +697,14 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
         return "Unexpected field type".to_string();
     }
 
+    // An array where a scalar or a map belongs: DynamoDB refuses it with no
+    // message (captured eu-west-2 and us-east-1, 11 and 12 November 2026).
+    // An array at a structure is refused by the type checks run before the
+    // decoder.
+    if is_sequence {
+        return String::new();
+    }
+
     if target_is_string {
         if is_bool_true {
             return "TRUE_VALUE cannot be converted to String".to_string();
@@ -645,9 +717,6 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
         }
         if is_integer {
             return "NUMBER_VALUE cannot be converted to String".to_string();
-        }
-        if is_sequence {
-            return "Unrecognized collection type class java.lang.String".to_string();
         }
         if is_map {
             return "Start of structure or map found where not expected".to_string();
@@ -664,9 +733,6 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
         if is_integer {
             return "NUMBER_VALUE cannot be converted to Boolean".to_string();
         }
-        if is_sequence {
-            return "Unrecognized collection type class java.lang.Boolean".to_string();
-        }
         if is_map {
             return "Start of structure or map found where not expected".to_string();
         }
@@ -682,28 +748,16 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
         if is_bool_false {
             return "FALSE_VALUE cannot be converted to Long".to_string();
         }
-        if is_sequence {
-            return "Unrecognized collection type class java.lang.Long".to_string();
-        }
         if is_map {
             return "Start of structure or map found where not expected".to_string();
         }
     }
 
     if target_is_struct || target_is_map {
-        if is_sequence {
-            // Need to figure out the class from target
-            if let Some(struct_name) = target.strip_prefix("struct ") {
-                let name = struct_name.split(' ').next().unwrap_or("Unknown");
-                if let Some(dynamo_class) = map_struct_to_dynamo_class(name) {
-                    return format!("Unrecognized collection type class {dynamo_class}");
-                }
-            }
-        }
         if is_map && target_is_struct {
             return "Start of structure or map found where not expected".to_string();
         }
-        if !is_map && !is_sequence {
+        if !is_map {
             return "Unexpected field type".to_string();
         }
     }
@@ -738,47 +792,6 @@ fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> Stri
         }
     }
     format!("TRUE_VALUE cannot be converted to {target_type}")
-}
-
-/// Map Rust struct names to DynamoDB Java class names for SerializationException messages.
-fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
-    match struct_name {
-        "ProvisionedThroughput" | "ProvisionedThroughputRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.ProvisionedThroughput")
-        }
-        "Projection" | "ProjectionRaw" => Some("com.amazonaws.dynamodb.v20120810.Projection"),
-        "KeySchemaElement" | "KeySchemaElementRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.KeySchemaElement")
-        }
-        "AttributeDefinition" | "AttributeDefinitionRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.AttributeDefinition")
-        }
-        "LocalSecondaryIndex" | "LocalSecondaryIndexRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.LocalSecondaryIndex")
-        }
-        "GlobalSecondaryIndex" | "GlobalSecondaryIndexRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndex")
-        }
-        "DeleteGsiAction" | "DeleteGsiActionRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.DeleteGlobalSecondaryIndexAction")
-        }
-        "CreateGsiAction" | "CreateGsiActionRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.CreateGlobalSecondaryIndexAction")
-        }
-        "UpdateGsiAction" | "UpdateGsiActionRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.UpdateGlobalSecondaryIndexAction")
-        }
-        "GlobalSecondaryIndexUpdate" | "GlobalSecondaryIndexUpdateRaw" => {
-            Some("com.amazonaws.dynamodb.v20120810.GlobalSecondaryIndexUpdate")
-        }
-        "VectorIndex" => Some("com.amazonaws.dynamodb.v20120810.VectorIndex"),
-        "VectorAttributeDefinition" => {
-            Some("com.amazonaws.dynamodb.v20120810.VectorAttributeDefinition")
-        }
-        "SearchSchemaElement" => Some("com.amazonaws.dynamodb.v20120810.SearchSchemaElement"),
-        "Tag" | "TagRaw" => Some("com.amazonaws.dynamodb.v20120810.Tag"),
-        _ => None,
-    }
 }
 
 #[cfg(feature = "http-server")]
@@ -990,5 +1003,25 @@ mod tests {
         assert_eq!(strip_position("msg at line 1 column 2"), "msg");
         assert_eq!(strip_position("msg"), "msg");
         assert_eq!(strip_position("look at line 9"), "look at line 9");
+    }
+
+    /// An array the decoder meets where a structure, a scalar or a map
+    /// belongs is a `SerializationException` with no message.
+    #[test]
+    fn an_array_the_decoder_meets_is_refused_with_no_message() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Pair {
+            a: Option<String>,
+            b: Option<std::collections::HashMap<String, String>>,
+        }
+        for body in [r#"["x"]"#, r#"[]"#, r#"{"a":["x"]}"#, r#"{"b":["x"]}"#] {
+            match deserialize::<Pair>(body) {
+                Err(crate::DynoxideError::SerializationException(message)) => {
+                    assert_eq!(message, "", "{body}")
+                }
+                other => panic!("{body}: {other:?}"),
+            }
+        }
     }
 }

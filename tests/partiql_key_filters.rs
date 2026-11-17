@@ -279,3 +279,141 @@ fn a_missing_table_is_reported_before_the_refusal() {
     .unwrap_err();
     assert!(err.starts_with("ResourceNotFoundException:"), "{err}");
 }
+
+/// Each page of a walk at `limit`: its rows and whether it carried a token.
+fn pages(db: &Database, sql: &str, limit: usize) -> Vec<(usize, bool)> {
+    let mut pages = Vec::new();
+    let mut next_token = None;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: sql.replace("\"T\"", "\"KeyFilters\""),
+                limit: Some(limit),
+                next_token: next_token.take(),
+                ..Default::default()
+            })
+            .unwrap();
+        let more = response.next_token.is_some();
+        pages.push((response.items.unwrap_or_default().len(), more));
+        if !more || pages.len() > 8 {
+            return pages;
+        }
+        next_token = response.next_token;
+    }
+}
+
+/// A read by partition key with no filter hands back no token on the page
+/// holding its last row, on the table and on both kinds of index, whether the
+/// index's sort key ties across rows or not. Captured on DynamoDB in eu-west-2
+/// and us-east-1 on 6 and 13 November 2026 over a partition of four rows.
+#[test]
+fn a_read_by_partition_key_ends_on_its_last_row() {
+    let db = setup();
+    for sql in [
+        "SELECT * FROM \"T\" WHERE pk = 'k'",
+        "SELECT * FROM \"T\".\"l-all\" WHERE pk = 'k'",
+        "SELECT * FROM \"T\".\"g-all\" WHERE g = 'k'",
+    ] {
+        assert_eq!(
+            pages(&db, sql, 1),
+            [(1, true), (1, true), (1, true), (1, false)],
+            "{sql} at Limit 1"
+        );
+        assert_eq!(pages(&db, sql, 4), [(4, false)], "{sql} at Limit 4");
+    }
+}
+
+/// Read in descending order, the walk keeps its trailing page.
+#[test]
+fn a_descending_read_keeps_its_trailing_page() {
+    let db = setup();
+    assert_eq!(
+        pages(
+            &db,
+            "SELECT * FROM \"T\" WHERE pk = 'k' ORDER BY sk DESC",
+            4
+        ),
+        [(4, true), (0, false)]
+    );
+}
+
+/// `begins_with` is not consistent on DynamoDB: over four rows it ended on the
+/// last row at `Limit` 1 on every walk, but at `Limit` 4 kept a trailing empty
+/// page on 9 walks out of 10. Dynoxide keeps the trailing page for it, on the
+/// table and on both kinds of index, the indexes here over two rows sharing
+/// their sort key.
+#[test]
+fn begins_with_keeps_its_trailing_page() {
+    let db = setup();
+    let sql = "SELECT * FROM \"T\" WHERE pk = 'k' AND begins_with(sk, 'row-')";
+    assert_eq!(
+        pages(&db, sql, 1),
+        [(1, true), (1, true), (1, true), (1, true), (0, false)]
+    );
+    assert_eq!(pages(&db, sql, 4), [(4, true), (0, false)]);
+    for sql in [
+        "SELECT * FROM \"T\".\"l-all\" WHERE pk = 'k' AND begins_with(l, 'b')",
+        "SELECT * FROM \"T\".\"g-all\" WHERE g = 'k' AND begins_with(l, 'b')",
+    ] {
+        assert_eq!(
+            pages(&db, sql, 1),
+            [(1, true), (1, true), (0, false)],
+            "{sql} at Limit 1"
+        );
+        assert_eq!(
+            pages(&db, sql, 2),
+            [(2, true), (0, false)],
+            "{sql} at Limit 2"
+        );
+    }
+}
+
+/// More reads by partition key that end on their last row: the key written
+/// as a one-value `IN` or with the value first, an ascending `ORDER BY`, a
+/// bound beyond the last row, and `>=` on either kind of index. Captured on
+/// DynamoDB in eu-west-2 and us-east-1 on 14 November 2026.
+#[test]
+fn more_reads_by_partition_key_end_on_their_last_row() {
+    let db = setup();
+    for sql in [
+        "SELECT * FROM \"T\" WHERE pk IN ['k']",
+        "SELECT * FROM \"T\" WHERE 'k' = pk",
+        "SELECT * FROM \"T\" WHERE pk = 'k' ORDER BY sk",
+        "SELECT * FROM \"T\" WHERE pk = 'k' ORDER BY sk ASC",
+        "SELECT * FROM \"T\" WHERE pk = 'k' AND sk <= 'row-9'",
+        "SELECT * FROM \"T\" WHERE pk = 'k' AND sk BETWEEN 'row-1' AND 'row-9'",
+        "SELECT * FROM \"T\".\"l-all\" WHERE pk = 'k' AND l >= 'a'",
+        "SELECT * FROM \"T\".\"g-all\" WHERE g = 'k' AND l >= 'a'",
+    ] {
+        assert_eq!(
+            pages(&db, sql, 1),
+            [(1, true), (1, true), (1, true), (1, false)],
+            "{sql} at Limit 1"
+        );
+        assert_eq!(pages(&db, sql, 4), [(4, false)], "{sql} at Limit 4");
+    }
+}
+
+/// DynamoDB reads a clause written with `NOT NOT` around the key as a scan,
+/// and ends the walk on an empty page (captured on DynamoDB in eu-west-2 and
+/// us-east-1 on 14 November 2026). Dynoxide reads it by key, and pages it as
+/// it did before it ended a read on its last row: `NOT NOT pk = 'k'` keeps the
+/// trailing page, and with `sk <= 'row-4'` beside it the page ending on that
+/// closed bound carries no token, as a sort key range ending on its bound
+/// always has here.
+#[test]
+fn a_key_written_under_not_pages_as_before() {
+    let db = setup();
+    let sql = "SELECT * FROM \"T\" WHERE NOT NOT pk = 'k'";
+    assert_eq!(
+        pages(&db, sql, 1),
+        [(1, true), (1, true), (1, true), (1, true), (0, false)]
+    );
+    assert_eq!(pages(&db, sql, 4), [(4, true), (0, false)]);
+    let sql = "SELECT * FROM \"T\" WHERE NOT NOT (pk = 'k' AND sk <= 'row-4')";
+    assert_eq!(
+        pages(&db, sql, 1),
+        [(1, true), (1, true), (1, true), (1, false)]
+    );
+    assert_eq!(pages(&db, sql, 4), [(4, false)]);
+}

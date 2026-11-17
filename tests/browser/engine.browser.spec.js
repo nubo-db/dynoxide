@@ -770,6 +770,41 @@ test("UpdateTable with a StreamSpecification is refused and leaves the table int
   expect(result.streamEnabled).toBe(false); // streams were not enabled
 });
 
+test("forms DynamoDB reads by position are read, and an array body is refused", async ({ page }) => {
+  // DynamoDB reads a BatchWriteItem PutRequest given as [Item] and a Query
+  // condition given as [AttributeValueList, ComparisonOperator], and refuses a
+  // request body that is an array with a SerializationException.
+  const result = await page.evaluate(async () => {
+    const client = globalThis.dynoxide.makeClient({ name: `arrays-${crypto.randomUUID()}` });
+    await client.ready();
+    await client.execute("CreateTable", {
+      TableName: "Arrays",
+      KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+      AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+      BillingMode: "PAY_PER_REQUEST",
+    });
+    const written = await client.execute("BatchWriteItem", {
+      RequestItems: { Arrays: [{ PutRequest: [{ pk: { S: "a" }, x: { N: "1" } }] }] },
+    });
+    const query = await client.execute("Query", {
+      TableName: "Arrays",
+      KeyConditions: { pk: [[{ S: "a" }], "EQ"] },
+    });
+    let refused = null;
+    try {
+      await client.execute("PutItem", ["Arrays", { pk: { S: "b" } }]);
+    } catch (e) {
+      refused = e.type;
+    }
+    client.terminate();
+    return { unprocessed: written.UnprocessedItems, items: query.Items, refused };
+  });
+
+  expect(result.unprocessed).toEqual({});
+  expect(result.items).toEqual([{ pk: { S: "a" }, x: { N: "1" } }]);
+  expect(result.refused).toBe("com.amazon.coral.service#SerializationException");
+});
+
 test("a GSI added to a populated table survives a reload (OPFS)", async ({ page }) => {
   const name = `addgsi-persist-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 

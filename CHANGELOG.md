@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-17
+
 The crate moves to `dynoxide-rs` 4.0.0, because the `rusqlite` move changes
 public types: see Breaking (Rust API). Everything else a user installs carries
 1.7.0. The first writable open by this release moves a database to schema
@@ -2769,7 +2771,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0

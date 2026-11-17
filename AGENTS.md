@@ -54,13 +54,14 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 - New behaviour ships with tests in `tests/` or inline module tests.
 - Bug fixes ship with a regression test that fails before the fix.
 - `cargo test` on default features is what most contributors run
-  locally. CI goes further and runs a feature matrix across five
+  locally. CI goes further and runs a feature matrix across six
   configurations:
   - default (all default features)
   - `--no-default-features --features native-sqlite --lib`
   - `--no-default-features --features encryption --lib`
-  - `--no-default-features --features encryption,http-server`
+  - `--no-default-features --features encryption,http-server,cli`
   - `--features bench-counters --test repeated_work_counts`
+  - `--no-default-features --features native-sqlite --test expected_library_build`
   A separate feature-guard job checks that deliberately incompatible
   feature combinations fail to compile (for example
   `native-sqlite + encryption`). A `wasm-check` job builds the library
@@ -140,8 +141,8 @@ The action handlers are async and generic over the trait
 with a `NativeDatabase` alias that keeps the historical synchronous public API
 through a `block_on` facade, and a `WasmDatabase` alias whose methods are async
 (the wasm main thread cannot block). The trait is consumed monomorphically (no
-`dyn`). The raw `Storage::conn()` / `conn_mut()` escape hatches are no longer
-used by action handlers. Please open an issue before submitting changes to
+`dyn`). Action handlers don't use the raw `Storage::conn()` / `conn_mut()`
+escape hatches. Please open an issue before submitting changes to
 `src/storage.rs` or `src/storage_backend/`; we can advise whether your change
 fits the current shape.
 

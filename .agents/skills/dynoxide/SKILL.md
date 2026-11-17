@@ -23,11 +23,19 @@ docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
 brew install nubo-db/tap/dynoxide && dynoxide --port 8000
 ```
 
-In a test suite, `--port 0` picks a free port and prints it on stderr as
-`Dynoxide listening on http://127.0.0.1:<port>`. Without `--db-path` the data
-lives in memory and is gone when the process stops, which is usually what
-tests want. `--log quiet` drops the startup and shutdown lines, including
-that one, so leave it off when the port is read from stderr.
+In a Node test suite, use the npm package's `start()`, which picks a free port
+and hands back the endpoint. From anything else, start
+`dynoxide --port 0 --ready-json --exit-with-parent` with stdin on a pipe. Once
+it's ready it prints one JSON line on stdout with the `endpoint`, and it shuts
+down cleanly when stdin closes, so the server stops even if the test runner is
+killed. Both flags need 1.7.0 or later. `docs/launcher.md` in the repository
+has the details. Without `--db-path` the data lives in memory and is gone when
+the process stops, which is usually what tests want.
+
+Before pointing Dynoxide at an existing database file with `--db-path`, note
+that 1.7.0's first writable open moves the file to schema version 12, which
+1.3.0 to 1.6.0 refuse to open. Copy the file first if anyone may go back to an
+older version.
 
 In GitHub Actions, use the `nubo-db/dynoxide/action` Action, pinned to a
 release tag. The current pin is in the installation guide:

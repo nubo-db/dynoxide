@@ -62,7 +62,7 @@ The options are all optional:
 | `dbPath` | A database file that survives a restart. Give each server its own file. Without it, the database lives in memory. |
 | `schema` | A schema file whose tables exist before the server is ready. |
 | `binary` | A Dynoxide binary to use instead of the one npm installed, 1.7.0 or later. `DYNOXIDE_BINARY` does the same. |
-| `readyTimeoutMs` | How long to wait for the server to be ready. Defaults to 10000. |
+| `readyTimeoutMs` | How long to wait for the server to be ready. Defaults to 10000. Raise it for a large `dbPath` file an older Dynoxide wrote, since the first open upgrades it, or if another process may hold the file, since the open waits up to 30 seconds for it. |
 
 `stop()` closes the server's stdin, which shuts it down cleanly, and kills it if it's still running after 5 seconds (on Linux and macOS it gets a SIGTERM and another 5 seconds first). Calling it again returns the same promise. Where the runtime has `Symbol.asyncDispose`, `await using server = await start()` stops the server at the end of the block.
 

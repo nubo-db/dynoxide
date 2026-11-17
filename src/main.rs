@@ -438,7 +438,12 @@ async fn main() {
     // decides where the log goes: stdout is reserved for the ready line under
     // `--ready-json`, and for JSON-RPC messages when MCP runs over stdio.
     let cli = Cli::parse();
-    let logs = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    // A log write that fails, as one does once a killed launcher stops reading
+    // stderr, is dropped. Reporting it would write to stderr again, and that
+    // panics, which aborts the release build before the database closes.
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .log_internal_errors(false);
     if cli.wants_ready_line() || speaks_mcp_over_stdio(&cli) {
         logs.with_writer(std::io::stderr).init();
     } else {

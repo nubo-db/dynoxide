@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-17
+
 The crate moves to `dynoxide-rs` 4.0.0, because the `rusqlite` move changes
 public types: see Breaking (Rust API). Everything else a user installs carries
 1.7.0. The first writable open by this release moves a database to schema
@@ -129,7 +131,9 @@ Fixed.
   line failed to write and the release build aborted before closing the
   database, leaving its write-ahead log behind. Writes weren't lost, but the
   shutdown wasn't the clean one `--exit-with-parent` promises. Informational
-  lines on the `serve` path now drop a failed write instead.
+  lines on the `serve` path now drop a failed write instead, and so does the
+  log `RUST_LOG` turns on, which otherwise also dropped every request served
+  after the launcher stopped reading.
 
 - A Query on a table with no sort key no longer returns a
   `LastEvaluatedKey`, as DynamoDB never does for one: a partition of such a
@@ -638,6 +642,7 @@ Fixed.
   back in the same segment and the same place as a fresh write. That open
   moves the file to schema version 12, and the upgrade is one way: Dynoxide
   1.3.0 to 1.6.0 read up to version 11 and will refuse the file afterwards.
+  Looking for such items reads each table once, in the order it is stored.
   Recording version 12 is a write, so the first open by this release writes
   to the file. A database kept read-only that has items to fill is refused
   until it has been opened writable once; one with nothing to fill still
@@ -2769,7 +2774,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0

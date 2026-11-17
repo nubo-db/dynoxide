@@ -470,9 +470,9 @@ impl StorageBackend for TestBackend {
         &self,
         _table_name: &str,
         _fill: &[(String, String, String)],
-        _after: Option<(&str, &str)>,
+        _after: Option<i64>,
         _limit: usize,
-    ) -> Result<Vec<(String, String)>, BackendError> {
+    ) -> Result<Vec<(i64, String, String)>, BackendError> {
         unimplemented!()
     }
 

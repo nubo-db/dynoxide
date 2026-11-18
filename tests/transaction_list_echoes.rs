@@ -24,6 +24,7 @@ const TABLE: &str = "_capture_20261010_mcii_none";
 
 /// The message TransactGetItems answers these Gets with over HTTP, where a
 /// null name can be sent.
+#[cfg(feature = "http-server")]
 fn transact_get_message(gets: Vec<Value>) -> String {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -203,38 +204,42 @@ fn a_get_list_over_100_is_echoed_in_the_java_form() {
         "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
          Member must have length less than or equal to 100"
     );
-    items[51]["Get"]["ExpressionAttributeNames"] = json!({"#x": null});
-    let message = transact_get_message(items);
-    assert!(message.contains(
-        "{pk=AttributeValue(s=g50, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, \
-         sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, \
-         l=null, nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none, \
-         projectionExpression=null, expressionAttributeNames={#x=null}"
-    ));
-    assert_echo(
-        &message,
-        concat!(
-            "1 validation error detected: Value '[TransactGetItem(get=Get(key={pk=AttributeValue(s=k",
-            ", n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null",
-            ", bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null",
-            ", nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none",
-            ", projectionExpression=#n, expressionAttributeNames={#n=a}",
-            ", workloadProfileName=null))",
-            ", TransactGetItem(get=Get(key={pk=AttributeValue(s=g0, n=null, b=null",
-            ", iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null",
-            ", iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null",
-            ", bOOL=null)}, tableName=_capture_20261010_mcii_none",
-            ", projectionExpression=null, expressionAttributeNames=null",
-            ", workloadProfileName=null)), ",
-        ),
-        concat!(
-            "l, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
-            ", tableName=_capture_20261010_mcii_none, projectionExpression=null",
-            ", expressionAttributeNames=null",
-            ", workloadProfileName=null))]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
-        ),
-        34974,
-    );
+    // Only HTTP can send a null name, so this half needs the server.
+    #[cfg(feature = "http-server")]
+    {
+        items[51]["Get"]["ExpressionAttributeNames"] = json!({"#x": null});
+        let message = transact_get_message(items);
+        assert!(message.contains(
+            "{pk=AttributeValue(s=g50, n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, \
+             sS=null, nS=null, bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, \
+             l=null, nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none, \
+             projectionExpression=null, expressionAttributeNames={#x=null}"
+        ));
+        assert_echo(
+            &message,
+            concat!(
+                "1 validation error detected: Value '[TransactGetItem(get=Get(key={pk=AttributeValue(s=k",
+                ", n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null",
+                ", bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null",
+                ", nULL=null, bOOL=null)}, tableName=_capture_20261010_mcii_none",
+                ", projectionExpression=#n, expressionAttributeNames={#n=a}",
+                ", workloadProfileName=null))",
+                ", TransactGetItem(get=Get(key={pk=AttributeValue(s=g0, n=null, b=null",
+                ", iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null, bS=null",
+                ", iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null",
+                ", bOOL=null)}, tableName=_capture_20261010_mcii_none",
+                ", projectionExpression=null, expressionAttributeNames=null",
+                ", workloadProfileName=null)), ",
+            ),
+            concat!(
+                "l, dECIMALSET=null, dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null)}",
+                ", tableName=_capture_20261010_mcii_none, projectionExpression=null",
+                ", expressionAttributeNames=null",
+                ", workloadProfileName=null))]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+            ),
+            34974,
+        );
+    }
 }
 
 /// The names of the map that opens at `start` in `message` (just after its
@@ -418,31 +423,36 @@ fn an_echoed_map_is_sized_to_its_entries() {
         ["bsol", "pk", "btgp", "byko", "bvrn"]
     );
 
-    // So is ExpressionAttributeNames, echoed here in a get list.
-    let names: serde_json::Map<String, Value> = sent
-        .iter()
-        .map(|name| (format!("#{name}"), json!(name)))
-        .collect();
-    let projection = sent
-        .iter()
-        .map(|name| format!("#{name}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut gets = vec![json!({"Get": {
-        "TableName": "t",
-        "Key": {"pk": {"S": "n"}},
-        "ProjectionExpression": projection,
-        "ExpressionAttributeNames": names
-    }})];
-    gets.extend(
-        (0..100).map(|i| json!({"Get": {"TableName": "t", "Key": {"pk": {"S": format!("g{i}")}}}})),
-    );
-    gets[1]["Get"]["ExpressionAttributeNames"] = json!({"#x": null});
-    let message = transact_get_message(gets);
-    let start =
-        message.find("expressionAttributeNames={").unwrap() + "expressionAttributeNames={".len();
-    assert_eq!(
-        echoed_names(&message, start),
-        ["#bvrn", "#bsol", "#btgp", "#byko", "#pk"]
-    );
+    // Only HTTP can send a null name, so this half needs the server.
+    #[cfg(feature = "http-server")]
+    {
+        // So is ExpressionAttributeNames, echoed here in a get list.
+        let names: serde_json::Map<String, Value> = sent
+            .iter()
+            .map(|name| (format!("#{name}"), json!(name)))
+            .collect();
+        let projection = sent
+            .iter()
+            .map(|name| format!("#{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut gets = vec![json!({"Get": {
+            "TableName": "t",
+            "Key": {"pk": {"S": "n"}},
+            "ProjectionExpression": projection,
+            "ExpressionAttributeNames": names
+        }})];
+        gets.extend(
+            (0..100)
+                .map(|i| json!({"Get": {"TableName": "t", "Key": {"pk": {"S": format!("g{i}")}}}})),
+        );
+        gets[1]["Get"]["ExpressionAttributeNames"] = json!({"#x": null});
+        let message = transact_get_message(gets);
+        let start = message.find("expressionAttributeNames={").unwrap()
+            + "expressionAttributeNames={".len();
+        assert_eq!(
+            echoed_names(&message, start),
+            ["#bvrn", "#bsol", "#btgp", "#byko", "#pk"]
+        );
+    }
 }

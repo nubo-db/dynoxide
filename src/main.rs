@@ -1789,7 +1789,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("key.hex");
             let mut f = std::fs::File::create(&path).unwrap();
-            write!(f, "{}\n", "b".repeat(64)).unwrap();
+            writeln!(f, "{}", "b".repeat(64)).unwrap();
             let key = read_key_file(&path).unwrap();
             assert_eq!(key.len(), 64);
             assert_eq!(&*key, &"b".repeat(64));
@@ -1833,7 +1833,7 @@ mod tests {
         fn non_utf8_key_file() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("key.hex");
-            std::fs::write(&path, &[0xFF, 0xFE, 0xFD]).unwrap();
+            std::fs::write(&path, [0xFF, 0xFE, 0xFD]).unwrap();
             let err = read_key_file(&path).unwrap_err();
             assert!(err.to_string().contains("not valid UTF-8"));
         }

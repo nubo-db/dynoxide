@@ -273,6 +273,7 @@ test("a port option is passed after serve, and leaving it out passes 0", async (
 test("exit status 4 on a fixed port is DYNOXIDE_PORT_IN_USE, naming the port, with stderr", async () => {
   await assert.rejects(fake("port-in-use", { options: { port: 8123 } }), (err) => {
     assert.strictEqual(err.code, "DYNOXIDE_PORT_IN_USE");
+    assert.strictEqual(err.port, 8123);
     assert.match(err.message, /port 8123 is already in use/i);
     assert.ok(Array.isArray(err.stderr) && err.stderr.length > 0, "no stderr tail");
     assert.match(err.message, /detected listener/);
@@ -453,6 +454,7 @@ realTest("the real binary on a taken port rejects with DYNOXIDE_PORT_IN_USE", { 
   try {
     await assert.rejects(start({ port }), (err) => {
       assert.strictEqual(err.code, "DYNOXIDE_PORT_IN_USE");
+      assert.strictEqual(err.port, port);
       assert.match(err.message.replace(/\r\n/g, "\n"), new RegExp(`port ${port} is already in use`, "i"));
       return true;
     });

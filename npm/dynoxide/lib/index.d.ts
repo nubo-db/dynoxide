@@ -15,7 +15,8 @@ export interface StartOptions {
   schema?: string;
   /**
    * The port to listen on. Defaults to 0, which lets the OS pick a free one.
-   * A port that's taken rejects with DYNOXIDE_PORT_IN_USE.
+   * A port that's taken rejects with DYNOXIDE_PORT_IN_USE from Dynoxide 1.8.0;
+   * an older binary rejects with DYNOXIDE_EXITED.
    */
   port?: number;
   /** How long to wait for the server to be ready. Defaults to 10000. */
@@ -62,6 +63,8 @@ export interface DynoxideError extends Error {
   code: DynoxideErrorCode;
   /** The last lines of the server's stderr, for errors after it was spawned. */
   stderr?: string[];
+  /** The port that was taken, on DYNOXIDE_PORT_IN_USE. */
+  port?: number;
 }
 
 /**

@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   system picks a free port as before. A fixed port is for dev setups where
   something needs the endpoint in advance, such as a second app or an `.env`
   file. If that port is taken, `start()` rejects with `DYNOXIDE_PORT_IN_USE`,
-  naming the port. An invalid port (`"8000"`, `-1`, `70000`) makes `start()`
+  naming the port in the message and in `err.port`. An invalid port (`"8000"`, `-1`, `70000`) makes `start()`
   reject with a `TypeError` or `RangeError` before anything is run.
 - **`server::bind` in the `dynoxide-rs` crate.** It binds a listener with the
   checks `server::start` makes: it refuses a port another listener answers

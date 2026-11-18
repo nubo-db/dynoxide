@@ -78,7 +78,7 @@ If the server can't start, `start()` rejects with an error whose `code` says why
 | `DYNOXIDE_VERSION_CHECK_FAILED` | The supplied binary couldn't be run with `--version`, or didn't report a version. |
 | `DYNOXIDE_SPAWN_FAILED` | The binary couldn't be started. |
 | `DYNOXIDE_EXITED` | The server exited before it was ready. |
-| `DYNOXIDE_PORT_IN_USE` | Something else already holds the `port` you asked for. Dynoxide 1.8.0 or later reports this; an older `binary` gives `DYNOXIDE_EXITED`, with the port named in its stderr. On Windows, a port held by a socket that isn't listening can give `DYNOXIDE_EXITED` too. |
+| `DYNOXIDE_PORT_IN_USE` | Something else already holds the `port` you asked for, which is also in `err.port`. Dynoxide 1.8.0 or later reports this; an older `binary` gives `DYNOXIDE_EXITED`, with the port named in its stderr. On Windows, a port held by a socket that isn't listening can give `DYNOXIDE_EXITED` too. |
 | `DYNOXIDE_BAD_READY_LINE` | The server's first line of output wasn't a ready line. |
 | `DYNOXIDE_PORT_ZERO` | The ready line reported port 0. |
 | `DYNOXIDE_TIMEOUT` | The server wasn't ready within `readyTimeoutMs`. |

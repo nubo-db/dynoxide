@@ -237,7 +237,9 @@ function readyLine(child, watcher, timeoutMs, port) {
       // The engine exits 4 when the port it was given is taken (launcher
       // contract 2). With port 0 the OS picks, so 4 can't mean that there.
       if (code === EXIT_PORT_IN_USE && port !== 0) {
-        finish(reject, coded("DYNOXIDE_PORT_IN_USE", `Port ${port} is already in use, so Dynoxide couldn't start on it.`));
+        const taken = coded("DYNOXIDE_PORT_IN_USE", `Port ${port} is already in use, so Dynoxide couldn't start on it.`);
+        taken.port = port;
+        finish(reject, taken);
         return;
       }
       const how = signal ? `was killed by ${signal}` : `exited with status ${code}`;

@@ -807,6 +807,36 @@ fn import_serve_quiet_still_stops_on_an_exposure() {
     );
 }
 
+/// `import --serve --mcp` stops when the MCP listener can't be bound, before
+/// the DynamoDB listener serves, instead of serving until it is signalled.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_mcp_stops_when_the_mcp_listener_cant_be_bound() {
+    let e = import::export();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mcp_port = held.local_addr().unwrap().port().to_string();
+    let a = import::import_args(
+        &e,
+        &[
+            "--serve",
+            "--port",
+            "0",
+            "--mcp",
+            "--mcp-port",
+            &mcp_port,
+            "--mcp-no-auth",
+        ],
+    );
+    let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("127.0.0.1:{mcp_port}")),
+        "stderr doesn't name the MCP address:\n{stderr}"
+    );
+    assert!(!stderr.contains("Dynoxide listening on"), "{stderr}");
+}
+
 #[cfg(feature = "import")]
 #[test]
 fn import_help_lists_log() {

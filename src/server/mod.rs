@@ -116,17 +116,44 @@ pub async fn start_with_options(
     db: Database,
     options: ServerOptions,
 ) -> Result<(), String> {
+    serve_with_options(bind(host, port).await?, db, options).await
+}
+
+/// Check `host:port` is free and bind it, without serving yet.
+///
+/// The binary uses this to bind the DynamoDB listener and then the MCP one
+/// before either serves, so a listener that can't be bound stops startup
+/// before the ready line. It isn't part of the crate's promised API.
+///
+/// Call it inside a Tokio runtime and before spawning other work: it blocks
+/// the calling thread for up to about 300 ms while it probes the port.
+/// Dropping the listener gives the port back.
+#[doc(hidden)]
+pub async fn bind(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| format!("invalid address {host}:{port}: {e}"))?;
 
-    // Runs before any async tasks are spawned, so blocking connect probes are safe.
     check_port_available(addr)?;
 
     let std_listener = bind_exclusive(addr).map_err(|e| bind_failure(addr, e))?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .map_err(|e| format!("failed to create async listener: {e}"))?;
-    // With `--port 0` the OS picks the port, so `addr` would report `:0`.
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("failed to create async listener: {e}"))
+}
+
+/// Serve on a listener from [`bind`]: print the listening line and, if asked,
+/// the ready line, then serve until the shutdown signal.
+///
+/// The binary's half of [`start_with_options`] once both listeners are bound.
+/// It isn't part of the crate's promised API.
+#[doc(hidden)]
+pub async fn serve_with_options(
+    listener: tokio::net::TcpListener,
+    db: Database,
+    options: ServerOptions,
+) -> Result<(), String> {
+    // With `--port 0` the OS picks the port, so the requested address would
+    // report `:0`.
     let local_addr = listener
         .local_addr()
         .map_err(|e| format!("failed to read listener address: {e}"))?;

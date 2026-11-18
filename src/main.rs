@@ -644,8 +644,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {
-        use tokio_util::sync::CancellationToken;
-
         let quiet = is_quiet(args.log);
         let mcp_data_model = load_data_model(args.mcp_data_model.as_ref(), quiet)?;
         let mcp_config = dynoxide::mcp::McpConfig {
@@ -660,9 +658,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.mcp_no_auth,
             args.mcp_allowed_host.clone(),
         )?;
-        let mcp_db = db.clone();
-        let mcp_shutdown = CancellationToken::new();
-        let mcp_shutdown_clone = mcp_shutdown.clone();
         let mcp_options = server_options.clone();
 
         if !quiet {
@@ -672,29 +667,66 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
 
-        let (http_result, mcp_result) = tokio::join!(
-            async {
-                let r =
-                    dynoxide::server::start_with_options(&args.host, args.port, db, server_options)
-                        .await;
-                // HTTP server exited (Ctrl+C): tell MCP to shut down too
-                mcp_shutdown_clone.cancel();
-                r
-            },
-            dynoxide::mcp::serve_http_with_options(
-                mcp_db,
-                opts,
-                mcp_config,
-                Some(mcp_shutdown),
-                mcp_options,
-            ),
-        );
-        http_result?;
-        mcp_result?;
-        return Ok(());
+        return serve_dynamodb_and_mcp(
+            &args.host,
+            args.port,
+            db,
+            server_options,
+            opts,
+            mcp_config,
+            mcp_options,
+        )
+        .await;
     }
 
     dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
+    Ok(())
+}
+
+/// Run the DynamoDB listener and the MCP listener together, for `serve --mcp`
+/// and `import --serve --mcp`.
+///
+/// Both are bound before either serves, DynamoDB first: its port checks then
+/// can't see Dynoxide's own MCP listener, and an MCP listener that can't be
+/// bound stops startup before the ready line. When the DynamoDB side stops,
+/// it tells the MCP side to stop too.
+#[cfg(all(feature = "http-server", feature = "mcp-server"))]
+async fn serve_dynamodb_and_mcp(
+    host: &str,
+    port: u16,
+    db: Database,
+    options: dynoxide::ServerOptions,
+    mcp_opts: dynoxide::mcp::HttpOptions,
+    mcp_config: dynoxide::mcp::McpConfig,
+    mcp_options: dynoxide::ServerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dynamo_listener = dynoxide::server::bind(host, port).await?;
+    let mcp_listener = dynoxide::mcp::bind_http(&mcp_opts).await?;
+
+    let mcp_db = db.clone();
+    let mcp_shutdown = tokio_util::sync::CancellationToken::new();
+    let mcp_shutdown_clone = mcp_shutdown.clone();
+    // Biased, so the DynamoDB side is always polled first and its listening
+    // and ready lines come before the MCP listening line.
+    let (http_result, mcp_result) = tokio::join!(
+        biased;
+        async {
+            let r = dynoxide::server::serve_with_options(dynamo_listener, db, options).await;
+            // The DynamoDB server stopped: tell MCP to shut down too.
+            mcp_shutdown_clone.cancel();
+            r
+        },
+        dynoxide::mcp::serve_http_on(
+            mcp_listener,
+            mcp_db,
+            mcp_opts,
+            mcp_config,
+            Some(mcp_shutdown),
+            mcp_options,
+        ),
+    );
+    http_result?;
+    mcp_result?;
     Ok(())
 }
 
@@ -1262,8 +1294,6 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         // Both --serve and --mcp: run HTTP + MCP concurrently
         #[cfg(all(feature = "http-server", feature = "mcp-server"))]
         if wants_serve && wants_mcp {
-            use tokio_util::sync::CancellationToken;
-
             let mcp_data_model = load_data_model(
                 args.mcp_data_model.as_ref().or(args.data_model.as_ref()),
                 quiet,
@@ -1281,10 +1311,6 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 args.mcp_no_auth,
                 args.mcp_allowed_host.clone(),
             )?;
-            let mcp_db = db.clone();
-            let mcp_shutdown = CancellationToken::new();
-            let mcp_shutdown_clone = mcp_shutdown.clone();
-
             if !quiet {
                 dynoxide::stderr_line(format_args!(
                     "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
@@ -1292,29 +1318,16 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 ));
             }
 
-            let (http_result, mcp_result) = tokio::join!(
-                async {
-                    let r = dynoxide::server::start_with_options(
-                        &args.host,
-                        args.port,
-                        db,
-                        server_options(args.log),
-                    )
-                    .await;
-                    mcp_shutdown_clone.cancel();
-                    r
-                },
-                dynoxide::mcp::serve_http_with_options(
-                    mcp_db,
-                    opts,
-                    mcp_config,
-                    Some(mcp_shutdown),
-                    server_options(args.log),
-                ),
-            );
-            http_result?;
-            mcp_result?;
-            return Ok(());
+            return serve_dynamodb_and_mcp(
+                &args.host,
+                args.port,
+                db,
+                server_options(args.log),
+                opts,
+                mcp_config,
+                server_options(args.log),
+            )
+            .await;
         }
 
         #[cfg(feature = "http-server")]

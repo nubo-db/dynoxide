@@ -37,6 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   naming the port. An invalid port (`"8000"`, `-1`, `70000`) makes `start()`
   reject with a `TypeError` or `RangeError` before anything is run.
 
+### Fixed
+
+- **An MCP listener that can't be bound now stops startup.** With
+  `serve --mcp` or `import --serve --mcp`, Dynoxide used to start the DynamoDB
+  listener, print the ready line and serve, and only report the MCP bind
+  error, with exit `1`, once it was stopped. Now both listeners are bound
+  before either serves, so it exits `1` straight away, with no ready line.
+  That includes the default MCP port, 19280: a second `--mcp` instance on the
+  same machine now needs its own `--mcp-port`.
+  ([#354](https://github.com/nubo-db/dynoxide/issues/354))
+
 ## [1.7.0] - 2026-11-17
 
 The crate moves to `dynoxide-rs` 4.0.0, because the `rusqlite` move changes

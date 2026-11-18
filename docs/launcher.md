@@ -287,9 +287,13 @@ straight away. With the flag, stdout carries nothing but this line. Logging,
 however `RUST_LOG` is set, goes to stderr. Anything else on stdout is a bug to
 report.
 
-The line covers the DynamoDB listener only. The arguments above never include
-`--mcp`; if you add it, the MCP listener binds after the line is printed, and a
-failure to bind it shows up later rather than as a startup error.
+The line describes the DynamoDB listener only. The arguments above never
+include `--mcp`. If you add it, from Dynoxide 1.8.0 the line prints only once
+the MCP listener is bound too, and an MCP listener that can't be bound stops
+startup with exit `1` and no ready line. Earlier binaries bind it after the
+line, so a failure there shows up later rather than as a startup error. The
+MCP listener has no check like the DynamoDB one's: a listener it can bind
+beside, such as one on `0.0.0.0` with the same port, doesn't stop it.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts
@@ -311,7 +315,7 @@ nobody has to dig through stderr to find out why the server didn't start.
 |---|---|
 | `4` | Something already listens on the port. That includes the wildcard address and the other loopback family (`[::1]` for `127.0.0.1`, and the reverse), since a `localhost` client may reach either. |
 | `4` | Nothing answers on the port, but binding it fails because it's in use. |
-| `1` | Any other startup failure. That includes a port the process isn't allowed to bind (a privileged port, or a range Windows has reserved) and a taken `--mcp-port`. |
+| `1` | Any other startup failure. That includes a port the process isn't allowed to bind (a privileged port, or a range Windows has reserved) and an `--mcp-port` that can't be bound. |
 
 With `--port 0` the operating system picks the port, so `4` never happens.
 
@@ -517,8 +521,9 @@ Wrappers compare only `X.Y.Z`, so a flag that arrived in `rc.2` would crash
 them on `rc.1`.
 
 - **Launcher contract 2** (Dynoxide 1.8.0): exit status `4` for a taken
-  `--port`, and a fixed port as an option for dev setups. A wrapper that
-  always passes `--port 0` sees no change.
+  `--port`, and a fixed port as an option for dev setups. With `--mcp`, the
+  ready line waits for the MCP listener too. A wrapper that always passes
+  `--port 0` and no `--mcp` sees no change.
 - **Launcher contract 1** (Dynoxide 1.7.0): first draft. Corrected after the
   first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the
   cache path, pre-releases in the version check, spawns that report success

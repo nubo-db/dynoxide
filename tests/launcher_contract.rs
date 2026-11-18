@@ -1069,6 +1069,172 @@ fn closing_stdin_stops_the_mcp_listener_too() {
     assert!(status.success(), "exit status {status}");
 }
 
+/// Run `serve` with `args` until it exits on its own, and return its exit code,
+/// stdout and stderr. Panics if it is still running after the ready timeout.
+#[cfg(feature = "mcp-server")]
+fn serve_until_exit(args: &[&str]) -> (Option<i32>, Vec<String>, String) {
+    let mut server = Launched::spawn(serve(args), Stdio::piped());
+    let status = server.wait_exit(READY_TIMEOUT);
+    let stdout = server.stdout_after_finish();
+    let stderr = server.stderr_text();
+    let status = status.unwrap_or_else(|| panic!("the server started; stderr:\n{stderr}"));
+    (status.code(), stdout, stderr)
+}
+
+/// A port free on both loopback families, or None where there's no IPv6
+/// loopback.
+#[cfg(feature = "mcp-server")]
+fn a_port_free_on_both_loopbacks() -> Option<u16> {
+    for _ in 0..20 {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        match std::net::TcpListener::bind(("::1", port)) {
+            Ok(_) => return Some(port),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// From 1.8.0, with `--mcp` the ready line waits for both listeners, so an MCP
+/// listener that can't be bound stops startup before it, with no stdin closed.
+#[cfg(feature = "mcp-server")]
+#[test]
+fn an_mcp_listener_that_cant_be_bound_stops_startup_before_the_ready_line() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mcp_port = held.local_addr().unwrap().port().to_string();
+    let (code, stdout, stderr) = serve_until_exit(&[
+        "--port",
+        "0",
+        "--ready-json",
+        "--exit-with-parent",
+        "--mcp",
+        "--mcp-port",
+        &mcp_port,
+        "--mcp-no-auth",
+    ]);
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+    assert!(stdout.is_empty(), "a ready line printed: {stdout:?}");
+    assert!(
+        stderr.contains(&format!("127.0.0.1:{mcp_port}")),
+        "stderr doesn't name the MCP address:\n{stderr}"
+    );
+}
+
+/// The DynamoDB listener binds first, so asking both for one port is the MCP
+/// bind failing (1), not another process holding the DynamoDB port (4).
+#[cfg(feature = "mcp-server")]
+#[test]
+fn one_port_for_both_listeners_exits_1_not_4() {
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = free.local_addr().unwrap().port().to_string();
+    drop(free);
+    let (code, stdout, stderr) = serve_until_exit(&[
+        "--port",
+        &port,
+        "--ready-json",
+        "--exit-with-parent",
+        "--mcp",
+        "--mcp-port",
+        &port,
+        "--mcp-no-auth",
+    ]);
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+    assert!(stdout.is_empty(), "a ready line printed: {stdout:?}");
+    assert!(!stderr.contains("is already in use ("), "{stderr}");
+}
+
+/// Dynoxide's own MCP listener on the other loopback family isn't a conflict:
+/// the DynamoDB listener is checked before the MCP one exists.
+#[cfg(feature = "mcp-server")]
+#[test]
+fn dynamodb_and_mcp_can_share_a_port_across_loopback_families() {
+    let Some(port) = a_port_free_on_both_loopbacks() else {
+        eprintln!("skipped: this machine has no IPv6 loopback");
+        return;
+    };
+    let port = port.to_string();
+    let server = Launched::spawn(
+        serve(&[
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--ready-json",
+            "--exit-with-parent",
+            "--mcp",
+            "--mcp-host",
+            "::1",
+            "--mcp-port",
+            &port,
+            "--mcp-no-auth",
+        ]),
+        Stdio::piped(),
+    );
+    let endpoint = server.ready_line()["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(list_tables(&endpoint).0, 200);
+    server.wait_for_stderr("MCP HTTP server listening on");
+    TcpStream::connect(format!("[::1]:{port}")).expect("the MCP listener answers on [::1]");
+}
+
+/// A taken DynamoDB port still exits 4 with `--mcp`, before any MCP bind.
+#[cfg(feature = "mcp-server")]
+#[test]
+fn a_taken_port_exits_4_with_mcp_too_and_never_binds_mcp() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let port_arg = port.to_string();
+    let (code, stdout, stderr) = serve_until_exit(&[
+        "--port",
+        &port_arg,
+        "--ready-json",
+        "--exit-with-parent",
+        "--mcp",
+        "--mcp-port",
+        "0",
+        "--mcp-no-auth",
+    ]);
+    assert_port_in_use((code, stdout, stderr.clone()), port);
+    assert!(!stderr.contains("failed to bind"), "{stderr}");
+    assert!(!stderr.contains("MCP HTTP server listening on"), "{stderr}");
+}
+
+/// The startup lines come in a fixed order with `--mcp`, and changing their
+/// text or order is a product major (`docs/versioning.md`).
+#[cfg(feature = "mcp-server")]
+#[test]
+fn the_startup_lines_keep_their_order_with_mcp() {
+    let server = Launched::spawn(
+        serve(&[
+            "--port",
+            "0",
+            "--ready-json",
+            "--exit-with-parent",
+            "--mcp",
+            "--mcp-port",
+            "0",
+            "--mcp-no-auth",
+        ]),
+        Stdio::piped(),
+    );
+    server.ready_line();
+    server.wait_for_stderr("MCP HTTP server listening on");
+    let stderr = server.stderr_text();
+    let at = |needle: &str| {
+        stderr
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?} in stderr:\n{stderr}"))
+    };
+    let starting = at("Starting DynamoDB HTTP server on");
+    let dynamo = at("Dynoxide listening on");
+    let mcp = at("MCP HTTP server listening on");
+    assert!(starting < dynamo && dynamo < mcp, "stderr:\n{stderr}");
+}
+
 // --- The MCP server -------------------------------------------------------
 
 /// Run `dynoxide mcp` with `args` and check it refuses `flag`, naming the

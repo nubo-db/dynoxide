@@ -1,7 +1,9 @@
 //! `eprintln!` panics when nobody reads stderr, and the release build aborts
 //! on a panic, so the exit status a launcher relies on is lost. Everything in
 //! `src/` writes to stderr through `dynoxide::stderr_line` instead; this
-//! keeps it that way. Comments may still name the macro.
+//! keeps it that way. A comment line may still name the macro. Code lines
+//! are checked whole, since a `//` inside a string such as a URL would hide
+//! the rest of the line from a check that stopped there.
 
 use std::path::Path;
 
@@ -33,8 +35,10 @@ fn nothing_in_src_writes_to_stderr_with_eprintln() {
     for file in &files {
         let text = std::fs::read_to_string(file).unwrap();
         for (n, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if code.contains("eprintln!") || code.contains("eprint!") {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains("eprintln!") || line.contains("eprint!") {
                 uses.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
             }
         }

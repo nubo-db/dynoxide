@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a range Windows has reserved, still exits `1`, and on Windows the message
   says how to list the reserved ranges. `docs/launcher.md` moves to launcher
   contract 2 to cover it.
+- **npm `start()` takes a `port` option.** It defaults to 0, so the operating
+  system picks a free port as before. A fixed port is for dev setups where
+  something needs the endpoint in advance, such as a second app or an `.env`
+  file. If that port is taken, `start()` rejects with `DYNOXIDE_PORT_IN_USE`,
+  naming the port. An invalid port (`"8000"`, `-1`, `70000`) makes `start()`
+  reject with a `TypeError` or `RangeError` before anything is run.
 
 ## [1.7.0] - 2026-11-17
 

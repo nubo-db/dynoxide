@@ -6,6 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const http = require("http");
+const net = require("net");
 const { spawn, spawnSync } = require("child_process");
 const { launch } = require("../lib/server");
 
@@ -255,6 +256,58 @@ test("the arguments are the contract's, with --db-path and --schema as single ar
   ]);
 });
 
+test("a port option is passed after serve, and leaving it out passes 0", async () => {
+  const record = path.join(tmp(), "record");
+  const server = await fake("ready", { env: { FAKE_RECORD: record }, options: { port: 8123 } });
+  await server.stop();
+  const args = JSON.parse(fs.readFileSync(record, "utf8")).args;
+  assert.deepStrictEqual(args.slice(0, 3), ["serve", "--port", "8123"]);
+
+  for (const port of [undefined, null, 0]) {
+    const again = await fake("ready", { env: { FAKE_RECORD: record }, options: { port } });
+    await again.stop();
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, "utf8")).args.slice(0, 3), ["serve", "--port", "0"]);
+  }
+});
+
+test("exit status 4 on a fixed port is DYNOXIDE_PORT_IN_USE, naming the port, with stderr", async () => {
+  await assert.rejects(fake("port-in-use", { options: { port: 8123 } }), (err) => {
+    assert.strictEqual(err.code, "DYNOXIDE_PORT_IN_USE");
+    assert.match(err.message, /port 8123 is already in use/i);
+    assert.ok(Array.isArray(err.stderr) && err.stderr.length > 0, "no stderr tail");
+    assert.match(err.message, /detected listener/);
+    return true;
+  });
+});
+
+test("exit status 4 without a fixed port stays DYNOXIDE_EXITED", async () => {
+  await assert.rejects(fake("port-in-use"), (err) => {
+    assert.strictEqual(err.code, "DYNOXIDE_EXITED");
+    assert.match(err.message, /status 4/);
+    return true;
+  });
+});
+
+test("an invalid port is refused before anything is spawned", async () => {
+  const cases = [
+    [-1, RangeError],
+    [65536, RangeError],
+    [1.5, RangeError],
+    [NaN, RangeError],
+    ["8000", TypeError],
+  ];
+  for (const [port, type] of cases) {
+    const record = path.join(tmp(), "record");
+    await assert.rejects(fake("ready", { env: { FAKE_RECORD: record }, options: { port } }), (err) => {
+      assert.ok(err instanceof type, `port ${String(port)}: ${err}`);
+      assert.strictEqual(err.code, undefined);
+      assert.match(err.message, /port/);
+      return true;
+    });
+    assert.strictEqual(fs.existsSync(record), false, `port ${String(port)} spawned the binary`);
+  }
+});
+
 test("stop twice returns the same promise and status", async () => {
   const server = await fake("ready");
   const first = server.stop();
@@ -317,7 +370,10 @@ test("a script that never calls stop exits on its own, and the server stops", as
 // The real binary, when CI provides one
 
 const real = process.env.DYNOXIDE_BINARY;
-const realTest = (name, fn) => test(name, { skip: !real && "DYNOXIDE_BINARY isn't set" }, fn);
+const realTest = (name, opts, fn) => {
+  if (typeof opts === "function") [fn, opts] = [opts, {}];
+  return test(name, { ...opts, skip: !real && "DYNOXIDE_BINARY isn't set" }, fn);
+};
 
 function dynamo(endpoint, target, body) {
   return new Promise((resolve, reject) => {
@@ -352,6 +408,57 @@ realTest("the real binary starts, answers ListTables and stops", async () => {
   assert.strictEqual(server.binarySource, "env");
   assert.deepStrictEqual(await dynamo(server.endpoint, "ListTables", {}), { TableNames: [] });
   assert.strictEqual((await server.stop()).code, 0);
+});
+
+// A port that was free a moment ago. Another process can take it before the
+// server binds, so callers retry on DYNOXIDE_PORT_IN_USE.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+realTest("the real binary starts on the port it was given", { timeout: 60000 }, async () => {
+  const { start } = require("..");
+  for (let attempt = 1; ; attempt++) {
+    const port = await freePort();
+    let server;
+    try {
+      server = await start({ port });
+    } catch (err) {
+      if (err.code === "DYNOXIDE_PORT_IN_USE" && attempt < 5) continue;
+      throw err;
+    }
+    try {
+      assert.strictEqual(server.port, port);
+      assert.strictEqual(server.endpoint, `http://127.0.0.1:${port}`);
+      assert.deepStrictEqual(await dynamo(server.endpoint, "ListTables", {}), { TableNames: [] });
+    } finally {
+      await server.stop();
+    }
+    return;
+  }
+});
+
+realTest("the real binary on a taken port rejects with DYNOXIDE_PORT_IN_USE", { timeout: 30000 }, async () => {
+  const { start } = require("..");
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(0, "127.0.0.1", resolve));
+  const { port } = holder.address();
+  try {
+    await assert.rejects(start({ port }), (err) => {
+      assert.strictEqual(err.code, "DYNOXIDE_PORT_IN_USE");
+      assert.match(err.message.replace(/\r\n/g, "\n"), new RegExp(`port ${port} is already in use`, "i"));
+      return true;
+    });
+  } finally {
+    await new Promise((resolve) => holder.close(resolve));
+  }
 });
 
 realTest("a --db-path database survives a restart", async () => {

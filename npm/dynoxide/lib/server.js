@@ -8,6 +8,7 @@ const READY_TIMEOUT_MS = 10000;
 const GRACE_MS = 5000;
 const STDERR_LINES = 20;
 const STDERR_BYTES = 64 * 1024;
+const EXIT_PORT_IN_USE = 4;
 
 // Every running server, so one exit listener can close all their stdin pipes.
 // A server whose stdin closes shuts itself down (--exit-with-parent).
@@ -27,13 +28,14 @@ function watchExit() {
 // stand-in for the binary lookup.
 async function launch(options, seam = {}) {
   options = options || {};
+  const port = portOption(options.port);
   const found = seam.resolve ? seam.resolve() : resolveBinary(options);
   const command = seam.command || [];
   if (found.source !== "package") {
     await checkVersion(found.path, { command, env: seam.env });
   }
 
-  const args = ["serve", "--port", "0", "--ready-json", "--exit-with-parent"];
+  const args = ["serve", "--port", String(port), "--ready-json", "--exit-with-parent"];
   if (options.dbPath != null) args.push(`--db-path=${options.dbPath}`);
   if (options.schema != null) args.push(`--schema=${options.schema}`);
 
@@ -54,7 +56,7 @@ async function launch(options, seam = {}) {
   const watcher = watch(child, seam.graceMs || GRACE_MS);
   let ready;
   try {
-    ready = await readyLine(child, watcher, options.readyTimeoutMs || READY_TIMEOUT_MS);
+    ready = await readyLine(child, watcher, options.readyTimeoutMs || READY_TIMEOUT_MS, port);
   } catch (err) {
     await watcher.stop();
     err.stderr = watcher.stderrTail();
@@ -92,6 +94,20 @@ async function launch(options, seam = {}) {
     Object.defineProperty(server, Symbol.asyncDispose, { value: () => stop().then(() => undefined) });
   }
   return server;
+}
+
+// The port to ask for. Leaving it out, or null, means 0: the OS picks a free
+// one. A wrong value is the caller's mistake rather than a failed start, so it
+// throws a plain TypeError or RangeError before anything is run.
+function portOption(port) {
+  if (port == null) return 0;
+  if (typeof port !== "number") {
+    throw new TypeError(`The port option must be a number, not ${typeof port}.`);
+  }
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new RangeError(`The port option must be a whole number from 0 to 65535, not ${port}.`);
+  }
+  return port;
 }
 
 // Tracks one child: its first exit status, a bounded stderr tail, and the
@@ -166,7 +182,7 @@ function watch(child, graceMs) {
 // Resolves with the parsed ready line, or rejects with one of the contract's
 // startup errors. Output after the first line keeps being read and dropped,
 // so a chatty server can't fill the pipe.
-function readyLine(child, watcher, timeoutMs) {
+function readyLine(child, watcher, timeoutMs, port) {
   return new Promise((resolve, reject) => {
     let buffer = "";
     let done = false;
@@ -216,6 +232,12 @@ function readyLine(child, watcher, timeoutMs) {
       const err = watcher.spawnError();
       if (err) {
         finish(reject, coded("DYNOXIDE_SPAWN_FAILED", `Couldn't run Dynoxide: ${err.message}`));
+        return;
+      }
+      // The engine exits 4 when the port it was given is taken (launcher
+      // contract 2). With port 0 the OS picks, so 4 can't mean that there.
+      if (code === EXIT_PORT_IN_USE && port !== 0) {
+        finish(reject, coded("DYNOXIDE_PORT_IN_USE", `Port ${port} is already in use, so Dynoxide couldn't start on it.`));
         return;
       }
       const how = signal ? `was killed by ${signal}` : `exited with status ${code}`;

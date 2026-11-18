@@ -63,6 +63,13 @@ const untilEndOfInput = (onEnd) => {
 };
 
 switch (mode) {
+  case "port-in-use": {
+    // What the engine prints and exits with when its --port is taken.
+    const port = args[args.indexOf("--port") + 1];
+    process.stderr.write(`error: port ${port} is already in use (detected listener on 127.0.0.1:${port})\n`);
+    process.exit(4);
+    break;
+  }
   case "exit-127":
     process.stderr.write("cannot execute\n");
     process.exit(127);

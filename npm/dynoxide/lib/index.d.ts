@@ -13,6 +13,11 @@ export interface StartOptions {
   dbPath?: string;
   /** A schema file whose tables are created at startup. */
   schema?: string;
+  /**
+   * The port to listen on. Defaults to 0, which lets the OS pick a free one.
+   * A port that's taken rejects with DYNOXIDE_PORT_IN_USE.
+   */
+  port?: number;
   /** How long to wait for the server to be ready. Defaults to 10000. */
   readyTimeoutMs?: number;
 }
@@ -48,6 +53,7 @@ export type DynoxideErrorCode =
   | "DYNOXIDE_VERSION_CHECK_FAILED"
   | "DYNOXIDE_SPAWN_FAILED"
   | "DYNOXIDE_EXITED"
+  | "DYNOXIDE_PORT_IN_USE"
   | "DYNOXIDE_BAD_READY_LINE"
   | "DYNOXIDE_PORT_ZERO"
   | "DYNOXIDE_TIMEOUT";
@@ -58,5 +64,8 @@ export interface DynoxideError extends Error {
   stderr?: string[];
 }
 
-/** Starts a Dynoxide server on a free port. Rejects with a DynoxideError. */
+/**
+ * Starts a Dynoxide server, by default on a free port. Rejects with a
+ * DynoxideError, or with a TypeError or RangeError for an invalid option.
+ */
 export function start(options?: StartOptions): Promise<DynoxideServer>;

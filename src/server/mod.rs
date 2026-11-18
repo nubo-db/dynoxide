@@ -35,42 +35,48 @@ const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
 pub use crate::server_options::ServerOptions;
 
-/// Check whether the port is already in use by attempting a TCP connection.
-///
-/// Probes both the requested address and the cross-address (wildcard vs localhost)
-/// to detect conflicts like Docker binding `0.0.0.0` when dynoxide requests `127.0.0.1`.
-/// A loopback request also probes the other family's loopback (`[::1]` for
-/// `127.0.0.1`, and the reverse), because a `localhost` client may try that one
-/// first and reach the other listener instead. A machine without IPv6 refuses
-/// the connection, so the port counts as free.
+/// Check whether the port is already in use by attempting a TCP connection
+/// to each address [`probe_addresses`] gives.
 fn check_port_available(addr: SocketAddr) -> Result<(), String> {
     let timeout = Duration::from_millis(100);
-    let port = addr.port();
-
-    // Cross-check: if binding to loopback, also probe the wildcard (and vice versa),
-    // within the same address family.
-    let cross = SocketAddr::new(
-        match addr.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        },
-        port,
-    );
-    let other_loopback = match addr.ip() {
-        IpAddr::V4(ip) if ip.is_loopback() => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-        IpAddr::V6(ip) if ip.is_loopback() => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        _ => None,
-    }
-    .map(|ip| SocketAddr::new(ip, port));
-
-    for probe in [addr, cross].into_iter().chain(other_loopback) {
+    for probe in probe_addresses(addr) {
         if TcpStream::connect_timeout(&probe, timeout).is_ok() {
-            return Err(port_in_use(port, format!("detected listener on {probe}")));
+            return Err(port_in_use(
+                addr.port(),
+                format!("detected listener on {probe}"),
+            ));
         }
     }
     Ok(())
+}
+
+/// Where a listener would take connections meant for `addr`: the address
+/// itself, and the cross-address in the same family (the wildcard for a
+/// loopback request and the reverse), to catch Docker binding `0.0.0.0` when
+/// dynoxide requests `127.0.0.1`.
+///
+/// `127.0.0.1` and `[::1]` also probe each other, because a `localhost` client
+/// may try either first and reach the other listener instead. Other loopback
+/// addresses, such as `127.0.0.2`, don't: no `localhost` client reaches them.
+/// A machine without IPv6 refuses the connection, so the port counts as free.
+fn probe_addresses(addr: SocketAddr) -> Vec<SocketAddr> {
+    let port = addr.port();
+    let cross = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    let other_localhost = match addr.ip() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST) => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        IpAddr::V6(Ipv6Addr::LOCALHOST) => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        _ => None,
+    };
+    [Some(addr.ip()), Some(cross), other_localhost]
+        .into_iter()
+        .flatten()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
 }
 
 /// The taken-port error, worded in one place. The binary turns a message that
@@ -125,8 +131,8 @@ pub async fn start_with_options(
 /// it until your own shutdown future resolves.
 ///
 /// Before binding, it refuses a port that another listener already answers
-/// on, including one on the wildcard address and, for a loopback host, one on
-/// the other loopback family, since a `localhost` client may reach either.
+/// on, including one on the wildcard address and, for `127.0.0.1` or `::1`,
+/// one on the other of the two, since a `localhost` client may reach either.
 /// The bind itself is exclusive: on Windows no other process can bind the same
 /// port beside it. A taken port gives an error starting
 /// `port N is already in use`; anything else, such as a privileged port or an
@@ -853,6 +859,43 @@ fn dynamo_response_raw(status: StatusCode, body_str: &str) -> Response {
         .unwrap();
     add_dynamo_headers(&mut resp, body_bytes);
     resp
+}
+
+#[cfg(test)]
+mod probe_address_tests {
+    use super::probe_addresses;
+
+    fn probes(addr: &str) -> Vec<String> {
+        probe_addresses(addr.parse().unwrap())
+            .iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn localhost_in_either_family_probes_the_other() {
+        assert_eq!(
+            probes("127.0.0.1:8000"),
+            ["127.0.0.1:8000", "0.0.0.0:8000", "[::1]:8000"]
+        );
+        assert_eq!(
+            probes("[::1]:8000"),
+            ["[::1]:8000", "[::]:8000", "127.0.0.1:8000"]
+        );
+    }
+
+    /// No `localhost` client reaches 127.0.0.2, so a listener on `[::1]`
+    /// can't take its requests.
+    #[test]
+    fn another_loopback_address_probes_only_its_own_family() {
+        assert_eq!(probes("127.0.0.2:8000"), ["127.0.0.2:8000", "0.0.0.0:8000"]);
+    }
+
+    #[test]
+    fn a_wildcard_probes_localhost_in_its_family() {
+        assert_eq!(probes("0.0.0.0:8000"), ["0.0.0.0:8000", "127.0.0.1:8000"]);
+        assert_eq!(probes("[::]:8000"), ["[::]:8000", "[::1]:8000"]);
+    }
 }
 
 #[cfg(test)]

@@ -12,14 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A taken `--port` exits `4` instead of `1`.** A script that checks for a
   non-zero exit is unaffected; one that checks for exactly `1` needs to accept
   `4` too.
-- **`--mcp-port` can't share a fixed `--port`.** With `--mcp`, `serve` and
-  `import --serve` now refuse one port for both listeners, with exit `1`,
-  whatever the hosts. On macOS an MCP listener on `127.0.0.1` could bind
-  beside DynamoDB on `0.0.0.0` and take its loopback requests. Pairs that
-  used to work, such as DynamoDB on `127.0.0.1` and MCP on `[::1]` with one
-  port, need two ports now. The default `--mcp-port` counts too, so
-  `serve --port 19280 --mcp` and `import --serve --port 8100 --mcp` are
-  refused unless `--mcp-port` names another port.
+- **`--mcp-port` can't be the same as a fixed `--port`.** With `--mcp`,
+  `serve` and `import --serve` exit `1` before binding anything when the two
+  match, whatever the hosts. On macOS, an MCP listener on `127.0.0.1` could
+  bind beside DynamoDB on `0.0.0.0` and take the loopback requests meant for
+  it. The default `--mcp-port` counts, so `serve --port 19280 --mcp` and
+  `import --serve --port 8100 --mcp` now need `--mcp-port` set to another
+  port. So does DynamoDB on `127.0.0.1` with MCP on `[::1]` on one port,
+  which used to work.
   ([#355](https://github.com/nubo-db/dynoxide/issues/355))
 - **A listener on the other loopback family now counts as a taken port.**
   `dynoxide --port 8000` refuses to start when something listens on
@@ -48,13 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **An MCP listener that can't be bound now stops startup.** With
-  `serve --mcp` or `import --serve --mcp`, Dynoxide used to start the DynamoDB
-  listener, print the ready line and serve, and only report the MCP bind
-  error, with exit `1`, once it was stopped. Now both listeners are bound
-  before either serves, so it exits `1` straight away, with no ready line.
-  That includes the default MCP port, 19280: a second `--mcp` instance on the
-  same machine now needs its own `--mcp-port`.
+- **An MCP port that can't be bound now stops startup.** With `serve --mcp`
+  or `import --serve --mcp`, Dynoxide used to start DynamoDB, print the ready
+  line and serve, and only report the MCP bind error (exit `1`) when it was
+  stopped. Both listeners are now bound before either serves, so it exits `1`
+  straight away with no ready line. Two `--mcp` instances on one machine each
+  need their own `--mcp-port`, since they'd otherwise both take the
+  default.
   ([#354](https://github.com/nubo-db/dynoxide/issues/354))
 
 ## [1.7.0] - 2026-11-17

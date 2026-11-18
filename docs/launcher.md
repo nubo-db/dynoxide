@@ -294,13 +294,13 @@ startup with exit `1` and no ready line. Earlier binaries bind it after the
 line, so a failure there shows up later rather than as a startup error.
 
 The MCP listener has no check like the DynamoDB one's, so it only fails when
-its own bind does. Some systems, macOS among them, let it bind `127.0.0.1`
-beside another listener on `0.0.0.0` with the same port. That's why, from
-1.8.0, `--mcp-port` can't be the same as a fixed `--port`, whatever the hosts:
-Dynoxide refuses the pair with exit `1` before binding anything. With
-`--host 0.0.0.0` and one port for both, the MCP listener would otherwise take
-the loopback requests meant for DynamoDB. The default `--mcp-port` counts too
-(19280 for `serve`), so `--port 19280 --mcp` needs an `--mcp-port` of its own.
+its own bind does. On some systems, macOS among them, that bind succeeds on
+`127.0.0.1` beside a listener on `0.0.0.0` with the same port. With
+`--host 0.0.0.0` and one port for both, the MCP listener would then take the
+loopback requests meant for DynamoDB. So from 1.8.0, Dynoxide refuses an
+`--mcp-port` that's the same as a fixed `--port`, whatever the hosts, with
+exit `1` before anything is bound. The default `--mcp-port` counts (19280 for
+`serve`), so `--port 19280 --mcp` needs an `--mcp-port` of its own.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts

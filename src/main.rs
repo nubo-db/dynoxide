@@ -156,8 +156,8 @@ struct ServeArgs {
     #[arg(long)]
     mcp: bool,
 
-    /// Port for the MCP HTTP transport (default: 19280). Can't be the same as
-    /// a fixed --port, the default included
+    /// Port for the MCP HTTP transport (default: 19280). Must differ from a
+    /// fixed --port, even when left at its default
     #[cfg(feature = "mcp-server")]
     #[arg(long, default_value_t = 19280, requires = "mcp")]
     mcp_port: u16,
@@ -373,8 +373,8 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "output")]
     mcp: bool,
 
-    /// Port for the MCP HTTP server when using --serve --mcp together. Can't be
-    /// the same as a fixed --port, the default included
+    /// Port for the MCP HTTP server when using --serve --mcp together. Must differ
+    /// from a fixed --port, even when left at its default
     #[cfg(feature = "mcp-server")]
     #[arg(long, default_value_t = 8100, requires = "mcp")]
     mcp_port: u16,

@@ -41,7 +41,7 @@ On the `serve` subcommand the equivalent flags are prefixed
 `serve` already owns `--host`/`--port` for the DynamoDB server.
 
 To run the HTTP transport from the container image, see
-[MCP over HTTP in Docker](#mcp-over-http-in-docker).
+[MCP over HTTP in Docker](installation.md#mcp-over-http-in-docker).
 
 ### HTTP client configuration
 

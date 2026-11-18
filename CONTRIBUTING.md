@@ -13,15 +13,15 @@ same ground in a form those tools pick up automatically.
 - Open a GitHub issue describing the change if it is more than a small
   bug fix or obvious cleanup. A short paragraph is enough. This catches
   direction questions before a PR round-trips.
-- The storage layer is mid-refactor. A `StorageBackend` trait now lives
-  in `src/storage_backend/` and the native rusqlite-backed `Storage`
-  implements it. Nothing dynamic dispatches the trait yet; `Database`
-  and the action handlers still operate against `Storage` directly. The
-  `Storage::conn()` and `Storage::conn_mut()` escape hatches are not on
-  the trait and folding them in is the next pass. Please open an issue
-  before submitting changes to `src/storage.rs`, `src/storage_backend/`,
-  or call sites that use `conn()` directly so we can advise whether your
-  change fits the current shape or is better held until the next pass.
+- The data layer goes through the `StorageBackend` trait in
+  `src/storage_backend/`, which the native rusqlite-backed `Storage` and
+  the wasm build's `WasmBridgeBackend` both implement. The action
+  handlers are generic over it, and both backends build their SQL with
+  the shared builders in `src/storage_backend/sql_builders.rs`, so change
+  SQL there rather than inline in one backend. Please open an issue
+  before submitting changes to `src/storage.rs` or
+  `src/storage_backend/`, so we can advise whether your change fits the
+  current shape. `AGENTS.md` has more detail.
 - If you want to add a new dependency, open an issue so we can weigh
   binary size, build time, and licence.
 
@@ -75,7 +75,7 @@ move between runs. It benchmarks the base branch and then your merged
 change on the same runner. It fails if:
 
 - any benchmark rises more than 4% over the base, or
-- a benchmark the base has finds no baseline to compare with.
+- a benchmark that exists on the base has nothing to compare against.
 
 A benchmark your PR adds is reported as new and passes. A PR that
 changes the locked iai-callgrind version gets a warning and no

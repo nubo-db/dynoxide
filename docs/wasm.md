@@ -14,7 +14,7 @@ A build made with `--no-default-features --features wasm-sqlite` exposes `dynoxi
 - updating tables: adding or deleting a GSI (existing rows are backfilled into the new index), and changing provisioned throughput, billing mode, table class, on-demand throughput and deletion protection
 - putting, getting, deleting and updating items
 - query and scan
-- the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`)
+- batch reads and writes (`BatchGetItem`, `BatchWriteItem`) and transactional reads (`TransactGetItems`)
 - PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`), including `RETURNING` and `ClientRequestToken` idempotency
 - vector indexes, with `SearchVectors` over all three distance functions
 
@@ -28,7 +28,7 @@ One caveat on PartiQL writes: they record a stream event when the table has a st
 - Streams are planned but not wired up, as the delivery mechanism is still to be decided. An `UpdateTable` that changes a stream specification is refused, and `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table.
 - `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats and bulk import return a typed "not yet implemented" error.
 
-Those four blocks are the whole of the conformance skip count.
+These gaps account for the whole of the conformance skip count.
 
 Vector search is the same engine as native: exact brute-force KNN, the same `f32` storage, the same scoring and the same tie break, so a query answers identically either side. The candidate load for a search is a single bridge crossing rather than one per entry. A database persisted before the vector column existed is migrated on open, so an OPFS database created by an older build keeps working and gains vector search.
 

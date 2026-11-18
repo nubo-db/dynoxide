@@ -114,7 +114,7 @@ There's no Docker, no port to fight over and no need for table name prefixes, so
 | `mcp-server` | Yes | Adds MCP server for coding agents (stdio and Streamable HTTP transports). |
 | `import` | Yes | Adds `dynoxide import` CLI for importing DynamoDB Export data with anonymisation. |
 | `cli` | Yes | Gates the `dynoxide` binary, with its argument parser (clap) and log subscriber (`tracing-subscriber`). The binary also needs `http-server`, `mcp-server` or `import`. `import` turns `cli` on; `http-server` and `mcp-server` don't, so a library that embeds a server compiles neither dependency and keeps its own logging setup. |
-| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS). Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See the WASM section. |
+| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS). Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See [the wasm build](wasm.md). |
 | `encryption` | No | Bundles SQLCipher + vendored OpenSSL. Adds `Database::new_encrypted()` for encryption at rest. |
 | `encryption-cc` | No | Like `encryption` but uses Apple CommonCrypto instead of bundled OpenSSL. For macOS and iOS builds. |
 | `encrypted-server` | No | Convenience: enables `encryption` + `http-server` + `cli`. |

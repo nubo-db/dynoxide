@@ -56,8 +56,8 @@ Works with any language or SDK that supports custom endpoints: Python (boto3), N
 
 ## Logging
 
-The default output is unchanged when `--log` is omitted. To suppress
-informational startup and shutdown messages on stderr, use quiet mode:
+Without `--log`, Dynoxide prints its informational startup and shutdown
+messages to stderr. Quiet mode suppresses them:
 
 ```sh
 dynoxide --log quiet --port 8000

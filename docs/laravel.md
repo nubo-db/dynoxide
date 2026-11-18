@@ -134,8 +134,8 @@ same Compose project.
 
 For tests, Laravel's `phpunit.xml` already sets `CACHE_STORE` and
 `SESSION_DRIVER` to `array`, and PHPUnit keeps the first value it sees, so
-change those lines rather than adding new ones. Any non-empty credentials work: Dynoxide checks they're there and
-never checks the signature.
+change those lines rather than adding new ones. Any non-empty credentials
+work: Dynoxide checks they're there and never checks the signature.
 
 `config/cache.php` already reads `DYNAMODB_ENDPOINT` for its `dynamodb` store,
 so the cache and locks need nothing more.

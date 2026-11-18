@@ -103,7 +103,7 @@ fn test_user_creation() {
 }
 ```
 
-No Docker. No port conflicts. No table name prefixes. Tests run in parallel without coordination.
+There's no Docker, no port to fight over and no need for table name prefixes, so tests run in parallel without any coordination.
 
 ## Feature flags
 

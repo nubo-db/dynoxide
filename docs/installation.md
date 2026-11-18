@@ -18,7 +18,7 @@ npx dynoxide --port 8000
 brew install nubo-db/tap/dynoxide
 ```
 
-Homebrew 6.0.0 added [tap trust](https://docs.brew.sh/Tap-Trust). The fully-qualified command above still installs fine (Homebrew trusts a named formula at install time), but the tap stays untrusted after that, so `brew upgrade` will skip Dynoxide and `brew doctor` will flag the tap. Trust it once:
+Homebrew 6.0.0 added [tap trust](https://docs.brew.sh/Tap-Trust). The fully-qualified command above still installs fine, because Homebrew trusts a named formula at install time. The tap stays untrusted after that, though, so `brew upgrade` will skip Dynoxide and `brew doctor` will flag the tap. Trust it once:
 
 ```sh
 # Trust just Dynoxide - lets brew upgrade see it again
@@ -75,12 +75,14 @@ dynoxide-rs = { version = "4.0", default-features = false, features = ["native-s
 ## Upgrading to 1.7.0
 
 **Database files move to schema version 12 when 1.7.0 first opens them
-writable**, and 1.3.0 to 1.6.0 will refuse them afterwards, so copy a file
-first if you might go back. The open gives items written before 0.9.5 the hash
-prefix a fresh write would, so a parallel scan finds them. A read-only open
-leaves a file with nothing to fill at version 11, and refuses one with items to
-fill until it has been opened writable once. Make the `-wal` and `-shm` files
-beside it writable for that open, as well as the database.
+writable.** After that, 1.3.0 to 1.6.0 will refuse them, so copy a file first
+if you might go back. That writable open gives items written before 0.9.5 the
+hash prefix a fresh write would, so a parallel scan finds them.
+
+A read-only open leaves a file with nothing to fill at version 11, and refuses
+one with items to fill until it has been opened writable once. For that
+writable open, the `-wal` and `-shm` files beside the database need to be
+writable too.
 
 **Depending on the `dynoxide-rs` crate?** It's now 4.0.0. `rusqlite` moves to
 0.43, so code that passes `Storage::conn()` or `DynoxideError::SqliteError` to
@@ -89,9 +91,9 @@ is now 1.89. The changelog's Breaking (Rust API) section lists each change.
 
 ## Upgrading to 1.3.0
 
-**Database files are upgraded when 1.3.0 first opens them**, to schema version
-11, and older versions can't undo that. It only changes what an older Dynoxide
-reads in two cases: a global secondary index with a multi-attribute key, whose
+**Database files are upgraded to schema version 11 when 1.3.0 first opens
+them**, and older versions can't undo that. The upgrade only changes what an
+older Dynoxide reads in two cases: a global secondary index with a multi-attribute key, whose
 entries are rebuilt, and a table with a vector index, whose stored item sizes
 are recomputed. If a file has either and you might go back to 1.2.x, copy it
 first: 1.2.x doesn't check a file's schema version, so it would open the file
@@ -179,7 +181,7 @@ See [action/action.yml](../action/action.yml) for all inputs and outputs.
 
 ## Docker
 
-A 5 MB drop-in for `amazon/dynamodb-local` in containerised test suites. Same DynamoDB-compatible API, faster startup, smaller image. Note that this is a packaging convenience for test fixtures, not a containerised database product; production-database-on-Kubernetes patterns are out of scope.
+A 5 MB drop-in replacement for `amazon/dynamodb-local` in containerised test suites, with the same DynamoDB-compatible API, a faster start and a smaller image. The image is packaged as a test fixture, and running it as a production database on Kubernetes is out of scope.
 
 ```sh
 docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
@@ -199,7 +201,7 @@ across patches, and `dynoxide:1` floats across the whole 1.x line. `:1` receives
 conformance fixes, which change behaviour within a major; `:1.2` does not. See
 `docs/versioning.md`.
 
-The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux Just Work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only; if you want to verify provenance, pull from the GHCR canonical.
+The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only, so pull from GHCR if you want to verify provenance.
 
 If you override `CMD` to bind to a different port, set the healthcheck target with environment variables so the container's `HEALTHCHECK` follows:
 
@@ -207,14 +209,14 @@ If you override `CMD` to bind to a different port, set the healthcheck target wi
 docker run -e DYNOXIDE_HEALTHCHECK_PORT=9000 ghcr.io/nubo-db/dynoxide serve --port 9000
 ```
 
-`DYNOXIDE_HEALTHCHECK_HOST` and `DYNOXIDE_HEALTHCHECK_PORT` are documented public surface and will not be renamed in a patch or minor release.
+`DYNOXIDE_HEALTHCHECK_HOST` and `DYNOXIDE_HEALTHCHECK_PORT` are part of the documented public interface and won't be renamed in a patch or minor release.
 
 The container probes itself every 250ms until it first reports healthy, then
-every 30 seconds. Dynoxide boots in milliseconds, so that first probe is
-normally the only quick one and waiting on the healthcheck rather than polling
-the port resolves in well under a second. The ten second start period is
-headroom for a loaded host rather than a window a healthy container uses.
-Needs Docker Engine 25.0 or newer. See [Testcontainers](testcontainers.md) for
+every 30 seconds. Dynoxide boots in milliseconds, so the first quick probe is
+normally the only one needed, and waiting on the healthcheck instead of polling
+the port takes well under a second. The ten-second start period is headroom
+for a loaded host; a healthy container doesn't use it. Needs Docker Engine 25.0
+or newer. See [Testcontainers](testcontainers.md) for
 how to wait on it from a test suite.
 
 ### Docker Compose
@@ -262,7 +264,7 @@ and npm packages too.
 
 ### Running as nonroot
 
-For security-conscious operators, opt into a nonroot uid:
+To run as a nonroot uid instead:
 
 ```sh
 docker run --rm -p 8000:8000 --user 65532:65532 ghcr.io/nubo-db/dynoxide
@@ -282,7 +284,7 @@ The default in-memory mode needs no flags whether root or nonroot. The uid 65532
 
 ### MCP over HTTP in Docker
 
-The default image serves DynamoDB only. To also expose the [MCP](mcp.md) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind. Pass it via the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (which keeps it out of shell history and `ps`), not a `--mcp-token` flag:
+The default image serves DynamoDB only. To also expose the [MCP](mcp.md) Streamable HTTP transport, override the command to start it on `0.0.0.0` and supply a bearer token. The token is **mandatory** for any non-loopback bind. Pass it in the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable rather than with `--mcp-token`, which keeps it out of shell history and `ps`:
 
 ```sh
 TOKEN=$(openssl rand -base64 24)
@@ -298,7 +300,7 @@ DynamoDB is then reachable on `http://localhost:8000` and MCP on `http://localho
 
 A few things to know:
 
-- **The token is not optional.** Omit it and the container exits immediately with `a non-loopback MCP bind requires an explicit token`. The default `docker run ghcr.io/nubo-db/dynoxide` stays DynamoDB-only precisely because a token-less `0.0.0.0` MCP bind cannot boot.
+- **The token is not optional.** Omit it and the container exits immediately with `a non-loopback MCP bind requires an explicit token`. The default `docker run ghcr.io/nubo-db/dynoxide` stays DynamoDB-only because a token-less `0.0.0.0` MCP bind cannot boot.
 - **Reaching MCP from another container** by service name (rather than `localhost`) needs that name added to the Host allowlist: `--mcp-allowed-host <name>` (e.g. `--mcp-allowed-host dynoxide`). The `-p`-mapped `localhost` access above needs nothing extra.
 - **`--network host`** (Linux only) is an alternative to `-p`, but it bypasses Docker network isolation and binds MCP directly on the host's network interface, reachable from the LAN, not just the host. Prefer `-p` unless you specifically need host networking.
 

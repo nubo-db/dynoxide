@@ -126,9 +126,12 @@ prints `dynoxide <product version>` on one line. That format is part of this
 contract too.
 
 From 1.8.0, `serve` exits `4` when the `--port` it was given is already taken,
-whether a listener answers on it or the bind fails because it is in use. Every
-other startup failure exits `1`, including a taken `--mcp-port` and, from
-1.8.0, an `--mcp-port` that's the same as a fixed `--port`.
+whether a listener answers on it or the bind fails because it is in use. On
+Windows a port held without a listener can still exit `1`, as the exit table in
+`docs/launcher.md` explains. Arguments the parser refuses, such as
+`--port 70000`, exit `2`. Every other startup failure exits `1`, including a
+taken `--mcp-port` and, from 1.8.0, an `--mcp-port` that's the same as a fixed
+`--port`.
 Launchers rely on `4` to report a taken port without matching stderr text, so
 the status is part of this contract too.
 

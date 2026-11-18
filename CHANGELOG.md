@@ -61,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   need their own `--mcp-port`, since they'd otherwise both take the
   default.
   ([#354](https://github.com/nubo-db/dynoxide/issues/354))
+- **A stderr nobody reads no longer costs the exit status.** Writing to
+  stderr once its reader had gone made the release build abort, so a launcher
+  that had closed the pipe saw a crash instead of the status it was waiting
+  for, such as `4` for a taken port. Dynoxide now ignores a failed write to
+  stderr, the import report included.
+  ([#324](https://github.com/nubo-db/dynoxide/issues/324))
+- **`import` runs in a debug build without either server.** A debug build
+  with `import` but without `http-server` or `mcp-server` panicked in one of
+  clap's checks as soon as `import` ran. Release builds skip that check.
+  ([#314](https://github.com/nubo-db/dynoxide/issues/314))
 
 ## [1.7.0] - 2026-11-17
 

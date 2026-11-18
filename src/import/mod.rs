@@ -187,11 +187,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     let (rules, consistency_config) = if let Some(ref rules_path) = cmd.rules {
         let (rules, consistency) =
             config::load_and_validate(rules_path).map_err(ImportError::Config)?;
-        eprintln!(
+        crate::stderr_line(format_args!(
             "Loaded {} anonymisation rules from {}",
             rules.len(),
             rules_path.display()
-        );
+        ));
         (rules, consistency)
     } else {
         (Vec::new(), None)
@@ -206,12 +206,12 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
         Some(ref path) => {
             let model =
                 crate::schema::onetable::parse_onetable_file(path).map_err(ImportError::Config)?;
-            eprintln!(
+            crate::stderr_line(format_args!(
                 "Loaded data model: {} ({} entities) from {}",
                 model.schema_format,
                 model.entities.len(),
                 path.display()
-            );
+            ));
             Some(model)
         }
         None => None,
@@ -219,11 +219,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
 
     // 2. Load table schemas (returns both parsed schemas and raw JSON)
     let (schemas, schema_json) = schema::load_schemas(&cmd.schema)?;
-    eprintln!(
+    crate::stderr_line(format_args!(
         "Loaded {} table schemas from {}",
         schemas.len(),
         cmd.schema.display()
-    );
+    ));
     refuse_scopes_outside_the_schema(&rules, &schemas)?;
 
     // 3. Discover export files
@@ -345,11 +345,11 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
 
     // Report consistency map stats
     if run.consistency_map.field_count() > 0 {
-        eprintln!(
+        crate::stderr_line(format_args!(
             "Consistency map: {} fields, {} total mappings",
             run.consistency_map.field_count(),
             run.consistency_map.total_mappings()
-        );
+        ));
     }
 
     summary.finish();
@@ -486,7 +486,7 @@ impl TableImport<'_> {
                     // explanation, and the summary that carries them does
                     // not survive an error return.
                     for n in &summary.notices {
-                        eprintln!("  - {n}");
+                        crate::stderr_line(format_args!("  - {n}"));
                     }
                     ImportError::Config(format!("data model: {e}"))
                 })?;
@@ -505,7 +505,10 @@ impl TableImport<'_> {
         };
 
         let file_count = files.len();
-        eprintln!("Importing table '{}' ({} files)...", table_name, file_count);
+        crate::stderr_line(format_args!(
+            "Importing table '{}' ({} files)...",
+            table_name, file_count
+        ));
 
         let pb = ProgressBar::new_spinner();
         pb.set_style(
@@ -647,7 +650,7 @@ impl TableImport<'_> {
                 // returning without them leaves the operator with a verdict
                 // and no evidence.
                 for n in &summary.notices {
-                    eprintln!("  - {n}");
+                    crate::stderr_line(format_args!("  - {n}"));
                 }
                 // The BulkLoading guard in `run_into` restores the PRAGMAs.
                 return Err(ImportError::Config(format!(
@@ -933,7 +936,7 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
         db.vacuum()
             .map_err(|e| ImportError::Database(format!("VACUUM failed: {e}")))?;
     }
-    eprintln!("Database compacted.");
+    crate::stderr_line(format_args!("Database compacted."));
 
     // Atomically move the temp file to the final output path.
     // This overwrites any existing file (--force was already checked above).
@@ -949,7 +952,7 @@ pub fn run(cmd: ImportCommand) -> Result<ImportSummary, ImportError> {
             .into_temp_path();
         let size = compress_to(&tmp_path, &compressed_tmp)?;
         move_into_place(compressed_tmp, &compressed_path, force)?;
-        eprintln!("Compressed output: {}", format_bytes(size));
+        crate::stderr_line(format_args!("Compressed output: {}", format_bytes(size)));
         summary.output_path = Some(compressed_path);
         return Ok(summary);
     }

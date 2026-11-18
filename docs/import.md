@@ -331,6 +331,11 @@ starts.
 and accept. Everything else is unchanged: 0 is a clean import, 1 is a failure,
 and 3 is a run that finished while leaving something behind.
 
+From 1.8.0, `--serve` with a fixed `--port` that's already taken exits 4 once
+the import has run, the same as `serve`, so a launcher can tell a taken port
+from a failed import.
+[Knowing it's ready](launcher.md#knowing-its-ready) covers how to report it.
+
 A warning on its own does not change the exit code. Every message the import
 raises carries a concern, decided where it is raised:
 

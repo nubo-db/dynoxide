@@ -865,6 +865,40 @@ fn import_serve_mcp_refuses_the_same_port_before_importing() {
     assert!(!stderr.contains("Import complete:"), "{stderr}");
 }
 
+/// `import --serve` on a fixed port that's taken runs the import, then exits
+/// 4 as `serve` does, so a launcher can tell a taken port from a failure.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_on_a_taken_port_exits_4() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let e = import::export();
+    let a = import::import_args(&e, &["--serve", "--port", &port]);
+    let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(4), "stderr:\n{stderr}");
+    assert!(stderr.contains("Import complete:"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("error: port {port} is already in use")),
+        "{stderr}"
+    );
+}
+
+/// The import report and the error both go to stderr. With nobody reading
+/// it, neither may panic, or the release build aborts and the 4 is lost.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_on_a_taken_port_exits_4_when_no_one_reads_stderr() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let e = import::export();
+    let a = import::import_args(&e, &["--serve", "--port", &port]);
+    let mut child = spawn(&a, &[]);
+    drop(child.stderr.take());
+    let output = wait_with_timeout(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(4), "status {}", output.status);
+}
+
 #[cfg(feature = "import")]
 #[test]
 fn import_help_lists_log() {

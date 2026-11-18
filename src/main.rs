@@ -503,8 +503,7 @@ fn exit_status_for(message: &str) -> i32 {
 fn main() {
     if let Err(e) = run_sync() {
         // Not eprintln!, which panics when no one reads stderr.
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr().lock(), "error: {e}");
+        dynoxide::stderr_line(format_args!("error: {e}"));
         std::process::exit(1);
     }
 }
@@ -578,11 +577,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(not(feature = "http-server"))]
         None => {
-            eprintln!("No subcommand specified. Available subcommands:");
+            dynoxide::stderr_line(format_args!(
+                "No subcommand specified. Available subcommands:"
+            ));
             #[cfg(feature = "mcp-server")]
-            eprintln!("  mcp       Start the MCP server");
+            dynoxide::stderr_line(format_args!("  mcp       Start the MCP server"));
             #[cfg(feature = "import")]
-            eprintln!("  import    Import DynamoDB Export data");
+            dynoxide::stderr_line(format_args!("  import    Import DynamoDB Export data"));
             std::process::exit(1);
         }
 
@@ -604,8 +605,10 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Import(args)) => run_import(args),
 
         None => {
-            eprintln!("No subcommand specified. Available subcommands:");
-            eprintln!("  import    Import DynamoDB Export data");
+            dynoxide::stderr_line(format_args!(
+                "No subcommand specified. Available subcommands:"
+            ));
+            dynoxide::stderr_line(format_args!("  import    Import DynamoDB Export data"));
             std::process::exit(1);
         }
         #[allow(unreachable_patterns)]
@@ -948,7 +951,7 @@ fn run_healthcheck(args: HealthcheckArgs) -> ! {
     match do_healthcheck(args) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("healthcheck: {e}");
+            dynoxide::stderr_line(format_args!("healthcheck: {e}"));
             std::process::exit(1);
         }
     }
@@ -972,14 +975,16 @@ fn do_healthcheck(args: HealthcheckArgs) -> Result<(), String> {
     // value into `DYNOXIDE_HEALTHCHECK_HOST`.
     let probe_host = match args.host.as_str() {
         "0.0.0.0" => {
-            eprintln!("healthcheck: rewriting wildcard host 0.0.0.0 to 127.0.0.1 for probe");
+            dynoxide::stderr_line(format_args!(
+                "healthcheck: rewriting wildcard host 0.0.0.0 to 127.0.0.1 for probe"
+            ));
             "127.0.0.1".to_string()
         }
         "::" | "[::]" => {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "healthcheck: rewriting wildcard host {} to ::1 for probe",
                 args.host
-            );
+            ));
             "::1".to_string()
         }
         h => h.to_string(),
@@ -1215,18 +1220,18 @@ fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: boo
     if summary.exposures.is_empty() || accept_exposure {
         return;
     }
-    eprintln!();
-    eprintln!(
+    dynoxide::stderr_line(format_args!(""));
+    dynoxide::stderr_line(format_args!(
         "{} of the warnings above say an original value reached the output:",
         summary.exposures.len()
-    );
+    ));
     for exposure in &summary.exposures {
-        eprintln!("  - {exposure}");
+        dynoxide::stderr_line(format_args!("  - {exposure}"));
     }
-    eprintln!();
-    eprintln!(
+    dynoxide::stderr_line(format_args!(""));
+    dynoxide::stderr_line(format_args!(
         "Exiting {EXIT_EXPOSURE}. Fix the rules, or pass --accept-exposure if this is expected."
-    );
+    ));
     std::process::exit(EXIT_EXPOSURE);
 }
 
@@ -1262,22 +1267,22 @@ fn import_report(
 
 #[cfg(feature = "import")]
 fn print_import_summary(summary: &dynoxide::import::ImportSummary) {
-    eprintln!();
-    eprintln!("Import complete:");
-    eprintln!("  Tables: {}", summary.tables.len());
-    eprintln!("  Items:  {}", summary.total_items);
+    dynoxide::stderr_line(format_args!(""));
+    dynoxide::stderr_line(format_args!("Import complete:"));
+    dynoxide::stderr_line(format_args!("  Tables: {}", summary.tables.len()));
+    dynoxide::stderr_line(format_args!("  Items:  {}", summary.total_items));
     if summary.total_skipped > 0 {
-        eprintln!("  Skipped: {}", summary.total_skipped);
+        dynoxide::stderr_line(format_args!("  Skipped: {}", summary.total_skipped));
     }
     if let Some(ref path) = summary.output_path {
-        eprintln!("  Output: {}", path.display());
+        dynoxide::stderr_line(format_args!("  Output: {}", path.display()));
     }
 
     if !summary.warnings.is_empty() {
-        eprintln!();
-        eprintln!("Warnings:");
+        dynoxide::stderr_line(format_args!(""));
+        dynoxide::stderr_line(format_args!("Warnings:"));
         for w in &summary.warnings {
-            eprintln!("  - {w}");
+            dynoxide::stderr_line(format_args!("  - {w}"));
         }
     }
 }
@@ -1501,12 +1506,12 @@ fn read_key_file(path: &std::path::Path) -> Result<Zeroizing<String>, Box<dyn st
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "warning: key file {} has open permissions (mode {:04o}), \
                  consider chmod 600",
                 path.display(),
                 mode & 0o777,
-            );
+            ));
         }
     }
 

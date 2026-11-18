@@ -220,6 +220,10 @@ jobs:
       - name: Clippy (MCP without HTTP)
         run: cargo clippy --no-default-features --features native-sqlite,mcp-server --all-targets -- -D warnings
 
+      # The same with the CLI, which is what compiles the MCP server tests.
+      - name: Clippy (MCP without HTTP, with the CLI)
+        run: cargo clippy --no-default-features --features native-sqlite,mcp-server,cli --all-targets -- -D warnings
+
       - name: Format
         run: cargo fmt --check
 

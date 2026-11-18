@@ -1174,12 +1174,15 @@ fn the_same_port_for_dynamodb_and_mcp_is_refused() {
 }
 
 /// A taken DynamoDB port still exits 4 with `--mcp`, before any MCP bind.
+/// The MCP port is taken too: tried first, it would fail and exit 1.
 #[cfg(feature = "mcp-server")]
 #[test]
 fn a_taken_port_exits_4_with_mcp_too_and_never_binds_mcp() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port();
     let port_arg = port.to_string();
+    let taken_mcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mcp_port_arg = taken_mcp.local_addr().unwrap().port().to_string();
     let (code, stdout, stderr) = serve_until_exit(&[
         "--port",
         &port_arg,
@@ -1187,7 +1190,7 @@ fn a_taken_port_exits_4_with_mcp_too_and_never_binds_mcp() {
         "--exit-with-parent",
         "--mcp",
         "--mcp-port",
-        "0",
+        &mcp_port_arg,
         "--mcp-no-auth",
     ]);
     assert_port_in_use((code, stdout, stderr.clone()), port);

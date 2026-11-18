@@ -145,7 +145,7 @@ DynamoDB Local warm start (after JVM JIT): ~2ms. The cold start cost is what CI 
 | DeleteItem | <!-- bench:ci_op_DeleteItem_http -->0.31ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ddb -->0.92ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ratio -->**2.9x**<!-- /bench --> |
 | **Total workload** | <!-- bench:ci_workload_http -->**2.9s**<!-- /bench --> | <!-- bench:ci_workload_ddb -->**11.6s**<!-- /bench --> | <!-- bench:ci_workload_ratio -->**4.0x**<!-- /bench --> |
 
-The largest speedups are on read-heavy operations (GetItem, Query, Scan, BatchGetItem) and multi-item writes (BatchWriteItem, TransactWriteItems) where Dynoxide avoids JVM dispatch overhead and lock contention. Single-row writes (PutItem, DeleteItem) still show a clear win at 2-3x.
+The gap is widest on CreateTable and TransactWriteItems. Single-item reads and writes (GetItem, PutItem, DeleteItem) show the smallest speedup on CI runners, though still a clear one.
 
 ### CI Pipeline Simulation (50 integration tests)
 
@@ -195,13 +195,13 @@ the GetItem PDF (shows the tight distribution). To include them:
 | Disk (10K items) | - | <!-- bench:ci_disk_file_loaded -->15.6 MB<!-- /bench --> | - | - | - | - |
 | Disk (empty table) | - | <!-- bench:ci_disk_file_empty -->104 KB<!-- /bench --> | - | - | - | - |
 
-File-backed mode shows higher RSS at creation because SQLite memory-maps the file. Both modes converge at 10K items. The ~46MB for 10K items is ~4.6KB per item, roughly 4x the raw item size. The extra covers SQLite structures, indexes and the GSI.
+File-backed mode shows higher RSS at creation because SQLite memory-maps the file. Both modes converge at 10K items. At 10K items the in-memory RSS is <!-- bench:ci_mem_memory_loaded -->48.6 MB<!-- /bench -->, several times the ~10 MB of raw item data. The extra covers SQLite structures, indexes and the GSI.
 
 Docker idle memory is the mean of 3 samples taken 10s apart, 30s after the first successful ListTables, no requests served.
 
 ## Why the Numbers Differ Between Local and CI
 
-Local development (Apple Silicon) shows ~17x speedup for embedded CI pipeline; GitHub Actions shows ~7x. This is expected:
+For the embedded CI pipeline on four threads, local development (Apple Silicon) shows a <!-- bench:local_ci_embedded_par_ratio -->**5.9x**<!-- /bench --> speedup and GitHub Actions shows <!-- bench:ci_suite_embedded_par_ratio -->**4.6x**<!-- /bench -->. The difference is expected:
 
 - Apple Silicon has significantly faster single-thread performance than the shared CI runner
 - Dynoxide is CPU-bound (native code, in-process SQLite), so it scales roughly linearly with CPU speed
@@ -290,7 +290,7 @@ We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers
 ### What Dynoxide Does Better
 - **Startup time**: No JVM or Docker, and embedded initialisation takes microseconds
 - **CI pipeline speed**: Zero-cost per-test isolation in embedded mode
-- **Resource usage**: ~3 MB download (~6 MB on disk) vs 225 MB Docker download (471 MB on disk); 5 MB idle RSS vs 163 MB
+- **Resource usage**: a <!-- prose:dynoxide_binary_size -->~4 MB<!-- /bench --> download (<!-- bench:ci_binary_size -->8 MB<!-- /bench --> on disk) against DynamoDB Local's <!-- prose:ci_image_ddb_local_download -->~240 MB<!-- /bench --> image (<!-- bench:ci_image_ddb_local -->230 MB<!-- /bench --> on disk), and <!-- bench:ci_mem_memory_idle -->7.7 MB<!-- /bench --> idle RSS against <!-- bench:ci_mem_ddb_local_idle -->142.5 MB<!-- /bench -->
 - **Embedded mode**: Eliminates HTTP overhead entirely for Rust and iOS consumers
 - **Predictable latency**: No JVM GC pauses, no JIT warmup effects
 
@@ -303,7 +303,7 @@ We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers
 - JVM warmup makes DynamoDB Local's warm-start performance much better than its cold-start performance. Both are reported
 - CI wall-clock numbers vary between runners, so use the relative ratios rather than absolute numbers
 - Apple Silicon and x86_64 show different absolute numbers but consistent ratios
-- PutItem and DeleteItem show near-parity with DynamoDB Local. Dynoxide's advantage is largest on read operations and batch/scan workloads
+- On CI runners, single-item reads and writes show the smallest speedup over DynamoDB Local. The gap is widest on CreateTable and TransactWriteItems
 
 ## Reproducibility
 

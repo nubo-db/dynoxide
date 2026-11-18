@@ -163,7 +163,8 @@ key, and the DynamoDB attribute names come from the `--schema` file. GSI keys
 are matched by index name, so the OneTable index `name` must match the
 DynamoDB index.
 
-Only a key that is actually rebuilt takes part in that check. One left holding
+Only a key that is actually rebuilt takes part in the join check (see
+[What the check cannot see](#what-the-check-cannot-see)). One left holding
 its original value has already been reported as a template that does not
 reproduce, which is the accurate diagnostic for it.
 
@@ -357,21 +358,17 @@ this before treating a clean run as proof the relationships survived.
 - **A relationship the data model does not describe.** Only attributes an
   entity's templates name are tracked. A join your application makes by
   reading one attribute and querying another is invisible here.
-- **Anything past the cap.** The check holds a million distinct keys per
-  group. Past that it keeps checking the keys it already has and reports how
+- **Anything past the cap.** The check holds a million distinct keys for
+  each shared key it tracks. Past that it keeps checking the keys it already has and reports how
   many it could not take on, so the run tells you the check was partial, but
   a break among the ones it skipped is not found.
 - **A key whose value is not a string, a number or binary.** Those are not
   compared, and the collision counter is what notices if they pile up.
 
 A warning is not a failure. Only a break the check actually observes stops
-the import; everything else on this page is reported and the run still exits
-0, including keys that kept the values they arrived with. Read the warnings.
-
-The check holds a million distinct keys per template. Past that it keeps
-checking the keys it already has and says how many it could not take on, so
-a very large import is told its check was partial rather than left to look
-clean.
+the import with an error. An exposure, one of the cases under
+[Exit codes](#exit-codes), lets the import finish and then exits 3. Everything
+else on this page is reported and the run exits 0. Read the warnings.
 
 In file mode nothing is written on the error path, so a failed import leaves
 no database rather than a broken one. The library entry point `run_into`
@@ -431,8 +428,8 @@ shape of the original data survives into the keys and anyone holding the salt
 can re-derive every one of them. Treat a hashed export as sensitive, not
 anonymous.
 
-`--data-model` therefore imports on the index-maintaining write path rather
-than the faster one that assumes every key is unique, and so does a rules file
+Rebuilt keys can collide, so `--data-model` imports on the index-maintaining
+write path rather than the faster one that assumes every key is unique, and so does a rules file
 that names a key attribute directly. An import whose rules leave every key
 alone takes its keys from the export unchanged, cannot collide, and keeps the
 faster path.

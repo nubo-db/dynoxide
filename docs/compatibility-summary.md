@@ -143,12 +143,12 @@ the ones worth knowing.
 |----------|-----------|--------|
 | **Backup/Restore** | CreateBackup, DeleteBackup, RestoreTable*, etc. (8 ops) | Not applicable |
 | **Global Tables** | CreateGlobalTable, DescribeGlobalTable, etc. (6 ops) | Not applicable |
-| **Kinesis** | Enable/Disable/DescribeKinesisStreamingDestination | Not applicable |
+| **Kinesis** | Enable/Disable/Describe/UpdateKinesisStreamingDestination (4 ops) | Not applicable |
 | **Import/Export** | ImportTable, ExportTableToPointInTime, etc. (6 ops) | Not applicable |
-| **Capacity** | DescribeReservedCapacity, DescribeLimits, etc. (5 ops) | Not applicable |
+| **Capacity** | DescribeLimits (1 op) | Not applicable |
 | **Other** | ContributorInsights, ResourcePolicy, TableReplicas, DescribeEndpoints (9 ops) | Not applicable |
 
-**28 of 28 applicable DynamoDB operations are implemented**, including `SearchVectors` and the vector index surface on `CreateTable`, `UpdateTable` and `DescribeTable`. The remaining 39 operations are cloud-infrastructure features with no meaningful local equivalent.
+**28 of 28 applicable DynamoDB operations are implemented**, including `SearchVectors` and the vector index surface on `CreateTable`, `UpdateTable` and `DescribeTable`. The 28 include the four DynamoDB Streams operations. The remaining 34 DynamoDB operations are cloud-infrastructure features with no meaningful local equivalent.
 
 ---
 
@@ -456,7 +456,7 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 | Anonymised import with rule-based anonymisation | Import DynamoDB exports with fake/mask/hash/redact rules |
 | SQLCipher encryption at rest | `encryption` feature flag for encrypted databases |
 | iOS/native embedding | No runtime dependencies - runs on platforms where Docker can't |
-| Sub-millisecond startup, ~5 MB binary | vs ~2.5s and ~225 MB for DynamoDB Local |
+| Sub-millisecond startup, ~4 MB download | vs ~2 seconds and a ~240 MB image for DynamoDB Local |
 
 ---
 

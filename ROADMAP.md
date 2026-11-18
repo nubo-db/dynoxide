@@ -5,24 +5,24 @@ changes as things ship and as people ask for things, so treat it as direction
 rather than dates. If something here matters to you, or something missing
 does, say so in an [issue](https://github.com/nubo-db/dynoxide/issues).
 
-## Now: 1.7.0
+## Now: 1.8.0
+
+A fixed port for dev setups, where something needs the endpoint before the
+server starts: a second app, an `.env` file or NoSQL Workbench.
+
+- **A `port` option** on `start()` in the npm and PHP packages. It defaults to
+  0, so tests still get a free port.
+- **A taken port says so.** The engine exits with status `4` when the port it
+  was given is in use, and both packages turn that into an error naming the
+  port, without reading stderr.
+- **Laravel's `dynoxide:serve`** names a taken port and how to change it.
+
+## Shipped in 1.7.0
 
 Starting Dynoxide from a test suite, in any language, without hand-rolled
-process code.
-
-- **A launcher contract.** One written description of how a wrapper starts
-  Dynoxide, learns its address and stops it, so every language behaves the
-  same way. The engine gains the two flags it needs: a machine-readable ready
-  line, and shutting down when the process that started it goes away.
-- **`start()` in the npm package.** Run Dynoxide on a free port from a Node
-  test suite and get back its endpoint and a `stop()`.
-- **A PHP package.** `nubo-db/dynoxide` on Packagist downloads and verifies the
-  binary, starts it, and comes with a PHPUnit extension (Pest and ParaTest
-  included).
-- **A Laravel package.** `nubo-db/dynoxide-laravel` starts Dynoxide in tests,
-  points the app's DynamoDB cache, rate limiter, sessions and failed jobs at
-  it, creates the tables its config names, and adds
-  `php artisan dynoxide:serve` for local development.
+process code: the [launcher contract](docs/launcher.md), `start()` in the npm
+package, the `nubo-db/dynoxide` PHP package with its PHPUnit extension, and
+the `nubo-db/dynoxide-laravel` package.
 
 ## Next
 

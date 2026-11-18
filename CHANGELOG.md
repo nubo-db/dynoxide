@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A taken `--port` exits `4` instead of `1`.** A script that checks for a
   non-zero exit is unaffected; one that checks for exactly `1` needs to accept
   `4` too.
+- **`--mcp-port` can't share a fixed `--port`.** With `--mcp`, `serve` and
+  `import --serve` now refuse one port for both listeners, with exit `1`,
+  whatever the hosts. On macOS an MCP listener on `127.0.0.1` could bind
+  beside DynamoDB on `0.0.0.0` and take its loopback requests. Pairs that
+  used to work, such as DynamoDB on `127.0.0.1` and MCP on `[::1]` with one
+  port, need two ports now.
+  ([#355](https://github.com/nubo-db/dynoxide/issues/355))
 - **A listener on the other loopback family now counts as a taken port.**
   `dynoxide --port 8000` refuses to start when something listens on
   `[::1]:8000`, and `--host '[::1]'` refuses when something listens on

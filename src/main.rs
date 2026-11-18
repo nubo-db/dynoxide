@@ -156,7 +156,8 @@ struct ServeArgs {
     #[arg(long)]
     mcp: bool,
 
-    /// Port for the MCP HTTP transport (default: 19280)
+    /// Port for the MCP HTTP transport (default: 19280). Can't be the same as
+    /// a fixed --port
     #[cfg(feature = "mcp-server")]
     #[arg(long, default_value_t = 19280, requires = "mcp")]
     mcp_port: u16,
@@ -372,7 +373,8 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "output")]
     mcp: bool,
 
-    /// Port for the MCP HTTP server when using --serve --mcp together
+    /// Port for the MCP HTTP server when using --serve --mcp together. Can't be
+    /// the same as a fixed --port
     #[cfg(feature = "mcp-server")]
     #[arg(long, default_value_t = 8100, requires = "mcp")]
     mcp_port: u16,
@@ -599,6 +601,11 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "http-server")]
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "mcp-server")]
+    if args.mcp {
+        refuse_shared_port(args.port, args.mcp_port)?;
+    }
+
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
 
@@ -680,6 +687,22 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
+    Ok(())
+}
+
+/// Refuse one fixed port for both the DynamoDB and the MCP listener.
+///
+/// Whatever the hosts, sharing a port goes wrong somewhere: on macOS an MCP
+/// listener on `127.0.0.1` binds beside a DynamoDB one on `0.0.0.0` and takes
+/// its loopback requests, and on Linux the second bind fails. Port 0 is never
+/// refused, since the OS picks a different port for each.
+#[cfg(all(feature = "http-server", feature = "mcp-server"))]
+fn refuse_shared_port(port: u16, mcp_port: u16) -> Result<(), String> {
+    if port != 0 && port == mcp_port {
+        return Err(format!(
+            "--port and --mcp-port are both {port}; give the MCP server a port of its own with --mcp-port"
+        ));
+    }
     Ok(())
 }
 
@@ -1264,6 +1287,13 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
     any(feature = "http-server", feature = "mcp-server")
 ))]
 async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Before the import, which can take a while, since the arguments alone
+    // show the servers can't start.
+    #[cfg(all(feature = "http-server", feature = "mcp-server"))]
+    if args.serve && args.mcp {
+        refuse_shared_port(args.port, args.mcp_port)?;
+    }
+
     #[cfg(feature = "http-server")]
     let wants_serve = args.serve;
     #[cfg(not(feature = "http-server"))]
@@ -1535,9 +1565,24 @@ mod tests {
             "error: port 8000 is already in use (x)",
             "the port 8000 is already in use",
             "",
+            "--port and --mcp-port are both 8000; give the MCP server a port of its own with --mcp-port",
         ] {
             assert_eq!(exit_status_for(other), 1, "{other:?}");
         }
+    }
+
+    #[cfg(all(feature = "http-server", feature = "mcp-server"))]
+    #[test]
+    fn only_a_shared_fixed_port_is_refused() {
+        use super::refuse_shared_port;
+        for (port, mcp_port) in [(0, 0), (8000, 0), (0, 8000), (8000, 8001)] {
+            assert!(
+                refuse_shared_port(port, mcp_port).is_ok(),
+                "{port} {mcp_port}"
+            );
+        }
+        let err = refuse_shared_port(8000, 8000).unwrap_err();
+        assert!(err.contains("--port and --mcp-port are both 8000"), "{err}");
     }
 
     mod cli_parse_tests {

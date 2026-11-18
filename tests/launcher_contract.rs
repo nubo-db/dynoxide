@@ -1081,22 +1081,6 @@ fn serve_until_exit(args: &[&str]) -> (Option<i32>, Vec<String>, String) {
     (status.code(), stdout, stderr)
 }
 
-/// A port free on both loopback families, or None where there's no IPv6
-/// loopback.
-#[cfg(feature = "mcp-server")]
-fn a_port_free_on_both_loopbacks() -> Option<u16> {
-    for _ in 0..20 {
-        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = v4.local_addr().unwrap().port();
-        match std::net::TcpListener::bind(("::1", port)) {
-            Ok(_) => return Some(port),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
 /// From 1.8.0, with `--mcp` the ready line waits for both listeners, so an MCP
 /// listener that can't be bound stops startup before it, with no stdin closed.
 #[cfg(feature = "mcp-server")]
@@ -1122,67 +1106,40 @@ fn an_mcp_listener_that_cant_be_bound_stops_startup_before_the_ready_line() {
     );
 }
 
-/// The DynamoDB listener binds first, so asking both for one port is the MCP
-/// bind failing (1), not another process holding the DynamoDB port (4).
+/// From 1.8.0 `--mcp-port` can't be the same as `--port`, whatever the hosts.
+/// On macOS an MCP listener on `127.0.0.1` binds beside a DynamoDB one on
+/// `0.0.0.0` and takes its loopback requests, so the pair is refused before
+/// anything is bound. No port is bound here, so any number will do.
 #[cfg(feature = "mcp-server")]
 #[test]
-fn one_port_for_both_listeners_exits_1_not_4() {
-    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = free.local_addr().unwrap().port().to_string();
-    drop(free);
-    let (code, stdout, stderr) = serve_until_exit(&[
-        "--port",
-        &port,
-        "--ready-json",
-        "--exit-with-parent",
-        "--mcp",
-        "--mcp-port",
-        &port,
-        "--mcp-no-auth",
-    ]);
-    assert_eq!(code, Some(1), "stderr:\n{stderr}");
-    assert!(stdout.is_empty(), "a ready line printed: {stdout:?}");
-    assert!(!stderr.contains("is already in use ("), "{stderr}");
-    assert!(
-        stderr.contains(&format!("failed to bind 127.0.0.1:{port}")),
-        "stderr doesn't report the MCP bind failure:\n{stderr}"
-    );
-}
-
-/// Dynoxide's own MCP listener on the other loopback family isn't a conflict:
-/// the DynamoDB listener is checked before the MCP one exists.
-#[cfg(feature = "mcp-server")]
-#[test]
-fn dynamodb_and_mcp_can_share_a_port_across_loopback_families() {
-    let Some(port) = a_port_free_on_both_loopbacks() else {
-        eprintln!("skipped: this machine has no IPv6 loopback");
-        return;
-    };
-    let port = port.to_string();
-    let server = Launched::spawn(
-        serve(&[
+fn the_same_port_for_dynamodb_and_mcp_is_refused() {
+    for (host, mcp_host) in [
+        ("127.0.0.1", "127.0.0.1"),
+        ("0.0.0.0", "127.0.0.1"),
+        ("127.0.0.1", "::1"),
+    ] {
+        let (code, stdout, stderr) = serve_until_exit(&[
             "--host",
-            "127.0.0.1",
+            host,
             "--port",
-            &port,
+            "48123",
             "--ready-json",
             "--exit-with-parent",
             "--mcp",
             "--mcp-host",
-            "::1",
+            mcp_host,
             "--mcp-port",
-            &port,
+            "48123",
             "--mcp-no-auth",
-        ]),
-        Stdio::piped(),
-    );
-    let endpoint = server.ready_line()["endpoint"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(list_tables(&endpoint).0, 200);
-    server.wait_for_stderr("MCP HTTP server listening on");
-    TcpStream::connect(format!("[::1]:{port}")).expect("the MCP listener answers on [::1]");
+        ]);
+        assert_eq!(code, Some(1), "{host} and {mcp_host}; stderr:\n{stderr}");
+        assert!(stdout.is_empty(), "a ready line printed: {stdout:?}");
+        assert!(
+            stderr.contains("--port and --mcp-port are both 48123"),
+            "{host} and {mcp_host}: stderr doesn't name both flags:\n{stderr}"
+        );
+        assert!(!stderr.contains("Starting DynamoDB"), "{stderr}");
+    }
 }
 
 /// A taken DynamoDB port still exits 4 with `--mcp`, before any MCP bind.

@@ -837,6 +837,34 @@ fn import_serve_mcp_stops_when_the_mcp_listener_cant_be_bound() {
     assert!(!stderr.contains("Dynoxide listening on"), "{stderr}");
 }
 
+/// `import --serve --mcp` refuses one port for both listeners before it
+/// imports anything, since the arguments alone show it can't start.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_mcp_refuses_the_same_port_before_importing() {
+    let e = import::export();
+    let a = import::import_args(
+        &e,
+        &[
+            "--serve",
+            "--port",
+            "48124",
+            "--mcp",
+            "--mcp-port",
+            "48124",
+            "--mcp-no-auth",
+        ],
+    );
+    let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--port and --mcp-port are both 48124"),
+        "stderr doesn't name both flags:\n{stderr}"
+    );
+    assert!(!stderr.contains("Import complete:"), "{stderr}");
+}
+
 #[cfg(feature = "import")]
 #[test]
 fn import_help_lists_log() {

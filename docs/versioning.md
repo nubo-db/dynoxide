@@ -127,7 +127,8 @@ contract too.
 
 From 1.8.0, `serve` exits `4` when the `--port` it was given is already taken,
 whether a listener answers on it or the bind fails because it is in use. Every
-other startup failure, a taken `--mcp-port` included, still exits `1`.
+other startup failure, a taken `--mcp-port` included, still exits `1`, as
+does an `--mcp-port` that's the same as a fixed `--port`.
 Launchers rely on `4` to report a taken port without matching stderr text, so
 the status is part of this contract too.
 

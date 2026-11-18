@@ -295,10 +295,11 @@ line, so a failure there shows up later rather than as a startup error.
 
 The MCP listener has no check like the DynamoDB one's, so it only fails when
 its own bind does. Some systems, macOS among them, let it bind `127.0.0.1`
-beside another listener on `0.0.0.0` with the same port. Give `--mcp-port` a
-port of its own, never the one in `--port`: with `--host 0.0.0.0` and the same
-port for both, the MCP listener can take the loopback requests meant for
-DynamoDB.
+beside another listener on `0.0.0.0` with the same port. That's why, from
+1.8.0, `--mcp-port` can't be the same as a fixed `--port`, whatever the hosts:
+Dynoxide refuses the pair with exit `1` before binding anything. With
+`--host 0.0.0.0` and one port for both, the MCP listener would otherwise take
+the loopback requests meant for DynamoDB.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts
@@ -527,8 +528,9 @@ them on `rc.1`.
 
 - **Launcher contract 2** (Dynoxide 1.8.0): exit status `4` for a taken
   `--port`, and a fixed port as an option for dev setups. With `--mcp`, the
-  ready line waits for the MCP listener too. A wrapper that always passes
-  `--port 0` and no `--mcp` sees no change.
+  ready line waits for the MCP listener too, and `--mcp-port` can't be the
+  same as a fixed `--port`. A wrapper that always passes `--port 0` and no
+  `--mcp` sees no change.
 - **Launcher contract 1** (Dynoxide 1.7.0): first draft. Corrected after the
   first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the
   cache path, pre-releases in the version check, spawns that report success

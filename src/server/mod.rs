@@ -67,12 +67,17 @@ fn check_port_available(addr: SocketAddr) -> Result<(), String> {
 
     for probe in [addr, cross].into_iter().chain(other_loopback) {
         if TcpStream::connect_timeout(&probe, timeout).is_ok() {
-            return Err(format!(
-                "port {port} is already in use (detected listener on {probe})"
-            ));
+            return Err(port_in_use(port, format!("detected listener on {probe}")));
         }
     }
     Ok(())
+}
+
+/// The taken-port error, worded in one place. The binary turns a message that
+/// starts `port N is already in use` into its taken-port exit status, so every
+/// taken-port error goes through here and nothing else may start that way.
+fn port_in_use(port: u16, detail: impl std::fmt::Display) -> String {
+    format!("port {port} is already in use ({detail})")
 }
 
 /// The error for a listener that couldn't be set up on `addr`.
@@ -85,8 +90,9 @@ fn bind_failure(addr: SocketAddr, e: std::io::Error) -> String {
     let port = addr.port();
     match e.kind() {
         std::io::ErrorKind::AddrInUse if port != 0 => format!(
-            "port {port} is already in use (no listener answered, but {e}). On Windows, a \
-             server stopped moments ago can hold the port until its connections close."
+            "{}. On Windows, a server stopped moments ago can hold the port until its \
+             connections close.",
+            port_in_use(port, format!("no listener answered, but {e}"))
         ),
         // Windows also reports a port inside a range Hyper-V or WSL has
         // reserved as access denied, with nothing listening on it.
@@ -809,6 +815,14 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn a_probe_hit_gets_the_port_in_use_wording() {
+        assert_eq!(
+            port_in_use(8000, "detected listener on 127.0.0.1:8000"),
+            "port 8000 is already in use (detected listener on 127.0.0.1:8000)"
+        );
     }
 
     #[test]

@@ -16,18 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dynoxide --port 8000` refuses to start when something listens on
   `[::1]:8000`, and `--host '[::1]'` refuses when something listens on
   `127.0.0.1:8000`, because a `localhost` client may reach that listener
-  first. Before, Dynoxide started beside it.
+  first. Before, Dynoxide started beside it. The check is in the library, so
+  `server::start` in the `dynoxide-rs` crate refuses in the same way.
 
 ### Added
 
 - **`dynoxide serve` exits `4` when its `--port` is already taken.** Every
-  startup failure used to exit `1`, so the only way to spot a taken port was
-  the stderr wording, and that differed between the pre-bind check, the bind
-  itself and Windows. Now both cases exit `4` with the same `port N is already
-  in use` message. A permission error, such as a privileged port or a port in
-  a range Windows has reserved, still exits `1`, and on Windows the message
-  says how to list the reserved ranges. `docs/launcher.md` moves to launcher
-  contract 2 to cover it.
+  startup failure used to exit `1`, so a launcher could only spot a taken port
+  from the stderr wording, which differed between the pre-bind check, the bind
+  itself and Windows. Now a listener on the port and a bind that fails because
+  the port is in use both exit `4`, with the same `port N is already in use`
+  message. A permission error, such as a privileged port or a port in a range
+  Windows has reserved, still exits `1`; on Windows the message says how to
+  list the reserved ranges. `docs/launcher.md` moves to launcher contract 2 to
+  cover it.
 - **npm `start()` takes a `port` option.** It defaults to 0, so the operating
   system picks a free port as before. A fixed port is for dev setups where
   something needs the endpoint in advance, such as a second app or an `.env`

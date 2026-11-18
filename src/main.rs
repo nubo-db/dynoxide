@@ -1502,6 +1502,31 @@ mod tests {
     #[cfg(feature = "encryption")]
     use super::*;
 
+    /// The server's own wording for a taken port maps to 4; anything else,
+    /// including a near miss or a taken `--mcp-port`, stays 1.
+    #[cfg(any(feature = "http-server", feature = "mcp-server"))]
+    #[test]
+    fn only_the_taken_port_wording_exits_4() {
+        use super::{EXIT_PORT_IN_USE, exit_status_for};
+        for taken in [
+            "port 8000 is already in use (detected listener on 127.0.0.1:8000)",
+            "port 8000 is already in use (no listener answered, but Address in use). On Windows, a server stopped moments ago can hold the port until its connections close.",
+        ] {
+            assert_eq!(exit_status_for(taken), EXIT_PORT_IN_USE, "{taken}");
+        }
+        for other in [
+            "failed to bind 127.0.0.1:8001: Address already in use (os error 48)",
+            "Permission denied (os error 13)",
+            "port abc is already in use (x)",
+            "port  is already in use (x)",
+            "error: port 8000 is already in use (x)",
+            "the port 8000 is already in use",
+            "",
+        ] {
+            assert_eq!(exit_status_for(other), 1, "{other:?}");
+        }
+    }
+
     mod cli_parse_tests {
         use super::super::*;
 

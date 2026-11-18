@@ -28,10 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first. Before, Dynoxide started beside it. The check is in the library, so
   `server::start` in the `dynoxide-rs` crate refuses in the same way.
 - **The ports are bound before the database is touched or an import runs.**
-  `serve` binds them before it creates or opens the `--db-path` file and
-  scaffolds `--schema`, and `import --serve` before it imports. A taken port used to leave a new
-  database file behind, or turn up only after a full import. A client that
-  connects before the ready line now waits instead of being refused.
+  `serve` and `mcp --http` bind them before they create or open the
+  `--db-path` file, and `import --serve` before it imports. A port that was
+  taken or couldn't be bound used to leave a new database file behind, or
+  turn up only after a full import. A client that connects before the server
+  is ready now waits instead of being refused.
 
 ### Added
 

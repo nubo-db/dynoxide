@@ -1192,6 +1192,14 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
+    // Before the database is opened, as `serve` does, so a port that can't be
+    // bound leaves no new database file behind.
+    let listener = if args.http {
+        Some(dynoxide::mcp::bind_http_to(&args.host, args.port).await?)
+    } else {
+        None
+    };
+
     let db = open_database(&args.db_path, {
         #[cfg(feature = "encryption")]
         {
@@ -1214,7 +1222,7 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
         import: None,
     };
 
-    if args.http {
+    if let Some(listener) = listener {
         let opts = resolve_mcp_http_options(
             &args.host,
             args.port,
@@ -1222,8 +1230,15 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.no_auth,
             args.allowed_host.clone(),
         )?;
-        dynoxide::mcp::serve_http_with_options(db, opts, mcp_config, None, server_options(args.log))
-            .await
+        dynoxide::mcp::serve_http_on(
+            listener,
+            db,
+            opts,
+            mcp_config,
+            None,
+            server_options(args.log),
+        )
+        .await
     } else {
         dynoxide::mcp::serve_stdio(db, mcp_config).await
     }

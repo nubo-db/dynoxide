@@ -788,8 +788,7 @@ fn import_mcp_stdio_quiet_suppresses_the_data_model_line() {
 #[test]
 fn import_serve_quiet_still_stops_on_an_exposure() {
     let e = import::export();
-    // The exposure gate stops the run before the server binds, so port 0 is
-    // never bound and there is no port to lose.
+    // Port 0, so the port bound before the import can't clash with anything.
     let a = with_quiet(import::import_args(
         &e,
         &["--rules", &e.rules, "--serve", "--port", "0"],
@@ -808,7 +807,8 @@ fn import_serve_quiet_still_stops_on_an_exposure() {
 }
 
 /// `import --serve --mcp` stops when the MCP listener can't be bound, before
-/// the DynamoDB listener serves, instead of serving until it is signalled.
+/// it imports anything or the DynamoDB listener serves, instead of serving
+/// until it is signalled.
 #[cfg(feature = "import")]
 #[test]
 fn import_serve_mcp_stops_when_the_mcp_listener_cant_be_bound() {
@@ -835,6 +835,52 @@ fn import_serve_mcp_stops_when_the_mcp_listener_cant_be_bound() {
         "stderr doesn't report the MCP bind failure:\n{stderr}"
     );
     assert!(!stderr.contains("Dynoxide listening on"), "{stderr}");
+    assert!(!stderr.contains("Import complete:"), "{stderr}");
+}
+
+/// An import that runs to the end writes its report and the exposure block
+/// to stderr. With nobody reading it, neither may panic, or the release build
+/// aborts and the 3 is lost.
+#[cfg(feature = "import")]
+#[test]
+fn an_exposure_exits_3_when_no_one_reads_stderr() {
+    let e = import::export();
+    let out = tempfile::tempdir().unwrap();
+    let db = out.path().join("out.db");
+    let a = import::import_args(&e, &["--rules", &e.rules, "--output", db.to_str().unwrap()]);
+    let mut child = spawn(&a, &[]);
+    drop(child.stderr.take());
+    let output = wait_with_timeout(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(3), "status {}", output.status);
+}
+
+/// `mcp --http` binds before it opens the database, so a port it can't bind
+/// leaves no new database file behind.
+#[test]
+fn mcp_http_on_a_taken_port_leaves_no_database_file() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("new.db");
+    let a = args(&[
+        "mcp",
+        "--http",
+        "--port",
+        &port,
+        "--db-path",
+        db.to_str().unwrap(),
+    ]);
+    let output = wait_with_timeout(
+        spawn(&a, &[("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")]),
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr:\n{}",
+        stderr_of(&output)
+    );
+    assert!(!db.exists(), "a taken port left {} behind", db.display());
 }
 
 /// `import --serve --mcp` refuses one port for both listeners before it

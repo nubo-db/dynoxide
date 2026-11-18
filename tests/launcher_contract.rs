@@ -1102,7 +1102,6 @@ fn closing_stdin_stops_the_mcp_listener_too() {
 
 /// Run `serve` with `args` until it exits on its own, and return its exit code,
 /// stdout and stderr. Panics if it is still running after the ready timeout.
-#[cfg(feature = "mcp-server")]
 fn serve_until_exit(args: &[&str]) -> (Option<i32>, Vec<String>, String) {
     let mut server = Launched::spawn(serve(args), Stdio::piped());
     let status = server.wait_exit(READY_TIMEOUT);

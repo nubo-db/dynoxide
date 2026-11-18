@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Behaviour changes
 
-- **A taken `--port` exits `4` instead of `1`.** A script that checks for a
-  non-zero exit is unaffected; one that checks for exactly `1` needs to accept
-  `4` too.
+- **A taken `--port` on `serve` or `import --serve` exits `4` instead of
+  `1`.** A script that checks for a non-zero exit is unaffected; one that
+  checks for exactly `1` needs to accept `4` too. `mcp --http` still exits `1`.
 - **`--mcp-port` can't be the same as a fixed `--port`.** With `--mcp`,
   `serve` and `import --serve` exit `1` before binding anything when the two
   match, whatever the hosts. On macOS, an MCP listener on `127.0.0.1` could

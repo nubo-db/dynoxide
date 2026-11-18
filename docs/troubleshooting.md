@@ -20,7 +20,9 @@ and the reverse, because a `localhost` client may reach either.
 If the message says `no listener answered`, nothing answered on the port but
 binding it still failed, so something holds the port without listening on it.
 On Windows that can be a Dynoxide you stopped moments ago, which keeps the port
-until its connections close. Wait a few seconds and try again.
+until its connections close. Wait a few seconds and try again. Windows can
+also report a port held that way as access denied, which exits `1` with the
+reserved-range hint below, even though the port isn't reserved.
 
 A permission error isn't reported as a taken port, and exits `1`. On Linux and
 macOS that's usually a port below 1024. On Windows it can also be a port in a

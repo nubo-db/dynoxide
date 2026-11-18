@@ -321,7 +321,7 @@ nobody has to dig through stderr to find out why the server didn't start.
 | Exit | When |
 |---|---|
 | `4` | Something already listens on the port. That includes the wildcard address and the other loopback family (`[::1]` for `127.0.0.1`, and the reverse), since a `localhost` client may reach either. |
-| `4` | Nothing answers on the port, but binding it fails because it's in use. |
+| `4` | Nothing answers on the port, but binding it fails because it's in use. On Windows this can exit `1` instead: Windows may refuse the bind as access denied, the same error it gives for a reserved port, and Dynoxide can't tell the two apart. |
 | `1` | Any other startup failure. That includes a port the process isn't allowed to bind (a privileged port, or a range Windows has reserved) and an `--mcp-port` that can't be bound or is the same as a fixed `--port`. |
 
 With `--port 0` the operating system picks the port, so `4` never happens.

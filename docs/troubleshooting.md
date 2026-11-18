@@ -12,6 +12,21 @@ address for a loopback one, and loopback for the wildcard), so a Docker
 container published on `0.0.0.0:8000` blocks `dynoxide --port 8000` on
 `127.0.0.1` too. The address in brackets is where it found the listener.
 
+From 1.8.0, Dynoxide exits with status `4` here rather than `1`, so a script
+can tell a taken port from other startup failures. A listener on the other
+loopback family counts too: `[::1]:8000` blocks a `127.0.0.1:8000` request,
+and the reverse, because a `localhost` client may reach either.
+
+If the message says `no listener answered`, nothing answered on the port but
+binding it still failed, so something holds the port without listening on it.
+On Windows that can be a Dynoxide you stopped moments ago, which keeps the port
+until its connections close. Wait a few seconds and try again.
+
+A permission error isn't reported as a taken port, and exits `1`. On Linux and
+macOS that's usually a port below 1024. On Windows it can also be a port in a
+range Hyper-V or WSL has reserved, and
+`netsh interface ipv4 show excludedportrange protocol=tcp` lists those.
+
 Stop whatever holds the port, or pick another one. In a test suite, `--port 0`
 has the operating system choose a free port, and Dynoxide prints the one it
 got:

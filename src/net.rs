@@ -13,8 +13,12 @@ use std::net::SocketAddr;
 /// `SO_REUSEADDR`. `SO_EXCLUSIVEADDRUSE` closes that hole, at the cost
 /// that MSDN warns the port may not be rebindable while connections
 /// accepted by a previous instance are still terminating.
-pub(crate) fn bind_exclusive(addr: SocketAddr) -> Result<std::net::TcpListener, String> {
+///
+/// A failed bind or listen keeps its `io::ErrorKind`, so a caller can tell a
+/// taken port from any other failure without reading the OS's wording.
+pub(crate) fn bind_exclusive(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
+    use std::io::Error;
 
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -22,26 +26,28 @@ pub(crate) fn bind_exclusive(addr: SocketAddr) -> Result<std::net::TcpListener, 
         Domain::IPV4
     };
 
+    let context = |what: String| move |e: Error| Error::new(e.kind(), format!("{what}: {e}"));
+
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|e| format!("failed to create socket: {e}"))?;
+        .map_err(context("failed to create socket".into()))?;
 
     #[cfg(unix)]
     socket
         .set_reuse_address(true)
-        .map_err(|e| format!("failed to set SO_REUSEADDR: {e}"))?;
+        .map_err(context("failed to set SO_REUSEADDR".into()))?;
 
     #[cfg(windows)]
     set_exclusiveaddruse(&socket)?;
 
     socket
         .set_nonblocking(true)
-        .map_err(|e| format!("failed to set nonblocking: {e}"))?;
+        .map_err(context("failed to set nonblocking".into()))?;
     socket
         .bind(&addr.into())
-        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+        .map_err(context(format!("failed to bind {addr}")))?;
     socket
         .listen(1024)
-        .map_err(|e| format!("failed to listen on {addr}: {e}"))?;
+        .map_err(context(format!("failed to listen on {addr}")))?;
 
     Ok(std::net::TcpListener::from(socket))
 }
@@ -59,7 +65,7 @@ pub(crate) fn bind_exclusive_to(addr: &str) -> Result<std::net::TcpListener, Str
     for candidate in addrs {
         match bind_exclusive(candidate) {
             Ok(listener) => return Ok(listener),
-            Err(e) => last_err = e,
+            Err(e) => last_err = e.to_string(),
         }
     }
     Err(last_err)
@@ -68,7 +74,7 @@ pub(crate) fn bind_exclusive_to(addr: &str) -> Result<std::net::TcpListener, Str
 /// Set `SO_EXCLUSIVEADDRUSE` on a socket. socket2 does not expose this
 /// option, so it goes through raw `setsockopt`.
 #[cfg(windows)]
-fn set_exclusiveaddruse(socket: &socket2::Socket) -> Result<(), String> {
+fn set_exclusiveaddruse(socket: &socket2::Socket) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         SO_EXCLUSIVEADDRUSE, SOCKET, SOL_SOCKET, setsockopt,
@@ -87,9 +93,10 @@ fn set_exclusiveaddruse(socket: &socket2::Socket) -> Result<(), String> {
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "failed to set SO_EXCLUSIVEADDRUSE: {}",
-            std::io::Error::last_os_error()
+        let e = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("failed to set SO_EXCLUSIVEADDRUSE: {e}"),
         ));
     }
     Ok(())

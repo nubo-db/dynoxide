@@ -79,4 +79,9 @@ each on port 0 and read its port from that line, rather than choosing a free
 port itself and racing other processes to bind it. That needs the default
 logging mode, since quiet mode removes the line.
 
+A fixed `--port` that is already taken exits with status `4` rather than `1`,
+so a script can tell that apart from other startup failures.
+[Troubleshooting](troubleshooting.md#port-8000-is-already-in-use-detected-listener-on-1270018000)
+covers what counts as taken.
+
 `RUST_LOG` continues to control tracing independently.

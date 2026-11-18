@@ -124,7 +124,13 @@ A launcher handed a binary of unknown version reads `dynoxide --version`, which
 prints `dynoxide <product version>` on one line. That format is part of this
 contract too.
 
-`tests/launcher_contract.rs` holds all three, and `docs/launcher.md` describes
+From 1.8.0, `serve` exits `4` when the `--port` it was given is already taken,
+whether a listener answers on it or the bind fails because it is in use. Every
+other startup failure, a taken `--mcp-port` included, still exits `1`.
+Launchers rely on `4` to report a taken port without matching stderr text, so
+the status is part of this contract too.
+
+`tests/launcher_contract.rs` holds all of these, and `docs/launcher.md` describes
 the rest of what a launcher does.
 
 ## The storage backend seam

@@ -397,17 +397,232 @@ fn tables_from_a_schema_exist_once_the_ready_line_arrives() {
     assert!(body.contains("\"Launched\""), "body: {body}");
 }
 
-#[test]
-fn a_server_that_fails_to_bind_prints_no_ready_line() {
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = taken.local_addr().unwrap().port().to_string();
-    let mut server = Launched::spawn(serve(&["--port", &port, "--ready-json"]), Stdio::piped());
-    let status = server
-        .wait_exit(READY_TIMEOUT)
-        .expect("a server that can't bind should exit");
-    assert!(!status.success());
+// --- A fixed port that is taken ------------------------------------------
+
+/// The exit status for a `--port` that something else already holds.
+const EXIT_PORT_IN_USE: i32 = 4;
+
+/// What a server started on a fixed port did before it exited: its exit
+/// status, its stdout and its stderr. Panics if it is still running after
+/// the ready timeout, which means it bound a port it should have refused.
+fn start_and_expect_exit(host: &str, port: u16) -> (Option<i32>, Vec<String>, String) {
+    let port = port.to_string();
+    let mut server = Launched::spawn(
+        serve(&[
+            "--host",
+            host,
+            "--port",
+            &port,
+            "--ready-json",
+            "--exit-with-parent",
+        ]),
+        Stdio::piped(),
+    );
+    let status = server.wait_exit(READY_TIMEOUT);
     let stdout = server.stdout_after_finish();
+    let stderr = server.stderr_text();
+    let status =
+        status.unwrap_or_else(|| panic!("the server started on {host}:{port}; stderr:\n{stderr}"));
+    (status.code(), stdout, stderr)
+}
+
+/// Assert the run exited with the taken-port status, printed no ready line,
+/// and named the port on stderr.
+fn assert_port_in_use(result: (Option<i32>, Vec<String>, String), port: u16) {
+    let (code, stdout, stderr) = result;
+    assert_eq!(code, Some(EXIT_PORT_IN_USE), "stderr:\n{stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stderr.contains(&format!("port {port} is already in use")),
+        "stderr doesn't name the port:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_port_another_listener_holds_exits_with_the_port_in_use_status() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    assert_port_in_use(start_and_expect_exit("127.0.0.1", port), port);
+}
+
+#[test]
+fn a_wildcard_listener_on_the_port_counts_as_taken() {
+    let taken = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    assert_port_in_use(start_and_expect_exit("127.0.0.1", port), port);
+}
+
+/// A `localhost` client may try either loopback family first, so a listener
+/// on the other one would take some of the requests meant for Dynoxide.
+#[test]
+fn a_listener_on_the_other_loopback_family_counts_as_taken() {
+    let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("skipped: this machine has no IPv6 loopback");
+        return;
+    };
+    let port = v6.local_addr().unwrap().port();
+    assert_port_in_use(start_and_expect_exit("127.0.0.1", port), port);
+    drop(v6);
+
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = v4.local_addr().unwrap().port();
+    assert_port_in_use(start_and_expect_exit("[::1]", port), port);
+}
+
+/// A socket bound to the port but not listening doesn't answer the probe, so
+/// the conflict only shows up when Dynoxide binds. The holder is made with
+/// socket2 and without `SO_REUSEADDR`: `std::net::TcpListener` sets that and
+/// always listens, and Linux would then let Dynoxide's bind through.
+#[test]
+fn a_port_bound_without_a_listener_exits_with_the_port_in_use_status() {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let holder = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+    let any: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    holder.bind(&any.into()).unwrap();
+    let port = holder
+        .local_addr()
+        .unwrap()
+        .as_socket()
+        .expect("an IP socket")
+        .port();
+
+    let result = start_and_expect_exit("127.0.0.1", port);
+    // Windows may report this as WSAEACCES (10013) rather than
+    // WSAEADDRINUSE (10048) when the holder's bind is exclusive. 10013 also
+    // means a reserved port range, so it stays exit 1 with a hint that says
+    // so. Report which one this runner gave.
+    if cfg!(windows) && result.0 == Some(1) {
+        eprintln!("windows reported a bound, non-listening port as access denied (10013)");
+        assert!(
+            result.2.contains("excludedportrange"),
+            "exit 1 without the reserved-range hint:\n{}",
+            result.2
+        );
+        return;
+    }
+    if cfg!(windows) {
+        eprintln!("windows reported a bound, non-listening port as in use (10048)");
+    }
+    assert!(
+        result.2.contains("no listener answered"),
+        "the bind-path message doesn't say no listener answered:\n{}",
+        result.2
+    );
+    assert_port_in_use(result, port);
+}
+
+/// A port the process isn't allowed to bind is not a taken port, so it keeps
+/// the generic start failure.
+#[cfg(unix)]
+#[test]
+fn a_privileged_port_is_not_reported_as_taken() {
+    if std::net::TcpListener::bind("127.0.0.1:1").is_ok() {
+        eprintln!(
+            "skipped: this process may bind port 1 (root, or a lowered unprivileged port floor)"
+        );
+        return;
+    }
+    let (code, stdout, stderr) = start_and_expect_exit("127.0.0.1", 1);
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        !stderr.contains("already in use"),
+        "a permission error was reported as a taken port:\n{stderr}"
+    );
+}
+
+/// The first port of a range Windows has reserved (Hyper-V and WSL take
+/// some), read from `netsh`. None when the machine has no such range.
+#[cfg(windows)]
+fn an_excluded_port() -> Option<u16> {
+    let out = Command::new("netsh")
+        .args([
+            "interface",
+            "ipv4",
+            "show",
+            "excludedportrange",
+            "protocol=tcp",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let start: u16 = fields.next()?.parse().ok()?;
+            let _end: u16 = fields.next()?.parse().ok()?;
+            // A reserved range is only useful here if nothing listens on it.
+            TcpStream::connect(("127.0.0.1", start))
+                .is_err()
+                .then_some(start)
+        })
+}
+
+#[cfg(windows)]
+#[test]
+fn a_reserved_port_range_is_not_reported_as_taken() {
+    let Some(port) = an_excluded_port() else {
+        eprintln!("skipped: this runner has no excluded TCP port range");
+        return;
+    };
+    let (code, _, stderr) = start_and_expect_exit("127.0.0.1", port);
+    assert_eq!(code, Some(1), "port {port}; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("excludedportrange"),
+        "no reserved-range hint for port {port}:\n{stderr}"
+    );
+}
+
+/// Restarting on the same fixed port straight after a clean stop, with a
+/// client's connection still open at the time of the stop. Unix rebinds past
+/// the old sockets. Windows may refuse while they close, and if it does, the
+/// message says so rather than leaving someone to hunt for a listener.
+#[test]
+fn a_restart_on_the_same_fixed_port_starts_or_explains_why_not() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let port_arg = port.to_string();
+    let args = [
+        "--port",
+        port_arg.as_str(),
+        "--ready-json",
+        "--exit-with-parent",
+    ];
+
+    let mut first = Launched::spawn(serve(&args), Stdio::piped());
+    let endpoint = first.ready_line()["endpoint"].as_str().unwrap().to_owned();
+    assert_eq!(list_tables(&endpoint).0, 200);
+    let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    drop(first.child.stdin.take());
+    let status = first
+        .wait_exit(STOP_TIMEOUT)
+        .expect("the first server kept running after stdin closed");
+    assert!(status.success(), "exit status {status}");
+    first.finish();
+
+    let mut second = Launched::spawn(serve(&args), Stdio::piped());
+    match second.stdout_lines.recv_timeout(READY_TIMEOUT) {
+        Ok(line) => assert!(line.contains("\"ready\""), "unexpected stdout: {line}"),
+        Err(_) => {
+            let code = second.wait_exit(READY_TIMEOUT).and_then(|s| s.code());
+            second.finish();
+            let stderr = second.stderr_text();
+            if !cfg!(windows) {
+                panic!("the restart failed off Windows ({code:?}):\n{stderr}");
+            }
+            assert_eq!(code, Some(EXIT_PORT_IN_USE), "stderr:\n{stderr}");
+            assert!(
+                stderr.contains("connections close"),
+                "the refusal doesn't explain a recently stopped server:\n{stderr}"
+            );
+            eprintln!("windows refused the immediate restart on port {port}");
+        }
+    }
+    drop(client);
 }
 
 #[test]

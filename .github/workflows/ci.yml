@@ -107,6 +107,23 @@ jobs:
       - name: Test the launcher contract
         run: cargo test --test launcher_contract -- --test-threads=1
 
+  # A taken port is reported the same way on every OS, and macOS has its own
+  # rules for binding (a non-root user may bind 0.0.0.0 on a privileged port,
+  # but not 127.0.0.1), so the launcher contract runs here too.
+  test-macos:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test (macos)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test the launcher contract
+        run: cargo test --test launcher_contract -- --test-threads=1
+
   # `rust-version` is part of the published Rust API contract in
   # docs/versioning.md, so it is a promise rather than a description. Every
   # other job runs on stable, which cannot see a language feature that raises

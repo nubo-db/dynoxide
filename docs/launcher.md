@@ -1,6 +1,7 @@
 # Writing a launcher
 
-**Status: launcher contract 1. Needs Dynoxide 1.7.0 or later.**
+**Status: launcher contract 2. Needs Dynoxide 1.7.0 or later. The exit status
+for a taken port needs 1.8.0.**
 
 This is for anyone wrapping Dynoxide for another language: an npm `start()`,
 a Composer package for PHPUnit, a pytest fixture, a JVM test helper. Each of
@@ -227,6 +228,12 @@ at all.
   port, so parallel test processes never collide. Don't reuse a server you
   find already listening on a fixed port: you can't tell it's yours, or even
   that it's Dynoxide.
+- **A fixed port is for dev setups.** Some setups need the endpoint known in
+  advance: a second app, an `.env` holding `AWS_ENDPOINT_URL_DYNAMODB`, or
+  NoSQL Workbench. A wrapper can offer a port option for those, passed as
+  `--port N`, with 0 as its default. Keep test suites on port 0. If the port
+  is taken, the server exits `4` before the ready line (see below). Report
+  which port it was, and don't retry.
 - **Check the binary exists first.** Some runtimes report a successful spawn
   for a missing file and let the child exit `127` (PHP 8.1 and 8.2 do). Check
   the file before spawning, and treat an exit of `126` or `127` before the
@@ -293,6 +300,22 @@ Treat as errors, never warnings:
   configurable
 - the process exiting before the ready line
 - a line that doesn't parse, or has `port` 0
+
+If you started the server on a fixed port and it exits `4` before the ready
+line, that port is taken. Report it as its own error and name the port, so
+nobody has to dig through stderr to find out why the server didn't start.
+
+| Exit | When |
+|---|---|
+| `4` | Something already listens on the port. That includes the wildcard address and the other loopback family (`[::1]` for `127.0.0.1`, and the reverse), since a `localhost` client may reach either. |
+| `4` | Nothing answers on the port, but binding it fails because it's in use. |
+| `1` | Any other startup failure. That includes a port the process isn't allowed to bind (a privileged port, or a range Windows has reserved) and a taken `--mcp-port`. |
+
+With `--port 0` the operating system picks the port, so `4` never happens.
+
+Binaries before 1.8.0 exit `1` for a taken port, the same as any other
+startup failure, and never exit `4`. A wrapper that accepts them falls back to
+its general start error there, and the stderr tail still names the port.
 
 Include the last lines of stderr in the error. A server that failed to start
 should fail the test run, not show up later as a pile of confusing test
@@ -492,6 +515,9 @@ version that adds it, and a later pre-release of that version never adds one.
 Wrappers compare only `X.Y.Z`, so a flag that arrived in `rc.2` would crash
 them on `rc.1`.
 
+- **Launcher contract 2** (Dynoxide 1.8.0): exit status `4` for a taken
+  `--port`, and a fixed port as an option for dev setups. A wrapper that
+  always passes `--port 0` sees no change.
 - **Launcher contract 1** (Dynoxide 1.7.0): first draft. Corrected after the
   first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the
   cache path, pre-releases in the version check, spawns that report success

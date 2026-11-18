@@ -451,9 +451,29 @@ async fn main() {
     }
 
     if let Err(e) = run(cli).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        let message = e.to_string();
+        eprintln!("error: {message}");
+        std::process::exit(exit_status_for(&message));
     }
+}
+
+/// Exit status for a `serve` whose `--port` is already taken: a listener
+/// answered on it, or binding it failed because it is in use. Distinct from 1
+/// so a launcher that asked for a fixed port can say so without reading
+/// stderr. `docs/launcher.md` documents it.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+const EXIT_PORT_IN_USE: i32 = 4;
+
+/// The exit status for an error `run` returned. The DynamoDB listener reports
+/// a taken port as `port N is already in use (...)`, and this crate's own
+/// tests pin that wording, so matching it here is not matching OS text.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+fn exit_status_for(message: &str) -> i32 {
+    let taken = message
+        .strip_prefix("port ")
+        .and_then(|rest| rest.split_once(" is already in use"))
+        .is_some_and(|(port, _)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    if taken { EXIT_PORT_IN_USE } else { 1 }
 }
 
 // When only the import feature is enabled (no async runtime needed)

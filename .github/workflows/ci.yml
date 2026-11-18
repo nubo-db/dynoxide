@@ -224,6 +224,11 @@ jobs:
       - name: Clippy (MCP without HTTP, with the CLI)
         run: cargo clippy --no-default-features --features native-sqlite,mcp-server,cli --all-targets -- -D warnings
 
+      # The CLI's own tests in the MCP build with import and without HTTP,
+      # where clap has refused flags that name --serve.
+      - name: CLI tests (MCP and import without HTTP)
+        run: cargo test --bin dynoxide --no-default-features --features native-sqlite,import,mcp-server,cli
+
       - name: Format
         run: cargo fmt --check
 

@@ -306,7 +306,21 @@ struct ImportArgs {
     source: std::path::PathBuf,
 
     /// Output SQLite database file path (mutually exclusive with --serve/--mcp)
-    #[arg(long, conflicts_with_all = ["serve", "mcp"])]
+    // Each flag only exists with its feature, and clap refuses to build the
+    // command if a conflict names a missing one.
+    #[cfg_attr(
+        all(feature = "http-server", feature = "mcp-server"),
+        arg(long, conflicts_with_all = ["serve", "mcp"])
+    )]
+    #[cfg_attr(
+        all(feature = "http-server", not(feature = "mcp-server")),
+        arg(long, conflicts_with = "serve")
+    )]
+    #[cfg_attr(
+        all(not(feature = "http-server"), feature = "mcp-server"),
+        arg(long, conflicts_with = "mcp")
+    )]
+    #[cfg_attr(not(any(feature = "http-server", feature = "mcp-server")), arg(long))]
     output: Option<std::path::PathBuf>,
 
     /// Schema file (JSON with DescribeTable responses)
@@ -1636,6 +1650,7 @@ mod tests {
             assert!(stdio(&[
                 "dynoxide", "import", "--source", "x", "--schema", "s", "--mcp"
             ]));
+            #[cfg(feature = "http-server")]
             assert!(!stdio(&[
                 "dynoxide", "import", "--source", "x", "--schema", "s", "--mcp", "--serve"
             ]));
@@ -1794,7 +1809,11 @@ mod tests {
 
             let mut args = Vec::new();
             env_backed_args(&Cli::command(), "dynoxide", &mut args);
-            assert!(!args.is_empty(), "expected env-backed flags to check");
+            // Only the HTTP server and the MCP server have env-backed flags. In
+            // those builds an empty list means the walk found nothing.
+            if cfg!(any(feature = "http-server", feature = "mcp-server")) {
+                assert!(!args.is_empty(), "expected env-backed flags to check");
+            }
             for (flag, env, hidden) in &args {
                 assert!(
                     *hidden || ENV_VALUES_SHOWN_IN_HELP.contains(&env.as_str()),

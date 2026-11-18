@@ -229,6 +229,10 @@ jobs:
       - name: CLI tests (MCP and import without HTTP)
         run: cargo test --bin dynoxide --no-default-features --features native-sqlite,import,mcp-server,cli
 
+      # And with import alone, where --output has no flag to conflict with.
+      - name: CLI tests (import without either server)
+        run: cargo test --bin dynoxide --no-default-features --features native-sqlite,import
+
       - name: Format
         run: cargo fmt --check
 

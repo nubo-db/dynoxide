@@ -1627,6 +1627,16 @@ mod tests {
     #[cfg(feature = "encryption")]
     use super::*;
 
+    /// clap checks the command's definition only when it's built in a debug
+    /// build, and refuses one that names a flag this build doesn't have. Every
+    /// feature build runs this, so each finds that out here rather than on
+    /// someone's first `import`.
+    #[test]
+    fn the_command_line_is_valid_in_this_build() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+
     /// The server's own wording for a taken port maps to 4; anything else,
     /// including a near miss or a taken `--mcp-port`, stays 1.
     #[cfg(any(feature = "http-server", feature = "mcp-server"))]

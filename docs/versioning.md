@@ -14,7 +14,7 @@ lives in `Cargo.toml`.
 
 They were one number until 1.1.0. The split happened because a change to a
 public Rust type forced a major on every artefact whose users never touch the
-Rust API, and stranding everyone on `^1.x` and `dynoxide:1` to report a change
+Rust API. Stranding everyone on `^1.x` and `dynoxide:1` to report a change
 they cannot observe is a poor trade. The current mapping is product **1.7.0**,
 crate **4.0.0**.
 
@@ -38,14 +38,13 @@ not something the engine enforces, so it carries no version promise. Its
 `serverInfo.version` reports the product version because that is what the user
 installed.
 
-MSRV is the exception inside the Rust row. It is named there because the crate
-number describes it, not because every move in it breaks a consumer: raising it
-ships as a minor. Where the two tables could be read against each other, the one
-below is the authority.
+MSRV is the odd one out in the Rust row. It's listed there because the crate
+number describes it, not because every move in it breaks a consumer. Raising
+it ships as a minor. If the two tables seem to disagree, the one below wins.
 
 ## What forces what
 
-"Breaking" is doing work in the first row. Adding a public type or function is
+Note the word "breaking" in the first row. Adding a public type or function is
 additive and ships as a minor; changing or removing one is not.
 
 | Change | Stream | Version |
@@ -88,8 +87,8 @@ The startup line reads `Dynoxide listening on http://<host>:<port>` and goes to
 wrong stream waits forever. `--log quiet` suppresses the startup line; a wait
 on `GET /` works with either logging mode.
 
-`tests/container_contract.rs` holds both. Worth knowing if you change either:
-the container's own `HEALTHCHECK` reads the status line and never the body, so
+`tests/container_contract.rs` holds both. If you change either, note that the
+container's own `HEALTHCHECK` reads the status line and never the body, so
 without those tests nothing would notice the body change.
 
 ## What a launcher reads
@@ -104,9 +103,11 @@ bound, the server prints a single JSON object to **stdout**:
 
 With the flag, stdout carries this line and nothing else: tracing goes to
 stderr instead, whatever `RUST_LOG` asks for. The line prints even with
-`--log quiet`. `host` is the address bound; `endpoint` is the URL to give an
-SDK, so a wildcard bind (`0.0.0.0` or `[::]`) reports the loopback address of
-the same family there. `version` is the product version.
+`--log quiet`.
+
+`host` is the address bound. `endpoint` is the URL to give an SDK, so after a
+wildcard bind (`0.0.0.0` or `[::]`) it holds the loopback address of the same
+family. `version` is the product version.
 
 `schema` versions the line's shape. A new field can arrive in any minor
 release, so read the fields you need and ignore the rest. Removing or renaming
@@ -146,19 +147,20 @@ release. Were it open, each of those would have been a break, and an engine
 growing its own storage layer would reach a new major every few months.
 
 So adding a method to it is not a break, and the trait keeps pace with the
-engine inside a crate major. You can name it and use it as a bound; you cannot implement
-it. If third-party backends ever earn their place, unsealing is a minor.
+engine inside a crate major. You can name it and use it as a bound, but you
+can't implement it. If third-party backends ever earn their place, unsealing is
+a minor.
 
 ## The MCP server type
 
 `mcp::McpServer` is public and implements rmcp's `ServerHandler`. That impl is
-not a supported surface. It is there because the transport needs it, not so a
-third party can host `McpServer` inside their own rmcp server, and the type's
-own methods take Dynoxide types only.
+not a supported surface. It exists because the transport needs it, not so a
+third party can host `McpServer` inside their own rmcp server. The type's own
+methods take Dynoxide types only.
 
-So an rmcp major ships under the dependency row above, as a patch, and does not
-take the crate major with it. The alternative is a new crate major every time
-rmcp cuts one, for a surface this page already declines to version.
+So an rmcp major ships under the dependency row above, as a patch, and doesn't
+bump the crate major. Otherwise every rmcp major would force a new crate major,
+for a surface this page already declines to version.
 
 ## Conformance fixes are the exception
 
@@ -168,11 +170,12 @@ would be a major, and a project correcting its own divergences would reach
 8.0.0 inside a year, stranding a cohort of users at each one.
 
 So conformance fixes ship as **minors**, on one condition: there must be a
-recorded observation of the AWS behaviour being matched. A capture naming
-region, date and request, a conformance suite result, or an equivalent
-artefact. No recorded observation, no exception, and the change takes a major.
+recorded observation of the AWS behaviour being matched, such as a capture
+naming region, date and request, a conformance suite result, or an equivalent
+artefact. With no recorded observation there's no exception, and the change
+takes a major.
 
-That condition is load-bearing. Without it, "this matches AWS more closely" is a
+The condition matters. Without it, "this matches AWS more closely" is just a
 claim Dynoxide makes about its own change, and any behaviour change at all could
 be filed under it.
 
@@ -238,13 +241,13 @@ so a prerelease tag never reaches it.
 
 ## The browser engine
 
-`@dynoxide/wasm-engine` is versioned with the other installable artefacts and covered by the
-same rules.
+`@dynoxide/wasm-engine` is versioned with the other installable artefacts and
+covered by the same rules.
 
-It is a scored target in the conformance suite. Current results are published
-alongside every other target and are not quoted here, because a figure written
-into this page is stale by the next release. Two exclusions are structural, and
-worth knowing before you rely on it:
+It is a scored target in the conformance suite. Its current results are
+published alongside every other target and aren't quoted here, because a figure
+written into this page is stale by the next release. Two exclusions are
+structural, and worth knowing before you rely on it:
 
 - **Unimplemented operations.** `TransactWriteItems`, streams, tags and TTL are
   not implemented. The suite skips them rather than failing them, so they do not
@@ -254,14 +257,14 @@ worth knowing before you rely on it:
   conformance runs.
 
 `manifest.json` carries a `contractVersion` alongside the engine version. It
-stamps the message-envelope shape rather than the engine, moves on its own
-schedule, and the client validates it on boot.
+stamps the message-envelope shape rather than the engine, and moves on its own
+schedule. The client validates it on boot.
 
 ## The platform packages
 
 `@dynoxide/darwin-arm64` and its siblings carry no contract. The `dynoxide`
 wrapper pins them to exact versions and resolves them internally. Depend on
-`dynoxide`; never on a platform package directly.
+`dynoxide`, never on a platform package directly.
 
 ## Where behaviour changes are recorded
 

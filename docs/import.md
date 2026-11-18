@@ -146,48 +146,57 @@ dynoxide import \
   --output anonymised.db
 ```
 
-For each item the importer resolves the entity (by the type attribute,
-`_type` by default, or failing that by which entity's key templates reproduce
-the item's keys), notes which of `pk`, `sk` and the GSI keys the entity builds
-from a template such as `user#${email}`, applies the rules to the attributes,
-then renders those keys again. The prefix survives, and the key and the
-attribute agree by construction, so a rule on `email` is all a `User` entity
-needs. Which model attributes hold the primary key comes from the schema's
-`indexes.primary`, the DynamoDB attribute names come from the `--schema` file,
-and GSI keys are matched by index name, so the OneTable index `name` must
-match the DynamoDB index.
+For each item the importer:
+
+1. resolves the entity, by the type attribute (`_type` by default) or, failing
+   that, by which entity's key templates reproduce the item's keys
+2. notes which of `pk`, `sk` and the GSI keys the entity builds from a template
+   such as `user#${email}`
+3. applies the rules to the attributes
+4. renders those keys again.
+
+The prefix survives, and the key and the attribute agree by construction, so a
+rule on `email` is all a `User` entity needs.
+
+The schema's `indexes.primary` says which model attributes hold the primary
+key, and the DynamoDB attribute names come from the `--schema` file. GSI keys
+are matched by index name, so the OneTable index `name` must match the
+DynamoDB index.
 
 Only a key that is actually rebuilt takes part in that check. One left holding
 its original value has already been reported as a template that does not
 reproduce, which is the accurate diagnostic for it.
 
-A model describes one table. When rules are given, an export holding more
-than one needs `--tables` naming the one the model describes; without it the
-import refuses to start, since every row of the other tables would match no
-entity. With no rules the model rebuilds nothing and is never matched against
-a row, so a run that passes it only for serving can cover every table.
+A model describes one table. When rules are given and the export holds more
+than one table, pass `--tables` naming the one the model describes. Without
+it the import refuses to start, since every row of the other tables would
+match no entity. With no rules the model rebuilds nothing and is never matched
+against a row, so a run that passes it only for serving can cover every table.
 
 Templates follow OneTable's own forms: `${name}`, a dotted path that reaches
 into a map (`${address.city}`), and `${name:length:pad}` sort padding, which
 prefixes the value with `pad` (default `0`, as OneTable treats an empty one)
 until it is `length` characters.
-An unclosed `${` fails the import rather than leaving a key silently
-unrebuilt, and so does a key built from another templated key, which could
-only be rendered correctly in dependency order.
+
+Two template shapes fail the import rather than leaving a key silently
+unrebuilt: an unclosed `${`, and a key built from another templated key, which
+could only be rendered correctly in dependency order.
 
 An item carrying the type attribute is matched by it. One that does not is
 matched on the shape of its keys, constant templates included, since a
 constant `sk` is often the only thing separating two entities that share a
 partition template.
 
-An index counts when the entity templates either of its keys, so a GSI that
-hashes on a plain attribute such as a tenant id and sorts on
-`user#${email}` still gets its sort key rebuilt. The OneTable index's `name`
-has to match the DynamoDB index, since OneTable otherwise defaults it to the
-schema key (`gs1`) and the importer cannot tell which index is meant. It
-reports any index in the model that the table does not have, and counts the
-items that carry a key of an index the model never names, since that index is
-the one the model meant and its keys were not rebuilt.
+An index counts when the entity templates either of its keys. So a GSI that
+hashes on a plain attribute such as a tenant id and sorts on `user#${email}`
+still gets its sort key rebuilt.
+
+The OneTable index's `name` has to match the DynamoDB index. Otherwise
+OneTable defaults it to the schema key (`gs1`) and the importer can't tell
+which index is meant. The importer reports any index in the model that the
+table doesn't have. It also counts the items that carry a key of an index the
+model never names, since that index is the one the model meant and its keys
+were not rebuilt.
 
 **Local secondary indexes are not rebuilt.** OneTable declares one with a sort
 key and no hash key, so it never reaches the model as an index the importer
@@ -197,27 +206,27 @@ says so when the table has any.
 A key is only rewritten when its template reproduces the value the item
 arrived with. A key the template cannot reproduce, or that names an attribute
 the item does not carry, is left as it is and reported once per entity and
-key. That last case is the one to watch for: an `Order` item whose `pk` holds
-the customer's email but which has no attribute holding that email cannot be
-rebuilt, because there is nothing to derive it from. Give the entity an
+key. Watch for that last case. Say an `Order` item's `pk` holds the
+customer's email, but no attribute on the item holds that email: the key
+can't be rebuilt, because there is nothing to derive it from. Give the entity an
 attribute for the value and put it in the template.
 
 **Name that attribute the same on every entity that shares the value, and
-list the name in `[consistency] fields`.** Both halves are load-bearing,
-because consistency is keyed on the attribute name. An `Order` carrying
-`customerEmail` where the `Customer` carries `email` is two namespaces, so
-the same real address anonymises to two different values, both keys rebuild
-correctly, and the order lands in a different partition from its customer.
+list the name in `[consistency] fields`.** You need both, because consistency
+is keyed on the attribute name. An `Order` carrying `customerEmail` where the
+`Customer` carries `email` is two namespaces. The same real address
+anonymises to two different values, both keys rebuild correctly, and the order
+lands in a different partition from its customer.
 The same name in both places with no `[consistency]` entry fails the same
 way, since each item is then anonymised independently. Name it `email` on
 both and list `email`, and the order stays in its customer's partition.
 
 The importer enforces the second half. When two entities build the same key
 from the same template, an anonymised attribute that template reads has to be
-consistency-tracked, or their keys cannot agree. That is a warning when the
-model says it could happen, and an error once the anonymisation is seen to take
-one original key to two different values. That is usually two entities
-disagreeing, but one entity is enough on its own: many rows sharing a
+consistency-tracked, or their keys can't agree. It's a warning when the model
+says this could happen, and an error once the anonymisation is seen to take
+one original key to two different values. Usually that's two entities
+disagreeing, but one entity can do it on its own: many rows sharing a
 partition, each drawing its own fake, leave that partition split the same way.
 
 ```
@@ -247,20 +256,24 @@ in their partitions, so nothing is lost from a query on the partition, but a
 query matching that gs1sk exactly used to return them together and will not now
 ```
 
-It groups on the key attribute rather than the template text, so the ordinary
-single-table join is covered: a `Customer` keyed `CUSTOMER#${email}` and an
-`Order` keyed `CUSTOMER#${customerEmail}` build the same partition from
+The check groups on the key attribute rather than the template text, so it
+covers the ordinary single-table join. A `Customer` keyed `CUSTOMER#${email}`
+and an `Order` keyed `CUSTOMER#${customerEmail}` build the same partition from
 differently named attributes, and requiring identical template text would miss
-it. What it compares is the whole key value rather than one attribute the
-template reads, so two composite keys that merely share a component are left
-alone:
+it.
+
+It compares the whole key value rather than one attribute the template reads,
+so two composite keys that merely share a component are left alone.
 `TENANT#a#${email}` and `TENANT#b#${email}` never agreed and have no join to
-lose. It fails on what the anonymisation actually produced, rather than on the
-model or on a shared input, so importing one entity's slice still works, and
-so does a deterministic action such as `hash`, which takes both entities to
-the same result and keeps them joined without any `[consistency]` entry at
-all. Every outcome for a key is kept rather than the first, so a break is
-found whatever order the export happens to be in.
+lose.
+
+It fails on what the anonymisation actually produced, rather than on the model
+or on a shared input. So importing one entity's slice still works, and so does
+a deterministic action such as `hash`, which takes both entities to the same
+result and keeps them joined without any `[consistency]` entry at all.
+
+Every outcome for a key is kept, not just the first, so a break is found
+whatever order the export happens to be in.
 
 The field it names is always a top-level one, because that is what
 `[consistency] fields` is keyed on. A template reading `${contact.email}`
@@ -268,12 +281,13 @@ is reported as `contact`.
 
 ### Limits
 
-One export file may yield at most 50 GB, inflated or not. Past that the import
-fails rather than stopping at the limit, since a file that stops quietly reads
-as a short export that imported cleanly. A single line may be at most 4 MB,
-about ten times the largest DynamoDB item; a longer one is skipped and
-reported, and it is never held in memory past the limit. An item nests at most
-32 levels, as in DynamoDB.
+- **One export file** may yield at most 50 GB, inflated or not. Past that the
+  import fails rather than stopping at the limit, since a file that stops
+  quietly reads as a short export that imported cleanly.
+- **A single line** may be at most 4 MB, about ten times the largest DynamoDB
+  item. A longer one is skipped and reported, and it is never held in memory
+  past the limit.
+- **An item** nests at most 32 levels, as in DynamoDB.
 
 ### Scoping a rule to tables
 
@@ -288,8 +302,8 @@ tables = ["Orders"]
 ```
 
 The scope matters most with `--tables`. A rule for a table the run leaves out
-has nothing to do, and is reported as not applied rather than as having
-anonymised nothing, which is what an unscoped rule that fires on no item is.
+has nothing to do, so it's reported as not applied. An unscoped rule that
+fires on no item is reported differently, as having anonymised nothing.
 
 A table name the schema file does not have is an error, and the run stops
 before it reads any data. A rule scoped to `Usres` would otherwise apply to
@@ -298,32 +312,40 @@ nothing and pass for one whose table was left out on purpose.
 ### Exit codes
 
 An import that leaves an original value in the output exits **3** rather than
-0. That covers what the run actually saw: a rule that anonymised nothing, a
-key whose template could not rebuild it, a key the model never templated that
-still holds a value a rule replaced, items matching no entity, keys of an
-index the model never names on a table whose model names an index it lacks,
-and values a `mask` kept whole. Each one
-is printed again at the end under the count, so the reason is in front of you.
-`--serve` and `--mcp` are gated the same way, before any server starts.
+0. That covers what the run actually saw:
+
+- a rule that anonymised nothing
+- a key whose template could not rebuild it
+- a key the model never templated that still holds a value a rule replaced
+- items matching no entity
+- keys of an index the model never names, on a table whose model names an
+  index it lacks
+- values a `mask` kept whole.
+
+Each one is printed again at the end under the count, so the reason is in
+front of you. `--serve` and `--mcp` are gated the same way, before any server
+starts.
 
 `--accept-exposure` returns those runs to 0 for the cases you have looked at
 and accept. Everything else is unchanged: 0 is a clean import, 1 is a failure,
 and 3 is a run that finished while leaving something behind.
 
 A warning on its own does not change the exit code. Every message the import
-raises carries a concern, decided where it is raised: an *exposure* is a value
-the run saw reach the output, and a *caution* is something it could not do or
-could not check. Only exposures change the exit code, which is why they are
-printed separately, and `ImportSummary::notices` carries each message with
-its concern for anyone using the crate.
+raises carries a concern, decided where it is raised:
+
+- an *exposure* is a value the run saw reach the output
+- a *caution* is something it could not do or could not check.
+
+Only exposures change the exit code, which is why they are printed
+separately. If you're using the crate, `ImportSummary::notices` carries each
+message with its concern.
 
 ### What the check cannot see
 
-It compares the key values two rows arrived with, so it only finds a break
-where rows shared a key value and stopped sharing one. That leaves shapes it
-is blind to, and they fail the way everything else here fails, which is
-quietly. Read this before treating a clean run as proof the relationships
-survived.
+The check compares the key values two rows arrived with, so it only finds a
+break where rows shared a key value and stopped sharing one. That leaves
+shapes it can't see, and they fail quietly, like everything else here. Read
+this before treating a clean run as proof the relationships survived.
 
 - **A key built by embedding rather than repeating.** An adjacency-list or
   hierarchical design where a child's sort key carries its parent's id as a
@@ -349,17 +371,20 @@ the import; everything else on this page is reported and the run still exits
 The check holds a million distinct keys per template. Past that it keeps
 checking the keys it already has and says how many it could not take on, so
 a very large import is told its check was partial rather than left to look
-clean. In file mode nothing is written on the
-error path, so a failed import leaves no database rather than a broken one.
-The library entry point `run_into` writes into a database you supply, so
-there a failure on a later table leaves the earlier ones in place. Entities that merely reuse a
-key name cost nothing, because what is compared is the whole key value an item
-arrived with: `account#${id}` and `project#${id}` are different entities' own
-ids, and `account#a1` never equalled `project#p1`. Two entities neither of whose sources
-a rule rewrites are left alone too, since their keys still agree. One
-rewritten entity beside one that keeps its value is the ordinary break, an
-`Order` still keyed on the real address after its `Customer` has moved, and
-that is reported the same way.
+clean.
+
+In file mode nothing is written on the error path, so a failed import leaves
+no database rather than a broken one. The library entry point `run_into`
+writes into a database you supply, so there a failure on a later table leaves
+the earlier ones in place.
+
+Entities that merely reuse a key name cost nothing, because what is compared
+is the whole key value an item arrived with. `account#${id}` and
+`project#${id}` are different entities' own ids, and `account#a1` never
+equalled `project#p1`. Two entities whose sources no rule rewrites are left
+alone too, since their keys still agree. One rewritten entity beside one that
+keeps its value is the ordinary break (an `Order` still keyed on the real
+address after its `Customer` has moved), and that is reported the same way.
 
 **Prefer `hash`, or a seeded `safe_email`, for an attribute a key is built
 from.** The other actions each go wrong in their own way, and the importer
@@ -377,17 +402,18 @@ Collisions are counted whichever way they arise, and the overwritten item's
 index entries go with it, so the output stays internally consistent even when
 rows are lost.
 
-**The salt is the security property, not a formality.** `hash` is required to
-take one because an unkeyed digest of a low-entropy value is trivially
-reversible: an attacker with the hashed output hashes a wordlist of plausible
-email addresses and matches them off, recovering the originals without ever
-touching your data. The salt is what makes that wordlist useless, so it needs
-to be an actual secret. `ANON_SALT=test` gives you the reversibility back.
+**The salt is what keeps `hash` safe.** `hash` requires one because an
+unkeyed digest of a low-entropy value is trivially reversible. An attacker
+with the hashed output hashes a wordlist of plausible email addresses and
+matches them off, recovering the originals without ever touching your data.
+The salt makes that wordlist useless, so it needs to be an actual secret.
+`ANON_SALT=test` gives you the reversibility back.
 
-Both halves of that are enforced. An empty variable is rejected, since that is
-the shape an unset CI secret takes and it would otherwise pass through as if it
-were a value. So is anything shorter than 16 bytes, which fails in exactly the
-same way but looks deliberate, so nothing would ever prompt you to look at it.
+The importer enforces both. It rejects an empty variable, because that's what
+an unset CI secret looks like and it would otherwise pass through as if it
+were a value. It also rejects anything shorter than 16 bytes, which fails in
+exactly the same way but looks deliberate, so nothing would ever prompt you to
+look at it.
 The same floor applies to a `fake` rule's `seed_env`, which is a secret on the
 same terms. Generate one with `openssl rand -base64 24`.
 
@@ -413,10 +439,10 @@ faster path.
 
 **A rule that names a key attribute directly wins on the items it rewrote.**
 That key is not rebuilt from its template and the rule's value is stored
-instead. It is decided from what the rules actually did to each item, not
-from which rules looked like they would match, because each rule's condition
-sees the item as the rules before it left it. Deciding otherwise would leave
-a key unrebuilt on items the rule never touched, real value intact.
+instead. This is decided per item from what the rules actually did, not from
+which rules looked like they would match, because each rule's condition sees
+the item as the rules before it left it. Deciding otherwise would leave a key
+unrebuilt, with its real value intact, on items the rule never touched.
 
 When `--mcp` is set, `--data-model` also serves as the MCP data model unless
 `--mcp-data-model` is given.

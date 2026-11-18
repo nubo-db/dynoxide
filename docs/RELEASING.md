@@ -6,7 +6,7 @@ is tracked separately.
 
 ## Cadence
 
-Releases cut as needed when a fix or feature is ready to ship. No fixed
+A release is cut when a fix or feature is ready to ship, with no fixed
 schedule. Versioning follows [SemVer](https://semver.org).
 
 ## How a release ships
@@ -19,21 +19,24 @@ schedule. Versioning follows [SemVer](https://semver.org).
    committed to `main`. The two versions move independently: see
    `docs/versioning.md`.
 3. A `v*` tag is pushed on that commit.
-4. The tag push triggers the release pipeline: validate the tag against
-   `VERSION` and `CHANGELOG.md`, check the crate version is coherent, build
-   binaries for five targets in
-   parallel, create a GitHub Release with artefacts and checksums, pause for
-   one-click maintainer approval, then publish to crates.io, update the
-   Homebrew tap, publish the npm packages, and push the Docker image.
+4. The tag push triggers the release pipeline, which:
+   - validates the tag against `VERSION` and `CHANGELOG.md`
+   - checks the crate version is coherent
+   - builds binaries for five targets in parallel
+   - creates a GitHub Release with artefacts and checksums
+   - pauses for one-click maintainer approval
+   - publishes to crates.io, updates the Homebrew tap, publishes the npm
+     packages and pushes the Docker image.
 
 The approval gate sits between the GitHub Release and the registry publishes,
 so a release can still be aborted before anything reaches crates.io, Homebrew,
 npm, or any container registry.
 
-It does not cover the GitHub Release itself. That is created before the pause,
-and its artefacts are downloadable as soon as it exists, which is how the
-composite action resolves `version: latest`. Aborting at the gate leaves the
-GitHub Release in place; delete or mark it a draft if that matters.
+The gate doesn't cover the GitHub Release itself. The release is created
+before the pause, and its artefacts can be downloaded as soon as it exists,
+which is how the composite action resolves `version: latest`. Aborting at the
+gate leaves the GitHub Release in place; delete it or mark it a draft if that
+matters.
 
 A prerelease tag such as `vX.Y.Z-rc.1` runs the same pipeline, but only
 reaches people who ask for it. Its GitHub Release is flagged as a prerelease,
@@ -50,9 +53,10 @@ one.
 - **npm packages** are published with OIDC-backed provenance attestations.
   Provenance on npmjs.com confirms the package was built from this
   repository at the expected tag via GitHub Actions.
-- **crates.io** is published by the same pipeline under the same tag, and is skipped when the crate version is already published, so
+- **crates.io** is published by the same pipeline under the same tag, so
   `docs.rs`, the GitHub Release binaries, and the npm packages all
-  correspond to a single commit.
+  correspond to a single commit. The crates.io step is skipped when the crate
+  version is already published.
 - **Docker images** carry SLSA provenance and SBOM attestations on the
   GHCR canonical (`ghcr.io/nubo-db/dynoxide`). Verify with
   `gh attestation verify oci://ghcr.io/nubo-db/dynoxide:<version> --owner nubo-db`.
@@ -92,5 +96,5 @@ traffic.
 ## Maintainer runbook
 
 Step-by-step release execution, secret management, environment
-configuration, and recovery procedures are tracked in an internal runbook.
-This page intentionally does not duplicate that content.
+configuration, and recovery procedures are kept in an internal runbook, and
+this page doesn't repeat them.

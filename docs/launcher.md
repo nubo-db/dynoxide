@@ -13,10 +13,10 @@ developer moving between languages sees the same behaviour.
 The npm package's `start()` and the Composer package `nubo-db/dynoxide` for
 PHP implement it. The npm package takes its binary from its platform package,
 so it has no cache or download step, and it refuses a binary older than 1.7.0
-(`DYNOXIDE_TOO_OLD`) instead of falling back to the stderr line. Changes are
-listed at the end of this page, and feedback is
-welcome as an issue on the repository.
-`docs/versioning.md` covers what the engine itself promises.
+(`DYNOXIDE_TOO_OLD`) instead of falling back to the stderr line.
+
+Changes are listed at the end of this page, and feedback is welcome as an issue
+on the repository. `docs/versioning.md` covers what the engine itself promises.
 
 ## The short version
 
@@ -61,16 +61,18 @@ starts, so a test log shows which binary ran.
 
 A binary from step 1 or 2 could be any version, and it isn't checksum-verified
 (say so in your docs). Run `<binary> --version` first. It prints
-`dynoxide <version>` on one line. Compare only the `X.Y.Z` part: a
-pre-release counts as its release. That holds for the flags this contract
-needs: every 1.7.0 pre-release has `--ready-json` and `--exit-with-parent`, and
-a flag the contract comes to depend on ships in the first pre-release of the
-version that adds it.
-If that's older than the version this
-contract needs, the binary doesn't know `--ready-json` or `--exit-with-parent`.
-Start it without both, wait for the stderr line `Dynoxide listening on
-http://<host>:<port>` and then for `GET /` to answer `200`, and stop it with
-the procedure for servers started without `--exit-with-parent`.
+`dynoxide <version>` on one line.
+
+Compare only the `X.Y.Z` part, so a pre-release counts as its release. That's
+safe for the flags this contract needs: every 1.7.0 pre-release has
+`--ready-json` and `--exit-with-parent`, and a flag the contract comes to
+depend on ships in the first pre-release of the version that adds it.
+
+If the version is older than the one this contract needs, the binary doesn't
+know `--ready-json` or `--exit-with-parent`. Start it without both, wait for
+the stderr line `Dynoxide listening on http://<host>:<port>` and then for
+`GET /` to answer `200`, and stop it with the procedure for servers started
+without `--exit-with-parent`.
 
 That fallback needs 1.6.0 or later. Earlier versions print the port you asked
 for rather than the one they bound, so under `--port 0` the line says `:0`.
@@ -291,8 +293,8 @@ failure to bind it shows up later rather than as a startup error.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts
-down straight away, exiting `0`. If the process exits soon after a ready line, check that its stdin is a
-pipe you're still holding open.
+down straight away, exiting `0`. If the process exits soon after a ready line,
+check that its stdin is a pipe you're still holding open.
 
 Treat as errors, never warnings:
 
@@ -395,11 +397,11 @@ pass the endpoint to the client yourself.
 ## Stopping the server
 
 Signal the server only through the process handle your spawn call returned.
-Keep the first exit status you're given: some runtimes report a status only
-once (PHP's `proc_get_status()` reports a signal death, and on 8.1 and 8.2 any
-exit, on one call only).
-Never use the `pid` from the ready line: process IDs get reused, and a stale
-one can belong to something else.
+Keep the first exit status you're given, because some runtimes report a status
+only once. PHP's `proc_get_status()` reports a signal death on one call only,
+and on 8.1 and 8.2 the same goes for any exit. Never use the `pid` from the
+ready line: process IDs get reused, and a stale one can belong to something
+else.
 
 Started with `--exit-with-parent`:
 
@@ -418,10 +420,10 @@ Started without it, for a binary older than this contract:
 - On Windows: kill. There's no graceful option there. A `--db-path` file
   keeps every write that completed.
 
-A binary the user supplies may not be Dynoxide itself but a shim, such as a
-version manager's, or a script that starts the real binary as its child.
-Signals through the handle reach only the shim, so a wrapper may also,
-optionally, signal what the process started:
+A binary the user supplies may be a shim rather than Dynoxide itself: a
+version manager's, say, or a script that starts the real binary as its child.
+Signals through the handle reach only the shim, so a wrapper may optionally
+signal what the process started as well:
 
 - Read the process's descendants once it's ready, and again before closing
   stdin. A child is re-parented once its parent dies, so after a shim exits
@@ -454,8 +456,7 @@ waits out the grace period and a dead runner leaves the server running until
 that process exits too.
 
 - Spawned children don't inherit the pipe by default in Node, Python, Java and
-  PHP.
-  Check your runtime's behaviour if it isn't one of those.
+  PHP. Check your runtime's behaviour if it isn't one of those.
 - Forking copies every descriptor: `os.fork`, `multiprocessing` with the fork
   start method, PHP's `pcntl_fork`. Where the runtime has a fork hook, register
   one that closes the write end in the child (in Python,

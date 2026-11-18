@@ -36,11 +36,11 @@ summary.
 
 - **Number arithmetic** uses arbitrary-precision decimals, which may differ from
   DynamoDB's own implementation at extreme edge cases.
-- **Two PartiQL refusals in one statement**: when a statement has both an
+- **Two PartiQL refusals in one statement**: a statement can have both an
   operand of the wrong type for its operator and something refused while the
-  statement is read, Dynoxide reports the second and DynamoDB the first.
-- **Map order when a too-long request is echoed back in its error** can differ
-  for entries that land in the same hash bucket.
+  statement is read. Dynoxide reports the second and DynamoDB the first.
+- **Map order in an error that echoes a too-long request back** can differ for
+  entries that land in the same hash bucket.
 
 The compatibility summary's
 [Known Remaining Limitations](compatibility-summary.md#known-remaining-limitations)
@@ -48,8 +48,8 @@ has each of these in full.
 
 ## Vector search
 
-- **Results are exact.** Dynoxide returns the genuinely nearest vectors, where
-  AWS returns approximately the nearest.
+- **Results are exact.** Dynoxide returns the nearest vectors, where AWS
+  returns approximately the nearest.
 - **Ties are always ordered the same way**, where AWS may order equal scores
   differently between requests.
 - **Index creation** goes through the same states as on AWS, but not in

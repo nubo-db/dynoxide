@@ -201,8 +201,7 @@ have nothing to assert.
 
 Each one can make a test pass locally and fail against AWS.
 
-**1. Dynoxide finds the genuinely nearest vectors. AWS finds roughly the nearest
-ones.**
+**1. Dynoxide finds the nearest vectors. AWS finds roughly the nearest ones.**
 
 Dynoxide compares your query against every vector in the index and returns the
 closest. AWS builds an approximate index that skips most of those comparisons so
@@ -210,16 +209,15 @@ it stays fast on very large tables, and skipping comparisons means it can miss a
 close match that was really there.
 
 For the same data and the same query, AWS can return a slightly different set of
-results from dynoxide. Dynoxide will not miss anything. AWS occasionally will.
+results from Dynoxide. Dynoxide will not miss anything. AWS occasionally will.
 
 *What to do:* do not write a test that pins the exact list of results and expect
 it to pass against AWS. Assert the thing you actually care about, such as "the
-item I put in comes back" or "I got five results". Also worth knowing: because
-dynoxide checks every vector, a search costs time in proportion to how many
-there are, so a local table with millions of vectors will be slow in a way AWS
-would not be.
+item I put in comes back" or "I got five results". Because Dynoxide checks
+every vector, a search also costs time in proportion to how many there are, so
+a local table with millions of vectors will be slow in a way AWS would not be.
 
-**2. When two results score identically, dynoxide always orders them the same
+**2. When two results score identically, Dynoxide always orders them the same
 way. AWS does not.**
 
 Dynoxide breaks a tie by primary key, so the same query over the same data gives
@@ -243,7 +241,7 @@ have one.
 readiness by retrying the search and treating the refusal as "not yet". That
 works against both.
 
-**4. `VectorSearchRequestBytes` is dynoxide's own number, not AWS's.**
+**4. `VectorSearchRequestBytes` is Dynoxide's own number, not AWS's.**
 
 AWS bills a search on whatever data it happened to read, and it does not
 reproduce its own figure between identical calls: five identical searches over
@@ -251,14 +249,14 @@ one unchanged index reported 14214, 13903, 14214, 14214 and 14518. Dynoxide
 reports a stable figure sized on the entries it scanned, using the same unit AWS
 uses.
 
-*What to do:* use it to compare one search against another within dynoxide,
+*What to do:* use it to compare one search against another within Dynoxide,
 where it is meaningful. Do not compare it to a figure from AWS, and do not
 assert an exact value in a test that also runs against AWS. The write-side
 figure, `VectorWriteRequestBytes`, is captured from real DynamoDB and does match.
 
-A vector index added to a live table walks a creation lifecycle, the same shape
-AWS walks but nothing like the same length. A vector index created as part of
-`CreateTable` reports `ACTIVE` at once, which is what AWS does too.
+A vector index added to a live table goes through the creation lifecycle from
+difference 3. One created as part of `CreateTable` reports `ACTIVE` at once,
+which is what AWS does too.
 
 An index added through `UpdateTable` passes through four phases:
 
@@ -284,21 +282,21 @@ those first two phases. `DeleteTable` answers `ResourceInUseException` with
 `Attempt to change a resource which is still in use: Cannot delete table while
 indexes are being created, updated, or deleted.`
 
-The one online index limit is per table rather than per call, so a second index
-cannot start creating while the first still is, whether the two arrive in one
-`UpdateTable` or in separate ones: both answer `Subscriber limit exceeded: Only
-1 online index can be created or deleted simultaneously per table`. The action
-that does get through is a delete of the creating index itself, which is how you
-cancel one.
+The limit of one online index operation applies per table rather than per
+call. A second index can't start creating while the first still is, whether
+the two arrive in one `UpdateTable` or in separate ones: both answer
+`Subscriber limit exceeded: Only 1 online index can be created or deleted
+simultaneously per table`. The one action that does get through is a delete of
+the creating index itself, which is how you cancel one.
 
-When the index reaches `ACTIVE` the `Backfilling` field is not set to `false`,
+When the index reaches `ACTIVE`, the `Backfilling` field isn't set to `false`:
 it disappears. A wait condition of "`IndexStatus` is `ACTIVE` and `Backfilling`
 is `false`" therefore never comes true, here or on AWS.
 
-The sharper trap is the third row: `ACTIVE` arrives before the index will
-answer. On AWS it arrives early by minutes, an index added to a 25-item table
-taking roughly a quarter of an hour after `ACTIVE` before it stopped refusing
-searches. Dynoxide reproduces the gap so a readiness check that polls for
+The bigger trap is the third row: `ACTIVE` arrives before the index will
+answer. On AWS it arrives early by minutes. An index added to a 25-item table
+took roughly a quarter of an hour after `ACTIVE` before it stopped refusing
+searches. Dynoxide reproduces the gap, so a readiness check that polls for
 `ACTIVE` and searches immediately fails here the way it fails against the real
 thing. Search in a retry loop and treat the refusal as "not yet" rather than
 trusting the status.
@@ -332,31 +330,31 @@ while the base table keeps exactly what was written. And where several entries
 tie on score, Dynoxide breaks the tie deterministically, which is difference 2
 above.
 
-`SearchVectors` reports `VectorSearchRequestBytes`, and that figure is a
-divergence by construction. Real DynamoDB bills a search on the data it read and
-does not reproduce its own number between identical calls; five identical
-searches over one unchanged index reported 14214, 13903, 14214, 14214 and 14518.
-Dynoxide reports a deterministic figure sized on the entries the search scanned,
-using the same measure a write is captured against. The unit is therefore the
-captured one, but the quantity is still Dynoxide's own and not a figure to
-compare against AWS. Each entry's size is computed once when it is written and
-stored with it, so asking a search for capacity costs nothing extra. The write
-axis is the captured one: a write's
-`VectorWriteRequestBytes` is `4 * dimensions` plus the vector attribute's name
-plus the item size of the rest of the projected entry, held to a 1KB floor, and
-matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.
+`SearchVectors` reports `VectorSearchRequestBytes`, and that figure differs from
+AWS by design, as difference 4 above describes. Dynoxide reports a
+deterministic figure sized on the entries the search scanned, using the same
+measure a write is captured against. So the unit is the captured one, but the
+quantity is still Dynoxide's own and not a figure to compare against AWS. Each
+entry's size is computed once when it is written and stored with it, so asking
+a search for capacity costs nothing extra.
+
+The write side is the captured one. A write's `VectorWriteRequestBytes` is
+`4 * dimensions` plus the vector attribute's name plus the item size of the
+rest of the projected entry, held to a 1KB floor. It matches eu-west-2 byte for
+byte across fixtures from 3 to 512 dimensions.
 
 The base table charges the vector the same way. On a table with a vector index,
-an attribute an index reads costs its name plus `4 * dimensions` in a write's
-units, in a read's units on every read path and in `TableSizeBytes`, whatever
-numbers it holds, while the 400 KB item limit sizes it as the list of numbers it
-is. Both rules are DynamoDB's, captured in eu-west-2 and us-east-1 at 1, 3, 6,
-8, 256 and 1,024 dimensions; reads moved to the billed size between 9 and 22
-October 2026. A GSI's or LSI's share of the write, and a read served from one,
-is sized by the number rule even when the index projects the vector, so their
-`IndexSizeBytes` is too. A vector
-index's `ItemCount` and `IndexSizeBytes` count its entries and total their write
-figure without the floor.
+an attribute an index reads costs its name plus `4 * dimensions`, whatever
+numbers it holds. That applies in a write's units, in a read's units on every
+read path, and in `TableSizeBytes`. The 400 KB item limit, though, sizes it as
+the list of numbers it is. Both rules are DynamoDB's, captured in eu-west-2 and
+us-east-1 at 1, 3, 6, 8, 256 and 1,024 dimensions; reads moved to the billed
+size between 9 and 22 October 2026.
+
+A GSI's or LSI's share of the write, and a read served from one, is sized by
+the number rule even when the index projects the vector, so their
+`IndexSizeBytes` is too. A vector index's `ItemCount` and `IndexSizeBytes`
+count its entries and total their write figure without the floor.
 
 A vector index is not reachable through PartiQL, matching AWS: naming one in a
 `"table"."index"` qualifier answers `Scan operation not supported on this index
@@ -421,7 +419,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 
 **`ReturnConsumedCapacity`:** accepted on all three PartiQL surfaces. `BatchExecuteStatement` aggregates per table across the batch and charges a failed statement the write it attempted, sized on the row already stored.
 
-**Batch member options:** `BatchStatementRequest` carries `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`. `ConsistentRead` is per member and sets the rate that member's read is charged at, so a batch mixing the two sums both rates; it does not change which rows come back. `ReturnValuesOnConditionCheckFailure` set to `ALL_OLD` puts the item a member's `UPDATE` or `DELETE` failed its condition on on that member's `Error`, as it does on an `ExecuteTransaction` statement's cancellation reason and on `ExecuteStatement`'s `ConditionalCheckFailedException`; `NONE`, a missing item and a duplicate `INSERT` carry none. Captured against eu-west-2 and us-east-1. A batch `SELECT` must name the table's primary key and may not name an index; either shape is rejected against that member while the rest of the batch runs.
+**Batch member options:** `BatchStatementRequest` carries `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`. `ConsistentRead` is per member and sets the rate that member's read is charged at, so a batch mixing the two sums both rates; it does not change which rows come back. When a member's `UPDATE` or `DELETE` fails its condition, `ReturnValuesOnConditionCheckFailure` set to `ALL_OLD` puts the item on that member's `Error`, as it does on an `ExecuteTransaction` statement's cancellation reason and on `ExecuteStatement`'s `ConditionalCheckFailedException`. `NONE`, a missing item and a duplicate `INSERT` carry no item. Captured against eu-west-2 and us-east-1. A batch `SELECT` must name the table's primary key and may not name an index; either shape is rejected against that member while the rest of the batch runs.
 
 ---
 
@@ -468,7 +466,7 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 - **Number arithmetic precision** - uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
 - **Transaction contention errors** - `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
 - **Which of two PartiQL refusals is reported** - when one statement holds both an operand of the wrong type for its operator (such as `size(s) < true`) and something refused as the statement is read, Dynoxide reports the second and DynamoDB reports the operand's type
-- **Map order in a refused request's echo** - when a request too long to accept is echoed back in its error (`BatchWriteItem` over 25 requests, a transaction over 100 actions), each map lists its entries in the order of the Java hash map DynamoDB reads it into, sized to the map. Two entries that land in the same bucket are listed in the order they were sent on DynamoDB, and in name order on Dynoxide, which no longer has the order they were sent in once the request is read
+- **Map order in a refused request's echo** - when a request too long to accept is echoed back in its error (`BatchWriteItem` over 25 requests, a transaction over 100 actions), each map lists its entries in the order of the Java hash map DynamoDB reads it into, sized to the map. Two entries that land in the same bucket are listed in the order they were sent on DynamoDB, and in name order on Dynoxide, because Dynoxide no longer has the sending order once the request is read
 
 ### Where AWS answers the same request differently
 
@@ -487,33 +485,37 @@ Query or Scan fills its `Limit` with the last item there is, AWS sometimes
 returns a `LastEvaluatedKey` and sometimes does not. The same request answered
 one way in eu-west-2 and the other in us-east-1, and two requests that differed
 only in direction or `Select` answered differently in one region. Over a
-partition of four items some reads answered the same way on every walk, and
-Dynoxide follows them; for the rest it picks one answer (captured in eu-west-2
+partition of four items, some reads answered the same way on every walk, and
+Dynoxide follows them. For the rest it picks one answer (captured in eu-west-2
 and us-east-1 on 2026-11-06, 2026-11-13 and 2026-11-14):
 
-- **No token on the last item's page.** An ascending Query, or a PartiQL
-  `SELECT` read by partition key, with no filter and a sort key condition that
-  is absent or closed above (`BETWEEN`, `<=`, `<`, `=`), a bound beyond the
-  last item included. This holds on a table, a GSI and an LSI, and on a GSI
-  or an LSI an ascending `>=` ends the same way. On a multi-attribute GSI the
-  sort key needs a condition: an equality on its first attribute ends this
-  way. A Query of a table with no sort key ends on its item's page too. A
-  three-item partition varied between walks; Dynoxide gives the
-  no-token answer there too, the one eu-west-2 gave most often.
-- **A trailing empty page.** A descending read, a filtered read, a `>` on a
-  table or an index, a `>=` on a table, and every Scan (46 items
-  take 47 pages at `Limit: 1` on AWS too). `begins_with`, and a Query of a
-  multi-attribute index by its partition attributes alone, vary on DynamoDB,
-  and Dynoxide keeps the trailing page for them. An index with no sort key
-  has not been captured and pages as it did before, as does a PartiQL read of
-  a table with no sort key, where DynamoDB also hands back a token on the
-  item's page. Dynoxide returns a
-  `LastEvaluatedKey` or `NextToken` whenever one of these fills its `Limit`, so
-  the next request comes back empty, which AWS also does.
+- **No token on the last item's page.** This covers an ascending Query, or a
+  PartiQL `SELECT` read by partition key, with no filter and a sort key
+  condition that is absent or closed above (`BETWEEN`, `<=`, `<`, `=`),
+  including a bound beyond the last item.
+  - It holds on a table, a GSI and an LSI. On a GSI or an LSI, an ascending
+    `>=` ends the same way.
+  - On a multi-attribute GSI the sort key needs a condition: an equality on its
+    first attribute ends this way.
+  - A Query of a table with no sort key ends on its item's page too.
+  - A three-item partition varied between walks. Dynoxide gives the no-token
+    answer there too, the one eu-west-2 gave most often.
+- **A trailing empty page.** This covers a descending read, a filtered read, a
+  `>` on a table or an index, a `>=` on a table, and every Scan (46 items take
+  47 pages at `Limit: 1` on AWS too).
+  - `begins_with`, and a Query of a multi-attribute index by its partition
+    attributes alone, vary on DynamoDB, and Dynoxide keeps the trailing page
+    for them.
+  - An index with no sort key hasn't been captured and pages as it did before.
+    So does a PartiQL read of a table with no sort key, where DynamoDB also
+    hands back a token on the item's page.
+
+  Dynoxide returns a `LastEvaluatedKey` or `NextToken` whenever one of these
+  fills its `Limit`, so the next request comes back empty, which AWS also does.
 - A PartiQL read with an OR, with two conditions on the sort key, or written
   with a `NOT` (`NOT NOT pk = 'k'` is a scan on DynamoDB), keeps the rule it
-  had: no `NextToken` when the page ends on the last of a set of sort
-  keys or on a range's closed bound, and an empty page after it otherwise.
+  had: no `NextToken` when the page ends on the last of a set of sort keys or
+  on a range's closed bound, and an empty page after it otherwise.
 
 A page cut by the 1 MB limit always carries one, since an item is waiting
 behind it.

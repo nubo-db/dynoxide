@@ -642,6 +642,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
+    // Before the database is opened or scaffolded, so a taken port leaves
+    // nothing behind.
+    #[cfg(feature = "mcp-server")]
+    let (listener, mcp_listener) = bind_listeners(
+        &args.host,
+        args.port,
+        args.mcp.then_some((args.mcp_host.as_str(), args.mcp_port)),
+    )
+    .await?;
+    #[cfg(not(feature = "mcp-server"))]
+    let listener = dynoxide::server::bind(&args.host, args.port).await?;
+
     let db = open_database(&args.db_path, {
         #[cfg(feature = "encryption")]
         {
@@ -671,7 +683,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(feature = "mcp-server")]
-    if args.mcp {
+    if let Some(mcp_listener) = mcp_listener {
         let quiet = is_quiet(args.log);
         let mcp_data_model = load_data_model(args.mcp_data_model.as_ref(), quiet)?;
         let mcp_config = dynoxide::mcp::McpConfig {
@@ -696,8 +708,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         return serve_dynamodb_and_mcp(
-            &args.host,
-            args.port,
+            listener,
+            mcp_listener,
             db,
             server_options,
             opts,
@@ -707,8 +719,30 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .await;
     }
 
-    dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
+    dynoxide::server::serve_with_options(listener, db, server_options).await?;
     Ok(())
+}
+
+/// Bind the DynamoDB listener, then the MCP one if `mcp` names its host and
+/// port, before any other work: a port that's taken or can't be bound then
+/// stops startup before a database is opened or an import runs. DynamoDB
+/// goes first, so its port checks can't see Dynoxide's own MCP listener.
+///
+/// Until serving starts, a client that connects waits in the listen queue
+/// rather than being refused. A launcher waits for the ready line anyway.
+#[cfg(all(feature = "http-server", feature = "mcp-server"))]
+async fn bind_listeners(
+    host: &str,
+    port: u16,
+    mcp: Option<(&str, u16)>,
+) -> Result<(tokio::net::TcpListener, Option<tokio::net::TcpListener>), Box<dyn std::error::Error>>
+{
+    let listener = dynoxide::server::bind(host, port).await?;
+    let mcp_listener = match mcp {
+        Some((mcp_host, mcp_port)) => Some(dynoxide::mcp::bind_http_to(mcp_host, mcp_port).await?),
+        None => None,
+    };
+    Ok((listener, mcp_listener))
 }
 
 /// Refuse one fixed port for both the DynamoDB and the MCP listener.
@@ -727,26 +761,19 @@ fn refuse_shared_port(port: u16, mcp_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Run the DynamoDB listener and the MCP listener together, for `serve --mcp`
-/// and `import --serve --mcp`.
-///
-/// Both are bound before either serves, DynamoDB first: its port checks then
-/// can't see Dynoxide's own MCP listener, and an MCP listener that can't be
-/// bound stops startup before the ready line. When the DynamoDB side stops,
-/// it tells the MCP side to stop too.
+/// Serve the DynamoDB listener and the MCP listener together, for
+/// `serve --mcp` and `import --serve --mcp`, on listeners [`bind_listeners`]
+/// bound. When the DynamoDB side stops, it tells the MCP side to stop too.
 #[cfg(all(feature = "http-server", feature = "mcp-server"))]
 async fn serve_dynamodb_and_mcp(
-    host: &str,
-    port: u16,
+    dynamo_listener: tokio::net::TcpListener,
+    mcp_listener: tokio::net::TcpListener,
     db: Database,
     options: dynoxide::ServerOptions,
     mcp_opts: dynoxide::mcp::HttpOptions,
     mcp_config: dynoxide::mcp::McpConfig,
     mcp_options: dynoxide::ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dynamo_listener = dynoxide::server::bind(host, port).await?;
-    let mcp_listener = dynoxide::mcp::bind_http(&mcp_opts).await?;
-
     let mcp_db = db.clone();
     let mcp_shutdown = tokio_util::sync::CancellationToken::new();
     let mcp_shutdown_clone = mcp_shutdown.clone();
@@ -1330,6 +1357,29 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
     let quiet = is_quiet(args.log);
 
     if wants_serve || wants_mcp {
+        // Bound before the import, which can take a while, so a taken port
+        // stops the run before any of it.
+        // The DynamoDB listener, and the MCP one with --mcp.
+        #[cfg(all(feature = "http-server", feature = "mcp-server"))]
+        let served = if wants_serve {
+            Some(
+                bind_listeners(
+                    &args.host,
+                    args.port,
+                    wants_mcp.then_some((args.mcp_host.as_str(), args.mcp_port)),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        #[cfg(all(feature = "http-server", not(feature = "mcp-server")))]
+        let served = if wants_serve {
+            Some((dynoxide::server::bind(&args.host, args.port).await?, ()))
+        } else {
+            None
+        };
+
         // In-memory mode: import then serve
         let db = Database::memory()?;
         let cmd = build_import_command(&args);
@@ -1346,7 +1396,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
 
         // Both --serve and --mcp: run HTTP + MCP concurrently
         #[cfg(all(feature = "http-server", feature = "mcp-server"))]
-        if wants_serve && wants_mcp {
+        if let Some((listener, Some(mcp_listener))) = served {
             let mcp_data_model = load_data_model(
                 args.mcp_data_model.as_ref().or(args.data_model.as_ref()),
                 quiet,
@@ -1372,8 +1422,8 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
             }
 
             return serve_dynamodb_and_mcp(
-                &args.host,
-                args.port,
+                listener,
+                mcp_listener,
                 db,
                 server_options(args.log),
                 opts,
@@ -1384,14 +1434,8 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         #[cfg(feature = "http-server")]
-        if wants_serve {
-            dynoxide::server::start_with_options(
-                &args.host,
-                args.port,
-                db,
-                server_options(args.log),
-            )
-            .await?;
+        if let Some((listener, _)) = served {
+            dynoxide::server::serve_with_options(listener, db, server_options(args.log)).await?;
             return Ok(());
         }
 

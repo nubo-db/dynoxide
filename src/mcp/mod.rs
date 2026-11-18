@@ -113,16 +113,28 @@ pub async fn serve_http_with_options(
 }
 
 /// Bind the MCP HTTP listener at `opts.host:opts.port`, without serving yet.
-///
-/// The binary uses this to bind the DynamoDB listener and then this one
-/// before either serves, so a listener that can't be bound stops startup
-/// before the ready line. It isn't part of the crate's promised API. Call it
-/// inside a Tokio runtime. Dropping the listener gives the port back.
+/// See [`bind_http_to`].
 #[doc(hidden)]
 pub async fn bind_http(
     opts: &HttpOptions,
 ) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error>> {
-    let addr = format_bind_addr(&opts.host, opts.port);
+    bind_http_to(&opts.host, opts.port).await
+}
+
+/// Bind the MCP HTTP listener at `host:port`, without serving yet.
+///
+/// The binary binds the DynamoDB listener and then this one before it opens
+/// the database or imports anything, so a listener that can't be bound stops
+/// startup before any of that, and before the ready line. It takes the host
+/// and port alone so it can run before the auth options are resolved. It
+/// isn't part of the crate's promised API. Call it inside a Tokio runtime.
+/// Dropping the listener gives the port back.
+#[doc(hidden)]
+pub async fn bind_http_to(
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error>> {
+    let addr = format_bind_addr(host, port);
     // The shared exclusive-bind path gives this port the same Windows
     // hijack protection as the DynamoDB listener. Unix behaviour is
     // unchanged: tokio's bind also set SO_REUSEADDR there.

@@ -865,8 +865,9 @@ fn import_serve_mcp_refuses_the_same_port_before_importing() {
     assert!(!stderr.contains("Import complete:"), "{stderr}");
 }
 
-/// `import --serve` on a fixed port that's taken runs the import, then exits
-/// 4 as `serve` does, so a launcher can tell a taken port from a failure.
+/// `import --serve` on a fixed port that's taken exits 4 as `serve` does,
+/// before the import runs, so a launcher can tell a taken port from a failure
+/// without waiting for an import it can't use.
 #[cfg(feature = "import")]
 #[test]
 fn import_serve_on_a_taken_port_exits_4() {
@@ -877,15 +878,15 @@ fn import_serve_on_a_taken_port_exits_4() {
     let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
     let stderr = stderr_of(&output);
     assert_eq!(output.status.code(), Some(4), "stderr:\n{stderr}");
-    assert!(stderr.contains("Import complete:"), "{stderr}");
+    assert!(!stderr.contains("Import complete:"), "{stderr}");
     assert!(
         stderr.contains(&format!("error: port {port} is already in use")),
         "{stderr}"
     );
 }
 
-/// The import report and the error both go to stderr. With nobody reading
-/// it, neither may panic, or the release build aborts and the 4 is lost.
+/// With nobody reading stderr, writing the error mustn't panic, or the
+/// release build aborts and the 4 is lost.
 #[cfg(feature = "import")]
 #[test]
 fn import_serve_on_a_taken_port_exits_4_when_no_one_reads_stderr() {

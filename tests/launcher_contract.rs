@@ -1173,6 +1173,28 @@ fn the_same_port_for_dynamodb_and_mcp_is_refused() {
     }
 }
 
+/// A taken port is found before the database is opened, so a retry on
+/// another port doesn't find a file this run left behind.
+#[test]
+fn a_taken_port_exits_4_before_the_database_file_is_made() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("new.db");
+    let (code, stdout, stderr) = serve_until_exit(&[
+        "--port",
+        &port.to_string(),
+        "--db-path",
+        db_path.to_str().unwrap(),
+    ]);
+    assert_port_in_use((code, stdout, stderr), port);
+    assert!(
+        !db_path.exists(),
+        "a taken port left {} behind",
+        db_path.display()
+    );
+}
+
 /// A taken DynamoDB port still exits 4 with `--mcp`, before any MCP bind.
 /// The MCP port is taken too: tried first, it would fail and exit 1.
 #[cfg(feature = "mcp-server")]

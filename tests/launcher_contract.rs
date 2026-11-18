@@ -445,6 +445,37 @@ fn a_port_another_listener_holds_exits_with_the_port_in_use_status() {
     assert_port_in_use(start_and_expect_exit("127.0.0.1", port), port);
 }
 
+/// A launcher that has gone away leaves stderr with no reader. The error line
+/// can't be written then, but the exit status must still be the taken-port
+/// one, not a panic or an abort.
+#[test]
+fn a_taken_port_exits_4_even_when_no_one_reads_stderr() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let mut child = dynoxide()
+        .args(["serve", "--port", &port])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dynoxide");
+    // Close the read end before the port check finishes and the error is
+    // written.
+    drop(child.stderr.take());
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the server started on a taken port");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(EXIT_PORT_IN_USE), "status {status}");
+}
+
 #[test]
 fn a_wildcard_listener_on_the_port_counts_as_taken() {
     let taken = std::net::TcpListener::bind("0.0.0.0:0").unwrap();

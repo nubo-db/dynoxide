@@ -454,7 +454,9 @@ async fn main() {
 
     if let Err(e) = run(cli).await {
         let message = e.to_string();
-        eprintln!("error: {message}");
+        // Not eprintln!: with no one reading stderr it panics, and the release
+        // build aborts instead of exiting with this status.
+        dynoxide::stderr_line(format_args!("error: {message}"));
         std::process::exit(exit_status_for(&message));
     }
 }
@@ -486,7 +488,9 @@ fn exit_status_for(message: &str) -> i32 {
 ))]
 fn main() {
     if let Err(e) = run_sync() {
-        eprintln!("error: {e}");
+        // Not eprintln!, which panics when no one reads stderr.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "error: {e}");
         std::process::exit(1);
     }
 }

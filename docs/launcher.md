@@ -291,9 +291,14 @@ The line describes the DynamoDB listener only. The arguments above never
 include `--mcp`. If you add it, from Dynoxide 1.8.0 the line prints only once
 the MCP listener is bound too, and an MCP listener that can't be bound stops
 startup with exit `1` and no ready line. Earlier binaries bind it after the
-line, so a failure there shows up later rather than as a startup error. The
-MCP listener has no check like the DynamoDB one's: a listener it can bind
-beside, such as one on `0.0.0.0` with the same port, doesn't stop it.
+line, so a failure there shows up later rather than as a startup error.
+
+The MCP listener has no check like the DynamoDB one's, so it only fails when
+its own bind does. Some systems, macOS among them, let it bind `127.0.0.1`
+beside another listener on `0.0.0.0` with the same port. Give `--mcp-port` a
+port of its own, never the one in `--port`: with `--host 0.0.0.0` and the same
+port for both, the MCP listener can take the loopback requests meant for
+DynamoDB.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts

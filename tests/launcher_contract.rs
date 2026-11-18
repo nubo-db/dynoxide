@@ -1117,8 +1117,8 @@ fn an_mcp_listener_that_cant_be_bound_stops_startup_before_the_ready_line() {
     assert_eq!(code, Some(1), "stderr:\n{stderr}");
     assert!(stdout.is_empty(), "a ready line printed: {stdout:?}");
     assert!(
-        stderr.contains(&format!("127.0.0.1:{mcp_port}")),
-        "stderr doesn't name the MCP address:\n{stderr}"
+        stderr.contains(&format!("failed to bind 127.0.0.1:{mcp_port}")),
+        "stderr doesn't report the MCP bind failure:\n{stderr}"
     );
 }
 
@@ -1143,6 +1143,10 @@ fn one_port_for_both_listeners_exits_1_not_4() {
     assert_eq!(code, Some(1), "stderr:\n{stderr}");
     assert!(stdout.is_empty(), "a ready line printed: {stdout:?}");
     assert!(!stderr.contains("is already in use ("), "{stderr}");
+    assert!(
+        stderr.contains(&format!("failed to bind 127.0.0.1:{port}")),
+        "stderr doesn't report the MCP bind failure:\n{stderr}"
+    );
 }
 
 /// Dynoxide's own MCP listener on the other loopback family isn't a conflict:

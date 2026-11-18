@@ -831,8 +831,8 @@ fn import_serve_mcp_stops_when_the_mcp_listener_cant_be_bound() {
     let stderr = stderr_of(&output);
     assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
     assert!(
-        stderr.contains(&format!("127.0.0.1:{mcp_port}")),
-        "stderr doesn't name the MCP address:\n{stderr}"
+        stderr.contains(&format!("failed to bind 127.0.0.1:{mcp_port}")),
+        "stderr doesn't report the MCP bind failure:\n{stderr}"
     );
     assert!(!stderr.contains("Dynoxide listening on"), "{stderr}");
 }

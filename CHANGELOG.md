@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file. If that port is taken, `start()` rejects with `DYNOXIDE_PORT_IN_USE`,
   naming the port. An invalid port (`"8000"`, `-1`, `70000`) makes `start()`
   reject with a `TypeError` or `RangeError` before anything is run.
+- **`server::bind` in the `dynoxide-rs` crate.** It binds a listener with the
+  checks `server::start` makes: it refuses a port another listener answers
+  on, and binds exclusively on Windows. Hand the listener to
+  `server::serve_with_shutdown` to serve it until your own shutdown future
+  resolves. ([#257](https://github.com/nubo-db/dynoxide/issues/257))
 
 ### Fixed
 

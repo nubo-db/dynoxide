@@ -119,16 +119,35 @@ pub async fn start_with_options(
     serve_with_options(bind(host, port).await?, db, options).await
 }
 
-/// Check `host:port` is free and bind it, without serving yet.
+/// Bind `host:port` with the checks [`start`] makes, without serving yet.
 ///
-/// The binary uses this to bind the DynamoDB listener and then the MCP one
-/// before either serves, so a listener that can't be bound stops startup
-/// before the ready line. It isn't part of the crate's promised API.
+/// Hand the listener to [`serve_with_shutdown`] to serve the DynamoDB API on
+/// it until your own shutdown future resolves.
 ///
-/// Call it inside a Tokio runtime and before spawning other work: it blocks
-/// the calling thread for up to about 300 ms while it probes the port.
-/// Dropping the listener gives the port back.
-#[doc(hidden)]
+/// Before binding, it refuses a port that another listener already answers
+/// on, including one on the wildcard address and, for a loopback host, one on
+/// the other loopback family, since a `localhost` client may reach either.
+/// The bind itself is exclusive: on Windows no other process can bind the same
+/// port beside it. A taken port gives an error starting
+/// `port N is already in use`; anything else, such as a privileged port or an
+/// address that doesn't parse, gives another message.
+///
+/// Call it inside a Tokio runtime. It blocks the calling thread for up to
+/// about 300 ms while it probes the port, so call it before starting other
+/// work on a single-threaded runtime. Dropping the listener frees the port.
+///
+/// ```no_run
+/// # async fn run() -> Result<(), String> {
+/// let db = dynoxide::Database::memory().map_err(|e| e.to_string())?;
+/// let listener = dynoxide::server::bind("127.0.0.1", 8000).await?;
+/// let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+/// # drop(stop);
+/// dynoxide::server::serve_with_shutdown(listener, db, async {
+///     let _ = stopped.await;
+/// })
+/// .await
+/// # }
+/// ```
 pub async fn bind(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -145,7 +164,8 @@ pub async fn bind(host: &str, port: u16) -> Result<tokio::net::TcpListener, Stri
 /// the ready line, then serve until the shutdown signal.
 ///
 /// The binary's half of [`start_with_options`] once both listeners are bound.
-/// It isn't part of the crate's promised API.
+/// It isn't part of the crate's promised API: an embedder serves a listener
+/// from [`bind`] with [`serve_with_shutdown`] instead.
 #[doc(hidden)]
 pub async fn serve_with_options(
     listener: tokio::net::TcpListener,

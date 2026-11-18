@@ -53,15 +53,18 @@ serves the DynamoDB API on a listener you bind, until a future you supply
 resolves. It then stops accepting, closes idle keep-alive connections, lets
 running requests finish and returns, so the database is released when it does.
 
+From crate 4.1.0, bind the listener with `server::bind`. It refuses a port
+another listener already answers on, the same way `server::start` and the
+`dynoxide` binary do, and binds exclusively on Windows. A listener you bind
+yourself skips both checks.
+
 ```rust
 use dynoxide::Database;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let db = Database::new("data.db").map_err(|e| e.to_string())?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
-        .await
-        .map_err(|e| e.to_string())?;
+    let listener = dynoxide::server::bind("127.0.0.1", 8000).await?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
 
     // Hand `stop` to whatever decides when to shut down.

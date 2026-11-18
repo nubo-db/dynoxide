@@ -10,7 +10,7 @@ A DynamoDB emulator in Rust, backed by SQLite. Runs as an HTTP server or an MCP 
 
 I built Dynoxide because DynamoDB Local is slow and heavy, and you can't embed it. It needs a JVM, and the typical Docker-based setup adds <!-- prose:ddb_local_cold_start -->~2 seconds<!-- /bench --> of cold start, <!-- prose:ddb_local_idle_memory -->~142 MB<!-- /bench --> of memory at idle, and a <!-- prose:ddb_local_image_size -->~225MB<!-- /bench --> Docker image (<!-- prose:ddb_local_image_size_disk -->~230 MB<!-- /bench --> on disk) before you've done anything useful. In an integration test run, your pipeline waits for Docker to start and the JVM to warm up before the first test runs.
 
-Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~7.7 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~3 MB<!-- /bench --> download. Point any DynamoDB SDK at it and run your tests as normal.
+Dynoxide is a native binary. It starts in milliseconds, idles at <!-- prose:dynoxide_idle_memory -->~7.7 MB<!-- /bench -->, and ships as a <!-- prose:dynoxide_binary_size -->~4 MB<!-- /bench --> download. Point any DynamoDB SDK at it and run your tests as normal.
 
 For Rust projects, there's also an **embedded mode**: direct API calls via `Database::memory()`, with no HTTP layer at all. Each test gets an isolated in-memory database with zero startup cost. And because it compiles to a native library with no runtime dependencies, it runs on platforms where DynamoDB Local can't, including iOS.
 
@@ -36,7 +36,7 @@ Numbers from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core AMD EPYC 7
 | GetItem (p50) | <!-- bench:ci_getitem_embedded -->16µs<!-- /bench --> | <!-- bench:ci_getitem_http -->0.3ms<!-- /bench --> | <!-- bench:ci_getitem_ddb_local -->0.8ms<!-- /bench --> | - | - | - |
 | 50-test CI suite | <!-- bench:ci_suite_embedded_seq -->789ms<!-- /bench --> | <!-- bench:ci_suite_http_seq -->764ms<!-- /bench --> | <!-- bench:ci_suite_ddb_local_seq -->2,494ms<!-- /bench --> | - | - | - |
 | Full workload (10K items) | - | <!-- bench:ci_workload_http -->**2.9s**<!-- /bench --> | <!-- bench:ci_workload_ddb_local -->11.6s<!-- /bench --> | - | - | - |
-| Binary / image (download) | <!-- prose:ci_binary_download -->~3 MB<!-- /bench --> | <!-- prose:ci_binary_download_http -->~3 MB<!-- /bench --> | <!-- prose:ci_image_ddb_local_download -->225 MB<!-- /bench --> | <!-- prose:ci_image_localstack_download -->1.1 GB<!-- /bench --> | - | - |
+| Binary / image (download) | <!-- prose:ci_binary_download -->~4 MB<!-- /bench --> | <!-- prose:ci_binary_download_http -->~4 MB<!-- /bench --> | <!-- prose:ci_image_ddb_local_download -->225 MB<!-- /bench --> | <!-- prose:ci_image_localstack_download -->1.1 GB<!-- /bench --> | - | - |
 | Binary / image (on disk) | <!-- bench:ci_binary_size -->8 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->8 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->230 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->333 MB<!-- /bench --> | <!-- bench:ci_image_floci -->90 MB<!-- /bench --> | <!-- bench:ci_image_ministack -->65 MB<!-- /bench --> |
 | Idle memory (RSS) | <!-- bench:ci_memory_embedded_idle -->~7.7 MB<!-- /bench --> | <!-- bench:ci_memory_http_idle -->~8 MB<!-- /bench --> | <!-- bench:ci_memory_ddb_local_idle -->~142 MB<!-- /bench --> | <!-- bench:ci_memory_localstack_idle -->~390 MB<!-- /bench --> | <!-- bench:ci_memory_floci_idle -->~26 MB<!-- /bench --> | <!-- bench:ci_memory_ministack_idle -->~43 MB<!-- /bench --> |
 

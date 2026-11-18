@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   taken or couldn't be bound used to leave a new database file behind, or
   turn up only after a full import. A client that connects before the server
   is ready now waits instead of being refused.
+- **The `dynoxide-rs` crate needs tokio 1.46 or later**, up from any 1.x.
+  Starting DynamoDB and MCP together uses `join!` with `biased;`, which
+  arrived in 1.46. A project that pins an older tokio has to move up.
 
 ### Added
 

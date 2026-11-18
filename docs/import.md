@@ -334,7 +334,9 @@ and 3 is a run that finished while leaving something behind.
 From 1.8.0, `--serve` with a fixed `--port` that's already taken exits 4, the
 same as `serve`, so a launcher can tell a taken port from a failed import. It
 binds the port before it imports, so a taken port is found before any of
-the import runs. With `--mcp`, an MCP port that can't be bound stops the run
+the import runs. A request sent while the import runs waits until it has
+finished and the server is ready, so a check that only sees whether the port
+is open passes early; wait for the ready line or an HTTP answer instead. With `--mcp`, an MCP port that can't be bound stops the run
 there too, with exit 1.
 [Knowing it's ready](launcher.md#knowing-its-ready) covers how to report it.
 

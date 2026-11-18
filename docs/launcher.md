@@ -299,7 +299,8 @@ beside another listener on `0.0.0.0` with the same port. That's why, from
 1.8.0, `--mcp-port` can't be the same as a fixed `--port`, whatever the hosts:
 Dynoxide refuses the pair with exit `1` before binding anything. With
 `--host 0.0.0.0` and one port for both, the MCP listener would otherwise take
-the loopback requests meant for DynamoDB.
+the loopback requests meant for DynamoDB. The default `--mcp-port` counts too
+(19280 for `serve`), so `--port 19280 --mcp` needs an `--mcp-port` of its own.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts

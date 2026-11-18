@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whatever the hosts. On macOS an MCP listener on `127.0.0.1` could bind
   beside DynamoDB on `0.0.0.0` and take its loopback requests. Pairs that
   used to work, such as DynamoDB on `127.0.0.1` and MCP on `[::1]` with one
-  port, need two ports now.
+  port, need two ports now. The default `--mcp-port` counts too, so
+  `serve --port 19280 --mcp` and `import --serve --port 8100 --mcp` are
+  refused unless `--mcp-port` names another port.
   ([#355](https://github.com/nubo-db/dynoxide/issues/355))
 - **A listener on the other loopback family now counts as a taken port.**
   `dynoxide --port 8000` refuses to start when something listens on

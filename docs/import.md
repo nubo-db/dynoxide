@@ -568,7 +568,7 @@ instead.
 | `--host` | `127.0.0.1` | Bind address (requires `--serve`) |
 | `--port` | `8000` | HTTP port (requires `--serve`) |
 | `--mcp` | off | Start an MCP server on the imported data |
-| `--mcp-port` | `8100` | MCP HTTP port, used with `--serve --mcp` |
+| `--mcp-port` | `8100` | MCP HTTP port, used with `--serve --mcp`. It can't be the same as `--port`, so `--port 8100` needs another `--mcp-port`. |
 | `--mcp-read-only` | off | Reject write operations over MCP (requires `--mcp`) |
 | `--log quiet` | off | Suppress the started servers' informational lines (conflicts with `--output`) |
 

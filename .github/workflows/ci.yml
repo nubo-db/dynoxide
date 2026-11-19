@@ -104,8 +104,10 @@ jobs:
       # spawned on Windows can pick up handles another thread is passing to
       # its own child, and a stray copy of the server's stdin pipe would keep
       # it open after the launcher has gone.
+      # --nocapture so the log shows which tests skipped, and which error
+      # a port that's bound but not listening gave.
       - name: Test the launcher contract
-        run: cargo test --test launcher_contract -- --test-threads=1
+        run: cargo test --test launcher_contract -- --test-threads=1 --nocapture
 
   # A taken port is reported the same way on every OS, and macOS has its own
   # rules for binding (a non-root user may bind 0.0.0.0 on a privileged port,
@@ -121,8 +123,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # --nocapture so the log shows which tests skipped, and which error
+      # a port that's bound but not listening gave.
       - name: Test the launcher contract
-        run: cargo test --test launcher_contract -- --test-threads=1
+        run: cargo test --test launcher_contract -- --test-threads=1 --nocapture
 
   # `rust-version` is part of the published Rust API contract in
   # docs/versioning.md, so it is a promise rather than a description. Every

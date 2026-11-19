@@ -256,21 +256,27 @@ test("the arguments are the contract's, with --db-path and --schema as single ar
   ]);
 });
 
-test("a port option is passed after serve, and leaving it out passes 0", async () => {
+test("a port option is passed after serve, and leaving it out passes 0", { timeout: 20000 }, async () => {
   const record = path.join(tmp(), "record");
   const server = await fake("ready", { env: { FAKE_RECORD: record }, options: { port: 8123 } });
-  await server.stop();
-  const args = JSON.parse(fs.readFileSync(record, "utf8")).args;
-  assert.deepStrictEqual(args.slice(0, 3), ["serve", "--port", "8123"]);
+  try {
+    const args = JSON.parse(fs.readFileSync(record, "utf8")).args;
+    assert.deepStrictEqual(args.slice(0, 3), ["serve", "--port", "8123"]);
+  } finally {
+    await server.stop();
+  }
 
   for (const port of [undefined, null, 0]) {
     const again = await fake("ready", { env: { FAKE_RECORD: record }, options: { port } });
-    await again.stop();
-    assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, "utf8")).args.slice(0, 3), ["serve", "--port", "0"]);
+    try {
+      assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, "utf8")).args.slice(0, 3), ["serve", "--port", "0"]);
+    } finally {
+      await again.stop();
+    }
   }
 });
 
-test("exit status 4 on a fixed port is DYNOXIDE_PORT_IN_USE, naming the port, with stderr", async () => {
+test("exit status 4 on a fixed port is DYNOXIDE_PORT_IN_USE, naming the port, with stderr", { timeout: 10000 }, async () => {
   await assert.rejects(fake("port-in-use", { options: { port: 8123 } }), (err) => {
     assert.strictEqual(err.code, "DYNOXIDE_PORT_IN_USE");
     assert.strictEqual(err.port, 8123);
@@ -281,7 +287,7 @@ test("exit status 4 on a fixed port is DYNOXIDE_PORT_IN_USE, naming the port, wi
   });
 });
 
-test("exit status 4 without a fixed port stays DYNOXIDE_EXITED", async () => {
+test("exit status 4 without a fixed port stays DYNOXIDE_EXITED", { timeout: 10000 }, async () => {
   await assert.rejects(fake("port-in-use"), (err) => {
     assert.strictEqual(err.code, "DYNOXIDE_EXITED");
     assert.match(err.message, /status 4/);
@@ -289,7 +295,7 @@ test("exit status 4 without a fixed port stays DYNOXIDE_EXITED", async () => {
   });
 });
 
-test("an invalid port is refused before anything is spawned", async () => {
+test("an invalid port is refused before anything is spawned", { timeout: 10000 }, async () => {
   const cases = [
     [-1, RangeError],
     [65536, RangeError],

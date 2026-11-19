@@ -65,12 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **An MCP port that can't be bound now stops startup.** With `serve --mcp`
-  or `import --serve --mcp`, Dynoxide used to start DynamoDB, print the ready
-  line and serve, and only report the MCP bind error (exit `1`) when it was
-  stopped. Both listeners are now bound before either serves, so it exits `1`
-  straight away with no ready line. Two `--mcp` instances on one machine each
-  need their own `--mcp-port`, since they'd otherwise both take the
-  default (19280). An `--mcp-port` the same as a fixed `--port` is now
+  or `import --serve --mcp`, Dynoxide used to start DynamoDB and serve, and
+  only report the MCP bind error (exit `1`) when it was stopped. Both
+  listeners are now bound before either serves, so it exits `1` straight
+  away, before the ready line or the "Dynoxide listening on" line. Two
+  `--mcp` instances on one machine each need their own `--mcp-port`, since
+  they'd otherwise both take the default (19280 for `serve`, 8100 for
+  `import --serve`). An `--mcp-port` the same as a fixed `--port` is now
   refused, as set out under Behaviour changes.
   ([#354](https://github.com/nubo-db/dynoxide/issues/354),
   [#355](https://github.com/nubo-db/dynoxide/issues/355))

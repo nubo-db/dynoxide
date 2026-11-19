@@ -337,11 +337,13 @@ binds the port before it imports, so a taken port is found before any of
 the import runs. With `--mcp`, an MCP port that can't be bound stops the run
 there too, with exit 1.
 
-A request sent while the import runs is held until the server is ready, or
-dropped if the import fails, so a check that only sees whether the port is
-open passes early. Wait for the ready line or an HTTP answer instead.
-[Knowing it's ready](launcher.md#knowing-its-ready) covers both waiting for
-the ready line and reporting a taken port.
+A request sent while the import runs is held until the server starts
+serving, or dropped if the run stops first (an import that fails, or one
+the exposure gate stops with exit 3). A check that only sees whether the
+port is open therefore passes early. `import --serve` has no ready line, so
+wait for an HTTP answer instead, such as a `ListTables` call that succeeds.
+[Knowing it's ready](launcher.md#knowing-its-ready) covers reporting a taken
+port.
 
 A warning on its own does not change the exit code. Every message the import
 raises carries a concern, decided where it is raised:

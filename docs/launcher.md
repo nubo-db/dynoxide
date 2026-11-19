@@ -318,6 +318,9 @@ If you started the server on a fixed port and it exits `4` before the ready
 line, that port is taken. Report it as its own error and name the port, so
 nobody has to dig through stderr to find out why the server didn't start.
 
+These statuses are for the DynamoDB `--port` of `serve` and `import --serve`.
+`mcp --http` exits `1` for a taken port.
+
 | Exit | When |
 |---|---|
 | `4` | Something already listens on the port. That includes the wildcard address and the other loopback family (`[::1]` for `127.0.0.1`, and the reverse), since a `localhost` client may reach either. |

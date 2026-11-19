@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--db-path` file, and `import --serve` before it imports. A port that was
   taken or couldn't be bound used to leave a new database file behind, or
   turn up only after a full import. A client that connects before the server
-  is ready now waits instead of being refused.
+  is ready now waits instead of being refused. With `--mcp`, the "Starting
+  DynamoDB HTTP server" line now comes after the binds, so a bind that
+  fails prints its error without it.
 - **The `dynoxide-rs` crate needs tokio 1.46 or later**, up from any 1.x.
   Starting DynamoDB and MCP together uses `join!` with `biased;`, which
   arrived in 1.46. A project that pins an older tokio has to move up.
@@ -68,8 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped. Both listeners are now bound before either serves, so it exits `1`
   straight away with no ready line. Two `--mcp` instances on one machine each
   need their own `--mcp-port`, since they'd otherwise both take the
-  default.
-  ([#354](https://github.com/nubo-db/dynoxide/issues/354))
+  default (19280). An `--mcp-port` the same as a fixed `--port` is now
+  refused, as set out under Behaviour changes.
+  ([#354](https://github.com/nubo-db/dynoxide/issues/354),
+  [#355](https://github.com/nubo-db/dynoxide/issues/355))
 - **A stderr nobody reads no longer costs the exit status.** Writing to
   stderr once its reader had gone made the release build abort, so a launcher
   that had closed the pipe saw a crash instead of the status it was waiting

@@ -35,34 +35,79 @@ const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
 pub use crate::server_options::ServerOptions;
 
-/// Check whether the port is already in use by attempting a TCP connection.
-///
-/// Probes both the requested address and the cross-address (wildcard vs localhost)
-/// to detect conflicts like Docker binding `0.0.0.0` when dynoxide requests `127.0.0.1`.
+/// Check whether the port is already in use by attempting a TCP connection
+/// to each address [`probe_addresses`] gives.
 fn check_port_available(addr: SocketAddr) -> Result<(), String> {
     let timeout = Duration::from_millis(100);
-    let port = addr.port();
-
-    // Cross-check: if binding to loopback, also probe the wildcard (and vice versa),
-    // within the same address family.
-    let cross = SocketAddr::new(
-        match addr.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        },
-        port,
-    );
-
-    for probe in [addr, cross] {
+    for probe in probe_addresses(addr) {
         if TcpStream::connect_timeout(&probe, timeout).is_ok() {
-            return Err(format!(
-                "port {port} is already in use (detected listener on {probe})"
+            return Err(port_in_use(
+                addr.port(),
+                format!("detected listener on {probe}"),
             ));
         }
     }
     Ok(())
+}
+
+/// Where a listener would take connections meant for `addr`: the address
+/// itself, and the cross-address in the same family (the wildcard for a
+/// loopback request and the reverse), to catch Docker binding `0.0.0.0` when
+/// dynoxide requests `127.0.0.1`.
+///
+/// `127.0.0.1` and `[::1]` also probe each other, because a `localhost` client
+/// may try either first and reach the other listener instead. Other loopback
+/// addresses, such as `127.0.0.2`, don't: no `localhost` client reaches them.
+/// A machine without IPv6 refuses the connection, so the port counts as free.
+fn probe_addresses(addr: SocketAddr) -> Vec<SocketAddr> {
+    let port = addr.port();
+    let cross = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    let other_localhost = match addr.ip() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST) => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        IpAddr::V6(Ipv6Addr::LOCALHOST) => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        _ => None,
+    };
+    [Some(addr.ip()), Some(cross), other_localhost]
+        .into_iter()
+        .flatten()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+}
+
+/// The taken-port error, worded in one place. The binary turns a message that
+/// starts `port N is already in use` into its taken-port exit status, so every
+/// taken-port error goes through here and nothing else may start that way.
+fn port_in_use(port: u16, detail: impl std::fmt::Display) -> String {
+    format!("port {port} is already in use ({detail})")
+}
+
+/// The error for a listener that couldn't be set up on `addr`.
+///
+/// A requested port that is already bound gets the same `port N is already in
+/// use` wording the probe gives, because the binary turns that wording into
+/// its taken-port exit status. Port 0 never does: the OS picks the port, so a
+/// failure there is the machine running out of ports, not a conflict.
+fn bind_failure(addr: SocketAddr, e: std::io::Error) -> String {
+    let port = addr.port();
+    match e.kind() {
+        std::io::ErrorKind::AddrInUse if port != 0 => format!(
+            "{}. On Windows, a server stopped moments ago can hold the port until its \
+             connections close.",
+            port_in_use(port, format!("no listener answered, but {e}"))
+        ),
+        // Windows also reports a port inside a range Hyper-V or WSL has
+        // reserved as access denied, with nothing listening on it.
+        std::io::ErrorKind::PermissionDenied if cfg!(windows) && port != 0 => format!(
+            "{e}. The port may be in a range Windows has reserved; `netsh interface ipv4 \
+             show excludedportrange protocol=tcp` lists them."
+        ),
+        _ => e.to_string(),
+    }
 }
 
 /// Start the HTTP server.
@@ -77,17 +122,64 @@ pub async fn start_with_options(
     db: Database,
     options: ServerOptions,
 ) -> Result<(), String> {
+    serve_with_options(bind(host, port).await?, db, options).await
+}
+
+/// Bind `host:port` with the checks [`start`] makes, without serving yet.
+///
+/// Hand the listener to [`serve_with_shutdown`] to serve the DynamoDB API on
+/// it until your own shutdown future resolves.
+///
+/// Before binding, it refuses a port that another listener already answers
+/// on, including one on the wildcard address and, for `127.0.0.1` or `::1`,
+/// one on the other of the two, since a `localhost` client may reach either.
+/// The bind itself is exclusive: on Windows no other process can bind the same
+/// port beside it. A taken port gives an error starting
+/// `port N is already in use`; anything else, such as a privileged port or an
+/// address that doesn't parse, gives another message.
+///
+/// Call it inside a Tokio runtime. It blocks the calling thread for up to
+/// about 300 ms while it probes the port, so call it before starting other
+/// work on a single-threaded runtime. Dropping the listener frees the port.
+///
+/// ```no_run
+/// # async fn run() -> Result<(), String> {
+/// let db = dynoxide::Database::memory().map_err(|e| e.to_string())?;
+/// let listener = dynoxide::server::bind("127.0.0.1", 8000).await?;
+/// let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+/// # drop(stop);
+/// dynoxide::server::serve_with_shutdown(listener, db, async {
+///     let _ = stopped.await;
+/// })
+/// .await
+/// # }
+/// ```
+pub async fn bind(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| format!("invalid address {host}:{port}: {e}"))?;
 
-    // Runs before any async tasks are spawned, so blocking connect probes are safe.
     check_port_available(addr)?;
 
-    let std_listener = bind_exclusive(addr)?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .map_err(|e| format!("failed to create async listener: {e}"))?;
-    // With `--port 0` the OS picks the port, so `addr` would report `:0`.
+    let std_listener = bind_exclusive(addr).map_err(|e| bind_failure(addr, e))?;
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("failed to create async listener: {e}"))
+}
+
+/// Serve on a listener from [`bind`]: print the listening line and, if asked,
+/// the ready line, then serve until the shutdown signal.
+///
+/// The binary's half of [`start_with_options`] once both listeners are bound.
+/// It isn't part of the crate's promised API: an embedder serves a listener
+/// from [`bind`] with [`serve_with_shutdown`] instead.
+#[doc(hidden)]
+pub async fn serve_with_options(
+    listener: tokio::net::TcpListener,
+    db: Database,
+    options: ServerOptions,
+) -> Result<(), String> {
+    // With `--port 0` the OS picks the port, so the requested address would
+    // report `:0`.
     let local_addr = listener
         .local_addr()
         .map_err(|e| format!("failed to read listener address: {e}"))?;
@@ -767,4 +859,84 @@ fn dynamo_response_raw(status: StatusCode, body_str: &str) -> Response {
         .unwrap();
     add_dynamo_headers(&mut resp, body_bytes);
     resp
+}
+
+#[cfg(test)]
+mod probe_address_tests {
+    use super::probe_addresses;
+
+    fn probes(addr: &str) -> Vec<String> {
+        probe_addresses(addr.parse().unwrap())
+            .iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn localhost_in_either_family_probes_the_other() {
+        assert_eq!(
+            probes("127.0.0.1:8000"),
+            ["127.0.0.1:8000", "0.0.0.0:8000", "[::1]:8000"]
+        );
+        assert_eq!(
+            probes("[::1]:8000"),
+            ["[::1]:8000", "[::]:8000", "127.0.0.1:8000"]
+        );
+    }
+
+    /// No `localhost` client reaches 127.0.0.2, so a listener on `[::1]`
+    /// can't take its requests.
+    #[test]
+    fn another_loopback_address_probes_only_its_own_family() {
+        assert_eq!(probes("127.0.0.2:8000"), ["127.0.0.2:8000", "0.0.0.0:8000"]);
+    }
+
+    #[test]
+    fn a_wildcard_probes_localhost_in_its_family() {
+        assert_eq!(probes("0.0.0.0:8000"), ["0.0.0.0:8000", "127.0.0.1:8000"]);
+        assert_eq!(probes("[::]:8000"), ["[::]:8000", "[::1]:8000"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn a_probe_hit_gets_the_port_in_use_wording() {
+        assert_eq!(
+            port_in_use(8000, "detected listener on 127.0.0.1:8000"),
+            "port 8000 is already in use (detected listener on 127.0.0.1:8000)"
+        );
+    }
+
+    #[test]
+    fn a_taken_fixed_port_gets_the_port_in_use_wording() {
+        let message = bind_failure(addr(8000), Error::new(ErrorKind::AddrInUse, "in use"));
+        assert!(
+            message.starts_with("port 8000 is already in use (no listener answered"),
+            "{message}"
+        );
+    }
+
+    /// With port 0 the OS picks the port, so running out is not a conflict
+    /// and must not look like one.
+    #[test]
+    fn port_zero_running_out_keeps_the_os_error() {
+        let message = bind_failure(addr(0), Error::new(ErrorKind::AddrInUse, "in use"));
+        assert_eq!(message, "in use");
+    }
+
+    #[test]
+    fn a_permission_error_is_never_called_taken() {
+        let message = bind_failure(addr(1), Error::new(ErrorKind::PermissionDenied, "denied"));
+        assert!(!message.contains("already in use"), "{message}");
+        assert!(message.starts_with("denied"), "{message}");
+        assert_eq!(message.contains("excludedportrange"), cfg!(windows));
+    }
 }

@@ -21,7 +21,7 @@ You do not need one for bug fixes, dependency bumps, internal refactors that kee
 2. Open a pull request. The PR is the discussion thread.
 3. The maintainer either accepts it (merged with the next number assigned) or declines it (merged with `Status: Rejected`, so the reasoning is kept for anyone who wonders later). Implementation PRs reference the RFC by number.
 
-This is deliberately light: no fixed comment period and no vote. dynoxide has a single maintainer, and the process exists to think a change through and leave a record, not to add ceremony.
+This is deliberately light, with no fixed comment period and no vote. dynoxide has a single maintainer, and the process exists to think a change through and leave a record of it.
 
 ## Index
 

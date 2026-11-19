@@ -36,7 +36,7 @@ aws dynamodb list-tables --endpoint-url http://localhost:8000
 
 ## Starting a server from your tests
 
-`start()` runs Dynoxide on a free port and returns its endpoint, region and credentials. The server stops when you call `stop()`, and also when the Node process exits, however it exits.
+`start()` runs Dynoxide, on a free port by default, and returns its endpoint, region and credentials. The server stops when you call `stop()`, and also when the Node process exits, however it exits.
 
 ```js
 import { start } from "dynoxide";
@@ -62,6 +62,7 @@ The options are all optional:
 | `dbPath` | A database file that survives a restart. Give each server its own file. Without it, the database lives in memory. |
 | `schema` | A schema file whose tables exist before the server is ready. |
 | `binary` | A Dynoxide binary to use instead of the one npm installed, 1.7.0 or later. `DYNOXIDE_BINARY` does the same. |
+| `port` | The port to listen on. Defaults to 0, which has the operating system pick a free one. A fixed port suits a dev setup where something needs the endpoint in advance, such as a second app or an `.env` file. Keep tests on the default, so parallel runs never collide. |
 | `readyTimeoutMs` | How long to wait for the server to be ready. Defaults to 10000. Raise it for a large `dbPath` file an older Dynoxide wrote, since the first open upgrades it, or if another process may hold the file, since the open waits up to 30 seconds for it. |
 
 `stop()` closes the server's stdin, which shuts it down cleanly, and kills it if it's still running after 5 seconds (on Linux and macOS it gets a SIGTERM and another 5 seconds first). Calling it again returns the same promise. Where the runtime has `Symbol.asyncDispose`, `await using server = await start()` stops the server at the end of the block.
@@ -77,9 +78,12 @@ If the server can't start, `start()` rejects with an error whose `code` says why
 | `DYNOXIDE_VERSION_CHECK_FAILED` | The supplied binary couldn't be run with `--version`, or didn't report a version. |
 | `DYNOXIDE_SPAWN_FAILED` | The binary couldn't be started. |
 | `DYNOXIDE_EXITED` | The server exited before it was ready. |
+| `DYNOXIDE_PORT_IN_USE` | Something else already holds the `port` you asked for, which is also in `err.port`. Dynoxide 1.8.0 or later reports this; an older `binary` gives `DYNOXIDE_EXITED`, with the port named in its stderr. On Windows, a port held by a socket that isn't listening can give `DYNOXIDE_EXITED` too. |
 | `DYNOXIDE_BAD_READY_LINE` | The server's first line of output wasn't a ready line. |
 | `DYNOXIDE_PORT_ZERO` | The ready line reported port 0. |
 | `DYNOXIDE_TIMEOUT` | The server wasn't ready within `readyTimeoutMs`. |
+
+An option of the wrong type or out of range, such as a `port` of `"8000"` or `70000`, makes `start()` reject with a plain `TypeError` or `RangeError` instead, with no `code`, before anything is started.
 
 `start()` is tested on Node 18 and later.
 
@@ -156,7 +160,7 @@ dynoxide import --source ./export-data/ --schema schema.json --output data.db
 
 ## How It Works
 
-This package installs a platform-specific prebuilt binary via npm's `optionalDependencies`. No compilation, no Docker, no JVM.
+This package installs a prebuilt binary for your platform through npm's `optionalDependencies`, so there's nothing to compile, and no Docker or JVM to run.
 
 The binary is the same one available via [Homebrew](https://github.com/nubo-db/homebrew-tap), [GitHub Releases](https://github.com/nubo-db/dynoxide/releases), and [crates.io](https://crates.io/crates/dynoxide-rs).
 

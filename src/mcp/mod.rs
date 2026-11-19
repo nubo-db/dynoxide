@@ -108,6 +108,54 @@ pub async fn serve_http_with_options(
     shutdown: Option<tokio_util::sync::CancellationToken>,
     options: crate::ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = bind_http(&opts).await?;
+    serve_http_on(listener, db, opts, config, shutdown, options).await
+}
+
+/// Bind the MCP HTTP listener at `opts.host:opts.port`, without serving yet.
+/// See [`bind_http_to`].
+#[doc(hidden)]
+pub async fn bind_http(
+    opts: &HttpOptions,
+) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error>> {
+    bind_http_to(&opts.host, opts.port).await
+}
+
+/// Bind the MCP HTTP listener at `host:port`, without serving yet.
+///
+/// The binary binds the DynamoDB listener and then this one before it opens
+/// the database or imports anything, so a listener that can't be bound stops
+/// startup before any of that, and before the ready line. It takes the host
+/// and port alone so it can run before the auth options are resolved. It
+/// isn't part of the crate's promised API. Call it inside a Tokio runtime.
+/// Dropping the listener gives the port back.
+#[doc(hidden)]
+pub async fn bind_http_to(
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error>> {
+    let addr = format_bind_addr(host, port);
+    // The shared exclusive-bind path gives this port the same Windows
+    // hijack protection as the DynamoDB listener. Unix behaviour is
+    // unchanged: tokio's bind also set SO_REUSEADDR there.
+    let std_listener = crate::net::bind_exclusive_to(&addr).map_err(std::io::Error::other)?;
+    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+}
+
+/// Serve MCP over Streamable HTTP on a listener from [`bind_http`].
+///
+/// The listener decides the address: `opts.host` and `opts.port` aren't used
+/// here, only the auth mode and the allowed hosts. It isn't part of the
+/// crate's promised API.
+#[doc(hidden)]
+pub async fn serve_http_on(
+    listener: tokio::net::TcpListener,
+    db: Database,
+    opts: HttpOptions,
+    config: McpConfig,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
+    options: crate::ServerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -166,12 +214,6 @@ pub async fn serve_http_with_options(
     let router = axum::Router::new().nest_service("/mcp", service).layer(
         axum::middleware::from_fn_with_state(opts.auth.clone(), auth::enforce),
     );
-    let addr = format_bind_addr(&opts.host, opts.port);
-    // The shared exclusive-bind path gives this port the same Windows
-    // hijack protection as the DynamoDB listener. Unix behaviour is
-    // unchanged: tokio's bind also set SO_REUSEADDR there.
-    let std_listener = crate::net::bind_exclusive_to(&addr).map_err(std::io::Error::other)?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let local_addr = listener.local_addr()?;
 
     if !options.suppresses_informational_messages() {

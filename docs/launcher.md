@@ -1,6 +1,7 @@
 # Writing a launcher
 
-**Status: launcher contract 1. Needs Dynoxide 1.7.0 or later.**
+**Status: launcher contract 2. Needs Dynoxide 1.7.0 or later. The exit status
+for a taken port needs 1.8.0.**
 
 This is for anyone wrapping Dynoxide for another language: an npm `start()`,
 a Composer package for PHPUnit, a pytest fixture, a JVM test helper. Each of
@@ -12,10 +13,10 @@ developer moving between languages sees the same behaviour.
 The npm package's `start()` and the Composer package `nubo-db/dynoxide` for
 PHP implement it. The npm package takes its binary from its platform package,
 so it has no cache or download step, and it refuses a binary older than 1.7.0
-(`DYNOXIDE_TOO_OLD`) instead of falling back to the stderr line. Changes are
-listed at the end of this page, and feedback is
-welcome as an issue on the repository.
-`docs/versioning.md` covers what the engine itself promises.
+(`DYNOXIDE_TOO_OLD`) instead of falling back to the stderr line.
+
+Changes are listed at the end of this page, and feedback is welcome as an issue
+on the repository. `docs/versioning.md` covers what the engine itself promises.
 
 ## The short version
 
@@ -60,16 +61,18 @@ starts, so a test log shows which binary ran.
 
 A binary from step 1 or 2 could be any version, and it isn't checksum-verified
 (say so in your docs). Run `<binary> --version` first. It prints
-`dynoxide <version>` on one line. Compare only the `X.Y.Z` part: a
-pre-release counts as its release. That holds for the flags this contract
-needs: every 1.7.0 pre-release has `--ready-json` and `--exit-with-parent`, and
-a flag the contract comes to depend on ships in the first pre-release of the
-version that adds it.
-If that's older than the version this
-contract needs, the binary doesn't know `--ready-json` or `--exit-with-parent`.
-Start it without both, wait for the stderr line `Dynoxide listening on
-http://<host>:<port>` and then for `GET /` to answer `200`, and stop it with
-the procedure for servers started without `--exit-with-parent`.
+`dynoxide <version>` on one line.
+
+Compare only the `X.Y.Z` part, so a pre-release counts as its release. That's
+safe for the flags this contract needs: every 1.7.0 pre-release has
+`--ready-json` and `--exit-with-parent`, and a flag the contract comes to
+depend on ships in the first pre-release of the version that adds it.
+
+If the version is older than the one this contract needs, the binary doesn't
+know `--ready-json` or `--exit-with-parent`. Start it without both, wait for
+the stderr line `Dynoxide listening on http://<host>:<port>` and then for
+`GET /` to answer `200`, and stop it with the procedure for servers started
+without `--exit-with-parent`.
 
 That fallback needs 1.6.0 or later. Earlier versions print the port you asked
 for rather than the one they bound, so under `--port 0` the line says `:0`.
@@ -227,6 +230,12 @@ at all.
   port, so parallel test processes never collide. Don't reuse a server you
   find already listening on a fixed port: you can't tell it's yours, or even
   that it's Dynoxide.
+- **A fixed port is for dev setups.** Some setups need the endpoint known in
+  advance: a second app, an `.env` holding `AWS_ENDPOINT_URL_DYNAMODB`, or
+  NoSQL Workbench. A wrapper can offer a port option for those, passed as
+  `--port N`, with 0 as its default. Keep test suites on port 0. If the port
+  is taken, the server exits `4` before the ready line (see below). Report
+  which port it was, and don't retry.
 - **Check the binary exists first.** Some runtimes report a successful spawn
   for a missing file and let the child exit `127` (PHP 8.1 and 8.2 do). Check
   the file before spawning, and treat an exit of `126` or `127` before the
@@ -278,14 +287,25 @@ straight away. With the flag, stdout carries nothing but this line. Logging,
 however `RUST_LOG` is set, goes to stderr. Anything else on stdout is a bug to
 report.
 
-The line covers the DynamoDB listener only. The arguments above never include
-`--mcp`; if you add it, the MCP listener binds after the line is printed, and a
-failure to bind it shows up later rather than as a startup error.
+The line describes the DynamoDB listener only. The arguments above never
+include `--mcp`. If you add it, from Dynoxide 1.8.0 the line prints only once
+the MCP listener is bound too, and an MCP listener that can't be bound stops
+startup with exit `1` and no ready line. Earlier binaries bind it after the
+line, so a failure there shows up later rather than as a startup error.
+
+The MCP listener has no check like the DynamoDB one's, so it only fails when
+its own bind does. On some systems, macOS among them, that bind succeeds on
+`127.0.0.1` beside a listener on `0.0.0.0` with the same port. With
+`--host 0.0.0.0` and one port for both, the MCP listener would then take the
+loopback requests meant for DynamoDB. So from 1.8.0, Dynoxide refuses an
+`--mcp-port` that's the same as a fixed `--port`, whatever the hosts, with
+exit `1` before anything is bound. The default `--mcp-port` counts (19280 for
+`serve`), so `--port 19280 --mcp` needs an `--mcp-port` of its own.
 
 With `--exit-with-parent`, a server whose stdin reaches end-of-file at once
 (already closed, `/dev/null`, or a file) prints the ready line and then shuts
-down straight away, exiting `0`. If the process exits soon after a ready line, check that its stdin is a
-pipe you're still holding open.
+down straight away, exiting `0`. If the process exits soon after a ready line,
+check that its stdin is a pipe you're still holding open.
 
 Treat as errors, never warnings:
 
@@ -293,6 +313,26 @@ Treat as errors, never warnings:
   configurable
 - the process exiting before the ready line
 - a line that doesn't parse, or has `port` 0
+
+If you started the server on a fixed port and it exits `4` before the ready
+line, that port is taken. Report it as its own error and name the port, so
+nobody has to dig through stderr to find out why the server didn't start.
+
+These statuses are for the DynamoDB `--port` of `serve` and `import --serve`.
+`mcp --http` exits `1` for a taken port.
+
+| Exit | When |
+|---|---|
+| `4` | Something already listens on the port. That includes the wildcard address and the other loopback family (`[::1]` for `127.0.0.1`, and the reverse), since a `localhost` client may reach either. |
+| `4` | Nothing answers on the port, but binding it fails because it's in use. On Windows this can exit `1` instead: Windows may refuse the bind as access denied, the same error it gives for a reserved port, and Dynoxide can't tell the two apart. |
+| `2` | The arguments were refused before anything started, such as an unknown flag or `--port 70000`. |
+| `1` | Any other startup failure. That includes a port the process isn't allowed to bind (a privileged port, or a range Windows has reserved) and an `--mcp-port` that can't be bound or is the same as a fixed `--port`. |
+
+With `--port 0` the operating system picks the port, so `4` never happens.
+
+Binaries before 1.8.0 exit `1` for a taken port, the same as any other
+startup failure, and never exit `4`. A wrapper that accepts them falls back to
+its general start error there, and the stderr tail still names the port.
 
 Include the last lines of stderr in the error. A server that failed to start
 should fail the test run, not show up later as a pile of confusing test
@@ -372,11 +412,11 @@ pass the endpoint to the client yourself.
 ## Stopping the server
 
 Signal the server only through the process handle your spawn call returned.
-Keep the first exit status you're given: some runtimes report a status only
-once (PHP's `proc_get_status()` reports a signal death, and on 8.1 and 8.2 any
-exit, on one call only).
-Never use the `pid` from the ready line: process IDs get reused, and a stale
-one can belong to something else.
+Keep the first exit status you're given, because some runtimes report a status
+only once. PHP's `proc_get_status()` reports a signal death on one call only,
+and on 8.1 and 8.2 the same goes for any exit. Never use the `pid` from the
+ready line: process IDs get reused, and a stale one can belong to something
+else.
 
 Started with `--exit-with-parent`:
 
@@ -395,10 +435,10 @@ Started without it, for a binary older than this contract:
 - On Windows: kill. There's no graceful option there. A `--db-path` file
   keeps every write that completed.
 
-A binary the user supplies may not be Dynoxide itself but a shim, such as a
-version manager's, or a script that starts the real binary as its child.
-Signals through the handle reach only the shim, so a wrapper may also,
-optionally, signal what the process started:
+A binary the user supplies may be a shim rather than Dynoxide itself: a
+version manager's, say, or a script that starts the real binary as its child.
+Signals through the handle reach only the shim, so a wrapper may optionally
+signal what the process started as well:
 
 - Read the process's descendants once it's ready, and again before closing
   stdin. A child is re-parented once its parent dies, so after a shim exits
@@ -431,8 +471,7 @@ waits out the grace period and a dead runner leaves the server running until
 that process exits too.
 
 - Spawned children don't inherit the pipe by default in Node, Python, Java and
-  PHP.
-  Check your runtime's behaviour if it isn't one of those.
+  PHP. Check your runtime's behaviour if it isn't one of those.
 - Forking copies every descriptor: `os.fork`, `multiprocessing` with the fork
   start method, PHP's `pcntl_fork`. Where the runtime has a fork hook, register
   one that closes the write end in the child (in Python,
@@ -492,6 +531,11 @@ version that adds it, and a later pre-release of that version never adds one.
 Wrappers compare only `X.Y.Z`, so a flag that arrived in `rc.2` would crash
 them on `rc.1`.
 
+- **Launcher contract 2** (Dynoxide 1.8.0): exit status `4` for a taken
+  `--port`, and a fixed port as an option for dev setups. With `--mcp`, the
+  ready line waits for the MCP listener too, and `--mcp-port` can't be the
+  same as a fixed `--port`. A wrapper that always passes `--port 0` and no
+  `--mcp` sees no change.
 - **Launcher contract 1** (Dynoxide 1.7.0): first draft. Corrected after the
   first wrapper, for PHP: what `dynoxide.sha256` holds, the version in the
   cache path, pre-releases in the version check, spawns that report success

@@ -56,8 +56,8 @@ Works with any language or SDK that supports custom endpoints: Python (boto3), N
 
 ## Logging
 
-The default output is unchanged when `--log` is omitted. To suppress
-informational startup and shutdown messages on stderr, use quiet mode:
+Without `--log`, Dynoxide prints its informational startup and shutdown
+messages to stderr. Quiet mode suppresses them:
 
 ```sh
 dynoxide --log quiet --port 8000
@@ -78,5 +78,10 @@ port it assigned. A test harness that runs several servers at once can start
 each on port 0 and read its port from that line, rather than choosing a free
 port itself and racing other processes to bind it. That needs the default
 logging mode, since quiet mode removes the line.
+
+A fixed `--port` that is already taken exits with status `4` rather than `1`,
+so a script can tell that apart from other startup failures.
+[Troubleshooting](troubleshooting.md#port-8000-is-already-in-use-detected-listener-on-1270018000)
+covers what counts as taken.
 
 `RUST_LOG` continues to control tracing independently.

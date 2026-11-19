@@ -2,7 +2,7 @@
 
 The [dynoxide](https://github.com/nubo-db/dynoxide) DynamoDB-compatible engine, compiled to WebAssembly and packaged to run in the browser. It carries the engine `.wasm`, the official [@sqlite.org/sqlite-wasm](https://github.com/sqlite/sqlite-wasm) SQLite build, the bundled Web Worker, and an `EngineClient` that drives them, so you can run real DynamoDB operations client-side against a SQLite-backed store persisted to OPFS.
 
-The wasm build is a scored target in the same conformance suite that backs dynoxide's native build; current results are published with every other target. It leaves several operations unimplemented - `TransactWriteItems`, streams, tags and TTL - so it is not a like-for-like replacement for the native engine.
+The wasm build is scored by the same conformance suite that backs dynoxide's native build, and its current results are published alongside every other target. It leaves several operations unimplemented - `TransactWriteItems`, streams, tags and TTL - so it is not a like-for-like replacement for the native engine.
 
 ## Install
 
@@ -10,7 +10,9 @@ The wasm build is a scored target in the same conformance suite that backs dynox
 npm install @dynoxide/wasm-engine
 ```
 
-The package is versioned in lockstep with every other installable dynoxide artefact, on the product version stream; the `dynoxide-rs` crate carries its own number and is not part of that lockstep. See `docs/versioning.md` for what each number promises and what the conformance suite does and does not exercise. `npm install @dynoxide/wasm-engine` gets the current release; use `~1.7.0` to hold behaviour still across minors.
+The package shares the product version number with every other installable dynoxide artefact. The `dynoxide-rs` crate has its own number and isn't part of that. See `docs/versioning.md` for what each number promises and what the conformance suite does and does not exercise.
+
+`npm install @dynoxide/wasm-engine` gets the current release. Use `~1.7.0` if you want behaviour to stay the same when later minor versions come out.
 
 ## Quick start
 
@@ -84,7 +86,7 @@ The engine needs a [secure context](https://developer.mozilla.org/en-US/docs/Web
 
 ## Versioning
 
-`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions sit in `manifest.json`. `manifest.engineVersion` is the dynoxide product version, and the npm package ships at that same version: every installable artefact shares that number, while the `dynoxide-rs` crate is on its own. See `docs/versioning.md`.
+`CONTRACT_VERSION` stamps the message-envelope shape, not the engine version. Adding an operation leaves it alone; changing a request, response, or error envelope bumps it. The client validates it against the engine on boot and fails loudly on a mismatch, so a pinned consumer fails with a clear error rather than mis-reading a newer engine. The shipped engine and contract versions are in `manifest.json`. `manifest.engineVersion` is the dynoxide product version, and the npm package ships at that same version, like every other installable artefact. The `dynoxide-rs` crate has its own number. See `docs/versioning.md`.
 
 ## Persistence
 

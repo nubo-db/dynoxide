@@ -4,35 +4,62 @@ Dynoxide compiles to `wasm32-unknown-unknown` and runs in the browser. The same 
 
 Both backends issue the same SQL. The native and wasm code share one set of query builders, so a query fixed on one is fixed on both.
 
-The wasm build is a scored target in the same conformance suite that backs the native build; current results are published alongside every other target. Its skip count is far higher than any other target because several operations are still missing, so read the row as "correct on what it implements" rather than as a like-for-like comparison. `docs/versioning.md` names what the suite does and does not exercise. A build made with `--no-default-features --features wasm-sqlite` exposes `dynoxide::WASM_BACKEND` (`true`) so you can tell which path you're on.
+The wasm build is a scored target in the same conformance suite that backs the native build, and its current results are published alongside every other target. Its skip count is far higher than any other target's because several operations are still missing, so read its row as "correct on what it implements" rather than as a like-for-like comparison. `docs/versioning.md` names what the suite does and doesn't exercise.
 
-**What works:** create and delete tables, describe and list them, update tables (add or delete a GSI, with existing rows backfilled into the new index, and change provisioned throughput, billing mode, table class, on-demand throughput, and deletion protection), put, get, delete, and update items, query, scan, the batch and transactional reads (`BatchGetItem`, `BatchWriteItem`, `TransactGetItems`), and PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`, including `RETURNING` and `ClientRequestToken` idempotency), over base tables and both secondary index types (GSI and LSI), and vector indexes with `SearchVectors` over all three distance functions. Index maintenance is atomic with the base write, same as native, vector shadow tables included. One caveat on PartiQL writes: they record a stream event when the table has a stream enabled, and the wasm build cannot enable one, so that path is unreachable rather than supported.
+A build made with `--no-default-features --features wasm-sqlite` exposes `dynoxide::WASM_BACKEND` (`true`) so you can tell which path you're on.
 
-**What doesn't, yet:** TTL returns a typed `Unsupported` error (it needs a background sweep the browser doesn't drive). Streams are planned but not wired - the delivery mechanism is still to be decided, so an `UpdateTable` that changes a stream specification is refused. `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table. `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats, and bulk import return a typed "not yet implemented" error. Those four blocks are the whole of the conformance skip count.
+**What works:**
 
-Vector search is the same engine as native: exact brute-force KNN, the same `f32` storage, the same scoring and the same tie break, so a query answers identically either side. The candidate load for a search is a single bridge crossing rather than one per entry. A database persisted before the vector column existed is migrated on open, so an OPFS database created by an older build keeps working and gains the surface.
+- creating, deleting, describing and listing tables
+- updating tables: adding or deleting a GSI (existing rows are backfilled into the new index), and changing provisioned throughput, billing mode, table class, on-demand throughput and deletion protection
+- putting, getting, deleting and updating items
+- query and scan
+- batch reads and writes (`BatchGetItem`, `BatchWriteItem`) and transactional reads (`TransactGetItems`)
+- PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`), including `RETURNING` and `ClientRequestToken` idempotency
+- vector indexes, with `SearchVectors` over all three distance functions
+
+These work over base tables and both secondary index types (GSI and LSI). Index maintenance is atomic with the base write, as on native, and that includes vector shadow tables.
+
+One caveat on PartiQL writes: they record a stream event when the table has a stream enabled, but the wasm build can't enable one, so that path is unreachable rather than supported.
+
+**What doesn't, yet:**
+
+- TTL returns a typed `Unsupported` error, because it needs a background sweep the browser doesn't drive.
+- Streams are planned but not wired up, as the delivery mechanism is still to be decided. An `UpdateTable` that changes a stream specification is refused, and `CreateTable` applies the same rule up front: a request carrying an enabled stream specification or tags is refused before anything is created, so a refusal never leaves a half-made table.
+- `TransactWriteItems`, tags (on `CreateTable` as well as the `TagResource` family), table stats and bulk import return a typed "not yet implemented" error.
+
+These gaps account for the whole of the conformance skip count.
+
+Vector search is the same engine as native: exact brute-force KNN, the same `f32` storage, the same scoring and the same tie break, so a query answers identically either side. The candidate load for a search is a single bridge crossing rather than one per entry. A database persisted before the vector column existed is migrated on open, so an OPFS database created by an older build keeps working and gains vector search.
 
 One fidelity note on what *is* supported: adding a GSI is synchronous. The new index is immediately `ACTIVE` and immediately usable, where AWS reports it `CREATING` and backfills in the background. The backfilled data matches; only the lifecycle is compressed. This is the same behaviour as the native build.
 
-A vector index added through `UpdateTable` is different: it reports `CREATING` first, holds the base table at `UPDATING` while it allocates, refuses searches for a window that outlasts its own `ACTIVE`, and holds off a `DeleteTable` while it creates. It also refuses to be cancelled until it is past allocating. The backfill still runs synchronously, so the data is complete before the window opens; the window reproduces the lifecycle rather than the work, and its durations are tens of seconds rather than AWS's minutes. A vector index created as part of `CreateTable` reports `ACTIVE` at once, on both.
+A vector index added through `UpdateTable` is different. It:
 
-That window is what makes a naive readiness check fail here rather than only against AWS. A vector index on real DynamoDB reports `ACTIVE` before it will answer a search, and the `Backfilling` field disappears rather than turning `false`, so the obvious wait conditions either pass too early or never finish. `docs/compatibility-summary.md` has the detail and a check that works on both.
+- reports `CREATING` first, and holds the base table at `UPDATING` while it allocates
+- refuses searches for a window that outlasts its own `ACTIVE`
+- holds off a `DeleteTable` while it creates
+- refuses to be cancelled until it's past allocating
+
+The backfill still runs synchronously, so the data is complete before the window opens. The window reproduces AWS's lifecycle rather than the work behind it, and lasts tens of seconds rather than AWS's minutes. On both builds, a vector index created as part of `CreateTable` reports `ACTIVE` at once.
+
+Because of that window, a naive readiness check fails here too, not only against AWS. A vector index on real DynamoDB reports `ACTIVE` before it will answer a search, and the `Backfilling` field disappears rather than turning `false`, so the obvious wait conditions either pass too early or never finish. `docs/compatibility-summary.md` has the detail and a check that works on both.
 
 The engine runs in a Web Worker (OPFS's synchronous file handles are Worker-only), and the page talks to it over a message channel. It needs no special server headers (no COOP/COEP cross-origin isolation), so it works on ordinary static hosting.
 
-Keeping secondary indexes in step with a write means a delete and a re-insert per GSI and per LSI, and on wasm each of those statements is a bridge crossing. The maintenance for one write (or one delete) is issued as a single ordered batch through the `exec_script` bridge primitive - one crossing for the whole GSI fan-out and one for the LSI fan-out - rather than one crossing per index operation. A table with no indexes crosses zero extra times. Native runs the same fan-out in-process, so it has no crossings to save.
+Keeping secondary indexes in step with a write means a delete and a re-insert per GSI and per LSI, and on wasm each of those statements would be a bridge crossing. Instead, the maintenance for one write (or one delete) goes as a single ordered batch through the `exec_script` bridge primitive: one crossing for the whole GSI fan-out and one for the LSI fan-out. A table with no indexes crosses zero extra times. Native runs the same fan-out in-process, so it has no crossings to save.
 
 ## Persistence and durability
 
-The database lives in OPFS, reached through the official OPFS SAHPool VFS - a pool of synchronous access handles. Where a browser can't provide those handles - a Firefox private window, an older Safari - the engine falls back to an in-memory database that works for the session but doesn't survive a reload, and `open` reports which mode you got as `persistenceMode` so you can warn the user.
+The database lives in OPFS, reached through the official OPFS SAHPool VFS (a pool of synchronous access handles). Some browsers can't provide those handles, such as a Firefox private window or an older Safari. There the engine falls back to an in-memory database that works for the session but doesn't survive a reload. `open` reports which mode you got as `persistenceMode`, so you can warn the user.
 
-Each database name gets its own OPFS directory and its own pool of file handles, so opening several databases on one page never makes them contend for a shared pool. Opening the *same* database a second time while another tab or client still holds it doesn't quietly fork to a private in-memory copy - that would split reads from writes and lose everything on reload - it fails with a clear "OPFS is busy" error instead. That state is recoverable, not sticky: once the holder releases the database, a later open of the same name succeeds rather than replaying the earlier failure. Closing a database relinquishes its access handles (without destroying the data) so another tab can pick it up.
+Each database name gets its own OPFS directory and its own pool of file handles, so opening several databases on one page never makes them contend for a shared pool. Opening the *same* database a second time while another tab or client still holds it fails with a clear "OPFS is busy" error. It doesn't quietly fork to a private in-memory copy, which would split reads from writes and lose everything on reload. The error doesn't stick: once the holder releases the database, a later open of the same name succeeds. Closing a database releases its access handles (without destroying the data) so another tab can pick it up.
 
 The wasm path runs in rollback-journal mode, not WAL. The SAHPool VFS doesn't implement WAL's shared-memory interface, so `PRAGMA journal_mode = WAL` is a no-op there and SQLite keeps a rollback journal. That costs no atomicity: the backend funnels every write through a single connection it serialises, so it never needs the concurrent readers WAL buys, and each commit flushes through the synchronous handle. (The native build enables WAL because it has the concurrency to gain from it.)
 
-`ClientRequestToken` idempotency runs the same ten-minute window as the native build: a same-token `ExecuteTransaction` replays inside it and re-executes after. What differs is where the cache lives. It belongs to the database handle, so each `open()` starts an empty one - re-opening the same name in the same Worker included - where the native server keeps one for as long as the process runs.
+`ClientRequestToken` idempotency runs the same ten-minute window as the native build: a same-token `ExecuteTransaction` replays inside it and re-executes after. What differs is where the cache lives. It belongs to the database handle, so each `open()` starts with an empty one, even when re-opening the same name in the same Worker. The native server keeps one for as long as the process runs.
 
-Integers round-trip at full 64-bit width - a value past 2^53 crosses the bridge as a BigInt rather than losing precision as a JavaScript double. DynamoDB number attributes travel as text inside the item JSON regardless, so this only touches the engine's own integer columns.
+Integers round-trip at full 64-bit width: a value past 2^53 crosses the bridge as a BigInt rather than losing precision as a JavaScript double. DynamoDB number attributes travel as text inside the item JSON regardless, so this only touches the engine's own integer columns.
 
 ## Building and shipping it
 
@@ -43,7 +70,7 @@ npm install
 npm run build:wasm
 ```
 
-`dist/` is the two `.wasm` plus the bundled Worker, kept separate so the `.wasm` cache independently of the JS bundle, and a small manifest:
+`dist/` holds the two `.wasm` files, the bundled Worker and a small manifest. The `.wasm` files are kept separate so they cache independently of the JS bundle:
 
 | File | Size | What |
 |---|---|---|
@@ -52,7 +79,7 @@ npm run build:wasm
 | `dynoxide-worker.js` | ~230 KB | the bundled Web Worker (engine glue + bridge, fully minified) |
 | `manifest.json` | <1 KB | engine version, contract version, file list |
 
-About 3 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 1.2 MB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
+About 3 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 1.2 MB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load. The SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
 
 Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running the official synchronous OPFS SAHPool VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
 
@@ -94,7 +121,7 @@ build - it is faster, persists, implements far more, and is what the `dynoxide`
 binary, npm package and container image all give you. This server is
 deliberately not distributed in any of them.
 
-Knowing that, the engine has no wire protocol of its own, so nothing that speaks
+The engine has no wire protocol of its own, so nothing that speaks
 DynamoDB over a socket can reach it directly. `npm run wasm:serve` puts an
 endpoint in front: it drives the shipping `dist/` bundle in a headless Chromium
 it manages itself and serves DynamoDB JSON-1.0 on a local port, so an AWS SDK
@@ -114,7 +141,7 @@ aws dynamodb list-tables --endpoint-url http://localhost:8003
 
 It carries one browser page's worth of concurrency and no TLS.
 
-Two things about it are load-bearing rather than incidental:
+Two things about it are deliberate:
 
 - **The engine owns the wire envelope.** `dispatchHttp` decides what a malformed
   body, a missing target, or an unimplemented operation returns, and the bridge
@@ -130,8 +157,8 @@ An operation the wasm build does not implement returns HTTP 501 with an
 `UnsupportedOperation` envelope, so a conformance runner can tell "out of scope"
 from "implemented and wrong" without guessing. An implemented operation can
 return the same envelope for a specific unsupported field (`CreateTable` or
-`UpdateTable` carrying streams or tags), so `capabilities()` answers whether an
-operation is routed at all, not whether every request to it will succeed.
+`UpdateTable` carrying streams or tags). So `capabilities()` tells you whether
+an operation is routed at all, not whether every request to it will succeed.
 `tests/bridge` drives the whole path over a socket; run it with
 `npm run test:bridge`.
 

@@ -4,7 +4,7 @@ Dynoxide supports DynamoDB Streams with all four view types: `NEW_IMAGE`, `OLD_I
 
 ## Enabling streams
 
-Streams are enabled per-table via `StreamSpecification` in `CreateTable` or `UpdateTable`, exactly like real DynamoDB:
+Streams are enabled per table with `StreamSpecification` in `CreateTable` or `UpdateTable`, as on real DynamoDB:
 
 ```sh
 # Via AWS CLI
@@ -45,7 +45,7 @@ aws dynamodbstreams get-shard-iterator \
 
 ## Streams with import
 
-If the `--schema` file (DescribeTable JSON) contains a `StreamSpecification`, streams are automatically enabled on the imported table. No extra flags needed. The import faithfully reproduces the source table's configuration:
+If the `--schema` file (DescribeTable JSON) contains a `StreamSpecification`, the imported table gets streams enabled with the same settings as the source table. No extra flags are needed:
 
 ```json
 {
@@ -59,5 +59,5 @@ If the `--schema` file (DescribeTable JSON) contains a `StreamSpecification`, st
 }
 ```
 
-Note: Imported items do not generate stream records by default (bulk import bypasses stream recording for performance). Stream recording begins for writes made after import completes.
+Imported items don't generate stream records by default, because bulk import skips stream recording for speed. Writes made after the import finishes are recorded as normal.
 

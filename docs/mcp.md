@@ -16,12 +16,12 @@ dynoxide mcp --http --port 19280
 ```
 
 The HTTP transport requires a bearer token on every request. On a loopback
-bind with no token supplied, dynoxide generates one on first run, saves it to a
-per-user config file (`~/.config/dynoxide/mcp-token` on Linux,
-`~/Library/Application Support/dynoxide/mcp-token` on macOS), and prints a
-ready-to-paste client snippet; later runs reuse it silently. Supply your own
-with `--token` or the `DYNOXIDE_MCP_AUTH_TOKEN` environment variable (the flag
-wins if both are set).
+bind with no token supplied, dynoxide generates one on first run and saves it
+to a per-user config file (`~/.config/dynoxide/mcp-token` on Linux,
+`~/Library/Application Support/dynoxide/mcp-token` on macOS). That first run
+prints a ready-to-paste client snippet; later runs reuse the token silently.
+Supply your own with `--token` or the `DYNOXIDE_MCP_AUTH_TOKEN` environment
+variable (the flag wins if both are set).
 
 | Flag | Purpose |
 |------|---------|
@@ -30,10 +30,10 @@ wins if both are set).
 | `--allowed-host <HOST>` | Accept an additional `Host` header by name (repeatable); needed for non-loopback access by hostname. |
 | `--no-auth` | Disable authentication. Loopback binds only; prints a warning. |
 
-Prefer the environment variable or the persisted file over `--token` for
-anything beyond one-shot debugging, because flag values leak into shell history and
-`ps`. To rotate the token, delete the persisted file (or change
-`DYNOXIDE_MCP_AUTH_TOKEN`) and restart; there is no rotation mechanism by
+Use the environment variable or the persisted file rather than `--token` for
+anything beyond one-shot debugging, because flag values leak into shell history
+and `ps`. To rotate the token, delete the persisted file (or change
+`DYNOXIDE_MCP_AUTH_TOKEN`) and restart. There's no rotation mechanism, by
 design.
 
 On the `serve` subcommand the equivalent flags are prefixed
@@ -41,7 +41,7 @@ On the `serve` subcommand the equivalent flags are prefixed
 `serve` already owns `--host`/`--port` for the DynamoDB server.
 
 To run the HTTP transport from the container image, see
-[MCP over HTTP in Docker](#mcp-over-http-in-docker).
+[MCP over HTTP in Docker](installation.md#mcp-over-http-in-docker).
 
 ### HTTP client configuration
 
@@ -122,11 +122,18 @@ With a OneTable data model for single-table designs:
 
 An agent can create a vector index and search it without a wire client. `create_table` takes `vector_indexes`, `update_table` takes `vector_index_updates` to add or remove one, `describe_table` reports them alongside the GSIs, and `search_vectors` runs the search.
 
-An index added to a live table through `update_table` is not searchable straight away. The first `search_vectors` against it answers `Cannot search backfilling vector index: <name>`, and it keeps answering that for a window that outlasts the `ACTIVE` `describe_table` reports, so waiting for the status is not enough. Retry the search and treat the refusal as "not yet". The table itself cannot be dropped while the index reports `CREATING`, which lifts earlier than the search does, so a successful `delete_table` is not evidence that a search would have worked. Cancelling the index is refused for a short window first, and the refusal names the phase to retry in. An index created as part of `create_table` is searchable at once and needs none of this.
+An index added to a live table through `update_table` isn't searchable straight away. A `search_vectors` against it answers `Cannot search backfilling vector index: <name>`, and keeps answering that for a while after `describe_table` reports the index `ACTIVE`. Waiting for the status isn't enough: retry the search and treat the refusal as "not yet".
 
-The search is exact brute-force KNN over the whole index, so the top-k it returns is the true top-k. That is one of four things about vector search that will never match AWS, all of which can make a test pass here and fail there; `docs/compatibility-summary.md` sets them out in plain terms. `COSINE` and `EUCLIDEAN` score as distances, where a self match is 0; `DOT_PRODUCT` scores as a similarity and can be negative. The vector attribute is left out of results unless a projection expression names it and the index projects it. A table carrying a vector index has to be `PAY_PER_REQUEST`.
+Two other limits apply while the index is being added:
 
-The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would. A tool's arguments arrive already parsed, without the order they were written in or a name written twice, so where DynamoDB would report whichever of two faults was written first, a tool may report the other one.
+- The table can't be dropped while the index reports `CREATING`. That lifts before the search refusal does, so a successful `delete_table` doesn't show that a search would have worked.
+- Cancelling the index is refused for a short window first, and the refusal names the phase to retry in.
+
+An index created as part of `create_table` is searchable at once and needs none of this.
+
+The search is exact brute-force KNN over the whole index, so the top-k it returns is the true top-k. That's one of four ways vector search will never match AWS, and each of them can make a test pass here and fail there. `docs/compatibility-summary.md` sets all four out. `COSINE` and `EUCLIDEAN` score as distances, where a self match is 0; `DOT_PRODUCT` scores as a similarity and can be negative. The vector attribute is left out of results unless a projection expression names it and the index projects it. A table carrying a vector index has to be `PAY_PER_REQUEST`.
+
+The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would. A tool's arguments arrive already parsed, so the order they were written in, and any name written twice, are lost. Where DynamoDB would report whichever of two faults was written first, a tool may report the other one.
 
 ## Consumed capacity
 
@@ -216,6 +223,6 @@ The data model is context-only - dynoxide does not validate writes against the s
 
 ## Serving an import
 
-`dynoxide import --mcp` loads a DynamoDB export into memory and serves it over stdio, so an agent can work on a copy of real data that disappears with the process. With `--rules`, the data is anonymised on the way in, and the run is gated on the result: if an original value reached the output, the import exits 3 before any server starts, and `--accept-exposure` lets it serve anyway. `--mcp-read-only` applies here as it does to `dynoxide mcp --read-only`, so the copy can be served without letting the agent write to it. The [exit codes](import.md#exit-codes) section of the import docs sets out what counts as an exposure.
+`dynoxide import --mcp` loads a DynamoDB export into memory and serves it over stdio, so an agent can work on a copy of real data that disappears with the process. With `--rules`, the data is anonymised on the way in and the run is gated on the result. If an original value reached the output, the import exits 3 before any server starts; `--accept-exposure` lets it serve anyway. `--mcp-read-only` applies here as it does to `dynoxide mcp --read-only`, so the copy can be served without letting the agent write to it. The [exit codes](import.md#exit-codes) section of the import docs sets out what counts as an exposure.
 
 The agent does not see the import's stderr, so the server tells it instead. The instructions name the import and its counts, and `get_database_info` returns an `import` object with every notice, its concern (`exposure` or `caution`), and whether exposures were accepted. Read it before treating the data as anonymised.

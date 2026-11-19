@@ -67,11 +67,10 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   `native-sqlite + encryption`). A `wasm-check` job builds the library
   for `wasm32-unknown-unknown` with `--no-default-features --features
   wasm-sqlite` (and `wasm-harness`), and runs `cargo clippy -- -D
-  warnings` on both, so code only the wasm build compiles is linted
-  too. If you change feature gates or
-  anything cross-cutting, running the relevant matrix leg locally
-  saves a CI round-trip. `.github/workflows/ci.yml` is the
-  authoritative list.
+  warnings` on both, so code that only the wasm build compiles is
+  linted too. If you change feature gates or anything cross-cutting,
+  run the relevant matrix leg locally to save a CI round-trip.
+  `.github/workflows/ci.yml` is the authoritative list.
 - A pull request that changes only documentation skips the build and
   test jobs and the benchmark workflow; `lint` still runs. The list of
   paths that count as documentation is in
@@ -96,14 +95,14 @@ they do not carry equal weight:
 - **iai-callgrind (instruction-count benchmarks).** Nearly
   deterministic, and the layer that can go red. The PR job benchmarks
   the base branch first, then your merged change against it on the
-  same runner, and fails if any benchmark runs more than 4% more
-  instructions than the base, or if a benchmark the base has ended up
+  same runner. It fails if any benchmark runs more than 4% more
+  instructions than the base, or if a benchmark the base has ends up
   with nothing to compare against. A benchmark your PR adds is
   reported as new and does not fail. The one case with no comparison
   is a PR that changes the locked iai-callgrind version: counts from
   two versions are not comparable, so the job warns and runs only your
-  benchmarks. The job is advisory, not a required check, but a red
-  result here usually means the code path really does more. To
+  benchmarks. The job is advisory rather than a required check, but a
+  red result here usually means the code path really does more. To
   reproduce it, run
   `cargo bench --bench iai_core --features iai-callgrind -- --save-baseline=base`
   in `benchmarks/` on `main`, then

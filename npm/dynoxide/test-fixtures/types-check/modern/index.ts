@@ -11,6 +11,6 @@ export async function check(): Promise<void> {
 }
 
 export async function stopping(): Promise<ExitStatus> {
-  const server = await start();
+  const server = await start({ port: 8000 });
   return server.stop();
 }

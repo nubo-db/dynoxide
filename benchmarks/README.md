@@ -47,9 +47,11 @@ python3 scripts/generate_report.py --results-dir results --output-dir results/ch
 | **Floci** | Docker container, with the Docker socket mounted | Startup, image size, idle memory only |
 | **MiniStack** | Docker container, Python | Startup, image size, idle memory only |
 
-LocalStack uses DynamoDB Local internally as its DynamoDB engine — its emulation layer is DynamoDB Local's JVM process wrapped with Python routing. This is why its startup and memory numbers are higher than DynamoDB Local alone: you're paying for both runtimes. We benchmark LocalStack for startup time, image size, and idle memory only — operation-level benchmarks would measure DynamoDB Local's performance through an additional network hop.
+LocalStack uses DynamoDB Local internally as its DynamoDB engine: its emulation layer is DynamoDB Local's JVM process wrapped in Python routing. That's why its startup and memory numbers are higher than DynamoDB Local's alone, since you're paying for both runtimes. We benchmark LocalStack for startup time, image size and idle memory only. Operation-level benchmarks would just measure DynamoDB Local's performance through an extra network hop.
 
-Floci and MiniStack are multi-service AWS emulators with their own DynamoDB implementations. They're measured the same way as LocalStack, from the `:latest` image each project publishes, started the way its docs show. For Floci that means mounting the Docker socket, which its CLI also does by default. Without the socket it retries the connection before serving anything, and its first ListTables lands about 15 seconds after start rather than well under a second, so the number would be measuring the missing socket rather than Floci. MiniStack's docs only add the socket for services backed by real containers (RDS, ECS, Lambda), so it runs without one.
+Floci and MiniStack are multi-service AWS emulators with their own DynamoDB implementations. They're measured the same way as LocalStack, using the `:latest` image each project publishes and starting it the way its docs show.
+
+For Floci that means mounting the Docker socket, which its CLI also does by default. Without the socket, Floci retries the connection before serving anything, and its first ListTables lands about 15 seconds after start instead of well under a second. The startup number would then be measuring the missing socket rather than Floci. MiniStack's docs only add the socket for services backed by real containers (RDS, ECS, Lambda), so it runs without one.
 
 ## Results: Local Development (Apple Silicon)
 
@@ -61,7 +63,7 @@ Results from a Mac Studio (M-series). These reflect the experience of a develope
 |--------|------|-------------------|
 | Dynoxide Embedded | <!-- bench:local_startup_embedded -->**~0.2ms**<!-- /bench --> | <!-- bench:local_startup_embedded_ratio -->**~10,046x faster**<!-- /bench --> |
 | Dynoxide HTTP | <!-- bench:local_startup_http -->**~15ms**<!-- /bench --> | <!-- bench:local_startup_http_ratio -->**~148x faster**<!-- /bench --> |
-| DynamoDB Local | <!-- bench:local_startup_ddb_local -->~2,287ms<!-- /bench --> | — |
+| DynamoDB Local | <!-- bench:local_startup_ddb_local -->~2,287ms<!-- /bench --> | - |
 | LocalStack | <!-- bench:local_startup_localstack -->~6,231ms<!-- /bench --> | <!-- bench:local_startup_localstack_ratio -->2.7x slower<!-- /bench --> |
 
 ### Per-Operation Comparison (Dynoxide HTTP vs DynamoDB Local)
@@ -90,8 +92,8 @@ Results from a Mac Studio (M-series). These reflect the experience of a develope
 | Dynoxide Embedded (4x parallel) | <!-- bench:local_ci_embedded_par -->~203ms<!-- /bench --> | <!-- bench:local_ci_embedded_par_ratio -->**5.9x**<!-- /bench --> |
 | Dynoxide HTTP (sequential) | <!-- bench:local_ci_http_seq -->~569ms<!-- /bench --> | <!-- bench:local_ci_http_seq_ratio -->**4.2x**<!-- /bench --> |
 | Dynoxide HTTP (4x parallel) | <!-- bench:local_ci_http_par -->~235ms<!-- /bench --> | <!-- bench:local_ci_http_par_ratio -->**5.1x**<!-- /bench --> |
-| DynamoDB Local (sequential) | <!-- bench:local_ci_ddb_seq -->~2,407ms<!-- /bench --> | — |
-| DynamoDB Local (4x parallel) | <!-- bench:local_ci_ddb_par -->~1,189ms<!-- /bench --> | — |
+| DynamoDB Local (sequential) | <!-- bench:local_ci_ddb_seq -->~2,407ms<!-- /bench --> | - |
+| DynamoDB Local (4x parallel) | <!-- bench:local_ci_ddb_par -->~1,189ms<!-- /bench --> | - |
 
 ### Embedded Micro-benchmarks (criterion)
 
@@ -118,7 +120,7 @@ Results from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core AMD EPYC 7
 |--------|------|--------|-------------------|
 | Dynoxide Embedded | <!-- bench:ci_startup_embedded_mean -->0.3ms<!-- /bench --> | <!-- bench:ci_startup_embedded_stddev -->±0.2ms<!-- /bench --> | <!-- bench:ci_startup_embedded_ratio -->**~5,507x faster**<!-- /bench --> |
 | Dynoxide HTTP | <!-- bench:ci_startup_http_mean -->2.1ms<!-- /bench --> | <!-- bench:ci_startup_http_stddev -->±2.5ms<!-- /bench --> | <!-- bench:ci_startup_http_ratio -->**~802x faster**<!-- /bench --> |
-| DynamoDB Local | <!-- bench:ci_startup_ddb_local_mean -->1,714ms<!-- /bench --> | <!-- bench:ci_startup_ddb_local_stddev -->±12ms<!-- /bench --> | — |
+| DynamoDB Local | <!-- bench:ci_startup_ddb_local_mean -->1,714ms<!-- /bench --> | <!-- bench:ci_startup_ddb_local_stddev -->±12ms<!-- /bench --> | - |
 | LocalStack | <!-- bench:ci_startup_localstack_mean -->12,431ms<!-- /bench --> | <!-- bench:ci_startup_localstack_stddev -->±519ms<!-- /bench --> | <!-- bench:ci_startup_localstack_ratio -->4.7x slower<!-- /bench --> |
 | Floci | <!-- bench:ci_startup_floci_mean -->271ms<!-- /bench --> | <!-- bench:ci_startup_floci_stddev -->±11ms<!-- /bench --> | <!-- bench:ci_startup_floci_ratio -->6.3x faster<!-- /bench --> |
 | MiniStack | <!-- bench:ci_startup_ministack_mean -->2,438ms<!-- /bench --> | <!-- bench:ci_startup_ministack_stddev -->±10ms<!-- /bench --> | <!-- bench:ci_startup_ministack_ratio -->1.4x slower<!-- /bench --> |
@@ -143,7 +145,7 @@ DynamoDB Local warm start (after JVM JIT): ~2ms. The cold start cost is what CI 
 | DeleteItem | <!-- bench:ci_op_DeleteItem_http -->0.31ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ddb -->0.92ms<!-- /bench --> | <!-- bench:ci_op_DeleteItem_ratio -->**2.9x**<!-- /bench --> |
 | **Total workload** | <!-- bench:ci_workload_http -->**2.9s**<!-- /bench --> | <!-- bench:ci_workload_ddb -->**11.6s**<!-- /bench --> | <!-- bench:ci_workload_ratio -->**4.0x**<!-- /bench --> |
 
-The largest speedups are on read-heavy operations (GetItem, Query, Scan, BatchGetItem) and multi-item writes (BatchWriteItem, TransactWriteItems) where Dynoxide avoids JVM dispatch overhead and lock contention. Single-row writes (PutItem, DeleteItem) still show a clear win at 2-3x.
+The gap is widest on CreateTable and TransactWriteItems. Single-item reads and writes (GetItem, PutItem, DeleteItem) show the smallest speedup on CI runners, though still a clear one.
 
 ### CI Pipeline Simulation (50 integration tests)
 
@@ -153,14 +155,14 @@ The largest speedups are on read-heavy operations (GetItem, Query, Scan, BatchGe
 | Dynoxide Embedded (4x parallel) | <!-- bench:ci_suite_embedded_par -->465ms<!-- /bench --> | <!-- bench:ci_suite_embedded_par_ratio -->**4.6x**<!-- /bench --> |
 | Dynoxide HTTP (sequential) | <!-- bench:ci_suite_http_seq -->764ms<!-- /bench --> | <!-- bench:ci_suite_http_seq_ratio -->**3.3x**<!-- /bench --> |
 | Dynoxide HTTP (4x parallel) | <!-- bench:ci_suite_http_par -->446ms<!-- /bench --> | <!-- bench:ci_suite_http_par_ratio -->**4.8x**<!-- /bench --> |
-| DynamoDB Local (sequential) | <!-- bench:ci_suite_ddb_seq -->2,494ms<!-- /bench --> | — |
-| DynamoDB Local (4x parallel) | <!-- bench:ci_suite_ddb_par -->2,134ms<!-- /bench --> | — |
+| DynamoDB Local (sequential) | <!-- bench:ci_suite_ddb_seq -->2,494ms<!-- /bench --> | - |
+| DynamoDB Local (4x parallel) | <!-- bench:ci_suite_ddb_par -->2,134ms<!-- /bench --> | - |
 
-DynamoDB Local barely benefits from parallelism (<!-- bench:ci_suite_ddb_seq_prose -->2,494ms<!-- /bench --> → <!-- bench:ci_suite_ddb_par_prose -->2,134ms<!-- /bench -->). Under concurrent load, individual tests take 3-4x longer due to JVM contention — setup times spike to 200-1,000ms on some tests as `CreateTable` calls queue behind the JVM's single-threaded SQLite access. Dynoxide embedded scales better because each test gets its own isolated `Database::memory()` with no shared state.
+DynamoDB Local barely benefits from parallelism (<!-- bench:ci_suite_ddb_seq_prose -->2,494ms<!-- /bench --> → <!-- bench:ci_suite_ddb_par_prose -->2,134ms<!-- /bench -->). Under concurrent load, individual tests take 3-4x longer because of JVM contention. On some tests, setup times spike to 200-1,000ms as `CreateTable` calls queue behind the JVM's single-threaded SQLite access. Dynoxide embedded scales better because each test gets its own isolated `Database::memory()` with no shared state.
 
 ### Embedded Micro-benchmarks (criterion)
 
-These measure Dynoxide's embedded API directly — no HTTP, no serialisation. This is the performance you get when using `Database::memory()` in your Rust test suite.
+These measure Dynoxide's embedded API directly, with no HTTP or serialisation in the way. This is the performance you get when using `Database::memory()` in your Rust test suite.
 
 | Operation | Latency |
 |-----------|---------|
@@ -189,17 +191,17 @@ the GetItem PDF (shows the tight distribution). To include them:
 | Metric | In-Memory | File-Backed | DynamoDB Local (Docker) | LocalStack (Docker) | Floci (Docker) | MiniStack (Docker) |
 |--------|-----------|-------------|------------------------|---------------------|----------------|--------------------|
 | Idle | <!-- bench:ci_mem_memory_idle -->7.7 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_idle -->48.5 MB<!-- /bench --> RSS | <!-- bench:ci_mem_ddb_local_idle -->142.5 MB<!-- /bench --> RSS | <!-- bench:ci_mem_localstack_idle -->389.9 MB<!-- /bench --> RSS | <!-- bench:ci_mem_floci_idle -->25.9 MB<!-- /bench --> RSS | <!-- bench:ci_mem_ministack_idle -->43.3 MB<!-- /bench --> RSS |
-| After 10K items (~1KB each) | <!-- bench:ci_mem_memory_loaded -->48.6 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_loaded -->48.5 MB<!-- /bench --> RSS | — | — | - | - |
-| Disk (10K items) | — | <!-- bench:ci_disk_file_loaded -->15.6 MB<!-- /bench --> | — | — | - | - |
-| Disk (empty table) | — | <!-- bench:ci_disk_file_empty -->104 KB<!-- /bench --> | — | — | - | - |
+| After 10K items (~1KB each) | <!-- bench:ci_mem_memory_loaded -->48.6 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_loaded -->48.5 MB<!-- /bench --> RSS | - | - | - | - |
+| Disk (10K items) | - | <!-- bench:ci_disk_file_loaded -->15.6 MB<!-- /bench --> | - | - | - | - |
+| Disk (empty table) | - | <!-- bench:ci_disk_file_empty -->104 KB<!-- /bench --> | - | - | - | - |
 
-File-backed mode shows higher RSS at creation because SQLite memory-maps the file. Both modes converge at 10K items. The ~46MB for 10K items is ~4.6KB per item — roughly 4x the raw item size, which accounts for SQLite structures, indexes, and the GSI.
+File-backed mode shows higher RSS at creation because SQLite memory-maps the file. Both modes converge at 10K items. At 10K items the in-memory RSS is <!-- bench:ci_mem_memory_loaded -->48.6 MB<!-- /bench -->, several times the ~10 MB of raw item data. The extra covers SQLite structures, indexes and the GSI.
 
 Docker idle memory is the mean of 3 samples taken 10s apart, 30s after the first successful ListTables, no requests served.
 
 ## Why the Numbers Differ Between Local and CI
 
-Local development (Apple Silicon) shows ~17x speedup for embedded CI pipeline; GitHub Actions shows ~7x. This is expected:
+For the embedded CI pipeline on four threads, local development (Apple Silicon) shows a <!-- bench:local_ci_embedded_par_ratio -->**5.9x**<!-- /bench --> speedup and GitHub Actions shows <!-- bench:ci_suite_embedded_par_ratio -->**4.6x**<!-- /bench -->. The difference is expected:
 
 - Apple Silicon has significantly faster single-thread performance than the shared CI runner
 - Dynoxide is CPU-bound (native code, in-process SQLite), so it scales roughly linearly with CPU speed
@@ -235,17 +237,17 @@ Criterion generates HTML reports with detailed charts (PDF distributions, regres
 ### Standard Workload (13 Steps)
 
 1. CreateTable (pk:S HASH, sk:N RANGE, GSI on email:S)
-2. BatchWriteItem — 10,000 medium items in batches of 25
-3. GetItem — 1,000 reads by primary key
-4. PutItem — 1,000 individual writes (mixed sizes)
-5. Query (base table) — 100 queries with key conditions + filters
-6. Query (GSI) — 100 queries on the email index
-7. Query (paginated) — 50 queries following LastEvaluatedKey
-8. Scan — full table scan with filter
-9. UpdateItem — 500 updates with condition expressions
-10. TransactWriteItems — 50 transactions of 4 actions each
-11. BatchGetItem — 100 batches of 100 keys
-12. DeleteItem — 500 deletes
+2. BatchWriteItem: 10,000 medium items in batches of 25
+3. GetItem: 1,000 reads by primary key
+4. PutItem: 1,000 individual writes (mixed sizes)
+5. Query (base table): 100 queries with key conditions + filters
+6. Query (GSI): 100 queries on the email index
+7. Query (paginated): 50 queries following LastEvaluatedKey
+8. Scan: full table scan with filter
+9. UpdateItem: 500 updates with condition expressions
+10. TransactWriteItems: 50 transactions of 4 actions each
+11. BatchGetItem: 100 batches of 100 keys
+12. DeleteItem: 500 deletes
 13. DeleteTable
 
 ### Item Definitions
@@ -270,7 +272,7 @@ All benchmarks run with `--release` (`opt-level = 3`, `lto = "thin"`). Debug bui
 
 ### CI Benchmark Philosophy
 
-Wall-clock benchmarks on shared CI runners are noisy — up to 3x variance between runs due to noisy neighbours. But **comparative** benchmarks (Dynoxide vs DynamoDB Local in the same job) are reliable because the noise affects both equally. The ratio is stable.
+Wall-clock benchmarks on shared CI runners are noisy, with up to 3x variance between runs because of noisy neighbours. **Comparative** benchmarks (Dynoxide vs DynamoDB Local in the same job) are still reliable, because the noise affects both equally and the ratio stays stable.
 
 We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers as headline figures. Instruction-count benchmarks (Iai-Callgrind) provide deterministic regression detection independent of runner load.
 
@@ -286,9 +288,9 @@ We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers
 ## Honesty & Limitations
 
 ### What Dynoxide Does Better
-- **Startup time**: No JVM, no Docker — microsecond-level embedded initialisation
+- **Startup time**: No JVM or Docker, and embedded initialisation takes microseconds
 - **CI pipeline speed**: Zero-cost per-test isolation in embedded mode
-- **Resource usage**: ~3 MB download (~6 MB on disk) vs 225 MB Docker download (471 MB on disk); 5 MB idle RSS vs 163 MB
+- **Resource usage**: a <!-- prose:dynoxide_binary_size -->~4 MB<!-- /bench --> download (<!-- bench:ci_binary_size -->8 MB<!-- /bench --> on disk) against DynamoDB Local's <!-- prose:ci_image_ddb_local_download -->~240 MB<!-- /bench --> image (<!-- bench:ci_image_ddb_local -->230 MB<!-- /bench --> on disk), and <!-- bench:ci_mem_memory_idle -->7.7 MB<!-- /bench --> idle RSS against <!-- bench:ci_mem_ddb_local_idle -->142.5 MB<!-- /bench -->
 - **Embedded mode**: Eliminates HTTP overhead entirely for Rust and iOS consumers
 - **Predictable latency**: No JVM GC pauses, no JIT warmup effects
 
@@ -297,11 +299,11 @@ We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers
 - **AWS-maintained**: Official tooling with ongoing updates
 
 ### Known Limitations
-- Dynoxide's `Arc<Mutex<Storage>>` serialises all operations — parallel benchmarks on a single `Database` instance measure mutex contention, not true parallelism (the CI pipeline benchmark avoids this by giving each parallel test its own `Database::memory()`)
-- JVM warmup means DynamoDB Local's warm-start performance is dramatically better than cold-start — both are reported
-- CI wall-clock numbers vary between runners — use relative ratios, not absolute numbers
+- Dynoxide's `Arc<Mutex<Storage>>` serialises all operations, so parallel benchmarks on a single `Database` instance measure mutex contention rather than true parallelism. The CI pipeline benchmark avoids this by giving each parallel test its own `Database::memory()`
+- JVM warmup makes DynamoDB Local's warm-start performance much better than its cold-start performance. Both are reported
+- CI wall-clock numbers vary between runners, so use the relative ratios rather than absolute numbers
 - Apple Silicon and x86_64 show different absolute numbers but consistent ratios
-- PutItem and DeleteItem show near-parity with DynamoDB Local — Dynoxide's advantage is largest on read operations and batch/scan workloads
+- On CI runners, single-item reads and writes show the smallest speedup over DynamoDB Local. The gap is widest on CreateTable and TransactWriteItems
 
 ## Reproducibility
 
@@ -322,7 +324,16 @@ Or run the full suite in CI: `.github/workflows/benchmark-refresh.yml` runs ever
 Neither benchmark workflow blocks a merge.
 
 ### `benchmark-regression.yml` (on every PR)
-Runs criterion micro-benchmarks (wall-clock, compared against the median of the last five runs stored on the `benchmark-data` branch; anything over 1.5x that median is flagged in the PR comment, as advice rather than a failure) and iai-callgrind instruction-count benchmarks. The iai-callgrind job benchmarks the base branch with `--save-baseline=base`, then the PR's merge commit with `--baseline=base --regression='ir=4.0'` in the same target directory, so every count has a counterpart from the same runner. It fails if any benchmark runs more than 4% more instructions than the base, and `scripts/check_iai_baselines.py` fails it if a benchmark the base produced has no baseline; a benchmark only the PR has is reported as new and passes. The one case with no comparison is a PR that changes the locked iai-callgrind version, since counts from two versions are not comparable: the job warns and runs the PR's benchmarks on their own. That job is advisory: it can go red, but it is not a required check.
+Runs two sets of benchmarks: criterion micro-benchmarks and iai-callgrind instruction-count benchmarks.
+
+The criterion benchmarks measure wall-clock time and are compared against the median of the last five runs stored on the `benchmark-data` branch. Anything over 1.5x that median is flagged in the PR comment, as advice rather than a failure.
+
+The iai-callgrind job benchmarks the base branch with `--save-baseline=base`, then the PR's merge commit with `--baseline=base --regression='ir=4.0'` in the same target directory, so every count has a counterpart from the same runner. The job fails if:
+
+- any benchmark runs more than 4% more instructions than the base, or
+- a benchmark the base produced has no baseline (`scripts/check_iai_baselines.py` checks this).
+
+A benchmark only the PR has is reported as new and passes. The one case with no comparison is a PR that changes the locked iai-callgrind version, since counts from two versions are not comparable. The job then warns and runs the PR's benchmarks on their own. The iai-callgrind job is advisory: it can go red, but it is not a required check.
 
 ### `benchmark-refresh.yml` (run by hand)
 Runs the full comparative benchmarks (Dynoxide vs DynamoDB Local, LocalStack, Floci and MiniStack), appends the run to the `benchmark-data` branch for historical tracking, and opens a pull request that updates the benchmark numbers in `README.md` and this file.

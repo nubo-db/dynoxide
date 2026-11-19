@@ -12,7 +12,7 @@ The canonical server identifier across every registry is
 Automated. `server.json` at the repo root describes the server, and the
 `publish-mcp-registry` job in `.github/workflows/release.yml` publishes it on
 every stable `v*` release tag, authenticating with GitHub OIDC (no token).
-Cutting a release as normal is all that is needed; the job waits for npm to go
+Cutting a release as normal is all that's needed. The job waits for npm to go
 live, stamps the release version into `server.json`, and runs
 `mcp-publisher publish`. A prerelease tag skips it, because the registry treats
 the highest semver as latest and `1.3.0-rc.1` sorts above `1.2.1`.
@@ -71,8 +71,8 @@ to the new release.
 **A published server is not a listed one.** The CLI publishes with visibility
 set to unlisted, so the server deploys and is reachable by direct link while
 never appearing in search. Turn it off under Settings, General, "Unlisted" in
-the Smithery web UI. This is a one-time change per server, not per release, and
-it is worth checking after the first publish because nothing in the CLI output
+the Smithery web UI. You only need to do this once per server, not per
+release. Check it after the first publish, because nothing in the CLI output
 says the listing is hidden.
 
 The listing's own metadata comes from the manifest, which is why
@@ -84,14 +84,14 @@ the server page ends up pointing at `smithery.ai` and a placeholder repo.
 ## Glama (glama.ai)
 
 One-off, and it needs your GitHub OAuth. `glama.json` at the repo root names the
-maintainer (`hicksy`) for the ownership claim. To list it:
+maintainer (`hicksy`), so the listing is attributed to you. To list it:
 
 1. Go to <https://glama.ai/mcp/servers> and choose "Add MCP Server".
 2. Sign in with GitHub and submit the repo URL for review.
 3. Glama build-checks the server in a sandbox and lists it, usually within minutes.
 
-`glama.json` names the maintainer (`hicksy`) so the listing is attributed to you;
-the current flow submits for review rather than offering a separate claim step.
+The current flow submits for review rather than offering a separate claim
+step.
 
 A directory listing needs no Dockerfile. To later have Glama host and run it
 through their gateway, point them at the `dynoxide` npm package in the admin

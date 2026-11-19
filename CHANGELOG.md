@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- **A taken `--port` on `serve` or `import --serve` exits `4` instead of
+  `1`.** A script that checks for a non-zero exit is unaffected; one that
+  checks for exactly `1` needs to accept `4` too. `mcp --http` still exits `1`.
+- **`--mcp-port` can't be the same as a fixed `--port`.** With `--mcp`,
+  `serve` and `import --serve` exit `1` before binding anything when the two
+  match, whatever the hosts. On macOS, an MCP listener on `127.0.0.1` could
+  bind beside DynamoDB on `0.0.0.0` and take the loopback requests meant for
+  it. The default `--mcp-port` counts, so `serve --port 19280 --mcp` and
+  `import --serve --port 8100 --mcp` now need `--mcp-port` set to another
+  port. So does DynamoDB on `127.0.0.1` with MCP on `[::1]` on one port,
+  which used to work.
+  ([#355](https://github.com/nubo-db/dynoxide/issues/355))
+- **A listener on the other loopback family now counts as a taken port.**
+  `dynoxide --port 8000` refuses to start when something listens on
+  `[::1]:8000`, and `--host '[::1]'` refuses when something listens on
+  `127.0.0.1:8000`, because a `localhost` client may reach that listener
+  first. Before, Dynoxide started beside it. The check is in the library, so
+  `server::start` in the `dynoxide-rs` crate refuses in the same way.
+- **The ports are bound before the database is touched or an import runs.**
+  `serve` and `mcp --http` bind them before they create or open the
+  `--db-path` file, and `import --serve` before it imports. A port that was
+  taken or couldn't be bound used to leave a new database file behind, or
+  turn up only after a full import. A client that connects before the server
+  is ready now waits instead of being refused. With `--mcp`, the "Starting
+  DynamoDB HTTP server" line now comes after the binds, so a bind that
+  fails prints its error without it.
+- **The `dynoxide-rs` crate needs tokio 1.46 or later**, up from any 1.x.
+  Starting DynamoDB and MCP together uses `join!` with `biased;`, which
+  arrived in 1.46. A project that pins an older tokio has to move up.
+
+### Added
+
+- **`dynoxide serve` exits `4` when its `--port` is already taken.** Every
+  startup failure used to exit `1`, so a launcher could only spot a taken port
+  from the stderr wording, which differed between the pre-bind check, the bind
+  itself and Windows. Now a listener on the port and a bind that fails because
+  the port is in use both exit `4`, with the same `port N is already in use`
+  message. A permission error, such as a privileged port or a port in a range
+  Windows has reserved, still exits `1`; on Windows the message says how to
+  list the reserved ranges. `docs/launcher.md` moves to launcher contract 2 to
+  cover it.
+- **npm `start()` takes a `port` option.** It defaults to 0, so the operating
+  system picks a free port as before. A fixed port is for dev setups where
+  something needs the endpoint in advance, such as a second app or an `.env`
+  file. If that port is taken, `start()` rejects with `DYNOXIDE_PORT_IN_USE`,
+  naming the port in the message and in `err.port`. An invalid port (`"8000"`, `-1`, `70000`) makes `start()`
+  reject with a `TypeError` or `RangeError` before anything is run.
+- **`server::bind` in the `dynoxide-rs` crate.** It binds a listener with the
+  checks `server::start` makes: it refuses a port another listener answers
+  on, and binds exclusively on Windows. Hand the listener to
+  `server::serve_with_shutdown` to serve it until your own shutdown future
+  resolves. ([#257](https://github.com/nubo-db/dynoxide/issues/257))
+
+### Fixed
+
+- **An MCP port that can't be bound now stops startup.** With `serve --mcp`
+  or `import --serve --mcp`, Dynoxide used to start DynamoDB and serve, and
+  only report the MCP bind error (exit `1`) when it was stopped. Both
+  listeners are now bound before either serves, so it exits `1` straight
+  away, before the ready line or the "Dynoxide listening on" line. Two
+  `--mcp` instances on one machine each need their own `--mcp-port`, since
+  they'd otherwise both take the default (19280 for `serve`, 8100 for
+  `import --serve`). An `--mcp-port` the same as a fixed `--port` is now
+  refused, as set out under Behaviour changes.
+  ([#354](https://github.com/nubo-db/dynoxide/issues/354),
+  [#355](https://github.com/nubo-db/dynoxide/issues/355))
+- **A stderr nobody reads no longer costs the exit status.** Writing to
+  stderr once its reader had gone made the release build abort, so a launcher
+  that had closed the pipe saw a crash instead of the status it was waiting
+  for, such as `4` for a taken port. Dynoxide now ignores a failed write to
+  stderr, the import report included.
+  ([#324](https://github.com/nubo-db/dynoxide/issues/324))
+- **`import` runs in a debug build without either server.** A debug build
+  with `import` but without `http-server` or `mcp-server` panicked in one of
+  clap's checks as soon as `import` ran. Release builds skip that check.
+  ([#314](https://github.com/nubo-db/dynoxide/issues/314))
+
 ## [1.7.0] - 2026-11-17
 
 The crate moves to `dynoxide-rs` 4.0.0, because the `rusqlite` move changes

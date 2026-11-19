@@ -104,8 +104,29 @@ jobs:
       # spawned on Windows can pick up handles another thread is passing to
       # its own child, and a stray copy of the server's stdin pipe would keep
       # it open after the launcher has gone.
+      # --nocapture so the log shows which tests skipped, and which error
+      # a port that's bound but not listening gave.
       - name: Test the launcher contract
-        run: cargo test --test launcher_contract -- --test-threads=1
+        run: cargo test --test launcher_contract -- --test-threads=1 --nocapture
+
+  # A taken port is reported the same way on every OS, and macOS has its own
+  # rules for binding (a non-root user may bind 0.0.0.0 on a privileged port,
+  # but not 127.0.0.1), so the launcher contract runs here too.
+  test-macos:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test (macos)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # --nocapture so the log shows which tests skipped, and which error
+      # a port that's bound but not listening gave.
+      - name: Test the launcher contract
+        run: cargo test --test launcher_contract -- --test-threads=1 --nocapture
 
   # `rust-version` is part of the published Rust API contract in
   # docs/versioning.md, so it is a promise rather than a description. Every
@@ -192,10 +213,29 @@ jobs:
       - name: Clippy (encryption)
         run: cargo clippy --no-default-features --features encryption --lib -- -D warnings
 
+      # With the server and CLI, so the binary's own tests (the key-file ones
+      # among them) are linted in the encryption build too.
+      - name: Clippy (encryption, all targets)
+        run: cargo clippy --no-default-features --features encryption,http-server,cli --all-targets -- -D warnings
+
       # The MCP server without the HTTP one, so code the two share can't be
-      # left behind an HTTP-only gate.
+      # left behind an HTTP-only gate, and a test that needs the HTTP server
+      # has to say so.
       - name: Clippy (MCP without HTTP)
-        run: cargo clippy --no-default-features --features native-sqlite,mcp-server --lib -- -D warnings
+        run: cargo clippy --no-default-features --features native-sqlite,mcp-server --all-targets -- -D warnings
+
+      # The same with the CLI, which is what compiles the MCP server tests.
+      - name: Clippy (MCP without HTTP, with the CLI)
+        run: cargo clippy --no-default-features --features native-sqlite,mcp-server,cli --all-targets -- -D warnings
+
+      # The CLI's own tests in the MCP build with import and without HTTP,
+      # where clap has refused flags that name --serve.
+      - name: CLI tests (MCP and import without HTTP)
+        run: cargo test --bin dynoxide --no-default-features --features native-sqlite,import,mcp-server,cli
+
+      # And with import alone, where --output has no flag to conflict with.
+      - name: CLI tests (import without either server)
+        run: cargo test --bin dynoxide --no-default-features --features native-sqlite,import
 
       - name: Format
         run: cargo fmt --check

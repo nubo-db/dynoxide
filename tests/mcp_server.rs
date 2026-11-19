@@ -6818,6 +6818,8 @@ fn a_null_name_or_set_member_is_refused_through_the_tools_as_over_http() {
 /// without one, a capacity mode outside the enum included (captured from
 /// DynamoDB on 12 November 2026, and pinned over HTTP in
 /// tests/null_attribute_values.rs).
+// It sends the requests over HTTP, so it needs the HTTP server.
+#[cfg(feature = "http-server")]
 #[test]
 fn over_100_gets_are_answered_through_the_tool_as_over_http() {
     let gets = |first: Value| {
@@ -6927,6 +6929,8 @@ fn over_100_gets_are_answered_through_the_tool_as_over_http() {
 /// value, with the message the HTTP API gives for the same request (captured
 /// from DynamoDB on 12 November 2026, and pinned over HTTP in
 /// tests/null_attribute_values.rs).
+// It sends the requests over HTTP, so it needs the HTTP server.
+#[cfg(feature = "http-server")]
 #[test]
 fn a_malformed_expression_value_is_refused_first_through_the_tools_as_over_http() {
     let cases: [(&str, &str, Value, Value); 6] = [

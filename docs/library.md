@@ -53,15 +53,18 @@ serves the DynamoDB API on a listener you bind, until a future you supply
 resolves. It then stops accepting, closes idle keep-alive connections, lets
 running requests finish and returns, so the database is released when it does.
 
+From crate 4.1.0, bind the listener with `server::bind`. It refuses a port
+another listener already answers on, the same way `server::start` and the
+`dynoxide` binary do, and binds exclusively on Windows. A listener you bind
+yourself skips both checks.
+
 ```rust
 use dynoxide::Database;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let db = Database::new("data.db").map_err(|e| e.to_string())?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
-        .await
-        .map_err(|e| e.to_string())?;
+    let listener = dynoxide::server::bind("127.0.0.1", 8000).await?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
 
     // Hand `stop` to whatever decides when to shut down.
@@ -103,7 +106,7 @@ fn test_user_creation() {
 }
 ```
 
-No Docker. No port conflicts. No table name prefixes. Tests run in parallel without coordination.
+There's no Docker, no port to fight over and no need for table name prefixes, so tests run in parallel without any coordination.
 
 ## Feature flags
 
@@ -114,7 +117,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 | `mcp-server` | Yes | Adds MCP server for coding agents (stdio and Streamable HTTP transports). |
 | `import` | Yes | Adds `dynoxide import` CLI for importing DynamoDB Export data with anonymisation. |
 | `cli` | Yes | Gates the `dynoxide` binary, with its argument parser (clap) and log subscriber (`tracing-subscriber`). The binary also needs `http-server`, `mcp-server` or `import`. `import` turns `cli` on; `http-server` and `mcp-server` don't, so a library that embeds a server compiles neither dependency and keeps its own logging setup. |
-| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS). Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See the WASM section. |
+| `wasm-sqlite` | No | wasm32 browser backend (@sqlite.org/sqlite-wasm over OPFS). Mutually exclusive with the native backends and the CLI, so it needs `default-features = false`. See [the wasm build](wasm.md). |
 | `encryption` | No | Bundles SQLCipher + vendored OpenSSL. Adds `Database::new_encrypted()` for encryption at rest. |
 | `encryption-cc` | No | Like `encryption` but uses Apple CommonCrypto instead of bundled OpenSSL. For macOS and iOS builds. |
 | `encrypted-server` | No | Convenience: enables `encryption` + `http-server` + `cli`. |

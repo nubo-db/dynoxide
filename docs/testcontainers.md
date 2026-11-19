@@ -68,9 +68,9 @@ ctr, err := testcontainers.Run(ctx, "ghcr.io/nubo-db/dynoxide:1.7",
 )
 ```
 
-Go's default port strategy already survives a shell-free image, so the HTTP wait
-here is about correctness rather than rescue: a listening socket is not the same
-as a ready engine.
+Go's default port strategy already works on a shell-free image. The HTTP wait
+is still worth setting, because a listening socket isn't the same as a ready
+engine.
 
 ### .NET
 

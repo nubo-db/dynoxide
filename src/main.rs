@@ -156,7 +156,8 @@ struct ServeArgs {
     #[arg(long)]
     mcp: bool,
 
-    /// Port for the MCP HTTP transport (default: 19280)
+    /// Port for the MCP HTTP transport (default: 19280). Must differ from a
+    /// fixed --port, even when left at its default
     #[cfg(feature = "mcp-server")]
     #[arg(long, default_value_t = 19280, requires = "mcp")]
     mcp_port: u16,
@@ -305,7 +306,21 @@ struct ImportArgs {
     source: std::path::PathBuf,
 
     /// Output SQLite database file path (mutually exclusive with --serve/--mcp)
-    #[arg(long, conflicts_with_all = ["serve", "mcp"])]
+    // Each flag only exists with its feature, and clap refuses to build the
+    // command if a conflict names a missing one.
+    #[cfg_attr(
+        all(feature = "http-server", feature = "mcp-server"),
+        arg(long, conflicts_with_all = ["serve", "mcp"])
+    )]
+    #[cfg_attr(
+        all(feature = "http-server", not(feature = "mcp-server")),
+        arg(long, conflicts_with = "serve")
+    )]
+    #[cfg_attr(
+        all(not(feature = "http-server"), feature = "mcp-server"),
+        arg(long, conflicts_with = "mcp")
+    )]
+    #[cfg_attr(not(any(feature = "http-server", feature = "mcp-server")), arg(long))]
     output: Option<std::path::PathBuf>,
 
     /// Schema file (JSON with DescribeTable responses)
@@ -372,7 +387,8 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "output")]
     mcp: bool,
 
-    /// Port for the MCP HTTP server when using --serve --mcp together
+    /// Port for the MCP HTTP server when using --serve --mcp together. Must differ
+    /// from a fixed --port, even when left at its default
     #[cfg(feature = "mcp-server")]
     #[arg(long, default_value_t = 8100, requires = "mcp")]
     mcp_port: u16,
@@ -451,9 +467,31 @@ async fn main() {
     }
 
     if let Err(e) = run(cli).await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        let message = e.to_string();
+        // Not eprintln!: with no one reading stderr it panics, and the release
+        // build aborts instead of exiting with this status.
+        dynoxide::stderr_line(format_args!("error: {message}"));
+        std::process::exit(exit_status_for(&message));
     }
+}
+
+/// Exit status for a `serve` whose `--port` is already taken: a listener
+/// answered on it, or binding it failed because it is in use. Distinct from 1
+/// so a launcher that asked for a fixed port can say so without reading
+/// stderr. `docs/launcher.md` documents it.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+const EXIT_PORT_IN_USE: i32 = 4;
+
+/// The exit status for an error `run` returned. The DynamoDB listener reports
+/// a taken port as `port N is already in use (...)`, and this crate's own
+/// tests pin that wording, so matching it here is not matching OS text.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+fn exit_status_for(message: &str) -> i32 {
+    let taken = message
+        .strip_prefix("port ")
+        .and_then(|rest| rest.split_once(" is already in use"))
+        .is_some_and(|(port, _)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    if taken { EXIT_PORT_IN_USE } else { 1 }
 }
 
 // When only the import feature is enabled (no async runtime needed)
@@ -464,7 +502,8 @@ async fn main() {
 ))]
 fn main() {
     if let Err(e) = run_sync() {
-        eprintln!("error: {e}");
+        // Not eprintln!, which panics when no one reads stderr.
+        dynoxide::stderr_line(format_args!("error: {e}"));
         std::process::exit(1);
     }
 }
@@ -538,11 +577,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(not(feature = "http-server"))]
         None => {
-            eprintln!("No subcommand specified. Available subcommands:");
+            dynoxide::stderr_line(format_args!(
+                "No subcommand specified. Available subcommands:"
+            ));
             #[cfg(feature = "mcp-server")]
-            eprintln!("  mcp       Start the MCP server");
+            dynoxide::stderr_line(format_args!("  mcp       Start the MCP server"));
             #[cfg(feature = "import")]
-            eprintln!("  import    Import DynamoDB Export data");
+            dynoxide::stderr_line(format_args!("  import    Import DynamoDB Export data"));
             std::process::exit(1);
         }
 
@@ -564,8 +605,10 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Import(args)) => run_import(args),
 
         None => {
-            eprintln!("No subcommand specified. Available subcommands:");
-            eprintln!("  import    Import DynamoDB Export data");
+            dynoxide::stderr_line(format_args!(
+                "No subcommand specified. Available subcommands:"
+            ));
+            dynoxide::stderr_line(format_args!("  import    Import DynamoDB Export data"));
             std::process::exit(1);
         }
         #[allow(unreachable_patterns)]
@@ -579,6 +622,11 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "http-server")]
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "mcp-server")]
+    if args.mcp {
+        refuse_shared_port(args.port, args.mcp_port)?;
+    }
+
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
 
@@ -593,6 +641,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
              are ephemeral and do not benefit from encryption at rest."
             .into());
     }
+
+    // Before the database is opened or scaffolded, so a taken port leaves
+    // nothing behind.
+    #[cfg(feature = "mcp-server")]
+    let (listener, mcp_listener) = bind_listeners(
+        &args.host,
+        args.port,
+        args.mcp.then_some((args.mcp_host.as_str(), args.mcp_port)),
+    )
+    .await?;
+    #[cfg(not(feature = "mcp-server"))]
+    let listener = dynoxide::server::bind(&args.host, args.port).await?;
 
     let db = open_database(&args.db_path, {
         #[cfg(feature = "encryption")]
@@ -623,9 +683,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(feature = "mcp-server")]
-    if args.mcp {
-        use tokio_util::sync::CancellationToken;
-
+    if let Some(mcp_listener) = mcp_listener {
         let quiet = is_quiet(args.log);
         let mcp_data_model = load_data_model(args.mcp_data_model.as_ref(), quiet)?;
         let mcp_config = dynoxide::mcp::McpConfig {
@@ -640,9 +698,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.mcp_no_auth,
             args.mcp_allowed_host.clone(),
         )?;
-        let mcp_db = db.clone();
-        let mcp_shutdown = CancellationToken::new();
-        let mcp_shutdown_clone = mcp_shutdown.clone();
         let mcp_options = server_options.clone();
 
         if !quiet {
@@ -652,29 +707,97 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
 
-        let (http_result, mcp_result) = tokio::join!(
-            async {
-                let r =
-                    dynoxide::server::start_with_options(&args.host, args.port, db, server_options)
-                        .await;
-                // HTTP server exited (Ctrl+C): tell MCP to shut down too
-                mcp_shutdown_clone.cancel();
-                r
-            },
-            dynoxide::mcp::serve_http_with_options(
-                mcp_db,
-                opts,
-                mcp_config,
-                Some(mcp_shutdown),
-                mcp_options,
-            ),
-        );
-        http_result?;
-        mcp_result?;
-        return Ok(());
+        return serve_dynamodb_and_mcp(
+            listener,
+            mcp_listener,
+            db,
+            server_options,
+            opts,
+            mcp_config,
+            mcp_options,
+        )
+        .await;
     }
 
-    dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
+    dynoxide::server::serve_with_options(listener, db, server_options).await?;
+    Ok(())
+}
+
+/// Bind the DynamoDB listener, then the MCP one if `mcp` names its host and
+/// port, before any other work: a port that's taken or can't be bound then
+/// stops startup before a database is opened or an import runs. DynamoDB
+/// goes first, so its port checks can't see Dynoxide's own MCP listener.
+///
+/// Until serving starts, a client that connects waits in the listen queue
+/// rather than being refused. A launcher waits for the ready line anyway.
+#[cfg(all(feature = "http-server", feature = "mcp-server"))]
+async fn bind_listeners(
+    host: &str,
+    port: u16,
+    mcp: Option<(&str, u16)>,
+) -> Result<(tokio::net::TcpListener, Option<tokio::net::TcpListener>), Box<dyn std::error::Error>>
+{
+    let listener = dynoxide::server::bind(host, port).await?;
+    let mcp_listener = match mcp {
+        Some((mcp_host, mcp_port)) => Some(dynoxide::mcp::bind_http_to(mcp_host, mcp_port).await?),
+        None => None,
+    };
+    Ok((listener, mcp_listener))
+}
+
+/// Refuse one fixed port for both the DynamoDB and the MCP listener.
+///
+/// Whatever the hosts, sharing a port goes wrong somewhere: on macOS an MCP
+/// listener on `127.0.0.1` binds beside a DynamoDB one on `0.0.0.0` and takes
+/// its loopback requests, and on Linux the second bind fails. Port 0 is never
+/// refused, since the OS picks a different port for each.
+#[cfg(all(feature = "http-server", feature = "mcp-server"))]
+fn refuse_shared_port(port: u16, mcp_port: u16) -> Result<(), String> {
+    if port != 0 && port == mcp_port {
+        return Err(format!(
+            "--port and --mcp-port are both {port}; give the MCP server a port of its own with --mcp-port"
+        ));
+    }
+    Ok(())
+}
+
+/// Serve the DynamoDB listener and the MCP listener together, for
+/// `serve --mcp` and `import --serve --mcp`, on listeners [`bind_listeners`]
+/// bound. When the DynamoDB side stops, it tells the MCP side to stop too.
+#[cfg(all(feature = "http-server", feature = "mcp-server"))]
+async fn serve_dynamodb_and_mcp(
+    dynamo_listener: tokio::net::TcpListener,
+    mcp_listener: tokio::net::TcpListener,
+    db: Database,
+    options: dynoxide::ServerOptions,
+    mcp_opts: dynoxide::mcp::HttpOptions,
+    mcp_config: dynoxide::mcp::McpConfig,
+    mcp_options: dynoxide::ServerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_db = db.clone();
+    let mcp_shutdown = tokio_util::sync::CancellationToken::new();
+    let mcp_shutdown_clone = mcp_shutdown.clone();
+    // Biased, so the DynamoDB side is always polled first and its listening
+    // and ready lines come before the MCP listening line.
+    let (http_result, mcp_result) = tokio::join!(
+        biased;
+        async {
+            let r = dynoxide::server::serve_with_options(dynamo_listener, db, options).await;
+            // The DynamoDB server stopped: tell MCP to shut down too.
+            mcp_shutdown_clone.cancel();
+            r
+        },
+        dynoxide::mcp::serve_http_on(
+            mcp_listener,
+            mcp_db,
+            mcp_opts,
+            mcp_config,
+            Some(mcp_shutdown),
+            mcp_options,
+        ),
+    );
+    http_result?;
+    mcp_result?;
     Ok(())
 }
 
@@ -855,7 +978,7 @@ fn run_healthcheck(args: HealthcheckArgs) -> ! {
     match do_healthcheck(args) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("healthcheck: {e}");
+            dynoxide::stderr_line(format_args!("healthcheck: {e}"));
             std::process::exit(1);
         }
     }
@@ -879,14 +1002,16 @@ fn do_healthcheck(args: HealthcheckArgs) -> Result<(), String> {
     // value into `DYNOXIDE_HEALTHCHECK_HOST`.
     let probe_host = match args.host.as_str() {
         "0.0.0.0" => {
-            eprintln!("healthcheck: rewriting wildcard host 0.0.0.0 to 127.0.0.1 for probe");
+            dynoxide::stderr_line(format_args!(
+                "healthcheck: rewriting wildcard host 0.0.0.0 to 127.0.0.1 for probe"
+            ));
             "127.0.0.1".to_string()
         }
         "::" | "[::]" => {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "healthcheck: rewriting wildcard host {} to ::1 for probe",
                 args.host
-            );
+            ));
             "::1".to_string()
         }
         h => h.to_string(),
@@ -1067,6 +1192,14 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
+    // Before the database is opened, as `serve` does, so a port that can't be
+    // bound leaves no new database file behind.
+    let listener = if args.http {
+        Some(dynoxide::mcp::bind_http_to(&args.host, args.port).await?)
+    } else {
+        None
+    };
+
     let db = open_database(&args.db_path, {
         #[cfg(feature = "encryption")]
         {
@@ -1089,7 +1222,7 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
         import: None,
     };
 
-    if args.http {
+    if let Some(listener) = listener {
         let opts = resolve_mcp_http_options(
             &args.host,
             args.port,
@@ -1097,8 +1230,15 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.no_auth,
             args.allowed_host.clone(),
         )?;
-        dynoxide::mcp::serve_http_with_options(db, opts, mcp_config, None, server_options(args.log))
-            .await
+        dynoxide::mcp::serve_http_on(
+            listener,
+            db,
+            opts,
+            mcp_config,
+            None,
+            server_options(args.log),
+        )
+        .await
     } else {
         dynoxide::mcp::serve_stdio(db, mcp_config).await
     }
@@ -1122,18 +1262,18 @@ fn finish_import(summary: &dynoxide::import::ImportSummary, accept_exposure: boo
     if summary.exposures.is_empty() || accept_exposure {
         return;
     }
-    eprintln!();
-    eprintln!(
+    dynoxide::stderr_line(format_args!(""));
+    dynoxide::stderr_line(format_args!(
         "{} of the warnings above say an original value reached the output:",
         summary.exposures.len()
-    );
+    ));
     for exposure in &summary.exposures {
-        eprintln!("  - {exposure}");
+        dynoxide::stderr_line(format_args!("  - {exposure}"));
     }
-    eprintln!();
-    eprintln!(
+    dynoxide::stderr_line(format_args!(""));
+    dynoxide::stderr_line(format_args!(
         "Exiting {EXIT_EXPOSURE}. Fix the rules, or pass --accept-exposure if this is expected."
-    );
+    ));
     std::process::exit(EXIT_EXPOSURE);
 }
 
@@ -1169,22 +1309,22 @@ fn import_report(
 
 #[cfg(feature = "import")]
 fn print_import_summary(summary: &dynoxide::import::ImportSummary) {
-    eprintln!();
-    eprintln!("Import complete:");
-    eprintln!("  Tables: {}", summary.tables.len());
-    eprintln!("  Items:  {}", summary.total_items);
+    dynoxide::stderr_line(format_args!(""));
+    dynoxide::stderr_line(format_args!("Import complete:"));
+    dynoxide::stderr_line(format_args!("  Tables: {}", summary.tables.len()));
+    dynoxide::stderr_line(format_args!("  Items:  {}", summary.total_items));
     if summary.total_skipped > 0 {
-        eprintln!("  Skipped: {}", summary.total_skipped);
+        dynoxide::stderr_line(format_args!("  Skipped: {}", summary.total_skipped));
     }
     if let Some(ref path) = summary.output_path {
-        eprintln!("  Output: {}", path.display());
+        dynoxide::stderr_line(format_args!("  Output: {}", path.display()));
     }
 
     if !summary.warnings.is_empty() {
-        eprintln!();
-        eprintln!("Warnings:");
+        dynoxide::stderr_line(format_args!(""));
+        dynoxide::stderr_line(format_args!("Warnings:"));
         for w in &summary.warnings {
-            eprintln!("  - {w}");
+            dynoxide::stderr_line(format_args!("  - {w}"));
         }
     }
 }
@@ -1212,6 +1352,13 @@ fn build_import_command(args: &ImportArgs) -> dynoxide::import::ImportCommand {
     any(feature = "http-server", feature = "mcp-server")
 ))]
 async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Before the import, which can take a while, since the arguments alone
+    // show the servers can't start.
+    #[cfg(all(feature = "http-server", feature = "mcp-server"))]
+    if args.serve && args.mcp {
+        refuse_shared_port(args.port, args.mcp_port)?;
+    }
+
     #[cfg(feature = "http-server")]
     let wants_serve = args.serve;
     #[cfg(not(feature = "http-server"))]
@@ -1225,6 +1372,29 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
     let quiet = is_quiet(args.log);
 
     if wants_serve || wants_mcp {
+        // Bound before the import, which can take a while, so a taken port
+        // stops the run before any of it.
+        // The DynamoDB listener, and the MCP one with --mcp.
+        #[cfg(all(feature = "http-server", feature = "mcp-server"))]
+        let served = if wants_serve {
+            Some(
+                bind_listeners(
+                    &args.host,
+                    args.port,
+                    wants_mcp.then_some((args.mcp_host.as_str(), args.mcp_port)),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        #[cfg(all(feature = "http-server", not(feature = "mcp-server")))]
+        let served = if wants_serve {
+            Some((dynoxide::server::bind(&args.host, args.port).await?, ()))
+        } else {
+            None
+        };
+
         // In-memory mode: import then serve
         let db = Database::memory()?;
         let cmd = build_import_command(&args);
@@ -1241,9 +1411,7 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
 
         // Both --serve and --mcp: run HTTP + MCP concurrently
         #[cfg(all(feature = "http-server", feature = "mcp-server"))]
-        if wants_serve && wants_mcp {
-            use tokio_util::sync::CancellationToken;
-
+        if let Some((listener, Some(mcp_listener))) = served {
             let mcp_data_model = load_data_model(
                 args.mcp_data_model.as_ref().or(args.data_model.as_ref()),
                 quiet,
@@ -1261,10 +1429,6 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 args.mcp_no_auth,
                 args.mcp_allowed_host.clone(),
             )?;
-            let mcp_db = db.clone();
-            let mcp_shutdown = CancellationToken::new();
-            let mcp_shutdown_clone = mcp_shutdown.clone();
-
             if !quiet {
                 dynoxide::stderr_line(format_args!(
                     "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
@@ -1272,40 +1436,21 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
                 ));
             }
 
-            let (http_result, mcp_result) = tokio::join!(
-                async {
-                    let r = dynoxide::server::start_with_options(
-                        &args.host,
-                        args.port,
-                        db,
-                        server_options(args.log),
-                    )
-                    .await;
-                    mcp_shutdown_clone.cancel();
-                    r
-                },
-                dynoxide::mcp::serve_http_with_options(
-                    mcp_db,
-                    opts,
-                    mcp_config,
-                    Some(mcp_shutdown),
-                    server_options(args.log),
-                ),
-            );
-            http_result?;
-            mcp_result?;
-            return Ok(());
+            return serve_dynamodb_and_mcp(
+                listener,
+                mcp_listener,
+                db,
+                server_options(args.log),
+                opts,
+                mcp_config,
+                server_options(args.log),
+            )
+            .await;
         }
 
         #[cfg(feature = "http-server")]
-        if wants_serve {
-            dynoxide::server::start_with_options(
-                &args.host,
-                args.port,
-                db,
-                server_options(args.log),
-            )
-            .await?;
+        if let Some((listener, _)) = served {
+            dynoxide::server::serve_with_options(listener, db, server_options(args.log)).await?;
             return Ok(());
         }
 
@@ -1420,12 +1565,12 @@ fn read_key_file(path: &std::path::Path) -> Result<Zeroizing<String>, Box<dyn st
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
-            eprintln!(
+            dynoxide::stderr_line(format_args!(
                 "warning: key file {} has open permissions (mode {:04o}), \
                  consider chmod 600",
                 path.display(),
                 mode & 0o777,
-            );
+            ));
         }
     }
 
@@ -1482,6 +1627,56 @@ mod tests {
     #[cfg(feature = "encryption")]
     use super::*;
 
+    /// clap checks the command's definition only when it's built in a debug
+    /// build, and refuses one that names a flag this build doesn't have. Every
+    /// feature build runs this, so each finds that out here rather than on
+    /// someone's first `import`.
+    #[test]
+    fn the_command_line_is_valid_in_this_build() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+
+    /// The server's own wording for a taken port maps to 4; anything else,
+    /// including a near miss or a taken `--mcp-port`, stays 1.
+    #[cfg(any(feature = "http-server", feature = "mcp-server"))]
+    #[test]
+    fn only_the_taken_port_wording_exits_4() {
+        use super::{EXIT_PORT_IN_USE, exit_status_for};
+        for taken in [
+            "port 8000 is already in use (detected listener on 127.0.0.1:8000)",
+            "port 8000 is already in use (no listener answered, but Address in use). On Windows, a server stopped moments ago can hold the port until its connections close.",
+        ] {
+            assert_eq!(exit_status_for(taken), EXIT_PORT_IN_USE, "{taken}");
+        }
+        for other in [
+            "failed to bind 127.0.0.1:8001: Address already in use (os error 48)",
+            "Permission denied (os error 13)",
+            "port abc is already in use (x)",
+            "port  is already in use (x)",
+            "error: port 8000 is already in use (x)",
+            "the port 8000 is already in use",
+            "",
+            "--port and --mcp-port are both 8000; give the MCP server a port of its own with --mcp-port",
+        ] {
+            assert_eq!(exit_status_for(other), 1, "{other:?}");
+        }
+    }
+
+    #[cfg(all(feature = "http-server", feature = "mcp-server"))]
+    #[test]
+    fn only_a_shared_fixed_port_is_refused() {
+        use super::refuse_shared_port;
+        for (port, mcp_port) in [(0, 0), (8000, 0), (0, 8000), (8000, 8001)] {
+            assert!(
+                refuse_shared_port(port, mcp_port).is_ok(),
+                "{port} {mcp_port}"
+            );
+        }
+        let err = refuse_shared_port(8000, 8000).unwrap_err();
+        assert!(err.contains("--port and --mcp-port are both 8000"), "{err}");
+    }
+
     mod cli_parse_tests {
         use super::super::*;
 
@@ -1529,6 +1724,7 @@ mod tests {
             assert!(stdio(&[
                 "dynoxide", "import", "--source", "x", "--schema", "s", "--mcp"
             ]));
+            #[cfg(feature = "http-server")]
             assert!(!stdio(&[
                 "dynoxide", "import", "--source", "x", "--schema", "s", "--mcp", "--serve"
             ]));
@@ -1687,7 +1883,11 @@ mod tests {
 
             let mut args = Vec::new();
             env_backed_args(&Cli::command(), "dynoxide", &mut args);
-            assert!(!args.is_empty(), "expected env-backed flags to check");
+            // Only the HTTP server and the MCP server have env-backed flags. In
+            // those builds an empty list means the walk found nothing.
+            if cfg!(any(feature = "http-server", feature = "mcp-server")) {
+                assert!(!args.is_empty(), "expected env-backed flags to check");
+            }
             for (flag, env, hidden) in &args {
                 assert!(
                     *hidden || ENV_VALUES_SHOWN_IN_HELP.contains(&env.as_str()),
@@ -1769,7 +1969,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("key.hex");
             let mut f = std::fs::File::create(&path).unwrap();
-            write!(f, "{}\n", "b".repeat(64)).unwrap();
+            writeln!(f, "{}", "b".repeat(64)).unwrap();
             let key = read_key_file(&path).unwrap();
             assert_eq!(key.len(), 64);
             assert_eq!(&*key, &"b".repeat(64));
@@ -1813,7 +2013,7 @@ mod tests {
         fn non_utf8_key_file() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("key.hex");
-            std::fs::write(&path, &[0xFF, 0xFE, 0xFD]).unwrap();
+            std::fs::write(&path, [0xFF, 0xFE, 0xFD]).unwrap();
             let err = read_key_file(&path).unwrap_err();
             assert!(err.to_string().contains("not valid UTF-8"));
         }

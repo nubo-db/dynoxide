@@ -788,8 +788,7 @@ fn import_mcp_stdio_quiet_suppresses_the_data_model_line() {
 #[test]
 fn import_serve_quiet_still_stops_on_an_exposure() {
     let e = import::export();
-    // The exposure gate stops the run before the server binds, so port 0 is
-    // never bound and there is no port to lose.
+    // Port 0, so the port bound before the import can't clash with anything.
     let a = with_quiet(import::import_args(
         &e,
         &["--rules", &e.rules, "--serve", "--port", "0"],
@@ -805,6 +804,146 @@ fn import_serve_quiet_still_stops_on_an_exposure() {
         stderr.contains("reached the output"),
         "quiet mode dropped the exposure block. stderr:\n{stderr}"
     );
+}
+
+/// `import --serve --mcp` stops when the MCP listener can't be bound, before
+/// it imports anything or the DynamoDB listener serves, instead of serving
+/// until it is signalled.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_mcp_stops_when_the_mcp_listener_cant_be_bound() {
+    let e = import::export();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mcp_port = held.local_addr().unwrap().port().to_string();
+    let a = import::import_args(
+        &e,
+        &[
+            "--serve",
+            "--port",
+            "0",
+            "--mcp",
+            "--mcp-port",
+            &mcp_port,
+            "--mcp-no-auth",
+        ],
+    );
+    let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("failed to bind 127.0.0.1:{mcp_port}")),
+        "stderr doesn't report the MCP bind failure:\n{stderr}"
+    );
+    assert!(!stderr.contains("Dynoxide listening on"), "{stderr}");
+    assert!(!stderr.contains("Import complete:"), "{stderr}");
+}
+
+/// An import that runs to the end writes its report and the exposure block
+/// to stderr. With nobody reading it, neither may panic, or the release build
+/// aborts and the 3 is lost.
+#[cfg(feature = "import")]
+#[test]
+fn an_exposure_exits_3_when_no_one_reads_stderr() {
+    let e = import::export();
+    let out = tempfile::tempdir().unwrap();
+    let db = out.path().join("out.db");
+    let a = import::import_args(&e, &["--rules", &e.rules, "--output", db.to_str().unwrap()]);
+    let mut child = spawn(&a, &[]);
+    drop(child.stderr.take());
+    let output = wait_with_timeout(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(3), "status {}", output.status);
+}
+
+/// `mcp --http` binds before it opens the database, so a port it can't bind
+/// leaves no new database file behind.
+#[test]
+fn mcp_http_on_a_taken_port_leaves_no_database_file() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("new.db");
+    let a = args(&[
+        "mcp",
+        "--http",
+        "--port",
+        &port,
+        "--db-path",
+        db.to_str().unwrap(),
+    ]);
+    let output = wait_with_timeout(
+        spawn(&a, &[("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")]),
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr:\n{}",
+        stderr_of(&output)
+    );
+    assert!(!db.exists(), "a taken port left {} behind", db.display());
+}
+
+/// `import --serve --mcp` refuses one port for both listeners before it
+/// imports anything, since the arguments alone show it can't start.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_mcp_refuses_the_same_port_before_importing() {
+    let e = import::export();
+    let a = import::import_args(
+        &e,
+        &[
+            "--serve",
+            "--port",
+            "48124",
+            "--mcp",
+            "--mcp-port",
+            "48124",
+            "--mcp-no-auth",
+        ],
+    );
+    let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--port and --mcp-port are both 48124"),
+        "stderr doesn't name both flags:\n{stderr}"
+    );
+    assert!(!stderr.contains("Import complete:"), "{stderr}");
+}
+
+/// `import --serve` on a fixed port that's taken exits 4 as `serve` does,
+/// before the import runs, so a launcher can tell a taken port from a failure
+/// without waiting for an import it can't use.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_on_a_taken_port_exits_4() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let e = import::export();
+    let a = import::import_args(&e, &["--serve", "--port", &port]);
+    let output = wait_with_timeout(spawn(&a, &[]), Duration::from_secs(30));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(4), "stderr:\n{stderr}");
+    assert!(!stderr.contains("Import complete:"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("error: port {port} is already in use")),
+        "{stderr}"
+    );
+}
+
+/// With nobody reading stderr, writing the error mustn't panic, or the
+/// release build aborts and the 4 is lost.
+#[cfg(feature = "import")]
+#[test]
+fn import_serve_on_a_taken_port_exits_4_when_no_one_reads_stderr() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let e = import::export();
+    let a = import::import_args(&e, &["--serve", "--port", &port]);
+    let mut child = spawn(&a, &[]);
+    drop(child.stderr.take());
+    let output = wait_with_timeout(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(4), "status {}", output.status);
 }
 
 #[cfg(feature = "import")]

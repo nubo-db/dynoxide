@@ -66,10 +66,10 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "4.0", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "4.1", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "4.0", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "4.1", default-features = false, features = ["encryption"] }
 ```
 
 ## Upgrading to 1.7.0
@@ -171,7 +171,7 @@ became `#[non_exhaustive]`:
 ## GitHub Actions
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v1.7.0
+- uses: nubo-db/dynoxide/action@v1.8.0
   with:
     snapshot-url: https://example.com/test-data.db.zst  # optional
     port: 8000
@@ -196,7 +196,7 @@ docker run --rm -p 8000:8000 \
   serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
 ```
 
-Image tags follow the version: `dynoxide:1.7.0` is exact, `dynoxide:1.7` floats
+Image tags follow the version: `dynoxide:1.8.0` is exact, `dynoxide:1.8` floats
 across patches, and `dynoxide:1` floats across the whole 1.x line. `:1` receives
 conformance fixes, which change behaviour within a major; `:1.2` does not. See
 `docs/versioning.md`.

@@ -12,7 +12,7 @@ npm install @dynoxide/wasm-engine
 
 The package shares the product version number with every other installable dynoxide artefact. The `dynoxide-rs` crate has its own number and isn't part of that. See `docs/versioning.md` for what each number promises and what the conformance suite does and does not exercise.
 
-`npm install @dynoxide/wasm-engine` gets the current release. Use `~1.7.0` if you want behaviour to stay the same when later minor versions come out.
+`npm install @dynoxide/wasm-engine` gets the current release. Use `~1.8.0` if you want behaviour to stay the same when later minor versions come out.
 
 ## Quick start
 

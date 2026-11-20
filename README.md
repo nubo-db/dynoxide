@@ -91,7 +91,7 @@ docker run --rm -p 8000:8000 ghcr.io/nubo-db/dynoxide
 Or start it in a GitHub Actions job:
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v1.7.0
+- uses: nubo-db/dynoxide/action@v1.8.0
   with:
     port: 8000
 ```

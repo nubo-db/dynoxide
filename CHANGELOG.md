@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-20
+
+The crate moves to `dynoxide-rs` 4.1.0. `server::bind` is new, and
+`server::start` now refuses a fixed port that a listener holds on the other
+loopback family, so it's a minor rather than a patch. Everything else a user
+installs carries 1.8.0.
+
 ### Behaviour changes
 
 - **A taken `--port` on `serve` or `import --serve` exits `4` instead of

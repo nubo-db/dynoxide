@@ -445,6 +445,33 @@ jobs:
           echo "Dispatched npm.yml with tag $TAG"
 
   # -------------------------------------------------------------------
+  # Trigger the PyPI publish workflow, which owns the Trusted Publishing
+  # configuration on PyPI. Nothing waits on it: a failed Python publish
+  # doesn't hold up any other channel, and python.yml can be re-run by hand
+  # for the same tag.
+  # -------------------------------------------------------------------
+  publish-pypi:
+    name: Trigger PyPI publish
+    needs: [validate, publish-crate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Dispatch python.yml with the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/workflows/python.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[tag]=$TAG"
+          echo "Dispatched python.yml with tag $TAG"
+
+  # -------------------------------------------------------------------
   # Build and push multi-arch Docker images. GHCR is canonical and
   # gating; Docker Hub and ECR Public are best-effort mirrors.
   # -------------------------------------------------------------------

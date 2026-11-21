@@ -124,6 +124,12 @@ if mode == "port-zero":
 if mode == "partial-then-exit":
     out('{"event":"rea')
     sys.exit(1)
+if mode == "long-stderr-then-exit":
+    err("short line\n" + "y" * 30000 + "\n")
+    sys.exit(1)
+if mode == "endless-first-line":
+    out("z" * 70000)
+    forever()
 if mode == "never-ready":
     err("still thinking\n")
     forever()

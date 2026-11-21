@@ -122,6 +122,24 @@ def test_port_in_use_on_a_fixed_port(start_fake: StartFake) -> None:
     assert caught.value.code == "PORT_IN_USE"
     assert caught.value.port == 8123
     assert "8123" in str(caught.value)
+    # Written just before the exit, and still in the tail.
+    assert any("already in use" in line for line in caught.value.stderr_tail)
+
+
+def test_a_long_last_stderr_line_is_still_in_the_tail(start_fake: StartFake) -> None:
+    with pytest.raises(DynoxideError) as caught:
+        start_fake("long-stderr-then-exit")
+    assert caught.value.code == "EXITED"
+    assert caught.value.stderr_tail[-1].startswith("y" * 100)
+    assert "wrote nothing" not in str(caught.value)
+
+
+def test_a_first_line_with_no_end_fails_without_waiting(start_fake: StartFake) -> None:
+    began = time.monotonic()
+    with pytest.raises(DynoxideError) as caught:
+        start_fake("endless-first-line", ready_timeout=10.0)
+    assert caught.value.code == "BAD_READY_LINE"
+    assert time.monotonic() - began < 5
 
 
 def test_exit_4_with_port_0_is_just_an_exit(start_fake: StartFake) -> None:
@@ -222,9 +240,63 @@ def test_a_chatty_server_never_stalls(start_fake: StartFake) -> None:
 
 def test_the_output_files_go_when_the_server_stops(start_fake: StartFake) -> None:
     server = start_fake()
-    folder = Path(server._process.output.dir)
+    output = server._process.output
+    folder = Path(output.dir)
+    # POSIX removes them as soon as both sides have them open.
+    assert folder.exists() == (sys.platform == "win32")
     server.stop()
     assert not folder.exists()
+    assert output.stdout.closed and output.stderr.closed
+
+
+def test_files_the_output_cannot_go_to_are_a_spawn_failure(
+    start_fake: StartFake, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import tempfile
+
+    import dynoxide._server as server_module
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    real_open = open
+    calls = {"n": 0}
+
+    def failing_open(path: str, mode: str = "r", *args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError(24, "Too many open files")
+        return real_open(path, mode, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(server_module, "open", failing_open, raising=False)
+    with pytest.raises(DynoxideError) as caught:
+        start_fake()
+    assert caught.value.code == "SPAWN_FAILED"
+    assert "Too many open files" in str(caught.value)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_spawn_leaves_no_files(start_fake: StartFake, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import subprocess as subprocess_module
+    import tempfile
+
+    import dynoxide._server as server_module
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    real_checked = server_module.checked
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError(13, "Permission denied")
+
+    def checked_then_break(*args: object) -> object:
+        # The version check runs first and needs a working Popen.
+        found = real_checked(*args)  # type: ignore[arg-type]
+        monkeypatch.setattr(subprocess_module, "Popen", refuse)
+        return found
+
+    monkeypatch.setattr(server_module, "checked", checked_then_break)
+    with pytest.raises(DynoxideError) as caught:
+        start_fake()
+    assert caught.value.code == "SPAWN_FAILED"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_start_leaves_no_thread_running(start_fake: StartFake) -> None:

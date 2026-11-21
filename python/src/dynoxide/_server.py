@@ -138,7 +138,12 @@ def _launch(
     if schema_file is not None:
         args.append(f"--schema={schema_file}")
 
-    output = _Output()
+    try:
+        output = _Output()
+    except OSError as err:
+        raise DynoxideError(
+            SPAWN_FAILED, f"Couldn't create the files for the server's output in {tempfile.gettempdir()}: {err}."
+        ) from None
     try:
         popen = subprocess.Popen(
             args,
@@ -148,9 +153,11 @@ def _launch(
             env=child_env(base),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if WINDOWS else 0,
         )
-    except (OSError, ValueError) as err:
+    except BaseException as err:
         output.close()
-        raise DynoxideError(SPAWN_FAILED, f"Couldn't run {found.describe()}: {err}.") from None
+        if isinstance(err, (OSError, ValueError)):
+            raise DynoxideError(SPAWN_FAILED, f"Couldn't run {found.describe()}: {err}.") from None
+        raise
     output.spawned()
 
     process = _Process(popen, output, found.launcher_flags, grace)
@@ -256,10 +263,19 @@ class _Output:
     def __init__(self) -> None:
         self.dir = tempfile.mkdtemp(prefix="dynoxide-")
         out, err = os.path.join(self.dir, "stdout"), os.path.join(self.dir, "stderr")
-        self.child_stdout: BinaryIO | None = open(out, "ab")  # noqa: SIM115
-        self.child_stderr: BinaryIO | None = open(err, "ab")  # noqa: SIM115
-        self.stdout: BinaryIO = open(out, "rb")  # noqa: SIM115
-        self.stderr: BinaryIO = open(err, "rb")  # noqa: SIM115
+        opened: list[BinaryIO] = []
+        try:
+            for path, append in ((out, True), (err, True), (out, False), (err, False)):
+                opened.append(open(path, "ab" if append else "rb"))  # noqa: SIM115
+        except BaseException:
+            for handle in opened:
+                handle.close()
+            self._remove()
+            raise
+        self.child_stdout: BinaryIO | None = opened[0]
+        self.child_stderr: BinaryIO | None = opened[1]
+        self.stdout: BinaryIO = opened[2]
+        self.stderr: BinaryIO = opened[3]
         self._closed = False
         if not WINDOWS:
             self._remove()
@@ -281,7 +297,13 @@ class _Output:
         self._remove()
 
     def _remove(self) -> None:
-        shutil.rmtree(self.dir, ignore_errors=True)
+        # On Windows a virus scanner or the indexer can hold a file that was
+        # just closed for a moment, so try again briefly before giving up.
+        for attempt in range(5):
+            shutil.rmtree(self.dir, ignore_errors=True)
+            if not os.path.exists(self.dir):
+                return
+            time.sleep(0.05 * (attempt + 1))
 
 
 class _Process:
@@ -305,11 +327,15 @@ class _Process:
 
     def _ready_line(self) -> str | None:
         """The first stdout line, once it's whole. A partial one means the
-        server is still writing it, or died part way through."""
+        server is still writing it, or died part way through. One that runs
+        past the limit with no end is returned as it stands, and fails as a
+        bad ready line."""
         if len(self._stdout) < _LINE_LIMIT:
             self._stdout += self.output.stdout.read(_LINE_LIMIT - len(self._stdout))
         line, newline, _ = self._stdout.partition(b"\n")
-        return line.decode("utf-8", "replace").strip() if newline else None
+        if not newline and len(self._stdout) < _LINE_LIMIT:
+            return None
+        return line.decode("utf-8", "replace").strip()
 
     def _new_stderr_lines(self) -> list[str]:
         self._stderr += self.output.stderr.read()
@@ -322,14 +348,17 @@ class _Process:
         file so a long log costs no more than a short one."""
         if not self.output._closed:
             stream = self.output.stderr
+            # Put back where the legacy start's scan has read to.
+            position = stream.tell()
             end = stream.seek(0, os.SEEK_END)
             stream.seek(max(0, end - STDERR_LINES * 1024))
             text = stream.read().decode("utf-8", "replace")
-            stream.seek(end)
-            lines = [line.rstrip("\r") for line in text.split("\n")]
-            if end > STDERR_LINES * 1024:
-                lines = lines[1:]  # the first may be cut short
-            self._tail = [line for line in lines if line.strip()][-STDERR_LINES:]
+            stream.seek(position)
+            lines = [line.rstrip("\r") for line in text.split("\n") if line.strip()]
+            # The first may be cut short, but a cut line beats none at all.
+            if end > STDERR_LINES * 1024 and len(lines) > 1:
+                lines = lines[1:]
+            self._tail = lines[-STDERR_LINES:]
         return list(self._tail)
 
     # Starting.

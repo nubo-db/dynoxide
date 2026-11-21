@@ -76,6 +76,11 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   paths that count as documentation is in
   `scripts/ci-changed-paths.sh`, and anything not on it runs the full
   suite.
+- The Python package in `python/` has its own tests, run with
+  `python -m pytest` from that directory after
+  `pip install -e . --group dev`. Set `DYNOXIDE_BINARY` to a built binary
+  for the tests that need a real server; without it they skip. CI also runs
+  `ruff check`, `ruff format --check` and `mypy` there.
 - The external conformance suite lives at
   <https://github.com/paritysuite/dynamodb-conformance>. It is run in CI
   for release candidates; you do not need to run it locally for every

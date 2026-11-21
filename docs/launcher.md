@@ -10,10 +10,13 @@ endpoint and stop it again, including when the test runner is killed. This
 page says how, so every wrapper gets those details right in the same way and a
 developer moving between languages sees the same behaviour.
 
-The npm package's `start()` and the Composer package `nubo-db/dynoxide` for
-PHP implement it. The npm package takes its binary from its platform package,
-so it has no cache or download step, and it refuses a binary older than 1.7.0
-(`DYNOXIDE_TOO_OLD`) instead of falling back to the stderr line.
+The npm package's `start()`, the Composer package `nubo-db/dynoxide` for PHP
+and the PyPI package `dynoxide` for Python implement it. The npm package takes
+its binary from its platform package, so it has no cache or download step, and
+it refuses a binary older than 1.7.0 (`DYNOXIDE_TOO_OLD`) instead of falling
+back to the stderr line. The Python package ships the binary inside its
+platform wheels, so it has no cache or download step either, and like PHP it
+starts a 1.6.x binary the older way.
 
 Changes are listed at the end of this page, and feedback is welcome as an issue
 on the repository. `docs/versioning.md` covers what the engine itself promises.

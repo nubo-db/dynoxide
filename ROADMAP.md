@@ -26,7 +26,9 @@ the `nubo-db/dynoxide-laravel` package.
 
 ## Next
 
-- **A Python launcher** on PyPI, built on the same contract.
+- **A Python launcher** on PyPI, built on the same contract: `dynoxide.start()`,
+  pytest fixtures, and the binary inside the wheel. The package is in
+  [`python/`](python/), and its first release carries 1.8.0.
 - **Guides for Symfony and Bref**, and for Architect's sandbox.
 - **Closing the remaining differences from DynamoDB.** The open
   [bug issues](https://github.com/nubo-db/dynoxide/issues?q=is%3Aopen+label%3Abug)

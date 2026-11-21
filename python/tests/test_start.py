@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from collections.abc import Callable
@@ -206,12 +207,33 @@ def test_an_interrupted_stop_still_ends_the_server(start_fake: StartFake, monkey
 
 def test_a_chatty_server_never_stalls(start_fake: StartFake) -> None:
     server = start_fake("flood")
-    time.sleep(1.0)
-    with urllib.request.urlopen(server.endpoint + "/", timeout=5) as response:
-        flushed = json.load(response)
-    # Far more than a pipe holds, so both pipes are being read.
-    assert flushed["out"] > 1 << 20
-    assert flushed["err"] > 1 << 20
+    deadline = time.monotonic() + 10
+    while True:
+        with urllib.request.urlopen(server.endpoint + "/", timeout=5) as response:
+            flushed = json.load(response)
+        # 4 MB of each, far more than a pipe holds, all written: nothing
+        # stalled the server's writes.
+        if flushed == {"out": 4 << 20, "err": 4 << 20} or time.monotonic() > deadline:
+            break
+        time.sleep(0.1)
+    assert flushed == {"out": 4 << 20, "err": 4 << 20}
+    assert server.stop() == 0
+
+
+def test_the_output_files_go_when_the_server_stops(start_fake: StartFake) -> None:
+    server = start_fake()
+    folder = Path(server._process.output.dir)
+    server.stop()
+    assert not folder.exists()
+
+
+def test_start_leaves_no_thread_running(start_fake: StartFake) -> None:
+    # Python 3.12+ warns on fork() while threads run, which fails suites that
+    # make warnings errors, so the launcher runs none.
+    before = set(threading.enumerate())
+    server = start_fake()
+    assert set(threading.enumerate()) == before
+    server.stop()
 
 
 def test_context_manager_stops_on_exit_and_on_error(start_fake: StartFake) -> None:

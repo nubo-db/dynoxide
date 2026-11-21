@@ -257,8 +257,10 @@ the server's next write blocks and requests stall with no error.
 
 A single-threaded runtime such as PHP can't read in the background while the
 tests run, so it sends both streams to files and polls the stdout file for the
-ready line. Keep the last few lines of stderr either way: they belong in any
-startup error.
+ready line. Python does the same for a different reason: a reader thread makes
+Python 3.12 and later warn on every `fork()` while the server runs, which fails
+a test suite that turns warnings into errors. Keep the last few lines of stderr
+either way: they belong in any startup error.
 
 ## Knowing it's ready
 
@@ -517,7 +519,7 @@ Fixed, so wrappers behave alike:
 - [ ] Extraction takes the one expected file and rejects anything else.
 - [ ] The server is spawned with an argument array, no shell, no shim, and no
       `--host`.
-- [ ] stdout and stderr are read for the life of the process.
+- [ ] stdout and stderr are read for the life of the process, or sent to files.
 - [ ] Readiness comes from the first stdout line, with a timeout that fails.
 - [ ] Start returns the endpoint, region and the `dynoxide` credentials.
 - [ ] Exporting is a separate call, sets both region variables and

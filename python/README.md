@@ -45,6 +45,8 @@ Keep test suites on port 0, the default. If a fixed port is taken, `start()` rai
 
 If it can't start, `start()` raises `DynoxideError`. Its `code` says why (`BINARY_MISSING`, `UNSUPPORTED_PLATFORM`, `TOO_OLD`, `VERSION_CHECK_FAILED`, `SPAWN_FAILED`, `EXITED`, `PORT_IN_USE`, `BAD_READY_LINE`, `PORT_ZERO` or `TIMEOUT`), and the message ends with the server's last lines of stderr.
 
+The server's output goes to temporary files, removed when it stops, so nothing in your process has to keep reading it. They stay small unless `RUST_LOG` turns on debug logging, which writes for as long as the server runs.
+
 ## Code that builds its own clients
 
 If the code under test calls `boto3.client("dynamodb")` itself, export the environment instead:

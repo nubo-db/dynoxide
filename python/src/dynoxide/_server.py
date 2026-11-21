@@ -9,17 +9,17 @@ import json
 import logging
 import math
 import os
-import queue
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import weakref
-from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
-from typing import IO, Any
+from typing import BinaryIO
 
 from . import _env
 from ._binary import WINDOWS, Binary, checked, child_env, resolve
@@ -37,6 +37,7 @@ from ._errors import (
 GRACE = 5.0
 STDERR_LINES = 20
 _LINE_LIMIT = 64 * 1024
+_POLL = 0.02
 _EXIT_PORT_IN_USE = 4
 _LISTENING = re.compile(r"Dynoxide listening on (http://(\[[0-9a-fA-F:.]+\]|[^\s:/]+):(\d{1,5}))\s*$")
 
@@ -137,19 +138,22 @@ def _launch(
     if schema_file is not None:
         args.append(f"--schema={schema_file}")
 
+    output = _Output()
     try:
         popen = subprocess.Popen(
             args,
             stdin=subprocess.PIPE if found.launcher_flags else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=output.child_stdout,
+            stderr=output.child_stderr,
             env=child_env(base),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if WINDOWS else 0,
         )
     except (OSError, ValueError) as err:
+        output.close()
         raise DynoxideError(SPAWN_FAILED, f"Couldn't run {found.describe()}: {err}.") from None
+    output.spawned()
 
-    process = _Process(popen, found.launcher_flags, grace)
+    process = _Process(popen, output, found.launcher_flags, grace)
     # Until the Server exists nobody else can stop it, so anything that goes
     # wrong first, the log callback included, stops it here.
     try:
@@ -237,57 +241,96 @@ class Server:
         return f"<dynoxide.Server {self.endpoint} pid={self.pid} {state}>"
 
 
-class _Process:
-    """One child process: its output readers, and the contract's stop
-    procedure (close stdin, SIGTERM, kill), run once."""
+class _Output:
+    """Where the server's stdout and stderr go: a file each, in a directory
+    only this process can read. A file never fills the way a pipe does, so
+    nothing has to keep reading it, and with no reader threads running a later
+    fork() is clean.
 
-    def __init__(self, popen: subprocess.Popen[bytes], launcher_flags: bool, grace: float) -> None:
+    The child writes through its own handles and this process reads through
+    separate ones, so reading never moves where the child writes. On POSIX
+    the files are removed as soon as both sides have them open; Windows can't
+    remove an open file, so there they go when the server has stopped.
+    """
+
+    def __init__(self) -> None:
+        self.dir = tempfile.mkdtemp(prefix="dynoxide-")
+        out, err = os.path.join(self.dir, "stdout"), os.path.join(self.dir, "stderr")
+        self.child_stdout: BinaryIO | None = open(out, "ab")  # noqa: SIM115
+        self.child_stderr: BinaryIO | None = open(err, "ab")  # noqa: SIM115
+        self.stdout: BinaryIO = open(out, "rb")  # noqa: SIM115
+        self.stderr: BinaryIO = open(err, "rb")  # noqa: SIM115
+        self._closed = False
+        if not WINDOWS:
+            self._remove()
+
+    def spawned(self) -> None:
+        """The child has its copies of the write handles; close ours."""
+        for handle in (self.child_stdout, self.child_stderr):
+            if handle is not None:
+                handle.close()
+        self.child_stdout = self.child_stderr = None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.spawned()
+        self.stdout.close()
+        self.stderr.close()
+        self._remove()
+
+    def _remove(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class _Process:
+    """One child process: its output, and the contract's stop procedure
+    (close stdin, SIGTERM, kill), run once."""
+
+    def __init__(self, popen: subprocess.Popen[bytes], output: _Output, launcher_flags: bool, grace: float) -> None:
         self.popen = popen
+        self.output = output
         self.launcher_flags = launcher_flags
         self.grace = grace
         self.owner = os.getpid()
-        self.stderr_tail: deque[str] = deque(maxlen=STDERR_LINES)
-        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._stdout = b""
+        self._stderr = b""
+        self._tail: list[str] = []
         self._lock = threading.Lock()
         self._stopped = False
-        assert popen.stdout is not None and popen.stderr is not None
-        self._readers = [
-            threading.Thread(target=self._read_stdout, args=(popen.stdout,), daemon=True, name="dynoxide-stdout"),
-            threading.Thread(target=self._read_stderr, args=(popen.stderr,), daemon=True, name="dynoxide-stderr"),
-        ]
-        for reader in self._readers:
-            reader.start()
         _live.add(self)
 
-    # Reading output. Both pipes are read for the life of the process, so a
-    # chatty server never fills one and stalls.
+    # Reading output.
 
-    def _read_stdout(self, stream: IO[bytes]) -> None:
-        try:
-            first = stream.readline(_LINE_LIMIT)
-            # Only a whole line counts: a partial one means the server died
-            # part-way through writing it.
-            if first.endswith(b"\n"):
-                self.events.put(("stdout", first.decode("utf-8", "replace").strip()))
-                while stream.read(65536):
-                    pass
-        except (OSError, ValueError):
-            pass
-        self.events.put(("eof", "stdout"))
+    def _ready_line(self) -> str | None:
+        """The first stdout line, once it's whole. A partial one means the
+        server is still writing it, or died part way through."""
+        if len(self._stdout) < _LINE_LIMIT:
+            self._stdout += self.output.stdout.read(_LINE_LIMIT - len(self._stdout))
+        line, newline, _ = self._stdout.partition(b"\n")
+        return line.decode("utf-8", "replace").strip() if newline else None
 
-    def _read_stderr(self, stream: IO[bytes]) -> None:
-        try:
-            for raw in iter(lambda: stream.readline(_LINE_LIMIT), b""):
-                line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                if line.strip():
-                    self.stderr_tail.append(line)
-                if not self.launcher_flags:
-                    match = _LISTENING.search(line)
-                    if match:
-                        self.events.put(("listening", match))
-        except (OSError, ValueError):
-            pass
-        self.events.put(("eof", "stderr"))
+    def _new_stderr_lines(self) -> list[str]:
+        self._stderr += self.output.stderr.read()
+        *lines, self._stderr = self._stderr.split(b"\n")
+        return [line.decode("utf-8", "replace").rstrip("\r") for line in lines]
+
+    @property
+    def stderr_tail(self) -> list[str]:
+        """The last lines the server wrote to stderr, read from the end of the
+        file so a long log costs no more than a short one."""
+        if not self.output._closed:
+            stream = self.output.stderr
+            end = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, end - STDERR_LINES * 1024))
+            text = stream.read().decode("utf-8", "replace")
+            stream.seek(end)
+            lines = [line.rstrip("\r") for line in text.split("\n")]
+            if end > STDERR_LINES * 1024:
+                lines = lines[1:]  # the first may be cut short
+            self._tail = [line for line in lines if line.strip()][-STDERR_LINES:]
+        return list(self._tail)
 
     # Starting.
 
@@ -295,8 +338,25 @@ class _Process:
         deadline = time.monotonic() + timeout
         listening: _Ready | None = None
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            # Checked before the output is read, so anything written just
+            # before the exit still counts.
+            exited = self.popen.poll() is not None
+            if self.launcher_flags:
+                line = self._ready_line()
+                if line is not None:
+                    return self._parse_ready(line, found)
+            elif listening is None:
+                for line in self._new_stderr_lines():
+                    match = _LISTENING.search(line)
+                    if match:
+                        endpoint, host, bound = match.group(1), match.group(2).strip("[]"), int(match.group(3))
+                        listening = _Ready(endpoint, host, bound, found.version)
+                        break
+            if listening is not None and _answers_get(listening.host, listening.port):
+                return listening
+            if exited:
+                self._raise_exited(found, port)
+            if time.monotonic() >= deadline:
                 if listening is None and not self.launcher_flags:
                     what = f"didn't say it was listening within {timeout:g} seconds"
                 elif listening is not None:
@@ -304,19 +364,7 @@ class _Process:
                 else:
                     what = f"didn't print its ready line within {timeout:g} seconds"
                 raise self._failure(TIMEOUT, found, what)
-            try:
-                kind, value = self.events.get(timeout=min(remaining, 0.05))
-            except queue.Empty:
-                kind, value = "", None
-
-            if kind == "stdout" and self.launcher_flags:
-                return self._parse_ready(value, found)
-            if kind == "listening" and listening is None:
-                listening = _Ready(value.group(1), value.group(2).strip("[]"), int(value.group(3)), found.version)
-            if listening is not None and _answers_get(listening.host, listening.port):
-                return listening
-            if (kind == "eof" and value == "stdout" and self.launcher_flags) or self.popen.poll() is not None:
-                self._raise_exited(found, port, deadline)
+            time.sleep(_POLL)
 
     def _parse_ready(self, line: str, found: Binary) -> _Ready:
         try:
@@ -342,14 +390,8 @@ class _Process:
             version if isinstance(version, str) else None,
         )
 
-    def _raise_exited(self, found: Binary, port: int, deadline: float) -> None:
-        # Its stdout has closed, or it has exited. Give it a moment to do the
-        # other, and the stderr reader time to catch up.
-        try:
-            status = self.popen.wait(timeout=max(0.0, min(self.grace, deadline - time.monotonic())))
-        except subprocess.TimeoutExpired:
-            raise self._failure(BAD_READY_LINE, found, "closed its output without printing a ready line") from None
-        self._readers[1].join(timeout=1.0)
+    def _raise_exited(self, found: Binary, port: int) -> None:
+        status = self.popen.returncode
         if status == _EXIT_PORT_IN_USE and port != 0:
             raise PortInUseError(
                 port,
@@ -370,7 +412,7 @@ class _Process:
     def _failure(self, code: str, found: Binary, what: str) -> DynoxideError:
         # The server is stopped first, so the stderr tail is complete.
         self.stop()
-        tail = list(self.stderr_tail)
+        tail = self.stderr_tail
         quiet = "" if tail else " It wrote nothing to stderr."
         return DynoxideError(code, f"The Dynoxide server ({found.describe()}) {what}.{quiet}", tail)
 
@@ -388,7 +430,7 @@ class _Process:
                 except BaseException:
                     # Interrupted part way, by Ctrl+C in a grace wait say.
                     # Don't leave the server running, and let a later stop()
-                    # or the finaliser finish closing the pipes.
+                    # or the finaliser finish tidying up.
                     if self.popen.poll() is None:
                         with contextlib.suppress(OSError):
                             self.popen.kill()
@@ -409,14 +451,9 @@ class _Process:
             popen.kill()
             popen.wait()
         self._close_stdin()
-        # Each pipe is closed once its reader has seen the end of it. A reader
-        # still going means something the server started holds the pipe open;
-        # closing it under the reader would race, so it's left to the reader.
-        for reader, stream in zip(self._readers, (popen.stdout, popen.stderr), strict=True):
-            if reader is not threading.current_thread():
-                reader.join(timeout=1.0)
-            if not reader.is_alive() and stream is not None:
-                stream.close()
+        # Read before the files go, so a failure can still report it.
+        self._tail = self.stderr_tail
+        self.output.close()
 
     def _wait(self, seconds: float) -> None:
         with contextlib.suppress(subprocess.TimeoutExpired):

@@ -17,7 +17,9 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="no fork on Wind
 
 PRELUDE = f"""
 import json, os, sys, time, warnings
-warnings.simplefilter("ignore", DeprecationWarning)  # fork() with threads running
+# Python 3.12+ warns when a process with threads forks. The launcher runs
+# none, so a fork with a server running must be clean.
+warnings.simplefilter("error", DeprecationWarning)
 from dynoxide._server import _launch
 env = dict(os.environ, FAKE_MODE="ready")
 server = _launch(binary={str(FAKE)!r}, command=[sys.executable], env=env, grace=5.0)

@@ -83,6 +83,8 @@ def ready(port: int, **extra: object) -> None:
     out(json.dumps(line) + "\n")
 
 
+FLOOD = 4 << 20
+
 # In flood mode, how many bytes of each stream the reader has taken. A reader
 # that stops reading stops the count, as it would stop a real server's writes.
 flushed = {"out": 0, "err": 0}
@@ -153,10 +155,12 @@ else:
     ready(port)
 
 if mode == "flood":
+    # Far more than a pipe holds, then stops, so a launcher that sent output
+    # to files doesn't fill the disk.
     line = "x" * (16 * 1024 - 1) + "\n"
 
     def pump(stream: object, key: str) -> None:
-        while True:
+        while flushed[key] < FLOOD:
             stream.write(line)  # type: ignore[attr-defined]
             stream.flush()  # type: ignore[attr-defined]
             flushed[key] += len(line)

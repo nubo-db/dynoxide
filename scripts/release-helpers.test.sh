@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exercises the small scripts the release workflows share: is-semver.sh,
-# is-prerelease.sh, npm-dist-tag.sh, is-crate-published.sh,
+# is-prerelease.sh, npm-dist-tag.sh, pypi-version.sh, is-crate-published.sh,
 # crate-publish-decision.sh, check-release-binary-version.sh and
 # install-mcp-publisher.sh.
 #
@@ -89,6 +89,25 @@ expect 0 "next" "a prerelease publishes to next" "$DIST_TAG" 1.2.0-rc.1
 expect 0 "next" "a hyphenated prerelease publishes to next" "$DIST_TAG" 1.2.0-beta-2
 expect 1 "" "a malformed version has no dist-tag" "$DIST_TAG" "1.2.0-"
 expect 1 "" "an empty version has no dist-tag" "$DIST_TAG" ""
+
+# --- pypi-version.sh --------------------------------------------------------
+
+PYPI="$SCRIPTS/pypi-version.sh"
+expect 0 "1.2.0" "a release keeps its version on PyPI" "$PYPI" 1.2.0
+expect 0 "1.2.0.post1" "a post number makes a post-release" "$PYPI" 1.2.0 1
+expect 0 "1.2.0.post12" "a two-digit post number" "$PYPI" 1.2.0 12
+expect 0 "1.2.0rc2" "a release candidate becomes rcN" "$PYPI" 1.2.0-rc.2
+expect 0 "1.2.0b1" "a beta becomes bN" "$PYPI" 1.2.0-beta.1
+expect 0 "1.2.0a0" "an unnumbered alpha becomes a0" "$PYPI" 1.2.0-alpha
+expect 1 "" "a release candidate can't have a post number" "$PYPI" 1.2.0-rc.1 1
+expect 1 "" "a post number of 0 is refused" "$PYPI" 1.2.0 0
+expect 1 "" "a post number with a leading zero is refused" "$PYPI" 1.2.0 01
+expect 1 "" "a post number that isn't a number is refused" "$PYPI" 1.2.0 "1; echo"
+expect 1 "" "a prerelease PEP 440 can't express is refused" "$PYPI" 1.2.0-alpha.1-x
+expect 1 "" "a hyphenated prerelease is refused" "$PYPI" 1.2.0-beta-2
+expect 1 "" "a tag rather than a version is refused" "$PYPI" v1.2.0
+expect 1 "" "a malformed version is refused" "$PYPI" 1.2.0-rc..1
+expect 1 "" "an empty version is refused" "$PYPI" ""
 
 # --- is-crate-published.sh --------------------------------------------------
 #

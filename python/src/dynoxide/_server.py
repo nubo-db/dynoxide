@@ -383,7 +383,18 @@ class _Process:
             if not self._stopped:
                 self._stopped = True
                 _live.discard(self)
-                self._stop()
+                try:
+                    self._stop()
+                except BaseException:
+                    # Interrupted part way, by Ctrl+C in a grace wait say.
+                    # Don't leave the server running, and let a later stop()
+                    # or the finaliser finish closing the pipes.
+                    if self.popen.poll() is None:
+                        with contextlib.suppress(OSError):
+                            self.popen.kill()
+                    self._stopped = False
+                    _live.add(self)
+                    raise
         return self.popen.returncode
 
     def _stop(self) -> None:

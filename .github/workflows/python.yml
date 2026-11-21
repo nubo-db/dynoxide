@@ -51,12 +51,14 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       engine: ${{ steps.version.outputs.engine }}
       version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.version.outputs.skip }}
     steps:
       - uses: actions/checkout@v5
 
       - name: Map the tag to a PyPI version
         id: version
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_POST: ${{ inputs.post }}
         run: |
@@ -81,17 +83,32 @@ jobs:
             echo "::error::python/src/dynoxide/_version.py on $GITHUB_REF is for $PACKAGE_ENGINE, not $ENGINE. Run this from a ref whose package matches the tag."
             exit 1
           fi
-          VERSION=$(scripts/pypi-version.sh "$ENGINE" "$POST")
+          SKIP=false
+          if ! VERSION=$(scripts/pypi-version.sh "$ENGINE" "$POST"); then
+            # The tag is already known to be semver, so with no post number
+            # this is a prerelease PyPI can't express, which skips PyPI.
+            if [ -n "$POST" ]; then exit 1; fi
+            echo "::notice::$ENGINE has no PyPI version form, so there is nothing to build or publish."
+            SKIP=true
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # A release pull request bumps the package before its release
+            # exists, so there are no binaries to build from yet. The publish
+            # run after the release does the full build.
+            echo "::notice::Release $TAG isn't published yet, so the wheels can't be built on this pull request."
+            SKIP=true
+          fi
           {
             echo "tag=$TAG"
             echo "engine=$ENGINE"
             echo "version=$VERSION"
+            echo "skip=$SKIP"
           } >> "$GITHUB_OUTPUT"
-          echo "Packaging $TAG as dynoxide $VERSION on PyPI"
+          [ "$SKIP" = true ] || echo "Packaging $TAG as dynoxide $VERSION on PyPI"
 
   build:
     name: Build the wheels
     needs: version
+    if: needs.version.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -242,7 +259,9 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [version, build, smoke, smoke-sdist]
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    # Only from main, so a branch can't publish by accident. The pypi
+    # environment's branch rule is what enforces it.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -251,29 +270,17 @@ jobs:
     permissions:
       id-token: write
     steps:
-      # Idempotent, so a re-run after a later step failed goes through. A
-      # PyPI version can't be replaced, so one already there is left alone.
-      - name: Skip if this version is already published
-        id: published
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          status=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/dynoxide/$VERSION/json")
-          if [ "$status" = 200 ]; then
-            echo "::notice::dynoxide $VERSION is already on PyPI; skipping. Its contents were not checked: a PyPI version can't be replaced, so a wrong one needs a post-release."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/download-artifact@v7
-        if: steps.published.outputs.skip == 'false'
         with:
           name: python-dist
           path: dist
 
       # Trusted Publishing: PyPI trusts this workflow and environment, so no
-      # token is stored. Attestations are on by default.
+      # token is stored. Attestations are on by default. skip-existing makes
+      # a re-run upload only the files PyPI doesn't have yet, which finishes
+      # a release whose upload stopped part way. A file already there can't
+      # be replaced, so a wrong one needs a post-release.
       - name: Publish
-        if: steps.published.outputs.skip == 'false'
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true

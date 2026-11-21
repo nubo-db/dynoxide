@@ -700,6 +700,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Python (${{ matrix.os }}, ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -768,6 +769,7 @@ jobs:
     needs: [changes, python]
     if: always() && needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v7

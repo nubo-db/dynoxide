@@ -52,6 +52,11 @@ A fix to the Python package alone doesn't need an engine release. Once it's on
 `main`, run `python.yml` by hand with the release tag and a post number, and
 it publishes `X.Y.Z.postN` with the same binaries.
 
+PyPI trusts `python.yml` through Trusted Publishing, set up once on PyPI for
+this repository, the `python.yml` workflow and the `pypi` environment. The
+`pypi` environment in the repository settings allows deployments from `main`
+only, so a run from any other branch can't publish.
+
 ## Verifying a release
 
 - **sha256sums.txt** is attached to every GitHub Release. Download it

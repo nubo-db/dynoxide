@@ -186,6 +186,24 @@ def test_a_server_ignoring_sigterm_is_killed(start_fake: StartFake) -> None:
     assert not server.is_running()
 
 
+def test_an_interrupted_stop_still_ends_the_server(start_fake: StartFake, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = start_fake("ignore-term", grace=5.0)
+    process = server._process
+
+    def interrupted(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(process, "_wait", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        server.stop()
+    process.popen.wait(timeout=5)
+    assert not server.is_running()
+    # A later stop() finishes the job, which the fixture's teardown checks by
+    # leaving no pipe open.
+    monkeypatch.undo()
+    assert server.stop() is not None
+
+
 def test_a_chatty_server_never_stalls(start_fake: StartFake) -> None:
     server = start_fake("flood")
     time.sleep(1.0)

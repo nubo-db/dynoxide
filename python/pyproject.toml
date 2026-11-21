@@ -71,6 +71,10 @@ filterwarnings = ["error"]
 line-length = 120
 target-version = "py310"
 
+[tool.ruff.format]
+# The README's examples keep their comments lined up for reading.
+exclude = ["*.md"]
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 

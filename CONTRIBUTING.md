@@ -62,6 +62,11 @@ or behaviour note that motivates the change. Cleaner ergonomics or
   (<https://github.com/paritysuite/dynamodb-conformance>) runs in CI for
   release candidates. Running it locally is optional but useful when
   you change request or response shapes.
+- The Python package in `python/` has its own tests: from that directory,
+  `pip install -e . --group dev`, then `python -m pytest`. Set
+  `DYNOXIDE_BINARY` to a built binary for the tests that start a real
+  server. CI also runs `ruff check`, `ruff format --check` and `mypy`
+  there.
 
 ## Benchmarks
 

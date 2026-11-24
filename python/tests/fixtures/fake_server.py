@@ -13,6 +13,7 @@ import http.server
 import json
 import os
 import signal
+import socketserver
 import sys
 import threading
 import time
@@ -134,7 +135,17 @@ if mode == "never-ready":
     err("still thinking\n")
     forever()
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+class QuickServer(http.server.ThreadingHTTPServer):
+    # HTTPServer looks up the host's full name when it binds, and on macOS CI
+    # runners that reverse lookup can take longer than the ready timeout.
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
+
+server = QuickServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 port = server.server_address[1]
 

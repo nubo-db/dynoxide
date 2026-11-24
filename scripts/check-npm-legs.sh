@@ -20,11 +20,12 @@ for leg in "$@"; do
     status=1
     continue
   fi
-  field() { sed -n "s/^# $1 //p" "$file"; }
-  tests=$(field tests)
-  fail=$(field fail)
-  skipped=$(field skipped)
-  want=$(sed -n 's/^expected_skips=//p' "$file")
+  # A Windows leg can write CRLF, and a stray \r would fail every compare.
+  field() { tr -d '\r' < "$file" | sed -n "s/^$1//p"; }
+  tests=$(field '# tests ')
+  fail=$(field '# fail ')
+  skipped=$(field '# skipped ')
+  want=$(field 'expected_skips=')
   echo "$leg: $tests tests, $fail failed, $skipped skipped (expected $want)"
   if [ -z "$tests" ] || [ "$tests" -lt 1 ] || [ "$fail" != 0 ] || [ "$skipped" != "$want" ]; then
     echo "::error::the $leg leg didn't run cleanly"

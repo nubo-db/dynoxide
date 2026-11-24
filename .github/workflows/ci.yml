@@ -282,6 +282,12 @@ jobs:
       - name: Check the changed-paths gate still runs code changes
         run: scripts/ci-changed-paths.test.sh
 
+      # The npm and Python jobs each finish with a check that every leg ran
+      # its tests cleanly. A check that always passes would hide a leg that
+      # never ran, so its verdicts are pinned here.
+      - name: Check the every-leg-ran check can still fail
+        run: scripts/check-npm-legs.test.sh
+
       # The Trusted Publishing probe passes by reading a refusal from
       # crates.io, which is easy to get wrong in the direction that always
       # says yes. Every answer crates.io can give is replayed against it here,
